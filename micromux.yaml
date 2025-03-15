@@ -1,0 +1,37 @@
+version: "1"
+ui:
+  width: 40
+services:
+  app:
+    command: "./start.sh"
+    env_file:
+      - path: ../../.env
+    restart: unless-stopped
+    watch: false
+    environment:
+      APP_ENV: production
+      APP_DEBUG: "false"
+    ports:
+      - ${MINIO_PORT}:9000
+      - ${MINIO_UI_PORT}:9001
+    depends_on:
+      - db
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost/health || exit 1"]
+      interval: "30s"
+      timeout: "10s"
+      retries: 3
+  db:
+    command: "./start.sh"
+    watch:
+      - "./*.toml"
+    environment:
+      POSTGRES_PASSWORD: example
+    depends_on:
+      minio:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres"]
+      interval: "10s"
+      timeout: "5s"
+      retries: 5

@@ -1,0 +1,12 @@
+[package]
+name = "micromux"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+color-eyre.workspace = true
+micromux-tui = { path = "../micromux-tui/" }
+
+# serialization
+serde.workspace = true
+serde_yaml.workspace = true

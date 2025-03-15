@@ -1,0 +1,13 @@
+[package]
+name = "micromux-tui"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+color-eyre.workspace = true
+itertools.workspace = true
+strum.workspace = true
+
+# tui
+ratatui = { version = "0", features = [] }
+crossterm = "0"
