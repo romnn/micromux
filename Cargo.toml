@@ -1,8 +1,9 @@
 [workspace]
 resolver = "2"
 members = [
-	"crates/micromux-tui",
 	"crates/micromux",
+	"crates/micromux-tui",
+	"crates/micromux-cli",
 ]
 
 [workspace.package]
@@ -15,10 +16,24 @@ codegen-units = 1
 
 [workspace.dependencies]
 color-eyre = "0"
+thiserror = "2"
 itertools = "0"
 rand = "0"
+indexmap = "2"
 strum = { version = "0", features = ["derive"] }
+
+# tracing
+tracing = "0"
+
+# diagnostics
+codespan-reporting = "0"
 
 # serde
 serde = { version = "1", features = ["derive"] }
-serde_yaml = "0"
+# TODO: remove
+# serde_yaml = "0"
+
+# async runtime
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0"
+futures = "0"

@@ -5,8 +5,38 @@ edition.workspace = true
 
 [dependencies]
 color-eyre.workspace = true
-micromux-tui = { path = "../micromux-tui/" }
+thiserror.workspace = true
+strum.workspace = true
+itertools.workspace = true
+indexmap.workspace = true
+
+# command and process management
+async-process = "2"
+shlex = "1"
+nix = { version = "0", features = ["signal"] }
+
+# graph
+petgraph = "0"
+
+# cross platform cache and config directories
+directories = "6"
+
+# config parsing
+humantime = "2"
+
+# tracing
+tracing.workspace = true
+
+# diagnostics
+codespan-reporting.workspace = true
+unindent = "0"
+
+# async runtime
+tokio.workspace = true
+tokio-util.workspace = true
+futures.workspace = true
 
 # serialization
+yaml-spanned = { git = "https://github.com/romnn/yaml-spanned.git" }
 serde.workspace = true
-serde_yaml.workspace = true
+# serde_yaml.workspace = true

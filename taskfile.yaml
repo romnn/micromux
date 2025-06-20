@@ -6,24 +6,44 @@ tasks:
       - task: run
 
   run:
-    ignore_error: true
+    desc: "run"
     interactive: true
     cmds:
-      - cargo run -p micromux --bin micromux -- {{.CLI_ARGS}}
-
-  run:cargo:
-    ignore_error: true
-    interactive: true
-    cmds:
-      - cargo run -p micromux --bin micromux -- {{.CLI_ARGS}}
+      - cargo run -p micromux-cli -- {{.CLI_ARGS}}
 
   build:
+    desc: "build in debug mode"
     cmds:
       - cargo build --all-targets {{.CLI_ARGS}}
 
   build:release:
+    desc: "build in release mode"
     cmds:
       - cargo build --all-targets --release {{.CLI_ARGS}}
+
+  build:goreleaser:
+    desc: "build in release mode using goreleaser"
+    cmds:
+      # pretter-ignore
+      - >-
+        docker run --rm
+        -v "${PWD}:/workspace"
+        -w /workspace
+        ghcr.io/rust-cross/cargo-zigbuild
+        bash -c './release.sh && goreleaser build --snapshot --clean'
+
+  release:
+    desc: "release using goreleaser"
+    cmds:
+      # pretter-ignore
+      - >-
+        docker run --rm
+        -e "GITHUB_TOKEN=${GITHUB_TOKEN}"
+        -e "TAP_GITHUB_TOKEN=${TAP_GITHUB_TOKEN}"
+        -v "${PWD}:/workspace"
+        -w /workspace
+        ghcr.io/rust-cross/cargo-zigbuild
+        bash -c './release.sh && goreleaser release --clean'
 
   typos:
     desc: "check repository for typos"
@@ -38,12 +58,13 @@ tasks:
       - cargo check --workspace --all-targets {{.CLI_ARGS}}
 
   check:fc:
-    desc: "check cargo workspace"
+    desc: "check cargo workspace for all combinations of features"
     dir: "{{.ROOT_DIR}}"
     cmds:
       - cargo fc check --workspace --all-targets {{.CLI_ARGS}}
 
   clean:
+    desc: "clean cargo workspace"
     cmds:
       - cargo clean {{.CLI_ARGS}}
 
@@ -91,28 +112,33 @@ tasks:
       # prettier-ignore
       - >-
         cargo clippy
-        --tests --benches --examples --all-features
+        --workspace --all-targets --all-features
         {{.CLI_ARGS}}
         -- -Dclippy::all -Dclippy::pedantic
 
   lint:fc:
-    desc: "lint cargo workspace for feature combinations"
+    desc: "lint cargo workspace for all combinations of features"
     cmds:
       # prettier-ignore
       - >-
         cargo fc clippy
-        --tests --benches --examples --all-features
+        --workspace --all-targets --all-features
         {{.CLI_ARGS}}
         -- -Dclippy::all -Dclippy::pedantic
 
   lint:fix:
     desc: "lint and fix cargo workspace"
-    alias: [fix]
+    aliases: [fix]
     cmds:
       # prettier-ignore
       - >-
         cargo clippy
         --fix --allow-dirty --allow-staged
-        --tests --benches --examples --all-features
+        --workspace --all-targets --all-features
         {{.CLI_ARGS}}
         -- -Dclippy::all -Dclippy::pedantic
+
+  lint:actions:
+    desc: "lint github actions"
+    cmds:
+      - actionlint

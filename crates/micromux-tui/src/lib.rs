@@ -1,5 +1,8 @@
 #![allow(warnings)]
 
+pub use crossterm;
+pub use ratatui;
+
 use color_eyre::eyre;
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind},
@@ -7,44 +10,23 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use itertools::intersperse;
-use ratatui::{DefaultTerminal, prelude::*, style::Styled};
+use micromux::{Micromux, health_check::Health, scheduler::State, service::Service};
 use ratatui::{
-    Terminal,
+    DefaultTerminal, Terminal,
     backend::{Backend, CrosstermBackend},
     buffer::Buffer,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
+    prelude::*,
+    style::Styled,
     style::{Color, Modifier, Style, palette::tailwind},
     text::Span,
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Widget},
 };
+use std::sync::Arc;
 use std::{
     io,
     time::{Duration, Instant},
 };
-
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, strum::Display, strum::IntoStaticStr,
-)]
-pub enum Health {
-    #[strum(serialize = "HEALTHY")]
-    Healthy,
-    #[strum(serialize = "UNHEALTHY")]
-    Unhealthy,
-}
-
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, strum::Display, strum::IntoStaticStr,
-)]
-pub enum State {
-    #[strum(serialize = "PENDING")]
-    Pending,
-    #[strum(serialize = "RUNNING")]
-    Running,
-    #[strum(serialize = "EXITED")]
-    Exited,
-    #[strum(serialize = "DISABLED")]
-    Disabled,
-}
 
 #[derive(Debug, Default, PartialEq, Eq)]
 enum AppMode {
@@ -53,91 +35,57 @@ enum AppMode {
     Quit,
 }
 
-#[derive(Debug)]
-pub struct Service {
-    pub state: State,
-    pub health: Option<Health>,
-    pub name: String,
-    pub open_ports: Vec<u16>,
+// #[derive(Debug)]
+// pub struct Service {
+//     pub state: State,
+//     pub health: Option<Health>,
+//     pub name: String,
+//     pub open_ports: Vec<u16>,
+// }
+
+pub fn health_style(service: &Service) -> Style {
+    match service.health {
+        Some(Health::Unhealthy) => Style::default().fg(tailwind::RED.c500),
+        _ => Style::default().fg(Color::White).fg(tailwind::GREEN.c500),
+    }
 }
 
-impl Service {
-    pub fn new(name: impl Into<String>) -> Self {
-        Self {
-            name: name.into(),
-            state: State::Pending,
-            health: None,
-            open_ports: vec![],
-        }
-    }
-
-    pub fn with_state(mut self, state: impl Into<State>) -> Self {
-        self.state = state.into();
-        self
-    }
-
-    pub fn with_health(mut self, health: impl Into<Health>) -> Self {
-        self.health = Some(health.into());
-        self
-    }
-
-    pub fn with_port(mut self, port: u16) -> Self {
-        self.open_ports.push(port);
-        self
-    }
-
-    pub fn health_style(&self) -> Style {
-        match self.health {
-            Some(Health::Unhealthy) => Style::default().fg(tailwind::RED.c500),
-            _ => Style::default().fg(Color::White).fg(tailwind::GREEN.c500),
-        }
-    }
-
-    pub fn style(&self) -> Style {
-        match self.state {
-            State::Disabled => Style::default().fg(Color::White).fg(tailwind::GRAY.c500),
-            State::Pending => Style::default().fg(Color::White).fg(tailwind::BLUE.c500),
-            State::Running | State::Exited => self.health_style(),
-        }
-    }
-
-    pub fn status(&self) -> &'static str {
-        match (self.state, self.health) {
-            (state @ (State::Disabled | State::Pending | State::Exited), _) => state.into(),
-            (_, Some(health)) => health.into(),
-            (state, _) => state.into(),
+pub fn style(service: &Service) -> Style {
+    match service.state {
+        State::Disabled => Style::default().fg(Color::White).fg(tailwind::GRAY.c500),
+        State::Pending => Style::default().fg(Color::White).fg(tailwind::BLUE.c500),
+        State::Running { .. } | State::Killed { .. } | State::Exited { .. } => {
+            health_style(service)
         }
     }
 }
 
-#[derive(Debug)]
+pub fn status(service: &Service) -> &'static str {
+    match (&service.state, &service.health) {
+        (state @ (State::Disabled | State::Pending | State::Exited { .. }), _) => state.into(),
+        (_, Some(health)) => health.into(),
+        (state, _) => state.into(),
+    }
+}
+
+#[derive()]
 pub struct App {
-    mode: AppMode,
-    services: Vec<Service>,
-    services_sidebar_width: u16,
-    selected_service: usize,
-    viewer_text: String,
-    show_popup: bool,
+    pub mode: AppMode,
+    pub mux: Arc<micromux::Micromux>,
+    pub services_sidebar_width: u16,
+    pub selected_service: usize,
+    pub viewer_text: String,
+    pub show_popup: bool,
 }
 
 const INITIAL_SIDEBAR_WIDTH: u16 = 40;
 const MIN_SIDEBAR_WIDTH: u16 = 20;
 
-impl Default for App {
-    fn default() -> Self {
+impl App {
+    pub fn new(mux: Arc<Micromux>) -> Self {
         Self {
             mode: AppMode::default(),
-            services: vec![
-                Service::new("Service A").with_state(State::Running),
-                Service::new("Service B")
-                    .with_state(State::Pending)
-                    .with_port(9000),
-                Service::new("Service C").with_state(State::Disabled),
-                Service::new("Service D")
-                    .with_state(State::Running)
-                    .with_health(Health::Unhealthy)
-                    .with_port(8080),
-            ],
+            mux,
             services_sidebar_width: INITIAL_SIDEBAR_WIDTH,
             selected_service: 0,
             show_popup: false,
@@ -148,7 +96,6 @@ impl Default for App {
 
 impl App {
     pub fn run(mut self, mut terminal: DefaultTerminal) -> eyre::Result<()> {
-        // self.insert_test_defaults();
         while self.is_running() {
             terminal.draw(|frame| frame.render_widget(&self, frame.area()))?;
             self.handle_events()?;
@@ -179,6 +126,8 @@ impl App {
     }
 
     fn exit(&mut self) {
+        // Send shutdown (cancellation) signal
+        self.mux.cancel.cancel();
         self.mode = AppMode::Quit;
     }
 
@@ -199,7 +148,7 @@ impl App {
         self.selected_service = self
             .selected_service
             .saturating_add(1)
-            .min(self.services.len().saturating_sub(1));
+            .min(self.mux.services.len().saturating_sub(1));
     }
 
     fn service_up(&mut self) {
@@ -266,10 +215,11 @@ impl App {
 
     fn render_services(&self, area: Rect, buf: &mut Buffer) {
         let items: Vec<ListItem> = self
+            .mux
             .services
             .iter()
             // .map(|i| ListItem::new(i.name.as_str()))
-            .map(|service| {
+            .map(|(name, service)| {
                 // Paragraph::new(
                 //     Line::from(
                 //         footer_text
@@ -293,7 +243,7 @@ impl App {
                 //     State::Starting => Style::default().fg(tailwind::YELLOW.c500),
                 //     State::Unhealthy | State::Exited => Style::default().fg(tailwind::RED.c500),
                 // };
-                let status = format!("{: >10}", service.status()).set_style(service.style());
+                let status = format!("{: >10}", status(service)).set_style(style(service));
                 // let fixed_latency = format!("{: <10}", service.latency);
 
                 // let status_span = Span::styled(fixed_status, status_style);
@@ -306,7 +256,7 @@ impl App {
                     .iter()
                     .map(|i| format!(":{i}").fg(tailwind::GRAY.c400)); // .collect::<Vec<();
 
-                let line = [status, " ".into(), service.name.as_str().into()]
+                let line = [status, " ".into(), service.id.as_str().into()]
                     .into_iter()
                     .chain(if ports.len() > 0 {
                         [" [".into()]
@@ -413,285 +363,17 @@ impl App {
         )
         .wrap(ratatui::widgets::Wrap { trim: false })
     }
+
+    pub fn render(self) {
+        let terminal = ratatui::init();
+        let app_result = self.run(terminal);
+        ratatui::restore();
+    }
 }
 
-pub fn render() -> eyre::Result<()> {
-    color_eyre::install()?;
-    let terminal = ratatui::init();
-    let app_result = App::default().run(terminal);
-    ratatui::restore();
-    return app_result;
-
-    // // Terminal setup.
-    // enable_raw_mode()?;
-    // let mut stdout = io::stdout();
-    // execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
-    // let backend = CrosstermBackend::new(stdout);
-    // let mut terminal = Terminal::new(backend)?;
-    //
-    // let mut app = App::default();
-    // let tick_rate = Duration::from_millis(200);
-    // let mut last_tick = Instant::now();
-    //
-    // 'main_loop: loop {
-    //     terminal.draw(|f| {
-    //         let size = f.size();
-    //
-    //         // Split into header, main area, and footer.
-    //         let chunks = Layout::default()
-    //             .direction(Direction::Vertical)
-    //             .constraints([
-    //                 Constraint::Length(1), // header
-    //                 Constraint::Min(0),    // main area
-    //                 Constraint::Length(1), // footer
-    //             ])
-    //             .split(size);
-    //
-    //         // Header.
-    //         let header = Paragraph::new("micromux")
-    //             .alignment(Alignment::Right)
-    //             .style(Style::default().fg(Color::Yellow))
-    //             .block(Block::default().borders(Borders::BOTTOM));
-    //         f.render_widget(header, chunks[0]);
-    //
-    //         // Footer with commands.
-    //         let footer_text = [
-    //             "←/→: Resize sidebar",
-    //             "↑/↓: Navigate",
-    //             "r: Restart",
-    //             "R: Restart All",
-    //             "d: Disable",
-    //             "q: Toggle Quit Popup / Quit",
-    //         ]
-    //         .join(" ");
-    //         let footer = Paragraph::new(footer_text)
-    //             .alignment(Alignment::Center)
-    //             .block(Block::default().borders(Borders::TOP));
-    //         f.render_widget(footer, chunks[2]);
-    //
-    //         if app.show_popup {
-    //             // Render normal viewer behind popup if desired.
-    //             let main_chunks = Layout::default()
-    //                 .direction(Direction::Horizontal)
-    //                 .constraints(
-    //                     [Constraint::Length(app.sidebar_width), Constraint::Min(0)].as_ref(),
-    //                 )
-    //                 .split(chunks[1]);
-    //
-    //             let viewer = Paragraph::new(app.viewer_text.as_str())
-    //                 .block(Block::default().borders(Borders::ALL).title("Viewer"));
-    //             f.render_widget(viewer, main_chunks[1]);
-    //
-    //             // Render popup (centered) with the sidebar list.
-    //             let popup_area = centered_rect(60, 50, chunks[1]);
-    //             // Clear background behind popup.
-    //             f.render_widget(ratatui::widgets::Clear, popup_area);
-    //             let items: Vec<ListItem> = app
-    //                 .sidebar_items
-    //                 .iter()
-    //                 .map(|i| ListItem::new(i.as_str()))
-    //                 .collect();
-    //             let mut state = ListState::default();
-    //             state.select(Some(app.selected));
-    //             let popup_list = List::new(items)
-    //                 .block(
-    //                     Block::default()
-    //                         .borders(Borders::ALL)
-    //                         .title("Sidebar (Popup)"),
-    //                 )
-    //                 .highlight_style(
-    //                     Style::default()
-    //                         .bg(Color::Blue)
-    //                         .fg(Color::White)
-    //                         .add_modifier(Modifier::BOLD),
-    //                 )
-    //                 .highlight_symbol(">> ");
-    //             f.render_stateful_widget(popup_list, popup_area, &mut state);
-    //         } else {
-    //             // Normal layout: sidebar on left and viewer on right.
-    //             let main_chunks = Layout::default()
-    //                 .direction(Direction::Horizontal)
-    //                 .constraints(
-    //                     [Constraint::Length(app.sidebar_width), Constraint::Min(0)].as_ref(),
-    //                 )
-    //                 .split(chunks[1]);
-    //
-    //             let items: Vec<ListItem> = app
-    //                 .sidebar_items
-    //                 .iter()
-    //                 .map(|i| ListItem::new(i.as_str()))
-    //                 .collect();
-    //             let mut state = ListState::default();
-    //             state.select(Some(app.selected));
-    //             let sidebar = List::new(items)
-    //                 .block(Block::default().borders(Borders::ALL).title("Sidebar"))
-    //                 .highlight_style(
-    //                     Style::default()
-    //                         .bg(Color::Blue)
-    //                         .fg(Color::White)
-    //                         .add_modifier(Modifier::BOLD),
-    //                 )
-    //                 .highlight_symbol(">> ");
-    //             f.render_stateful_widget(sidebar, main_chunks[0], &mut state);
-    //
-    //             let viewer = Paragraph::new(app.viewer_text.as_str())
-    //                 .block(Block::default().borders(Borders::ALL).title("Viewer"));
-    //             f.render_widget(viewer, main_chunks[1]);
-    //         }
-    //     })?;
-    //
-    //     // Poll for events.
-    //     let timeout = tick_rate
-    //         .checked_sub(last_tick.elapsed())
-    //         .unwrap_or_else(|| Duration::from_secs(0));
-    //
-    //     if crossterm::event::poll(timeout)? {
-    //         if let Event::Key(key) = event::read()? {
-    //             match key.code {
-    //                 // Toggle popup: if popup not shown, press q to show it;
-    //                 // if already shown, pressing q quits the app.
-    //                 KeyCode::Char('q') => {
-    //                     if app.show_popup {
-    //                         break 'main_loop;
-    //                     } else {
-    //                         app.show_popup = true;
-    //                     }
-    //                 }
-    //                 KeyCode::Left => app.resize_sidebar_left(),
-    //                 KeyCode::Right => app.resize_sidebar_right(),
-    //                 KeyCode::Up => {
-    //                     if app.show_popup {
-    //                         if app.selected > 0 {
-    //                             app.selected -= 1;
-    //                         }
-    //                     } else {
-    //                         app.previous();
-    //                     }
-    //                 }
-    //                 KeyCode::Down => {
-    //                     if app.show_popup {
-    //                         if app.selected < app.sidebar_items.len() - 1 {
-    //                             app.selected += 1;
-    //                         }
-    //                     } else {
-    //                         app.next();
-    //                     }
-    //                 }
-    //                 KeyCode::Char('r') => {
-    //                     app.viewer_text = "Restart triggered".into();
-    //                 }
-    //                 KeyCode::Char('R') => {
-    //                     app.viewer_text = "Restart All triggered".into();
-    //                 }
-    //                 KeyCode::Char('d') => {
-    //                     app.viewer_text = "Disable triggered".into();
-    //                 }
-    //                 _ => {}
-    //             }
-    //         }
-    //     }
-    //     if last_tick.elapsed() >= tick_rate {
-    //         last_tick = Instant::now();
-    //     }
-    // }
-    //
-    // // Restore terminal.
-    // disable_raw_mode()?;
-    // execute!(
-    //     terminal.backend_mut(),
-    //     LeaveAlternateScreen,
-    //     DisableMouseCapture
-    // )?;
-    // terminal.show_cursor()?;
-    // Ok(())
-}
-
-// pub fn render1() -> eyre::Result<()> {
-//     // Setup terminal.
-//     enable_raw_mode()?;
-//     let mut stdout = io::stdout();
-//     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
-//     let backend = CrosstermBackend::new(stdout);
-//     let mut terminal = Terminal::new(backend)?;
-//
-//     // Create the application state.
-//     let mut app = App::new();
-//     let tick_rate = Duration::from_millis(200);
-//     let mut last_tick = Instant::now();
-//
-//     loop {
-//         terminal.draw(|f| {
-//             // Divide the screen vertically: main area and footer.
-//             let vertical_chunks = Layout::default()
-//                 .direction(Direction::Vertical)
-//                 .constraints([Constraint::Min(0), Constraint::Length(3)].as_ref())
-//                 .split(f.area());
-//
-//             // Divide the main area horizontally: sidebar and viewer.
-//             let horizontal_chunks = Layout::default()
-//                 .direction(Direction::Horizontal)
-//                 .constraints([Constraint::Length(30), Constraint::Min(0)].as_ref())
-//                 .split(vertical_chunks[0]);
-//
-//             // Sidebar: Create list items.
-//             let items: Vec<ListItem> = app
-//                 .sidebar_items
-//                 .iter()
-//                 .map(|i| ListItem::new(i.as_str()))
-//                 .collect();
-//
-//             // Prepare a ListState to track the selected item.
-//             let mut state = ListState::default();
-//             state.select(Some(app.selected));
-//
-//             let sidebar = List::new(items)
-//                 .block(Block::default().borders(Borders::ALL).title("Sidebar"))
-//                 .highlight_style(
-//                     Style::default()
-//                         .bg(Color::Blue)
-//                         .fg(Color::White)
-//                         .add_modifier(Modifier::BOLD),
-//                 )
-//                 .highlight_symbol(">> ");
-//
-//             f.render_stateful_widget(sidebar, horizontal_chunks[0], &mut state);
-//
-//             // Viewer: Show some text.
-//             let viewer = Paragraph::new(app.viewer_text.as_str())
-//                 .block(Block::default().borders(Borders::ALL).title("Viewer"));
-//             f.render_widget(viewer, horizontal_chunks[1]);
-//
-//             // Footer: Show available commands.
-//             let footer_text = "Commands: ↑/↓ to navigate, q to quit";
-//             let footer = Paragraph::new(footer_text).block(Block::default().borders(Borders::ALL));
-//             f.render_widget(footer, vertical_chunks[1]);
-//         })?;
-//
-//         let timeout = tick_rate
-//             .checked_sub(last_tick.elapsed())
-//             .unwrap_or_else(|| Duration::from_secs(0));
-//         if crossterm::event::poll(timeout)? {
-//             if let Event::Key(key) = event::read()? {
-//                 match key.code {
-//                     KeyCode::Char('q') => break,
-//                     KeyCode::Down => app.next(),
-//                     KeyCode::Up => app.previous(),
-//                     _ => {}
-//                 }
-//             }
-//         }
-//         if last_tick.elapsed() >= tick_rate {
-//             last_tick = Instant::now();
-//         }
-//     }
-//
-//     // Restore terminal.
-//     disable_raw_mode()?;
-//     execute!(
-//         terminal.backend_mut(),
-//         LeaveAlternateScreen,
-//         DisableMouseCapture
-//     )?;
-//     terminal.show_cursor()?;
-//     Ok(())
+// pub fn render() -> eyre::Result<()> {
+//     let terminal = ratatui::init();
+//     let app_result = App::default().run(terminal);
+//     ratatui::restore();
+//     return app_result;
 // }
