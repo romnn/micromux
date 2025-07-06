@@ -2,10 +2,10 @@ use std::time::Duration;
 
 use async_process::{Command, Stdio};
 use color_eyre::eyre;
-use futures::AsyncBufReadExt;
 use futures::stream::StreamExt;
+use futures::{AsyncBufReadExt, channel::mpsc};
 use itertools::Itertools;
-use nix::sys::signal::{self, Signal};
+use yaml_spanned::Spanned;
 
 use crate::{
     config::{self, HealthCheck},
@@ -28,11 +28,10 @@ use crate::{
 // }
 
 /// Send a Unix signal to a process with the given PID.
-pub fn send_signal(pid: u32, sig: Signal) -> eyre::Result<()> {
-    use nix::unistd::Pid;
-
+#[cfg(unix)]
+pub fn send_signal(pid: u32, sig: nix::sys::signal::Signal) -> eyre::Result<()> {
     // Send SIGTERM to child process.
-    signal::kill(Pid::from_raw(pid as i32), sig)?;
+    nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), sig)?;
     Ok(())
 }
 
@@ -47,9 +46,19 @@ pub enum RestartPolicy {
     },
 }
 
+// #[derive(Debug)]
+// pub struct ProcessState {
+//     pub(crate) process: Option<async_process::Child>,
+//     pub(crate) stdout_tx: mpsc::Sender<String>,
+//     pub stdout_rx: mpsc::Receiver<String>,
+//     pub(crate) stderr_tx: mpsc::Sender<String>,
+//     pub stderr_rx: mpsc::Receiver<String>,
+// }
+
 #[derive(Debug)]
 pub struct Service {
     pub id: ServiceID,
+    pub name: Spanned<String>,
     pub command: (String, Vec<String>),
     pub restart_policy: RestartPolicy,
     pub depends_on: Vec<config::Dependency>,
@@ -57,14 +66,22 @@ pub struct Service {
     pub state: State,
     pub health: Option<Health>,
     pub open_ports: Vec<u16>,
-    process: Option<async_process::Child>,
+    // pub process_state: ProcessState,
+    pub(crate) process: Option<async_process::Child>,
+    // pub(crate) stdout_tx: mpsc::Sender<Result<String, std::io::Error>>,
+    // pub stdout_rx: mpsc::Receiver<Result<String, std::io::Error>>,
+    // pub(crate) stderr_tx: mpsc::Sender<Result<String, std::io::Error>>,
+    // pub stderr_rx: mpsc::Receiver<Result<String, std::io::Error>>,
 }
 
 impl Service {
     pub fn new(id: impl Into<ServiceID>, config: config::Service) -> Self {
         let (prog, args) = config.command;
+        // let (stdout_tx, stdout_rx) = mpsc::channel(1024);
+        // let (stderr_tx, stderr_rx) = mpsc::channel(1024);
         Self {
             id: id.into(),
+            name: config.name,
             // command: config.command.iter().map(|part| part.as_str()).join(" "),
             command: (
                 prog.into_inner(),
@@ -79,6 +96,10 @@ impl Service {
             state: State::Pending,
             health: None,
             process: None,
+            // stdout_tx,
+            // stdout_rx,
+            // stderr_tx,
+            // stderr_rx,
         }
     }
 
@@ -110,7 +131,12 @@ impl Service {
         };
         let pid = process.id();
         tracing::debug!(pid, "sending SIGTERM");
-        send_signal(pid, Signal::SIGTERM)?;
+
+        #[cfg(unix)]
+        send_signal(pid, nix::sys::signal::Signal::SIGTERM)?;
+
+        #[cfg(not(unix))]
+        panic!("termination is not yet implemented on windows");
 
         // wait up to 10 seconds for the child to exit gracefully.
         match tokio::time::timeout(timeout, process.status()).await {

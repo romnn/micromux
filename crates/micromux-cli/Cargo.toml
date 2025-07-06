@@ -26,6 +26,7 @@ micromux-tui = { path = "../micromux-tui/" }
 
 # async runtime
 tokio.workspace = true
+futures.workspace = true
 
 # parse cli arguments
 clap = { version = "4", features = ["derive", "env"] }

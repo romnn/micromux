@@ -1,53 +1,90 @@
 use crate::{
+    ServiceMap,
     graph::ServiceGraph,
     health_check::Health,
     service::{self, Service},
-    shutdown,
 };
 use color_eyre::eyre;
-use futures::FutureExt;
+use futures::{FutureExt, SinkExt, channel::oneshot::Cancellation};
 use std::collections::HashMap;
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
 pub type ServiceID = String;
 
-// Healthy,
-// Unhealthy,
-
-#[derive(Debug, strum::Display, strum::IntoStaticStr)]
+#[derive(
+    Debug,
+    strum::Display,
+    // strum::IntoStaticStr,
+)]
 pub enum State {
     /// Service has not yet started.
-    #[strum(serialize = "PENDING")]
+    // #[strum(serialize = "PENDING")]
     Pending,
     /// Service is running.
-    #[strum(serialize = "RUNNING")]
+    // #[strum(serialize = "RUNNING")]
     Running {
         // process: async_process::Child,
         health: Option<Health>,
     },
     /// Service is disabled.
-    #[strum(serialize = "DISABLED")]
+    // #[strum(serialize = "DISABLED")]
     Disabled,
     /// Service exited with code.
-    #[strum(serialize = "EXITED")]
+    // #[strum(serialize = "EXITED")]
     Exited {
         exit_code: i32,
         restart_policy: service::RestartPolicy,
     },
     /// Service has been killed and is awaiting exit
-    #[strum(serialize = "KILLED")]
+    // #[strum(serialize = "KILLED")]
     Killed,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum Event {
-    Started(ServiceID),
+    Started {
+        service_id: ServiceID,
+        stderr: Option<async_process::ChildStderr>,
+        stdout: Option<async_process::ChildStdout>,
+    },
     Killed(ServiceID),
     Exited(ServiceID, i32),
     Healthy(ServiceID),
     Unhealthy(ServiceID),
     Disabled(ServiceID),
+}
+
+impl Event {
+    pub fn service_id(&self) -> &ServiceID {
+        match self {
+            Self::Started { service_id, .. } => service_id,
+            Self::Killed(service_id) => service_id,
+            Self::Exited(service_id, _) => service_id,
+            Self::Healthy(service_id) => service_id,
+            Self::Unhealthy(service_id) => service_id,
+            Self::Disabled(service_id) => service_id,
+        }
+    }
+}
+
+impl std::fmt::Display for Event {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Started { service_id, .. } => write!(f, "Started({service_id})"),
+            Self::Killed(service_id) => write!(f, "Killed({service_id})"),
+            Self::Exited(service_id, _) => write!(f, "Exited({service_id})"),
+            Self::Healthy(service_id) => write!(f, "Healthy({service_id})"),
+            Self::Unhealthy(service_id) => write!(f, "Unhealty({service_id})"),
+            Self::Disabled(service_id) => write!(f, "Disabled({service_id})"),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum Command {
+    Restart(ServiceID),
+    Disable(ServiceID),
 }
 
 /// Start service.
@@ -56,12 +93,15 @@ async fn start_service(
     events_tx: mpsc::Sender<Event>,
     // shutdown: crate::shutdown::Shutdown,
     // mut shutdown_handle: crate::shutdown::Handle,
-    cancel: CancellationToken,
+    shutdown: CancellationToken,
+    terminate: CancellationToken,
 ) -> eyre::Result<()> {
     use async_process::{Command, Stdio};
     use futures::{AsyncBufReadExt, StreamExt};
 
     let service_id = service.id.clone();
+
+    tracing::info!(service_id, "start service");
 
     // let args: Vec<String> = shlex::split(&service.command).unwrap_or_default();
     // let Some((program, program_args)) = args.split_first() else {
@@ -74,46 +114,63 @@ async fn start_service(
         .stdout(Stdio::piped())
         .spawn()?;
 
-    // TODO: send output of program somewhere...
-    // if let Some(stderr) = process.stderr.take() {
-    //     // let mut lines = tokio::io::BufReader::new(stdout).lines();
-    //     let mut lines = futures::io::BufReader::new(stderr).lines();
-    //
-    //     while let Some(line) = lines.next().await {
-    //         // println!("{}", line?);
-    //     }
-    // }
-    //
-    // if let Some(stdout) = process.stdout.take() {
-    //     // let mut lines = tokio::io::BufReader::new(stdout).lines();
-    //     let mut lines = futures::io::BufReader::new(stdout).lines();
-    //
-    //     while let Some(line) = lines.next().await {
-    //         // println!("{}", line?);
-    //     }
-    // }
+    // let mut log = BoundedLog::with_limits(1000, 64 * 1024); // 1000 lines, up to 64 KB
+
+    // let  = |reader, log_clone: Arc<Mutex<BoundedLog>>, tx_clone: mpsc::Sender<()>| {
+    //     tokio::spawn(async move {
+    //         let mut lines = futures::io::BufReader::new(reader).lines();
+    //         while let Ok(Some(line)) = lines.next().await {
+    //             let mut lg = log_clone.lock().await;
+    //             lg.push(line);
+    //             // Notify TUI
+    //             let _ = tx_clone.send(()).await;
+    //         }
+    //     });
+    // };
+
+    let stderr = process.stderr.take();
+    let stdout = process.stdout.take();
 
     // let mut cmd = async_process::Command::new(&service.command[0]);
     // cmd.args(&service.command[1..]);
     // let mut child = cmd.spawn().expect("spawn failed");
 
-    let _ = events_tx.send(Event::Started(service_id.clone())).await;
+    let terminate = CancellationToken::new();
+    let _ = events_tx
+        .send(Event::Started {
+            service_id: service_id.clone(),
+            stdout,
+            stderr,
+        })
+        .await;
+
+    // let process_clone = process.clone();
 
     // Monitor for exit or shutdown
     tokio::spawn({
         let events_tx = events_tx.clone();
         let service_id = service_id.clone();
-        let cancel = cancel.clone();
+        let shutdown = shutdown.clone();
+        let terminate = terminate.clone();
         async move {
+            let kill = |service_id: ServiceID,
+                        mut process: async_process::Child,
+                        events_tx: mpsc::Sender<Event>| async move {
+                tracing::info!(pid = process.id(), "killing process");
+                // Kill the process
+                let _ = events_tx.send(Event::Killed(service_id.clone())).await;
+                let _ = process.kill();
+                // Optionally wait for it to actually exit
+                let _ = process.status().await;
+                let _ = events_tx.send(Event::Exited(service_id.clone(), -1)).await;
+            };
+
             tokio::select! {
-                _ = cancel.cancelled() => {
-                    tracing::info!(pid = process.id(), "killing process");
-                    // Kill the process
-                    let _ = events_tx.send(Event::Killed(service_id.clone())).await;
-                    let _ = process.kill();
-                    // Optionally wait for it to actually exit
-                    let _ = process.status().await;
-                    let _ = events_tx.send(Event::Exited(service_id.clone(), -1)).await;
+                _ = shutdown.cancelled() => {
+                    kill(service_id.clone(), process, events_tx.clone()).await;
+                }
+                _ = terminate.cancelled() => {
+                    kill(service_id.clone(), process, events_tx.clone()).await;
                 }
                 status = process.status() => {
                     // Process exited by itself
@@ -137,7 +194,9 @@ async fn start_service(
         tokio::spawn({
             let service_id = service_id.clone();
             async move {
-                let _ = health_check.run_loop(&service_id, events_tx, cancel).await;
+                health_check
+                    .run_loop(&service_id, events_tx, shutdown, terminate)
+                    .await
             }
         });
     }
@@ -145,21 +204,20 @@ async fn start_service(
 }
 
 async fn schedule_ready(
-    services: &HashMap<ServiceID, Service>,
+    services: &ServiceMap,
     graph: &petgraph::graphmap::DiGraphMap<&str, ()>,
     service_state: &mut HashMap<ServiceID, State>,
     // events_rx: &mpsc::Receiver<Event>,
     events_tx: &mpsc::Sender<Event>,
-    broadcast_tx: &broadcast::Sender<Event>,
+    ui_tx: &mpsc::Sender<Event>,
+    // broadcast_tx: &broadcast::Sender<Event>,
     // shutdown_handle: &crate::shutdown::Handle,
-    cancel: &CancellationToken,
+    shutdown: &CancellationToken,
 ) {
     use crate::{config::DependencyCondition, service::RestartPolicy};
 
     // Find services that are ready to start
     for (service_id, service) in services {
-        tracing::trace!(service_id, state = ?service.state, "evaluating service");
-
         let state = service_state.get_mut(service_id.as_str()).unwrap();
 
         // Check if service should be (re)started
@@ -191,6 +249,13 @@ async fn schedule_ready(
                 }
             },
         }
+
+        tracing::debug!(
+            service_id,
+            ?state,
+            // state = ?service.state,
+            "evaluating service"
+        );
 
         // Only start if not already Running/Healthy
         // if matches!(state, State::Pending | State::Exited { .. }) {
@@ -227,75 +292,97 @@ async fn schedule_ready(
             };
             is_ready
         });
+
         if is_ready {
-            tracing::info!("starting {}", service_id);
-            start_service(service, events_tx.clone(), cancel.clone()).await;
+            // Start service
+            tracing::info!(service_id, "starting service");
+            let terminate = CancellationToken::new();
+            if let Err(err) =
+                start_service(service, events_tx.clone(), shutdown.clone(), terminate).await
+            {
+                tracing::error!(?err, service_id, "failed to start service");
+            }
         }
-        // }
     }
 }
 
-pub async fn update_state(
-    services: &HashMap<ServiceID, Service>,
+pub fn update_state(
+    services: &ServiceMap,
     service_state: &mut HashMap<ServiceID, State>,
     event: &Event,
 ) {
-    // Update our local status
-    match &event {
-        Event::Started(service_id) => {
+    let (service_id, new_state) = match &event {
+        Event::Started { service_id, .. } => {
             let service = &services[service_id];
             let health = if service.health_check.is_some() {
                 Some(Health::Unhealthy)
             } else {
                 None
             };
-            service_state.insert(
-                service_id.clone(),
-                State::Running {
-                    // process,
-                    health,
-                },
-            );
+            let new_state = State::Running {
+                // process,
+                health,
+            };
+            (service_id, new_state)
+            // service_state.insert(service_id.clone(), new_state);
         }
         Event::Killed(service_id) => {
-            service_state.insert(service_id.clone(), State::Killed {});
+            let new_state = State::Killed {};
+            // tracing::debug!(service_id, ?new_state, "update state");
+            // service_state.insert(service_id.clone(), new_state);
+            (service_id, new_state)
         }
         Event::Exited(service_id, code) => {
-            service_state.insert(
-                service_id.clone(),
-                State::Exited {
-                    exit_code: *code,
-                    restart_policy: services[service_id].restart_policy.clone(),
-                },
-            );
+            let new_state = State::Exited {
+                exit_code: *code,
+                restart_policy: services[service_id].restart_policy.clone(),
+            };
+            // service_state.insert(service_id.clone(), new_state);
+            (service_id, new_state)
         }
         Event::Disabled(service_id) => {
-            service_state.insert(service_id.clone(), State::Disabled);
+            let new_state = State::Disabled;
+            (service_id, new_state)
+            // service_state.insert(service_id.clone(), );
         }
         Event::Healthy(service_id) => {
-            if let Some(State::Running { health, .. }) = service_state.get_mut(service_id.as_str())
-            {
-                *health = Some(Health::Healthy);
-            }
+            let new_state = State::Running {
+                health: Some(Health::Healthy),
+            };
+            // if let Some(State::Running { health, .. }) = service_state.get_mut(service_id.as_str())
+            // {
+            //     *health = Some(Health::Healthy);
+            // }
             // service_state.insert(service_id.clone(), State::Healthy);
+            (service_id, new_state)
         }
         Event::Unhealthy(service_id) => {
-            if let Some(State::Running { health, .. }) = service_state.get_mut(service_id.as_str())
-            {
-                *health = Some(Health::Unhealthy);
-            }
+            // if let Some(State::Running { health, .. }) = service_state.get_mut(service_id.as_str())
+            // {
+            //     *health = Some(Health::Unhealthy);
+            // }
+            let new_state = State::Running {
+                health: Some(Health::Unhealthy),
+            };
+            (service_id, new_state)
             // service_state.insert(service_id.clone(), State::Unhealthy);
         }
-    }
+    };
+
+    // if let Some((service_id, new_state)) = new_state {
+    tracing::debug!(service_id, ?new_state, "update state");
+    service_state.insert(service_id.clone(), new_state);
 }
 
 pub async fn scheduler(
-    services: &HashMap<ServiceID, Service>,
+    services: &ServiceMap,
+    mut commands_rx: mpsc::Receiver<Command>,
     mut events_rx: mpsc::Receiver<Event>,
     mut events_tx: mpsc::Sender<Event>,
-    mut broadcast_tx: broadcast::Sender<Event>,
+    mut ui_tx: mpsc::Sender<Event>,
+    // mut broadcast_tx: broadcast::Sender<Event>,
     // mut shutdown_handle: crate::shutdown::Handle,
-    cancel: CancellationToken,
+    shutdown: CancellationToken,
 ) -> eyre::Result<()> {
     let graph = ServiceGraph::new(&services)?;
 
@@ -306,55 +393,66 @@ pub async fn scheduler(
         .collect();
 
     // Initial scheduling pass
-    tracing::trace!("started initial scheduling pass");
+    tracing::debug!("started initial scheduling pass");
     schedule_ready(
         &services,
         &graph.inner,
         &mut service_state,
         &events_tx,
-        &broadcast_tx,
-        &cancel,
-        // &shutdown_handle,
+        &ui_tx,
+        &shutdown,
     )
     .await;
-    tracing::trace!("completed initial scheduling pass");
+    tracing::debug!("completed initial scheduling pass");
 
     // Whenever an event comes in, try to (re)start any services whose deps are now healthy
-    // while let Some(event) = events_rx.recv().await {
     let mut rounds_left: usize = 3;
     loop {
-        // let shutdown_fut = shutdown_handle.changed();
-        tracing::trace!("waiting for scheduling event");
+        tracing::debug!("waiting for scheduling event");
         if rounds_left <= 0 {
             break;
         }
         tokio::select! {
-            _ = cancel.cancelled() => {
-                tracing::trace!("exiting scheduler");
+            _ = shutdown.cancelled() => {
+                tracing::debug!("exiting scheduler");
                 break;
+            }
+            command = commands_rx.recv() => {
+                let Some(command) = command else {
+                    break;
+                };
+                tracing::debug!(?command, "received command");
+                match command {
+                    Command::Restart(service_id) => {
+                        tracing::debug!(service_id, "TODO: restart service");
+                    },
+                    Command::Disable(service_id) => {
+                        tracing::debug!(service_id, "TODO: disable service");
+                    },
+                }
             }
             event = events_rx.recv() => {
                 let Some(event) = event else {
                     break;
                 };
-                tracing::debug!(?event, "received event");
+                tracing::debug!(%event, "received event");
 
                 update_state(services, &mut service_state, &event);
 
-                // Re-broadcast it for anyone else (e.g. UI)
-                let _ = broadcast_tx.send(event.clone());
-
-                schedule_ready(
-                    &services,
-                    &graph.inner,
-                    &mut service_state,
-                    &events_tx,
-                    &broadcast_tx,
-                    &cancel,
-                )
-                .await;
+                // Forward event to the UI
+                ui_tx.send(event).await?;
             }
         }
+
+        schedule_ready(
+            &services,
+            &graph.inner,
+            &mut service_state,
+            &events_tx,
+            &ui_tx,
+            &shutdown,
+        )
+        .await;
         rounds_left = rounds_left.saturating_sub(1);
     }
     Ok(())

@@ -1,4 +1,4 @@
-use crate::{config::Config, scheduler::ServiceID, service::Service};
+use crate::{ServiceMap, config::Config, scheduler::ServiceID, service::Service};
 use color_eyre::eyre;
 use petgraph::{Graph, graph::NodeIndex, graphmap::DiGraphMap};
 use std::collections::HashMap;
@@ -10,7 +10,7 @@ pub struct ServiceGraph<'a> {
 
 impl<'a> ServiceGraph<'a> {
     // pub fn new(config: &'a Config) -> eyre::Result<ServiceGraph<'a>> {
-    pub fn new(services: &'a HashMap<ServiceID, Service>) -> eyre::Result<ServiceGraph<'a>> {
+    pub fn new(services: &'a ServiceMap) -> eyre::Result<ServiceGraph<'a>> {
         // Build an empty directed graph keyed by service name
         let mut graph = DiGraphMap::new();
 

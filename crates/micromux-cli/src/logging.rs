@@ -80,7 +80,7 @@ pub fn setup<'a>(
 
     let fmt_layer_pretty_compact = tracing_subscriber::fmt::Layer::new()
         .compact()
-        .without_time()
+        // .without_time()
         .with_ansi(false)
         .with_writer(log_writer);
 

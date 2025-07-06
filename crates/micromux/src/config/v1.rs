@@ -9,29 +9,48 @@ use itertools::Itertools;
 use std::path::{Path, PathBuf};
 use yaml_spanned::{Mapping, Sequence, Spanned, Value, value::Kind};
 
-pub fn expect_sequence(value: &yaml_spanned::Spanned<Value>) -> Result<&Sequence, ConfigError> {
+pub fn expect_sequence<'a>(
+    value: &'a yaml_spanned::Spanned<Value>,
+    message: Option<&'a str>,
+) -> Result<&'a Sequence, ConfigError> {
     value
         .as_sequence()
         .ok_or_else(|| ConfigError::UnexpectedType {
-            message: "expected sequence".to_string(),
+            message: message.unwrap_or("expected sequence").to_string(),
             expected: vec![Kind::Sequence],
             found: value.kind(),
             span: value.span().into(),
         })
 }
 
-pub fn expect_mapping(
-    value: &yaml_spanned::Spanned<Value>,
-) -> Result<(&yaml_spanned::spanned::Span, &Mapping), ConfigError> {
+pub fn expect_mapping<'a>(
+    value: &'a yaml_spanned::Spanned<Value>,
+    message: Option<&'a str>,
+) -> Result<(&'a yaml_spanned::spanned::Span, &'a Mapping), ConfigError> {
     let mapping = value
         .as_mapping()
         .ok_or_else(|| ConfigError::UnexpectedType {
-            message: "expected mapping".to_string(),
+            message: message.unwrap_or("expected mapping").to_string(),
             expected: vec![Kind::Mapping],
             found: value.kind(),
             span: value.span().into(),
         })?;
     Ok((value.span(), mapping))
+}
+
+pub fn expect_string<'a>(
+    value: &'a yaml_spanned::Spanned<Value>,
+    message: Option<&'a str>,
+) -> Result<(&'a yaml_spanned::spanned::Span, &'a String), ConfigError> {
+    let string = value
+        .as_string()
+        .ok_or_else(|| ConfigError::UnexpectedType {
+            message: message.unwrap_or("expected string").to_string(),
+            expected: vec![Kind::String],
+            found: value.kind(),
+            span: value.span().into(),
+        })?;
+    Ok((value.span(), string))
 }
 
 pub fn parse_ui_config<F>(
@@ -43,7 +62,7 @@ pub fn parse_ui_config<F>(
     let Some(value) = value.get("ui") else {
         return Ok(UiConfig::default());
     };
-    let (_span, mapping) = expect_mapping(value)?;
+    let (_span, mapping) = expect_mapping(value, "ui config must be a mapping".into())?;
     let width = parse_optional::<usize>(mapping.get("width"))?;
     Ok(UiConfig { width })
 }
@@ -173,8 +192,6 @@ fn parse_command(
             span,
             inner: Value::Sequence(command),
         } => {
-            // let test: Option<String> = None;
-            // test.map(f)
             let raw_command = command.iter().join(" ");
             let command =
                 command
@@ -182,7 +199,7 @@ fn parse_command(
                     .map(|Spanned { span, inner }| {
                         let inner = inner.as_string().cloned().ok_or_else(|| {
                             ConfigError::UnexpectedType {
-                                message: "command arguments must be strings".to_string(),
+                                message: "command arguments must be string".to_string(),
                                 expected: vec![Kind::String],
                                 found: inner.kind(),
                                 span: span.into(),
@@ -258,11 +275,13 @@ pub fn parse_health_check(
 
 pub fn parse_service<F>(
     value: &yaml_spanned::Spanned<Value>,
+    name: &yaml_spanned::Spanned<String>,
     _file_id: F,
     _strict: bool,
     _diagnostics: &mut Vec<Diagnostic<F>>,
 ) -> Result<Service, ConfigError> {
-    let (span, mapping) = expect_mapping(value)?;
+    let (span, mapping) = expect_mapping(value, "service config must be a mapping".into())?;
+    let name = parse_optional::<String>(mapping.get("name"))?.unwrap_or_else(|| name.clone());
     let command = match mapping.get("command") {
         None => Err(ConfigError::MissingKey {
             key: "command".to_string(),
@@ -274,6 +293,7 @@ pub fn parse_service<F>(
     let healthcheck = parse_health_check(mapping)?;
     dbg!(&healthcheck);
     Ok(Service {
+        name,
         command,
         env_file: vec![],
         environment: IndexMap::default(),
@@ -314,7 +334,7 @@ pub fn parse_services<F: Copy>(
                 .iter()
                 .map(|(name, service)| {
                     let name = parse::<String>(name)?;
-                    let service = parse_service(service, file_id, strict, diagnostics)?;
+                    let service = parse_service(service, &name, file_id, strict, diagnostics)?;
                     Ok::<_, ConfigError>((name, service))
                 })
                 .collect::<Result<Vec<(Spanned<String>, Service)>, _>>()?

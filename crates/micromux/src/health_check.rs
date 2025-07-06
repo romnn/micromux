@@ -1,4 +1,4 @@
-use crate::scheduler::Event;
+use crate::scheduler::{Event, ServiceID};
 use async_process::{Command, Stdio};
 use color_eyre::eyre;
 use futures::{AsyncBufReadExt, FutureExt, StreamExt, TryFutureExt, TryStreamExt};
@@ -6,13 +6,9 @@ use itertools::Itertools;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, strum::Display, strum::IntoStaticStr,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, strum::Display)]
 pub enum Health {
-    #[strum(serialize = "HEALTHY")]
     Healthy,
-    #[strum(serialize = "UNHEALTHY")]
     Unhealthy,
 }
 
@@ -46,26 +42,36 @@ pub struct Error {
 impl crate::config::HealthCheck {
     pub async fn run_loop(
         self,
-        service_id: &str,
+        service_id: &ServiceID,
         events_tx: mpsc::Sender<Event>,
         // mut shutdown_handle: crate::shutdown::Handle,
-        cancel: CancellationToken,
+        shutdown: CancellationToken,
+        terminate: CancellationToken,
         // ) -> Result<(), BadCommandError> {
     ) {
-        tracing::info!(service_id, "starting health check loop");
         let max_retries = self.retries.as_deref().copied().unwrap_or(1);
         let interval = self.interval.as_deref().cloned().unwrap_or_default();
+        tracing::info!(
+            service_id,
+            ?interval,
+            max_retries,
+            "starting health check loop"
+        );
+
         let mut attempt = 0;
         loop {
-            let mut cancel_clone = cancel.clone();
-            let res = tokio::select! {
-                _ = cancel.cancelled() => {
-                    tracing::info!(service_id, "shutting down health check");
-                    return;
-                    // return Ok(())
-                }
-                res = self.run(service_id, cancel_clone) => res,
-            };
+            let mut shutdown_clone = shutdown.clone();
+            let res = self
+                .run(service_id, shutdown.clone(), terminate.clone())
+                .await;
+            // let res = tokio::select! {
+            //     _ = shutdown_clone.cancelled() => {
+            //         tracing::info!(service_id, "shutting down health check");
+            //         return;
+            //         // return Ok(())
+            //     }
+            //     res = self.run(service_id, shutdown.clone(), terminate.clone()) => res,
+            // };
             match res {
                 Ok(()) => {
                     let _ = events_tx.send(Event::Healthy(service_id.to_string())).await;
@@ -78,8 +84,9 @@ impl crate::config::HealthCheck {
                     match err.source {
                         ErrorReason::Failed { exit_code } => {
                             tracing::warn!(
+                                service_id,
                                 code = exit_code,
-                                command,
+                                // command,
                                 attempt,
                                 max_attempts = max_retries,
                                 "health check failed",
@@ -88,7 +95,8 @@ impl crate::config::HealthCheck {
                         ErrorReason::Spawn(err) => {
                             tracing::warn!(
                                 ?err,
-                                command,
+                                service_id,
+                                // command,
                                 attempt,
                                 max_attempts = max_retries,
                                 "failed to run health check",
@@ -96,7 +104,8 @@ impl crate::config::HealthCheck {
                         }
                         ErrorReason::Timeout => {
                             tracing::warn!(
-                                command,
+                                // command,
+                                service_id,
                                 attempt,
                                 max_attempts = max_retries,
                                 "health check timed out",
@@ -106,9 +115,10 @@ impl crate::config::HealthCheck {
                           //     return Err(err);
                           // }
                     };
+
                     if attempt < max_retries {
                         // Increment attempt
-                        attempt += 1;
+                        attempt = attempt.saturating_add(1);
                         // tokio::select! {
                         //     _ = cancel.cancelled() => return Ok(()),
                         //     _ = tokio::time::sleep(interval) => {},
@@ -126,20 +136,24 @@ impl crate::config::HealthCheck {
                     // tracing::warn!(?attempt, ?max_retries);
                 }
             }
+
             // Wait the full interval before re-checking
             tokio::select! {
                 // _ = cancel.cancelled() => return Ok(()),
-                _ = cancel.cancelled() => return,
+                _ = shutdown.cancelled() => return,
+                _ = terminate.cancelled() => return,
                 _ = tokio::time::sleep(interval) => {},
             };
+            // tracing::debug!(?interval, "slept");
         }
     }
 
     pub async fn run(
         &self,
-        service_id: &str,
+        service_id: &ServiceID,
         // mut shutdown_handle: crate::shutdown::Handle,
-        cancel: CancellationToken,
+        shutdown: CancellationToken,
+        terminate: CancellationToken,
     ) -> Result<(), Error> {
         // let command: Vec<&str> = self.test.iter().map(|part| part.as_str()).collect();
         // let command_string = || command.join(" ");
@@ -176,29 +190,35 @@ impl crate::config::HealthCheck {
             })?;
 
         if let Some(stderr) = process.stderr.take() {
-            let mut lines = futures::io::BufReader::new(stderr).lines();
+            let service_id = service_id.clone();
+            tokio::task::spawn(async move {
+                let mut lines = futures::io::BufReader::new(stderr).lines();
 
-            while let Some(line) = lines.next().await {
-                match line {
-                    Ok(line) => tracing::trace!(service_id, "health check: {}", line),
-                    Err(err) => {
-                        tracing::error!(service_id, ?err, "health check: failed to read line")
+                while let Some(line) = lines.next().await {
+                    match line {
+                        Ok(line) => tracing::trace!(service_id, "health check: {}", line),
+                        Err(err) => {
+                            tracing::error!(service_id, ?err, "health check: failed to read line")
+                        }
                     }
                 }
-            }
+            });
         }
 
         if let Some(stdout) = process.stdout.take() {
-            let mut lines = futures::io::BufReader::new(stdout).lines();
+            let service_id = service_id.clone();
+            tokio::task::spawn(async move {
+                let mut lines = futures::io::BufReader::new(stdout).lines();
 
-            while let Some(line) = lines.next().await {
-                match line {
-                    Ok(line) => tracing::trace!(service_id, "health check: {}", line),
-                    Err(err) => {
-                        tracing::error!(service_id, ?err, "health check: failed to read line")
+                while let Some(line) = lines.next().await {
+                    match line {
+                        Ok(line) => tracing::trace!(service_id, "health check: {}", line),
+                        Err(err) => {
+                            tracing::error!(service_id, ?err, "health check: failed to read line")
+                        }
                     }
                 }
-            }
+            });
         }
 
         let process_fut = match self.timeout.clone() {
@@ -208,16 +228,31 @@ impl crate::config::HealthCheck {
                 .map(Result::<_, tokio::time::error::Elapsed>::Ok)
                 .boxed(),
         };
-        // let res = process_fut.await;
+
+        // service_id: ServiceID,
+        // events_tx: mpsc::Sender<Event>
+        let kill = |mut process: async_process::Child| async move {
+            tracing::info!(
+                pid = process.id(),
+                command = command_string(),
+                "killing process"
+            );
+            // Kill the process
+            let _ = process.kill();
+            // Optionally wait for it to actually exit
+            let _ = process.status().await;
+            // return Ok(());
+            // let _ = events_tx.send(Event::Exited(service_id.clone(), -1)).await;
+        };
+
         let res = tokio::select! {
-            _ = cancel.cancelled() => {
-                tracing::info!(pid = process.id(), command = command_string(), "killing process");
-                // Kill the process
-                let _ = process.kill();
-                // Optionally wait for it to actually exit
-                let _ = process.status().await;
+            _ = shutdown.cancelled() => {
+                kill(process).await;
                 return Ok(());
-                // let _ = events_tx.send(Event::Exited(service_id.clone(), -1)).await;
+            }
+            _ = terminate.cancelled() => {
+                kill(process).await;
+                return Ok(());
             }
             status = process_fut => status,
         };

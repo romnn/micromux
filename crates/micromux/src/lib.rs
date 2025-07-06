@@ -1,4 +1,5 @@
 #![allow(warnings)]
+#![deny(unused_must_use)]
 
 pub mod bounded_log;
 pub mod config;
@@ -7,25 +8,27 @@ pub mod graph;
 pub mod health_check;
 pub mod scheduler;
 pub mod service;
-pub mod shutdown;
 
+use crate::scheduler::{Command, ServiceID};
 use color_eyre::eyre;
 use service::{RestartPolicy, Service};
-use shutdown::Shutdown;
 use std::collections::HashMap;
 use tokio::sync::{Notify, mpsc};
-use tokio_util::sync::CancellationToken;
 use yaml_spanned::Spanned;
+
+pub use tokio_util::sync::CancellationToken;
+
+pub type ServiceMap = indexmap::IndexMap<ServiceID, Service>;
 
 #[derive()]
 pub struct Micromux {
     pub config_file: config::ConfigFile<diagnostics::FileId>,
-    pub services: HashMap<String, Service>,
+    pub services: ServiceMap,
     // pub services: HashMap<Spanned<String>, Service>,
     // pub graph: petgraph::Graph<String, ()>,
     // pub project_dir: directories::ProjectDirs,
     // state_change: Notify,
-    pub cancel: CancellationToken,
+    // pub shutdown: CancellationToken,
     // pub shutdown: Shutdown,
     // app: micromux_tui::App,
 }
@@ -37,7 +40,7 @@ pub fn project_dir() -> Option<directories::ProjectDirs> {
 impl Micromux {
     pub fn new(
         config_file: config::ConfigFile<diagnostics::FileId>,
-        shutdown: Shutdown,
+        // shutdown: Shutdown,
     ) -> eyre::Result<Self> {
         let services = config_file
             .config
@@ -55,43 +58,61 @@ impl Micromux {
         // build graph
         // let graph = graph::ServiceGraph::new(&config_file.config)?;
 
-        let cancel = CancellationToken::new();
+        // let shutdown = CancellationToken::new();
 
         Ok(Self {
             config_file,
             services,
             // graph: graph.inner,
             // state_change: Notify::new(),
-            cancel,
+            // shutdown,
             // shutdown,
             // project_dir,
         })
     }
 
-    pub async fn start(&self) -> eyre::Result<()> {
+    pub async fn start(
+        &self,
+        ui_tx: mpsc::Sender<scheduler::Event>,
+        shutdown: CancellationToken,
+    ) -> eyre::Result<()> {
+        // mpsc::Sender<Command>
         tracing::info!("starting");
         let (events_tx, events_rx) = mpsc::channel(1024);
-        let (broadcast_tx, broadcast_rx) = tokio::sync::broadcast::channel(1024);
+        let (commands_tx, commands_rx) = mpsc::channel(1024);
+
+        // TODO: change this to be a mpsc too
+        // let (broadcast_tx, broadcast_rx) = tokio::sync::broadcast::channel(1024);
+        // let (ui_tx, ui_rx) = mpsc::channel(1024);
 
         tokio::spawn({
-            let mut cancel = self.cancel.clone();
+            let mut shutdown = shutdown.clone();
             async move {
-                cancel.cancelled().await;
-                tracing::info!("shutdown signal works!");
+                shutdown.cancelled().await;
+                tracing::warn!("received shutdown signal");
             }
         });
 
         crate::scheduler::scheduler(
             &self.services,
+            commands_rx,
             events_rx,
             events_tx,
-            broadcast_tx,
-            self.cancel.clone(),
+            ui_tx,
+            shutdown.clone(),
         )
         .await?;
         tracing::info!("exiting");
         Ok(())
     }
+
+    // pub fn disable_service(&self, service_id: &ServiceID) {
+    //     self.commands_tx.send();
+    // }
+    //
+    // pub fn restart_service(&self, service_id: &ServiceID) {
+    //     // TODO
+    // }
 
     // pub async fn start(&mut self) {
     //     let mut shutdown_handle = self.shutdown.handle();

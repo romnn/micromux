@@ -129,6 +129,7 @@ pub struct EnvFile {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Service {
+    pub name: Spanned<String>,
     pub command: (Spanned<String>, Vec<Spanned<String>>),
     // pub command: Spanned<Vec<String>>,
     pub env_file: Vec<EnvFile>,

@@ -1,16 +1,17 @@
 #![allow(warnings)]
+#![deny(unused_must_use)]
+
+pub mod event;
+pub mod render;
+pub mod state;
+pub mod style;
 
 pub use crossterm;
 pub use ratatui;
 
 use color_eyre::eyre;
-use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind},
-    execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
-};
-use itertools::intersperse;
-use micromux::{Micromux, health_check::Health, scheduler::State, service::Service};
+use futures::StreamExt;
+use micromux::{Micromux, ServiceMap, bounded_log::BoundedLog, scheduler::Event as SchedulerEvent};
 use ratatui::{
     DefaultTerminal, Terminal,
     backend::{Backend, CrosstermBackend},
@@ -23,357 +24,285 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Widget},
 };
 use std::sync::Arc;
-use std::{
-    io,
-    time::{Duration, Instant},
-};
+use std::time::{Duration, Instant};
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
 
-#[derive(Debug, Default, PartialEq, Eq)]
-enum AppMode {
-    #[default]
-    Running,
-    Quit,
-}
+pub type UiEventStream = futures::stream::Chain<
+    ReceiverStream<SchedulerEvent>,
+    futures::stream::Pending<SchedulerEvent>,
+>;
 
-// #[derive(Debug)]
-// pub struct Service {
-//     pub state: State,
-//     pub health: Option<Health>,
-//     pub name: String,
-//     pub open_ports: Vec<u16>,
-// }
-
-pub fn health_style(service: &Service) -> Style {
-    match service.health {
-        Some(Health::Unhealthy) => Style::default().fg(tailwind::RED.c500),
-        _ => Style::default().fg(Color::White).fg(tailwind::GREEN.c500),
-    }
-}
-
-pub fn style(service: &Service) -> Style {
-    match service.state {
-        State::Disabled => Style::default().fg(Color::White).fg(tailwind::GRAY.c500),
-        State::Pending => Style::default().fg(Color::White).fg(tailwind::BLUE.c500),
-        State::Running { .. } | State::Killed { .. } | State::Exited { .. } => {
-            health_style(service)
-        }
-    }
-}
-
-pub fn status(service: &Service) -> &'static str {
-    match (&service.state, &service.health) {
-        (state @ (State::Disabled | State::Pending | State::Exited { .. }), _) => state.into(),
-        (_, Some(health)) => health.into(),
-        (state, _) => state.into(),
-    }
-}
+pub const KiB: usize = 1024;
+pub const MiB: usize = 1024 * KiB;
+pub const GiB: usize = 1024 * MiB;
 
 #[derive()]
 pub struct App {
-    pub mode: AppMode,
-    pub mux: Arc<micromux::Micromux>,
-    pub services_sidebar_width: u16,
-    pub selected_service: usize,
-    pub viewer_text: String,
-    pub show_popup: bool,
+    /// Running state of the TUI application.
+    pub running: bool,
+    pub shutdown: micromux::CancellationToken,
+    pub ui_rx: UiEventStream,
+    /// Event handler
+    pub input_event_handler: event::InputHandler,
+    /// Current state
+    pub state: state::State,
+    /// Log viewer
+    pub log_view: crate::render::log_view::LogView,
 }
 
-const INITIAL_SIDEBAR_WIDTH: u16 = 40;
-const MIN_SIDEBAR_WIDTH: u16 = 20;
-
 impl App {
-    pub fn new(mux: Arc<Micromux>) -> Self {
+    pub fn new(
+        services: &ServiceMap,
+        ui_rx: mpsc::Receiver<SchedulerEvent>,
+        shutdown: micromux::CancellationToken,
+    ) -> Self {
+        let mut ui_rx = ReceiverStream::new(ui_rx).chain(futures::stream::pending());
+
+        let services = services
+            .iter()
+            .map(|(service_id, service)| {
+                let service_state = state::Service {
+                    name: service.name.as_ref().to_string(),
+                    id: service.id.clone(),
+                    exec_state: state::Execution::Pending,
+                    open_ports: vec![],
+                    logs: BoundedLog::with_limits(1000, 64 * MiB).into(),
+                };
+                (service_id.clone(), service_state)
+            })
+            .collect();
+
+        let log_view = render::log_view::LogView::default();
+
         Self {
-            mode: AppMode::default(),
-            mux,
-            services_sidebar_width: INITIAL_SIDEBAR_WIDTH,
-            selected_service: 0,
-            show_popup: false,
-            viewer_text: "This is the viewer output.\nYou can display multiline text here.".into(),
+            running: true,
+            shutdown,
+            ui_rx,
+            input_event_handler: event::InputHandler::new(),
+            state: state::State::new(services),
+            log_view,
         }
     }
 }
 
 impl App {
-    pub fn run(mut self, mut terminal: DefaultTerminal) -> eyre::Result<()> {
+    pub async fn run(mut self, mut terminal: DefaultTerminal) -> eyre::Result<()> {
+        #[derive(Debug)]
+        enum Event {
+            Input(event::Input),
+            Scheduler(SchedulerEvent),
+        }
+
+        let debounce_duration = Duration::from_millis(100);
+        let mut pending = false;
+
         while self.is_running() {
-            terminal.draw(|frame| frame.render_widget(&self, frame.area()))?;
-            self.handle_events()?;
+            tracing::debug!("render frame");
+
+            terminal.draw(|frame| frame.render_widget(&mut self, frame.area()))?;
+
+            // Debounce timer -> perform redraw if pending
+            // tokio::select! {
+            //     _ = async {
+            //         if pending {
+            //             tokio::time::sleep(debounce_duration).await;
+            //         } else {
+            //             futures::future::pending::<()>().await;
+            //         }
+            //     } => {
+            //         if pending {
+            //             terminal.draw(|frame| frame.render_widget(&self, frame.area()))?;
+            //             pending = false;
+            //         }
+            //     }
+            // }
+
+            let mut new_logs_subscription = self.state.current_service().logs.subscribe();
+
+            // Wait until an (input) event is received.
+            let event = tokio::select! {
+                _ = self.shutdown.cancelled() => None,
+                // _ = new_logs_subscription.changed() => None,
+                event = self.ui_rx.next() => event.map(Event::Scheduler),
+                input = self.input_event_handler.next() => Some(Event::Input(input?)),
+            };
+
+            tracing::debug!(?event, "received event");
+
+            match event {
+                Some(Event::Input(event)) => {
+                    self.handle_input_event(event)?;
+                }
+                Some(Event::Scheduler(event)) => {
+                    self.handle_event(event)?;
+                }
+                None => {}
+            };
         }
         Ok(())
     }
 
-    fn handle_events(&mut self) -> eyre::Result<()> {
-        match event::read()? {
-            Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
-                KeyCode::Char('q') | KeyCode::Esc => self.exit(),
-                KeyCode::Char('d') => self.disable_service(),
-                KeyCode::Char('r') => self.restart_service(),
-                KeyCode::Char('R') => self.restart_all_services(),
-                KeyCode::Char('k') | KeyCode::Up => self.service_up(),
-                KeyCode::Char('j') | KeyCode::Down => self.service_down(),
-                KeyCode::Char('-') | KeyCode::Char('h') | KeyCode::Left => self.resize_left(),
-                KeyCode::Char('+') | KeyCode::Char('l') | KeyCode::Right => self.resize_right(),
+    fn handle_event(&mut self, event: SchedulerEvent) -> eyre::Result<()> {
+        match event {
+            SchedulerEvent::Started {
+                service_id,
+                stderr,
+                stdout,
+            } => {
+                use futures::{AsyncBufReadExt, StreamExt};
+
+                let service = self.state.services.get(&service_id).unwrap();
+
+                if let Some(stderr) = stderr {
+                    tokio::spawn({
+                        let logs = service.logs.clone();
+                        let service_id = service_id.clone();
+                        async move {
+                            let mut lines = futures::io::BufReader::new(stderr).lines();
+                            while let Some(line) = lines.next().await {
+                                tracing::trace!(?line, service_id, "read stderr line");
+                                match line {
+                                    Ok(line) => logs.push(line),
+                                    Err(err) => {
+                                        tracing::warn!(
+                                            ?err,
+                                            service_id,
+                                            "failed to read stderr line"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    });
+                }
+
+                if let Some(stdout) = stdout {
+                    tokio::spawn({
+                        let logs = service.logs.clone();
+                        let service_id = service_id.clone();
+                        async move {
+                            let mut lines = futures::io::BufReader::new(stdout).lines();
+                            while let Some(line) = lines.next().await {
+                                tracing::trace!(?line, service_id, "read stdout line");
+                                match line {
+                                    Ok(line) => logs.push(line),
+                                    Err(err) => {
+                                        tracing::warn!(
+                                            ?err,
+                                            service_id,
+                                            "failed to read stdout line"
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    });
+                }
+            }
+            SchedulerEvent::Killed(service_id) => {}
+            SchedulerEvent::Exited(service_id, _) => {}
+            SchedulerEvent::Healthy(service_id) => {}
+            SchedulerEvent::Unhealthy(service_id) => {}
+            SchedulerEvent::Disabled(service_id) => {}
+        }
+        Ok(())
+    }
+
+    fn handle_input_event(&mut self, input_event: event::Input) -> eyre::Result<()> {
+        use crossterm::event::{
+            DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind,
+        };
+
+        match input_event {
+            event::Input::Tick => self.tick(),
+            event::Input::Event(event) => match event {
+                crossterm::event::Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    match key.code {
+                        // Quit
+                        KeyCode::Char('q') | KeyCode::Esc => self.exit(),
+                        // Disable current service
+                        KeyCode::Char('d') => self.disable_current_service(),
+                        // Restart service
+                        KeyCode::Char('r') => self.restart_current_service(),
+                        // Restart all services
+                        KeyCode::Char('R') => self.restart_all_services(),
+                        // Select service above current service (move up)
+                        KeyCode::Char('k') | KeyCode::Up => self.state.service_up(),
+                        // Select service below current service (move down)
+                        KeyCode::Char('j') | KeyCode::Down => self.state.service_down(),
+                        // Decrease service sidebar width (resize to the left)
+                        KeyCode::Char('-') | KeyCode::Char('h') | KeyCode::Left => {
+                            self.state.resize_left()
+                        }
+                        // Increase service sidebar width (resize to the right)
+                        KeyCode::Char('+') | KeyCode::Char('l') | KeyCode::Right => {
+                            self.state.resize_right()
+                        }
+                        // Toggle wrapping for log viewer
+                        KeyCode::Char('w') => {
+                            self.log_view.wrap = !self.log_view.wrap;
+                        }
+                        // Toggle automatic tailing for log viewer
+                        KeyCode::Char('w') => {
+                            self.log_view.follow_tail = !self.log_view.follow_tail;
+                        }
+                        // scroll up manually
+                        //         KeyCode::Up => {
+                        //             self.follow_tail = false;
+                        //             self.scroll_offset = self.scroll_offset.saturating_sub(1);
+                        //         }
+                        //         // scroll down manually
+                        //         KeyCode::Down => {
+                        //             self.follow_tail = false;
+                        //             let max_off = total_lines.saturating_sub(area_height as usize) as u16;
+                        //             self.scroll_offset = (self.scroll_offset + 1).min(max_off);
+                        //         }
+                        _ => {}
+                    }
+                }
                 _ => {}
             },
-            _ => {}
         }
         Ok(())
     }
 
+    /// Handles the tick event of the terminal.
+    pub fn tick(&self) {}
+
     fn is_running(&self) -> bool {
-        self.mode == AppMode::Running
+        self.running
     }
 
     fn exit(&mut self) {
         // Send shutdown (cancellation) signal
-        self.mux.cancel.cancel();
-        self.mode = AppMode::Quit;
+        self.shutdown.cancel();
+        self.running = false;
     }
 
-    fn disable_service(&mut self) {
-        // disable
+    /// Disable service
+    fn disable_current_service(&self) {
+        let service = self.state.current_service();
+        tracing::info!(service_id = service.id, "disabling service");
+        // self.mux.disable_service(service.id);
     }
 
-    fn restart_service(&mut self) {
-        // restart
+    /// Restart service
+    fn restart_current_service(&self) {
+        let service = self.state.current_service();
+        tracing::info!(service_id = service.id, "restarting service");
+        // self.mux.restart_service(service.id);
     }
 
-    fn restart_all_services(&mut self) {
-        // restart
-    }
+    // /// Restart service
+    // fn restart_service(&mut self, service: ) {
+    //     let service = self.state.current_service();
+    //     tracing::info!(service_id = service.id, "restarting service");
+    // }
 
-    /// Update the selection index.
-    fn service_down(&mut self) {
-        self.selected_service = self
-            .selected_service
-            .saturating_add(1)
-            .min(self.mux.services.len().saturating_sub(1));
-    }
-
-    fn service_up(&mut self) {
-        self.selected_service = self.selected_service.saturating_sub(1);
-    }
-
-    fn resize_left(&mut self) {
-        self.services_sidebar_width = self
-            .services_sidebar_width
-            .saturating_sub(2)
-            .max(MIN_SIDEBAR_WIDTH);
-    }
-
-    fn resize_right(&mut self) {
-        self.services_sidebar_width = self.services_sidebar_width.saturating_add(2);
+    /// Restart all services
+    fn restart_all_services(&self) {
+        tracing::info!("restarting all services");
+        for service in self.state.services.iter() {}
     }
 }
-
-fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
-    let popup_width = r.width * percent_x / 100;
-    let popup_height = r.height * percent_y / 100;
-    let popup_x = r.x + (r.width - popup_width) / 2;
-    let popup_y = r.y + (r.height - popup_height) / 2;
-    Rect {
-        x: popup_x,
-        y: popup_y,
-        width: popup_width,
-        height: popup_height,
-    }
-}
-
-impl Widget for &App {
-    fn render(self, area: Rect, buf: &mut Buffer) {
-        let [header_area, main_area, footer_area] = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(0), // header
-                Constraint::Min(0),    // main area
-                Constraint::Length(1), // footer
-            ])
-            .spacing(0)
-            .areas(area);
-
-        let [services_area, logs_area] = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Length(self.services_sidebar_width),
-                Constraint::Min(0),
-            ])
-            .spacing(0)
-            .areas(main_area);
-
-        App::header().render(header_area, buf);
-        self.render_services(services_area, buf);
-        self.render_logs(logs_area, buf);
-        App::footer().render(footer_area, buf);
-    }
-}
-
-impl App {
-    const HEADER_COLOR: Color = tailwind::YELLOW.c500;
-    const HIGHLIGHT_COLOR: Color = tailwind::GRAY.c900;
-    // const AXIS_COLOR: Color = tailwind::BLUE.c300;
-
-    fn render_services(&self, area: Rect, buf: &mut Buffer) {
-        let items: Vec<ListItem> = self
-            .mux
-            .services
-            .iter()
-            // .map(|i| ListItem::new(i.name.as_str()))
-            .map(|(name, service)| {
-                // Paragraph::new(
-                //     Line::from(
-                //         footer_text
-                //             .iter()
-                //             .flat_map(|Keys { keys, description }| {
-                //                 [
-                //                     "   ".into(),
-                //                     keys.fg(tailwind::YELLOW.c500).bold(),
-                //                     format!(" {description}").fg(tailwind::GRAY.c500),
-                //                 ]
-                //             })
-                //             .collect::<Vec<_>>(),
-                //     )
-                //     .left_aligned(),
-                // )
-                // .wrap(ratatui::widgets::Wrap { trim: false })
-
-                // let name_span = Span::raw(&service.name);
-                // let status_style = match service.state {
-                //     State::Healthy | State::Running => Style::default().fg(tailwind::GREEN.c500),
-                //     State::Starting => Style::default().fg(tailwind::YELLOW.c500),
-                //     State::Unhealthy | State::Exited => Style::default().fg(tailwind::RED.c500),
-                // };
-                let status = format!("{: >10}", status(service)).set_style(style(service));
-                // let fixed_latency = format!("{: <10}", service.latency);
-
-                // let status_span = Span::styled(fixed_status, status_style);
-                // let latency_span = Span::styled(fixed_latency, Style::default().fg(Color::Yellow));
-
-                // Combine into one line.
-                // let spans = Spans::from(vec![name_span, status_span, latency_span]);
-                let ports = service
-                    .open_ports
-                    .iter()
-                    .map(|i| format!(":{i}").fg(tailwind::GRAY.c400)); // .collect::<Vec<();
-
-                let line = [status, " ".into(), service.id.as_str().into()]
-                    .into_iter()
-                    .chain(if ports.len() > 0 {
-                        [" [".into()]
-                            .into_iter()
-                            .chain(intersperse(ports, ", ".into()))
-                            .chain(["]".into()])
-                            .collect()
-                    } else {
-                        vec!["".into()]
-                    });
-
-                // std::iter::empty()
-                // format!(" [{}]", intersperse(ports, ", ".into()).collect::<Vec<_>>()).into()
-                //     line =
-                // }
-
-                ListItem::new(Line::from_iter(line))
-                // Span::from(vec![status, service.name.into()])
-                // ListItem::new([
-                //     Line::from("left").alignment(Alignment::Left),
-                //     Line::from("center").alignment(Alignment::Center),
-                //     Line::from("right").alignment(Alignment::Right),
-                // ])
-                // ListItem::new(i.name.as_str()))
-            })
-            .collect();
-
-        let mut state = ListState::default();
-        state.select(Some(self.selected_service));
-
-        let sidebar = List::new(items)
-            .block(Block::default().borders(Borders::ALL).title("Services"))
-            .highlight_style(
-                Style::default()
-                    .bg(Self::HIGHLIGHT_COLOR)
-                    // .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
-            )
-            .highlight_symbol(" > ");
-        StatefulWidget::render(&sidebar, area, buf, &mut state);
-    }
-
-    fn render_logs(&self, area: Rect, buf: &mut Buffer) {
-        let viewer = Paragraph::new(self.viewer_text.as_str())
-            .block(Block::default().borders(Borders::ALL).title("Logs"));
-        Widget::render(&viewer, area, buf);
-    }
-
-    #[allow(unused)]
-    fn header() -> impl Widget {
-        let header = format!("micromux v{}", env!("CARGO_PKG_VERSION"))
-            .bold()
-            .fg(Self::HEADER_COLOR)
-            .into_centered_line();
-        Paragraph::new(header)
-        // .block(Block::default().borders(Borders::BOTTOM))
-        // Paragraph::new("micromux")
-        //     .alignment(Alignment::Left)
-        //     // .style(Style::default().fg(Self::HEADER_COLOR))
-        //     .block(Block::default().borders(Borders::BOTTOM))
-    }
-
-    // Footer with commands.
-    fn footer() -> impl Widget {
-        let header = format!("micromux v{}", env!("CARGO_PKG_VERSION"))
-            .bold()
-            .fg(Self::HEADER_COLOR);
-
-        #[derive(Debug)]
-        struct Keys<'a> {
-            keys: &'a str,
-            description: &'a str,
-        }
-
-        impl<'a> Keys<'a> {
-            fn new(keys: &'a str, description: &'a str) -> Self {
-                Self { keys, description }
-            }
-        }
-
-        let footer_text = [
-            Keys::new("↑/↓", "Navigate"),
-            Keys::new("←/→", "Resize"),
-            Keys::new("r", "Restart"),
-            Keys::new("R", "Restart All"),
-            Keys::new("d", "Disable"),
-            Keys::new("q", "Quit"),
-        ];
-
-        Paragraph::new(
-            Line::from(
-                footer_text
-                    .iter()
-                    .flat_map(|Keys { keys, description }| {
-                        [
-                            "   ".into(),
-                            keys.fg(tailwind::YELLOW.c500).bold(),
-                            format!(" {description}").fg(tailwind::GRAY.c500),
-                        ]
-                    })
-                    .collect::<Vec<_>>(),
-            )
-            .left_aligned(),
-        )
-        .wrap(ratatui::widgets::Wrap { trim: false })
-    }
-
-    pub fn render(self) {
-        let terminal = ratatui::init();
-        let app_result = self.run(terminal);
-        ratatui::restore();
-    }
-}
-
-// pub fn render() -> eyre::Result<()> {
-//     let terminal = ratatui::init();
-//     let app_result = App::default().run(terminal);
-//     ratatui::restore();
-//     return app_result;
-// }

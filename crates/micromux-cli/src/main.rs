@@ -1,10 +1,14 @@
 #![allow(warnings)]
+#![deny(unused_must_use)]
+
 pub mod logging;
 
 use clap::Parser;
 use codespan_reporting::diagnostic::Diagnostic;
 use color_eyre::eyre;
 use micromux::{diagnostics::Printer as DiagnosticsPrinter, project_dir};
+use std::sync::Arc;
+use tokio::sync::mpsc;
 
 pub mod options {
     use clap::Parser;
@@ -73,7 +77,8 @@ async fn main() -> eyre::Result<()> {
     color_eyre::install()?;
     let options = options::Options::parse();
 
-    let shutdown = micromux::shutdown::Shutdown::new();
+    // let shutdown = micromux::shutdown::Shutdown::new();
+    let shutdown = micromux::CancellationToken::new();
 
     // setup logging to a log file
     let project_dir =
@@ -148,17 +153,16 @@ async fn main() -> eyre::Result<()> {
 
     dbg!(&config);
 
-    use std::sync::Arc;
-    let mux = micromux::Micromux::new(config, shutdown.clone())?;
-    let mux = Arc::new(mux);
-    let app = micromux_tui::App::new(mux);
-    let handle = tokio::task::spawn({
-        let mux = Arc::clone(&app.mux);
-        async move {
-            mux.start().await;
-        }
+    let (ui_tx, ui_rx) = mpsc::channel(1024);
+    let mux = micromux::Micromux::new(config)?;
+    // let mux = Arc::new(mux);
+    let tui = micromux_tui::App::new(&mux.services, ui_rx, shutdown.clone());
+    let mux_handle = tokio::task::spawn({
+        // let mux = Arc::clone(&app.mux);
+        async move { mux.start(ui_tx, shutdown.clone()).await }
     });
-    app.render();
-    handle.await;
+    let (render_res, mux_res) = futures::join!(tui.render(), mux_handle);
+    render_res?;
+    mux_res??;
     Ok(())
 }
