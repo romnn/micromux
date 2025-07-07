@@ -1,4 +1,5 @@
 use color_eyre::eyre::OptionExt;
+use crossterm::event::{KeyEvent, KeyEventKind, MouseEvent, MouseEventKind};
 use futures::{FutureExt, StreamExt};
 use ratatui::crossterm::event::Event as CrosstermEvent;
 use std::time::Duration;
@@ -7,32 +8,13 @@ use tokio::sync::mpsc;
 /// The frequency at which tick events are emitted.
 const DRAW_TICK_FPS: f64 = 10.0; // 10 fps
 
-// /// Representation of all possible events.
-// #[derive(Clone, Debug)]
-// pub enum Event {
-//     /// An event that is emitted on a regular schedule.
-//     ///
-//     /// Use this event to run any code which has to run outside of being a direct response to a user
-//     /// event. e.g. polling exernal systems, updating animations, or rendering the UI based on a
-//     /// fixed frame rate.
-//     Tick,
-//     /// Crossterm events.
-//     ///
-//     /// These events are emitted by the terminal.
-//     Crossterm(CrosstermEvent),
-//     /// Application events.
-//     ///
-//     /// Use this event to emit custom events that are specific to your application.
-//     App(AppEvent),
-// }
-
 /// Representation of all possible events.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Hash)]
 pub enum Input {
     /// An event that is emitted on a regular schedule.
     ///
     /// Use this event to run any code which has to run outside of being a direct response to a user
-    /// event. e.g. polling exernal systems, updating animations, or rendering the UI based on a
+    /// event. e.g. polling external systems, updating animations, or rendering the UI based on a
     /// fixed frame rate.
     Tick,
     /// Crossterm events.
@@ -41,18 +23,28 @@ pub enum Input {
     Event(CrosstermEvent),
 }
 
-// /// Application events.
-// ///
-// /// You can extend this enum with your own custom events.
-// #[derive(Clone, Debug)]
-// pub enum AppEvent {
-//     /// Increment the counter.
-//     Increment,
-//     /// Decrement the counter.
-//     Decrement,
-//     /// Quit the application.
-//     Quit,
-// }
+impl std::fmt::Display for Input {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Tick => write!(f, "Tick"),
+            Self::Event(CrosstermEvent::Key(KeyEvent { code, kind, .. })) => match kind {
+                KeyEventKind::Press => write!(f, "KeyPress({code:?})"),
+                KeyEventKind::Release => write!(f, "KeyRelease({code:?})"),
+                KeyEventKind::Repeat => write!(f, "KeyRepeat({code:?})"),
+            },
+            Self::Event(CrosstermEvent::Resize(cols, rows)) => {
+                write!(f, "Resize(cols={cols}, rows={rows})")
+            }
+            // TODO match kind
+            Self::Event(CrosstermEvent::Mouse(MouseEvent {
+                column, row, kind, ..
+            })) => {
+                write!(f, "Mouse(col={column}, row={row})")
+            }
+            other => std::fmt::Debug::fmt(other, f),
+        }
+    }
+}
 
 /// Terminal event handler.
 #[derive(Debug)]
@@ -93,7 +85,7 @@ impl InputHandler {
     // /// This is useful for sending events to the event handler which will be processed by the next
     // /// iteration of the application's event loop.
     // pub fn send(&mut self, app_event: AppEvent) {
-    //     // Ignore the result as the reciever cannot be dropped while this struct still has a
+    //     // Ignore the result as the receiver cannot be dropped while this struct still has a
     //     // reference to it
     //     let _ = self.sender.send(Event::App(app_event));
     // }

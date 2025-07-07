@@ -21,6 +21,8 @@ itertools = "0"
 rand = "0"
 indexmap = "2"
 strum = { version = "0", features = ["derive"] }
+enum-as-inner = "0"
+# derive_more = { version = "2", features = ["from", "into", "display", "debug"] }
 
 # tracing
 tracing = "0"

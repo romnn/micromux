@@ -1,10 +1,9 @@
-use std::time::Duration;
-
 use async_process::{Command, Stdio};
 use color_eyre::eyre;
 use futures::stream::StreamExt;
 use futures::{AsyncBufReadExt, channel::mpsc};
 use itertools::Itertools;
+use std::time::Duration;
 use yaml_spanned::Spanned;
 
 use crate::{
@@ -12,20 +11,6 @@ use crate::{
     health_check::Health,
     scheduler::{ServiceID, State},
 };
-
-// #[derive(
-//     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, strum::Display, strum::IntoStaticStr,
-// )]
-// pub enum State {
-//     #[strum(serialize = "PENDING")]
-//     Pending,
-//     #[strum(serialize = "RUNNING")]
-//     Running,
-//     #[strum(serialize = "EXITED")]
-//     Exited,
-//     #[strum(serialize = "DISABLED")]
-//     Disabled,
-// }
 
 /// Send a Unix signal to a process with the given PID.
 #[cfg(unix)]
@@ -46,14 +31,19 @@ pub enum RestartPolicy {
     },
 }
 
-// #[derive(Debug)]
-// pub struct ProcessState {
-//     pub(crate) process: Option<async_process::Child>,
-//     pub(crate) stdout_tx: mpsc::Sender<String>,
-//     pub stdout_rx: mpsc::Receiver<String>,
-//     pub(crate) stderr_tx: mpsc::Sender<String>,
-//     pub stderr_rx: mpsc::Receiver<String>,
-// }
+impl std::fmt::Display for RestartPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Always => write!(f, "Always"),
+            Self::UnlessStopped => write!(f, "UnlessStopped"),
+            Self::Never => write!(f, "Never"),
+            Self::OnFailure { remaining_attempts } => f
+                .debug_struct("OnFailure")
+                .field("remaining", remaining_attempts)
+                .finish(),
+        }
+    }
+}
 
 #[derive(Debug)]
 pub struct Service {
@@ -66,19 +56,13 @@ pub struct Service {
     pub state: State,
     pub health: Option<Health>,
     pub open_ports: Vec<u16>,
-    // pub process_state: ProcessState,
+    pub enable_color: bool,
     pub(crate) process: Option<async_process::Child>,
-    // pub(crate) stdout_tx: mpsc::Sender<Result<String, std::io::Error>>,
-    // pub stdout_rx: mpsc::Receiver<Result<String, std::io::Error>>,
-    // pub(crate) stderr_tx: mpsc::Sender<Result<String, std::io::Error>>,
-    // pub stderr_rx: mpsc::Receiver<Result<String, std::io::Error>>,
 }
 
 impl Service {
     pub fn new(id: impl Into<ServiceID>, config: config::Service) -> Self {
         let (prog, args) = config.command;
-        // let (stdout_tx, stdout_rx) = mpsc::channel(1024);
-        // let (stderr_tx, stderr_rx) = mpsc::channel(1024);
         Self {
             id: id.into(),
             name: config.name,
@@ -96,10 +80,7 @@ impl Service {
             state: State::Pending,
             health: None,
             process: None,
-            // stdout_tx,
-            // stdout_rx,
-            // stderr_tx,
-            // stderr_rx,
+            enable_color: config.color.as_deref().copied().unwrap_or(true),
         }
     }
 

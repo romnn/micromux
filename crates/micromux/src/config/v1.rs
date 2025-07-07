@@ -282,6 +282,7 @@ pub fn parse_service<F>(
 ) -> Result<Service, ConfigError> {
     let (span, mapping) = expect_mapping(value, "service config must be a mapping".into())?;
     let name = parse_optional::<String>(mapping.get("name"))?.unwrap_or_else(|| name.clone());
+    let color = parse_optional::<bool>(mapping.get("color"))?;
     let command = match mapping.get("command") {
         None => Err(ConfigError::MissingKey {
             key: "command".to_string(),
@@ -291,7 +292,6 @@ pub fn parse_service<F>(
         Some(value) => parse_command(value),
     }?;
     let healthcheck = parse_health_check(mapping)?;
-    dbg!(&healthcheck);
     Ok(Service {
         name,
         command,
@@ -301,6 +301,7 @@ pub fn parse_service<F>(
         healthcheck,
         restart: None,
         ports: vec![],
+        color,
     })
 }
 

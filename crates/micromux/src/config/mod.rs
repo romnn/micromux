@@ -138,6 +138,7 @@ pub struct Service {
     pub healthcheck: Option<HealthCheck>,
     pub ports: Vec<u16>,
     pub restart: Option<RestartPolicy>,
+    pub color: Option<Spanned<bool>>,
     // ports, inputs, watch, restart policy
     // You can add more fields such as ports, volumes, etc.
 }

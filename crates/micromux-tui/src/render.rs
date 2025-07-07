@@ -170,7 +170,7 @@ impl App {
     fn render_logs(&mut self, area: Rect, buf: &mut Buffer) {
         let current_service = self.state.current_service();
         let (num_lines, current_logs) = current_service.logs.full_text();
-        tracing::debug!(
+        tracing::trace!(
             service_id = current_service.id,
             current_logs,
             num_lines,
@@ -303,6 +303,8 @@ pub mod log_view {
             logs: &str,
             buf: &mut Buffer,
         ) {
+            use ansi_to_tui::IntoText;
+
             // Account for the two borders
             let viewport_height = log_area.height.saturating_sub(2);
 
@@ -318,8 +320,16 @@ pub mod log_view {
                 .viewport_content_length(viewport_height.into())
                 .position(self.scroll_offset.into());
 
+            // Strip ANSI control codes that could confuse our TUI
+            let text: ratatui::text::Text = logs.into_text().unwrap_or_else(|err| {
+                // As a fallback, remove all ANSI controls (losing all color)
+                let escaped = strip_ansi_escapes::strip_str(logs);
+                tracing::error!(?err, escaped, "failed to sanitize log line");
+                escaped.into()
+            });
+
             // Build paragraph
-            let mut paragraph = Paragraph::new(logs)
+            let mut paragraph = Paragraph::new(text)
                 .block(Block::default().borders(Borders::ALL).title("Logs"))
                 .scroll((self.scroll_offset, 0)); // scroll by lines then cols
 

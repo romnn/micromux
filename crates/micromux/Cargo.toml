@@ -7,6 +7,8 @@ edition.workspace = true
 color-eyre.workspace = true
 thiserror.workspace = true
 strum.workspace = true
+enum-as-inner.workspace = true
+# derive_more.workspace = true
 itertools.workspace = true
 indexmap.workspace = true
 

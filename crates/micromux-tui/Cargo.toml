@@ -17,6 +17,8 @@ micromux = { path = "../micromux/" }
 
 # tui
 ratatui = { version = "0", features = [] }
+ansi-to-tui = "7"
+strip-ansi-escapes = "0"
 crossterm = { version = "0.28.1", features = ["event-stream"] }
 
 # async runtime

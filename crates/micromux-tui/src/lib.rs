@@ -88,7 +88,7 @@ impl App {
 
 impl App {
     pub async fn run(mut self, mut terminal: DefaultTerminal) -> eyre::Result<()> {
-        #[derive(Debug)]
+        #[derive(Debug, strum::Display)]
         enum Event {
             Input(event::Input),
             Scheduler(SchedulerEvent),
@@ -98,9 +98,7 @@ impl App {
         let mut pending = false;
 
         while self.is_running() {
-            tracing::debug!("render frame");
-
-            terminal.draw(|frame| frame.render_widget(&mut self, frame.area()))?;
+            // tracing::trace!("render frame");
 
             // Debounce timer -> perform redraw if pending
             // tokio::select! {
@@ -117,18 +115,28 @@ impl App {
             //         }
             //     }
             // }
-
-            let mut new_logs_subscription = self.state.current_service().logs.subscribe();
+            // let mut new_logs_subscription = self.state.current_service().logs.subscribe();
 
             // Wait until an (input) event is received.
             let event = tokio::select! {
                 _ = self.shutdown.cancelled() => None,
-                // _ = new_logs_subscription.changed() => None,
-                event = self.ui_rx.next() => event.map(Event::Scheduler),
                 input = self.input_event_handler.next() => Some(Event::Input(input?)),
+                event = self.ui_rx.next() => event.map(Event::Scheduler),
+                // _ = new_logs_subscription.changed() => None,
             };
 
-            tracing::debug!(?event, "received event");
+            match &event {
+                Some(Event::Input(event::Input::Tick)) => {
+                    terminal.draw(|frame| frame.render_widget(&mut self, frame.area()))?;
+                }
+                Some(Event::Input(event)) => {
+                    tracing::debug!(%event, "received event");
+                }
+                Some(Event::Scheduler(event)) => {
+                    tracing::debug!(%event, "received event");
+                }
+                _ => {}
+            }
 
             match event {
                 Some(Event::Input(event)) => {
@@ -152,7 +160,8 @@ impl App {
             } => {
                 use futures::{AsyncBufReadExt, StreamExt};
 
-                let service = self.state.services.get(&service_id).unwrap();
+                let service = self.state.services.get_mut(&service_id).unwrap();
+                service.exec_state = state::Execution::Running { health: None };
 
                 if let Some(stderr) = stderr {
                     tokio::spawn({
@@ -200,11 +209,30 @@ impl App {
                     });
                 }
             }
-            SchedulerEvent::Killed(service_id) => {}
-            SchedulerEvent::Exited(service_id, _) => {}
-            SchedulerEvent::Healthy(service_id) => {}
-            SchedulerEvent::Unhealthy(service_id) => {}
-            SchedulerEvent::Disabled(service_id) => {}
+            SchedulerEvent::Killed(service_id) => {
+                let service = self.state.services.get_mut(&service_id).unwrap();
+                service.exec_state = state::Execution::Killed;
+            }
+            SchedulerEvent::Exited(service_id, _) => {
+                let service = self.state.services.get_mut(&service_id).unwrap();
+                service.exec_state = state::Execution::Exited;
+            }
+            SchedulerEvent::Healthy(service_id) => {
+                let service = self.state.services.get_mut(&service_id).unwrap();
+                service.exec_state = state::Execution::Running {
+                    health: Some(state::Health::Healthy),
+                };
+            }
+            SchedulerEvent::Unhealthy(service_id) => {
+                let service = self.state.services.get_mut(&service_id).unwrap();
+                service.exec_state = state::Execution::Running {
+                    health: Some(state::Health::Unhealthy),
+                };
+            }
+            SchedulerEvent::Disabled(service_id) => {
+                let service = self.state.services.get_mut(&service_id).unwrap();
+                service.exec_state = state::Execution::Disabled;
+            }
         }
         Ok(())
     }
