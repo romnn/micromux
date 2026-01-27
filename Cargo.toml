@@ -9,6 +9,21 @@ members = [
 [workspace.package]
 edition = "2024"
 
+[workspace.lints.rust]
+unsafe_code = "deny"
+unused_must_use = "deny"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+unwrap_used      = "deny"
+expect_used      = "deny"
+panic            = "deny"
+unreachable      = "deny"
+unimplemented    = "deny"
+todo             = "deny"
+indexing_slicing = "deny"
+missing_errors_doc = "allow"
+
 [profile.release]
 opt-level = 3
 lto = true

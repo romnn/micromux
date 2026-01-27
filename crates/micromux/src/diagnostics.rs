@@ -46,10 +46,7 @@ impl Default for Printer {
 impl Printer {
     pub fn new(color_choice: term::termcolor::ColorChoice) -> Self {
         let writer = term::termcolor::StandardStream::stderr(color_choice);
-        let diagnostic_config = term::Config {
-            styles: term::Styles::with_blue(term::termcolor::Color::Blue),
-            ..term::Config::default()
-        };
+        let diagnostic_config = term::Config::default();
         Self {
             writer: Arc::new(writer),
             diagnostic_config,

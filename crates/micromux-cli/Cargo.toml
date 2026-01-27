@@ -3,6 +3,9 @@ name = "micromux-cli"
 version = "0.1.0"
 edition.workspace = true
 
+[lints]
+workspace = true
+
 [[bin]]
 name = "micromux"
 path = "./src/main.rs"
