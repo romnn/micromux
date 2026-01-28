@@ -1,14 +1,10 @@
-#![allow(warnings)]
-#![deny(unused_must_use)]
-
 pub mod logging;
 pub mod options;
 
 use clap::Parser;
 use codespan_reporting::diagnostic::Diagnostic;
 use color_eyre::eyre;
-use micromux::{diagnostics::Printer as DiagnosticsPrinter, project_dir};
-use std::sync::Arc;
+use micromux::diagnostics::Printer as DiagnosticsPrinter;
 use tokio::sync::mpsc;
 
 #[tokio::main]
@@ -59,7 +55,7 @@ async fn main() -> eyre::Result<()> {
     };
 
     let color_choice = options.color_choice.unwrap_or(termcolor::ColorChoice::Auto);
-    let use_color = match color_choice {
+    let _use_color = match color_choice {
         ColorChoice::Always | ColorChoice::AlwaysAnsi => true,
         ColorChoice::Never => false,
         ColorChoice::Auto => {
@@ -102,7 +98,6 @@ async fn main() -> eyre::Result<()> {
             diagnostics.extend(err.to_diagnostics(file_id));
             None
         }
-        // Ok(valid_configs) => Ok::<_, eyre::Report>((valid_configs, diagnostics)),
         Ok(config) => Some(config),
     };
 
@@ -123,11 +118,9 @@ async fn main() -> eyre::Result<()> {
     let (ui_tx, ui_rx) = mpsc::channel(1024);
     let (commands_tx, commands_rx) = mpsc::channel(1024);
     let mux = micromux::Micromux::new(config)?;
-    // let mux = Arc::new(mux);
     let tui = micromux_tui::App::new(&mux.services, ui_rx, commands_tx, shutdown.clone());
     let interactive_logs = !options.no_interactive_logs;
     let mux_handle = tokio::task::spawn({
-        // let mux = Arc::clone(&app.mux);
         async move {
             mux.start_with_options(ui_tx, commands_rx, shutdown.clone(), interactive_logs)
                 .await

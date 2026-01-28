@@ -1,5 +1,5 @@
 use color_eyre::eyre::OptionExt;
-use crossterm::event::{KeyEvent, KeyEventKind, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyEvent, KeyEventKind, MouseEvent};
 use futures::{FutureExt, StreamExt};
 use ratatui::crossterm::event::Event as CrosstermEvent;
 use std::time::Duration;
@@ -37,7 +37,10 @@ impl std::fmt::Display for Input {
             }
             // TODO match kind
             Self::Event(CrosstermEvent::Mouse(MouseEvent {
-                column, row, kind, ..
+                column,
+                row,
+                kind: _,
+                ..
             })) => {
                 write!(f, "Mouse(col={column}, row={row})")
             }
@@ -85,16 +88,6 @@ impl InputHandler {
             .await
             .ok_or_eyre("Failed to receive event")
     }
-
-    // /// Queue an app event to be sent to the event receiver.
-    // ///
-    // /// This is useful for sending events to the event handler which will be processed by the next
-    // /// iteration of the application's event loop.
-    // pub fn send(&mut self, app_event: AppEvent) {
-    //     // Ignore the result as the receiver cannot be dropped while this struct still has a
-    //     // reference to it
-    //     let _ = self.sender.send(Event::App(app_event));
-    // }
 }
 
 /// A thread that handles reading crossterm events and emitting tick events on a regular schedule.

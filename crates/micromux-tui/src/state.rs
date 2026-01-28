@@ -1,11 +1,9 @@
 use std::collections::VecDeque;
-use std::sync::mpsc;
 
 use micromux::{
     bounded_log::{AsyncBoundedLog, BoundedLog},
     scheduler::ServiceID,
 };
-use ratatui::widgets::ScrollbarState;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, strum::Display, strum::IntoStaticStr)]
 pub enum Health {
@@ -44,9 +42,6 @@ pub struct Service {
     pub healthcheck_cached_num_lines: u16,
     pub healthcheck_cached_text: String,
     pub healthcheck_dirty: bool,
-    // pub logs: BoundedLog,
-    // pub stderr_rx: mpsc::Receiver<Result<String, std::io::Error>>,
-    // pub stdout_rx: mpsc::Receiver<Result<String, std::io::Error>>,
 }
 
 #[derive(Debug)]
@@ -68,24 +63,14 @@ pub struct State {
     pub services: indexmap::IndexMap<ServiceID, Service>,
     pub services_sidebar_width: u16,
     pub selected_service: usize,
-    // pub viewer_text: String,
-    // pub show_popup: bool,
 }
 
 impl Default for State {
     fn default() -> Self {
-        // let scrollbar_state = ScrollbarState::default()
-        //     .content_length(0)
-        //     .viewport_content_length(0)
-        //     .position(0);
-
         Self {
             services: indexmap::IndexMap::new(),
             services_sidebar_width: crate::style::INITIAL_SIDEBAR_WIDTH,
             selected_service: 0,
-            // scrollbar_state,
-            // show_popup: false,
-            // viewer_text: "This is the viewer output.\nYou can display multiline text here.".into(),
         }
     }
 }

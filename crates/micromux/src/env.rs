@@ -12,6 +12,12 @@ pub fn interpolate_str(input: &str, env: &HashMap<String, String>) -> String {
     interpolate(input, env)
 }
 
+impl Default for EnvMap {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl EnvMap {
     pub fn new() -> Self {
         Self {
@@ -63,8 +69,8 @@ pub fn parse_dotenv(contents: &str) -> eyre::Result<EnvMap> {
         let mut in_double = false;
         let mut last_was_ws = false;
         let mut cleaned = String::with_capacity(line.len());
-        let mut chars = line.chars().peekable();
-        while let Some(ch) = chars.next() {
+        let chars = line.chars().peekable();
+        for ch in chars {
             match ch {
                 '\'' if !in_double => {
                     in_single = !in_single;
@@ -212,7 +218,7 @@ fn interpolate(input: &str, env: &HashMap<String, String>) -> String {
         if next == '{' {
             let _ = chars.next();
             let mut key = String::new();
-            while let Some(c) = chars.next() {
+            for c in chars.by_ref() {
                 if c == '}' {
                     break;
                 }

@@ -1,6 +1,7 @@
 use itertools::Itertools;
 use std::collections::VecDeque;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+use parking_lot::RwLock;
 use tokio::sync::watch;
 
 /// A log buffer that retains only the most recent entries, bounded by line count and/or total bytes.
@@ -122,7 +123,7 @@ impl AsyncBoundedLog {
     /// Push a line and notify subscribers.
     pub fn push(&self, line: String) {
         {
-            let mut log = self.inner.write().unwrap();
+            let mut log = self.inner.write();
             log.push(line);
         }
         // bump version to signal update
@@ -132,7 +133,7 @@ impl AsyncBoundedLog {
 
     pub fn replace_last(&self, line: String) {
         {
-            let mut log = self.inner.write().unwrap();
+            let mut log = self.inner.write();
             log.replace_last(line);
         }
         // bump version to signal update
@@ -141,8 +142,9 @@ impl AsyncBoundedLog {
     }
 
     pub fn full_text(&self) -> (u16, String) {
-        let log = self.inner.read().unwrap();
-        (log.len().try_into().unwrap(), log.full_text())
+        let log = self.inner.read();
+        let lines = log.len().min(u16::MAX as usize) as u16;
+        (lines, log.full_text())
     }
 
     /// Subscribe to updates; resolves when a new line is pushed.

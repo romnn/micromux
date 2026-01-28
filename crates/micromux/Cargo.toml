@@ -14,6 +14,7 @@ enum-as-inner.workspace = true
 # derive_more.workspace = true
 itertools.workspace = true
 indexmap.workspace = true
+parking_lot.workspace = true
 
 # command and process management
 async-process = "2"
@@ -47,3 +48,6 @@ futures.workspace = true
 yaml-spanned = { git = "https://github.com/romnn/yaml-spanned.git" }
 serde.workspace = true
 # serde_yaml.workspace = true
+
+[dev-dependencies]
+indoc.workspace = true

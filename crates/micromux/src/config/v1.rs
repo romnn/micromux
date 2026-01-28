@@ -1,13 +1,11 @@
 use super::{Config, ConfigError, Service, UiConfig, parse, parse_duration, parse_optional};
 use crate::{
     config::InvalidCommandReason,
-    diagnostics::{self, DiagnosticExt, DisplayRepr, Span},
     service::RestartPolicy,
 };
-use codespan_reporting::diagnostic::{Diagnostic, Label};
+use codespan_reporting::diagnostic::Diagnostic;
 use indexmap::IndexMap;
 use itertools::Itertools;
-use std::path::{Path, PathBuf};
 use yaml_spanned::{Mapping, Sequence, Spanned, Value, value::Kind};
 
 fn parse_string_value(
@@ -42,7 +40,7 @@ fn parse_environment(
         env.insert(
             key,
             Spanned {
-                span: v.span.clone(),
+                span: v.span,
                 inner: raw,
             },
         );
@@ -64,7 +62,7 @@ fn parse_env_file(mapping: &yaml_spanned::Mapping) -> Result<Vec<super::EnvFile>
             } => {
                 env_files.push(super::EnvFile {
                     path: Spanned {
-                        span: span.clone(),
+                        span: *span,
                         inner: path.clone(),
                     },
                 });
@@ -84,7 +82,7 @@ fn parse_env_file(mapping: &yaml_spanned::Mapping) -> Result<Vec<super::EnvFile>
                     expect_string(path_value, "env_file.path must be a string".into())?;
                 env_files.push(super::EnvFile {
                     path: Spanned {
-                        span: path_span.clone(),
+                        span: *path_span,
                         inner: path.clone(),
                     },
                 });
@@ -139,7 +137,7 @@ fn parse_depends_on(
             } => {
                 deps.push(super::Dependency {
                     name: Spanned {
-                        span: span.clone(),
+                        span: *span,
                         inner: name.clone(),
                     },
                     condition: None,
@@ -182,7 +180,7 @@ fn parse_ports(mapping: &yaml_spanned::Mapping) -> Result<Vec<Spanned<String>>, 
     for item in seq.iter() {
         let raw = parse_string_value(item, "ports entries must be a scalar")?;
         ports.push(Spanned {
-            span: item.span.clone(),
+            span: item.span,
             inner: raw,
         });
     }
@@ -300,42 +298,81 @@ pub fn normalize_command(
         });
     }
 
-    let (prog, args) = match command[0].as_str() {
+    let Some(first) = command.first() else {
+        return Err(ConfigError::InvalidCommand {
+            command: raw_command.to_string(),
+            reason: InvalidCommandReason::EmptyCommand,
+            span: span.into(),
+        });
+    };
+
+    let (prog, args) = match first.as_str() {
         "CMD" => {
             // Exec form: ["CMD", prog, arg1, arg2...]
-            if command.len() < 2 {
+            let Some(prog) = command.get(1).cloned() else {
                 // CMD form needs at least one program
                 return Err(ConfigError::InvalidCommand {
                     command: raw_command.to_string(),
                     reason: InvalidCommandReason::EmptyCommand,
                     span: span.into(),
                 });
-            }
-            let prog = command[1].clone();
-            let args = command[2..].to_vec();
+            };
+            let args = command
+                .get(2..)
+                .map(|rest| rest.to_vec())
+                .unwrap_or_default();
             (prog, args)
         }
         "CMD-SHELL" => {
             // Shell form: ["CMD-SHELL", cmd...]
             // Join everything after index 0 into one string:
-            let command_string = command[1..].join(" ");
-            let cmd_shell_span = &command[0].span;
+            let Some(rest) = command.get(1..) else {
+                return Err(ConfigError::InvalidCommand {
+                    command: raw_command.to_string(),
+                    reason: InvalidCommandReason::EmptyCommand,
+                    span: span.into(),
+                });
+            };
+            if rest.is_empty() {
+                return Err(ConfigError::InvalidCommand {
+                    command: raw_command.to_string(),
+                    reason: InvalidCommandReason::EmptyCommand,
+                    span: span.into(),
+                });
+            }
+
+            let command_string = rest.iter().join(" ");
+            let cmd_shell_span = &first.span;
+            let Some(span_start) = rest.first().map(|v| v.span.start) else {
+                return Err(ConfigError::InvalidCommand {
+                    command: raw_command.to_string(),
+                    reason: InvalidCommandReason::EmptyCommand,
+                    span: span.into(),
+                });
+            };
+            let Some(span_end) = rest.last().map(|v| v.span.end) else {
+                return Err(ConfigError::InvalidCommand {
+                    command: raw_command.to_string(),
+                    reason: InvalidCommandReason::EmptyCommand,
+                    span: span.into(),
+                });
+            };
 
             #[cfg(unix)]
             let (prog, args) = (
                 Spanned {
-                    span: cmd_shell_span.clone().into(),
+                    span: (*cmd_shell_span),
                     inner: "sh".to_string(),
                 },
                 vec![
                     Spanned {
-                        span: cmd_shell_span.clone().into(),
+                        span: (*cmd_shell_span),
                         inner: "-c".to_string(),
                     },
                     Spanned {
                         span: yaml_spanned::spanned::Span {
-                            start: command[1].span.start,
-                            end: command[command.len() - 1].span.end,
+                            start: span_start,
+                            end: span_end,
                         },
                         inner: command_string,
                     },
@@ -358,8 +395,8 @@ pub fn normalize_command(
                     },
                     Spanned {
                         span: yaml_spanned::spanned::Span {
-                            start: command[1].span.start,
-                            end: command[command.len() - 1].span.end,
+                            start: span_start,
+                            end: span_end,
                         },
                         inner: command_string,
                     },
@@ -368,8 +405,11 @@ pub fn normalize_command(
             (prog, args)
         }
         _ => {
-            let prog = command[0].clone();
-            let args = command[1..].to_vec();
+            let prog = first.clone();
+            let args = command
+                .get(1..)
+                .map(|rest| rest.to_vec())
+                .unwrap_or_default();
             (prog, args)
         }
     };
@@ -399,18 +439,18 @@ fn parse_command(
                     });
                 }
                 let cmd_shell = Spanned {
-                    span: span.clone(),
+                    span: *span,
                     inner: "CMD-SHELL".to_string(),
                 };
                 let payload = Spanned {
-                    span: span.clone(),
+                    span: *span,
                     inner: rest.to_string(),
                 };
                 return normalize_command(vec![cmd_shell, payload], raw_command.as_str(), *span);
             }
 
             let command =
-                shlex::split(&raw_command).ok_or_else(|| ConfigError::InvalidCommand {
+                shlex::split(raw_command).ok_or_else(|| ConfigError::InvalidCommand {
                     command: raw_command.clone(),
                     reason: InvalidCommandReason::FailedToSplit,
                     span: span.into(),
@@ -420,7 +460,7 @@ fn parse_command(
             let command = command
                 .into_iter()
                 .map(|value| Spanned {
-                    span: span.clone(),
+                    span: *span,
                     inner: value,
                 })
                 .collect();
@@ -439,7 +479,7 @@ fn parse_command(
             let raw_command = command.iter().join(" ");
             let command =
                 command
-                    .into_iter()
+                    .iter()
                     .map(|Spanned { span, inner }| {
                         let inner = inner.as_string().cloned().ok_or_else(|| {
                             ConfigError::UnexpectedType {
@@ -450,7 +490,7 @@ fn parse_command(
                             }
                         })?;
                         Ok::<_, ConfigError>(Spanned {
-                            span: span.clone(),
+                            span: *span,
                             inner,
                         })
                     })
@@ -639,10 +679,11 @@ pub fn parse_config<F: Copy + PartialEq>(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    
     use crate::config;
     use codespan_reporting::diagnostic::Diagnostic;
     use color_eyre::eyre;
+    use indoc::indoc;
     use std::path::Path;
 
     fn get_service<'a>(cfg: &'a config::Config, name: &str) -> &'a config::Service {
@@ -655,21 +696,21 @@ mod tests {
 
     #[test]
     fn env_file_accepts_string_mapping_and_sequence_forms() -> eyre::Result<()> {
-        let yaml = r#"
-version: 1
-services:
-  app_string:
-    command: ["sh", "-c", "true"]
-    env_file: ".env"
-  app_mapping:
-    command: ["sh", "-c", "true"]
-    env_file:
-      path: ".env"
-  app_sequence:
-    command: ["sh", "-c", "true"]
-    env_file:
-      - ".env"
-"#;
+        let yaml = indoc! {r#"
+            version: 1
+            services:
+              app_string:
+                command: ["sh", "-c", "true"]
+                env_file: ".env"
+              app_mapping:
+                command: ["sh", "-c", "true"]
+                env_file:
+                  path: ".env"
+              app_sequence:
+                command: ["sh", "-c", "true"]
+                env_file:
+                  - ".env"
+        "#};
 
         let mut diagnostics: Vec<Diagnostic<usize>> = vec![];
         let parsed = config::from_str(yaml, Path::new("."), 0, None, &mut diagnostics)?;
@@ -691,17 +732,17 @@ services:
 
     #[test]
     fn depends_on_condition_parses_and_invalid_condition_is_error() {
-        let yaml_ok = r#"
-version: 1
-services:
-  app:
-    command: ["sh", "-c", "true"]
-    depends_on:
-      - name: db
-        condition: healthy
-  db:
-    command: ["sh", "-c", "true"]
-"#;
+        let yaml_ok = indoc! {r#"
+            version: 1
+            services:
+              app:
+                command: ["sh", "-c", "true"]
+                depends_on:
+                  - name: db
+                    condition: healthy
+              db:
+                command: ["sh", "-c", "true"]
+        "#};
 
         let mut diagnostics: Vec<Diagnostic<usize>> = vec![];
         let parsed = config::from_str(yaml_ok, Path::new("."), 0, None, &mut diagnostics).unwrap();
@@ -714,17 +755,17 @@ services:
             Some(config::DependencyCondition::ServiceHealthy)
         );
 
-        let yaml_bad = r#"
-version: 1
-services:
-  app:
-    command: ["sh", "-c", "true"]
-    depends_on:
-      - name: db
-        condition: totally_not_a_condition
-  db:
-    command: ["sh", "-c", "true"]
-"#;
+        let yaml_bad = indoc! {r#"
+            version: 1
+            services:
+              app:
+                command: ["sh", "-c", "true"]
+                depends_on:
+                  - name: db
+                    condition: totally_not_a_condition
+              db:
+                command: ["sh", "-c", "true"]
+        "#};
 
         let mut diagnostics: Vec<Diagnostic<usize>> = vec![];
         let err =
@@ -737,14 +778,14 @@ services:
 
     #[test]
     fn cmd_shell_string_preserves_quoting_in_payload() -> eyre::Result<()> {
-        let yaml = r#"
-version: 1
-services:
-  app:
-    command: ["sh", "-c", "true"]
-    healthcheck:
-      test: "CMD-SHELL echo \"a b\""
-"#;
+        let yaml = indoc! {r#"
+            version: 1
+            services:
+              app:
+                command: ["sh", "-c", "true"]
+                healthcheck:
+                  test: "CMD-SHELL echo \"a b\""
+        "#};
 
         let mut diagnostics: Vec<Diagnostic<usize>> = vec![];
         let parsed = config::from_str(yaml, Path::new("."), 0, None, &mut diagnostics)?;
@@ -758,14 +799,14 @@ services:
 
     #[test]
     fn cmd_shell_sequence_joins_items_with_spaces() -> eyre::Result<()> {
-        let yaml = r#"
-version: 1
-services:
-  app:
-    command: ["sh", "-c", "true"]
-    healthcheck:
-      test: ["CMD-SHELL", "echo", "a b"]
-"#;
+        let yaml = indoc! {r#"
+            version: 1
+            services:
+              app:
+                command: ["sh", "-c", "true"]
+                healthcheck:
+                  test: ["CMD-SHELL", "echo", "a b"]
+        "#};
 
         let mut diagnostics: Vec<Diagnostic<usize>> = vec![];
         let parsed = config::from_str(yaml, Path::new("."), 0, None, &mut diagnostics)?;

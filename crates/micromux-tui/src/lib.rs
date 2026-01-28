@@ -1,6 +1,3 @@
-#![allow(warnings)]
-#![deny(unused_must_use)]
-
 pub mod event;
 pub mod render;
 pub mod state;
@@ -11,20 +8,8 @@ pub use ratatui;
 
 use color_eyre::eyre;
 use futures::StreamExt;
-use micromux::{Micromux, ServiceMap, bounded_log::BoundedLog, scheduler::Event as SchedulerEvent};
-use ratatui::{
-    DefaultTerminal, Terminal,
-    backend::{Backend, CrosstermBackend},
-    buffer::Buffer,
-    layout::{Alignment, Constraint, Direction, Layout, Rect},
-    prelude::*,
-    style::Styled,
-    style::{Color, Modifier, Style, palette::tailwind},
-    text::Span,
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Widget},
-};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use micromux::{ServiceMap, bounded_log::BoundedLog, scheduler::Event as SchedulerEvent};
+use ratatui::{DefaultTerminal, backend::Backend};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -72,7 +57,7 @@ impl App {
         commands_tx: mpsc::Sender<micromux::scheduler::Command>,
         shutdown: micromux::CancellationToken,
     ) -> Self {
-        let mut ui_rx = ReceiverStream::new(ui_rx).chain(futures::stream::pending());
+        let ui_rx = ReceiverStream::new(ui_rx).chain(futures::stream::pending());
 
         let services = services
             .iter()
@@ -135,31 +120,11 @@ impl App {
             .await;
 
         while self.is_running() {
-            // tracing::trace!("render frame");
-
-            // Debounce timer -> perform redraw if pending
-            // tokio::select! {
-            //     _ = async {
-            //         if pending {
-            //             tokio::time::sleep(debounce_duration).await;
-            //         } else {
-            //             futures::future::pending::<()>().await;
-            //         }
-            //     } => {
-            //         if pending {
-            //             terminal.draw(|frame| frame.render_widget(&self, frame.area()))?;
-            //             pending = false;
-            //         }
-            //     }
-            // }
-            // let mut new_logs_subscription = self.state.current_service().logs.subscribe();
-
             // Wait until an (input) event is received.
             let event = tokio::select! {
                 _ = self.shutdown.cancelled() => None,
                 input = self.input_event_handler.next() => Some(Event::Input(input?)),
                 event = self.ui_rx.next() => event.map(Event::Scheduler),
-                // _ = new_logs_subscription.changed() => None,
             };
 
             match &event {
@@ -304,9 +269,7 @@ impl App {
     }
 
     fn handle_input_event(&mut self, input_event: event::Input) -> eyre::Result<()> {
-        use crossterm::event::{
-            DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
-        };
+        use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
 
         match input_event {
             event::Input::Tick => self.tick(),
@@ -520,12 +483,6 @@ impl App {
             .try_send(micromux::scheduler::Command::Restart(service.id.clone()));
     }
 
-    // /// Restart service
-    // fn restart_service(&mut self, service: ) {
-    //     let service = self.state.current_service();
-    //     tracing::info!(service_id = service.id, "restarting service");
-    // }
-
     /// Restart all services
     fn restart_all_services(&self) {
         tracing::info!("restarting all services");
@@ -558,7 +515,7 @@ fn key_event_to_bytes(
         match code {
             KeyCode::Char(c) => {
                 let c = c.to_ascii_lowercase();
-                if ('a'..='z').contains(&c) {
+                if c.is_ascii_lowercase() {
                     return Some(vec![(c as u8) - b'a' + 1]);
                 }
                 match c {
@@ -601,6 +558,7 @@ mod tests {
     use super::{App, Focus, key_event_to_bytes};
     use codespan_reporting::diagnostic::Diagnostic;
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+    use indoc::indoc;
     use micromux::{ServiceMap, config};
     use std::path::Path;
     use tokio::sync::mpsc;
@@ -708,12 +666,12 @@ mod tests {
 
     #[tokio::test]
     async fn tab_cycles_focus_with_and_without_healthcheck_pane() {
-        let yaml = r#"
-version: 1
-services:
-  svc:
-    command: ["sh", "-c", "true"]
-"#;
+        let yaml = indoc! {r#"
+            version: 1
+            services:
+              svc:
+                command: ["sh", "-c", "true"]
+        "#};
         let mut diagnostics: Vec<Diagnostic<usize>> = vec![];
         let parsed =
             config::from_str(yaml, Path::new("."), 0usize, None, &mut diagnostics).unwrap();

@@ -1,8 +1,7 @@
 use color_eyre::eyre;
 use std::path::Path;
-use termcolor::ColorChoice;
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
-use tracing_subscriber::{EnvFilter, fmt::writer::BoxMakeWriter, layer::SubscriberExt};
+use tracing_subscriber::{EnvFilter, layer::SubscriberExt};
 
 #[derive(Debug)]
 pub enum LogFile<'a> {
@@ -87,7 +86,6 @@ pub fn setup<'a>(
 
     let fmt_layer_pretty_compact = tracing_subscriber::fmt::Layer::new()
         .compact()
-        // .without_time()
         .with_ansi(false)
         .with_writer(log_writer);
 

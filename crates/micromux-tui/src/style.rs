@@ -1,5 +1,5 @@
 use crate::state;
-use ratatui::style::{Color, Modifier, Style, palette::tailwind};
+use ratatui::style::{Color, Style, palette::tailwind};
 
 pub const INITIAL_SIDEBAR_WIDTH: u16 = 40;
 pub const MIN_SIDEBAR_WIDTH: u16 = 20;
@@ -17,6 +17,6 @@ pub fn service_style(state: state::Execution) -> Style {
         state::Execution::Disabled => Style::default().fg(Color::White).fg(tailwind::GRAY.c500),
         state::Execution::Pending => Style::default().fg(Color::White).fg(tailwind::BLUE.c500),
         state::Execution::Running { health, .. } => health_style(health),
-        state::Execution::Killed { .. } | state::Execution::Exited { .. } => health_style(None),
+        state::Execution::Killed | state::Execution::Exited => health_style(None),
     }
 }

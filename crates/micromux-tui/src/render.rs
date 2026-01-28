@@ -3,16 +3,11 @@ use crate::App;
 use color_eyre::eyre;
 use itertools::intersperse;
 use ratatui::{
-    DefaultTerminal, Terminal,
-    backend::{Backend, CrosstermBackend},
     buffer::Buffer,
-    layout::{Alignment, Constraint, Direction, Layout, Rect},
+    layout::{Constraint, Direction, Layout, Rect},
     prelude::*,
     style::{Color, Modifier, Style, Styled, palette::tailwind},
-    text::Span,
-    widgets::{
-        Block, Borders, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarState, Widget,
-    },
+    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Scrollbar, Widget},
 };
 
 fn wrapped_text_height(text: &ratatui::text::Text, wrap_width: u16) -> u16 {
@@ -188,23 +183,15 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
 
 pub fn state_name(service: crate::state::Execution) -> &'static str {
     match service {
-        // state @ (state::Service::Disabled
-        // | state::Service::Pending
-        // | state::Service::Exited { .. }) => state.into(),
         crate::state::Execution::Running {
             health: Some(health),
         } => health.into(),
         state => state.into(),
     }
-    // match (&service.state, &service.health) {
-    //     (state @ (State::Disabled | State::Pending | State::Exited { .. }), _) => state.into(),
-    //     (_, Some(health)) => health.into(),
-    //     (state, _) => state.into(),
-    // }
 }
 
 impl Widget for &mut App {
-    fn render(mut self, area: Rect, buf: &mut Buffer) {
+    fn render(self, area: Rect, buf: &mut Buffer) {
         let [header_area, main_area, footer_area] = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -248,53 +235,21 @@ impl Widget for &mut App {
 impl App {
     const HEADER_COLOR: Color = tailwind::YELLOW.c500;
     const HIGHLIGHT_COLOR: Color = tailwind::GRAY.c900;
-    // const AXIS_COLOR: Color = tailwind::BLUE.c300;
 
     fn render_services(&self, area: Rect, buf: &mut Buffer) {
         let items: Vec<ListItem> = self
-            // .mux
             .state
             .services
             .iter()
-            // .map(|i| ListItem::new(i.name.as_str()))
-            .map(|(name, service)| {
-                // .map(|service| {
-                // Paragraph::new(
-                //     Line::from(
-                //         footer_text
-                //             .iter()
-                //             .flat_map(|Keys { keys, description }| {
-                //                 [
-                //                     "   ".into(),
-                //                     keys.fg(tailwind::YELLOW.c500).bold(),
-                //                     format!(" {description}").fg(tailwind::GRAY.c500),
-                //                 ]
-                //             })
-                //             .collect::<Vec<_>>(),
-                //     )
-                //     .left_aligned(),
-                // )
-                // .wrap(ratatui::widgets::Wrap { trim: false })
-
-                // let name_span = Span::raw(&service.name);
-                // let status_style = match service.state {
-                //     State::Healthy | State::Running => Style::default().fg(tailwind::GREEN.c500),
-                //     State::Starting => Style::default().fg(tailwind::YELLOW.c500),
-                //     State::Unhealthy | State::Exited => Style::default().fg(tailwind::RED.c500),
-                // };
+            .map(|(_name, service)| {
                 let status = format!("{: >10}", state_name(service.exec_state))
                     .set_style(crate::style::service_style(service.exec_state));
-                // let fixed_latency = format!("{: <10}", service.latency);
-
-                // let status_span = Span::styled(fixed_status, status_style);
-                // let latency_span = Span::styled(fixed_latency, Style::default().fg(Color::Yellow));
 
                 // Combine into one line.
-                // let spans = Spans::from(vec![name_span, status_span, latency_span]);
                 let ports = service
                     .open_ports
                     .iter()
-                    .map(|i| format!(":{i}").fg(tailwind::GRAY.c400)); // .collect::<Vec<();
+                    .map(|i| format!(":{i}").fg(tailwind::GRAY.c400));
 
                 let line = [status, " ".into(), service.id.as_str().into()]
                     .into_iter()
@@ -308,19 +263,7 @@ impl App {
                         vec!["".into()]
                     });
 
-                // std::iter::empty()
-                // format!(" [{}]", intersperse(ports, ", ".into()).collect::<Vec<_>>()).into()
-                //     line =
-                // }
-
                 ListItem::new(Line::from_iter(line))
-                // Span::from(vec![status, service.name.into()])
-                // ListItem::new([
-                //     Line::from("left").alignment(Alignment::Left),
-                //     Line::from("center").alignment(Alignment::Center),
-                //     Line::from("right").alignment(Alignment::Right),
-                // ])
-                // ListItem::new(i.name.as_str()))
             })
             .collect();
 
@@ -332,7 +275,6 @@ impl App {
             .highlight_style(
                 Style::default()
                     .bg(Self::HIGHLIGHT_COLOR)
-                    // .fg(Color::White)
                     .add_modifier(Modifier::BOLD),
             )
             .highlight_symbol(" > ");
@@ -498,11 +440,6 @@ impl App {
             .fg(Self::HEADER_COLOR)
             .into_centered_line();
         Paragraph::new(header)
-        // .block(Block::default().borders(Borders::BOTTOM))
-        // Paragraph::new("micromux")
-        //     .alignment(Alignment::Left)
-        //     // .style(Style::default().fg(Self::HEADER_COLOR))
-        //     .block(Block::default().borders(Borders::BOTTOM))
     }
 
     fn render_footer(&self, area: Rect, buf: &mut Buffer) {
@@ -578,11 +515,7 @@ impl App {
 }
 
 pub mod log_view {
-    use color_eyre::owo_colors::Style;
-    use crossterm::event::KeyCode;
     use ratatui::{
-        Frame,
-        backend::Backend,
         buffer::Buffer,
         layout::Rect,
         widgets::{

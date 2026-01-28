@@ -22,7 +22,7 @@ unreachable      = "deny"
 unimplemented    = "deny"
 todo             = "deny"
 indexing_slicing = "deny"
-missing_errors_doc = "allow"
+missing_errors_doc = "warn"
 
 [profile.release]
 opt-level = 3
@@ -35,9 +35,10 @@ thiserror = "2"
 itertools = "0"
 rand = "0"
 indexmap = "2"
+indoc = "2"
 strum = { version = "0", features = ["derive"] }
 enum-as-inner = "0"
-# derive_more = { version = "2", features = ["from", "into", "display", "debug"] }
+parking_lot = "0"
 
 # tracing
 tracing = "0"
@@ -47,8 +48,6 @@ codespan-reporting = "0"
 
 # serde
 serde = { version = "1", features = ["derive"] }
-# TODO: remove
-# serde_yaml = "0"
 
 # async runtime
 tokio = { version = "1", features = ["full"] }

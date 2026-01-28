@@ -1,14 +1,10 @@
-use async_process::{Command, Stdio};
 use color_eyre::eyre;
-use futures::stream::StreamExt;
-use futures::{AsyncBufReadExt, channel::mpsc};
-use itertools::Itertools;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use yaml_spanned::Spanned;
 
 use crate::{
-    config::{self, HealthCheck},
+    config::{self},
     env,
     health_check::Health,
     scheduler::{ServiceID, State},
@@ -28,7 +24,7 @@ mod tests {
     use crate::config;
     use indexmap::IndexMap;
     use std::fs;
-    use std::path::Path;
+
     use std::time::{SystemTime, UNIX_EPOCH};
     use yaml_spanned::Spanned;
 
@@ -279,7 +275,6 @@ impl Service {
         Ok(Self {
             id,
             name: config.name,
-            // command: config.command.iter().map(|part| part.as_str()).join(" "),
             command: (
                 prog.into_inner(),
                 args.into_iter()
@@ -315,13 +310,6 @@ impl Service {
         self
     }
 
-    // pub fn is_healthy(&self) -> bool {
-    //     match self.health {
-    //         Some(health) => health == Health::Healthy,
-    //         None => self.state == State::Running,
-    //     }
-    // }
-
     pub async fn terminate(&mut self, timeout: Duration) -> eyre::Result<()> {
         let Some(mut process) = self.process.take() else {
             return Ok(());
@@ -335,7 +323,7 @@ impl Service {
         #[cfg(not(unix))]
         panic!("termination is not yet implemented on windows");
 
-        // wait up to 10 seconds for the child to exit gracefully.
+        // Wait up to 10 seconds for the child to exit gracefully.
         match tokio::time::timeout(timeout, process.status()).await {
             Ok(status_result) => {
                 let status = status_result?;
@@ -348,39 +336,4 @@ impl Service {
         }
         Ok(())
     }
-
-    // pub async fn spawn(&mut self) -> eyre::Result<()> {
-    //     let args: Vec<String> = shlex::split(&self.command).unwrap_or_default();
-    //     let Some((program, program_args)) = args.split_first() else {
-    //         eyre::bail!("bad command: {:?}", self.command);
-    //     };
-    //     let mut process = Command::new(program)
-    //         .args(program_args)
-    //         .stdout(Stdio::piped())
-    //         .spawn()?;
-    //
-    //     if let Some(stdout) = process.stdout.take() {
-    //         // let mut lines = tokio::io::BufReader::new(stdout).lines();
-    //         let mut lines = futures::io::BufReader::new(stdout).lines();
-    //
-    //         while let Some(line) = lines.next().await {
-    //             println!("{}", line?);
-    //         }
-    //     }
-    //
-    //     self.process = Some(process);
-    //     Ok(())
-    // }
-
-    // pub async fn run_health_check(&mut self) -> eyre::Result<()> {
-    //     let Some(health_check) = &self.health_check else {
-    //         return Ok(());
-    //     };
-    //     health_check.run(&self.id, shutdown_handle).await?;
-    //
-    //     // self.process = Some(process);
-    //     Ok(())
-    // }
-
-    // self.state_change.notify_waiters();
 }

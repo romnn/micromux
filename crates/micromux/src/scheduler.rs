@@ -5,13 +5,13 @@ use crate::{
     service::{self, Service},
 };
 use color_eyre::eyre;
-use futures::{FutureExt, SinkExt, channel::oneshot::Cancellation};
+use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, Write};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 #[cfg(unix)]
@@ -25,25 +25,19 @@ pub type ServiceID = String;
 #[derive(Debug, enum_as_inner::EnumAsInner)]
 pub enum State {
     /// Service has not yet started.
-    // #[strum(serialize = "PENDING")]
     Pending,
     Starting,
     /// Service is running.
-    // #[strum(serialize = "RUNNING")]
     Running {
-        // process: async_process::Child,
         health: Option<Health>,
     },
     /// Service is disabled.
-    // #[strum(serialize = "DISABLED")]
     Disabled,
     /// Service exited with code.
-    // #[strum(serialize = "EXITED")]
     Exited {
         exit_code: i32,
     },
     /// Service has been killed and is awaiting exit
-    // #[strum(serialize = "KILLED")]
     Killed,
 }
 
@@ -228,37 +222,6 @@ pub enum Command {
     ResizeAll { cols: u16, rows: u16 },
 }
 
-// shutdown: crate::shutdown::Shutdown,
-// mut shutdown_handle: crate::shutdown::Handle,
-// let args: Vec<String> = shlex::split(&service.command).unwrap_or_default();
-// let Some((program, program_args)) = args.split_first() else {
-//     eyre::bail!("bad command: {:?}", service.command);
-// };
-
-/// Start service.
-async fn start_service(
-    service: &Service,
-    events_tx: mpsc::Sender<Event>,
-
-    shutdown: CancellationToken,
-    terminate: CancellationToken,
-) -> eyre::Result<PtyHandles> {
-    start_service_with_pty_size(
-        service,
-        events_tx,
-        shutdown,
-        terminate,
-        portable_pty::PtySize {
-            rows: 24,
-            cols: 80,
-            pixel_width: 0,
-            pixel_height: 0,
-        },
-        true,
-    )
-    .await
-}
-
 async fn start_service_with_pty_size(
     service: &Service,
     events_tx: mpsc::Sender<Event>,
@@ -395,7 +358,7 @@ async fn start_service_with_pty_size(
                 let mut line: Vec<u8> = Vec::new();
                 let mut pending_cr = false;
 
-                let mut flush = |update: LogUpdateKind, line: &mut Vec<u8>| {
+                let flush = |update: LogUpdateKind, line: &mut Vec<u8>| {
                     if line.is_empty() {
                         return;
                     }
@@ -508,13 +471,13 @@ async fn start_service_with_pty_size(
                     _ = tokio::time::sleep(std::time::Duration::from_millis(25)) => {}
                 }
 
-                if termination_started && !hard_killed {
-                    if let Some(deadline) = kill_deadline {
-                        if tokio::time::Instant::now() >= deadline {
-                            let _ = killer.kill();
-                            hard_killed = true;
-                        }
-                    }
+                if termination_started
+                    && !hard_killed
+                    && let Some(deadline) = kill_deadline
+                    && tokio::time::Instant::now() >= deadline
+                {
+                    let _ = killer.kill();
+                    hard_killed = true;
                 }
 
                 match child.try_wait() {
@@ -586,11 +549,8 @@ async fn schedule_ready(
     current_pty_size: portable_pty::PtySize,
     restart_backoff_until: &HashMap<ServiceID, tokio::time::Instant>,
     interactive_logs: bool,
-    // events_rx: &mpsc::Receiver<Event>,
     events_tx: &mpsc::Sender<Event>,
-    ui_tx: &mpsc::Sender<Event>,
-    // broadcast_tx: &broadcast::Sender<Event>,
-    // shutdown_handle: &crate::shutdown::Handle,
+    _ui_tx: &mpsc::Sender<Event>,
     shutdown: &CancellationToken,
 ) {
     use crate::{config::DependencyCondition, service::RestartPolicy};
@@ -601,12 +561,11 @@ async fn schedule_ready(
             continue;
         }
 
-        if !restart_requested.contains(service_id) {
-            if let Some(until) = restart_backoff_until.get(service_id) {
-                if tokio::time::Instant::now() < *until {
-                    continue;
-                }
-            }
+        if !restart_requested.contains(service_id)
+            && let Some(until) = restart_backoff_until.get(service_id)
+            && tokio::time::Instant::now() < *until
+        {
+            continue;
         }
         // Compute scheduling decision using an immutable view first.
         let (should_consider_start, exited_code) = match service_state.get(service_id.as_str()) {
@@ -653,12 +612,10 @@ async fn schedule_ready(
         tracing::debug!(
             service_id,
             state = ?service_state.get(service_id.as_str()),
-            // state = ?service.state,
             "evaluating service"
         );
 
         // Only start if not already Running/Healthy
-        // if matches!(state, State::Pending | State::Exited { .. }) {
         // Find dependencies
         let mut dependencies = graph.neighbors_directed(service_id, petgraph::Incoming);
 
@@ -676,7 +633,8 @@ async fn schedule_ready(
                 Some(state) => state,
                 None => return false,
             };
-            let is_ready = match condition {
+
+            match condition {
                 DependencyCondition::ServiceStarted => {
                     matches!(state, State::Running { .. })
                 }
@@ -692,8 +650,7 @@ async fn schedule_ready(
                 DependencyCondition::ServiceCompletedSuccessfully => {
                     matches!(state, State::Exited { exit_code: 0, .. })
                 }
-            };
-            is_ready
+            }
         });
 
         if is_ready {
@@ -704,10 +661,9 @@ async fn schedule_ready(
                 if matches!(policy, RestartPolicy::OnFailure { .. })
                     && !restart_requested.contains(service_id)
                     && exit_code != 0
+                    && let Some(remaining) = restart_on_failure_remaining.get_mut(service_id)
                 {
-                    if let Some(remaining) = restart_on_failure_remaining.get_mut(service_id) {
-                        *remaining = remaining.saturating_sub(1);
-                    }
+                    *remaining = remaining.saturating_sub(1);
                 }
             }
 
@@ -748,12 +704,12 @@ pub async fn scheduler(
     services: &ServiceMap,
     mut commands_rx: mpsc::Receiver<Command>,
     mut events_rx: mpsc::Receiver<Event>,
-    mut events_tx: mpsc::Sender<Event>,
-    mut ui_tx: mpsc::Sender<Event>,
+    events_tx: mpsc::Sender<Event>,
+    ui_tx: mpsc::Sender<Event>,
     shutdown: CancellationToken,
     interactive_logs: bool,
 ) -> eyre::Result<()> {
-    let graph = ServiceGraph::new(&services)?;
+    let graph = ServiceGraph::new(services)?;
 
     let mut desired_disabled: HashSet<ServiceID> = HashSet::new();
     let mut restart_requested: HashSet<ServiceID> = HashSet::new();
@@ -788,7 +744,7 @@ pub async fn scheduler(
     // Initial scheduling pass
     tracing::debug!("started initial scheduling pass");
     schedule_ready(
-        &services,
+        services,
         &graph.inner,
         &mut service_state,
         &desired_disabled,
@@ -807,39 +763,9 @@ pub async fn scheduler(
     .await;
     tracing::debug!("completed initial scheduling pass");
 
-    // let handle_command = |service_state: &mut HashMap<String, State>, command: Command| {
-    //     tracing::debug!(?command, "received command");
-    //     match command {
-    //         Command::Restart(service_id) => {
-    //             tracing::debug!(service_id, "TODO: restart service");
-    //             service_state.get(&service_id).unwrap();
-    //         }
-    //         Command::Disable(service_id) => {
-    //             tracing::debug!(service_id, "TODO: disable service");
-    //             let service = service_state.get(&service_id).unwrap();
-    //             service.
-    //         }
-    //     }
-    //     Ok::<_, eyre::Report>(())
-    // };
-
-    // let handle_event = |service_state: &mut HashMap<String, State>, event: Event| {
-    //     tracing::debug!(%event, "received event");
-    //
-    //     update_state(services, service_state, &event);
-    //
-    //     // Forward event to the UI
-    //     ui_tx.send(event).await?;
-    //     Ok::<_, eyre::Report>(())
-    // };
-
     // Whenever an event comes in, try to (re)start any services whose deps are now healthy
-    // let mut rounds_left: usize = 3;
     loop {
         tracing::debug!("waiting for scheduling event");
-        // if rounds_left <= 0 {
-        //     break;
-        // }
         tokio::select! {
             _ = shutdown.cancelled() => {
                 tracing::debug!("exiting scheduler");
@@ -889,13 +815,7 @@ pub async fn scheduler(
                         let Some(writer) = pty_writers.get(&service_id) else {
                             continue;
                         };
-                        let mut guard = match writer.lock() {
-                            Ok(guard) => guard,
-                            Err(_) => {
-                                tracing::warn!(service_id, "pty writer lock poisoned");
-                                continue;
-                            }
-                        };
+                        let mut guard = writer.lock();
                         if let Err(err) = guard.write_all(&data) {
                             tracing::warn!(?err, service_id, "failed to write to pty");
                         }
@@ -911,13 +831,7 @@ pub async fn scheduler(
                             pixel_height: 0,
                         };
                         for (service_id, master) in pty_masters.iter() {
-                            let guard = match master.lock() {
-                                Ok(guard) => guard,
-                                Err(_) => {
-                                    tracing::warn!(service_id, "pty master lock poisoned");
-                                    continue;
-                                }
-                            };
+                            let guard = master.lock();
                             let res = guard.resize(portable_pty::PtySize {
                                 rows,
                                 cols,
@@ -935,7 +849,6 @@ pub async fn scheduler(
                 let Some(event) = event else {
                     break;
                 };
-                // handle_event(&mut service_state, event)?;
                 tracing::debug!(%event, "received event");
 
                 let service_id = event.service_id().clone();
@@ -972,7 +885,7 @@ pub async fn scheduler(
         }
 
         schedule_ready(
-            &services,
+            services,
             &graph.inner,
             &mut service_state,
             &desired_disabled,
@@ -989,7 +902,6 @@ pub async fn scheduler(
             &shutdown,
         )
         .await;
-        // rounds_left = rounds_left.saturating_sub(1);
     }
     Ok(())
 }

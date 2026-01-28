@@ -1,6 +1,6 @@
 pub mod v1;
 
-use crate::diagnostics::{self, DiagnosticExt, Span, ToDiagnostics};
+use crate::diagnostics::{DiagnosticExt, Span, ToDiagnostics};
 use crate::service::RestartPolicy;
 use codespan_reporting::diagnostic::{Diagnostic, Label};
 use indexmap::IndexMap;
@@ -43,8 +43,8 @@ pub fn parse_duration(
                 }
             })?;
             Ok(Spanned {
-                inner: duration.into(),
-                span: value.span().clone(),
+                inner: duration,
+                span: *value.span(),
             })
         })
         .transpose()
@@ -148,7 +148,6 @@ pub struct EnvFile {
 pub struct Service {
     pub name: Spanned<String>,
     pub command: (Spanned<String>, Vec<Spanned<String>>),
-    // pub command: Spanned<Vec<String>>,
     pub working_dir: Option<Spanned<String>>,
     pub env_file: Vec<EnvFile>,
     pub environment: IndexMap<Spanned<String>, Spanned<String>>,
@@ -157,8 +156,6 @@ pub struct Service {
     pub ports: Vec<Spanned<String>>,
     pub restart: Option<RestartPolicy>,
     pub color: Option<Spanned<bool>>,
-    // ports, inputs, watch, restart policy
-    // You can add more fields such as ports, volumes, etc.
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -251,12 +248,13 @@ impl ToDiagnostics for ConfigError {
                 ];
                 match reason {
                     InvalidCommandReason::FailedToSplit => {
-                        diagnostics
-                            .push(Diagnostic::help().with_message(format!("try using a sequence")));
+                        diagnostics.push(
+                            Diagnostic::help().with_message("try using a sequence".to_string()),
+                        );
                     }
                     InvalidCommandReason::EmptyCommand => {
                         diagnostics.push(
-                            Diagnostic::help().with_message(format!("use a non-empty command")),
+                            Diagnostic::help().with_message("use a non-empty command".to_string()),
                         );
                     }
                 }
@@ -362,7 +360,7 @@ pub fn from_str<F: Copy + PartialEq>(
     strict: Option<bool>,
     diagnostics: &mut Vec<Diagnostic<F>>,
 ) -> Result<ConfigFile<F>, ConfigError> {
-    let value = yaml_spanned::from_str(&raw_config).map_err(ConfigError::YAML)?;
+    let value = yaml_spanned::from_str(raw_config).map_err(ConfigError::YAML)?;
     let version = parse_version(&value, file_id, strict, diagnostics)?;
     let config = match version {
         Version::Latest | Version::V1 => v1::parse_config(&value, file_id, strict, diagnostics)?,
@@ -378,34 +376,36 @@ pub fn from_str<F: Copy + PartialEq>(
 #[cfg(test)]
 mod tests {
     use color_eyre::eyre;
+    use indoc::indoc;
 
     #[test]
     fn parse_config() -> eyre::Result<()> {
-        let yaml = r#"
-version: "3"
-services:
-  app:
-    command: "./start.sh"
-    environment:
-      APP_ENV: production
-      APP_DEBUG: "false"
-    depends_on:
-      - db
-    healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost/health || exit 1"]
-      interval: "30s"
-      timeout: "10s"
-      retries: 3
-  db:
-    environment:
-      POSTGRES_PASSWORD: example
-    healthcheck:
-      test: ["CMD", "pg_isready", "-U", "postgres"]
-      interval: "10s"
-      timeout: "5s"
-      retries: 5
-"#;
+        let _yaml = indoc! {r#"
+            version: "3"
+            services:
+              app:
+                command: "./start.sh"
+                environment:
+                  APP_ENV: production
+                  APP_DEBUG: "false"
+                depends_on:
+                  - db
+                healthcheck:
+                  test: ["CMD-SHELL", "curl -f http://localhost/health || exit 1"]
+                  interval: "30s"
+                  timeout: "10s"
+                  retries: 3
+              db:
+                environment:
+                  POSTGRES_PASSWORD: example
+                healthcheck:
+                  test: ["CMD", "pg_isready", "-U", "postgres"]
+                  interval: "10s"
+                  timeout: "5s"
+                  retries: 5
+        "#};
 
+        // TODO: complete this test
         // let config = super::from_str(yaml)?;
         // println!("{:#?}", config);
         Ok(())

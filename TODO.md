@@ -243,6 +243,166 @@ A solid structure (still close to your crates) is:
 - **Completed**: deep repo mapping and identification of the highest-risk bugs/gaps + a concrete v1 milestone plan (grounded in [TODO.md](cci:7://file:///home/roman/dev/micromux/TODO.md:0:0-0:0)).
 - **Next step**: I can start implementing **Milestone 1** (graph fix, diagnostics output, signal wiring, keybind fix) to stabilize the baseline before the engine refactor.
 
+# Lock down before v1 TODO's
+
+I’ll do a fresh, end-to-end architecture review by (1) mapping the current crate/module boundaries and runtime data flow (CLI → config/diagnostics → core scheduler/healthchecks → TUI), (2) identifying coupling/ownership issues and “missing abstraction” hotspots, and (3) proposing a small, high-leverage plan to “lock down” the architecture before the final lint/docs/tests pass. I’m going to inspect the relevant entry points and core modules first.
+
+
+
+I’ll base the review on the actual code boundaries and call graph: `micromux-cli` currently owns process startup, config discovery + parsing + diagnostics emission, then spawns the `micromux` scheduler and the `micromux-tui` event loop. Next I’ll inspect `micromux`’s config/service/env/healthcheck modules and the TUI state/render split to evaluate separation of concerns and identify any “lock-down before polish” refactors that are worth doing.
+
+
+
+
+
+
+
+# Architecture Review (Micromux CLI + Core + TUI)
+
+## Current high-level structure (as it exists today)
+
+- **`micromux-cli`**
+  - Owns: CLI options parsing, signal handling, config discovery, config file I/O, diagnostics emission, logging setup, and wiring together TUI + engine.
+  - Starts two async “subsystems”:
+    - **Engine**: [Micromux::start_with_options(...)](cci:1://file:///home/roman/dev/micromux/crates/micromux/src/lib.rs:59:4-89:5) (spawns scheduler)
+    - **UI**: `micromux_tui::App::render()/run()`
+
+- **`micromux` (core crate)**
+  - Owns:
+    - **Configuration layer**: `config::{from_str, v1, ConfigError->Diagnostics}`
+    - **Diagnostics**: `diagnostics::Printer` and `ToDiagnostics`
+    - **Runtime model**: [service::Service](cci:2://file:///home/roman/dev/micromux/crates/micromux/src/config/mod.rs:147:0-158:1) (resolved config + env + ports)
+    - **Runtime engine**: [scheduler](cci:1://file:///home/roman/dev/micromux/crates/micromux/src/scheduler.rs:702:0-906:1) (event loop, restart/disable/enable, PTY spawning, log streaming, termination)
+    - **Runtime sidecars**: `health_check` (spawning + supervision), `graph` (dependency graph), `env` (dotenv + expansion)
+
+- **`micromux-tui`**
+  - Owns:
+    - **UI state**: `state::{State, Service, HealthCheckAttempt}`
+    - **Rendering**: `render` (widgets, log view, scrollbar logic)
+    - **Input**: `event::InputHandler`
+  - Consumes `micromux::scheduler::{Event, Command}` and emits commands back to core.
+
+## What’s already *good* (and worth preserving)
+
+- **Clear integration boundary**
+  - The `Event`/`Command` channel boundary between “engine” and “UI” is a strong separation point. It’s the most valuable architectural choice in the repo.
+
+- **Config/diagnostics quality**
+  - The parsing pipeline (`yaml_spanned` → `ConfigError` → `ToDiagnostics`) is cohesive and testable. This is a good foundation to “lock down”.
+
+- **Environment semantics live in one place**
+  - [env.rs](cci:7://file:///home/roman/dev/micromux/crates/micromux/src/env.rs:0:0-0:0) encapsulates dotenv parsing + single-pass expansion. That’s a clean, reusable unit.
+
+- **Scheduler owns process lifecycle**
+  - The scheduler uses PTYs and a consistent “emit events” model. Healthchecks integrate through the same event stream (nice uniformity).
+
+## Main architectural risks / coupling issues (high value to fix *before* “locking down”)
+
+### 1) **`micromux` public API surface is not intentionally designed**
+Right now [micromux/src/lib.rs](cci:7://file:///home/roman/dev/micromux/crates/micromux/src/lib.rs:0:0-0:0) exports many modules (`pub mod ...`) and re-exports `CancellationToken`. This makes it hard to know what is “stable” vs “internal detail”, and it increases refactor cost later.
+
+- **Why it matters**
+  - If you “lock down” now, you’ll lock down accidental APIs.
+  - Tests and other crates may keep reaching into internals because it’s convenient.
+
+### 2) **[scheduler.rs](cci:7://file:///home/roman/dev/micromux/crates/micromux/src/scheduler.rs:0:0-0:0) is a monolith**
+[scheduler.rs](cci:7://file:///home/roman/dev/micromux/crates/micromux/src/scheduler.rs:0:0-0:0) currently owns:
+- event/command types
+- dependency evaluation logic
+- restart/disable policy logic
+- PTY spawning + IO threads
+- shutdown/termination sequencing
+- event loop coordination
+
+- **Why it matters**
+  - This is already the “complexity hotspot”.
+  - It will become the main brake on maintainability and adding new features (JSON output mode, multiple UIs, different runners, etc.).
+  - Testing gets harder because logic isn’t separated into testable units.
+
+### 3) **Mixed “config model” and “runtime behavior”**
+Two examples:
+- `impl crate::config::HealthCheck { run_loop / run }` attaches runtime behavior directly to a config struct.
+- [service::Service](cci:2://file:///home/roman/dev/micromux/crates/micromux/src/config/mod.rs:147:0-158:1) contains runtime-ish fields (`state`, `health`, `process`) but the scheduler also maintains *separate* state (`service_state: HashMap<ServiceID, State>`), and PTY process lifecycle is largely handled outside of [Service](cci:2://file:///home/roman/dev/micromux/crates/micromux/src/config/mod.rs:147:0-158:1).
+
+- **Why it matters**
+  - It blurs ownership. It’s not obvious what the canonical state is.
+  - It makes it harder to eventually support alternative execution backends (non-PTY, remote execution, etc.).
+  - It’s easy to regress invariants because “the truth” is duplicated.
+
+### 4) **TUI depends on strong invariants but encodes them with `unwrap()`**
+The TUI frequently does `get_mut(...).unwrap()` for service lookups. That’s a correctness risk (and will fight clippy rules), and it couples the UI to assumptions that aren’t expressed in types.
+
+- **Why it matters**
+  - For “lock down”, you want invariants explicit:
+    - either via APIs that guarantee existence
+    - or via graceful handling of missing state (e.g. ignore events for unknown service)
+
+## Are we ready to lock it down?
+
+**Almost, but not yet.** The channel boundary (`Event`/`Command`) is strong enough to keep, but the *internal layering* inside `micromux` is still too “accidental”:
+- public surface is too broad
+- scheduler is too large
+- config vs runtime boundaries are blurred
+
+I’d strongly recommend doing **two “high leverage” refactors** before you declare the architecture stable.
+
+# Proposed plan (high value, minimal churn, sets us up for lint/docs/tests)
+
+## Phase 1 (must-do): define the *intended* core API surface (lock this down)
+- **Goal**
+  - Decide what `micromux` promises externally (to CLI/TUI/other future frontends).
+- **Concrete changes**
+  - **Keep public**:
+    - [Micromux](cci:2://file:///home/roman/dev/micromux/crates/micromux/src/lib.rs:19:0-22:1) (or rename to `Engine` / `Runtime`)
+    - `CancellationToken` (or accept it as dependency boundary)
+    - `scheduler::{Event, Command, ServiceID}` (or move to `engine::protocol`)
+    - `config::{from_str, find_config_file, ConfigFile, ConfigError}` (if you want core to own config parsing)
+  - **Make internal (`pub(crate)`)**:
+    - low-level scheduler helpers, PTY internals, log parsing helpers
+    - possibly `env` (unless you consider it a supported public API)
+- **Payoff**
+  - Lets you refactor internals freely later.
+  - Prevents the CLI/TUI from “reaching into internals” during future feature work.
+
+## Phase 2 (must-do): split scheduler into modules (no behavior change)
+- **Target structure (example)**
+  - `scheduler/mod.rs` (main loop orchestration)
+  - `scheduler/types.rs` (`Event`, `Command`, [State](cci:2://file:///home/roman/dev/micromux/crates/micromux-tui/src/state.rs:61:0-65:1), `OutputStream`, `LogUpdateKind`)
+  - `scheduler/pty.rs` (spawn PTY process, log streaming, input writing, resizing)
+  - `scheduler/deps.rs` (dependency satisfaction evaluation)
+  - `scheduler/restart.rs` (backoff + restart policy)
+- **Payoff**
+  - Adds testable seams.
+  - Makes correctness work (timeouts, termination, races) much easier to reason about.
+
+## Phase 3 (high-value, medium scope): clarify config vs runtime ownership
+Pick one of these directions:
+
+- **Option A (least invasive)**: keep [Service](cci:2://file:///home/roman/dev/micromux/crates/micromux/src/config/mod.rs:147:0-158:1) mostly as “resolved config”, and keep runtime state *only* in scheduler-owned structs.
+  - Remove/avoid fields in [Service](cci:2://file:///home/roman/dev/micromux/crates/micromux/src/config/mod.rs:147:0-158:1) that look runtime-owned (`state`, `health`, `process`) unless they’re actually used and canonical.
+  - Move healthcheck execution into a runtime module (e.g. `healthcheck_runner`) rather than an `impl` on the config type.
+
+- **Option B (more explicit)**: introduce `ResolvedService` + `RunningService` types.
+  - `ResolvedService`: immutable, resolved paths/env/ports/command/working_dir.
+  - `RunningService`: has handles (pty, killer, pgid, termination token, etc.) and current state.
+
+**Payoff**
+- Removes duplicated “truth”.
+- Makes alternate UIs and future non-TUI outputs easier.
+
+## Phase 4 (cleanup-friendly): small TUI hardening pass
+- Replace `unwrap()`-based lookups with:
+  - `if let Some(service) = ... { ... }` or
+  - a small accessor that returns `Result<&mut Service, eyre::Report>` without unwrap/expect.
+- Add a single translation point from `scheduler::Event` → `tui::state` updates (a “reducer”), so rendering code doesn’t also become state logic.
+
+# Recommendation on “locking down”
+If you do **Phase 1 + Phase 2**, I’d say you’re in a good place to “lock down” the architecture and then proceed to the final pass (lint/docs/tests). Phase 3 is high-value but can be staged if you want to minimize churn; however, I’d at least decide which direction you want *now*, because it affects how you split scheduler and what you expose publicly.
+
+---
+
+If you want, I can take the lead implementing **Phase 1 (API boundary)** first, since it’s the smallest change with the highest long-term payoff.
+
 # Previous TODOs
 
 - smoothly handle transitions between desired and actual state.
