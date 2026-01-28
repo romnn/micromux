@@ -172,7 +172,6 @@ impl App {
         let (num_lines, current_logs) = current_service.logs.full_text();
         tracing::trace!(
             service_id = current_service.id,
-            current_logs,
             num_lines,
             "collected logs"
         );
@@ -226,6 +225,10 @@ impl App {
         let footer_text = [
             Keys::new("↑/↓", "Navigate"),
             Keys::new("←/→", "Resize"),
+            Keys::new("Tab", "Focus"),
+            Keys::new("a", "Attach"),
+            Keys::new("w", "Wrap"),
+            Keys::new("t", "Tail"),
             Keys::new("r", "Restart"),
             Keys::new("R", "Restart All"),
             Keys::new("d", "Disable"),

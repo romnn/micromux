@@ -19,6 +19,7 @@ indexmap.workspace = true
 async-process = "2"
 shlex = "1"
 nix = { version = "0", features = ["signal"] }
+portable-pty = "0.9"
 
 # graph
 petgraph = "0"
@@ -28,6 +29,7 @@ directories = "6"
 
 # config parsing
 humantime = "2"
+shellexpand = "3"
 
 # tracing
 tracing.workspace = true

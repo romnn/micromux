@@ -4,6 +4,7 @@
 pub mod bounded_log;
 pub mod config;
 pub mod diagnostics;
+pub mod env;
 pub mod graph;
 pub mod health_check;
 pub mod scheduler;
@@ -42,18 +43,17 @@ impl Micromux {
         config_file: config::ConfigFile<diagnostics::FileId>,
         // shutdown: Shutdown,
     ) -> eyre::Result<Self> {
+        let config_dir = config_file.config_dir.clone();
         let services = config_file
             .config
             .services
             .iter()
             .map(|(name, service_config)| {
-                (
-                    // name.clone(),
-                    name.as_ref().to_string(),
-                    Service::new(name.as_ref().clone(), service_config.clone()),
-                )
+                let service_id = name.as_ref().to_string();
+                let service = Service::new(name.as_ref().clone(), &config_dir, service_config.clone())?;
+                Ok::<_, eyre::Report>((service_id, service))
             })
-            .collect();
+            .collect::<Result<ServiceMap, _>>()?;
 
         // build graph
         // let graph = graph::ServiceGraph::new(&config_file.config)?;
@@ -74,12 +74,12 @@ impl Micromux {
     pub async fn start(
         &self,
         ui_tx: mpsc::Sender<scheduler::Event>,
+        commands_rx: mpsc::Receiver<scheduler::Command>,
         shutdown: CancellationToken,
     ) -> eyre::Result<()> {
         // mpsc::Sender<Command>
         tracing::info!("starting");
         let (events_tx, events_rx) = mpsc::channel(1024);
-        let (commands_tx, commands_rx) = mpsc::channel(1024);
 
         // TODO: change this to be a mpsc too
         // let (broadcast_tx, broadcast_rx) = tokio::sync::broadcast::channel(1024);

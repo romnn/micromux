@@ -107,11 +107,29 @@ pub struct ConfigFile<F> {
     pub config: Config,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 pub enum DependencyCondition {
     #[default]
+    #[serde(
+        rename = "service_started",
+        alias = "service-started",
+        alias = "ServiceStarted",
+        alias = "started"
+    )]
     ServiceStarted,
+    #[serde(
+        rename = "service_healthy",
+        alias = "service-healthy",
+        alias = "ServiceHealthy",
+        alias = "healthy"
+    )]
     ServiceHealthy,
+    #[serde(
+        rename = "service_completed_successfully",
+        alias = "service-completed-successfully",
+        alias = "ServiceCompletedSuccessfully",
+        alias = "completed"
+    )]
     ServiceCompletedSuccessfully,
 }
 
@@ -123,8 +141,7 @@ pub struct Dependency {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnvFile {
-    pub name: Spanned<String>,
-    pub condition: Option<DependencyCondition>,
+    pub path: Spanned<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -136,7 +153,7 @@ pub struct Service {
     pub environment: IndexMap<Spanned<String>, Spanned<String>>,
     pub depends_on: Vec<Dependency>,
     pub healthcheck: Option<HealthCheck>,
-    pub ports: Vec<u16>,
+    pub ports: Vec<Spanned<String>>,
     pub restart: Option<RestartPolicy>,
     pub color: Option<Spanned<bool>>,
     // ports, inputs, watch, restart policy
@@ -189,6 +206,11 @@ pub enum ConfigError {
         message: String,
         expected: Vec<yaml_spanned::value::Kind>,
         found: yaml_spanned::value::Kind,
+        span: Span,
+    },
+    #[error("{message}")]
+    InvalidValue {
+        message: String,
         span: Span,
     },
     #[error("{source}")]
@@ -284,6 +306,13 @@ impl ToDiagnostics for ConfigError {
                     ))]);
                 vec![diagnostic]
             }
+            Self::InvalidValue { message, span } => vec![
+                Diagnostic::error()
+                    .with_message(message.to_string())
+                    .with_labels(vec![
+                        Label::primary(file_id, span.clone()).with_message(message.to_string()),
+                    ]),
+            ],
             Self::Serde { source, span } => vec![
                 Diagnostic::error()
                     .with_message(self.to_string())

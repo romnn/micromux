@@ -31,7 +31,6 @@ pub fn setup<'a>(
                 .write(true)
                 .truncate(true)
                 .open(path)?;
-            dbg!(&path);
             tracing_appender::non_blocking(log_file)
         }
     };
@@ -51,8 +50,6 @@ pub fn setup<'a>(
         )
         .collect::<Vec<String>>()
         .join(",");
-
-    dbg!(&default_log_directive);
     let default_env_filter = tracing_subscriber::filter::EnvFilter::builder()
         .with_regex(true)
         .with_default_directive(default_log_level.into())

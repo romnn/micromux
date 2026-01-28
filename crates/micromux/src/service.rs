@@ -3,11 +3,13 @@ use color_eyre::eyre;
 use futures::stream::StreamExt;
 use futures::{AsyncBufReadExt, channel::mpsc};
 use itertools::Itertools;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use yaml_spanned::Spanned;
 
 use crate::{
     config::{self, HealthCheck},
+    env,
     health_check::Health,
     scheduler::{ServiceID, State},
 };
@@ -52,6 +54,8 @@ pub struct Service {
     pub command: (String, Vec<String>),
     pub restart_policy: RestartPolicy,
     pub depends_on: Vec<config::Dependency>,
+    pub env_files: Vec<PathBuf>,
+    pub environment: indexmap::IndexMap<String, String>,
     pub health_check: Option<config::HealthCheck>,
     pub state: State,
     pub health: Option<Health>,
@@ -61,10 +65,61 @@ pub struct Service {
 }
 
 impl Service {
-    pub fn new(id: impl Into<ServiceID>, config: config::Service) -> Self {
+    pub fn new(
+        id: impl Into<ServiceID>,
+        config_dir: &Path,
+        config: config::Service,
+    ) -> eyre::Result<Self> {
         let (prog, args) = config.command;
-        Self {
-            id: id.into(),
+        let id: ServiceID = id.into();
+
+        let env_files = config
+            .env_file
+            .iter()
+            .map(|env_file| env::resolve_path(config_dir, env_file.path.as_ref()))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let base_env: std::collections::HashMap<String, String> = std::env::vars().collect();
+        let env_file_env = env::load_env_files_sync(&env_files)?;
+        let env_file_env = env::expand_env_values(&env_file_env, &base_env);
+
+        let mut base_with_env_file = base_env.clone();
+        for (k, v) in env_file_env.iter() {
+            base_with_env_file.insert(k.clone(), v.clone());
+        }
+
+        let mut config_env_map = env::EnvMap::new();
+        for (k, v) in config.environment.iter() {
+            config_env_map.insert(k.as_ref().to_string(), v.as_ref().to_string());
+        }
+        let config_env_map = env::expand_env_values(&config_env_map, &base_with_env_file);
+
+        let mut full_env = base_with_env_file.clone();
+        for (k, v) in config_env_map.iter() {
+            full_env.insert(k.clone(), v.clone());
+        }
+
+        let open_ports = config
+            .ports
+            .iter()
+            .map(|port| {
+                let expanded = env::interpolate_str(port.as_ref(), &full_env);
+                expanded
+                    .parse::<u16>()
+                    .map_err(|err| eyre::eyre!("invalid port `{}`: {err}", expanded))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut environment = indexmap::IndexMap::new();
+        for (k, v) in env_file_env.iter() {
+            environment.insert(k.clone(), v.clone());
+        }
+        for (k, v) in config_env_map.iter() {
+            environment.insert(k.clone(), v.clone());
+        }
+
+        Ok(Self {
+            id,
             name: config.name,
             // command: config.command.iter().map(|part| part.as_str()).join(" "),
             command: (
@@ -73,15 +128,17 @@ impl Service {
                     .map(|value| value.to_string())
                     .collect::<Vec<_>>(),
             ),
-            open_ports: config.ports.clone(),
+            open_ports,
             restart_policy: config.restart.unwrap_or_default(),
             depends_on: config.depends_on,
+            env_files,
+            environment,
             health_check: config.healthcheck,
             state: State::Pending,
             health: None,
             process: None,
             enable_color: config.color.as_deref().copied().unwrap_or(true),
-        }
+        })
     }
 
     pub fn with_state(mut self, state: impl Into<State>) -> Self {

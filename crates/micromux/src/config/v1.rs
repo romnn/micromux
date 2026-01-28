@@ -2,12 +2,202 @@ use super::{Config, ConfigError, Service, UiConfig, parse, parse_duration, parse
 use crate::{
     config::InvalidCommandReason,
     diagnostics::{self, DiagnosticExt, DisplayRepr, Span},
+    service::RestartPolicy,
 };
 use codespan_reporting::diagnostic::{Diagnostic, Label};
 use indexmap::IndexMap;
 use itertools::Itertools;
 use std::path::{Path, PathBuf};
 use yaml_spanned::{Mapping, Sequence, Spanned, Value, value::Kind};
+
+fn parse_string_value(
+    value: &yaml_spanned::Spanned<Value>,
+    message: &str,
+) -> Result<String, ConfigError> {
+    match &value.inner {
+        Value::String(s) => Ok(s.clone()),
+        Value::Number(n) => Ok(n.to_string()),
+        Value::Bool(b) => Ok(b.to_string()),
+        other => Err(ConfigError::UnexpectedType {
+            message: message.to_string(),
+            expected: vec![Kind::String, Kind::Number, Kind::Bool],
+            found: other.kind(),
+            span: value.span().into(),
+        }),
+    }
+}
+
+fn parse_environment(mapping: &yaml_spanned::Mapping) -> Result<IndexMap<Spanned<String>, Spanned<String>>, ConfigError> {
+    let Some(value) = mapping.get("environment") else {
+        return Ok(IndexMap::new());
+    };
+    let (_span, env_mapping) = expect_mapping(value, "environment must be a mapping".into())?;
+
+    let mut env = IndexMap::new();
+    for (k, v) in env_mapping.iter() {
+        let key = parse::<String>(k)?;
+        let raw = parse_string_value(v, "environment values must be scalar")?;
+        env.insert(
+            key,
+            Spanned {
+                span: v.span.clone(),
+                inner: raw,
+            },
+        );
+    }
+    Ok(env)
+}
+
+fn parse_env_file(mapping: &yaml_spanned::Mapping) -> Result<Vec<super::EnvFile>, ConfigError> {
+    let Some(value) = mapping.get("env_file") else {
+        return Ok(vec![]);
+    };
+    let seq = expect_sequence(value, "env_file must be a sequence".into())?;
+    let mut env_files = vec![];
+    for item in seq.iter() {
+        match item {
+            Spanned {
+                span,
+                inner: Value::String(path),
+            } => {
+                env_files.push(super::EnvFile {
+                    path: Spanned {
+                        span: span.clone(),
+                        inner: path.clone(),
+                    },
+                });
+            }
+            Spanned {
+                span: _,
+                inner: Value::Mapping(m),
+            } => {
+                let Some(path_value) = m.get("path") else {
+                    return Err(ConfigError::MissingKey {
+                        key: "path".to_string(),
+                        message: "env_file entries must have a 'path'".to_string(),
+                        span: item.span().into(),
+                    });
+                };
+                let (path_span, path) = expect_string(path_value, "env_file.path must be a string".into())?;
+                env_files.push(super::EnvFile {
+                    path: Spanned {
+                        span: path_span.clone(),
+                        inner: path.clone(),
+                    },
+                });
+            }
+            _ => {
+                return Err(ConfigError::UnexpectedType {
+                    message: "env_file entries must be a string or mapping".to_string(),
+                    expected: vec![Kind::String, Kind::Mapping],
+                    found: item.kind(),
+                    span: item.span().into(),
+                });
+            }
+        }
+    }
+    Ok(env_files)
+}
+
+fn parse_depends_on(mapping: &yaml_spanned::Mapping) -> Result<Vec<super::Dependency>, ConfigError> {
+    let Some(value) = mapping.get("depends_on") else {
+        return Ok(vec![]);
+    };
+    let seq = expect_sequence(value, "depends_on must be a sequence".into())?;
+    let mut deps = vec![];
+    for item in seq.iter() {
+        match item {
+            Spanned {
+                span,
+                inner: Value::String(name),
+            } => {
+                deps.push(super::Dependency {
+                    name: Spanned {
+                        span: span.clone(),
+                        inner: name.clone(),
+                    },
+                    condition: None,
+                });
+            }
+            Spanned {
+                span: _,
+                inner: Value::Mapping(m),
+            } => {
+                let Some(name_value) = m.get("name") else {
+                    return Err(ConfigError::MissingKey {
+                        key: "name".to_string(),
+                        message: "depends_on entries must have a 'name'".to_string(),
+                        span: item.span().into(),
+                    });
+                };
+                let name = parse::<String>(name_value)?;
+                let condition = parse_optional::<super::DependencyCondition>(m.get("condition"))?;
+                deps.push(super::Dependency { name, condition });
+            }
+            _ => {
+                return Err(ConfigError::UnexpectedType {
+                    message: "depends_on entries must be a string or mapping".to_string(),
+                    expected: vec![Kind::String, Kind::Mapping],
+                    found: item.kind(),
+                    span: item.span().into(),
+                });
+            }
+        }
+    }
+    Ok(deps)
+}
+
+fn parse_ports(mapping: &yaml_spanned::Mapping) -> Result<Vec<Spanned<String>>, ConfigError> {
+    let Some(value) = mapping.get("ports") else {
+        return Ok(vec![]);
+    };
+    let seq = expect_sequence(value, "ports must be a sequence".into())?;
+    let mut ports = vec![];
+    for item in seq.iter() {
+        let raw = parse_string_value(item, "ports entries must be a scalar")?;
+        ports.push(Spanned {
+            span: item.span.clone(),
+            inner: raw,
+        });
+    }
+    Ok(ports)
+}
+
+fn parse_restart(mapping: &yaml_spanned::Mapping) -> Result<Option<RestartPolicy>, ConfigError> {
+    let Some(value) = mapping.get("restart") else {
+        return Ok(None);
+    };
+    let raw = parse_string_value(value, "restart must be a string")?;
+    let normalized = raw.trim().to_ascii_lowercase();
+    let policy = match normalized.as_str() {
+        "always" => RestartPolicy::Always,
+        "unless-stopped" | "unless_stopped" => RestartPolicy::UnlessStopped,
+        "never" | "no" => RestartPolicy::Never,
+        _ => {
+            let prefix = "on-failure";
+            if let Some(rest) = normalized.strip_prefix(prefix).or_else(|| normalized.strip_prefix("on_failure")) {
+                let rest = rest.trim_start_matches([':', '=']).trim();
+                let attempts = if rest.is_empty() {
+                    1
+                } else {
+                    rest.parse::<usize>().map_err(|_| ConfigError::InvalidValue {
+                        message: format!("invalid restart policy `{raw}`"),
+                        span: value.span().into(),
+                    })?
+                };
+                RestartPolicy::OnFailure {
+                    remaining_attempts: attempts,
+                }
+            } else {
+                return Err(ConfigError::InvalidValue {
+                    message: format!("invalid restart policy `{raw}`"),
+                    span: value.span().into(),
+                });
+            }
+        }
+    };
+    Ok(Some(policy))
+}
 
 pub fn expect_sequence<'a>(
     value: &'a yaml_spanned::Spanned<Value>,
@@ -292,15 +482,22 @@ pub fn parse_service<F>(
         Some(value) => parse_command(value),
     }?;
     let healthcheck = parse_health_check(mapping)?;
+
+    let env_file = parse_env_file(mapping)?;
+    let environment = parse_environment(mapping)?;
+    let depends_on = parse_depends_on(mapping)?;
+    let ports = parse_ports(mapping)?;
+    let restart = parse_restart(mapping)?;
+
     Ok(Service {
         name,
         command,
-        env_file: vec![],
-        environment: IndexMap::default(),
-        depends_on: vec![],
+        env_file,
+        environment,
+        depends_on,
         healthcheck,
-        restart: None,
-        ports: vec![],
+        restart,
+        ports,
         color,
     })
 }

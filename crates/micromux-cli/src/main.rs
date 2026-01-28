@@ -20,6 +20,34 @@ async fn main() -> eyre::Result<()> {
 
     let shutdown = micromux::CancellationToken::new();
 
+    // Wire OS shutdown signals into the shared cancellation token.
+    tokio::spawn({
+        let shutdown = shutdown.clone();
+        async move {
+            let ctrl_c = async {
+                let _ = tokio::signal::ctrl_c().await;
+            };
+
+            #[cfg(unix)]
+            let terminate = async {
+                use tokio::signal::unix::{SignalKind, signal};
+                if let Ok(mut sigterm) = signal(SignalKind::terminate()) {
+                    sigterm.recv().await;
+                }
+            };
+
+            #[cfg(not(unix))]
+            let terminate = std::future::pending::<()>();
+
+            tokio::select! {
+                () = ctrl_c => {},
+                () = terminate => {},
+            }
+
+            shutdown.cancel();
+        }
+    });
+
     // setup logging to a log file
     let project_dir =
         micromux::project_dir().ok_or_else(|| eyre::eyre!("failed to create project directory"))?;
@@ -72,12 +100,10 @@ async fn main() -> eyre::Result<()> {
         Err(err) => {
             use micromux::diagnostics::ToDiagnostics;
             diagnostics.extend(err.to_diagnostics(file_id));
-            // print them
-            return Ok(());
-            // Ok::<_, eyre::Report>((, diagnostics))
+            None
         }
         // Ok(valid_configs) => Ok::<_, eyre::Report>((valid_configs, diagnostics)),
-        Ok(config) => config,
+        Ok(config) => Some(config),
     };
 
     // emit diagnostics
@@ -87,19 +113,21 @@ async fn main() -> eyre::Result<()> {
     for diagnostic in diagnostics.into_iter() {
         diagnostic_printer.emit(&diagnostic).await?;
     }
+    let Some(config) = config else {
+        eyre::bail!("failed to parse config");
+    };
     if has_error {
         eyre::bail!("failed to parse config");
     }
 
-    dbg!(&config);
-
     let (ui_tx, ui_rx) = mpsc::channel(1024);
+    let (commands_tx, commands_rx) = mpsc::channel(1024);
     let mux = micromux::Micromux::new(config)?;
     // let mux = Arc::new(mux);
-    let tui = micromux_tui::App::new(&mux.services, ui_rx, shutdown.clone());
+    let tui = micromux_tui::App::new(&mux.services, ui_rx, commands_tx, shutdown.clone());
     let mux_handle = tokio::task::spawn({
         // let mux = Arc::clone(&app.mux);
-        async move { mux.start(ui_tx, shutdown.clone()).await }
+        async move { mux.start(ui_tx, commands_rx, shutdown.clone()).await }
     });
     let (render_res, mux_res) = futures::join!(tui.render(), mux_handle);
     render_res?;

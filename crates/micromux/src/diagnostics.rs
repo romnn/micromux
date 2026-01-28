@@ -65,13 +65,12 @@ impl Printer {
         } else {
             tracing::warn!("{:?}", diagnostic);
         };
-        Ok(())
-        // use term::views::{RichDiagnostic, ShortDiagnostic};
-        //
-        // let mut renderer = Renderer::new(writer, config);
-        // match config.display_style {
-        //     DisplayStyle::Rich => {
-        //         RichDiagnostic::new(diagnostic, config).render(files, &mut renderer)
+        term::emit(
+            &mut self.writer.lock(),
+            &self.diagnostic_config,
+            &*self.files.read().await,
+            diagnostic,
+        )
         //     }
         //     DisplayStyle::Medium => {
         //         ShortDiagnostic::new(diagnostic, true).render(files, &mut renderer)
