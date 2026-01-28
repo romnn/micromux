@@ -27,7 +27,9 @@ fn parse_string_value(
     }
 }
 
-fn parse_environment(mapping: &yaml_spanned::Mapping) -> Result<IndexMap<Spanned<String>, Spanned<String>>, ConfigError> {
+fn parse_environment(
+    mapping: &yaml_spanned::Mapping,
+) -> Result<IndexMap<Spanned<String>, Spanned<String>>, ConfigError> {
     let Some(value) = mapping.get("environment") else {
         return Ok(IndexMap::new());
     };
@@ -52,9 +54,9 @@ fn parse_env_file(mapping: &yaml_spanned::Mapping) -> Result<Vec<super::EnvFile>
     let Some(value) = mapping.get("env_file") else {
         return Ok(vec![]);
     };
-    let seq = expect_sequence(value, "env_file must be a sequence".into())?;
     let mut env_files = vec![];
-    for item in seq.iter() {
+
+    let mut push_item = |item: &Spanned<Value>| -> Result<(), ConfigError> {
         match item {
             Spanned {
                 span,
@@ -78,7 +80,8 @@ fn parse_env_file(mapping: &yaml_spanned::Mapping) -> Result<Vec<super::EnvFile>
                         span: item.span().into(),
                     });
                 };
-                let (path_span, path) = expect_string(path_value, "env_file.path must be a string".into())?;
+                let (path_span, path) =
+                    expect_string(path_value, "env_file.path must be a string".into())?;
                 env_files.push(super::EnvFile {
                     path: Spanned {
                         span: path_span.clone(),
@@ -95,11 +98,34 @@ fn parse_env_file(mapping: &yaml_spanned::Mapping) -> Result<Vec<super::EnvFile>
                 });
             }
         }
+        Ok(())
+    };
+
+    match &value.inner {
+        Value::Sequence(seq) => {
+            for item in seq.iter() {
+                push_item(item)?;
+            }
+        }
+        Value::String(_) | Value::Mapping(_) => {
+            push_item(value)?;
+        }
+        other => {
+            return Err(ConfigError::UnexpectedType {
+                message: "env_file must be a sequence, string, or mapping".to_string(),
+                expected: vec![Kind::Sequence, Kind::String, Kind::Mapping],
+                found: other.kind(),
+                span: value.span().into(),
+            });
+        }
     }
+
     Ok(env_files)
 }
 
-fn parse_depends_on(mapping: &yaml_spanned::Mapping) -> Result<Vec<super::Dependency>, ConfigError> {
+fn parse_depends_on(
+    mapping: &yaml_spanned::Mapping,
+) -> Result<Vec<super::Dependency>, ConfigError> {
     let Some(value) = mapping.get("depends_on") else {
         return Ok(vec![]);
     };
@@ -175,15 +201,19 @@ fn parse_restart(mapping: &yaml_spanned::Mapping) -> Result<Option<RestartPolicy
         "never" | "no" => RestartPolicy::Never,
         _ => {
             let prefix = "on-failure";
-            if let Some(rest) = normalized.strip_prefix(prefix).or_else(|| normalized.strip_prefix("on_failure")) {
+            if let Some(rest) = normalized
+                .strip_prefix(prefix)
+                .or_else(|| normalized.strip_prefix("on_failure"))
+            {
                 let rest = rest.trim_start_matches([':', '=']).trim();
                 let attempts = if rest.is_empty() {
                     1
                 } else {
-                    rest.parse::<usize>().map_err(|_| ConfigError::InvalidValue {
-                        message: format!("invalid restart policy `{raw}`"),
-                        span: value.span().into(),
-                    })?
+                    rest.parse::<usize>()
+                        .map_err(|_| ConfigError::InvalidValue {
+                            message: format!("invalid restart policy `{raw}`"),
+                            span: value.span().into(),
+                        })?
                 };
                 RestartPolicy::OnFailure {
                     remaining_attempts: attempts,
@@ -355,6 +385,30 @@ fn parse_command(
             span,
             inner: Value::String(raw_command),
         } => {
+            let trimmed = raw_command.trim_start();
+            if let Some(rest) = trimmed
+                .strip_prefix("CMD-SHELL")
+                .and_then(|s| s.strip_prefix(char::is_whitespace))
+            {
+                let rest = rest.trim_start();
+                if rest.is_empty() {
+                    return Err(ConfigError::InvalidCommand {
+                        command: raw_command.clone(),
+                        reason: InvalidCommandReason::EmptyCommand,
+                        span: span.into(),
+                    });
+                }
+                let cmd_shell = Spanned {
+                    span: span.clone(),
+                    inner: "CMD-SHELL".to_string(),
+                };
+                let payload = Spanned {
+                    span: span.clone(),
+                    inner: rest.to_string(),
+                };
+                return normalize_command(vec![cmd_shell, payload], raw_command.as_str(), *span);
+            }
+
             let command =
                 shlex::split(&raw_command).ok_or_else(|| ConfigError::InvalidCommand {
                     command: raw_command.clone(),
@@ -450,11 +504,18 @@ pub fn parse_health_check(
                 }),
                 Some(value) => parse_command(value),
             }?;
+            let start_delay = parse_duration(
+                healthcheck
+                    .get("start_delay")
+                    .or_else(|| healthcheck.get("startup_delay"))
+                    .or_else(|| healthcheck.get("initial_delay")),
+            )?;
             let interval = parse_duration(healthcheck.get("interval"))?;
             let retries = parse_optional::<usize>(healthcheck.get("retries"))?;
             let timeout = parse_duration(healthcheck.get("timeout"))?;
             Ok::<_, ConfigError>(super::HealthCheck {
                 test,
+                start_delay,
                 interval,
                 retries,
                 timeout,
@@ -473,6 +534,11 @@ pub fn parse_service<F>(
     let (span, mapping) = expect_mapping(value, "service config must be a mapping".into())?;
     let name = parse_optional::<String>(mapping.get("name"))?.unwrap_or_else(|| name.clone());
     let color = parse_optional::<bool>(mapping.get("color"))?;
+    let working_dir = mapping
+        .get("working_dir")
+        .or_else(|| mapping.get("cwd"))
+        .or_else(|| mapping.get("directory"));
+    let working_dir = parse_optional::<String>(working_dir)?;
     let command = match mapping.get("command") {
         None => Err(ConfigError::MissingKey {
             key: "command".to_string(),
@@ -492,6 +558,7 @@ pub fn parse_service<F>(
     Ok(Service {
         name,
         command,
+        working_dir,
         env_file,
         environment,
         depends_on,
@@ -568,4 +635,145 @@ pub fn parse_config<F: Copy + PartialEq>(
         ui_config,
         services,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config;
+    use codespan_reporting::diagnostic::Diagnostic;
+    use color_eyre::eyre;
+    use std::path::Path;
+
+    fn get_service<'a>(cfg: &'a config::Config, name: &str) -> &'a config::Service {
+        cfg.services
+            .iter()
+            .find(|(k, _)| k.as_ref() == name)
+            .map(|(_, v)| v)
+            .unwrap()
+    }
+
+    #[test]
+    fn env_file_accepts_string_mapping_and_sequence_forms() -> eyre::Result<()> {
+        let yaml = r#"
+version: 1
+services:
+  app_string:
+    command: ["sh", "-c", "true"]
+    env_file: ".env"
+  app_mapping:
+    command: ["sh", "-c", "true"]
+    env_file:
+      path: ".env"
+  app_sequence:
+    command: ["sh", "-c", "true"]
+    env_file:
+      - ".env"
+"#;
+
+        let mut diagnostics: Vec<Diagnostic<usize>> = vec![];
+        let parsed = config::from_str(yaml, Path::new("."), 0, None, &mut diagnostics)?;
+
+        let s1 = get_service(&parsed.config, "app_string");
+        assert_eq!(s1.env_file.len(), 1);
+        assert_eq!(s1.env_file[0].path.as_ref(), ".env");
+
+        let s2 = get_service(&parsed.config, "app_mapping");
+        assert_eq!(s2.env_file.len(), 1);
+        assert_eq!(s2.env_file[0].path.as_ref(), ".env");
+
+        let s3 = get_service(&parsed.config, "app_sequence");
+        assert_eq!(s3.env_file.len(), 1);
+        assert_eq!(s3.env_file[0].path.as_ref(), ".env");
+
+        Ok(())
+    }
+
+    #[test]
+    fn depends_on_condition_parses_and_invalid_condition_is_error() {
+        let yaml_ok = r#"
+version: 1
+services:
+  app:
+    command: ["sh", "-c", "true"]
+    depends_on:
+      - name: db
+        condition: healthy
+  db:
+    command: ["sh", "-c", "true"]
+"#;
+
+        let mut diagnostics: Vec<Diagnostic<usize>> = vec![];
+        let parsed = config::from_str(yaml_ok, Path::new("."), 0, None, &mut diagnostics).unwrap();
+        let app = get_service(&parsed.config, "app");
+        assert_eq!(app.depends_on.len(), 1);
+        let dep = &app.depends_on[0];
+        assert_eq!(dep.name.as_ref(), "db");
+        assert_eq!(
+            dep.condition.as_ref().map(|c| *c.as_ref()),
+            Some(config::DependencyCondition::ServiceHealthy)
+        );
+
+        let yaml_bad = r#"
+version: 1
+services:
+  app:
+    command: ["sh", "-c", "true"]
+    depends_on:
+      - name: db
+        condition: totally_not_a_condition
+  db:
+    command: ["sh", "-c", "true"]
+"#;
+
+        let mut diagnostics: Vec<Diagnostic<usize>> = vec![];
+        let err =
+            config::from_str(yaml_bad, Path::new("."), 0, None, &mut diagnostics).unwrap_err();
+        match err {
+            config::ConfigError::Serde { .. } => {}
+            other => panic!("expected serde error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cmd_shell_string_preserves_quoting_in_payload() -> eyre::Result<()> {
+        let yaml = r#"
+version: 1
+services:
+  app:
+    command: ["sh", "-c", "true"]
+    healthcheck:
+      test: "CMD-SHELL echo \"a b\""
+"#;
+
+        let mut diagnostics: Vec<Diagnostic<usize>> = vec![];
+        let parsed = config::from_str(yaml, Path::new("."), 0, None, &mut diagnostics)?;
+        let svc = get_service(&parsed.config, "app");
+        let hc = svc.healthcheck.as_ref().unwrap();
+        assert_eq!(hc.test.0.as_ref(), "sh");
+        assert_eq!(hc.test.1[0].as_ref(), "-c");
+        assert_eq!(hc.test.1[1].as_ref(), "echo \"a b\"");
+        Ok(())
+    }
+
+    #[test]
+    fn cmd_shell_sequence_joins_items_with_spaces() -> eyre::Result<()> {
+        let yaml = r#"
+version: 1
+services:
+  app:
+    command: ["sh", "-c", "true"]
+    healthcheck:
+      test: ["CMD-SHELL", "echo", "a b"]
+"#;
+
+        let mut diagnostics: Vec<Diagnostic<usize>> = vec![];
+        let parsed = config::from_str(yaml, Path::new("."), 0, None, &mut diagnostics)?;
+        let svc = get_service(&parsed.config, "app");
+        let hc = svc.healthcheck.as_ref().unwrap();
+        assert_eq!(hc.test.0.as_ref(), "sh");
+        assert_eq!(hc.test.1[0].as_ref(), "-c");
+        assert_eq!(hc.test.1[1].as_ref(), "echo a b");
+        Ok(())
+    }
 }

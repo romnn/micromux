@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::sync::mpsc;
 
 use micromux::{
@@ -35,9 +36,31 @@ pub struct Service {
     pub exec_state: Execution,
     pub open_ports: Vec<u16>,
     pub logs: AsyncBoundedLog,
+    pub cached_num_lines: u16,
+    pub cached_logs: String,
+    pub logs_dirty: bool,
+    pub healthcheck_configured: bool,
+    pub healthcheck_attempts: VecDeque<HealthCheckAttempt>,
+    pub healthcheck_cached_num_lines: u16,
+    pub healthcheck_cached_text: String,
+    pub healthcheck_dirty: bool,
     // pub logs: BoundedLog,
     // pub stderr_rx: mpsc::Receiver<Result<String, std::io::Error>>,
     // pub stdout_rx: mpsc::Receiver<Result<String, std::io::Error>>,
+}
+
+#[derive(Debug)]
+pub struct HealthCheckAttempt {
+    pub id: u64,
+    pub command: String,
+    pub output: BoundedLog,
+    pub result: Option<HealthCheckResult>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct HealthCheckResult {
+    pub success: bool,
+    pub exit_code: i32,
 }
 
 #[derive(Debug)]

@@ -54,4 +54,11 @@ pub struct Options {
 
     #[arg(long = "log-file", env = "MICROMUX_LOG_FILE", help = "Log file")]
     pub log_file: Option<PathBuf>,
+
+    #[arg(
+        long = "no-interactive-logs",
+        env = "MICROMUX_NO_INTERACTIVE_LOGS",
+        help = "Disable interactive log rendering (carriage return / progress updates)"
+    )]
+    pub no_interactive_logs: bool,
 }

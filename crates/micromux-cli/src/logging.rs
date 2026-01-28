@@ -26,11 +26,21 @@ pub fn setup<'a>(
             tracing_appender::non_blocking(file_appender)
         }
         LogFile::LogFile { path } => {
+            // Start each run with a fresh log file.
+            // Removing + recreating avoids any surprising "append" behavior caused by
+            // existing file handles or file metadata in edge cases.
+            let _ = std::fs::remove_file(path);
             let log_file = std::fs::OpenOptions::new()
-                .create(true)
+                .create_new(true)
                 .write(true)
-                .truncate(true)
-                .open(path)?;
+                .open(path)
+                .or_else(|_| {
+                    std::fs::OpenOptions::new()
+                        .create(true)
+                        .write(true)
+                        .truncate(true)
+                        .open(path)
+                })?;
             tracing_appender::non_blocking(log_file)
         }
     };

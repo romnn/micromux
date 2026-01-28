@@ -125,9 +125,13 @@ async fn main() -> eyre::Result<()> {
     let mux = micromux::Micromux::new(config)?;
     // let mux = Arc::new(mux);
     let tui = micromux_tui::App::new(&mux.services, ui_rx, commands_tx, shutdown.clone());
+    let interactive_logs = !options.no_interactive_logs;
     let mux_handle = tokio::task::spawn({
         // let mux = Arc::clone(&app.mux);
-        async move { mux.start(ui_tx, commands_rx, shutdown.clone()).await }
+        async move {
+            mux.start_with_options(ui_tx, commands_rx, shutdown.clone(), interactive_logs)
+                .await
+        }
     });
     let (render_res, mux_res) = futures::join!(tui.render(), mux_handle);
     render_res?;

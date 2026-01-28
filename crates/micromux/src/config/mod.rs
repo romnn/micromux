@@ -149,6 +149,7 @@ pub struct Service {
     pub name: Spanned<String>,
     pub command: (Spanned<String>, Vec<Spanned<String>>),
     // pub command: Spanned<Vec<String>>,
+    pub working_dir: Option<Spanned<String>>,
     pub env_file: Vec<EnvFile>,
     pub environment: IndexMap<Spanned<String>, Spanned<String>>,
     pub depends_on: Vec<Dependency>,
@@ -166,6 +167,7 @@ pub struct HealthCheck {
     ///
     /// E.g. ("pg_isready", ["-U", "postgres"])
     pub test: (Spanned<String>, Vec<Spanned<String>>),
+    pub start_delay: Option<Spanned<std::time::Duration>>,
     /// e.g. "30s"
     pub interval: Option<Spanned<std::time::Duration>>,
     /// e.g. "10s"
@@ -209,10 +211,7 @@ pub enum ConfigError {
         span: Span,
     },
     #[error("{message}")]
-    InvalidValue {
-        message: String,
-        span: Span,
-    },
+    InvalidValue { message: String, span: Span },
     #[error("{source}")]
     Serde {
         #[source]

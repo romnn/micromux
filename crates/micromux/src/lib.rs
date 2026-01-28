@@ -50,7 +50,8 @@ impl Micromux {
             .iter()
             .map(|(name, service_config)| {
                 let service_id = name.as_ref().to_string();
-                let service = Service::new(name.as_ref().clone(), &config_dir, service_config.clone())?;
+                let service =
+                    Service::new(name.as_ref().clone(), &config_dir, service_config.clone())?;
                 Ok::<_, eyre::Report>((service_id, service))
             })
             .collect::<Result<ServiceMap, _>>()?;
@@ -77,6 +78,17 @@ impl Micromux {
         commands_rx: mpsc::Receiver<scheduler::Command>,
         shutdown: CancellationToken,
     ) -> eyre::Result<()> {
+        self.start_with_options(ui_tx, commands_rx, shutdown, true)
+            .await
+    }
+
+    pub async fn start_with_options(
+        &self,
+        ui_tx: mpsc::Sender<scheduler::Event>,
+        commands_rx: mpsc::Receiver<scheduler::Command>,
+        shutdown: CancellationToken,
+        interactive_logs: bool,
+    ) -> eyre::Result<()> {
         // mpsc::Sender<Command>
         tracing::info!("starting");
         let (events_tx, events_rx) = mpsc::channel(1024);
@@ -100,6 +112,7 @@ impl Micromux {
             events_tx,
             ui_tx,
             shutdown.clone(),
+            interactive_logs,
         )
         .await?;
         tracing::info!("exiting");

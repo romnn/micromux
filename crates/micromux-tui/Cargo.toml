@@ -28,3 +28,6 @@ crossterm = { version = "0.29", features = ["event-stream"] }
 tokio.workspace = true
 tokio-stream = "0"
 futures.workspace = true
+
+[dev-dependencies]
+codespan-reporting.workspace = true

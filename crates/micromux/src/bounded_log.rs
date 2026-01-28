@@ -73,6 +73,13 @@ impl BoundedLog {
         }
     }
 
+    pub fn replace_last(&mut self, line: String) {
+        if let Some(old) = self.entries.pop_back() {
+            self.current_bytes = self.current_bytes.saturating_sub(old.len());
+        }
+        self.push(line);
+    }
+
     /// Iterate over the retained log lines, in order (oldest first).
     pub fn entries(&self) -> impl Iterator<Item = &String> {
         self.entries.iter()
@@ -117,6 +124,16 @@ impl AsyncBoundedLog {
         {
             let mut log = self.inner.write().unwrap();
             log.push(line);
+        }
+        // bump version to signal update
+        let ver = self.tx.borrow().wrapping_add(1);
+        let _ = self.tx.send(ver);
+    }
+
+    pub fn replace_last(&self, line: String) {
+        {
+            let mut log = self.inner.write().unwrap();
+            log.replace_last(line);
         }
         // bump version to signal update
         let ver = self.tx.borrow().wrapping_add(1);

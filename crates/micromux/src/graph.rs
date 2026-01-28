@@ -67,13 +67,11 @@ mod tests {
         }
     }
 
-    fn service_config(
-        name: &str,
-        depends_on: Vec<config::Dependency>,
-    ) -> config::Service {
+    fn service_config(name: &str, depends_on: Vec<config::Dependency>) -> config::Service {
         config::Service {
             name: spanned_string(name),
             command: (spanned_string("echo"), vec![spanned_string("hi")]),
+            working_dir: None,
             env_file: vec![],
             environment: IndexMap::new(),
             depends_on,
@@ -124,7 +122,7 @@ mod tests {
         assert!(res.is_err());
         Ok(())
     }
- }
+}
 
 #[derive(Debug)]
 pub struct OwnedServiceGraph {

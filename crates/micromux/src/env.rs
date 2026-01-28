@@ -50,7 +50,46 @@ pub fn parse_dotenv(contents: &str) -> eyre::Result<EnvMap> {
             continue;
         }
 
-        let line = line.strip_prefix("export ").unwrap_or(line);
+        let line = {
+            let trimmed = line.trim_start();
+            trimmed
+                .strip_prefix("export")
+                .and_then(|s| s.strip_prefix(char::is_whitespace))
+                .map(|rest| rest.trim_start())
+                .unwrap_or(trimmed)
+        };
+
+        let mut in_single = false;
+        let mut in_double = false;
+        let mut last_was_ws = false;
+        let mut cleaned = String::with_capacity(line.len());
+        let mut chars = line.chars().peekable();
+        while let Some(ch) = chars.next() {
+            match ch {
+                '\'' if !in_double => {
+                    in_single = !in_single;
+                    cleaned.push(ch);
+                    last_was_ws = false;
+                }
+                '"' if !in_single => {
+                    in_double = !in_double;
+                    cleaned.push(ch);
+                    last_was_ws = false;
+                }
+                '#' if !in_single && !in_double && last_was_ws => {
+                    while cleaned.ends_with(char::is_whitespace) {
+                        cleaned.pop();
+                    }
+                    break;
+                }
+                _ => {
+                    last_was_ws = ch.is_whitespace();
+                    cleaned.push(ch);
+                }
+            }
+        }
+        let line = cleaned.trim();
+
         let (key, value) = line
             .split_once('=')
             .ok_or_else(|| eyre::eyre!("invalid env file line {line_no}: missing '='"))?;
@@ -65,8 +104,31 @@ pub fn parse_dotenv(contents: &str) -> eyre::Result<EnvMap> {
             let bytes = value.as_bytes();
             let first = bytes[0];
             let last = bytes[bytes.len() - 1];
-            if (first == b'\'' && last == b'\'') || (first == b'"' && last == b'"') {
+            if first == b'\'' && last == b'\'' {
                 value = value[1..value.len() - 1].to_string();
+            } else if first == b'"' && last == b'"' {
+                let inner = &value[1..value.len() - 1];
+                let mut out = String::with_capacity(inner.len());
+                let mut chars = inner.chars();
+                while let Some(c) = chars.next() {
+                    if c != '\\' {
+                        out.push(c);
+                        continue;
+                    }
+                    match chars.next() {
+                        Some('n') => out.push('\n'),
+                        Some('r') => out.push('\r'),
+                        Some('t') => out.push('\t'),
+                        Some('"') => out.push('"'),
+                        Some('\\') => out.push('\\'),
+                        Some(other) => {
+                            out.push('\\');
+                            out.push(other);
+                        }
+                        None => out.push('\\'),
+                    }
+                }
+                value = out;
             }
         }
 
@@ -103,27 +165,12 @@ pub async fn load_env_files(paths: &[PathBuf]) -> eyre::Result<EnvMap> {
 
 pub fn expand_env_values(env: &EnvMap, base: &HashMap<String, String>) -> EnvMap {
     let mut current: HashMap<String, String> = base.clone();
+    let mut out = EnvMap::new();
+
     for (k, v) in env.iter() {
-        current.insert(k.clone(), v.clone());
-    }
-
-    let mut out = env.clone();
-
-    for _ in 0..8 {
-        let mut changed = false;
-        let mut new_map = EnvMap::new();
-        for (k, v) in out.iter() {
-            let expanded = interpolate(v, &current);
-            if expanded != *v {
-                changed = true;
-            }
-            new_map.insert(k.clone(), expanded.clone());
-            current.insert(k.clone(), expanded);
-        }
-        out = new_map;
-        if !changed {
-            break;
-        }
+        let expanded = interpolate(v, &current);
+        out.insert(k.clone(), expanded.clone());
+        current.insert(k.clone(), expanded);
     }
 
     out
@@ -226,5 +273,55 @@ mod tests {
         assert_eq!(interpolate("$A-$B", &m), "x-y");
         assert_eq!(interpolate("${A}${B}", &m), "xy");
         assert_eq!(interpolate("$$A", &m), "$A");
+    }
+
+    #[test]
+    fn expand_env_values_is_single_pass_and_ordered() {
+        let mut base = HashMap::new();
+        base.insert("X".to_string(), "base".to_string());
+
+        let mut env = EnvMap::new();
+        env.insert("A", "${X}-a");
+        env.insert("B", "${A}-b");
+
+        let out = expand_env_values(&env, &base);
+        assert_eq!(out.get("A"), Some("base-a"));
+        assert_eq!(out.get("B"), Some("base-a-b"));
+    }
+
+    #[test]
+    fn expand_env_values_does_not_expand_forward_references() {
+        let base = HashMap::new();
+
+        let mut env = EnvMap::new();
+        env.insert("B", "${A}-b");
+        env.insert("A", "a");
+
+        let out = expand_env_values(&env, &base);
+        assert_eq!(out.get("B"), Some("-b"));
+        assert_eq!(out.get("A"), Some("a"));
+    }
+
+    #[test]
+    fn dotenv_allows_export_with_extra_whitespace() -> eyre::Result<()> {
+        let env = parse_dotenv("export   FOO=bar\nexport\tBAZ=qux\n")?;
+        assert_eq!(env.get("FOO"), Some("bar"));
+        assert_eq!(env.get("BAZ"), Some("qux"));
+        Ok(())
+    }
+
+    #[test]
+    fn dotenv_strips_inline_comments_outside_quotes() -> eyre::Result<()> {
+        let env = parse_dotenv("FOO=bar # comment\nBAR=\"x # y\" # z\n")?;
+        assert_eq!(env.get("FOO"), Some("bar"));
+        assert_eq!(env.get("BAR"), Some("x # y"));
+        Ok(())
+    }
+
+    #[test]
+    fn dotenv_double_quote_unescapes_common_sequences() -> eyre::Result<()> {
+        let env = parse_dotenv("A=\"x\\n\\\"y\\\"\\\\z\"\n")?;
+        assert_eq!(env.get("A"), Some("x\n\"y\"\\z"));
+        Ok(())
     }
 }

@@ -6,7 +6,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 
 /// The frequency at which tick events are emitted.
-const DRAW_TICK_FPS: f64 = 10.0; // 10 fps
+const DRAW_TICK_FPS: f64 = 30.0; // 30 fps
 
 /// Representation of all possible events.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Hash)]
@@ -43,6 +43,12 @@ impl std::fmt::Display for Input {
             }
             other => std::fmt::Debug::fmt(other, f),
         }
+    }
+}
+
+impl Input {
+    pub fn is_tick(&self) -> bool {
+        matches!(self, Input::Tick)
     }
 }
 
