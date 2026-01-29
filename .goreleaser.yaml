@@ -47,7 +47,7 @@ builds:
     flags:
       - "--release"
       - "--package=micromux-cli"
-      - "--target-dir=./target" # TODO: can we remove this once rust support is better?
+      - "--target-dir=./target-goreleaser"
 
 archives:
   - id: *micromux

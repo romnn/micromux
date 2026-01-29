@@ -767,12 +767,25 @@ mod tests {
         let Some(hc) = svc.healthcheck.as_ref() else {
             return Err(eyre::eyre!("missing healthcheck"));
         };
-        assert_eq!(hc.test.0.as_ref(), "sh");
-        assert_eq!(hc.test.1.first().map(|v| v.as_ref().as_str()), Some("-c"));
-        assert_eq!(
-            hc.test.1.get(1).map(|v| v.as_ref().as_str()),
-            Some("echo \"a b\"")
-        );
+        #[cfg(unix)]
+        {
+            assert_eq!(hc.test.0.as_ref(), "sh");
+            assert_eq!(hc.test.1.first().map(|v| v.as_ref().as_str()), Some("-c"));
+            assert_eq!(
+                hc.test.1.get(1).map(|v| v.as_ref().as_str()),
+                Some("echo \"a b\"")
+            );
+        }
+        #[cfg(windows)]
+        {
+            assert_eq!(hc.test.0.as_ref(), "cmd.exe");
+            assert_eq!(hc.test.1.first().map(|v| v.as_ref().as_str()), Some("/S"));
+            assert_eq!(hc.test.1.get(1).map(|v| v.as_ref().as_str()), Some("/C"));
+            assert_eq!(
+                hc.test.1.get(2).map(|v| v.as_ref().as_str()),
+                Some("echo \"a b\"")
+            );
+        }
         Ok(())
     }
 
@@ -793,12 +806,19 @@ mod tests {
         let Some(hc) = svc.healthcheck.as_ref() else {
             return Err(eyre::eyre!("missing healthcheck"));
         };
-        assert_eq!(hc.test.0.as_ref(), "sh");
-        assert_eq!(hc.test.1.first().map(|v| v.as_ref().as_str()), Some("-c"));
-        assert_eq!(
-            hc.test.1.get(1).map(|v| v.as_ref().as_str()),
-            Some("echo a b")
-        );
+        #[cfg(unix)]
+        {
+            assert_eq!(hc.test.0.as_ref(), "sh");
+            assert_eq!(hc.test.1.first().map(|v| v.as_ref().as_str()), Some("-c"));
+            assert_eq!(hc.test.1.get(1).map(|v| v.as_ref().as_str()), Some("echo a b"));
+        }
+        #[cfg(windows)]
+        {
+            assert_eq!(hc.test.0.as_ref(), "cmd.exe");
+            assert_eq!(hc.test.1.first().map(|v| v.as_ref().as_str()), Some("/S"));
+            assert_eq!(hc.test.1.get(1).map(|v| v.as_ref().as_str()), Some("/C"));
+            assert_eq!(hc.test.1.get(2).map(|v| v.as_ref().as_str()), Some("echo a b"));
+        }
         Ok(())
     }
 }

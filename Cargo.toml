@@ -7,7 +7,14 @@ members = [
 ]
 
 [workspace.package]
+version = "0.0.1"
 edition = "2024"
+authors = ["romnn <contact@romnn.com>"]
+description = "Micromux is a local process supervisor with a terminal UI"
+license-file = "LICENSE"
+readme = "README.md"
+homepage = "https://github.com/romnn/micromux"
+repository = "https://github.com/romnn/micromux"
 
 [workspace.lints.rust]
 unsafe_code = "deny"
@@ -28,6 +35,7 @@ missing_errors_doc = "warn"
 opt-level = 3
 lto = true
 codegen-units = 1
+strip = "symbols"
 
 [workspace.dependencies]
 color-eyre = "0"
@@ -37,7 +45,6 @@ rand = "0"
 indexmap = "2"
 indoc = "2"
 strum = { version = "0", features = ["derive"] }
-enum-as-inner = "0"
 parking_lot = "0"
 
 # tracing

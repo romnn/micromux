@@ -1,17 +1,29 @@
 # micromux
  
+[<img alt="build status" src="https://img.shields.io/github/actions/workflow/status/romnn/micromux/build.yaml?branch=main&label=build">](https://github.com/romnn/micromux/actions/workflows/build.yaml)
+[<img alt="test status" src="https://img.shields.io/github/actions/workflow/status/romnn/micromux/test.yaml?branch=main&label=test">](https://github.com/romnn/micromux/actions/workflows/test.yaml)
+[![dependency status](https://deps.rs/repo/github/romnn/micromux/status.svg)](https://deps.rs/repo/github/romnn/micromux)
+[<img alt="docs.rs" src="https://img.shields.io/docsrs/micromux/latest?label=docs.rs">](https://docs.rs/micromux)
+[<img alt="crates.io" src="https://img.shields.io/crates/v/micromux">](https://crates.io/crates/micromux)
+
  Micromux is a **local process supervisor** with a **terminal UI**.
- 
+
+ Think of it as **Docker Compose for local processes** (not containers) — like **preconfigured tmux panes** that come with Compose-style dependencies, healthchecks, and restarts.
+
  It runs multiple long-lived commands (your dev “services”) on your machine, tracks their state, and gives you a single place to:
  - **see logs** (ANSI/interactive output supported)
  - **restart/disable services**
  - **gate startup by dependencies + healthchecks**
  - **send input to a service** (PTY-backed “attach” mode)
+
  
  ## Install
  
  ```bash
- brew install micromux
+ brew install --cask romnn/tap/micromux
+
+ # Or install from source
+ cargo install --locked micromux-cli
  ```
  
  ## Use

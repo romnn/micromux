@@ -266,7 +266,7 @@ pub async fn scheduler(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::config;

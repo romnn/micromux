@@ -1,7 +1,24 @@
 [package]
 name = "micromux"
-version = "0.1.0"
+license-file = "../../LICENSE"
+readme = "../../README.md"
+documentation = "https://docs.rs/micromux"
+publish = true
+
+version.workspace = true
 edition.workspace = true
+authors.workspace = true
+description.workspace = true
+homepage.workspace = true
+repository.workspace = true
+categories = [
+  "command-line-utilities",
+]
+keywords = [
+  "terminal",
+  "multiplexer",
+  "tui",
+]
 
 [lints]
 workspace = true
@@ -10,13 +27,11 @@ workspace = true
 color-eyre.workspace = true
 thiserror.workspace = true
 strum.workspace = true
-enum-as-inner.workspace = true
 itertools.workspace = true
 indexmap.workspace = true
 parking_lot.workspace = true
 
 # command and process management
-async-process = "2"
 shlex = "1"
 nix = { version = "0", features = ["signal"] }
 portable-pty = "0.9"
@@ -44,7 +59,8 @@ tokio-util.workspace = true
 futures.workspace = true
 
 # serialization
-yaml-spanned = { git = "https://github.com/romnn/yaml-spanned.git" }
+yaml-spanned = "0"
+# yaml-spanned = { git = "https://github.com/romnn/yaml-spanned.git" }
 serde.workspace = true
 
 [dev-dependencies]

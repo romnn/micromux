@@ -3,7 +3,7 @@ version: "1"
 ui:
   width: 40
 services:
-  google:
+  ping-google:
     command: "ping google.com"
     env_file:
       - path: ../../.env
@@ -23,7 +23,25 @@ services:
       interval: "30s"
       timeout: "10s"
       retries: 3
-  apple:
+  ping-apple:
+    name: Apple
+    command: "ping apple.com"
+    watch:
+      - "./*.toml"
+    environment:
+      POSTGRES_PASSWORD: example
+    depends_on: []
+      # - "minio"
+    ports: []
+    # depends_on:
+    #   minio:
+    #     condition: service_healthy
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres"]
+      interval: "10s"
+      timeout: "5s"
+      retries: 3
+  htop:
     name: Apple
     command: "ping apple.com"
     watch:
