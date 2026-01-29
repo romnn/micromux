@@ -10,6 +10,10 @@
 
  Think of it as **Docker Compose for local processes** (not containers) — like **preconfigured tmux panes** that come with Compose-style dependencies, healthchecks, and restarts.
 
+ <p align="center">
+   <img src="./screenshot.png" alt="micromux TUI screenshot" width="800" />
+ </p>
+
  It runs multiple long-lived commands (your dev “services”) on your machine, tracks their state, and gives you a single place to:
  - **see logs** (ANSI/interactive output supported)
  - **restart/disable services**

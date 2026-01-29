@@ -47,7 +47,6 @@ builds:
     flags:
       - "--release"
       - "--package=micromux-cli"
-      - "--target-dir=./target-goreleaser"
 
 archives:
   - id: *micromux

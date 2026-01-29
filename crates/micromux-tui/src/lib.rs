@@ -165,7 +165,9 @@ impl App {
                     self.handle_event(event);
                     terminal.draw(|frame| frame.render_widget(&mut self, frame.area()))?;
                 }
-                None => {}
+                None => {
+                    self.running = false;
+                }
             }
         }
         Ok(())

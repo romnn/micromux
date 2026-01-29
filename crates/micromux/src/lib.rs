@@ -93,6 +93,8 @@ impl Micromux {
             })
             .collect::<Result<ServiceMap, _>>()?;
 
+        graph::ServiceGraph::new(&services)?;
+
         Ok(Self { services })
     }
 
