@@ -1,3 +1,11 @@
+//! Configuration parsing and types.
+//!
+//! This module provides:
+//! - [`from_str`]: parse a YAML configuration into a typed [`ConfigFile`].
+//! - [`find_config_file`]: locate a config file in a directory.
+//! - A set of configuration types (e.g. [`Service`], [`HealthCheck`]) and diagnostics-friendly
+//!   errors ([`ConfigError`]).
+
 pub mod v1;
 
 use crate::diagnostics::{DiagnosticExt, Span, ToDiagnostics};
@@ -8,6 +16,11 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use yaml_spanned::{Spanned, Value};
 
+/// Parse a value into a typed, spanned value.
+///
+/// # Errors
+///
+/// Returns [`ConfigError::Serde`] if `value` cannot be deserialized into `T`.
 pub fn parse<T: serde::de::DeserializeOwned>(
     value: &yaml_spanned::Spanned<Value>,
 ) -> Result<Spanned<T>, ConfigError> {
@@ -18,12 +31,26 @@ pub fn parse<T: serde::de::DeserializeOwned>(
     Ok(Spanned::new(value.span, inner))
 }
 
+/// Parse an optional value into a typed, spanned value.
+///
+/// # Errors
+///
+/// Returns the same errors as [`parse`] if the value is present but cannot be parsed.
 pub fn parse_optional<T: serde::de::DeserializeOwned>(
     value: Option<&yaml_spanned::Spanned<Value>>,
 ) -> Result<Option<Spanned<T>>, ConfigError> {
     value.map(|value| parse(value)).transpose()
 }
 
+/// Parse an optional duration.
+///
+/// The duration must be provided as a string compatible with [`humantime::parse_duration`]
+/// (e.g. `"30s"`, `"2min"`).
+///
+/// # Errors
+///
+/// Returns an error if the value is not a string ([`ConfigError::UnexpectedType`]) or if the
+/// duration cannot be parsed ([`ConfigError::InvalidDuration`]).
 pub fn parse_duration(
     value: Option<&yaml_spanned::Spanned<Value>>,
 ) -> Result<Option<Spanned<std::time::Duration>>, ConfigError> {
@@ -50,6 +77,7 @@ pub fn parse_duration(
         .transpose()
 }
 
+/// Candidate configuration file names, in lookup order.
 pub fn config_file_names() -> impl Iterator<Item = &'static str> {
     [
         "micromux.yaml",
@@ -60,6 +88,14 @@ pub fn config_file_names() -> impl Iterator<Item = &'static str> {
     .into_iter()
 }
 
+/// Find a configuration file in the given directory.
+///
+/// The search checks [`config_file_names`] concurrently and returns the first file that exists.
+///
+/// # Errors
+///
+/// Returns an error if a file exists but cannot be canonicalized for reasons other than
+/// `NotFound`.
 pub async fn find_config_file(dir: &Path) -> std::io::Result<Option<PathBuf>> {
     use futures::{StreamExt, TryStreamExt};
     let mut found = futures::stream::iter(config_file_names().map(|path| dir.join(path)))
@@ -81,34 +117,48 @@ pub async fn find_config_file(dir: &Path) -> std::io::Result<Option<PathBuf>> {
     Ok(None)
 }
 
+/// Configuration file format version.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
 pub enum Version {
+    /// Version 1 of the configuration format.
     #[serde(rename = "1", alias = "v1", alias = "V1")]
     V1,
+    /// Alias for the latest supported version.
     #[serde(rename = "latest")]
     Latest,
 }
 
+/// User-interface related configuration.
 #[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct UiConfig {
+    /// Optional desired UI width.
     pub width: Option<Spanned<usize>>,
 }
 
+/// Parsed configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
+    /// Configuration for the UI.
     pub ui_config: UiConfig,
+    /// Service definitions keyed by service name.
     pub services: IndexMap<Spanned<String>, Service>,
 }
 
+/// A parsed config file together with its origin metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigFile<F> {
+    /// File identifier used in diagnostics.
     pub file_id: F,
+    /// Directory the config was loaded from.
     pub config_dir: PathBuf,
+    /// Parsed config contents.
     pub config: Config,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+/// Condition that must be satisfied before a dependent service is considered ready.
 pub enum DependencyCondition {
+    /// Dependency must have started.
     #[default]
     #[serde(
         rename = "service_started",
@@ -116,106 +166,157 @@ pub enum DependencyCondition {
         alias = "ServiceStarted",
         alias = "started"
     )]
-    ServiceStarted,
+    Started,
+    /// Dependency must be healthy.
     #[serde(
         rename = "service_healthy",
         alias = "service-healthy",
         alias = "ServiceHealthy",
         alias = "healthy"
     )]
-    ServiceHealthy,
+    Healthy,
+    /// Dependency must have completed successfully.
     #[serde(
         rename = "service_completed_successfully",
         alias = "service-completed-successfully",
         alias = "ServiceCompletedSuccessfully",
         alias = "completed"
     )]
-    ServiceCompletedSuccessfully,
+    CompletedSuccessfully,
 }
 
+/// A dependency on another service.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Dependency {
+    /// Name of the dependent service.
     pub name: Spanned<String>,
+    /// Optional condition that must be met.
     pub condition: Option<Spanned<DependencyCondition>>,
 }
 
+/// A `.env` file reference.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnvFile {
+    /// Path to the `.env` file (relative to `config_dir` unless absolute).
     pub path: Spanned<String>,
 }
 
+/// Service configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Service {
+    /// Service name.
     pub name: Spanned<String>,
+    /// Command to execute and its arguments.
     pub command: (Spanned<String>, Vec<Spanned<String>>),
+    /// Optional working directory.
     pub working_dir: Option<Spanned<String>>,
+    /// Environment files to load.
     pub env_file: Vec<EnvFile>,
+    /// Explicit environment variables.
     pub environment: IndexMap<Spanned<String>, Spanned<String>>,
+    /// Dependencies on other services.
     pub depends_on: Vec<Dependency>,
+    /// Optional healthcheck configuration.
     pub healthcheck: Option<HealthCheck>,
+    /// Port mappings / port specs.
     pub ports: Vec<Spanned<String>>,
+    /// Restart policy for this service.
     pub restart: Option<RestartPolicy>,
+    /// Whether this service should be rendered in color.
     pub color: Option<Spanned<bool>>,
 }
 
+/// Healthcheck configuration for a service.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HealthCheck {
     /// The healthcheck test.
     ///
-    /// E.g. ("pg_isready", ["-U", "postgres"])
+    /// For example, `( "pg_isready", ["-U", "postgres"] )`.
     pub test: (Spanned<String>, Vec<Spanned<String>>),
+    /// Optional delay before the first healthcheck.
     pub start_delay: Option<Spanned<std::time::Duration>>,
-    /// e.g. "30s"
+    /// Healthcheck interval (e.g. `"30s"`).
     pub interval: Option<Spanned<std::time::Duration>>,
-    /// e.g. "10s"
+    /// Healthcheck timeout (e.g. `"10s"`).
     pub timeout: Option<Spanned<std::time::Duration>>,
     /// Number of retries before marking unhealthy.
     pub retries: Option<Spanned<usize>>,
 }
 
+/// Reason why a command is invalid.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum InvalidCommandReason {
+    /// The command string could not be split into an argv-like representation.
     FailedToSplit,
+    /// The command is empty.
     EmptyCommand,
 }
 
+/// Errors that can occur while parsing configuration.
 #[derive(thiserror::Error, Debug)]
 pub enum ConfigError {
     #[error("invalid command {command}: {reason:?}")]
+    /// A command could not be parsed.
     InvalidCommand {
+        /// Raw command string.
         command: String,
+        /// Why the command is invalid.
         reason: InvalidCommandReason,
+        /// Span of the command value.
         span: Span,
     },
     #[error("invalid duration {duration}")]
+    /// A duration value could not be parsed.
     InvalidDuration {
+        /// Raw duration string.
         duration: String,
+        /// Span of the duration value.
         span: Span,
         #[source]
+        /// Underlying parse error.
         source: humantime::DurationError,
     },
     #[error("{message}")]
+    /// A required mapping key was missing.
     MissingKey {
+        /// Missing key.
         key: String,
+        /// User-facing error message.
         message: String,
+        /// Span of the mapping where the key is missing.
         span: Span,
     },
     #[error("{message}")]
+    /// A YAML value had an unexpected type.
     UnexpectedType {
+        /// User-facing error message.
         message: String,
+        /// Expected YAML kinds.
         expected: Vec<yaml_spanned::value::Kind>,
+        /// Actual YAML kind.
         found: yaml_spanned::value::Kind,
+        /// Span of the offending value.
         span: Span,
     },
     #[error("{message}")]
-    InvalidValue { message: String, span: Span },
+    /// A YAML value was syntactically valid but semantically invalid.
+    InvalidValue {
+        /// User-facing error message.
+        message: String,
+        /// Span of the offending value.
+        span: Span,
+    },
     #[error("{source}")]
+    /// A serde-based deserialization error occurred.
     Serde {
         #[source]
+        /// Underlying serde error.
         source: yaml_spanned::error::SerdeError,
+        /// Span of the offending value.
         span: Span,
     },
     #[error(transparent)]
+    /// A YAML parser error occurred.
     YAML(#[from] yaml_spanned::Error),
 }
 
@@ -226,97 +327,23 @@ impl ToDiagnostics for ConfigError {
                 command,
                 span,
                 reason,
-            } => {
-                let mut labels = vec![];
-                match reason {
-                    InvalidCommandReason::FailedToSplit => {
-                        labels.push(
-                            Label::secondary(file_id, span.clone())
-                                .with_message("failed to split command"),
-                        );
-                    }
-                    InvalidCommandReason::EmptyCommand => {
-                        labels.push(
-                            Label::secondary(file_id, span.clone()).with_message("empty command"),
-                        );
-                    }
-                }
-                let mut diagnostics = vec![
-                    Diagnostic::error()
-                        .with_message(format!("invalid command `{command}`"))
-                        .with_labels(labels),
-                ];
-                match reason {
-                    InvalidCommandReason::FailedToSplit => {
-                        diagnostics.push(
-                            Diagnostic::help().with_message("try using a sequence".to_string()),
-                        );
-                    }
-                    InvalidCommandReason::EmptyCommand => {
-                        diagnostics.push(
-                            Diagnostic::help().with_message("use a non-empty command".to_string()),
-                        );
-                    }
-                }
-                diagnostics
+            } => Self::invalid_command_diagnostics(file_id, command, span, reason),
+            Self::InvalidDuration { duration, span, .. } => {
+                Self::invalid_duration_diagnostics(file_id, duration, span)
             }
-            Self::InvalidDuration { duration, span, .. } => vec![
-                Diagnostic::error()
-                    .with_message(format!("invalid duration `{duration}`"))
-                    .with_labels(vec![
-                        Label::secondary(file_id, span.clone())
-                            .with_message("cannot parse as duration"),
-                    ]),
-                Diagnostic::help().with_message("Duration must have a valid format like `2min 2s`"),
-            ],
             Self::MissingKey {
                 message, key, span, ..
-            } => vec![
-                Diagnostic::error()
-                    .with_message(format!("missing required key `{key}`"))
-                    .with_labels(vec![
-                        Label::secondary(file_id, span.clone()).with_message(message),
-                    ]),
-            ],
+            } => Self::missing_key_diagnostics(file_id, key, message, span),
             Self::UnexpectedType {
                 expected,
                 found,
                 span,
                 ..
-            } => {
-                let expected = expected
-                    .iter()
-                    .map(|ty| format!("`{ty:?}`"))
-                    .collect::<Vec<_>>()
-                    .join(", or ");
-                let diagnostic = Diagnostic::error()
-                    .with_message(self.to_string())
-                    .with_labels(vec![
-                        Label::primary(file_id, span.clone())
-                            .with_message(format!("expected {expected}")),
-                    ])
-                    .with_notes(vec![unindent::unindent(&format!(
-                        "
-                        expected type {expected}
-                           found type `{found:?}`
-                        "
-                    ))]);
-                vec![diagnostic]
+            } => Self::unexpected_type_diagnostics(file_id, self, expected, *found, span),
+            Self::InvalidValue { message, span } => {
+                Self::invalid_value_diagnostics(file_id, message, span)
             }
-            Self::InvalidValue { message, span } => vec![
-                Diagnostic::error()
-                    .with_message(message.to_string())
-                    .with_labels(vec![
-                        Label::primary(file_id, span.clone()).with_message(message.to_string()),
-                    ]),
-            ],
-            Self::Serde { source, span } => vec![
-                Diagnostic::error()
-                    .with_message(self.to_string())
-                    .with_labels(vec![
-                        Label::primary(file_id, span.clone()).with_message(source.to_string()),
-                    ]),
-            ],
+            Self::Serde { source, span } => Self::serde_diagnostics(file_id, self, source, span),
             Self::YAML(source) => {
                 use yaml_spanned::error::ToDiagnostics;
                 source.to_diagnostics(file_id)
@@ -325,6 +352,131 @@ impl ToDiagnostics for ConfigError {
     }
 }
 
+impl ConfigError {
+    fn invalid_command_diagnostics<F: Copy + PartialEq>(
+        file_id: F,
+        command: &str,
+        span: &Span,
+        reason: &InvalidCommandReason,
+    ) -> Vec<Diagnostic<F>> {
+        let mut labels = vec![];
+        match reason {
+            InvalidCommandReason::FailedToSplit => {
+                labels.push(
+                    Label::secondary(file_id, span.clone()).with_message("failed to split command"),
+                );
+            }
+            InvalidCommandReason::EmptyCommand => {
+                labels.push(Label::secondary(file_id, span.clone()).with_message("empty command"));
+            }
+        }
+
+        let mut diagnostics = vec![
+            Diagnostic::error()
+                .with_message(format!("invalid command `{command}`"))
+                .with_labels(labels),
+        ];
+
+        match reason {
+            InvalidCommandReason::FailedToSplit => {
+                diagnostics.push(Diagnostic::help().with_message("try using a sequence".to_string()));
+            }
+            InvalidCommandReason::EmptyCommand => {
+                diagnostics.push(Diagnostic::help().with_message("use a non-empty command".to_string()));
+            }
+        }
+
+        diagnostics
+    }
+
+    fn invalid_duration_diagnostics<F: Copy + PartialEq>(
+        file_id: F,
+        duration: &str,
+        span: &Span,
+    ) -> Vec<Diagnostic<F>> {
+        vec![
+            Diagnostic::error()
+                .with_message(format!("invalid duration `{duration}`"))
+                .with_labels(vec![
+                    Label::secondary(file_id, span.clone()).with_message("cannot parse as duration"),
+                ]),
+            Diagnostic::help().with_message("Duration must have a valid format like `2min 2s`"),
+        ]
+    }
+
+    fn missing_key_diagnostics<F: Copy + PartialEq>(
+        file_id: F,
+        key: &str,
+        message: &str,
+        span: &Span,
+    ) -> Vec<Diagnostic<F>> {
+        vec![
+            Diagnostic::error()
+                .with_message(format!("missing required key `{key}`"))
+                .with_labels(vec![Label::secondary(file_id, span.clone()).with_message(message)]),
+        ]
+    }
+
+    fn unexpected_type_diagnostics<F: Copy + PartialEq>(
+        file_id: F,
+        this: &Self,
+        expected: &[yaml_spanned::value::Kind],
+        found: yaml_spanned::value::Kind,
+        span: &Span,
+    ) -> Vec<Diagnostic<F>> {
+        let expected = expected
+            .iter()
+            .map(|ty| format!("`{ty:?}`"))
+            .collect::<Vec<_>>()
+            .join(", or ");
+        vec![
+            Diagnostic::error()
+                .with_message(this.to_string())
+                .with_labels(vec![
+                    Label::primary(file_id, span.clone()).with_message(format!("expected {expected}")),
+                ])
+                .with_notes(vec![unindent::unindent(&format!(
+                    "
+                    expected type {expected}
+                       found type `{found:?}`
+                    "
+                ))]),
+        ]
+    }
+
+    fn invalid_value_diagnostics<F: Copy + PartialEq>(
+        file_id: F,
+        message: &str,
+        span: &Span,
+    ) -> Vec<Diagnostic<F>> {
+        vec![
+            Diagnostic::error()
+                .with_message(message.to_string())
+                .with_labels(vec![Label::primary(file_id, span.clone()).with_message(message.to_string())]),
+        ]
+    }
+
+    fn serde_diagnostics<F: Copy + PartialEq>(
+        file_id: F,
+        this: &Self,
+        source: &yaml_spanned::error::SerdeError,
+        span: &Span,
+    ) -> Vec<Diagnostic<F>> {
+        vec![
+            Diagnostic::error()
+                .with_message(this.to_string())
+                .with_labels(vec![
+                    Label::primary(file_id, span.clone()).with_message(source.to_string()),
+                ]),
+        ]
+    }
+}
+
+/// Parse the `version` field of the config.
+///
+/// # Errors
+///
+/// Returns an error if the version field exists but cannot be parsed.
 pub fn parse_version<F>(
     value: &yaml_spanned::Spanned<Value>,
     file_id: F,
@@ -353,6 +505,12 @@ pub fn parse_version<F>(
     }
 }
 
+/// Parse a micromux configuration from a YAML string.
+///
+/// # Errors
+///
+/// Returns an error if the YAML cannot be parsed or if the resulting value does not match the
+/// expected schema.
 pub fn from_str<F: Copy + PartialEq>(
     raw_config: &str,
     config_dir: &Path,
@@ -375,12 +533,11 @@ pub fn from_str<F: Copy + PartialEq>(
 
 #[cfg(test)]
 mod tests {
-    use color_eyre::eyre;
     use indoc::indoc;
 
     #[test]
-    fn parse_config() -> eyre::Result<()> {
-        let _yaml = indoc! {r#"
+    fn parse_config() {
+        let yaml = indoc! {r#"
             version: "3"
             services:
               app:
@@ -405,9 +562,10 @@ mod tests {
                   retries: 5
         "#};
 
+        let _ = yaml;
+
         // TODO: complete this test
         // let config = super::from_str(yaml)?;
         // println!("{:#?}", config);
-        Ok(())
     }
 }

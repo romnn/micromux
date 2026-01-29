@@ -1,10 +1,17 @@
-pub mod event;
-mod reducer;
-pub mod render;
-pub mod state;
-pub mod style;
+//! `micromux-tui` provides the terminal user interface for micromux.
+//!
+//! The main entry point is [`App`]. Most consumers construct an [`App`] from a list of
+//! [`micromux::ServiceDescriptor`] values, then call [`App::render`].
 
+mod event;
+mod reducer;
+mod render;
+mod state;
+mod style;
+
+/// Re-export of `crossterm` for consumers that need to share types with the TUI.
 pub use crossterm;
+/// Re-export of `ratatui` for consumers that need to share types with the TUI.
 pub use ratatui;
 
 use color_eyre::eyre;
@@ -14,44 +21,49 @@ use ratatui::DefaultTerminal;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
-pub type UiEventStream = futures::stream::Chain<
+type UiEventStream = futures::stream::Chain<
     ReceiverStream<SchedulerEvent>,
     futures::stream::Pending<SchedulerEvent>,
 >;
 
-pub const KiB: usize = 1024;
-pub const MiB: usize = 1024 * KiB;
-pub const GiB: usize = 1024 * MiB;
-pub const HEALTHCHECK_HISTORY: usize = 2;
+const KIB: usize = 1024;
+const MIB: usize = 1024 * KIB;
+const HEALTHCHECK_HISTORY: usize = 2;
 
 #[derive()]
+/// Terminal application state.
 pub struct App {
     /// Running state of the TUI application.
-    pub running: bool,
-    pub commands_tx: mpsc::Sender<Command>,
-    pub shutdown: micromux::CancellationToken,
-    pub ui_rx: UiEventStream,
+    running: bool,
+    commands_tx: mpsc::Sender<Command>,
+    shutdown: micromux::CancellationToken,
+    ui_rx: UiEventStream,
     /// Event handler
-    pub input_event_handler: event::InputHandler,
+    input_event_handler: event::InputHandler,
     /// Current state
-    pub state: state::State,
+    state: state::State,
     /// Log viewer
-    pub log_view: crate::render::log_view::LogView,
-    pub healthcheck_view: crate::render::log_view::LogView,
-    pub show_healthcheck_pane: bool,
-    pub attach_mode: bool,
-    pub focus: Focus,
-    pub terminal_rows: u16,
+    log_view: crate::render::log_view::LogView,
+    healthcheck_view: crate::render::log_view::LogView,
+    show_healthcheck_pane: bool,
+    attach_mode: bool,
+    focus: Focus,
+    terminal_rows: u16,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Focus {
+enum Focus {
+    /// Service list is focused.
     Services,
+    /// Log pane is focused.
     Logs,
+    /// Healthcheck pane is focused.
     Healthcheck,
 }
 
 impl App {
+    /// Construct a new [`App`].
+    #[must_use]
     pub fn new(
         services: &[ServiceDescriptor],
         ui_rx: mpsc::Receiver<SchedulerEvent>,
@@ -64,11 +76,10 @@ impl App {
             .iter()
             .map(|service| {
                 let service_state = state::Service {
-                    name: service.name.clone(),
                     id: service.id.clone(),
                     exec_state: state::Execution::Pending,
                     open_ports: service.open_ports.clone(),
-                    logs: BoundedLog::with_limits(1000, 64 * MiB).into(),
+                    logs: BoundedLog::with_limits(1000, 64 * MIB).into(),
                     cached_num_lines: 0,
                     cached_logs: String::new(),
                     logs_dirty: true,
@@ -103,6 +114,13 @@ impl App {
 }
 
 impl App {
+    /// Run the TUI event loop.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - Receiving an input event fails.
+    /// - The underlying terminal backend fails to draw.
     pub async fn run(mut self, mut terminal: DefaultTerminal) -> eyre::Result<()> {
         #[derive(Debug, strum::Display)]
         enum Event {
@@ -123,7 +141,7 @@ impl App {
         while self.is_running() {
             // Wait until an (input) event is received.
             let event = tokio::select! {
-                _ = self.shutdown.cancelled() => None,
+                () = self.shutdown.cancelled() => None,
                 input = self.input_event_handler.next() => Some(Event::Input(input?)),
                 event = self.ui_rx.next() => event.map(Event::Scheduler),
             };
@@ -140,163 +158,195 @@ impl App {
 
             match event {
                 Some(Event::Input(event)) => {
-                    self.handle_input_event(event)?;
+                    self.handle_input_event(event);
                     terminal.draw(|frame| frame.render_widget(&mut self, frame.area()))?;
                 }
                 Some(Event::Scheduler(event)) => {
-                    self.handle_event(event)?;
+                    self.handle_event(event);
                     terminal.draw(|frame| frame.render_widget(&mut self, frame.area()))?;
                 }
                 None => {}
-            };
+            }
         }
         Ok(())
     }
 
-    fn handle_event(&mut self, event: SchedulerEvent) -> eyre::Result<()> {
+    fn handle_event(&mut self, event: SchedulerEvent) {
         reducer::apply(&mut self.state, event);
-        Ok(())
     }
 
-    fn handle_input_event(&mut self, input_event: event::Input) -> eyre::Result<()> {
-        use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
-
+    fn handle_input_event(&mut self, input_event: event::Input) {
         match input_event {
             event::Input::Tick => self.tick(),
-            event::Input::Event(event) => match event {
-                crossterm::event::Event::Resize(cols, rows) => {
-                    self.terminal_rows = rows;
+            event::Input::Event(event) => self.handle_crossterm_event(&event),
+        }
+    }
+
+    fn handle_crossterm_event(&mut self, event: &crossterm::event::Event) {
+        use crossterm::event::{KeyEventKind};
+
+        match *event {
+            crossterm::event::Event::Resize(cols, rows) => {
+                self.terminal_rows = rows;
+                let _ = self.commands_tx.try_send(Command::ResizeAll { cols, rows });
+            }
+            crossterm::event::Event::Key(key) if key.kind == KeyEventKind::Press => {
+                self.handle_key_press(key);
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_key_press(&mut self, key: crossterm::event::KeyEvent) {
+        use crossterm::event::KeyCode;
+
+        if self.attach_mode {
+            self.handle_key_press_attach_mode(key);
+            return;
+        }
+
+        match key.code {
+            // Quit
+            KeyCode::Char('q') | KeyCode::Esc => self.exit(),
+
+            // Toggle focus
+            KeyCode::Tab => self.toggle_focus(),
+
+            // Toggle attach mode
+            KeyCode::Char('a') => {
+                self.attach_mode = !self.attach_mode;
+            }
+            KeyCode::Char('H') => self.toggle_healthcheck_pane(),
+
+            // Disable current service
+            KeyCode::Char('d') => self.disable_current_service(),
+
+            // Restart service
+            KeyCode::Char('r') => self.restart_current_service(),
+
+            // Restart all services
+            KeyCode::Char('R') => self.restart_all_services(),
+
+            // Navigation
+            KeyCode::Char('k') | KeyCode::Up => self.navigate_up(),
+            KeyCode::Char('j') | KeyCode::Down => self.navigate_down(),
+            KeyCode::Char('g') => self.scroll_to_top(),
+            KeyCode::Char('G') => self.scroll_to_bottom(),
+
+            // Decrease service sidebar width (resize to the left)
+            KeyCode::Char('-' | 'h') | KeyCode::Left => self.state.resize_left(),
+
+            // Increase service sidebar width (resize to the right)
+            KeyCode::Char('+' | 'l') | KeyCode::Right => self.state.resize_right(),
+
+            // Toggle wrapping for log viewer
+            KeyCode::Char('w') => self.toggle_wrap(),
+
+            // Toggle automatic tailing for log viewer
+            KeyCode::Char('t') => self.toggle_tail(),
+            _ => {}
+        }
+    }
+
+    fn handle_key_press_attach_mode(&mut self, key: crossterm::event::KeyEvent) {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        match key.code {
+            KeyCode::Esc if key.modifiers.contains(KeyModifiers::ALT) => {
+                self.attach_mode = false;
+            }
+            _ => {
+                if let Some(bytes) = key_event_to_bytes(key.code, key.modifiers)
+                    && let Some(service) = self.state.current_service()
+                {
+                    let service_id = service.id.clone();
                     let _ = self
                         .commands_tx
-                        .try_send(Command::ResizeAll { cols, rows });
+                        .try_send(Command::SendInput(service_id, bytes));
                 }
-                crossterm::event::Event::Key(key) if key.kind == KeyEventKind::Press => {
-                    if self.attach_mode {
-                        match key.code {
-                            KeyCode::Esc => {
-                                if key.modifiers.contains(KeyModifiers::ALT) {
-                                    self.attach_mode = false;
-                                } else if let Some(bytes) =
-                                    key_event_to_bytes(key.code, key.modifiers)
-                                {
-                                    if let Some(service) = self.state.current_service() {
-                                        let service_id = service.id.clone();
-                                        let _ = self
-                                            .commands_tx
-                                            .try_send(Command::SendInput(service_id, bytes));
-                                    }
-                                }
-                            }
-                            _ => {
-                                if let Some(bytes) = key_event_to_bytes(key.code, key.modifiers) {
-                                    if let Some(service) = self.state.current_service() {
-                                        let service_id = service.id.clone();
-                                        let _ = self
-                                            .commands_tx
-                                            .try_send(Command::SendInput(service_id, bytes));
-                                    }
-                                }
-                            }
-                        }
-                        return Ok(());
-                    }
-
-                    match key.code {
-                        // Quit
-                        KeyCode::Char('q') | KeyCode::Esc => self.exit(),
-                        // Toggle focus
-                        KeyCode::Tab => {
-                            self.focus = if self.show_healthcheck_pane {
-                                match self.focus {
-                                    Focus::Services => Focus::Logs,
-                                    Focus::Logs => Focus::Healthcheck,
-                                    Focus::Healthcheck => Focus::Services,
-                                }
-                            } else {
-                                match self.focus {
-                                    Focus::Services => Focus::Logs,
-                                    Focus::Logs | Focus::Healthcheck => Focus::Services,
-                                }
-                            };
-                        }
-                        // Toggle attach mode
-                        KeyCode::Char('a') => {
-                            self.attach_mode = !self.attach_mode;
-                        }
-                        KeyCode::Char('H') => {
-                            self.show_healthcheck_pane = !self.show_healthcheck_pane;
-                            if !self.show_healthcheck_pane && self.focus == Focus::Healthcheck {
-                                self.focus = Focus::Logs;
-                            }
-                        }
-                        // Disable current service
-                        KeyCode::Char('d') => self.disable_current_service(),
-                        // Restart service
-                        KeyCode::Char('r') => self.restart_current_service(),
-                        // Restart all services
-                        KeyCode::Char('R') => self.restart_all_services(),
-                        // Navigation
-                        KeyCode::Char('k') | KeyCode::Up => match self.focus {
-                            Focus::Services => self.state.service_up(),
-                            Focus::Logs => self.scroll_logs_up(1),
-                            Focus::Healthcheck => self.scroll_healthchecks_up(1),
-                        },
-                        KeyCode::Char('j') | KeyCode::Down => match self.focus {
-                            Focus::Services => self.state.service_down(),
-                            Focus::Logs => self.scroll_logs_down(1),
-                            Focus::Healthcheck => self.scroll_healthchecks_down(1),
-                        },
-                        KeyCode::Char('g') => match self.focus {
-                            Focus::Logs => {
-                                self.log_view.follow_tail = false;
-                                self.log_view.scroll_offset = 0;
-                            }
-                            Focus::Healthcheck => {
-                                self.healthcheck_view.follow_tail = false;
-                                self.healthcheck_view.scroll_offset = 0;
-                            }
-                            Focus::Services => {}
-                        },
-                        KeyCode::Char('G') => match self.focus {
-                            Focus::Logs => {
-                                self.log_view.follow_tail = true;
-                            }
-                            Focus::Healthcheck => {
-                                self.healthcheck_view.follow_tail = true;
-                            }
-                            Focus::Services => {}
-                        },
-                        // Decrease service sidebar width (resize to the left)
-                        KeyCode::Char('-') | KeyCode::Char('h') | KeyCode::Left => {
-                            self.state.resize_left()
-                        }
-                        // Increase service sidebar width (resize to the right)
-                        KeyCode::Char('+') | KeyCode::Char('l') | KeyCode::Right => {
-                            self.state.resize_right()
-                        }
-                        // Toggle wrapping for log viewer
-                        KeyCode::Char('w') => {
-                            let wrap = !self.log_view.wrap;
-                            self.log_view.wrap = wrap;
-                            self.healthcheck_view.wrap = wrap;
-                        }
-                        // Toggle automatic tailing for log viewer
-                        KeyCode::Char('t') => match self.focus {
-                            Focus::Logs | Focus::Services => {
-                                self.log_view.follow_tail = !self.log_view.follow_tail;
-                            }
-                            Focus::Healthcheck => {
-                                self.healthcheck_view.follow_tail =
-                                    !self.healthcheck_view.follow_tail;
-                            }
-                        },
-                        _ => {}
-                    }
-                }
-                _ => {}
-            },
+            }
         }
-        Ok(())
+    }
+
+    fn toggle_focus(&mut self) {
+        self.focus = if self.show_healthcheck_pane {
+            match self.focus {
+                Focus::Services => Focus::Logs,
+                Focus::Logs => Focus::Healthcheck,
+                Focus::Healthcheck => Focus::Services,
+            }
+        } else {
+            match self.focus {
+                Focus::Services => Focus::Logs,
+                Focus::Logs | Focus::Healthcheck => Focus::Services,
+            }
+        };
+    }
+
+    fn toggle_healthcheck_pane(&mut self) {
+        self.show_healthcheck_pane = !self.show_healthcheck_pane;
+        if !self.show_healthcheck_pane && self.focus == Focus::Healthcheck {
+            self.focus = Focus::Logs;
+        }
+    }
+
+    fn navigate_up(&mut self) {
+        match self.focus {
+            Focus::Services => self.state.service_up(),
+            Focus::Logs => self.scroll_logs_up(1),
+            Focus::Healthcheck => self.scroll_healthchecks_up(1),
+        }
+    }
+
+    fn navigate_down(&mut self) {
+        match self.focus {
+            Focus::Services => self.state.service_down(),
+            Focus::Logs => self.scroll_logs_down(1),
+            Focus::Healthcheck => self.scroll_healthchecks_down(1),
+        }
+    }
+
+    fn scroll_to_top(&mut self) {
+        match self.focus {
+            Focus::Logs => {
+                self.log_view.follow_tail = false;
+                self.log_view.scroll_offset = 0;
+            }
+            Focus::Healthcheck => {
+                self.healthcheck_view.follow_tail = false;
+                self.healthcheck_view.scroll_offset = 0;
+            }
+            Focus::Services => {}
+        }
+    }
+
+    fn scroll_to_bottom(&mut self) {
+        match self.focus {
+            Focus::Logs => {
+                self.log_view.follow_tail = true;
+            }
+            Focus::Healthcheck => {
+                self.healthcheck_view.follow_tail = true;
+            }
+            Focus::Services => {}
+        }
+    }
+
+    fn toggle_wrap(&mut self) {
+        let wrap = !self.log_view.wrap;
+        self.log_view.wrap = wrap;
+        self.healthcheck_view.wrap = wrap;
+    }
+
+    fn toggle_tail(&mut self) {
+        match self.focus {
+            Focus::Logs | Focus::Services => {
+                self.log_view.follow_tail = !self.log_view.follow_tail;
+            }
+            Focus::Healthcheck => {
+                self.healthcheck_view.follow_tail = !self.healthcheck_view.follow_tail;
+            }
+        }
     }
 
     fn log_viewport_height(&self) -> u16 {
@@ -578,7 +628,7 @@ mod tests {
         let mut diagnostics: Vec<Diagnostic<usize>> = vec![];
         let parsed = micromux::from_str(yaml, Path::new("."), 0usize, None, &mut diagnostics)
             .map_err(|err| color_eyre::eyre::eyre!(err.to_string()))?;
-        let mux = micromux::Micromux::new(parsed)
+        let mux = micromux::Micromux::new(&parsed)
             .map_err(|err| color_eyre::eyre::eyre!(err.to_string()))?;
         let services = mux.services();
 
@@ -590,18 +640,18 @@ mod tests {
         app.focus = Focus::Services;
         app.show_healthcheck_pane = false;
 
-        app.handle_input_event(tab_press())?;
+        app.handle_input_event(tab_press());
         assert_eq!(app.focus, Focus::Logs);
-        app.handle_input_event(tab_press())?;
+        app.handle_input_event(tab_press());
         assert_eq!(app.focus, Focus::Services);
 
         app.show_healthcheck_pane = true;
         app.focus = Focus::Services;
-        app.handle_input_event(tab_press())?;
+        app.handle_input_event(tab_press());
         assert_eq!(app.focus, Focus::Logs);
-        app.handle_input_event(tab_press())?;
+        app.handle_input_event(tab_press());
         assert_eq!(app.focus, Focus::Healthcheck);
-        app.handle_input_event(tab_press())?;
+        app.handle_input_event(tab_press());
         assert_eq!(app.focus, Focus::Services);
 
         Ok(())

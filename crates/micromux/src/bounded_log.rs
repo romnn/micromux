@@ -14,10 +14,11 @@ pub struct BoundedLog {
 }
 
 impl BoundedLog {
-    /// Create a new BoundedLog with optional line and byte limits.
+    /// Create a new `BoundedLog` with optional line and byte limits.
     ///
     /// - `max_lines`: keeps at most this many lines (if `Some`).
     /// - `max_bytes`: keeps at most this many bytes total (if `Some`).
+    #[must_use]
     pub fn new(max_lines: Option<u16>, max_bytes: Option<usize>) -> Self {
         BoundedLog {
             entries: VecDeque::new(),
@@ -28,23 +29,33 @@ impl BoundedLog {
     }
 
     /// Keep only the most recent `max_lines` lines.
+    #[must_use]
     pub fn with_max_lines(max_lines: u16) -> Self {
         Self::new(Some(max_lines), None)
     }
 
     /// Keep only the most recent content fitting in `max_bytes` bytes.
+    #[must_use]
     pub fn with_max_bytes(max_bytes: usize) -> Self {
         Self::new(None, Some(max_bytes))
     }
 
     /// Keep at most `max_lines` and at most `max_bytes`.
+    #[must_use]
     pub fn with_limits(max_lines: u16, max_bytes: usize) -> Self {
         Self::new(Some(max_lines), Some(max_bytes))
     }
 
     /// Number of log lines in the buffer.
+    #[must_use]
     pub fn len(&self) -> usize {
         self.entries.len()
+    }
+
+    /// Returns `true` if the buffer contains no entries.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
     }
 
     /// Push a new log line into the buffer, evicting old entries as needed.
@@ -74,6 +85,9 @@ impl BoundedLog {
         }
     }
 
+    /// Replace the last line in the buffer.
+    ///
+    /// If the buffer is empty, this behaves like [`push`].
     pub fn replace_last(&mut self, line: String) {
         if let Some(old) = self.entries.pop_back() {
             self.current_bytes = self.current_bytes.saturating_sub(old.len());
@@ -86,6 +100,8 @@ impl BoundedLog {
         self.entries.iter()
     }
 
+    /// Return the full contents joined with `\n`.
+    #[must_use]
     pub fn full_text(&self) -> String {
         self.entries.iter().join("\n")
     }
@@ -97,7 +113,7 @@ impl BoundedLog {
     }
 }
 
-/// An async wrapper around BoundedLog that supports subscriptions.
+/// An async wrapper around `BoundedLog` that supports subscriptions.
 #[derive(Debug, Clone)]
 pub struct AsyncBoundedLog {
     inner: Arc<RwLock<BoundedLog>>,
@@ -112,6 +128,7 @@ impl From<BoundedLog> for AsyncBoundedLog {
 
 impl AsyncBoundedLog {
     /// Create with optional limits.
+    #[must_use]
     pub fn new(log: BoundedLog) -> Self {
         let (tx, _) = watch::channel(0);
         AsyncBoundedLog {
@@ -131,6 +148,9 @@ impl AsyncBoundedLog {
         let _ = self.tx.send(ver);
     }
 
+    /// Replace the last line in the buffer and notify subscribers.
+    ///
+    /// If the buffer is empty, this behaves like [`push`].
     pub fn replace_last(&self, line: String) {
         {
             let mut log = self.inner.write();
@@ -141,13 +161,16 @@ impl AsyncBoundedLog {
         let _ = self.tx.send(ver);
     }
 
+    /// Return the number of lines and full text joined with `\n`.
+    #[must_use]
     pub fn full_text(&self) -> (u16, String) {
         let log = self.inner.read();
-        let lines = log.len().min(u16::MAX as usize) as u16;
+        let lines = u16::try_from(log.len()).unwrap_or(u16::MAX);
         (lines, log.full_text())
     }
 
     /// Subscribe to updates; resolves when a new line is pushed.
+    #[must_use]
     pub fn subscribe(&self) -> watch::Receiver<u64> {
         self.tx.subscribe()
     }

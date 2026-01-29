@@ -14,9 +14,9 @@ pub enum LogFile<'a> {
 /// # Errors
 /// - If the logging directive cannot be parsed.
 /// - If the global tracing subscriber cannot be installed.
-pub fn setup<'a>(
+pub fn setup(
     log_level: Option<tracing::metadata::Level>,
-    log_file: LogFile<'a>,
+    log_file: &LogFile<'_>,
 ) -> eyre::Result<tracing_appender::non_blocking::WorkerGuard> {
     let (log_writer, guard) = match log_file {
         LogFile::RollingLog { cache_dir } => {

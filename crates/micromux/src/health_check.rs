@@ -19,7 +19,7 @@ mod tests {
 
     fn spanned_string(value: &str) -> Spanned<String> {
         Spanned {
-            span: Default::default(),
+            span: yaml_spanned::spanned::Span::default(),
             inner: value.to_string(),
         }
     }
@@ -34,7 +34,7 @@ mod tests {
 
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_nanos();
         let dir = std::env::temp_dir().join(format!("micromux-hc-timeout-{nanos}"));
         std::fs::create_dir_all(&dir)?;
@@ -54,11 +54,11 @@ mod tests {
             start_delay: None,
             interval: None,
             timeout: Some(Spanned {
-                span: Default::default(),
+                span: yaml_spanned::spanned::Span::default(),
                 inner: std::time::Duration::from_millis(50),
             }),
             retries: Some(Spanned {
-                span: Default::default(),
+                span: yaml_spanned::spanned::Span::default(),
                 inner: 1,
             }),
         };
@@ -67,17 +67,20 @@ mod tests {
         let shutdown = CancellationToken::new();
         let terminate = CancellationToken::new();
         let env = std::collections::HashMap::new();
+        let service_id: ServiceID = "svc".to_string();
 
         let start = tokio::time::Instant::now();
         let res = super::run(
             &hc,
-            &"svc".to_string(),
+            &service_id,
             1,
-            Some(&dir),
-            &env,
-            events_tx,
-            shutdown,
-            terminate,
+            RunParams {
+                working_dir: Some(&dir),
+                environment: &env,
+                events_tx,
+                shutdown,
+                terminate,
+            },
         )
         .await;
         assert!(matches!(
@@ -130,6 +133,20 @@ pub struct Error {
     pub source: ErrorReason,
 }
 
+struct RunParams<'a> {
+    pub working_dir: Option<&'a std::path::Path>,
+    pub environment: &'a std::collections::HashMap<String, String>,
+    pub events_tx: mpsc::Sender<Event>,
+    pub shutdown: CancellationToken,
+    pub terminate: CancellationToken,
+}
+
+enum Completion {
+    Shutdown,
+    Timeout,
+    Status(Result<std::process::ExitStatus, std::io::Error>),
+}
+
 pub async fn run_loop(
     health_check: crate::config::HealthCheck,
     service_id: &ServiceID,
@@ -143,9 +160,9 @@ pub async fn run_loop(
     let start_delay = health_check
         .start_delay
         .as_deref()
-        .cloned()
+        .copied()
         .unwrap_or_default();
-    let interval = health_check.interval.as_deref().cloned().unwrap_or_default();
+    let interval = health_check.interval.as_deref().copied().unwrap_or_default();
     tracing::info!(
         service_id,
         ?start_delay,
@@ -156,9 +173,9 @@ pub async fn run_loop(
 
     if !start_delay.is_zero() {
         tokio::select! {
-            _ = shutdown.cancelled() => return,
-            _ = terminate.cancelled() => return,
-            _ = tokio::time::sleep(start_delay) => {},
+            () = shutdown.cancelled() => return,
+            () = terminate.cancelled() => return,
+            () = tokio::time::sleep(start_delay) => {},
         };
     }
 
@@ -172,16 +189,18 @@ pub async fn run_loop(
             &health_check,
             service_id,
             attempt_id,
-            working_dir.as_deref(),
-            &environment,
-            events_tx.clone(),
-            shutdown.clone(),
-            terminate.clone(),
+            RunParams {
+                working_dir: working_dir.as_deref(),
+                environment: &environment,
+                events_tx: events_tx.clone(),
+                shutdown: shutdown.clone(),
+                terminate: terminate.clone(),
+            },
         )
         .await;
         match res {
             Ok(()) => {
-                let _ = events_tx.send(Event::Healthy(service_id.to_string())).await;
+                let _ = events_tx.send(Event::Healthy(service_id.clone())).await;
                 attempt = 0;
             }
             Err(err) => {
@@ -212,13 +231,13 @@ pub async fn run_loop(
                             "health check timed out",
                         );
                     }
-                };
+                }
 
                 if attempt < max_retries {
                     attempt = attempt.saturating_add(1);
                 } else {
                     let _ = events_tx
-                        .send(Event::Unhealthy(service_id.to_string()))
+                        .send(Event::Unhealthy(service_id.clone()))
                         .await;
                     return;
                 }
@@ -226,288 +245,316 @@ pub async fn run_loop(
         }
 
         tokio::select! {
-            _ = shutdown.cancelled() => return,
-            _ = terminate.cancelled() => return,
-            _ = tokio::time::sleep(interval) => {},
+            () = shutdown.cancelled() => return,
+            () = terminate.cancelled() => return,
+            () = tokio::time::sleep(interval) => {},
         };
     }
 }
 
-pub async fn run(
+fn command_string(health_check: &crate::config::HealthCheck) -> String {
+    let (prog, args) = &health_check.test;
+    [prog]
+        .into_iter()
+        .chain(args.iter())
+        .map(|value| value.as_str())
+        .join(" ")
+}
+
+async fn emit_started(
+    events_tx: &mpsc::Sender<Event>,
+    service_id: &ServiceID,
+    attempt: u64,
+    command: String,
+) {
+    let _ = events_tx
+        .send(Event::HealthCheckStarted {
+            service_id: service_id.clone(),
+            attempt,
+            command,
+        })
+        .await;
+}
+
+async fn emit_finished(
+    events_tx: &mpsc::Sender<Event>,
+    service_id: &ServiceID,
+    attempt: u64,
+    success: bool,
+    exit_code: i32,
+) {
+    let _ = events_tx
+        .send(Event::HealthCheckFinished {
+            service_id: service_id.clone(),
+            attempt,
+            success,
+            exit_code,
+        })
+        .await;
+}
+
+fn try_emit_spawn_failed(
+    events_tx: &mpsc::Sender<Event>,
+    service_id: &ServiceID,
+    attempt: u64,
+    source: &std::io::Error,
+) {
+    let _ = events_tx.try_send(Event::HealthCheckLogLine {
+        service_id: service_id.clone(),
+        attempt,
+        stream: OutputStream::Stderr,
+        line: source.to_string(),
+    });
+    let _ = events_tx.try_send(Event::HealthCheckFinished {
+        service_id: service_id.clone(),
+        attempt,
+        success: false,
+        exit_code: -1,
+    });
+}
+
+fn spawn_output_task(
+    mut lines: tokio::io::Lines<BufReader<impl tokio::io::AsyncRead + Unpin + Send + 'static>>,
+    service_id: ServiceID,
+    attempt: u64,
+    stream: OutputStream,
+    events_tx: mpsc::Sender<Event>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::task::spawn(async move {
+        loop {
+            match lines.next_line().await {
+                Ok(Some(line)) => {
+                    let _ = events_tx
+                        .send(Event::HealthCheckLogLine {
+                            service_id: service_id.clone(),
+                            attempt,
+                            stream,
+                            line,
+                        })
+                        .await;
+                }
+                Ok(None) => break,
+                Err(err) => {
+                    tracing::error!(service_id, ?err, "health check: failed to read line");
+                }
+            }
+        }
+    })
+}
+
+async fn join_tasks(tasks: &mut [Option<tokio::task::JoinHandle<()>>]) {
+    for task in tasks {
+        if let Some(task) = task.take() {
+            let _ = task.await;
+        }
+    }
+}
+
+struct Running {
+    service_id: ServiceID,
+    attempt: u64,
+    command: String,
+    events_tx: mpsc::Sender<Event>,
+    stdout_task: Option<tokio::task::JoinHandle<()>>,
+    stderr_task: Option<tokio::task::JoinHandle<()>>,
+    wait_handle: tokio::task::JoinHandle<Result<std::process::ExitStatus, std::io::Error>>,
+    kill_token: CancellationToken,
+    child_pid: Option<i32>,
+}
+
+fn spawn_wait_task(
+    mut child: tokio::process::Child,
+    kill_token: &CancellationToken,
+) -> tokio::task::JoinHandle<Result<std::process::ExitStatus, std::io::Error>> {
+    let poll = std::time::Duration::from_millis(25);
+    let kill_token_child = kill_token.clone();
+    tokio::task::spawn(async move {
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => return Ok(status),
+                Ok(None) => {}
+                Err(err) => return Err(err),
+            }
+
+            tokio::select! {
+                () = kill_token_child.cancelled() => {
+                    #[cfg(unix)]
+                    if let Some(pid) = child.id() {
+                        let pid = i32::try_from(pid).unwrap_or(i32::MAX);
+                        let pid = nix::unistd::Pid::from_raw(pid);
+                        let _ = nix::sys::signal::killpg(pid, nix::sys::signal::Signal::SIGKILL);
+                    }
+                    let _ = child.kill().await;
+                    return child.wait().await;
+                }
+                () = tokio::time::sleep(poll) => {}
+            }
+        }
+    })
+}
+
+async fn select_completion(
+    timeout: Option<std::time::Duration>,
+    shutdown: &CancellationToken,
+    terminate: &CancellationToken,
+    wait_handle: &mut tokio::task::JoinHandle<Result<std::process::ExitStatus, std::io::Error>>,
+) -> Completion {
+    tokio::select! {
+        () = shutdown.cancelled() => Completion::Shutdown,
+        () = terminate.cancelled() => Completion::Shutdown,
+        () = async {
+            if let Some(d) = timeout {
+                tokio::time::sleep(d).await;
+            } else {
+                futures::future::pending::<()>().await;
+            }
+        } => Completion::Timeout,
+        res = wait_handle => Completion::Status(res.unwrap_or_else(|err| Err(std::io::Error::other(err.to_string())))),
+    }
+}
+
+async fn cleanup_after_cancel(running: &mut Running) {
+    running.kill_token.cancel();
+    #[cfg(unix)]
+    if let Some(pid) = running.child_pid {
+        kill_process_group(pid);
+    }
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        &mut running.wait_handle,
+    )
+    .await;
+    join_tasks(&mut [running.stdout_task.take(), running.stderr_task.take()]).await;
+}
+
+async fn finish_with_exit(running: &mut Running, success: bool, exit_code: i32) {
+    join_tasks(&mut [running.stdout_task.take(), running.stderr_task.take()]).await;
+    emit_finished(
+        &running.events_tx,
+        &running.service_id,
+        running.attempt,
+        success,
+        exit_code,
+    )
+    .await;
+}
+
+#[cfg(unix)]
+fn kill_process_group(pid: i32) {
+    let pid = nix::unistd::Pid::from_raw(pid);
+    let _ = nix::sys::signal::killpg(pid, nix::sys::signal::Signal::SIGKILL);
+    let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
+}
+
+async fn run(
     health_check: &crate::config::HealthCheck,
     service_id: &ServiceID,
     attempt: u64,
-    working_dir: Option<&std::path::Path>,
-    environment: &std::collections::HashMap<String, String>,
-    events_tx: mpsc::Sender<Event>,
-    shutdown: CancellationToken,
-    terminate: CancellationToken,
+    params: RunParams<'_>,
 ) -> Result<(), Error> {
-        let (prog, args) = &health_check.test;
-        let command_string = || {
-            [prog]
-                .into_iter()
-                .chain(args.iter())
-                .map(|value| value.as_str())
-                .join(" ")
-        };
+    let (prog, args) = &health_check.test;
+    let command = command_string(health_check);
 
-        let _ = events_tx
-            .send(Event::HealthCheckStarted {
-                service_id: service_id.to_string(),
-                attempt,
-                command: command_string(),
-            })
-            .await;
+    emit_started(&params.events_tx, service_id, attempt, command.clone()).await;
 
-        let mut cmd = Command::new(prog.as_ref());
-        cmd.args(args.iter().map(|value| value.as_ref()))
-            .envs(environment.iter())
-            .stderr(Stdio::piped())
-            .stdout(Stdio::piped());
-        #[cfg(unix)]
-        {
-            cmd.process_group(0);
-        }
-        if let Some(dir) = working_dir {
-            cmd.current_dir(dir);
-        }
-        let mut process = cmd.spawn().map_err(|source| {
-            let _ = events_tx.try_send(Event::HealthCheckLogLine {
-                service_id: service_id.to_string(),
-                attempt,
-                stream: OutputStream::Stderr,
-                line: source.to_string(),
-            });
-            let _ = events_tx.try_send(Event::HealthCheckFinished {
-                service_id: service_id.to_string(),
-                attempt,
-                success: false,
-                exit_code: -1,
-            });
-            Error {
-                command: command_string(),
-                source: ErrorReason::Spawn(source),
-            }
-        })?;
-
-        let mut stderr_task = None;
-        if let Some(stderr) = process.stderr.take() {
-            let service_id = service_id.clone();
-            let events_tx = events_tx.clone();
-            stderr_task = Some(tokio::task::spawn(async move {
-                let mut lines = BufReader::new(stderr).lines();
-                loop {
-                    match lines.next_line().await {
-                        Ok(Some(line)) => {
-                            let _ = events_tx
-                                .send(Event::HealthCheckLogLine {
-                                    service_id: service_id.to_string(),
-                                    attempt,
-                                    stream: OutputStream::Stderr,
-                                    line,
-                                })
-                                .await;
-                        }
-                        Ok(None) => break,
-                        Err(err) => {
-                            tracing::error!(service_id, ?err, "health check: failed to read line")
-                        }
-                    }
-                }
-            }));
-        }
-
-        let mut stdout_task = None;
-        if let Some(stdout) = process.stdout.take() {
-            let service_id = service_id.clone();
-            let events_tx = events_tx.clone();
-            stdout_task = Some(tokio::task::spawn(async move {
-                let mut lines = BufReader::new(stdout).lines();
-                loop {
-                    match lines.next_line().await {
-                        Ok(Some(line)) => {
-                            let _ = events_tx
-                                .send(Event::HealthCheckLogLine {
-                                    service_id: service_id.to_string(),
-                                    attempt,
-                                    stream: OutputStream::Stdout,
-                                    line,
-                                })
-                                .await;
-                        }
-                        Ok(None) => break,
-                        Err(err) => {
-                            tracing::error!(service_id, ?err, "health check: failed to read line")
-                        }
-                    }
-                }
-            }));
-        }
-
-        let child_pid = process.id().map(|pid| pid as i32);
-        let kill_token = CancellationToken::new();
-        let mut child = process;
-        let kill_token_child = kill_token.clone();
-        let poll = std::time::Duration::from_millis(25);
-        let mut wait_handle = tokio::task::spawn(async move {
-            loop {
-                match child.try_wait() {
-                    Ok(Some(status)) => return Ok(status),
-                    Ok(None) => {}
-                    Err(err) => return Err(err),
-                }
-
-                tokio::select! {
-                    _ = kill_token_child.cancelled() => {
-                        #[cfg(unix)]
-                        if let Some(pid) = child.id() {
-                            let pid = nix::unistd::Pid::from_raw(pid as i32);
-                            let _ = nix::sys::signal::killpg(pid, nix::sys::signal::Signal::SIGKILL);
-                        }
-                        let _ = child.kill();
-                        return child.wait().await;
-                    }
-                    _ = tokio::time::sleep(poll) => {}
-                }
-            }
-        });
-
-        let timeout = health_check.timeout.clone().map(|t| t.into_inner());
-
-        enum Completion {
-            Shutdown,
-            Timeout,
-            Status(Result<std::process::ExitStatus, std::io::Error>),
-        }
-
-        let completion = tokio::select! {
-            _ = shutdown.cancelled() => Completion::Shutdown,
-            _ = terminate.cancelled() => Completion::Shutdown,
-            _ = async {
-                if let Some(d) = timeout {
-                    tokio::time::sleep(d).await;
-                } else {
-                    futures::future::pending::<()>().await;
-                }
-            } => Completion::Timeout,
-            res = &mut wait_handle => Completion::Status(res.unwrap_or_else(|err| Err(std::io::Error::other(err.to_string())))),
-        };
-
-        match completion {
-            Completion::Shutdown => {
-                kill_token.cancel();
-                #[cfg(unix)]
-                if let Some(pid) = child_pid {
-                    let pid = nix::unistd::Pid::from_raw(pid);
-                    let _ = nix::sys::signal::killpg(pid, nix::sys::signal::Signal::SIGKILL);
-                    let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
-                }
-                let _ =
-                    tokio::time::timeout(std::time::Duration::from_secs(1), &mut wait_handle).await;
-                if let Some(task) = stdout_task.take() {
-                    let _ = task.await;
-                }
-                if let Some(task) = stderr_task.take() {
-                    let _ = task.await;
-                }
-                let _ = events_tx
-                    .send(Event::HealthCheckFinished {
-                        service_id: service_id.to_string(),
-                        attempt,
-                        success: false,
-                        exit_code: -1,
-                    })
-                    .await;
-                Ok(())
-            }
-            Completion::Timeout => {
-                kill_token.cancel();
-                #[cfg(unix)]
-                if let Some(pid) = child_pid {
-                    let pid = nix::unistd::Pid::from_raw(pid);
-                    let _ = nix::sys::signal::killpg(pid, nix::sys::signal::Signal::SIGKILL);
-                    let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
-                }
-                let _ =
-                    tokio::time::timeout(std::time::Duration::from_secs(1), &mut wait_handle).await;
-                if let Some(task) = stdout_task.take() {
-                    let _ = task.await;
-                }
-                if let Some(task) = stderr_task.take() {
-                    let _ = task.await;
-                }
-                let _ = events_tx
-                    .send(Event::HealthCheckFinished {
-                        service_id: service_id.to_string(),
-                        attempt,
-                        success: false,
-                        exit_code: -1,
-                    })
-                    .await;
-                Err(Error {
-                    command: command_string(),
-                    source: ErrorReason::Timeout,
-                })
-            }
-            Completion::Status(Ok(status)) if status.success() => {
-                if let Some(task) = stdout_task.take() {
-                    let _ = task.await;
-                }
-                if let Some(task) = stderr_task.take() {
-                    let _ = task.await;
-                }
-                let _ = events_tx
-                    .send(Event::HealthCheckFinished {
-                        service_id: service_id.to_string(),
-                        attempt,
-                        success: true,
-                        exit_code: status.code().unwrap_or(0),
-                    })
-                    .await;
-                Ok(())
-            }
-            Completion::Status(Ok(status)) => {
-                if let Some(task) = stdout_task.take() {
-                    let _ = task.await;
-                }
-                if let Some(task) = stderr_task.take() {
-                    let _ = task.await;
-                }
-                let exit_code = status.code().unwrap_or(-1);
-                let _ = events_tx
-                    .send(Event::HealthCheckFinished {
-                        service_id: service_id.to_string(),
-                        attempt,
-                        success: false,
-                        exit_code,
-                    })
-                    .await;
-                Err(Error {
-                    command: command_string(),
-                    source: ErrorReason::Failed { exit_code },
-                })
-            }
-            Completion::Status(Err(err)) => {
-                if let Some(task) = stdout_task.take() {
-                    let _ = task.await;
-                }
-                if let Some(task) = stderr_task.take() {
-                    let _ = task.await;
-                }
-                let _ = events_tx
-                    .send(Event::HealthCheckFinished {
-                        service_id: service_id.to_string(),
-                        attempt,
-                        success: false,
-                        exit_code: -1,
-                    })
-                    .await;
-                Err(Error {
-                    command: command_string(),
-                    source: ErrorReason::Spawn(err),
-                })
-            }
-        }
+    let mut cmd = Command::new(prog.as_ref());
+    cmd.args(args.iter().map(std::convert::AsRef::as_ref))
+        .envs(params.environment.iter())
+        .stderr(Stdio::piped())
+        .stdout(Stdio::piped());
+    #[cfg(unix)]
+    {
+        cmd.process_group(0);
+    }
+    if let Some(dir) = params.working_dir {
+        cmd.current_dir(dir);
     }
 
+    let mut process = cmd.spawn().map_err(|source| {
+        try_emit_spawn_failed(&params.events_tx, service_id, attempt, &source);
+        Error {
+            command: command.clone(),
+            source: ErrorReason::Spawn(source),
+        }
+    })?;
+
+    let mut stderr_task = None;
+    if let Some(stderr) = process.stderr.take() {
+        stderr_task = Some(spawn_output_task(
+            BufReader::new(stderr).lines(),
+            service_id.clone(),
+            attempt,
+            OutputStream::Stderr,
+            params.events_tx.clone(),
+        ));
+    }
+
+    let mut stdout_task = None;
+    if let Some(stdout) = process.stdout.take() {
+        stdout_task = Some(spawn_output_task(
+            BufReader::new(stdout).lines(),
+            service_id.clone(),
+            attempt,
+            OutputStream::Stdout,
+            params.events_tx.clone(),
+        ));
+    }
+
+    let child_pid = process.id().and_then(|pid| i32::try_from(pid).ok());
+    let kill_token = CancellationToken::new();
+    let mut wait_handle = spawn_wait_task(process, &kill_token);
+    let timeout = health_check.timeout.as_ref().map(|t| t.inner);
+
+    let completion =
+        select_completion(timeout, &params.shutdown, &params.terminate, &mut wait_handle).await;
+
+    let mut running = Running {
+        service_id: service_id.clone(),
+        attempt,
+        command,
+        events_tx: params.events_tx.clone(),
+        stdout_task,
+        stderr_task,
+        wait_handle,
+        kill_token,
+        child_pid,
+    };
+
+    match completion {
+        Completion::Shutdown => {
+            cleanup_after_cancel(&mut running).await;
+            emit_finished(&running.events_tx, &running.service_id, attempt, false, -1).await;
+            Ok(())
+        }
+        Completion::Timeout => {
+            cleanup_after_cancel(&mut running).await;
+            emit_finished(&running.events_tx, &running.service_id, attempt, false, -1).await;
+            let command = std::mem::take(&mut running.command);
+            Err(Error {
+                command,
+                source: ErrorReason::Timeout,
+            })
+        }
+        Completion::Status(Ok(status)) if status.success() => {
+            finish_with_exit(&mut running, true, status.code().unwrap_or(0)).await;
+            Ok(())
+        }
+        Completion::Status(Ok(status)) => {
+            let exit_code = status.code().unwrap_or(-1);
+            finish_with_exit(&mut running, false, exit_code).await;
+            let command = std::mem::take(&mut running.command);
+            Err(Error {
+                command,
+                source: ErrorReason::Failed { exit_code },
+            })
+        }
+        Completion::Status(Err(err)) => {
+            finish_with_exit(&mut running, false, -1).await;
+            let command = std::mem::take(&mut running.command);
+            Err(Error {
+                command,
+                source: ErrorReason::Spawn(err),
+            })
+        }
+    }
+}

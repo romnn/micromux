@@ -13,12 +13,12 @@ impl<'a> ServiceGraph<'a> {
         let mut graph = DiGraphMap::new();
 
         // Add all nodes first so dependency validation is order-independent.
-        for (name, _service) in services.iter() {
+        for (name, _service) in services {
             graph.add_node(name.as_str());
         }
 
         // Add node for each service and edges for its dependencies
-        for (name, service) in services.iter() {
+        for (name, service) in services {
             let name = name.as_ref();
             for dep in &service.depends_on {
                 let dep_name = dep.name.as_ref().as_str();
@@ -61,7 +61,7 @@ mod tests {
 
     fn spanned_string(value: &str) -> Spanned<String> {
         Spanned {
-            span: Default::default(),
+            span: yaml_spanned::spanned::Span::default(),
             inner: value.to_string(),
         }
     }

@@ -22,6 +22,198 @@ mod pty;
 #[path = "scheduler/schedule.rs"]
 mod schedule;
 
+struct SchedulerRuntime<'a> {
+    graph: ServiceGraph<'a>,
+    desired_disabled: HashSet<ServiceID>,
+    restart_requested: HashSet<ServiceID>,
+    terminate_tokens: HashMap<ServiceID, CancellationToken>,
+    pty_masters: HashMap<ServiceID, Arc<Mutex<Box<dyn portable_pty::MasterPty + Send>>>>,
+    pty_writers: HashMap<ServiceID, Arc<Mutex<Box<dyn Write + Send>>>>,
+    current_pty_size: portable_pty::PtySize,
+    restart_backoff_until: HashMap<ServiceID, tokio::time::Instant>,
+    restart_backoff_delay: HashMap<ServiceID, Duration>,
+    restart_on_failure_remaining: HashMap<ServiceID, usize>,
+    service_state: HashMap<ServiceID, State>,
+    events_tx: mpsc::Sender<Event>,
+    ui_tx: mpsc::Sender<Event>,
+    shutdown: CancellationToken,
+    interactive_logs: bool,
+}
+
+impl<'a> SchedulerRuntime<'a> {
+    fn new(
+        services: &ServiceMap,
+        graph: ServiceGraph<'a>,
+        events_tx: mpsc::Sender<Event>,
+        ui_tx: mpsc::Sender<Event>,
+        shutdown: CancellationToken,
+        interactive_logs: bool,
+    ) -> Self {
+        let restart_on_failure_remaining: HashMap<ServiceID, usize> = services
+            .iter()
+            .filter_map(|(service_id, service)| match service.restart_policy {
+                service::RestartPolicy::OnFailure { remaining_attempts } => {
+                    Some((service_id.clone(), remaining_attempts))
+                }
+                _ => None,
+            })
+            .collect();
+
+        let service_state: HashMap<ServiceID, State> = services
+            .keys()
+            .map(|service_id| (service_id.clone(), State::Pending))
+            .collect();
+
+        Self {
+            graph,
+            desired_disabled: HashSet::new(),
+            restart_requested: HashSet::new(),
+            terminate_tokens: HashMap::new(),
+            pty_masters: HashMap::new(),
+            pty_writers: HashMap::new(),
+            current_pty_size: portable_pty::PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            },
+            restart_backoff_until: HashMap::new(),
+            restart_backoff_delay: HashMap::new(),
+            restart_on_failure_remaining,
+            service_state,
+            events_tx,
+            ui_tx,
+            shutdown,
+            interactive_logs,
+        }
+    }
+
+    async fn schedule_pass(&mut self, services: &ServiceMap) {
+        schedule::schedule_ready(&mut schedule::ScheduleContext {
+            services,
+            graph: &self.graph.inner,
+            service_state: &mut self.service_state,
+            desired_disabled: &self.desired_disabled,
+            restart_requested: &mut self.restart_requested,
+            restart_on_failure_remaining: &mut self.restart_on_failure_remaining,
+            terminate_tokens: &mut self.terminate_tokens,
+            pty_masters: &mut self.pty_masters,
+            pty_writers: &mut self.pty_writers,
+            current_pty_size: self.current_pty_size,
+            restart_backoff_until: &self.restart_backoff_until,
+            interactive_logs: self.interactive_logs,
+            events_tx: &self.events_tx,
+            shutdown: &self.shutdown,
+        })
+        .await;
+    }
+
+    fn apply_restart_backoff(&mut self, service_id: &ServiceID, code: i32) {
+        if code != 0 && !self.desired_disabled.contains(service_id) {
+            let delay = self
+                .restart_backoff_delay
+                .entry(service_id.clone())
+                .and_modify(|d| {
+                    *d = (*d * 2).min(Duration::from_secs(10));
+                })
+                .or_insert(Duration::from_millis(250));
+            self.restart_backoff_until
+                .insert(service_id.clone(), tokio::time::Instant::now() + *delay);
+        } else {
+            self.restart_backoff_until.remove(service_id);
+            self.restart_backoff_delay.remove(service_id);
+        }
+    }
+
+    async fn handle_command(&mut self, services: &ServiceMap, command: Command) {
+        match command {
+            Command::Restart(service_id) => {
+                self.desired_disabled.remove(&service_id);
+                self.restart_requested.insert(service_id.clone());
+                self.restart_backoff_until.remove(&service_id);
+                self.restart_backoff_delay.remove(&service_id);
+                if let Some(terminate) = self.terminate_tokens.get(&service_id) {
+                    terminate.cancel();
+                }
+            }
+            Command::RestartAll => {
+                for service_id in services.keys() {
+                    self.desired_disabled.remove(service_id);
+                    self.restart_requested.insert(service_id.clone());
+                    self.restart_backoff_until.remove(service_id);
+                    self.restart_backoff_delay.remove(service_id);
+                    if let Some(terminate) = self.terminate_tokens.get(service_id) {
+                        terminate.cancel();
+                    }
+                }
+            }
+            Command::Disable(service_id) => {
+                self.desired_disabled.insert(service_id.clone());
+                let _ = self.ui_tx.send(Event::Disabled(service_id.clone())).await;
+                self.restart_backoff_until.remove(&service_id);
+                self.restart_backoff_delay.remove(&service_id);
+                if let Some(terminate) = self.terminate_tokens.get(&service_id) {
+                    terminate.cancel();
+                }
+            }
+            Command::Enable(service_id) => {
+                self.desired_disabled.remove(&service_id);
+                self.restart_requested.insert(service_id.clone());
+                self.restart_backoff_until.remove(&service_id);
+                self.restart_backoff_delay.remove(&service_id);
+            }
+            Command::SendInput(service_id, data) => {
+                let Some(writer) = self.pty_writers.get(&service_id) else {
+                    return;
+                };
+                let mut guard = writer.lock();
+                if let Err(err) = guard.write_all(&data) {
+                    tracing::warn!(?err, service_id, "failed to write to pty");
+                }
+                if let Err(err) = guard.flush() {
+                    tracing::warn!(?err, service_id, "failed to flush pty");
+                }
+            }
+            Command::ResizeAll { cols, rows } => {
+                self.current_pty_size = portable_pty::PtySize {
+                    rows,
+                    cols,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                };
+                for (service_id, master) in &self.pty_masters {
+                    let guard = master.lock();
+                    let res = guard.resize(portable_pty::PtySize {
+                        rows,
+                        cols,
+                        pixel_width: 0,
+                        pixel_height: 0,
+                    });
+                    if let Err(err) = res {
+                        tracing::warn!(?err, service_id, "failed to resize pty");
+                    }
+                }
+            }
+        }
+    }
+
+    async fn handle_event(&mut self, services: &ServiceMap, event: Event) -> eyre::Result<()> {
+        tracing::debug!(%event, "received event");
+
+        let service_id = event.service_id().clone();
+        schedule::update_state(services, &mut self.service_state, &event);
+
+        if let Event::Exited(_, code) = &event {
+            self.terminate_tokens.remove(&service_id);
+            self.pty_masters.remove(&service_id);
+            self.pty_writers.remove(&service_id);
+            self.apply_restart_backoff(&service_id, *code);
+        }
+
+        self.ui_tx.send(event).await?;
+        Ok(())
+    }
+}
 
 pub async fn scheduler(
     services: &ServiceMap,
@@ -33,64 +225,25 @@ pub async fn scheduler(
     interactive_logs: bool,
 ) -> eyre::Result<()> {
     let graph = ServiceGraph::new(services)?;
-
-    let mut desired_disabled: HashSet<ServiceID> = HashSet::new();
-    let mut restart_requested: HashSet<ServiceID> = HashSet::new();
-    let mut terminate_tokens: HashMap<ServiceID, CancellationToken> = HashMap::new();
-    let mut pty_masters: HashMap<ServiceID, Arc<Mutex<Box<dyn portable_pty::MasterPty + Send>>>> =
-        HashMap::new();
-    let mut pty_writers: HashMap<ServiceID, Arc<Mutex<Box<dyn Write + Send>>>> = HashMap::new();
-    let mut current_pty_size = portable_pty::PtySize {
-        rows: 24,
-        cols: 80,
-        pixel_width: 0,
-        pixel_height: 0,
-    };
-    let mut restart_backoff_until: HashMap<ServiceID, tokio::time::Instant> = HashMap::new();
-    let mut restart_backoff_delay: HashMap<ServiceID, Duration> = HashMap::new();
-    let mut restart_on_failure_remaining: HashMap<ServiceID, usize> = services
-        .iter()
-        .filter_map(|(service_id, service)| match service.restart_policy {
-            service::RestartPolicy::OnFailure { remaining_attempts } => {
-                Some((service_id.clone(), remaining_attempts))
-            }
-            _ => None,
-        })
-        .collect();
-
-    // Initially, all services are in pending state
-    let mut service_state: HashMap<ServiceID, State> = services
-        .keys()
-        .map(|service_id| (service_id.to_string(), State::Pending))
-        .collect();
+    let mut rt = SchedulerRuntime::new(
+        services,
+        graph,
+        events_tx,
+        ui_tx,
+        shutdown.clone(),
+        interactive_logs,
+    );
 
     // Initial scheduling pass
     tracing::debug!("started initial scheduling pass");
-    schedule::schedule_ready(
-        services,
-        &graph.inner,
-        &mut service_state,
-        &desired_disabled,
-        &mut restart_requested,
-        &mut restart_on_failure_remaining,
-        &mut terminate_tokens,
-        &mut pty_masters,
-        &mut pty_writers,
-        current_pty_size,
-        &restart_backoff_until,
-        interactive_logs,
-        &events_tx,
-        &ui_tx,
-        &shutdown,
-    )
-    .await;
+    rt.schedule_pass(services).await;
     tracing::debug!("completed initial scheduling pass");
 
     // Whenever an event comes in, try to (re)start any services whose deps are now healthy
     loop {
         tracing::debug!("waiting for scheduling event");
         tokio::select! {
-            _ = shutdown.cancelled() => {
+            () = shutdown.cancelled() => {
                 tracing::debug!("exiting scheduler");
                 break;
             }
@@ -98,133 +251,17 @@ pub async fn scheduler(
                 let Some(command) = command else {
                     break;
                 };
-                match command {
-                    Command::Restart(service_id) => {
-                        desired_disabled.remove(&service_id);
-                        restart_requested.insert(service_id.clone());
-                        restart_backoff_until.remove(&service_id);
-                        restart_backoff_delay.remove(&service_id);
-                        if let Some(terminate) = terminate_tokens.get(&service_id) {
-                            terminate.cancel();
-                        }
-                    }
-                    Command::RestartAll => {
-                        for service_id in services.keys() {
-                            desired_disabled.remove(service_id);
-                            restart_requested.insert(service_id.clone());
-                            restart_backoff_until.remove(service_id);
-                            restart_backoff_delay.remove(service_id);
-                            if let Some(terminate) = terminate_tokens.get(service_id) {
-                                terminate.cancel();
-                            }
-                        }
-                    }
-                    Command::Disable(service_id) => {
-                        desired_disabled.insert(service_id.clone());
-                        let _ = ui_tx.send(Event::Disabled(service_id.clone())).await;
-                        restart_backoff_until.remove(&service_id);
-                        restart_backoff_delay.remove(&service_id);
-                        if let Some(terminate) = terminate_tokens.get(&service_id) {
-                            terminate.cancel();
-                        }
-                    }
-                    Command::Enable(service_id) => {
-                        desired_disabled.remove(&service_id);
-                        restart_requested.insert(service_id.clone());
-                        restart_backoff_until.remove(&service_id);
-                        restart_backoff_delay.remove(&service_id);
-                    }
-                    Command::SendInput(service_id, data) => {
-                        let Some(writer) = pty_writers.get(&service_id) else {
-                            continue;
-                        };
-                        let mut guard = writer.lock();
-                        if let Err(err) = guard.write_all(&data) {
-                            tracing::warn!(?err, service_id, "failed to write to pty");
-                        }
-                        if let Err(err) = guard.flush() {
-                            tracing::warn!(?err, service_id, "failed to flush pty");
-                        }
-                    }
-                    Command::ResizeAll { cols, rows } => {
-                        current_pty_size = portable_pty::PtySize {
-                            rows,
-                            cols,
-                            pixel_width: 0,
-                            pixel_height: 0,
-                        };
-                        for (service_id, master) in pty_masters.iter() {
-                            let guard = master.lock();
-                            let res = guard.resize(portable_pty::PtySize {
-                                rows,
-                                cols,
-                                pixel_width: 0,
-                                pixel_height: 0,
-                            });
-                            if let Err(err) = res {
-                                tracing::warn!(?err, service_id, "failed to resize pty");
-                            }
-                        }
-                    }
-                }
+                rt.handle_command(services, command).await;
             }
             event = events_rx.recv() => {
                 let Some(event) = event else {
                     break;
                 };
-                tracing::debug!(%event, "received event");
-
-                let service_id = event.service_id().clone();
-                schedule::update_state(services, &mut service_state, &event);
-
-                if matches!(event, Event::Exited(_, _)) {
-                    terminate_tokens.remove(&service_id);
-                    pty_masters.remove(&service_id);
-                    pty_writers.remove(&service_id);
-
-                    // Basic restart backoff for crash loops.
-                    if let Event::Exited(_, code) = &event {
-                        if *code != 0 && !desired_disabled.contains(&service_id) {
-                            let delay = restart_backoff_delay
-                                .entry(service_id.clone())
-                                .and_modify(|d| {
-                                    *d = (*d * 2).min(Duration::from_secs(10));
-                                })
-                                .or_insert(Duration::from_millis(250));
-                            restart_backoff_until.insert(
-                                service_id.clone(),
-                                tokio::time::Instant::now() + *delay,
-                            );
-                        } else {
-                            restart_backoff_until.remove(&service_id);
-                            restart_backoff_delay.remove(&service_id);
-                        }
-                    }
-                }
-
-                // Forward event to the UI
-                ui_tx.send(event).await?;
+                rt.handle_event(services, event).await?;
             }
         }
 
-        schedule::schedule_ready(
-            services,
-            &graph.inner,
-            &mut service_state,
-            &desired_disabled,
-            &mut restart_requested,
-            &mut restart_on_failure_remaining,
-            &mut terminate_tokens,
-            &mut pty_masters,
-            &mut pty_writers,
-            current_pty_size,
-            &restart_backoff_until,
-            interactive_logs,
-            &events_tx,
-            &ui_tx,
-            &shutdown,
-        )
-        .await;
+        rt.schedule_pass(services).await;
     }
     Ok(())
 }
@@ -244,7 +281,7 @@ mod tests {
 
     fn spanned_string(value: &str) -> Spanned<String> {
         Spanned {
-            span: Default::default(),
+            span: yaml_spanned::spanned::Span::default(),
             inner: value.to_string(),
         }
     }
@@ -274,7 +311,7 @@ mod tests {
     fn unique_tmp_dir(prefix: &str) -> std::path::PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_nanos();
         std::env::temp_dir().join(format!("micromux-{prefix}-{nanos}"))
     }
@@ -297,15 +334,15 @@ mod tests {
             ),
             start_delay: None,
             interval: Some(Spanned {
-                span: Default::default(),
+                span: yaml_spanned::spanned::Span::default(),
                 inner: Duration::from_millis(25),
             }),
             timeout: Some(Spanned {
-                span: Default::default(),
+                span: yaml_spanned::spanned::Span::default(),
                 inner: Duration::from_millis(500),
             }),
             retries: Some(Spanned {
-                span: Default::default(),
+                span: yaml_spanned::spanned::Span::default(),
                 inner: 10,
             }),
         }
@@ -327,15 +364,15 @@ mod tests {
             ),
             start_delay: None,
             interval: Some(Spanned {
-                span: Default::default(),
+                span: yaml_spanned::spanned::Span::default(),
                 inner: Duration::from_millis(25),
             }),
             timeout: Some(Spanned {
-                span: Default::default(),
+                span: yaml_spanned::spanned::Span::default(),
                 inner: Duration::from_millis(500),
             }),
             retries: Some(Spanned {
-                span: Default::default(),
+                span: yaml_spanned::spanned::Span::default(),
                 inner: 1,
             }),
         });
@@ -395,15 +432,15 @@ mod tests {
             ),
             start_delay: None,
             interval: Some(Spanned {
-                span: Default::default(),
+                span: yaml_spanned::spanned::Span::default(),
                 inner: Duration::from_millis(25),
             }),
             timeout: Some(Spanned {
-                span: Default::default(),
+                span: yaml_spanned::spanned::Span::default(),
                 inner: Duration::from_millis(500),
             }),
             retries: Some(Spanned {
-                span: Default::default(),
+                span: yaml_spanned::spanned::Span::default(),
                 inner: 1,
             }),
         });
@@ -459,15 +496,15 @@ mod tests {
             ),
             start_delay: None,
             interval: Some(Spanned {
-                span: Default::default(),
+                span: yaml_spanned::spanned::Span::default(),
                 inner: Duration::from_millis(25),
             }),
             timeout: Some(Spanned {
-                span: Default::default(),
+                span: yaml_spanned::spanned::Span::default(),
                 inner: Duration::from_millis(500),
             }),
             retries: Some(Spanned {
-                span: Default::default(),
+                span: yaml_spanned::spanned::Span::default(),
                 inner: 1,
             }),
         });
@@ -744,7 +781,6 @@ mod tests {
         let (_event, mut ui_rx) = recv_event(ui_rx).await?;
 
         let mut saw_tty = false;
-        let mut saw_exit = false;
         for _ in 0..20 {
             let (event, next_rx) = recv_event(ui_rx).await?;
             ui_rx = next_rx;
@@ -753,7 +789,6 @@ mod tests {
                     saw_tty = true;
                 }
                 Event::Exited(_, _) => {
-                    saw_exit = true;
                     if saw_tty {
                         break;
                     }
@@ -845,8 +880,8 @@ mod tests {
         app_cfg.depends_on = vec![config::Dependency {
             name: spanned_string("dep"),
             condition: Some(Spanned {
-                span: Default::default(),
-                inner: config::DependencyCondition::ServiceHealthy,
+                span: yaml_spanned::spanned::Span::default(),
+                inner: config::DependencyCondition::Healthy,
             }),
         }];
         services.insert("app".to_string(), Service::new("app", config_dir, app_cfg)?);
@@ -918,8 +953,8 @@ mod tests {
         app_cfg.depends_on = vec![config::Dependency {
             name: spanned_string("dep"),
             condition: Some(Spanned {
-                span: Default::default(),
-                inner: config::DependencyCondition::ServiceCompletedSuccessfully,
+                span: yaml_spanned::spanned::Span::default(),
+                inner: config::DependencyCondition::CompletedSuccessfully,
             }),
         }];
         services.insert("app".to_string(), Service::new("app", config_dir, app_cfg)?);
@@ -965,15 +1000,15 @@ mod tests {
                     service_id, line, ..
                 } if service_id == "app" => {
                     if line.trim() == "40 100" {
-                        if !saw_first {
-                            saw_first = true;
-                            commands_tx
-                                .send(Command::SendInput("app".to_string(), b"go\r".to_vec()))
-                                .await?;
-                        } else {
+                        if saw_first {
                             saw_second = true;
                             break;
                         }
+
+                        saw_first = true;
+                        commands_tx
+                            .send(Command::SendInput("app".to_string(), b"go\r".to_vec()))
+                            .await?;
                     }
                 }
                 _ => {}

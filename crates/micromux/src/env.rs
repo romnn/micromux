@@ -29,10 +29,6 @@ impl EnvMap {
         self.inner.insert(key.into(), value.into());
     }
 
-    pub fn get(&self, key: &str) -> Option<&str> {
-        self.inner.get(key).map(|s| s.as_str())
-    }
-
     pub fn iter(&self) -> impl Iterator<Item = (&String, &String)> {
         self.inner.iter()
     }
@@ -40,10 +36,93 @@ impl EnvMap {
     pub fn extend(&mut self, other: EnvMap) {
         self.inner.extend(other.inner);
     }
+}
 
-    pub fn into_inner(self) -> IndexMap<String, String> {
-        self.inner
+fn strip_export_prefix(line: &str) -> &str {
+    let trimmed = line.trim_start();
+    if let Some(rest) = trimmed
+        .strip_prefix("export")
+        .and_then(|s| s.strip_prefix(char::is_whitespace))
+    {
+        rest.trim_start()
+    } else {
+        trimmed
     }
+}
+
+fn strip_inline_comment_outside_quotes(line: &str) -> String {
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut last_was_ws = false;
+    let mut cleaned = String::with_capacity(line.len());
+
+    for ch in line.chars() {
+        if ch == '\'' && !in_double {
+            in_single = !in_single;
+            cleaned.push(ch);
+            last_was_ws = false;
+            continue;
+        }
+
+        if ch == '"' && !in_single {
+            in_double = !in_double;
+            cleaned.push(ch);
+            last_was_ws = false;
+            continue;
+        }
+
+        if ch == '#' && !in_single && !in_double && last_was_ws {
+            while cleaned.ends_with(char::is_whitespace) {
+                cleaned.pop();
+            }
+            break;
+        }
+
+        last_was_ws = ch.is_whitespace();
+        cleaned.push(ch);
+    }
+
+    cleaned
+}
+
+fn unescape_double_quoted_value(inner: &str) -> String {
+    let mut out = String::with_capacity(inner.len());
+    let mut chars = inner.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some('t') => out.push('\t'),
+            Some('"') => out.push('"'),
+            Some('\\') | None => out.push('\\'),
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+        }
+    }
+    out
+}
+
+fn parse_value(raw_value: &str) -> String {
+    let value = raw_value.trim().to_string();
+    if value.len() < 2 {
+        return value;
+    }
+
+    if let Some(inner) = value.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
+        return unescape_double_quoted_value(inner);
+    }
+
+    if let Some(inner) = value.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')) {
+        return inner.to_string();
+    }
+
+    value
 }
 
 pub fn parse_dotenv(contents: &str) -> eyre::Result<EnvMap> {
@@ -56,44 +135,8 @@ pub fn parse_dotenv(contents: &str) -> eyre::Result<EnvMap> {
             continue;
         }
 
-        let line = {
-            let trimmed = line.trim_start();
-            trimmed
-                .strip_prefix("export")
-                .and_then(|s| s.strip_prefix(char::is_whitespace))
-                .map(|rest| rest.trim_start())
-                .unwrap_or(trimmed)
-        };
-
-        let mut in_single = false;
-        let mut in_double = false;
-        let mut last_was_ws = false;
-        let mut cleaned = String::with_capacity(line.len());
-        let chars = line.chars().peekable();
-        for ch in chars {
-            match ch {
-                '\'' if !in_double => {
-                    in_single = !in_single;
-                    cleaned.push(ch);
-                    last_was_ws = false;
-                }
-                '"' if !in_single => {
-                    in_double = !in_double;
-                    cleaned.push(ch);
-                    last_was_ws = false;
-                }
-                '#' if !in_single && !in_double && last_was_ws => {
-                    while cleaned.ends_with(char::is_whitespace) {
-                        cleaned.pop();
-                    }
-                    break;
-                }
-                _ => {
-                    last_was_ws = ch.is_whitespace();
-                    cleaned.push(ch);
-                }
-            }
-        }
+        let line = strip_export_prefix(line);
+        let cleaned = strip_inline_comment_outside_quotes(line);
         let line = cleaned.trim();
 
         let (key, value) = line
@@ -105,50 +148,7 @@ pub fn parse_dotenv(contents: &str) -> eyre::Result<EnvMap> {
             return Err(eyre::eyre!("invalid env file line {line_no}: empty key"));
         }
 
-        let mut value = value.trim().to_string();
-        if value.len() >= 2 {
-            if value
-                .strip_prefix('"')
-                .and_then(|s| s.strip_suffix('"'))
-                .is_some()
-            {
-                let inner = value
-                    .strip_prefix('"')
-                    .and_then(|s| s.strip_suffix('"'))
-                    .unwrap_or("");
-                let mut out = String::with_capacity(inner.len());
-                let mut chars = inner.chars();
-                while let Some(c) = chars.next() {
-                    if c != '\\' {
-                        out.push(c);
-                        continue;
-                    }
-                    match chars.next() {
-                        Some('n') => out.push('\n'),
-                        Some('r') => out.push('\r'),
-                        Some('t') => out.push('\t'),
-                        Some('"') => out.push('"'),
-                        Some('\\') => out.push('\\'),
-                        Some(other) => {
-                            out.push('\\');
-                            out.push(other);
-                        }
-                        None => out.push('\\'),
-                    }
-                }
-                value = out;
-            } else if value
-                .strip_prefix('\'')
-                .and_then(|s| s.strip_suffix('\''))
-                .is_some()
-            {
-                value = value
-                    .strip_prefix('\'')
-                    .and_then(|s| s.strip_suffix('\''))
-                    .unwrap_or("")
-                    .to_string();
-            }
-        }
+        let value = parse_value(value);
 
         env.insert(key.to_string(), value);
     }
@@ -160,19 +160,6 @@ pub fn load_env_files_sync(paths: &[PathBuf]) -> eyre::Result<EnvMap> {
     let mut env = EnvMap::new();
     for path in paths {
         let content = std::fs::read_to_string(path)
-            .map_err(|err| eyre::eyre!("failed to read env file {}: {err}", path.display()))?;
-        let parsed = parse_dotenv(&content)
-            .map_err(|err| eyre::eyre!("failed to parse env file {}: {err}", path.display()))?;
-        env.extend(parsed);
-    }
-    Ok(env)
-}
-
-pub async fn load_env_files(paths: &[PathBuf]) -> eyre::Result<EnvMap> {
-    let mut env = EnvMap::new();
-    for path in paths {
-        let content = tokio::fs::read_to_string(path)
-            .await
             .map_err(|err| eyre::eyre!("failed to read env file {}: {err}", path.display()))?;
         let parsed = parse_dotenv(&content)
             .map_err(|err| eyre::eyre!("failed to parse env file {}: {err}", path.display()))?;
@@ -285,8 +272,8 @@ mod tests {
     #[test]
     fn dotenv_parse_basic() -> eyre::Result<()> {
         let env = parse_dotenv("FOO=bar\n# comment\nexport BAZ=qux\n")?;
-        assert_eq!(env.get("FOO"), Some("bar"));
-        assert_eq!(env.get("BAZ"), Some("qux"));
+        assert_eq!(env.inner.get("FOO").map(String::as_str), Some("bar"));
+        assert_eq!(env.inner.get("BAZ").map(String::as_str), Some("qux"));
         Ok(())
     }
 
@@ -310,8 +297,8 @@ mod tests {
         env.insert("B", "${A}-b");
 
         let out = expand_env_values(&env, &base);
-        assert_eq!(out.get("A"), Some("base-a"));
-        assert_eq!(out.get("B"), Some("base-a-b"));
+        assert_eq!(out.inner.get("A").map(String::as_str), Some("base-a"));
+        assert_eq!(out.inner.get("B").map(String::as_str), Some("base-a-b"));
     }
 
     #[test]
@@ -323,30 +310,33 @@ mod tests {
         env.insert("A", "a");
 
         let out = expand_env_values(&env, &base);
-        assert_eq!(out.get("B"), Some("-b"));
-        assert_eq!(out.get("A"), Some("a"));
+        assert_eq!(out.inner.get("B").map(String::as_str), Some("-b"));
+        assert_eq!(out.inner.get("A").map(String::as_str), Some("a"));
     }
 
     #[test]
     fn dotenv_allows_export_with_extra_whitespace() -> eyre::Result<()> {
         let env = parse_dotenv("export   FOO=bar\nexport\tBAZ=qux\n")?;
-        assert_eq!(env.get("FOO"), Some("bar"));
-        assert_eq!(env.get("BAZ"), Some("qux"));
+        assert_eq!(env.inner.get("FOO").map(String::as_str), Some("bar"));
+        assert_eq!(env.inner.get("BAZ").map(String::as_str), Some("qux"));
         Ok(())
     }
 
     #[test]
     fn dotenv_strips_inline_comments_outside_quotes() -> eyre::Result<()> {
         let env = parse_dotenv("FOO=bar # comment\nBAR=\"x # y\" # z\n")?;
-        assert_eq!(env.get("FOO"), Some("bar"));
-        assert_eq!(env.get("BAR"), Some("x # y"));
+        assert_eq!(env.inner.get("FOO").map(String::as_str), Some("bar"));
+        assert_eq!(env.inner.get("BAR").map(String::as_str), Some("x # y"));
         Ok(())
     }
 
     #[test]
     fn dotenv_double_quote_unescapes_common_sequences() -> eyre::Result<()> {
         let env = parse_dotenv("A=\"x\\n\\\"y\\\"\\\\z\"\n")?;
-        assert_eq!(env.get("A"), Some("x\n\"y\"\\z"));
+        assert_eq!(
+            env.inner.get("A").map(String::as_str),
+            Some("x\n\"y\"\\z")
+        );
         Ok(())
     }
 }

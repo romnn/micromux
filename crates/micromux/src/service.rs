@@ -8,14 +8,6 @@ use crate::{
     scheduler::ServiceID,
 };
 
-/// Send a Unix signal to a process with the given PID.
-#[cfg(unix)]
-pub fn send_signal(pid: u32, sig: nix::sys::signal::Signal) -> eyre::Result<()> {
-    // Send SIGTERM to child process.
-    nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), sig)?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -28,7 +20,7 @@ mod tests {
 
     fn spanned_string(value: &str) -> Spanned<String> {
         Spanned {
-            span: Default::default(),
+            span: yaml_spanned::spanned::Span::default(),
             inner: value.to_string(),
         }
     }
@@ -36,7 +28,7 @@ mod tests {
     fn unique_tmp_dir(prefix: &str) -> PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_nanos();
         std::env::temp_dir().join(format!("micromux-{prefix}-{nanos}"))
     }
@@ -64,17 +56,22 @@ mod tests {
     }
 
     #[test]
-    fn env_file_missing_is_error() {
+    fn env_file_missing_is_error() -> eyre::Result<()> {
         let dir = unique_tmp_dir("env-missing");
-        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&dir)?;
         let mut cfg = service_config("svc", ("sh", &["-c", "true"]));
         cfg.env_file = vec![config::EnvFile {
             path: spanned_string("./definitely-not-present.env"),
         }];
 
-        let err = Service::new("svc", &dir, cfg).unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("failed to read env file"), "{msg}");
+        match Service::new("svc", &dir, cfg) {
+            Ok(_) => Err(eyre::eyre!("expected error for missing env file")),
+            Err(err) => {
+                let msg = err.to_string();
+                assert!(msg.contains("failed to read env file"), "{msg}");
+                Ok(())
+            }
+        }
     }
 
     #[test]
@@ -89,10 +86,14 @@ mod tests {
             path: spanned_string(env_path.to_string_lossy().as_ref()),
         }];
 
-        let err = Service::new("svc", &dir, cfg).unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("failed to parse env file"), "{msg}");
-        Ok(())
+        match Service::new("svc", &dir, cfg) {
+            Ok(_) => Err(eyre::eyre!("expected error for invalid env file")),
+            Err(err) => {
+                let msg = err.to_string();
+                assert!(msg.contains("failed to parse env file"), "{msg}");
+                Ok(())
+            }
+        }
     }
 
     #[test]
@@ -111,7 +112,7 @@ mod tests {
 
         let svc = Service::new("svc", &dir, cfg)?;
         assert_eq!(
-            svc.environment.get("FOO").map(|s| s.as_str()),
+            svc.environment.get("FOO").map(String::as_str),
             Some("from_config")
         );
         Ok(())
@@ -134,7 +135,7 @@ mod tests {
 
         let svc = Service::new("svc", &dir, cfg)?;
         assert_eq!(
-            svc.environment.get("PORT").map(|s| s.as_str()),
+            svc.environment.get("PORT").map(String::as_str),
             Some("1023")
         );
         assert_eq!(svc.open_ports, vec![1023]);
@@ -156,11 +157,10 @@ mod tests {
         }];
 
         let svc = Service::new("svc", &dir, cfg)?;
-        assert_eq!(svc.env_files, vec![dir.join(".env")]);
         assert_eq!(
             svc.environment
                 .get("AIRTYPE_API_SPICEDB_ENDPOINT")
-                .map(|s| s.as_str()),
+                .map(String::as_str),
             Some("http://0.0.0.0:50051")
         );
         Ok(())
@@ -200,7 +200,6 @@ pub struct Service {
     pub working_dir: Option<PathBuf>,
     pub restart_policy: RestartPolicy,
     pub depends_on: Vec<config::Dependency>,
-    pub env_files: Vec<PathBuf>,
     pub environment: indexmap::IndexMap<String, String>,
     pub health_check: Option<config::HealthCheck>,
     pub open_ports: Vec<u16>,
@@ -238,8 +237,8 @@ impl Service {
         }
 
         let mut config_env_map = env::EnvMap::new();
-        for (k, v) in config.environment.iter() {
-            config_env_map.insert(k.as_ref().to_string(), v.as_ref().to_string());
+        for (k, v) in &config.environment {
+            config_env_map.insert(k.as_ref().clone(), v.as_ref().clone());
         }
         let config_env_map = env::expand_env_values(&config_env_map, &base_with_env_file);
 
@@ -280,7 +279,6 @@ impl Service {
             open_ports,
             restart_policy: config.restart.unwrap_or_default(),
             depends_on: config.depends_on,
-            env_files,
             environment,
             health_check: config.healthcheck,
             enable_color: config.color.as_deref().copied().unwrap_or(true),

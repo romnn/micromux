@@ -34,7 +34,7 @@ fn parse_environment(
     let (_span, env_mapping) = expect_mapping(value, "environment must be a mapping".into())?;
 
     let mut env = IndexMap::new();
-    for (k, v) in env_mapping.iter() {
+    for (k, v) in env_mapping {
         let key = parse::<String>(k)?;
         let raw = parse_string_value(v, "environment values must be scalar")?;
         env.insert(
@@ -101,7 +101,7 @@ fn parse_env_file(mapping: &yaml_spanned::Mapping) -> Result<Vec<super::EnvFile>
 
     match &value.inner {
         Value::Sequence(seq) => {
-            for item in seq.iter() {
+            for item in seq {
                 push_item(item)?;
             }
         }
@@ -129,7 +129,7 @@ fn parse_depends_on(
     };
     let seq = expect_sequence(value, "depends_on must be a sequence".into())?;
     let mut deps = vec![];
-    for item in seq.iter() {
+    for item in seq {
         match item {
             Spanned {
                 span,
@@ -177,7 +177,7 @@ fn parse_ports(mapping: &yaml_spanned::Mapping) -> Result<Vec<Spanned<String>>, 
     };
     let seq = expect_sequence(value, "ports must be a sequence".into())?;
     let mut ports = vec![];
-    for item in seq.iter() {
+    for item in seq {
         let raw = parse_string_value(item, "ports entries must be a scalar")?;
         ports.push(Spanned {
             span: item.span,
@@ -285,139 +285,129 @@ pub fn parse_ui_config<F>(
     Ok(UiConfig { width })
 }
 
+fn invalid_empty_command(raw_command: &str, span: yaml_spanned::spanned::Span) -> ConfigError {
+    ConfigError::InvalidCommand {
+        command: raw_command.to_string(),
+        reason: InvalidCommandReason::EmptyCommand,
+        span: span.into(),
+    }
+}
+
+fn normalize_cmd_exec(
+    command: &[Spanned<String>],
+    raw_command: &str,
+    span: yaml_spanned::spanned::Span,
+) -> Result<(Spanned<String>, Vec<Spanned<String>>), ConfigError> {
+    // Exec form: ["CMD", prog, arg1, arg2...]
+    let Some(prog) = command.get(1).cloned() else {
+        // CMD form needs at least one program
+        return Err(invalid_empty_command(raw_command, span));
+    };
+    let args = command
+        .get(2..)
+        .map(<[yaml_spanned::Spanned<std::string::String>]>::to_vec)
+        .unwrap_or_default();
+    Ok((prog, args))
+}
+
+fn normalize_cmd_shell(
+    command: &[Spanned<String>],
+    raw_command: &str,
+    span: yaml_spanned::spanned::Span,
+) -> Result<(Spanned<String>, Vec<Spanned<String>>), ConfigError> {
+    // Shell form: ["CMD-SHELL", cmd...]
+    // Join everything after index 0 into one string.
+    let Some(rest) = command.get(1..) else {
+        return Err(invalid_empty_command(raw_command, span));
+    };
+
+    let command_string = rest.iter().map(std::convert::AsRef::as_ref).join(" ");
+    let Some(span_start) = rest.first().map(|v| v.span.start) else {
+        return Err(invalid_empty_command(raw_command, span));
+    };
+    let Some(span_end) = rest.last().map(|v| v.span.end) else {
+        return Err(invalid_empty_command(raw_command, span));
+    };
+
+    let cmd_shell_span = command.first().map_or(span, |v| v.span);
+
+    #[cfg(unix)]
+    let (prog, args) = (
+        Spanned {
+            span: cmd_shell_span,
+            inner: "sh".to_string(),
+        },
+        vec![
+            Spanned {
+                span: cmd_shell_span,
+                inner: "-c".to_string(),
+            },
+            Spanned {
+                span: yaml_spanned::spanned::Span {
+                    start: span_start,
+                    end: span_end,
+                },
+                inner: command_string,
+            },
+        ],
+    );
+    #[cfg(windows)]
+    let (prog, args) = (
+        Spanned {
+            span: cmd_shell_span.clone().into(),
+            inner: "cmd.exe".to_string(),
+        },
+        vec![
+            Spanned {
+                span: cmd_shell_span.clone().into(),
+                inner: "/S".to_string(),
+            },
+            Spanned {
+                span: cmd_shell_span.clone().into(),
+                inner: "/C".to_string(),
+            },
+            Spanned {
+                span: yaml_spanned::spanned::Span {
+                    start: span_start,
+                    end: span_end,
+                },
+                inner: command_string,
+            },
+        ],
+    );
+
+    Ok((prog, args))
+}
+
 pub fn normalize_command(
-    command: Vec<Spanned<String>>,
+    command: &[Spanned<String>],
     raw_command: &str,
     span: yaml_spanned::spanned::Span,
 ) -> Result<(Spanned<String>, Vec<Spanned<String>>), ConfigError> {
     if command.is_empty() {
-        return Err(ConfigError::InvalidCommand {
-            command: raw_command.to_string(),
-            reason: InvalidCommandReason::EmptyCommand,
-            span: span.into(),
-        });
+        return Err(invalid_empty_command(raw_command, span));
     }
 
     let Some(first) = command.first() else {
-        return Err(ConfigError::InvalidCommand {
-            command: raw_command.to_string(),
-            reason: InvalidCommandReason::EmptyCommand,
-            span: span.into(),
-        });
+        return Err(invalid_empty_command(raw_command, span));
     };
 
     let (prog, args) = match first.as_str() {
-        "CMD" => {
-            // Exec form: ["CMD", prog, arg1, arg2...]
-            let Some(prog) = command.get(1).cloned() else {
-                // CMD form needs at least one program
-                return Err(ConfigError::InvalidCommand {
-                    command: raw_command.to_string(),
-                    reason: InvalidCommandReason::EmptyCommand,
-                    span: span.into(),
-                });
-            };
-            let args = command
-                .get(2..)
-                .map(|rest| rest.to_vec())
-                .unwrap_or_default();
-            (prog, args)
-        }
-        "CMD-SHELL" => {
-            // Shell form: ["CMD-SHELL", cmd...]
-            // Join everything after index 0 into one string:
-            let Some(rest) = command.get(1..) else {
-                return Err(ConfigError::InvalidCommand {
-                    command: raw_command.to_string(),
-                    reason: InvalidCommandReason::EmptyCommand,
-                    span: span.into(),
-                });
-            };
-            if rest.is_empty() {
-                return Err(ConfigError::InvalidCommand {
-                    command: raw_command.to_string(),
-                    reason: InvalidCommandReason::EmptyCommand,
-                    span: span.into(),
-                });
-            }
-
-            let command_string = rest.iter().join(" ");
-            let cmd_shell_span = &first.span;
-            let Some(span_start) = rest.first().map(|v| v.span.start) else {
-                return Err(ConfigError::InvalidCommand {
-                    command: raw_command.to_string(),
-                    reason: InvalidCommandReason::EmptyCommand,
-                    span: span.into(),
-                });
-            };
-            let Some(span_end) = rest.last().map(|v| v.span.end) else {
-                return Err(ConfigError::InvalidCommand {
-                    command: raw_command.to_string(),
-                    reason: InvalidCommandReason::EmptyCommand,
-                    span: span.into(),
-                });
-            };
-
-            #[cfg(unix)]
-            let (prog, args) = (
-                Spanned {
-                    span: (*cmd_shell_span),
-                    inner: "sh".to_string(),
-                },
-                vec![
-                    Spanned {
-                        span: (*cmd_shell_span),
-                        inner: "-c".to_string(),
-                    },
-                    Spanned {
-                        span: yaml_spanned::spanned::Span {
-                            start: span_start,
-                            end: span_end,
-                        },
-                        inner: command_string,
-                    },
-                ],
-            );
-            #[cfg(windows)]
-            let (prog, args) = (
-                Spanned {
-                    span: cmd_shell_span.clone().into(),
-                    inner: "cmd.exe".to_string(),
-                },
-                vec![
-                    Spanned {
-                        span: cmd_shell_span.clone().into(),
-                        inner: "/S".to_string(),
-                    },
-                    Spanned {
-                        span: cmd_shell_span.clone().into(),
-                        inner: "/C".to_string(),
-                    },
-                    Spanned {
-                        span: yaml_spanned::spanned::Span {
-                            start: span_start,
-                            end: span_end,
-                        },
-                        inner: command_string,
-                    },
-                ],
-            );
-            (prog, args)
-        }
-        _ => {
-            let prog = first.clone();
-            let args = command
+        "CMD" => normalize_cmd_exec(command, raw_command, span)?,
+        "CMD-SHELL" => normalize_cmd_shell(command, raw_command, span)?,
+        _ => (
+            first.clone(),
+            command
                 .get(1..)
-                .map(|rest| rest.to_vec())
-                .unwrap_or_default();
-            (prog, args)
-        }
+                .map(<[yaml_spanned::Spanned<std::string::String>]>::to_vec)
+                .unwrap_or_default(),
+        ),
     };
 
     Ok((prog, args))
 }
 
-fn parse_command(
+pub fn parse_command(
     value: &yaml_spanned::Spanned<Value>,
 ) -> Result<(Spanned<String>, Vec<Spanned<String>>), ConfigError> {
     match value {
@@ -446,7 +436,7 @@ fn parse_command(
                     span: *span,
                     inner: rest.to_string(),
                 };
-                return normalize_command(vec![cmd_shell, payload], raw_command.as_str(), *span);
+                return normalize_command(&[cmd_shell, payload], raw_command.as_str(), *span);
             }
 
             let command =
@@ -463,9 +453,9 @@ fn parse_command(
                     span: *span,
                     inner: value,
                 })
-                .collect();
+                .collect::<Vec<_>>();
 
-            normalize_command(command, raw_command.as_str(), *span)
+            normalize_command(&command, raw_command.as_str(), *span)
 
             // Ok(Spanned {
             //     span: *span,
@@ -476,48 +466,24 @@ fn parse_command(
             span,
             inner: Value::Sequence(command),
         } => {
-            let raw_command = command.iter().join(" ");
-            let command =
-                command
-                    .iter()
-                    .map(|Spanned { span, inner }| {
-                        let inner = inner.as_string().cloned().ok_or_else(|| {
-                            ConfigError::UnexpectedType {
-                                message: "command arguments must be string".to_string(),
-                                expected: vec![Kind::String],
-                                found: inner.kind(),
-                                span: span.into(),
-                            }
-                        })?;
-                        Ok::<_, ConfigError>(Spanned {
-                            span: *span,
-                            inner,
-                        })
+            let command = command
+                .iter()
+                .map(|item| {
+                    let raw = parse_string_value(item, "command entries must be a scalar")?;
+                    Ok::<_, ConfigError>(Spanned {
+                        span: item.span,
+                        inner: raw,
                     })
-                    // .map(|Spanned { span, inner }| {
-                    //     inner
-                    //         .as_string()
-                    //         .cloned()
-                    //         .ok_or_else(|| ConfigError::UnexpectedType {
-                    //             message: "command arguments must be strings".to_string(),
-                    //             expected: vec![Kind::String],
-                    //             found: inner.kind(),
-                    //             span: span.into(),
-                    //         })
-                    // })
-                    .collect::<Result<Vec<_>, ConfigError>>()?;
-            normalize_command(command, raw_command.as_str(), *span)
-            // Ok(command)
-            // Ok(Spanned {
-            //     span: *span,
-            //     inner: command,
-            // })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let raw_command = command.iter().map(std::convert::AsRef::as_ref).join(" ");
+            normalize_command(&command, raw_command.as_str(), *span)
         }
-        Spanned { span, inner } => Err(ConfigError::UnexpectedType {
-            message: "command must be a string or sequence of strings".to_string(),
-            found: inner.kind(),
-            expected: vec![Kind::Mapping],
-            span: span.into(),
+        other => Err(ConfigError::UnexpectedType {
+            message: "command must be a string or sequence".to_string(),
+            expected: vec![Kind::String, Kind::Sequence],
+            found: other.kind(),
+            span: other.span().into(),
         }),
     }
 }
@@ -553,12 +519,12 @@ pub fn parse_health_check(
             let interval = parse_duration(healthcheck.get("interval"))?;
             let retries = parse_optional::<usize>(healthcheck.get("retries"))?;
             let timeout = parse_duration(healthcheck.get("timeout"))?;
-            Ok::<_, ConfigError>(super::HealthCheck {
+            Ok(super::HealthCheck {
                 test,
                 start_delay,
                 interval,
-                retries,
                 timeout,
+                retries,
             })
         })
         .transpose()
@@ -603,8 +569,8 @@ pub fn parse_service<F>(
         environment,
         depends_on,
         healthcheck,
-        restart,
         ports,
+        restart,
         color,
     })
 }
@@ -686,12 +652,12 @@ mod tests {
     use indoc::indoc;
     use std::path::Path;
 
-    fn get_service<'a>(cfg: &'a config::Config, name: &str) -> &'a config::Service {
+    fn get_service<'a>(cfg: &'a config::Config, name: &str) -> eyre::Result<&'a config::Service> {
         cfg.services
             .iter()
             .find(|(k, _)| k.as_ref() == name)
             .map(|(_, v)| v)
-            .unwrap()
+            .ok_or_else(|| eyre::eyre!("missing service {name}"))
     }
 
     #[test]
@@ -715,23 +681,32 @@ mod tests {
         let mut diagnostics: Vec<Diagnostic<usize>> = vec![];
         let parsed = config::from_str(yaml, Path::new("."), 0, None, &mut diagnostics)?;
 
-        let s1 = get_service(&parsed.config, "app_string");
+        let s1 = get_service(&parsed.config, "app_string")?;
         assert_eq!(s1.env_file.len(), 1);
-        assert_eq!(s1.env_file[0].path.as_ref(), ".env");
+        assert_eq!(
+            s1.env_file.first().map(|v| v.path.as_ref().as_str()),
+            Some(".env")
+        );
 
-        let s2 = get_service(&parsed.config, "app_mapping");
+        let s2 = get_service(&parsed.config, "app_mapping")?;
         assert_eq!(s2.env_file.len(), 1);
-        assert_eq!(s2.env_file[0].path.as_ref(), ".env");
+        assert_eq!(
+            s2.env_file.first().map(|v| v.path.as_ref().as_str()),
+            Some(".env")
+        );
 
-        let s3 = get_service(&parsed.config, "app_sequence");
+        let s3 = get_service(&parsed.config, "app_sequence")?;
         assert_eq!(s3.env_file.len(), 1);
-        assert_eq!(s3.env_file[0].path.as_ref(), ".env");
+        assert_eq!(
+            s3.env_file.first().map(|v| v.path.as_ref().as_str()),
+            Some(".env")
+        );
 
         Ok(())
     }
 
     #[test]
-    fn depends_on_condition_parses_and_invalid_condition_is_error() {
+    fn depends_on_condition_parses_and_invalid_condition_is_error() -> eyre::Result<()> {
         let yaml_ok = indoc! {r#"
             version: 1
             services:
@@ -745,14 +720,16 @@ mod tests {
         "#};
 
         let mut diagnostics: Vec<Diagnostic<usize>> = vec![];
-        let parsed = config::from_str(yaml_ok, Path::new("."), 0, None, &mut diagnostics).unwrap();
-        let app = get_service(&parsed.config, "app");
+        let parsed = config::from_str(yaml_ok, Path::new("."), 0, None, &mut diagnostics)?;
+        let app = get_service(&parsed.config, "app")?;
         assert_eq!(app.depends_on.len(), 1);
-        let dep = &app.depends_on[0];
+        let Some(dep) = app.depends_on.first() else {
+            return Err(eyre::eyre!("missing depends_on entry"));
+        };
         assert_eq!(dep.name.as_ref(), "db");
         assert_eq!(
             dep.condition.as_ref().map(|c| *c.as_ref()),
-            Some(config::DependencyCondition::ServiceHealthy)
+            Some(config::DependencyCondition::Healthy)
         );
 
         let yaml_bad = indoc! {r#"
@@ -768,12 +745,13 @@ mod tests {
         "#};
 
         let mut diagnostics: Vec<Diagnostic<usize>> = vec![];
-        let err =
-            config::from_str(yaml_bad, Path::new("."), 0, None, &mut diagnostics).unwrap_err();
-        match err {
-            config::ConfigError::Serde { .. } => {}
-            other => panic!("expected serde error, got {other:?}"),
+        match config::from_str(yaml_bad, Path::new("."), 0, None, &mut diagnostics) {
+            Ok(_) => return Err(eyre::eyre!("expected error")),
+            Err(config::ConfigError::Serde { .. }) => {}
+            Err(other) => return Err(eyre::eyre!("expected serde error, got {other:?}")),
         }
+
+        Ok(())
     }
 
     #[test]
@@ -789,11 +767,19 @@ mod tests {
 
         let mut diagnostics: Vec<Diagnostic<usize>> = vec![];
         let parsed = config::from_str(yaml, Path::new("."), 0, None, &mut diagnostics)?;
-        let svc = get_service(&parsed.config, "app");
-        let hc = svc.healthcheck.as_ref().unwrap();
+        let svc = get_service(&parsed.config, "app")?;
+        let Some(hc) = svc.healthcheck.as_ref() else {
+            return Err(eyre::eyre!("missing healthcheck"));
+        };
         assert_eq!(hc.test.0.as_ref(), "sh");
-        assert_eq!(hc.test.1[0].as_ref(), "-c");
-        assert_eq!(hc.test.1[1].as_ref(), "echo \"a b\"");
+        assert_eq!(
+            hc.test.1.first().map(|v| v.as_ref().as_str()),
+            Some("-c")
+        );
+        assert_eq!(
+            hc.test.1.get(1).map(|v| v.as_ref().as_str()),
+            Some("echo \"a b\"")
+        );
         Ok(())
     }
 
@@ -810,11 +796,19 @@ mod tests {
 
         let mut diagnostics: Vec<Diagnostic<usize>> = vec![];
         let parsed = config::from_str(yaml, Path::new("."), 0, None, &mut diagnostics)?;
-        let svc = get_service(&parsed.config, "app");
-        let hc = svc.healthcheck.as_ref().unwrap();
+        let svc = get_service(&parsed.config, "app")?;
+        let Some(hc) = svc.healthcheck.as_ref() else {
+            return Err(eyre::eyre!("missing healthcheck"));
+        };
         assert_eq!(hc.test.0.as_ref(), "sh");
-        assert_eq!(hc.test.1[0].as_ref(), "-c");
-        assert_eq!(hc.test.1[1].as_ref(), "echo a b");
+        assert_eq!(
+            hc.test.1.first().map(|v| v.as_ref().as_str()),
+            Some("-c")
+        );
+        assert_eq!(
+            hc.test.1.get(1).map(|v| v.as_ref().as_str()),
+            Some("echo a b")
+        );
         Ok(())
     }
 }

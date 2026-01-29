@@ -1,5 +1,12 @@
-pub mod logging;
-pub mod options;
+//! `micromux-cli` is the command-line entry point for micromux.
+//!
+//! It is responsible for:
+//! - Locating and parsing the configuration file.
+//! - Emitting diagnostics.
+//! - Starting the TUI and scheduler.
+
+mod logging;
+mod options;
 
 use clap::Parser;
 use codespan_reporting::diagnostic::Diagnostic;
@@ -64,7 +71,7 @@ async fn main() -> eyre::Result<()> {
         }
     };
 
-    let _guard = logging::setup(options.log_level, log_file)?;
+    let _guard = logging::setup(options.log_level, &log_file)?;
 
     let working_dir = std::env::current_dir()?;
     let config_path = match options.config_path {
@@ -81,9 +88,7 @@ async fn main() -> eyre::Result<()> {
     let raw_config = tokio::fs::read_to_string(&config_path).await?;
 
     let diagnostic_printer = DiagnosticsPrinter::new(color_choice);
-    let file_id = diagnostic_printer
-        .add_source_file(&config_path, raw_config.clone())
-        .await;
+    let file_id = diagnostic_printer.add_source_file(&config_path, raw_config.clone());
     let mut diagnostics: Vec<Diagnostic<usize>> = vec![];
 
     let config = match micromux::from_str(
@@ -104,8 +109,8 @@ async fn main() -> eyre::Result<()> {
     let has_error = diagnostics
         .iter()
         .any(|d| d.severity == codespan_reporting::diagnostic::Severity::Error);
-    for diagnostic in diagnostics.into_iter() {
-        diagnostic_printer.emit(&diagnostic).await?;
+    for diagnostic in diagnostics {
+        diagnostic_printer.emit(&diagnostic)?;
     }
     let Some(config) = config else {
         eyre::bail!("failed to parse config");
@@ -116,7 +121,7 @@ async fn main() -> eyre::Result<()> {
 
     let (ui_tx, ui_rx) = mpsc::channel(1024);
     let (commands_tx, commands_rx) = mpsc::channel(1024);
-    let mux = micromux::Micromux::new(config)?;
+    let mux = micromux::Micromux::new(&config)?;
     let services = mux.services();
     let tui = micromux_tui::App::new(&services, ui_rx, commands_tx, shutdown.clone());
     let interactive_logs = !options.no_interactive_logs;

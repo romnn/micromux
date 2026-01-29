@@ -1,6 +1,7 @@
 use crate::App;
 
 use color_eyre::eyre;
+use ansi_to_tui::IntoText;
 use itertools::intersperse;
 use ratatui::{
     buffer::Buffer,
@@ -21,19 +22,19 @@ fn wrapped_text_height(text: &ratatui::text::Text, wrap_width: u16) -> u16 {
             rows.max(1)
         })
         .sum::<usize>();
-    height.min(u16::MAX as usize) as u16
+    u16::try_from(height).unwrap_or(u16::MAX)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{log_view::LogView, wrapped_text_height};
-    use ratatui::{buffer::Buffer, layout::Rect, widgets::Widget};
+    use ratatui::{buffer::Buffer, layout::Rect};
 
     fn count_thumb(buf: &Buffer, area: Rect) -> usize {
         let mut n = 0;
         for y in area.y..area.y.saturating_add(area.height) {
             for x in area.x..area.x.saturating_add(area.width) {
-                if buf.get(x, y).symbol() == "▐" {
+                if buf.cell((x, y)).map(ratatui::buffer::Cell::symbol) == Some("▐") {
                     n += 1;
                 }
             }
@@ -42,7 +43,7 @@ mod tests {
     }
 
     fn has_thumb_at(buf: &Buffer, x: u16, y: u16) -> bool {
-        buf.get(x, y).symbol() == "▐"
+        buf.cell((x, y)).map(ratatui::buffer::Cell::symbol) == Some("▐")
     }
 
     #[test]
@@ -55,8 +56,10 @@ mod tests {
 
     #[test]
     fn scrollbar_thumb_is_full_height_when_content_fits() {
-        let mut view = LogView::default();
-        view.follow_tail = false;
+        let mut view = LogView {
+            follow_tail: false,
+            ..LogView::default()
+        };
 
         let buf_area = Rect {
             x: 0,
@@ -90,7 +93,6 @@ mod tests {
     #[test]
     fn scrollbar_thumb_moves_to_bottom_when_following_tail() {
         let mut view = LogView::default();
-        view.follow_tail = true;
 
         let buf_area = Rect {
             x: 0,
@@ -130,7 +132,6 @@ mod tests {
     #[test]
     fn wrap_changes_scrollbar_behavior_for_long_lines() {
         let mut view = LogView::default();
-        view.follow_tail = true;
 
         let buf_area = Rect {
             x: 0,
@@ -168,19 +169,7 @@ mod tests {
     }
 }
 
-fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
-    let popup_width = r.width * percent_x / 100;
-    let popup_height = r.height * percent_y / 100;
-    let popup_x = r.x + (r.width - popup_width) / 2;
-    let popup_y = r.y + (r.height - popup_height) / 2;
-    Rect {
-        x: popup_x,
-        y: popup_y,
-        width: popup_width,
-        height: popup_height,
-    }
-}
-
+#[must_use]
 pub fn state_name(service: crate::state::Execution) -> &'static str {
     match service {
         crate::state::Execution::Running {
@@ -222,7 +211,11 @@ impl Widget for &mut App {
             [main_right_area, Rect::default()]
         };
 
-        App::header().render(header_area, buf);
+        let header = format!("micromux v{}", env!("CARGO_PKG_VERSION"))
+            .bold()
+            .fg(App::HEADER_COLOR)
+            .into_centered_line();
+        Paragraph::new(header).render(header_area, buf);
         self.render_services(services_area, buf);
         self.render_logs(logs_area, buf);
         if self.show_healthcheck_pane {
@@ -263,7 +256,7 @@ impl App {
                         vec!["".into()]
                     });
 
-                ListItem::new(Line::from_iter(line))
+                ListItem::new(line.collect::<Line>())
             })
             .collect();
 
@@ -334,10 +327,9 @@ impl App {
                         out.push('\n');
                     }
 
-                    let (success, exit_code) = attempt
-                        .result
-                        .map(|r| (Some(r.success), Some(r.exit_code)))
-                        .unwrap_or((None, None));
+                    let (success, exit_code) = attempt.result.map_or((None, None), |r| {
+                        (Some(r.success), Some(r.exit_code))
+                    });
 
                     // Separator line rendered with ANSI so ansi_to_tui can color it reliably.
                     let status = match (success, exit_code) {
@@ -384,8 +376,6 @@ impl App {
             height: scrollbar_area.height.saturating_sub(2),
         };
 
-        use ansi_to_tui::IntoText;
-
         let tui_text: ratatui::text::Text = text.into_text().unwrap_or_else(|err| {
             let escaped = strip_ansi_escapes::strip_str(text);
             tracing::error!(?err, escaped, "failed to sanitize healthcheck output");
@@ -396,7 +386,7 @@ impl App {
         let num_lines: u16 = if self.healthcheck_view.wrap {
             wrapped_text_height(&tui_text, wrap_width)
         } else {
-            tui_text.height().min(u16::MAX as usize) as u16
+            u16::try_from(tui_text.height()).unwrap_or(u16::MAX)
         };
         current_service.healthcheck_cached_num_lines = num_lines;
 
@@ -435,15 +425,6 @@ impl App {
             buf,
             &mut self.healthcheck_view.scrollbar_state,
         );
-    }
-
-    #[allow(unused)]
-    fn header() -> impl Widget {
-        let header = format!("micromux v{}", env!("CARGO_PKG_VERSION"))
-            .bold()
-            .fg(Self::HEADER_COLOR)
-            .into_centered_line();
-        Paragraph::new(header)
     }
 
     fn render_footer(&self, area: Rect, buf: &mut Buffer) {
@@ -510,6 +491,13 @@ impl App {
         Widget::render(&widget, area, buf);
     }
 
+    /// Run the application in the terminal.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The terminal backend fails to initialize or restore.
+    /// - The underlying event loop (`App::run`) fails.
     pub async fn render(self) -> eyre::Result<()> {
         let terminal = ratatui::init();
         self.run(terminal).await?;
@@ -519,6 +507,7 @@ impl App {
 }
 
 pub mod log_view {
+    use ansi_to_tui::IntoText;
     use ratatui::{
         buffer::Buffer,
         layout::Rect,
@@ -559,8 +548,6 @@ pub mod log_view {
             logs: &str,
             buf: &mut Buffer,
         ) {
-            use ansi_to_tui::IntoText;
-
             // Strip ANSI control codes that could confuse our TUI
             let text: ratatui::text::Text = logs.into_text().unwrap_or_else(|err| {
                 // As a fallback, remove all ANSI controls (losing all color)
@@ -573,8 +560,7 @@ pub mod log_view {
             let num_lines = if self.wrap {
                 super::wrapped_text_height(&text, wrap_width)
             } else {
-                let height = text.height().min(u16::MAX as usize);
-                height as u16
+                u16::try_from(text.height()).unwrap_or(u16::MAX)
             };
 
             let viewport_height = scrollbar_area.height;

@@ -26,7 +26,6 @@ pub enum Execution {
 
 #[derive(Debug)]
 pub struct Service {
-    pub name: String,
     pub id: ServiceID,
     pub exec_state: Execution,
     pub open_ports: Vec<u16>,
@@ -73,6 +72,7 @@ impl Default for State {
 }
 
 impl State {
+    #[must_use]
     pub fn new(services: indexmap::IndexMap<ServiceID, Service>) -> Self {
         Self {
             services,
@@ -80,12 +80,14 @@ impl State {
         }
     }
 
+    #[must_use]
     pub fn current_service(&self) -> Option<&Service> {
         self.services
             .get_index(self.selected_service)
             .map(|(_id, service)| service)
     }
 
+    #[must_use]
     pub fn current_service_mut(&mut self) -> Option<&mut Service> {
         self.services
             .get_index_mut(self.selected_service)

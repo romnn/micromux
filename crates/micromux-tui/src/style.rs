@@ -4,6 +4,7 @@ use ratatui::style::{Color, Style, palette::tailwind};
 pub const INITIAL_SIDEBAR_WIDTH: u16 = 40;
 pub const MIN_SIDEBAR_WIDTH: u16 = 20;
 
+#[must_use]
 pub fn health_style(health: Option<state::Health>) -> Style {
     match health {
         Some(state::Health::Unhealthy) => Style::default().fg(tailwind::RED.c500),
@@ -12,6 +13,7 @@ pub fn health_style(health: Option<state::Health>) -> Style {
     }
 }
 
+#[must_use]
 pub fn service_style(state: state::Execution) -> Style {
     match state {
         state::Execution::Disabled => Style::default().fg(Color::White).fg(tailwind::GRAY.c500),

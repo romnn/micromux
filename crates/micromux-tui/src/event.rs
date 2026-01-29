@@ -44,12 +44,13 @@ impl std::fmt::Display for Input {
             })) => {
                 write!(f, "Mouse(col={column}, row={row})")
             }
-            other => std::fmt::Debug::fmt(other, f),
+            other @ Self::Event(_) => std::fmt::Debug::fmt(other, f),
         }
     }
 }
 
 impl Input {
+    #[must_use]
     pub fn is_tick(&self) -> bool {
         matches!(self, Input::Tick)
     }
@@ -59,18 +60,22 @@ impl Input {
 #[derive(Debug)]
 pub struct InputHandler {
     /// Event sender channel.
-    sender: mpsc::UnboundedSender<Input>,
+    _sender: mpsc::UnboundedSender<Input>,
     /// Event receiver channel.
     receiver: mpsc::UnboundedReceiver<Input>,
 }
 
 impl InputHandler {
     /// Constructs a new instance of [`EventHandler`] and spawns a new task to handle events.
+    #[must_use]
     pub fn new() -> Self {
         let (sender, receiver) = mpsc::unbounded_channel();
         let actor = EventTask::new(sender.clone());
         tokio::spawn(async { actor.run().await });
-        Self { sender, receiver }
+        Self {
+            _sender: sender,
+            receiver,
+        }
     }
 
     /// Receives an event from the sender.
@@ -113,7 +118,7 @@ impl EventTask {
             let tick_delay_fut = tick.tick();
             let crossterm_event_fut = reader.next().fuse();
             tokio::select! {
-              _ = self.sender.closed() => {
+              () = self.sender.closed() => {
                 break;
               }
               _ = tick_delay_fut => {
@@ -132,5 +137,11 @@ impl EventTask {
         // Ignores the result because shutting down the app drops the receiver, which causes the send
         // operation to fail. This is expected behavior and should not panic.
         let _ = self.sender.send(event);
+    }
+}
+
+impl Default for InputHandler {
+    fn default() -> Self {
+        Self::new()
     }
 }
