@@ -183,7 +183,7 @@ impl App {
     }
 
     fn handle_crossterm_event(&mut self, event: &crossterm::event::Event) {
-        use crossterm::event::{KeyEventKind};
+        use crossterm::event::KeyEventKind;
 
         match *event {
             crossterm::event::Event::Resize(cols, rows) => {
@@ -440,9 +440,7 @@ impl App {
     /// Restart all services
     fn restart_all_services(&self) {
         tracing::info!("restarting all services");
-        let _ = self
-            .commands_tx
-            .try_send(Command::RestartAll);
+        let _ = self.commands_tx.try_send(Command::RestartAll);
     }
 }
 

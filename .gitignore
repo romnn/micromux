@@ -1,3 +1,6 @@
 .DS_Store
 target/
+goreleaser-dist/
+
+.intentionally-empty-file.o
 *.log

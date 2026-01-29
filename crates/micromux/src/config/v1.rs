@@ -1,8 +1,5 @@
 use super::{Config, ConfigError, Service, UiConfig, parse, parse_duration, parse_optional};
-use crate::{
-    config::InvalidCommandReason,
-    service::RestartPolicy,
-};
+use crate::{config::InvalidCommandReason, service::RestartPolicy};
 use codespan_reporting::diagnostic::Diagnostic;
 use indexmap::IndexMap;
 use itertools::Itertools;
@@ -354,16 +351,16 @@ fn normalize_cmd_shell(
     #[cfg(windows)]
     let (prog, args) = (
         Spanned {
-            span: cmd_shell_span.clone().into(),
+            span: cmd_shell_span,
             inner: "cmd.exe".to_string(),
         },
         vec![
             Spanned {
-                span: cmd_shell_span.clone().into(),
+                span: cmd_shell_span,
                 inner: "/S".to_string(),
             },
             Spanned {
-                span: cmd_shell_span.clone().into(),
+                span: cmd_shell_span,
                 inner: "/C".to_string(),
             },
             Spanned {
@@ -439,12 +436,11 @@ pub fn parse_command(
                 return normalize_command(&[cmd_shell, payload], raw_command.as_str(), *span);
             }
 
-            let command =
-                shlex::split(raw_command).ok_or_else(|| ConfigError::InvalidCommand {
-                    command: raw_command.clone(),
-                    reason: InvalidCommandReason::FailedToSplit,
-                    span: span.into(),
-                })?;
+            let command = shlex::split(raw_command).ok_or_else(|| ConfigError::InvalidCommand {
+                command: raw_command.clone(),
+                reason: InvalidCommandReason::FailedToSplit,
+                span: span.into(),
+            })?;
 
             // TODO: compute the actual spans by writing our own shlex that tracks positions
             let command = command
@@ -645,7 +641,7 @@ pub fn parse_config<F: Copy + PartialEq>(
 
 #[cfg(test)]
 mod tests {
-    
+
     use crate::config;
     use codespan_reporting::diagnostic::Diagnostic;
     use color_eyre::eyre;
@@ -772,10 +768,7 @@ mod tests {
             return Err(eyre::eyre!("missing healthcheck"));
         };
         assert_eq!(hc.test.0.as_ref(), "sh");
-        assert_eq!(
-            hc.test.1.first().map(|v| v.as_ref().as_str()),
-            Some("-c")
-        );
+        assert_eq!(hc.test.1.first().map(|v| v.as_ref().as_str()), Some("-c"));
         assert_eq!(
             hc.test.1.get(1).map(|v| v.as_ref().as_str()),
             Some("echo \"a b\"")
@@ -801,10 +794,7 @@ mod tests {
             return Err(eyre::eyre!("missing healthcheck"));
         };
         assert_eq!(hc.test.0.as_ref(), "sh");
-        assert_eq!(
-            hc.test.1.first().map(|v| v.as_ref().as_str()),
-            Some("-c")
-        );
+        assert_eq!(hc.test.1.first().map(|v| v.as_ref().as_str()), Some("-c"));
         assert_eq!(
             hc.test.1.get(1).map(|v| v.as_ref().as_str()),
             Some("echo a b")

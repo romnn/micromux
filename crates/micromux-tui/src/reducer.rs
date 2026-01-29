@@ -1,7 +1,12 @@
 use crate::{HEALTHCHECK_HISTORY, state};
 use micromux::Event;
 
-fn push_log_line(service: &mut state::Service, stream: micromux::OutputStream, update: micromux::LogUpdateKind, line: String) {
+fn push_log_line(
+    service: &mut state::Service,
+    stream: micromux::OutputStream,
+    update: micromux::LogUpdateKind,
+    line: String,
+) {
     let line = match stream {
         micromux::OutputStream::Stdout => line,
         micromux::OutputStream::Stderr => format!("[stderr] {line}"),
@@ -30,6 +35,7 @@ fn push_healthcheck_line(
     attempt_entry.output.push(line);
 }
 
+ #[allow(clippy::too_many_lines)]
 pub fn apply(state: &mut state::State, event: Event) {
     match event {
         Event::Started { service_id } => {
@@ -49,15 +55,17 @@ pub fn apply(state: &mut state::State, event: Event) {
         }
         Event::Killed(service_id) => {
             if let Some(service) = state.services.get_mut(&service_id)
-                && service.exec_state != state::Execution::Disabled {
-                    service.exec_state = state::Execution::Killed;
-                }
+                && service.exec_state != state::Execution::Disabled
+            {
+                service.exec_state = state::Execution::Killed;
+            }
         }
         Event::Exited(service_id, _) => {
             if let Some(service) = state.services.get_mut(&service_id)
-                && service.exec_state != state::Execution::Disabled {
-                    service.exec_state = state::Execution::Exited;
-                }
+                && service.exec_state != state::Execution::Disabled
+            {
+                service.exec_state = state::Execution::Exited;
+            }
         }
         Event::Healthy(service_id) => {
             if let Some(service) = state.services.get_mut(&service_id) {

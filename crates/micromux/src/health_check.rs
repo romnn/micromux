@@ -12,7 +12,7 @@ pub enum Health {
     Unhealthy,
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use yaml_spanned::Spanned;
@@ -162,7 +162,11 @@ pub async fn run_loop(
         .as_deref()
         .copied()
         .unwrap_or_default();
-    let interval = health_check.interval.as_deref().copied().unwrap_or_default();
+    let interval = health_check
+        .interval
+        .as_deref()
+        .copied()
+        .unwrap_or_default();
     tracing::info!(
         service_id,
         ?start_delay,
@@ -236,9 +240,7 @@ pub async fn run_loop(
                 if attempt < max_retries {
                     attempt = attempt.saturating_add(1);
                 } else {
-                    let _ = events_tx
-                        .send(Event::Unhealthy(service_id.clone()))
-                        .await;
+                    let _ = events_tx.send(Event::Unhealthy(service_id.clone())).await;
                     return;
                 }
             }
@@ -359,6 +361,7 @@ struct Running {
     stderr_task: Option<tokio::task::JoinHandle<()>>,
     wait_handle: tokio::task::JoinHandle<Result<std::process::ExitStatus, std::io::Error>>,
     kill_token: CancellationToken,
+    #[cfg(unix)]
     child_pid: Option<i32>,
 }
 
@@ -419,11 +422,7 @@ async fn cleanup_after_cancel(running: &mut Running) {
     if let Some(pid) = running.child_pid {
         kill_process_group(pid);
     }
-    let _ = tokio::time::timeout(
-        std::time::Duration::from_secs(1),
-        &mut running.wait_handle,
-    )
-    .await;
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(1), &mut running.wait_handle).await;
     join_tasks(&mut [running.stdout_task.take(), running.stderr_task.take()]).await;
 }
 
@@ -446,6 +445,7 @@ fn kill_process_group(pid: i32) {
     let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
 }
 
+#[allow(clippy::too_many_lines)]
 async fn run(
     health_check: &crate::config::HealthCheck,
     service_id: &ServiceID,
@@ -500,13 +500,19 @@ async fn run(
         ));
     }
 
+    #[cfg(unix)]
     let child_pid = process.id().and_then(|pid| i32::try_from(pid).ok());
     let kill_token = CancellationToken::new();
     let mut wait_handle = spawn_wait_task(process, &kill_token);
     let timeout = health_check.timeout.as_ref().map(|t| t.inner);
 
-    let completion =
-        select_completion(timeout, &params.shutdown, &params.terminate, &mut wait_handle).await;
+    let completion = select_completion(
+        timeout,
+        &params.shutdown,
+        &params.terminate,
+        &mut wait_handle,
+    )
+    .await;
 
     let mut running = Running {
         service_id: service_id.clone(),
@@ -517,6 +523,7 @@ async fn run(
         stderr_task,
         wait_handle,
         kill_token,
+        #[cfg(unix)]
         child_pid,
     };
 

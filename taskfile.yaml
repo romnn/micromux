@@ -27,6 +27,8 @@ tasks:
       # pretter-ignore
       - >-
         docker run --rm
+        -e "HOST_UID=$(id -u)"
+        -e "HOST_GID=$(id -g)"
         -v "${PWD}:/workspace"
         -w /workspace
         ghcr.io/rust-cross/cargo-zigbuild
@@ -38,6 +40,8 @@ tasks:
       # pretter-ignore
       - >-
         docker run --rm
+        -e "HOST_UID=$(id -u)"
+        -e "HOST_GID=$(id -g)"
         -e "GITHUB_TOKEN=${GITHUB_TOKEN}"
         -e "TAP_GITHUB_TOKEN=${TAP_GITHUB_TOKEN}"
         -v "${PWD}:/workspace"

@@ -1,4 +1,4 @@
-use super::{pty, Event, ServiceID, State};
+use super::{Event, ServiceID, State, pty};
 use crate::{ServiceMap, health_check::Health};
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
@@ -143,7 +143,9 @@ fn should_consider_start(
     };
     match state {
         State::Pending => StartCheck::Consider { exited_code: None },
-        State::Starting | State::Running { .. } | State::Killed | State::Disabled => StartCheck::Skip,
+        State::Starting | State::Running { .. } | State::Killed | State::Disabled => {
+            StartCheck::Skip
+        }
         State::Exited { exit_code } => {
             if ctx.restart_requested.contains(service_id) {
                 StartCheck::Consider {

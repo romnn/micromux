@@ -1,7 +1,7 @@
 use crate::App;
 
-use color_eyre::eyre;
 use ansi_to_tui::IntoText;
+use color_eyre::eyre;
 use itertools::intersperse;
 use ratatui::{
     buffer::Buffer,
@@ -327,9 +327,9 @@ impl App {
                         out.push('\n');
                     }
 
-                    let (success, exit_code) = attempt.result.map_or((None, None), |r| {
-                        (Some(r.success), Some(r.exit_code))
-                    });
+                    let (success, exit_code) = attempt
+                        .result
+                        .map_or((None, None), |r| (Some(r.success), Some(r.exit_code)));
 
                     // Separator line rendered with ANSI so ansi_to_tui can color it reliably.
                     let status = match (success, exit_code) {

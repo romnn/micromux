@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::sync::Arc;
 use std::thread;
+#[cfg(unix)]
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -193,7 +194,10 @@ fn spawn_termination_task(args: TerminationTaskArgs) {
 
         let mut termination_started = false;
         let mut hard_killed = false;
+        #[cfg(unix)]
         let mut kill_deadline: Option<tokio::time::Instant> = None;
+        #[cfg(not(unix))]
+        let kill_deadline: Option<tokio::time::Instant> = None;
         loop {
             tokio::select! {
                 () = shutdown.cancelled(), if !termination_started => {
@@ -210,6 +214,7 @@ fn spawn_termination_task(args: TerminationTaskArgs) {
                     }
                     #[cfg(not(unix))]
                     {
+                        let _ = process_group_leader_id;
                         let _ = killer.kill();
                         hard_killed = true;
                     }
@@ -229,6 +234,7 @@ fn spawn_termination_task(args: TerminationTaskArgs) {
                     }
                     #[cfg(not(unix))]
                     {
+                        let _ = process_group_leader_id;
                         let _ = killer.kill();
                         hard_killed = true;
                     }
@@ -319,7 +325,10 @@ pub(super) async fn start_service_with_pty_size(
         .take_writer()
         .map_err(|err| eyre::eyre!("failed to take pty writer: {err}"))?;
 
+    #[cfg(unix)]
     let process_group_leader = pair.master.process_group_leader();
+    #[cfg(not(unix))]
+    let process_group_leader = None;
     let master = Arc::new(Mutex::new(pair.master));
     let writer = Arc::new(Mutex::new(writer));
 
@@ -329,7 +338,12 @@ pub(super) async fn start_service_with_pty_size(
         })
         .await;
 
-    spawn_log_reader_thread(service_id.clone(), reader, events_tx.clone(), interactive_logs);
+    spawn_log_reader_thread(
+        service_id.clone(),
+        reader,
+        events_tx.clone(),
+        interactive_logs,
+    );
 
     spawn_termination_task(TerminationTaskArgs {
         service_id: service_id.clone(),

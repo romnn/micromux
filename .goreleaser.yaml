@@ -1,0 +1,76 @@
+# yaml-language-server: $schema=https://goreleaser.com/static/schema.json
+version: 2
+
+dist: goreleaser-dist
+
+before:
+  hooks:
+    - rustup default stable
+    - cargo install --locked --force cargo-zigbuild
+
+homebrew_casks:
+  - name: &micromux micromux
+    ids:
+      - *micromux
+    description: "Micromux is a local process supervisor with a terminal UI"
+    directory: Casks
+    commit_author:
+      name: romnn
+      email: contact@romnn.com
+    repository:
+      owner: romnn
+      name: homebrew-tap
+      branch: main
+      token: "{{ .Env.TAP_GITHUB_TOKEN }}"
+      pull_request:
+        enabled: false
+    hooks:
+      post:
+        install: |
+          if OS.mac? && File.exist?("/usr/bin/xattr")
+            system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/micromux"]
+          end
+
+builds:
+  - id: *micromux
+    builder: rust
+    binary: *micromux
+    targets:
+      - x86_64-unknown-linux-gnu
+      - x86_64-apple-darwin
+      - x86_64-pc-windows-gnu
+      - aarch64-unknown-linux-gnu
+      - aarch64-apple-darwin
+    dir: ./
+    tool: cargo
+    command: zigbuild
+    flags:
+      - "--release"
+      - "--package=micromux-cli"
+      - "--target-dir=./target" # TODO: can we remove this once rust support is better?
+
+archives:
+  - id: *micromux
+    formats: ["tar.gz"]
+    name_template: "{{ .Binary }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    ids:
+      - *micromux
+    files:
+      - LICENSE
+    format_overrides:
+      - goos: windows
+        formats: ["zip"]
+
+checksum:
+  name_template: "checksums.txt"
+
+changelog:
+  use: github
+  filters:
+    exclude:
+      - "^ci:"
+      - "^docs:"
+      - "^test:"
+
+release:
+  draft: false

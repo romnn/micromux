@@ -333,10 +333,7 @@ mod tests {
     #[test]
     fn dotenv_double_quote_unescapes_common_sequences() -> eyre::Result<()> {
         let env = parse_dotenv("A=\"x\\n\\\"y\\\"\\\\z\"\n")?;
-        assert_eq!(
-            env.inner.get("A").map(String::as_str),
-            Some("x\n\"y\"\\z")
-        );
+        assert_eq!(env.inner.get("A").map(String::as_str), Some("x\n\"y\"\\z"));
         Ok(())
     }
 }

@@ -379,10 +379,12 @@ impl ConfigError {
 
         match reason {
             InvalidCommandReason::FailedToSplit => {
-                diagnostics.push(Diagnostic::help().with_message("try using a sequence".to_string()));
+                diagnostics
+                    .push(Diagnostic::help().with_message("try using a sequence".to_string()));
             }
             InvalidCommandReason::EmptyCommand => {
-                diagnostics.push(Diagnostic::help().with_message("use a non-empty command".to_string()));
+                diagnostics
+                    .push(Diagnostic::help().with_message("use a non-empty command".to_string()));
             }
         }
 
@@ -398,7 +400,8 @@ impl ConfigError {
             Diagnostic::error()
                 .with_message(format!("invalid duration `{duration}`"))
                 .with_labels(vec![
-                    Label::secondary(file_id, span.clone()).with_message("cannot parse as duration"),
+                    Label::secondary(file_id, span.clone())
+                        .with_message("cannot parse as duration"),
                 ]),
             Diagnostic::help().with_message("Duration must have a valid format like `2min 2s`"),
         ]
@@ -413,7 +416,9 @@ impl ConfigError {
         vec![
             Diagnostic::error()
                 .with_message(format!("missing required key `{key}`"))
-                .with_labels(vec![Label::secondary(file_id, span.clone()).with_message(message)]),
+                .with_labels(vec![
+                    Label::secondary(file_id, span.clone()).with_message(message),
+                ]),
         ]
     }
 
@@ -433,7 +438,8 @@ impl ConfigError {
             Diagnostic::error()
                 .with_message(this.to_string())
                 .with_labels(vec![
-                    Label::primary(file_id, span.clone()).with_message(format!("expected {expected}")),
+                    Label::primary(file_id, span.clone())
+                        .with_message(format!("expected {expected}")),
                 ])
                 .with_notes(vec![unindent::unindent(&format!(
                     "
@@ -452,7 +458,9 @@ impl ConfigError {
         vec![
             Diagnostic::error()
                 .with_message(message.to_string())
-                .with_labels(vec![Label::primary(file_id, span.clone()).with_message(message.to_string())]),
+                .with_labels(vec![
+                    Label::primary(file_id, span.clone()).with_message(message.to_string()),
+                ]),
         ]
     }
 
@@ -534,17 +542,35 @@ pub fn from_str<F: Copy + PartialEq>(
 #[cfg(test)]
 mod tests {
     use indoc::indoc;
+    use jsonschema::{Draft, Validator};
+    use std::path::Path;
+
+    fn compiled_schema() -> color_eyre::eyre::Result<Validator> {
+        let schema: serde_json::Value =
+            serde_json::from_str(include_str!("../../../../micromux.schema.json"))?;
+        let schema: &'static serde_json::Value = Box::leak(Box::new(schema));
+        Ok(jsonschema::options()
+            .with_draft(Draft::Draft7)
+            .build(schema)?)
+    }
 
     #[test]
-    fn parse_config() {
+    fn parse_config_basic_and_special_cases() -> color_eyre::eyre::Result<()> {
         let yaml = indoc! {r#"
-            version: "3"
+            version: "1"
+            ui:
+              width: 80
             services:
               app:
-                command: "./start.sh"
+                # string form command
+                command: "./start.sh --flag"
+                # env_file can be a string
+                env_file: ".env"
                 environment:
                   APP_ENV: production
                   APP_DEBUG: "false"
+                ports: [8080]
+                restart: on-failure=3
                 depends_on:
                   - db
                 healthcheck:
@@ -553,8 +579,14 @@ mod tests {
                   timeout: "10s"
                   retries: 3
               db:
-                environment:
-                  POSTGRES_PASSWORD: example
+                # array form command
+                command: ["CMD", "postgres", "-c", "fsync=off"]
+                env_file:
+                  - path: "./db.env"
+                depends_on:
+                  - name: app
+                    condition: healthy
+                restart: unless-stopped
                 healthcheck:
                   test: ["CMD", "pg_isready", "-U", "postgres"]
                   interval: "10s"
@@ -562,10 +594,202 @@ mod tests {
                   retries: 5
         "#};
 
-        let _ = yaml;
+        let mut diagnostics = vec![];
+        let parsed = super::from_str(yaml, Path::new("."), 0usize, None, &mut diagnostics)?;
+        assert!(diagnostics.is_empty());
 
-        // TODO: complete this test
-        // let config = super::from_str(yaml)?;
-        // println!("{:#?}", config);
+        // UI config
+        assert_eq!(parsed.config.ui_config.width.as_deref().copied(), Some(80));
+
+        // Find services without indexing (clippy::indexing_slicing is denied)
+        let app = parsed
+            .config
+            .services
+            .iter()
+            .find(|(name, _svc)| name.as_ref() == "app")
+            .map(|(_name, svc)| svc)
+            .ok_or_else(|| color_eyre::eyre::eyre!("missing service 'app'"))?;
+
+        let db = parsed
+            .config
+            .services
+            .iter()
+            .find(|(name, _svc)| name.as_ref() == "db")
+            .map(|(_name, svc)| svc)
+            .ok_or_else(|| color_eyre::eyre::eyre!("missing service 'db'"))?;
+
+        // command parsing: string form is split
+        assert_eq!(app.command.0.as_ref(), "./start.sh");
+        assert!(app.command.1.iter().any(|v| v.as_ref() == "--flag"));
+
+        // env_file parsing: string + mapping forms
+        assert_eq!(app.env_file.len(), 1);
+        let app_env_file = app
+            .env_file
+            .first()
+            .ok_or_else(|| color_eyre::eyre::eyre!("missing app.env_file entry"))?;
+        assert_eq!(app_env_file.path.as_ref(), ".env");
+        assert_eq!(db.env_file.len(), 1);
+        let db_env_file = db
+            .env_file
+            .first()
+            .ok_or_else(|| color_eyre::eyre::eyre!("missing db.env_file entry"))?;
+        assert_eq!(db_env_file.path.as_ref(), "./db.env");
+
+        // depends_on parsing: string + mapping condition alias
+        assert_eq!(app.depends_on.len(), 1);
+        let app_dep = app
+            .depends_on
+            .first()
+            .ok_or_else(|| color_eyre::eyre::eyre!("missing app.depends_on entry"))?;
+        assert_eq!(app_dep.name.as_ref(), "db");
+        assert_eq!(db.depends_on.len(), 1);
+        let db_dep = db
+            .depends_on
+            .first()
+            .ok_or_else(|| color_eyre::eyre::eyre!("missing db.depends_on entry"))?;
+        assert_eq!(db_dep.name.as_ref(), "app");
+        assert_eq!(
+            db_dep.condition.as_ref().map(|c| *c.as_ref()),
+            Some(super::DependencyCondition::Healthy)
+        );
+
+        // restart parsing
+        match &app.restart {
+            Some(crate::service::RestartPolicy::OnFailure { remaining_attempts }) => {
+                assert_eq!(*remaining_attempts, 3);
+            }
+            other => {
+                return Err(color_eyre::eyre::eyre!(format!(
+                    "unexpected restart policy for app: {other:?}"
+                )));
+            }
+        }
+        assert!(matches!(
+            &db.restart,
+            Some(crate::service::RestartPolicy::UnlessStopped)
+        ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn parse_config_missing_version_emits_warning_and_defaults_to_v1()
+    -> color_eyre::eyre::Result<()> {
+        let yaml = indoc! {r#"
+            services:
+              app:
+                command: "echo hello"
+        "#};
+
+        let mut diagnostics = vec![];
+        let parsed = super::from_str(yaml, Path::new("."), 0usize, None, &mut diagnostics)?;
+
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("missing version"))
+        );
+        assert!(
+            parsed
+                .config
+                .services
+                .iter()
+                .any(|(name, _svc)| name.as_ref() == "app")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn parse_config_errors_on_missing_command() {
+        let yaml = indoc! {r#"
+            version: "1"
+            services:
+              app:
+                environment:
+                  APP_ENV: production
+        "#};
+
+        let mut diagnostics = vec![];
+        let result = super::from_str(yaml, Path::new("."), 0usize, None, &mut diagnostics);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn schema_validates_complex_config() -> color_eyre::eyre::Result<()> {
+        let compiled = compiled_schema()?;
+
+        let yaml = indoc! {r#"
+            version: 1
+            ui:
+              width: 120
+            services:
+              api:
+                command: ["CMD", "sh", "-c", "echo api"]
+                cwd: ./services/api
+                env_file:
+                  - "./.env"
+                  - path: "./.env.local"
+                environment:
+                  APP_ENV: production
+                  FEATURE_FLAG: true
+                  TIMEOUT_MS: 1500
+                depends_on:
+                  - db
+                  - name: cache
+                    condition: service_healthy
+                ports:
+                  - "8080"
+                  - 9090
+                restart: on-failure:5
+                color: false
+                healthcheck:
+                  test: "CMD-SHELL curl -f http://localhost:8080/health || exit 1"
+                  interval: "30s"
+                  timeout: "10s"
+                  retries: 3
+                  initial_delay: "2s"
+              db:
+                command: "postgres -c fsync=off"
+                working_dir: ./services/db
+                environment:
+                  POSTGRES_PASSWORD: example
+                depends_on: []
+                ports: []
+                restart: unless-stopped
+                healthcheck:
+                  test: ["CMD", "pg_isready", "-U", "postgres"]
+                  interval: "10s"
+                  timeout: "5s"
+                  retries: 5
+        "#};
+
+        let instance: serde_json::Value = serde_yaml::from_str(yaml)?;
+        if let Err(err) = compiled.validate(&instance) {
+            let message = std::iter::once(err)
+                .chain(compiled.iter_errors(&instance))
+                .map(|err| err.to_string())
+                .collect::<Vec<_>>()
+                .join("\n");
+            return Err(color_eyre::eyre::eyre!(message));
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn schema_rejects_missing_command() -> color_eyre::eyre::Result<()> {
+        let compiled = compiled_schema()?;
+
+        let yaml = indoc! {r#"
+            version: "1"
+            services:
+              api:
+                environment:
+                  APP_ENV: production
+        "#};
+        let instance: serde_json::Value = serde_yaml::from_str(yaml)?;
+        assert!(compiled.validate(&instance).is_err());
+        Ok(())
     }
 }

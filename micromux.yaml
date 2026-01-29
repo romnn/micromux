@@ -1,3 +1,4 @@
+# yaml-language-server: $schema=https://github.com/romnn/micromux/raw/main/micromux.schema.json
 version: "1"
 ui:
   width: 40

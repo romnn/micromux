@@ -1,7 +1,7 @@
 use itertools::Itertools;
+use parking_lot::RwLock;
 use std::collections::VecDeque;
 use std::sync::Arc;
-use parking_lot::RwLock;
 use tokio::sync::watch;
 
 /// A log buffer that retains only the most recent entries, bounded by line count and/or total bytes.
