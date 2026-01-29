@@ -4,7 +4,7 @@ pub mod options;
 use clap::Parser;
 use codespan_reporting::diagnostic::Diagnostic;
 use color_eyre::eyre;
-use micromux::diagnostics::Printer as DiagnosticsPrinter;
+use micromux::{Printer as DiagnosticsPrinter, ToDiagnostics};
 use tokio::sync::mpsc;
 
 #[tokio::main]
@@ -69,7 +69,7 @@ async fn main() -> eyre::Result<()> {
     let working_dir = std::env::current_dir()?;
     let config_path = match options.config_path {
         Some(config_path) => Some(config_path),
-        None => micromux::config::find_config_file(&working_dir).await?,
+        None => micromux::find_config_file(&working_dir).await?,
     };
     let config_path = config_path
         .ok_or_else(|| eyre::eyre!("missing config file"))?
@@ -86,7 +86,7 @@ async fn main() -> eyre::Result<()> {
         .await;
     let mut diagnostics: Vec<Diagnostic<usize>> = vec![];
 
-    let config = match micromux::config::from_str(
+    let config = match micromux::from_str(
         &raw_config,
         config_dir,
         file_id,
@@ -94,7 +94,6 @@ async fn main() -> eyre::Result<()> {
         &mut diagnostics,
     ) {
         Err(err) => {
-            use micromux::diagnostics::ToDiagnostics;
             diagnostics.extend(err.to_diagnostics(file_id));
             None
         }
@@ -118,7 +117,8 @@ async fn main() -> eyre::Result<()> {
     let (ui_tx, ui_rx) = mpsc::channel(1024);
     let (commands_tx, commands_rx) = mpsc::channel(1024);
     let mux = micromux::Micromux::new(config)?;
-    let tui = micromux_tui::App::new(&mux.services, ui_rx, commands_tx, shutdown.clone());
+    let services = mux.services();
+    let tui = micromux_tui::App::new(&services, ui_rx, commands_tx, shutdown.clone());
     let interactive_logs = !options.no_interactive_logs;
     let mux_handle = tokio::task::spawn({
         async move {

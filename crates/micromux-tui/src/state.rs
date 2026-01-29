@@ -1,9 +1,6 @@
 use std::collections::VecDeque;
 
-use micromux::{
-    bounded_log::{AsyncBoundedLog, BoundedLog},
-    scheduler::ServiceID,
-};
+use micromux::{AsyncBoundedLog, BoundedLog, ServiceID};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, strum::Display, strum::IntoStaticStr)]
 pub enum Health {
@@ -30,7 +27,7 @@ pub enum Execution {
 #[derive(Debug)]
 pub struct Service {
     pub name: String,
-    pub id: micromux::scheduler::ServiceID,
+    pub id: ServiceID,
     pub exec_state: Execution,
     pub open_ports: Vec<u16>,
     pub logs: AsyncBoundedLog,
@@ -83,12 +80,16 @@ impl State {
         }
     }
 
-    pub fn current_service(&self) -> &Service {
-        &self.services[self.selected_service]
+    pub fn current_service(&self) -> Option<&Service> {
+        self.services
+            .get_index(self.selected_service)
+            .map(|(_id, service)| service)
     }
 
-    pub fn current_service_mut(&mut self) -> &mut Service {
-        &mut self.services[self.selected_service]
+    pub fn current_service_mut(&mut self) -> Option<&mut Service> {
+        self.services
+            .get_index_mut(self.selected_service)
+            .map(|(_id, service)| service)
     }
 
     /// Update the selection index.

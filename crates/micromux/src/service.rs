@@ -1,13 +1,11 @@
 use color_eyre::eyre;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 use yaml_spanned::Spanned;
 
 use crate::{
     config::{self},
     env,
-    health_check::Health,
-    scheduler::{ServiceID, State},
+    scheduler::ServiceID,
 };
 
 /// Send a Unix signal to a process with the given PID.
@@ -205,11 +203,8 @@ pub struct Service {
     pub env_files: Vec<PathBuf>,
     pub environment: indexmap::IndexMap<String, String>,
     pub health_check: Option<config::HealthCheck>,
-    pub state: State,
-    pub health: Option<Health>,
     pub open_ports: Vec<u16>,
     pub enable_color: bool,
-    pub(crate) process: Option<async_process::Child>,
 }
 
 impl Service {
@@ -288,52 +283,7 @@ impl Service {
             env_files,
             environment,
             health_check: config.healthcheck,
-            state: State::Pending,
-            health: None,
-            process: None,
             enable_color: config.color.as_deref().copied().unwrap_or(true),
         })
-    }
-
-    pub fn with_state(mut self, state: impl Into<State>) -> Self {
-        self.state = state.into();
-        self
-    }
-
-    pub fn with_health(mut self, health: impl Into<Health>) -> Self {
-        self.health = Some(health.into());
-        self
-    }
-
-    pub fn with_port(mut self, port: u16) -> Self {
-        self.open_ports.push(port);
-        self
-    }
-
-    pub async fn terminate(&mut self, timeout: Duration) -> eyre::Result<()> {
-        let Some(mut process) = self.process.take() else {
-            return Ok(());
-        };
-        let pid = process.id();
-        tracing::debug!(pid, "sending SIGTERM");
-
-        #[cfg(unix)]
-        send_signal(pid, nix::sys::signal::Signal::SIGTERM)?;
-
-        #[cfg(not(unix))]
-        panic!("termination is not yet implemented on windows");
-
-        // Wait up to 10 seconds for the child to exit gracefully.
-        match tokio::time::timeout(timeout, process.status()).await {
-            Ok(status_result) => {
-                let status = status_result?;
-                tracing::debug!(?status, pid, "process exited");
-            }
-            Err(_elapsed) => {
-                tracing::debug!(pid, "killing process");
-                process.kill()?;
-            }
-        }
-        Ok(())
     }
 }

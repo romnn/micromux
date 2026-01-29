@@ -69,17 +69,17 @@ mod tests {
         let env = std::collections::HashMap::new();
 
         let start = tokio::time::Instant::now();
-        let res = hc
-            .run(
-                &"svc".to_string(),
-                1,
-                Some(&dir),
-                &env,
-                events_tx,
-                shutdown,
-                terminate,
-            )
-            .await;
+        let res = super::run(
+            &hc,
+            &"svc".to_string(),
+            1,
+            Some(&dir),
+            &env,
+            events_tx,
+            shutdown,
+            terminate,
+        )
+        .await;
         assert!(matches!(
             res,
             Err(Error {
@@ -130,121 +130,120 @@ pub struct Error {
     pub source: ErrorReason,
 }
 
-impl crate::config::HealthCheck {
-    pub async fn run_loop(
-        self,
-        service_id: &ServiceID,
-        working_dir: Option<std::path::PathBuf>,
-        environment: std::collections::HashMap<String, String>,
-        events_tx: mpsc::Sender<Event>,
-        shutdown: CancellationToken,
-        terminate: CancellationToken,
-    ) {
-        let max_retries = self.retries.as_deref().copied().unwrap_or(1);
-        let start_delay = self.start_delay.as_deref().cloned().unwrap_or_default();
-        let interval = self.interval.as_deref().cloned().unwrap_or_default();
-        tracing::info!(
-            service_id,
-            ?start_delay,
-            ?interval,
-            max_retries,
-            "starting health check loop"
-        );
+pub async fn run_loop(
+    health_check: crate::config::HealthCheck,
+    service_id: &ServiceID,
+    working_dir: Option<std::path::PathBuf>,
+    environment: std::collections::HashMap<String, String>,
+    events_tx: mpsc::Sender<Event>,
+    shutdown: CancellationToken,
+    terminate: CancellationToken,
+) {
+    let max_retries = health_check.retries.as_deref().copied().unwrap_or(1);
+    let start_delay = health_check
+        .start_delay
+        .as_deref()
+        .cloned()
+        .unwrap_or_default();
+    let interval = health_check.interval.as_deref().cloned().unwrap_or_default();
+    tracing::info!(
+        service_id,
+        ?start_delay,
+        ?interval,
+        max_retries,
+        "starting health check loop"
+    );
 
-        if !start_delay.is_zero() {
-            tokio::select! {
-                _ = shutdown.cancelled() => return,
-                _ = terminate.cancelled() => return,
-                _ = tokio::time::sleep(start_delay) => {},
-            };
-        }
-
-        let mut attempt = 0;
-        let mut run_id: u64 = 0;
-        loop {
-            run_id = run_id.wrapping_add(1);
-            let attempt_id = run_id;
-
-            let _shutdown_clone = shutdown.clone();
-            let res = self
-                .run(
-                    service_id,
-                    attempt_id,
-                    working_dir.as_deref(),
-                    &environment,
-                    events_tx.clone(),
-                    shutdown.clone(),
-                    terminate.clone(),
-                )
-                .await;
-            match res {
-                Ok(()) => {
-                    let _ = events_tx.send(Event::Healthy(service_id.to_string())).await;
-                    // Reset attempts
-                    attempt = 0;
-                }
-                Err(err) => {
-                    match err.source {
-                        ErrorReason::Failed { exit_code } => {
-                            tracing::warn!(
-                                service_id,
-                                code = exit_code,
-                                attempt,
-                                max_attempts = max_retries,
-                                "health check failed",
-                            );
-                        }
-                        ErrorReason::Spawn(err) => {
-                            tracing::warn!(
-                                ?err,
-                                service_id,
-                                attempt,
-                                max_attempts = max_retries,
-                                "failed to run health check",
-                            );
-                        }
-                        ErrorReason::Timeout => {
-                            tracing::warn!(
-                                service_id,
-                                attempt,
-                                max_attempts = max_retries,
-                                "health check timed out",
-                            );
-                        }
-                    };
-
-                    if attempt < max_retries {
-                        // Increment attempt
-                        attempt = attempt.saturating_add(1);
-                    } else {
-                        let _ = events_tx
-                            .send(Event::Unhealthy(service_id.to_string()))
-                            .await;
-                        return;
-                    }
-                }
-            }
-
-            // Wait the full interval before re-checking
-            tokio::select! {
-                _ = shutdown.cancelled() => return,
-                _ = terminate.cancelled() => return,
-                _ = tokio::time::sleep(interval) => {},
-            };
-        }
+    if !start_delay.is_zero() {
+        tokio::select! {
+            _ = shutdown.cancelled() => return,
+            _ = terminate.cancelled() => return,
+            _ = tokio::time::sleep(start_delay) => {},
+        };
     }
 
-    pub async fn run(
-        &self,
-        service_id: &ServiceID,
-        attempt: u64,
-        working_dir: Option<&std::path::Path>,
-        environment: &std::collections::HashMap<String, String>,
-        events_tx: mpsc::Sender<Event>,
-        shutdown: CancellationToken,
-        terminate: CancellationToken,
-    ) -> Result<(), Error> {
-        let (prog, args) = &self.test;
+    let mut attempt = 0;
+    let mut run_id: u64 = 0;
+    loop {
+        run_id = run_id.wrapping_add(1);
+        let attempt_id = run_id;
+
+        let res = run(
+            &health_check,
+            service_id,
+            attempt_id,
+            working_dir.as_deref(),
+            &environment,
+            events_tx.clone(),
+            shutdown.clone(),
+            terminate.clone(),
+        )
+        .await;
+        match res {
+            Ok(()) => {
+                let _ = events_tx.send(Event::Healthy(service_id.to_string())).await;
+                attempt = 0;
+            }
+            Err(err) => {
+                match err.source {
+                    ErrorReason::Failed { exit_code } => {
+                        tracing::warn!(
+                            service_id,
+                            code = exit_code,
+                            attempt,
+                            max_attempts = max_retries,
+                            "health check failed",
+                        );
+                    }
+                    ErrorReason::Spawn(err) => {
+                        tracing::warn!(
+                            ?err,
+                            service_id,
+                            attempt,
+                            max_attempts = max_retries,
+                            "failed to run health check",
+                        );
+                    }
+                    ErrorReason::Timeout => {
+                        tracing::warn!(
+                            service_id,
+                            attempt,
+                            max_attempts = max_retries,
+                            "health check timed out",
+                        );
+                    }
+                };
+
+                if attempt < max_retries {
+                    attempt = attempt.saturating_add(1);
+                } else {
+                    let _ = events_tx
+                        .send(Event::Unhealthy(service_id.to_string()))
+                        .await;
+                    return;
+                }
+            }
+        }
+
+        tokio::select! {
+            _ = shutdown.cancelled() => return,
+            _ = terminate.cancelled() => return,
+            _ = tokio::time::sleep(interval) => {},
+        };
+    }
+}
+
+pub async fn run(
+    health_check: &crate::config::HealthCheck,
+    service_id: &ServiceID,
+    attempt: u64,
+    working_dir: Option<&std::path::Path>,
+    environment: &std::collections::HashMap<String, String>,
+    events_tx: mpsc::Sender<Event>,
+    shutdown: CancellationToken,
+    terminate: CancellationToken,
+) -> Result<(), Error> {
+        let (prog, args) = &health_check.test;
         let command_string = || {
             [prog]
                 .into_iter()
@@ -374,7 +373,7 @@ impl crate::config::HealthCheck {
             }
         });
 
-        let timeout = self.timeout.clone().map(|t| t.into_inner());
+        let timeout = health_check.timeout.clone().map(|t| t.into_inner());
 
         enum Completion {
             Shutdown,
@@ -511,4 +510,4 @@ impl crate::config::HealthCheck {
             }
         }
     }
-}
+

@@ -107,13 +107,15 @@ pub fn parse_dotenv(contents: &str) -> eyre::Result<EnvMap> {
 
         let mut value = value.trim().to_string();
         if value.len() >= 2 {
-            let bytes = value.as_bytes();
-            let first = bytes[0];
-            let last = bytes[bytes.len() - 1];
-            if first == b'\'' && last == b'\'' {
-                value = value[1..value.len() - 1].to_string();
-            } else if first == b'"' && last == b'"' {
-                let inner = &value[1..value.len() - 1];
+            if value
+                .strip_prefix('"')
+                .and_then(|s| s.strip_suffix('"'))
+                .is_some()
+            {
+                let inner = value
+                    .strip_prefix('"')
+                    .and_then(|s| s.strip_suffix('"'))
+                    .unwrap_or("");
                 let mut out = String::with_capacity(inner.len());
                 let mut chars = inner.chars();
                 while let Some(c) = chars.next() {
@@ -135,6 +137,16 @@ pub fn parse_dotenv(contents: &str) -> eyre::Result<EnvMap> {
                     }
                 }
                 value = out;
+            } else if value
+                .strip_prefix('\'')
+                .and_then(|s| s.strip_suffix('\''))
+                .is_some()
+            {
+                value = value
+                    .strip_prefix('\'')
+                    .and_then(|s| s.strip_suffix('\''))
+                    .unwrap_or("")
+                    .to_string();
             }
         }
 
@@ -232,12 +244,19 @@ fn interpolate(input: &str, env: &HashMap<String, String>) -> String {
 
         if is_var_start(next) {
             let mut key = String::new();
-            key.push(chars.next().unwrap());
+            let Some(first) = chars.next() else {
+                out.push('$');
+                continue;
+            };
+            key.push(first);
             while let Some(c) = chars.peek().copied() {
                 if !is_var_continue(c) {
                     break;
                 }
-                key.push(chars.next().unwrap());
+                let Some(next) = chars.next() else {
+                    break;
+                };
+                key.push(next);
             }
             if let Some(value) = env.get(&key) {
                 out.push_str(value);

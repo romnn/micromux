@@ -282,7 +282,9 @@ impl App {
     }
 
     fn render_logs(&mut self, area: Rect, buf: &mut Buffer) {
-        let current_service = self.state.current_service_mut();
+        let Some(current_service) = self.state.current_service_mut() else {
+            return;
+        };
         if current_service.logs_dirty {
             let (num_lines, logs) = current_service.logs.full_text();
             current_service.cached_num_lines = num_lines;
@@ -316,7 +318,9 @@ impl App {
     }
 
     fn render_healthchecks(&mut self, area: Rect, buf: &mut Buffer) {
-        let current_service = self.state.current_service_mut();
+        let Some(current_service) = self.state.current_service_mut() else {
+            return;
+        };
         if current_service.healthcheck_dirty {
             let mut out = String::new();
 

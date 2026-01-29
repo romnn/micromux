@@ -1,4 +1,5 @@
 pub mod event;
+mod reducer;
 pub mod render;
 pub mod state;
 pub mod style;
@@ -8,8 +9,8 @@ pub use ratatui;
 
 use color_eyre::eyre;
 use futures::StreamExt;
-use micromux::{ServiceMap, bounded_log::BoundedLog, scheduler::Event as SchedulerEvent};
-use ratatui::{DefaultTerminal, backend::Backend};
+use micromux::{BoundedLog, Command, Event as SchedulerEvent, ServiceDescriptor};
+use ratatui::DefaultTerminal;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -27,7 +28,7 @@ pub const HEALTHCHECK_HISTORY: usize = 2;
 pub struct App {
     /// Running state of the TUI application.
     pub running: bool,
-    pub commands_tx: mpsc::Sender<micromux::scheduler::Command>,
+    pub commands_tx: mpsc::Sender<Command>,
     pub shutdown: micromux::CancellationToken,
     pub ui_rx: UiEventStream,
     /// Event handler
@@ -52,18 +53,18 @@ pub enum Focus {
 
 impl App {
     pub fn new(
-        services: &ServiceMap,
+        services: &[ServiceDescriptor],
         ui_rx: mpsc::Receiver<SchedulerEvent>,
-        commands_tx: mpsc::Sender<micromux::scheduler::Command>,
+        commands_tx: mpsc::Sender<Command>,
         shutdown: micromux::CancellationToken,
     ) -> Self {
         let ui_rx = ReceiverStream::new(ui_rx).chain(futures::stream::pending());
 
         let services = services
             .iter()
-            .map(|(service_id, service)| {
+            .map(|service| {
                 let service_state = state::Service {
-                    name: service.name.as_ref().to_string(),
+                    name: service.name.clone(),
                     id: service.id.clone(),
                     exec_state: state::Execution::Pending,
                     open_ports: service.open_ports.clone(),
@@ -71,13 +72,13 @@ impl App {
                     cached_num_lines: 0,
                     cached_logs: String::new(),
                     logs_dirty: true,
-                    healthcheck_configured: service.health_check.is_some(),
+                    healthcheck_configured: service.healthcheck_configured,
                     healthcheck_attempts: std::collections::VecDeque::new(),
                     healthcheck_cached_num_lines: 0,
                     healthcheck_cached_text: String::new(),
                     healthcheck_dirty: true,
                 };
-                (service_id.clone(), service_state)
+                (service.id.clone(), service_state)
             })
             .collect();
 
@@ -113,7 +114,7 @@ impl App {
         self.terminal_rows = area.height;
         let _ = self
             .commands_tx
-            .send(micromux::scheduler::Command::ResizeAll {
+            .send(Command::ResizeAll {
                 cols: area.width,
                 rows: area.height,
             })
@@ -153,118 +154,7 @@ impl App {
     }
 
     fn handle_event(&mut self, event: SchedulerEvent) -> eyre::Result<()> {
-        match event {
-            SchedulerEvent::Started { service_id } => {
-                let service = self.state.services.get_mut(&service_id).unwrap();
-                service.exec_state = state::Execution::Running { health: None };
-            }
-            SchedulerEvent::LogLine {
-                service_id,
-                stream,
-                update,
-                line,
-            } => {
-                let service = self.state.services.get_mut(&service_id).unwrap();
-                let line = match stream {
-                    micromux::scheduler::OutputStream::Stdout => line,
-                    micromux::scheduler::OutputStream::Stderr => format!("[stderr] {line}"),
-                };
-
-                match update {
-                    micromux::scheduler::LogUpdateKind::Append => {
-                        service.logs.push(line);
-                    }
-                    micromux::scheduler::LogUpdateKind::ReplaceLast => {
-                        service.logs.replace_last(line);
-                    }
-                }
-                service.logs_dirty = true;
-            }
-            SchedulerEvent::Killed(service_id) => {
-                let service = self.state.services.get_mut(&service_id).unwrap();
-                if service.exec_state != state::Execution::Disabled {
-                    service.exec_state = state::Execution::Killed;
-                }
-            }
-            SchedulerEvent::Exited(service_id, _) => {
-                let service = self.state.services.get_mut(&service_id).unwrap();
-                if service.exec_state != state::Execution::Disabled {
-                    service.exec_state = state::Execution::Exited;
-                }
-            }
-            SchedulerEvent::Healthy(service_id) => {
-                let service = self.state.services.get_mut(&service_id).unwrap();
-                service.exec_state = state::Execution::Running {
-                    health: Some(state::Health::Healthy),
-                };
-            }
-            SchedulerEvent::Unhealthy(service_id) => {
-                let service = self.state.services.get_mut(&service_id).unwrap();
-                service.exec_state = state::Execution::Running {
-                    health: Some(state::Health::Unhealthy),
-                };
-            }
-            SchedulerEvent::Disabled(service_id) => {
-                let service = self.state.services.get_mut(&service_id).unwrap();
-                service.exec_state = state::Execution::Disabled;
-            }
-            SchedulerEvent::HealthCheckStarted {
-                service_id,
-                attempt,
-                command,
-            } => {
-                let service = self.state.services.get_mut(&service_id).unwrap();
-                while service.healthcheck_attempts.len() >= HEALTHCHECK_HISTORY {
-                    service.healthcheck_attempts.pop_front();
-                }
-
-                service
-                    .healthcheck_attempts
-                    .push_back(state::HealthCheckAttempt {
-                        id: attempt,
-                        command,
-                        output: BoundedLog::with_limits(200, 256 * KiB),
-                        result: None,
-                    });
-                service.healthcheck_dirty = true;
-            }
-            SchedulerEvent::HealthCheckLogLine {
-                service_id,
-                attempt,
-                stream,
-                line,
-            } => {
-                let service = self.state.services.get_mut(&service_id).unwrap();
-                if let Some(attempt_entry) = service
-                    .healthcheck_attempts
-                    .iter_mut()
-                    .find(|a| a.id == attempt)
-                {
-                    let line = match stream {
-                        micromux::scheduler::OutputStream::Stdout => line,
-                        micromux::scheduler::OutputStream::Stderr => format!("[stderr] {line}"),
-                    };
-                    attempt_entry.output.push(line);
-                    service.healthcheck_dirty = true;
-                }
-            }
-            SchedulerEvent::HealthCheckFinished {
-                service_id,
-                attempt,
-                success,
-                exit_code,
-            } => {
-                let service = self.state.services.get_mut(&service_id).unwrap();
-                if let Some(attempt_entry) = service
-                    .healthcheck_attempts
-                    .iter_mut()
-                    .find(|a| a.id == attempt)
-                {
-                    attempt_entry.result = Some(state::HealthCheckResult { success, exit_code });
-                    service.healthcheck_dirty = true;
-                }
-            }
-        }
+        reducer::apply(&mut self.state, event);
         Ok(())
     }
 
@@ -278,7 +168,7 @@ impl App {
                     self.terminal_rows = rows;
                     let _ = self
                         .commands_tx
-                        .try_send(micromux::scheduler::Command::ResizeAll { cols, rows });
+                        .try_send(Command::ResizeAll { cols, rows });
                 }
                 crossterm::event::Event::Key(key) if key.kind == KeyEventKind::Press => {
                     if self.attach_mode {
@@ -289,18 +179,22 @@ impl App {
                                 } else if let Some(bytes) =
                                     key_event_to_bytes(key.code, key.modifiers)
                                 {
-                                    let service_id = self.state.current_service().id.clone();
-                                    let _ = self.commands_tx.try_send(
-                                        micromux::scheduler::Command::SendInput(service_id, bytes),
-                                    );
+                                    if let Some(service) = self.state.current_service() {
+                                        let service_id = service.id.clone();
+                                        let _ = self
+                                            .commands_tx
+                                            .try_send(Command::SendInput(service_id, bytes));
+                                    }
                                 }
                             }
                             _ => {
                                 if let Some(bytes) = key_event_to_bytes(key.code, key.modifiers) {
-                                    let service_id = self.state.current_service().id.clone();
-                                    let _ = self.commands_tx.try_send(
-                                        micromux::scheduler::Command::SendInput(service_id, bytes),
-                                    );
+                                    if let Some(service) = self.state.current_service() {
+                                        let service_id = service.id.clone();
+                                        let _ = self
+                                            .commands_tx
+                                            .try_send(Command::SendInput(service_id, bytes));
+                                    }
                                 }
                             }
                         }
@@ -417,7 +311,10 @@ impl App {
 
     fn scroll_logs_down(&mut self, lines: u16) {
         self.log_view.follow_tail = false;
-        let (num_lines, _) = self.state.current_service().logs.full_text();
+        let Some(service) = self.state.current_service() else {
+            return;
+        };
+        let (num_lines, _) = service.logs.full_text();
         let viewport = self.log_viewport_height();
         let max_off = num_lines.saturating_sub(viewport);
         self.log_view.scroll_offset = self
@@ -435,7 +332,10 @@ impl App {
 
     fn scroll_healthchecks_down(&mut self, lines: u16) {
         self.healthcheck_view.follow_tail = false;
-        let num_lines = self.state.current_service().healthcheck_cached_num_lines;
+        let Some(service) = self.state.current_service() else {
+            return;
+        };
+        let num_lines = service.healthcheck_cached_num_lines;
         let viewport = self.log_viewport_height();
         let max_off = num_lines.saturating_sub(viewport);
         self.healthcheck_view.scroll_offset = self
@@ -460,27 +360,31 @@ impl App {
 
     /// Disable service
     fn disable_current_service(&self) {
-        let service = self.state.current_service();
-        tracing::info!(service_id = service.id, "disabling service");
-        let cmd = match service.exec_state {
-            state::Execution::Disabled => micromux::scheduler::Command::Enable(service.id.clone()),
-            _ => micromux::scheduler::Command::Disable(service.id.clone()),
+        let Some(service) = self.state.current_service() else {
+            return;
         };
-        let _ = self.commands_tx.try_send(cmd);
+        tracing::info!(service_id = service.id, "disabling service");
+        let command = match service.exec_state {
+            state::Execution::Disabled => Command::Enable(service.id.clone()),
+            _ => Command::Disable(service.id.clone()),
+        };
+        let _ = self.commands_tx.try_send(command);
     }
 
     /// Restart service
     fn restart_current_service(&self) {
-        let service = self.state.current_service();
+        let Some(service) = self.state.current_service() else {
+            return;
+        };
         tracing::info!(service_id = service.id, "restarting service");
         if service.exec_state == state::Execution::Disabled {
             let _ = self
                 .commands_tx
-                .try_send(micromux::scheduler::Command::Enable(service.id.clone()));
+                .try_send(Command::Enable(service.id.clone()));
         }
         let _ = self
             .commands_tx
-            .try_send(micromux::scheduler::Command::Restart(service.id.clone()));
+            .try_send(Command::Restart(service.id.clone()));
     }
 
     /// Restart all services
@@ -488,7 +392,7 @@ impl App {
         tracing::info!("restarting all services");
         let _ = self
             .commands_tx
-            .try_send(micromux::scheduler::Command::RestartAll);
+            .try_send(Command::RestartAll);
     }
 }
 
@@ -555,11 +459,10 @@ fn key_event_to_bytes(
 
 #[cfg(test)]
 mod tests {
-    use super::{App, Focus, key_event_to_bytes};
+    use super::*;
     use codespan_reporting::diagnostic::Diagnostic;
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
     use indoc::indoc;
-    use micromux::{ServiceMap, config};
     use std::path::Path;
     use tokio::sync::mpsc;
 
@@ -665,7 +568,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tab_cycles_focus_with_and_without_healthcheck_pane() {
+    async fn tab_cycles_focus_with_and_without_healthcheck_pane() -> color_eyre::eyre::Result<()> {
         let yaml = indoc! {r#"
             version: 1
             services:
@@ -673,24 +576,11 @@ mod tests {
                 command: ["sh", "-c", "true"]
         "#};
         let mut diagnostics: Vec<Diagnostic<usize>> = vec![];
-        let parsed =
-            config::from_str(yaml, Path::new("."), 0usize, None, &mut diagnostics).unwrap();
-        let config_dir = parsed.config_dir.clone();
-        let services: ServiceMap = parsed
-            .config
-            .services
-            .iter()
-            .map(|(name, service_config)| {
-                let service_id = name.as_ref().to_string();
-                let service = micromux::service::Service::new(
-                    name.as_ref().clone(),
-                    &config_dir,
-                    service_config.clone(),
-                )
-                .unwrap();
-                (service_id, service)
-            })
-            .collect();
+        let parsed = micromux::from_str(yaml, Path::new("."), 0usize, None, &mut diagnostics)
+            .map_err(|err| color_eyre::eyre::eyre!(err.to_string()))?;
+        let mux = micromux::Micromux::new(parsed)
+            .map_err(|err| color_eyre::eyre::eyre!(err.to_string()))?;
+        let services = mux.services();
 
         let (_ui_tx, ui_rx) = mpsc::channel(1);
         let (cmd_tx, _cmd_rx) = mpsc::channel(1);
@@ -700,18 +590,20 @@ mod tests {
         app.focus = Focus::Services;
         app.show_healthcheck_pane = false;
 
-        app.handle_input_event(tab_press()).unwrap();
+        app.handle_input_event(tab_press())?;
         assert_eq!(app.focus, Focus::Logs);
-        app.handle_input_event(tab_press()).unwrap();
+        app.handle_input_event(tab_press())?;
         assert_eq!(app.focus, Focus::Services);
 
         app.show_healthcheck_pane = true;
         app.focus = Focus::Services;
-        app.handle_input_event(tab_press()).unwrap();
+        app.handle_input_event(tab_press())?;
         assert_eq!(app.focus, Focus::Logs);
-        app.handle_input_event(tab_press()).unwrap();
+        app.handle_input_event(tab_press())?;
         assert_eq!(app.focus, Focus::Healthcheck);
-        app.handle_input_event(tab_press()).unwrap();
+        app.handle_input_event(tab_press())?;
         assert_eq!(app.focus, Focus::Services);
+
+        Ok(())
     }
 }

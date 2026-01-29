@@ -38,9 +38,10 @@ impl<'a> ServiceGraph<'a> {
         // Ensure there are no cycles
         petgraph::algo::toposort(&graph, None).map_err(|cycle| {
             use petgraph::data::DataMap;
+            let service = graph.node_weight(cycle.node_id()).copied().unwrap_or("<unknown>");
             eyre::eyre!(
                 "cycle detected at service: `{}`",
-                graph.node_weight(cycle.node_id()).unwrap()
+                service
             )
         })?;
 
