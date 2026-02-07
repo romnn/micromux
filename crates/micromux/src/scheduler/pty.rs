@@ -92,6 +92,7 @@ impl AnsiFilter {
     /// cursor-positioning or screen-clearing CSI sequence just
     /// finished, signalling the caller to flush accumulated text
     /// (this turns ncurses-style screen redraws into discrete lines).
+    #[allow(clippy::too_many_lines)]
     fn push(&mut self, b: u8, out: &mut Vec<u8>) -> bool {
         match self.state {
             AnsiState::Ground => {
@@ -220,6 +221,7 @@ impl AnsiFilter {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn spawn_log_reader_thread(
     service_id: ServiceID,
     reader: Box<dyn std::io::Read + Send>,
@@ -229,17 +231,6 @@ fn spawn_log_reader_thread(
     pty_size: Arc<AtomicU32>,
 ) {
     thread::spawn(move || {
-        let mut reader = std::io::BufReader::new(reader);
-        let mut buf = [0u8; 4096];
-        let mut line: Vec<u8> = Vec::new();
-        let mut scratch: Vec<u8> = Vec::new();
-        let mut filter = AnsiFilter::new();
-        let mut term = Parser::new(pty_rows, pty_cols, 0);
-        let mut interactive = false;
-        let mut last_snapshot_at: Option<Instant> = None;
-        let mut dirty = false;
-        let mut last_size = 0u32;
-
         struct RateLimit {
             alt_screen: bool,
             window_start: Instant,
@@ -267,8 +258,6 @@ fn spawn_log_reader_thread(
                 self.have_snapshot = false;
             }
         }
-
-        const ALT_SCREEN_MAX_UPDATES_PER_SEC: u32 = 4;
 
         fn send_log(
             events_tx: &mpsc::Sender<Event>,
@@ -367,6 +356,19 @@ fn spawn_log_reader_thread(
             send_log(events_tx, service_id, LogUpdateKind::Append, s);
             line.clear();
         }
+
+        const ALT_SCREEN_MAX_UPDATES_PER_SEC: u32 = 4;
+
+        let mut reader = std::io::BufReader::new(reader);
+        let mut buf = [0u8; 4096];
+        let mut line: Vec<u8> = Vec::new();
+        let mut scratch: Vec<u8> = Vec::new();
+        let mut filter = AnsiFilter::new();
+        let mut term = Parser::new(pty_rows, pty_cols, 0);
+        let mut interactive = false;
+        let mut last_snapshot_at: Option<Instant> = None;
+        let mut dirty = false;
+        let mut last_size = 0u32;
 
         let mut rate = RateLimit::new();
 
@@ -562,6 +564,7 @@ fn spawn_termination_task(args: TerminationTaskArgs) {
     });
 }
 
+#[allow(clippy::too_many_lines)]
 pub(super) async fn start_service_with_pty_size(
     service: &Service,
     events_tx: mpsc::Sender<Event>,

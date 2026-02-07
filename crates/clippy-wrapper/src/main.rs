@@ -1,3 +1,6 @@
+//! Small helper binary used by `cargo fc lint` to invoke `cargo clippy` across
+//! multiple feature combinations.
+
 use std::path::PathBuf;
 use std::process::ExitCode;
 
