@@ -10,7 +10,13 @@ use std::thread;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use vt100::Parser;
+
+use alacritty_terminal::{
+    event::{Event as AlacrittyEvent, EventListener, WindowSize},
+    grid::Dimensions as _,
+    term::{Config as AlacrittyConfig, Term, TermMode},
+    vte::ansi,
+};
 
 #[cfg(unix)]
 use nix::sys::signal::Signal;
@@ -23,6 +29,26 @@ pub(super) struct PtyHandles {
     pub(super) master: Arc<Mutex<Box<dyn portable_pty::MasterPty + Send>>>,
     pub(super) writer: Arc<Mutex<Box<dyn Write + Send>>>,
     pub(super) size: Arc<AtomicU32>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TermSize {
+    columns: usize,
+    screen_lines: usize,
+}
+
+impl alacritty_terminal::grid::Dimensions for TermSize {
+    fn total_lines(&self) -> usize {
+        self.screen_lines
+    }
+
+    fn screen_lines(&self) -> usize {
+        self.screen_lines
+    }
+
+    fn columns(&self) -> usize {
+        self.columns
+    }
 }
 
 fn env_vars_for_service(service: &Service) -> HashMap<String, String> {
@@ -64,7 +90,6 @@ struct AnsiFilter {
     state: AnsiState,
     esc_seen: bool,
     csi_buf: Vec<u8>,
-    alt_screen_change: Option<bool>,
     saw_non_sgr_csi: bool,
 }
 
@@ -74,13 +99,8 @@ impl AnsiFilter {
             state: AnsiState::Ground,
             esc_seen: false,
             csi_buf: Vec::new(),
-            alt_screen_change: None,
             saw_non_sgr_csi: false,
         }
-    }
-
-    fn take_alt_screen_change(&mut self) -> Option<bool> {
-        self.alt_screen_change.take()
     }
 
     fn take_saw_non_sgr_csi(&mut self) -> bool {
@@ -158,41 +178,6 @@ impl AnsiFilter {
                         false
                     } else {
                         self.saw_non_sgr_csi = true;
-                        if matches!(b, b'h' | b'l')
-                            && self.csi_buf.len() >= 5
-                            && self.csi_buf.starts_with(&[0x1b, b'[', b'?'])
-                        {
-                            let set = b == b'h';
-                            let mut cur: u16 = 0;
-                            let mut have = false;
-                            let mut matched = false;
-                            if let Some(params) = self.csi_buf.get(3..self.csi_buf.len() - 1) {
-                                for &ch in params {
-                                    match ch {
-                                        b'0'..=b'9' => {
-                                            have = true;
-                                            cur = cur
-                                                .saturating_mul(10)
-                                                .saturating_add(u16::from(ch - b'0'));
-                                        }
-                                        b';' => {
-                                            if have && matches!(cur, 47 | 1047 | 1049) {
-                                                matched = true;
-                                            }
-                                            cur = 0;
-                                            have = false;
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                            }
-                            if have && matches!(cur, 47 | 1047 | 1049) {
-                                matched = true;
-                            }
-                            if matched {
-                                self.alt_screen_change = Some(set);
-                            }
-                        }
                         self.csi_buf.clear();
                         matches!(b, b'J')
                     }
@@ -222,9 +207,16 @@ impl AnsiFilter {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SgrColor {
+    Default,
+    Idx(u8),
+    Rgb(u8, u8, u8),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct CellStyle {
-    fg: vt100::Color,
-    bg: vt100::Color,
+    fg: SgrColor,
+    bg: SgrColor,
     bold: bool,
     dim: bool,
     italic: bool,
@@ -233,8 +225,8 @@ struct CellStyle {
 }
 
 const DEFAULT_CELL_STYLE: CellStyle = CellStyle {
-    fg: vt100::Color::Default,
-    bg: vt100::Color::Default,
+    fg: SgrColor::Default,
+    bg: SgrColor::Default,
     bold: false,
     dim: false,
     italic: false,
@@ -242,15 +234,54 @@ const DEFAULT_CELL_STYLE: CellStyle = CellStyle {
     inverse: false,
 };
 
-fn cell_style(cell: &vt100::Cell) -> CellStyle {
+fn named_to_sgr_color(
+    color: alacritty_terminal::vte::ansi::NamedColor,
+    colors: &alacritty_terminal::term::color::Colors,
+    is_fg: bool,
+) -> SgrColor {
+    let idx = color as usize;
+    if (is_fg && idx == 256) || (!is_fg && idx == 257) {
+        return SgrColor::Default;
+    }
+
+    if idx <= usize::from(u8::MAX) {
+        return SgrColor::Idx(idx as u8);
+    }
+
+    let Some(rgb) = colors[idx] else {
+        return SgrColor::Default;
+    };
+
+    SgrColor::Rgb(rgb.r, rgb.g, rgb.b)
+}
+
+fn color_to_sgr_color(
+    color: alacritty_terminal::vte::ansi::Color,
+    colors: &alacritty_terminal::term::color::Colors,
+    is_fg: bool,
+) -> SgrColor {
+    match color {
+        alacritty_terminal::vte::ansi::Color::Named(named) => {
+            named_to_sgr_color(named, colors, is_fg)
+        }
+        alacritty_terminal::vte::ansi::Color::Indexed(idx) => SgrColor::Idx(idx),
+        alacritty_terminal::vte::ansi::Color::Spec(rgb) => SgrColor::Rgb(rgb.r, rgb.g, rgb.b),
+    }
+}
+
+fn cell_style(
+    cell: &alacritty_terminal::term::cell::Cell,
+    colors: &alacritty_terminal::term::color::Colors,
+) -> CellStyle {
+    let flags = cell.flags;
     CellStyle {
-        fg: cell.fgcolor(),
-        bg: cell.bgcolor(),
-        bold: cell.bold(),
-        dim: cell.dim(),
-        italic: cell.italic(),
-        underline: cell.underline(),
-        inverse: cell.inverse(),
+        fg: color_to_sgr_color(cell.fg, colors, true),
+        bg: color_to_sgr_color(cell.bg, colors, false),
+        bold: flags.contains(alacritty_terminal::term::cell::Flags::BOLD),
+        dim: flags.contains(alacritty_terminal::term::cell::Flags::DIM),
+        italic: flags.contains(alacritty_terminal::term::cell::Flags::ITALIC),
+        underline: flags.intersects(alacritty_terminal::term::cell::Flags::ALL_UNDERLINES),
+        inverse: flags.contains(alacritty_terminal::term::cell::Flags::INVERSE),
     }
 }
 
@@ -276,21 +307,21 @@ fn push_sgr(snapshot: &mut String, style: CellStyle) {
     }
 
     match style.fg {
-        vt100::Color::Default => {}
-        vt100::Color::Idx(idx) => {
+        SgrColor::Default => {}
+        SgrColor::Idx(idx) => {
             let _ = write!(snapshot, ";38;5;{idx}");
         }
-        vt100::Color::Rgb(r, g, b) => {
+        SgrColor::Rgb(r, g, b) => {
             let _ = write!(snapshot, ";38;2;{r};{g};{b}");
         }
     }
 
     match style.bg {
-        vt100::Color::Default => {}
-        vt100::Color::Idx(idx) => {
+        SgrColor::Default => {}
+        SgrColor::Idx(idx) => {
             let _ = write!(snapshot, ";48;5;{idx}");
         }
-        vt100::Color::Rgb(r, g, b) => {
+        SgrColor::Rgb(r, g, b) => {
             let _ = write!(snapshot, ";48;2;{r};{g};{b}");
         }
     }
@@ -302,12 +333,51 @@ fn push_sgr(snapshot: &mut String, style: CellStyle) {
 fn spawn_log_reader_thread(
     service_id: ServiceID,
     reader: Box<dyn std::io::Read + Send>,
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
     events_tx: mpsc::Sender<Event>,
     pty_rows: u16,
     pty_cols: u16,
     pty_size: Arc<AtomicU32>,
 ) {
     thread::spawn(move || {
+        #[derive(Clone)]
+        struct PtyEventProxy {
+            writer: Arc<Mutex<Box<dyn Write + Send>>>,
+            pty_size: Arc<AtomicU32>,
+        }
+
+        impl EventListener for PtyEventProxy {
+            fn send_event(&self, event: AlacrittyEvent) {
+                let text = match event {
+                    AlacrittyEvent::PtyWrite(text) => Some(text),
+                    AlacrittyEvent::TextAreaSizeRequest(formatter) => {
+                        let size = self.pty_size.load(Ordering::Relaxed);
+                        if size == 0 {
+                            return;
+                        }
+                        let rows = (size >> 16) as u16;
+                        let cols = (size & 0xffff) as u16;
+                        Some(formatter(WindowSize {
+                            num_lines: rows,
+                            num_cols: cols,
+                            cell_width: 0,
+                            cell_height: 0,
+                        }))
+                    }
+                    _ => None,
+                };
+
+                let Some(text) = text else {
+                    return;
+                };
+
+                let mut guard = self.writer.lock();
+                if guard.write_all(text.as_bytes()).is_ok() {
+                    let _ = guard.flush();
+                }
+            }
+        }
+
         struct RateLimit {
             alt_screen: bool,
             window_start: Instant,
@@ -351,7 +421,7 @@ fn spawn_log_reader_thread(
         }
 
         fn emit_snapshot(
-            term: &Parser,
+            term: &Term<PtyEventProxy>,
             rate: &mut RateLimit,
             events_tx: &mpsc::Sender<Event>,
             service_id: &ServiceID,
@@ -377,56 +447,71 @@ fn spawn_log_reader_thread(
                 }
             }
 
-            let screen = term.screen();
-            let (rows, cols) = screen.size();
+            let _rows = term.screen_lines();
+            let cols = term.columns();
+            let content = term.renderable_content();
 
             let mut snapshot = String::new();
-            for row in 0..rows {
-                if row > 0 {
-                    snapshot.push('\n');
+            let mut cur_style = DEFAULT_CELL_STYLE;
+            let mut skip_next_wide = false;
+
+            for indexed in content.display_iter {
+                let cell = indexed.cell;
+                let point = indexed.point;
+
+                if point.column.0 == 0 {
+                    if !snapshot.is_empty() {
+                        snapshot.push('\n');
+                    }
+                    cur_style = DEFAULT_CELL_STYLE;
+                    push_sgr(&mut snapshot, cur_style);
+                    skip_next_wide = false;
                 }
 
-                let mut cur_style = DEFAULT_CELL_STYLE;
-                push_sgr(&mut snapshot, cur_style);
-
-                let mut col = 0;
-                while col < cols {
-                    let Some(cell) = screen.cell(row, col) else {
-                        if cur_style != DEFAULT_CELL_STYLE {
-                            cur_style = DEFAULT_CELL_STYLE;
-                            push_sgr(&mut snapshot, cur_style);
-                        }
-                        snapshot.push(' ');
-                        col = col.saturating_add(1);
+                if skip_next_wide {
+                    skip_next_wide = false;
+                    if cell
+                        .flags
+                        .contains(alacritty_terminal::term::cell::Flags::WIDE_CHAR_SPACER)
+                    {
                         continue;
-                    };
-
-                    if cell.is_wide_continuation() {
-                        col += 1;
-                        continue;
-                    }
-
-                    let style = cell_style(cell);
-                    if style != cur_style {
-                        cur_style = style;
-                        push_sgr(&mut snapshot, cur_style);
-                    }
-
-                    if cell.has_contents() {
-                        snapshot.push_str(cell.contents());
-                    } else {
-                        snapshot.push(' ');
-                    }
-
-                    if cell.is_wide() {
-                        col = col.saturating_add(2);
-                    } else {
-                        col = col.saturating_add(1);
                     }
                 }
 
-                if cur_style != DEFAULT_CELL_STYLE {
-                    push_sgr(&mut snapshot, DEFAULT_CELL_STYLE);
+                if cell
+                    .flags
+                    .contains(alacritty_terminal::term::cell::Flags::WIDE_CHAR_SPACER)
+                {
+                    continue;
+                }
+
+                let style = cell_style(cell, content.colors);
+                if style != cur_style {
+                    cur_style = style;
+                    push_sgr(&mut snapshot, cur_style);
+                }
+
+                let mut c = cell.c;
+                if cell
+                    .flags
+                    .contains(alacritty_terminal::term::cell::Flags::HIDDEN)
+                {
+                    c = ' ';
+                }
+                snapshot.push(c);
+
+                if let Some(zero_width) = cell.zerowidth() {
+                    for &c in zero_width {
+                        snapshot.push(c);
+                    }
+                }
+
+                if cell
+                    .flags
+                    .contains(alacritty_terminal::term::cell::Flags::WIDE_CHAR)
+                    && point.column.0 + 1 < cols
+                {
+                    skip_next_wide = true;
                 }
             }
 
@@ -469,11 +554,25 @@ fn spawn_log_reader_thread(
         let mut line: Vec<u8> = Vec::new();
         let mut scratch: Vec<u8> = Vec::new();
         let mut filter = AnsiFilter::new();
-        let mut term = Parser::new(pty_rows, pty_cols, 0);
+        let proxy = PtyEventProxy {
+            writer,
+            pty_size: pty_size.clone(),
+        };
+        let size = TermSize {
+            columns: usize::from(pty_cols),
+            screen_lines: usize::from(pty_rows),
+        };
+        let config = AlacrittyConfig {
+            scrolling_history: 0,
+            ..AlacrittyConfig::default()
+        };
+        let mut term: Term<PtyEventProxy> = Term::new(config, &size, proxy);
+        let mut processor: ansi::Processor<ansi::StdSyncHandler> = ansi::Processor::default();
         let mut interactive = false;
         let mut last_snapshot_at: Option<Instant> = None;
         let mut dirty = false;
         let mut last_size = 0u32;
+        let mut last_alt_screen = false;
 
         let mut rate = RateLimit::new();
 
@@ -483,7 +582,10 @@ fn spawn_log_reader_thread(
                 last_size = size;
                 let rows = (size >> 16) as u16;
                 let cols = (size & 0xffff) as u16;
-                term.screen_mut().set_size(rows, cols);
+                term.resize(TermSize {
+                    columns: usize::from(cols),
+                    screen_lines: usize::from(rows),
+                });
                 dirty = true;
             }
 
@@ -503,7 +605,17 @@ fn spawn_log_reader_thread(
             let Some(chunk) = buf.get(..n) else {
                 continue;
             };
-            term.process(chunk);
+
+            processor.advance(&mut term, chunk);
+
+            let alt_screen = term.mode().contains(TermMode::ALT_SCREEN);
+            if alt_screen != last_alt_screen {
+                last_alt_screen = alt_screen;
+                rate.set_alt_screen(alt_screen);
+                interactive = true;
+                dirty = true;
+                line.clear();
+            }
             if interactive {
                 dirty = true;
             }
@@ -534,13 +646,6 @@ fn spawn_log_reader_thread(
                                 rate.have_snapshot = false;
                                 line.clear();
                             }
-                        }
-
-                        if let Some(new_alt) = filter.take_alt_screen_change() {
-                            rate.set_alt_screen(new_alt);
-                            interactive = true;
-                            dirty = true;
-                            line.clear();
                         }
 
                         if !interactive && line.len() >= 16 * 1024 {
@@ -749,6 +854,7 @@ pub(super) async fn start_service_with_pty_size(
     spawn_log_reader_thread(
         service_id.clone(),
         reader,
+        writer.clone(),
         events_tx.clone(),
         pty_size.rows,
         pty_size.cols,
