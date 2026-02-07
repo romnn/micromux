@@ -37,3 +37,5 @@ services:
     command: "watch docker ps"
   htop:
     command: "htop"
+  btop:
+    command: "btop"

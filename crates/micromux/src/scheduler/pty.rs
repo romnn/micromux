@@ -221,6 +221,83 @@ impl AnsiFilter {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CellStyle {
+    fg: vt100::Color,
+    bg: vt100::Color,
+    bold: bool,
+    dim: bool,
+    italic: bool,
+    underline: bool,
+    inverse: bool,
+}
+
+const DEFAULT_CELL_STYLE: CellStyle = CellStyle {
+    fg: vt100::Color::Default,
+    bg: vt100::Color::Default,
+    bold: false,
+    dim: false,
+    italic: false,
+    underline: false,
+    inverse: false,
+};
+
+fn cell_style(cell: &vt100::Cell) -> CellStyle {
+    CellStyle {
+        fg: cell.fgcolor(),
+        bg: cell.bgcolor(),
+        bold: cell.bold(),
+        dim: cell.dim(),
+        italic: cell.italic(),
+        underline: cell.underline(),
+        inverse: cell.inverse(),
+    }
+}
+
+fn push_sgr(snapshot: &mut String, style: CellStyle) {
+    use std::fmt::Write as _;
+
+    snapshot.push_str("\x1b[");
+    snapshot.push('0');
+    if style.bold {
+        snapshot.push_str(";1");
+    }
+    if style.dim {
+        snapshot.push_str(";2");
+    }
+    if style.italic {
+        snapshot.push_str(";3");
+    }
+    if style.underline {
+        snapshot.push_str(";4");
+    }
+    if style.inverse {
+        snapshot.push_str(";7");
+    }
+
+    match style.fg {
+        vt100::Color::Default => {}
+        vt100::Color::Idx(idx) => {
+            let _ = write!(snapshot, ";38;5;{idx}");
+        }
+        vt100::Color::Rgb(r, g, b) => {
+            let _ = write!(snapshot, ";38;2;{r};{g};{b}");
+        }
+    }
+
+    match style.bg {
+        vt100::Color::Default => {}
+        vt100::Color::Idx(idx) => {
+            let _ = write!(snapshot, ";48;5;{idx}");
+        }
+        vt100::Color::Rgb(r, g, b) => {
+            let _ = write!(snapshot, ";48;2;{r};{g};{b}");
+        }
+    }
+
+    snapshot.push('m');
+}
+
 #[allow(clippy::too_many_lines)]
 fn spawn_log_reader_thread(
     service_id: ServiceID,
@@ -302,27 +379,55 @@ fn spawn_log_reader_thread(
 
             let screen = term.screen();
             let (rows, cols) = screen.size();
-            let plain_rows: Vec<String> = screen.rows(0, cols).take(rows as usize).collect();
-            let mut last_non_empty = None;
-            for (idx, row) in plain_rows.iter().enumerate() {
-                if !row.trim_end().is_empty() {
-                    last_non_empty = Some(idx);
-                }
-            }
-            let Some(last_non_empty) = last_non_empty else {
-                return;
-            };
 
-            let formatted_rows: Vec<Vec<u8>> = screen
-                .rows_formatted(0, cols)
-                .take(last_non_empty + 1)
-                .collect();
             let mut snapshot = String::new();
-            for (i, row) in formatted_rows.into_iter().enumerate() {
-                if i > 0 {
+            for row in 0..rows {
+                if row > 0 {
                     snapshot.push('\n');
                 }
-                snapshot.push_str(&String::from_utf8_lossy(&row));
+
+                let mut cur_style = DEFAULT_CELL_STYLE;
+                push_sgr(&mut snapshot, cur_style);
+
+                let mut col = 0;
+                while col < cols {
+                    let Some(cell) = screen.cell(row, col) else {
+                        if cur_style != DEFAULT_CELL_STYLE {
+                            cur_style = DEFAULT_CELL_STYLE;
+                            push_sgr(&mut snapshot, cur_style);
+                        }
+                        snapshot.push(' ');
+                        col = col.saturating_add(1);
+                        continue;
+                    };
+
+                    if cell.is_wide_continuation() {
+                        col += 1;
+                        continue;
+                    }
+
+                    let style = cell_style(cell);
+                    if style != cur_style {
+                        cur_style = style;
+                        push_sgr(&mut snapshot, cur_style);
+                    }
+
+                    if cell.has_contents() {
+                        snapshot.push_str(cell.contents());
+                    } else {
+                        snapshot.push(' ');
+                    }
+
+                    if cell.is_wide() {
+                        col = col.saturating_add(2);
+                    } else {
+                        col = col.saturating_add(1);
+                    }
+                }
+
+                if cur_style != DEFAULT_CELL_STYLE {
+                    push_sgr(&mut snapshot, DEFAULT_CELL_STYLE);
+                }
             }
 
             let update = if rate.have_snapshot {
