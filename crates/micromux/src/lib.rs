@@ -126,22 +126,6 @@ impl Micromux {
         commands_rx: mpsc::Receiver<scheduler::Command>,
         shutdown: CancellationToken,
     ) -> eyre::Result<()> {
-        self.start_with_options(ui_tx, commands_rx, shutdown, true)
-            .await
-    }
-
-    /// Start the scheduler with explicit options.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the scheduler fails to start or if any service fails during startup.
-    pub async fn start_with_options(
-        &self,
-        ui_tx: mpsc::Sender<scheduler::Event>,
-        commands_rx: mpsc::Receiver<scheduler::Command>,
-        shutdown: CancellationToken,
-        interactive_logs: bool,
-    ) -> eyre::Result<()> {
         tracing::info!("starting");
         let (events_tx, events_rx) = mpsc::channel(1024);
 
@@ -160,7 +144,6 @@ impl Micromux {
             events_tx,
             ui_tx,
             shutdown.clone(),
-            interactive_logs,
         )
         .await?;
         tracing::info!("exiting");

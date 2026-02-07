@@ -8,6 +8,7 @@ use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -29,6 +30,7 @@ struct SchedulerRuntime<'a> {
     terminate_tokens: HashMap<ServiceID, CancellationToken>,
     pty_masters: HashMap<ServiceID, Arc<Mutex<Box<dyn portable_pty::MasterPty + Send>>>>,
     pty_writers: HashMap<ServiceID, Arc<Mutex<Box<dyn Write + Send>>>>,
+    pty_sizes: HashMap<ServiceID, Arc<std::sync::atomic::AtomicU32>>,
     current_pty_size: portable_pty::PtySize,
     restart_backoff_until: HashMap<ServiceID, tokio::time::Instant>,
     restart_backoff_delay: HashMap<ServiceID, Duration>,
@@ -37,7 +39,6 @@ struct SchedulerRuntime<'a> {
     events_tx: mpsc::Sender<Event>,
     ui_tx: mpsc::Sender<Event>,
     shutdown: CancellationToken,
-    interactive_logs: bool,
 }
 
 impl<'a> SchedulerRuntime<'a> {
@@ -47,7 +48,6 @@ impl<'a> SchedulerRuntime<'a> {
         events_tx: mpsc::Sender<Event>,
         ui_tx: mpsc::Sender<Event>,
         shutdown: CancellationToken,
-        interactive_logs: bool,
     ) -> Self {
         let restart_on_failure_remaining: HashMap<ServiceID, usize> = services
             .iter()
@@ -71,6 +71,7 @@ impl<'a> SchedulerRuntime<'a> {
             terminate_tokens: HashMap::new(),
             pty_masters: HashMap::new(),
             pty_writers: HashMap::new(),
+            pty_sizes: HashMap::new(),
             current_pty_size: portable_pty::PtySize {
                 rows: 24,
                 cols: 80,
@@ -84,7 +85,6 @@ impl<'a> SchedulerRuntime<'a> {
             events_tx,
             ui_tx,
             shutdown,
-            interactive_logs,
         }
     }
 
@@ -99,9 +99,9 @@ impl<'a> SchedulerRuntime<'a> {
             terminate_tokens: &mut self.terminate_tokens,
             pty_masters: &mut self.pty_masters,
             pty_writers: &mut self.pty_writers,
+            pty_sizes: &mut self.pty_sizes,
             current_pty_size: self.current_pty_size,
             restart_backoff_until: &self.restart_backoff_until,
-            interactive_logs: self.interactive_logs,
             events_tx: &self.events_tx,
             shutdown: &self.shutdown,
         })
@@ -193,6 +193,11 @@ impl<'a> SchedulerRuntime<'a> {
                         tracing::warn!(?err, service_id, "failed to resize pty");
                     }
                 }
+
+                let packed = (u32::from(rows) << 16) | u32::from(cols);
+                for size in self.pty_sizes.values() {
+                    size.store(packed, Ordering::Relaxed);
+                }
             }
         }
     }
@@ -210,7 +215,11 @@ impl<'a> SchedulerRuntime<'a> {
             self.apply_restart_backoff(&service_id, *code);
         }
 
-        self.ui_tx.send(event).await?;
+        if matches!(&event, Event::LogLine { .. }) {
+            let _ = self.ui_tx.try_send(event);
+        } else {
+            self.ui_tx.send(event).await?;
+        }
         Ok(())
     }
 }
@@ -222,17 +231,9 @@ pub async fn scheduler(
     events_tx: mpsc::Sender<Event>,
     ui_tx: mpsc::Sender<Event>,
     shutdown: CancellationToken,
-    interactive_logs: bool,
 ) -> eyre::Result<()> {
     let graph = ServiceGraph::new(services)?;
-    let mut rt = SchedulerRuntime::new(
-        services,
-        graph,
-        events_tx,
-        ui_tx,
-        shutdown.clone(),
-        interactive_logs,
-    );
+    let mut rt = SchedulerRuntime::new(services, graph, events_tx, ui_tx, shutdown.clone());
 
     // Initial scheduling pass
     tracing::debug!("started initial scheduling pass");
@@ -395,7 +396,6 @@ mod tests {
                     events_tx,
                     ui_tx,
                     shutdown,
-                    true,
                 )
                 .await
             }
@@ -463,7 +463,6 @@ mod tests {
                     events_tx,
                     ui_tx,
                     shutdown,
-                    true,
                 )
                 .await
             }
@@ -527,7 +526,6 @@ mod tests {
                     events_tx,
                     ui_tx,
                     shutdown,
-                    true,
                 )
                 .await
             }
@@ -593,7 +591,6 @@ mod tests {
                     events_tx,
                     ui_tx,
                     shutdown,
-                    true,
                 )
                 .await
             }
@@ -647,7 +644,6 @@ mod tests {
                     events_tx,
                     ui_tx,
                     shutdown,
-                    true,
                 )
                 .await
             }
@@ -704,7 +700,6 @@ mod tests {
                     events_tx,
                     ui_tx,
                     shutdown,
-                    true,
                 )
                 .await
             }
@@ -772,7 +767,6 @@ mod tests {
                     events_tx,
                     ui_tx,
                     shutdown,
-                    true,
                 )
                 .await
             }
@@ -831,7 +825,6 @@ mod tests {
                     events_tx,
                     ui_tx,
                     shutdown,
-                    true,
                 )
                 .await
             }
@@ -901,7 +894,6 @@ mod tests {
                     events_tx,
                     ui_tx,
                     shutdown,
-                    true,
                 )
                 .await
             }
@@ -974,7 +966,6 @@ mod tests {
                     events_tx,
                     ui_tx,
                     shutdown,
-                    true,
                 )
                 .await
             }
@@ -1052,7 +1043,6 @@ mod tests {
                     events_tx,
                     ui_tx,
                     shutdown,
-                    true,
                 )
                 .await
             }

@@ -48,7 +48,10 @@ pub struct App {
     show_healthcheck_pane: bool,
     attach_mode: bool,
     focus: Focus,
+    terminal_cols: u16,
     terminal_rows: u16,
+    last_pty_cols: u16,
+    last_pty_rows: u16,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,12 +111,77 @@ impl App {
             show_healthcheck_pane: false,
             attach_mode: false,
             focus: Focus::Services,
+            terminal_cols: 80,
             terminal_rows: 24,
+            last_pty_cols: 0,
+            last_pty_rows: 0,
         }
     }
 }
 
 impl App {
+    fn desired_pty_size(&self) -> (u16, u16) {
+        use ratatui::layout::{Constraint, Direction, Layout, Rect};
+
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: self.terminal_cols,
+            height: self.terminal_rows,
+        };
+
+        let [_header_area, main_area, _footer_area] = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(0),
+                Constraint::Min(0),
+                Constraint::Length(1),
+            ])
+            .spacing(0)
+            .areas(area);
+
+        let [_services_area, main_right_area] = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Length(self.state.services_sidebar_width),
+                Constraint::Min(0),
+            ])
+            .spacing(0)
+            .areas(main_area);
+
+        let logs_area = if self.show_healthcheck_pane {
+            let [a, _b] = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .spacing(0)
+                .areas::<2>(main_right_area);
+            a
+        } else {
+            main_right_area
+        };
+
+        let [logs_pane_area, _scrollbar_area] = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(0), Constraint::Length(1)])
+            .spacing(0)
+            .areas(logs_area);
+
+        let cols = logs_pane_area.width.saturating_sub(2).max(1);
+        let rows = logs_pane_area.height.saturating_sub(2).max(1);
+        (cols, rows)
+    }
+
+    fn maybe_resize_pty(&mut self) {
+        let (cols, rows) = self.desired_pty_size();
+        if cols == self.last_pty_cols && rows == self.last_pty_rows {
+            return;
+        }
+
+        self.last_pty_cols = cols;
+        self.last_pty_rows = rows;
+        let _ = self.commands_tx.try_send(Command::ResizeAll { cols, rows });
+    }
+
     /// Run the TUI event loop.
     ///
     /// # Errors
@@ -129,14 +197,9 @@ impl App {
         }
 
         let area = terminal.size()?;
+        self.terminal_cols = area.width;
         self.terminal_rows = area.height;
-        let _ = self
-            .commands_tx
-            .send(Command::ResizeAll {
-                cols: area.width,
-                rows: area.height,
-            })
-            .await;
+        self.maybe_resize_pty();
 
         while self.is_running() {
             // Wait until an (input) event is received.
@@ -189,8 +252,9 @@ impl App {
 
         match *event {
             crossterm::event::Event::Resize(cols, rows) => {
+                self.terminal_cols = cols;
                 self.terminal_rows = rows;
-                let _ = self.commands_tx.try_send(Command::ResizeAll { cols, rows });
+                self.maybe_resize_pty();
             }
             crossterm::event::Event::Key(key) if key.kind == KeyEventKind::Press => {
                 self.handle_key_press(key);
@@ -236,10 +300,16 @@ impl App {
             KeyCode::Char('G') => self.scroll_to_bottom(),
 
             // Decrease service sidebar width (resize to the left)
-            KeyCode::Char('-' | 'h') | KeyCode::Left => self.state.resize_left(),
+            KeyCode::Char('-' | 'h') | KeyCode::Left => {
+                self.state.resize_left();
+                self.maybe_resize_pty();
+            }
 
             // Increase service sidebar width (resize to the right)
-            KeyCode::Char('+' | 'l') | KeyCode::Right => self.state.resize_right(),
+            KeyCode::Char('+' | 'l') | KeyCode::Right => {
+                self.state.resize_right();
+                self.maybe_resize_pty();
+            }
 
             // Toggle wrapping for log viewer
             KeyCode::Char('w') => self.toggle_wrap(),
@@ -290,6 +360,7 @@ impl App {
         if !self.show_healthcheck_pane && self.focus == Focus::Healthcheck {
             self.focus = Focus::Logs;
         }
+        self.maybe_resize_pty();
     }
 
     fn navigate_up(&mut self) {

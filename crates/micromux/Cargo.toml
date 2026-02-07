@@ -34,6 +34,9 @@ parking_lot.workspace = true
 # command and process management
 shlex = "1"
 nix = { version = "0", features = ["signal"] }
+
+# terminal emulation
+vt100 = "0.16"
 portable-pty = "0.9"
 
 # graph

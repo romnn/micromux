@@ -23,25 +23,6 @@ services:
       interval: "30s"
       timeout: "10s"
       retries: 3
-  # ping-apple:
-  #   name: Apple
-  #   command: "ping apple.com"
-  #   watch:
-  #     - "./*.toml"
-  #   environment:
-  #     POSTGRES_PASSWORD: example
-  #   depends_on: []
-  #     # - "minio"
-  #   ports: []
-  #   # depends_on:
-  #   #   minio:
-  #   #     condition: service_healthy
-  #   healthcheck:
-  #     test: "exit 0"
-  #     # test: ["CMD", "pg_isready", "-U", "postgres"]
-  #     interval: "10s"
-  #     timeout: "5s"
-  #     retries: 3
   frontend:
     name: Run frontend
     command: "true"
@@ -53,5 +34,6 @@ services:
     healthcheck:
       test: "exit 1"
   docker:
-    name: watch docker ps
     command: "watch docker ps"
+  htop:
+    command: "htop"
