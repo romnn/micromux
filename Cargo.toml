@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+	"crates/clippy-wrapper",
 	"crates/micromux",
 	"crates/micromux-tui",
 	"crates/micromux-cli",
