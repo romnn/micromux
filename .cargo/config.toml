@@ -1,3 +1,6 @@
 [alias]
-lint = "clippy --all-targets --no-deps"
-fixit = "clippy --fix --allow-dirty --all-targets --no-deps"
+clippy-wrapper = "run --package clippy-wrapper --"
+
+# linting
+lint = "clippy-wrapper lint"
+fixit = "clippy-wrapper fixit"

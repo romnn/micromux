@@ -4,6 +4,7 @@ use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU32;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -18,9 +19,9 @@ pub(super) struct ScheduleContext<'a> {
     pub(super) pty_masters:
         &'a mut HashMap<ServiceID, Arc<Mutex<Box<dyn portable_pty::MasterPty + Send>>>>,
     pub(super) pty_writers: &'a mut HashMap<ServiceID, Arc<Mutex<Box<dyn Write + Send>>>>,
+    pub(super) pty_sizes: &'a mut HashMap<ServiceID, Arc<AtomicU32>>,
     pub(super) current_pty_size: portable_pty::PtySize,
     pub(super) restart_backoff_until: &'a HashMap<ServiceID, tokio::time::Instant>,
-    pub(super) interactive_logs: bool,
     pub(super) events_tx: &'a mpsc::Sender<Event>,
     pub(super) shutdown: &'a CancellationToken,
 }
@@ -230,13 +231,13 @@ async fn start_service_if_ready(
         ctx.shutdown.clone(),
         terminate,
         ctx.current_pty_size,
-        ctx.interactive_logs,
     )
     .await
     {
         Ok(handles) => {
             ctx.pty_masters.insert(service_id.clone(), handles.master);
             ctx.pty_writers.insert(service_id.clone(), handles.writer);
+            ctx.pty_sizes.insert(service_id.clone(), handles.size);
         }
         Err(err) => {
             tracing::error!(?err, service_id, "failed to start service");

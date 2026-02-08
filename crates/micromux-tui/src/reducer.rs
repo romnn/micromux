@@ -35,7 +35,7 @@ fn push_healthcheck_line(
     attempt_entry.output.push(line);
 }
 
- #[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines)]
 pub fn apply(state: &mut state::State, event: Event) {
     match event {
         Event::Started { service_id } => {

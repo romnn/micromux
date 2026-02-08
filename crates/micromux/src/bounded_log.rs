@@ -78,7 +78,7 @@ impl BoundedLog {
         self.current_bytes += line_len;
 
         // Enforce line count limit
-        while self.entries.len() > self.max_lines.into() {
+        while self.entries.len() > usize::from(self.max_lines) {
             if let Some(old) = self.entries.pop_front() {
                 self.current_bytes = self.current_bytes.saturating_sub(old.len());
             }

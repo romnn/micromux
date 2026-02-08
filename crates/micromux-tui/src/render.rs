@@ -512,7 +512,8 @@ pub mod log_view {
         buffer::Buffer,
         layout::Rect,
         widgets::{
-            Block, Borders, Paragraph, Scrollbar, ScrollbarState, StatefulWidget, Widget, Wrap,
+            Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarState, StatefulWidget, Widget,
+            Wrap,
         },
     };
 
@@ -548,6 +549,9 @@ pub mod log_view {
             logs: &str,
             buf: &mut Buffer,
         ) {
+            Clear.render(log_area, buf);
+            Clear.render(scrollbar_area, buf);
+
             // Strip ANSI control codes that could confuse our TUI
             let text: ratatui::text::Text = logs.into_text().unwrap_or_else(|err| {
                 // As a fallback, remove all ANSI controls (losing all color)

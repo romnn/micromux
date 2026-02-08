@@ -122,18 +122,12 @@ async fn run() -> eyre::Result<()> {
     let mux = micromux::Micromux::new(&config)?;
     let services = mux.services();
     let tui = micromux_tui::App::new(&services, ui_rx, commands_tx, shutdown.clone());
-    let interactive_logs = !options.no_interactive_logs;
 
-    let tui_handle = tokio::task::spawn({
-        async move { tui.render().await }
-    });
+    let tui_handle = tokio::task::spawn(async move { tui.render().await });
 
     let mux_handle = tokio::task::spawn({
         let shutdown = shutdown.clone();
-        async move {
-            mux.start_with_options(ui_tx, commands_rx, shutdown, interactive_logs)
-                .await
-        }
+        async move { mux.start(ui_tx, commands_rx, shutdown).await }
     });
 
     let mut tui_handle = tui_handle;
