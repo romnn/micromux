@@ -357,7 +357,7 @@ checksum = "c3e64b0cc0439b12df2fa678eae89a1c56a529fd067a9115f7827f1fffd22b32"
 
 [[package]]
 name = "clippy-wrapper"
-version = "0.0.3"
+version = "0.0.4"
 
 [[package]]
 name = "codespan-reporting"
@@ -1526,7 +1526,7 @@ dependencies = [
 
 [[package]]
 name = "micromux"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "alacritty_terminal",
  "codespan-reporting",
@@ -1558,7 +1558,7 @@ dependencies = [
 
 [[package]]
 name = "micromux-cli"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "clap",
  "codespan-reporting",
@@ -1575,7 +1575,7 @@ dependencies = [
 
 [[package]]
 name = "micromux-tui"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "ansi-to-tui",
  "codespan-reporting",

@@ -27,6 +27,7 @@ pub struct Verbosity {
 }
 
 #[derive(Debug, Parser)]
+#[command(author, version)]
 pub struct Options {
     #[clap(short = 'c', long = "config", help = "path to config file")]
     pub config_path: Option<PathBuf>,
