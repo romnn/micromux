@@ -104,7 +104,7 @@ tasks:
   format:
     desc: "format cargo workspace"
     cmds:
-      - cargo fmt {{.CLI_ARGS}}
+      - cargo fmt --all {{.CLI_ARGS}}
 
   test:
     desc: "test cargo workspace"

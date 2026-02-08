@@ -79,12 +79,66 @@ fn run_cargo_clippy(
     cargo_args: Vec<String>,
     args: Vec<String>,
 ) -> Result<std::process::ExitStatus, std::io::Error> {
+    let (user_cargo_args, user_clippy_args) = split_args_on_double_dash(args);
+
+    let mut has_package = false;
+    let mut has_workspace = false;
+    let mut has_no_deps = false;
+    let mut has_all_features = false;
+    let mut has_features = false;
+    let mut has_no_default_features = false;
+
+    for arg in &user_cargo_args {
+        match arg.as_str() {
+            "-p" | "--package" => {
+                has_package = true;
+            }
+            "--workspace" => {
+                has_workspace = true;
+            }
+            "--no-deps" => {
+                has_no_deps = true;
+            }
+            "--all-features" => {
+                has_all_features = true;
+            }
+            "--features" => {
+                has_features = true;
+            }
+            "--no-default-features" => {
+                has_no_default_features = true;
+            }
+            _ => {
+                if arg.starts_with("--package=") {
+                    has_package = true;
+                }
+                if arg.starts_with("-p") && arg.len() > 2 {
+                    has_package = true;
+                }
+                if arg.starts_with("--features=") {
+                    has_features = true;
+                }
+            }
+        }
+    }
+
     let mut cargo_clippy_args = Vec::new();
     cargo_clippy_args.extend(cargo_args);
-    cargo_clippy_args.push("--all-targets".to_string());
-    cargo_clippy_args.push("--no-deps".to_string());
 
-    let (user_cargo_args, user_clippy_args) = split_args_on_double_dash(args);
+    if !has_package && !has_workspace {
+        cargo_clippy_args.push("--workspace".to_string());
+    }
+
+    cargo_clippy_args.push("--all-targets".to_string());
+
+    if has_package {
+        if !has_no_deps {
+            cargo_clippy_args.push("--no-deps".to_string());
+        }
+    } else if !has_all_features && !has_features && !has_no_default_features {
+        cargo_clippy_args.push("--all-features".to_string());
+    }
+
     cargo_clippy_args.extend(user_cargo_args);
 
     let mut command = std::process::Command::new("cargo");
@@ -121,7 +175,11 @@ fn main() -> ExitCode {
     let (cargo_args, args) = match subcommand.as_str() {
         "lint" => (Vec::new(), remaining_args),
         "fixit" => (
-            vec!["--fix".to_string(), "--allow-dirty".to_string()],
+            vec![
+                "--fix".to_string(),
+                "--allow-dirty".to_string(),
+                "--allow-staged".to_string(),
+            ],
             remaining_args,
         ),
         "-h" | "--help" | "help" => {

@@ -214,24 +214,35 @@ enum SgrColor {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CellAttrs(u8);
+
+impl CellAttrs {
+    const BOLD: u8 = 1 << 0;
+    const DIM: u8 = 1 << 1;
+    const ITALIC: u8 = 1 << 2;
+    const UNDERLINE: u8 = 1 << 3;
+    const INVERSE: u8 = 1 << 4;
+
+    const fn empty() -> Self {
+        Self(0)
+    }
+
+    const fn contains(self, flag: u8) -> bool {
+        (self.0 & flag) != 0
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct CellStyle {
     fg: SgrColor,
     bg: SgrColor,
-    bold: bool,
-    dim: bool,
-    italic: bool,
-    underline: bool,
-    inverse: bool,
+    attrs: CellAttrs,
 }
 
 const DEFAULT_CELL_STYLE: CellStyle = CellStyle {
     fg: SgrColor::Default,
     bg: SgrColor::Default,
-    bold: false,
-    dim: false,
-    italic: false,
-    underline: false,
-    inverse: false,
+    attrs: CellAttrs::empty(),
 };
 
 fn named_to_sgr_color(
@@ -244,8 +255,8 @@ fn named_to_sgr_color(
         return SgrColor::Default;
     }
 
-    if idx <= usize::from(u8::MAX) {
-        return SgrColor::Idx(idx as u8);
+    if let Ok(idx) = u8::try_from(idx) {
+        return SgrColor::Idx(idx);
     }
 
     let Some(rgb) = colors[idx] else {
@@ -274,14 +285,27 @@ fn cell_style(
     colors: &alacritty_terminal::term::color::Colors,
 ) -> CellStyle {
     let flags = cell.flags;
+    let mut attrs = CellAttrs::empty();
+    if flags.contains(alacritty_terminal::term::cell::Flags::BOLD) {
+        attrs.0 |= CellAttrs::BOLD;
+    }
+    if flags.contains(alacritty_terminal::term::cell::Flags::DIM) {
+        attrs.0 |= CellAttrs::DIM;
+    }
+    if flags.contains(alacritty_terminal::term::cell::Flags::ITALIC) {
+        attrs.0 |= CellAttrs::ITALIC;
+    }
+    if flags.intersects(alacritty_terminal::term::cell::Flags::ALL_UNDERLINES) {
+        attrs.0 |= CellAttrs::UNDERLINE;
+    }
+    if flags.contains(alacritty_terminal::term::cell::Flags::INVERSE) {
+        attrs.0 |= CellAttrs::INVERSE;
+    }
+
     CellStyle {
         fg: color_to_sgr_color(cell.fg, colors, true),
         bg: color_to_sgr_color(cell.bg, colors, false),
-        bold: flags.contains(alacritty_terminal::term::cell::Flags::BOLD),
-        dim: flags.contains(alacritty_terminal::term::cell::Flags::DIM),
-        italic: flags.contains(alacritty_terminal::term::cell::Flags::ITALIC),
-        underline: flags.intersects(alacritty_terminal::term::cell::Flags::ALL_UNDERLINES),
-        inverse: flags.contains(alacritty_terminal::term::cell::Flags::INVERSE),
+        attrs,
     }
 }
 
@@ -290,19 +314,19 @@ fn push_sgr(snapshot: &mut String, style: CellStyle) {
 
     snapshot.push_str("\x1b[");
     snapshot.push('0');
-    if style.bold {
+    if style.attrs.contains(CellAttrs::BOLD) {
         snapshot.push_str(";1");
     }
-    if style.dim {
+    if style.attrs.contains(CellAttrs::DIM) {
         snapshot.push_str(";2");
     }
-    if style.italic {
+    if style.attrs.contains(CellAttrs::ITALIC) {
         snapshot.push_str(";3");
     }
-    if style.underline {
+    if style.attrs.contains(CellAttrs::UNDERLINE) {
         snapshot.push_str(";4");
     }
-    if style.inverse {
+    if style.attrs.contains(CellAttrs::INVERSE) {
         snapshot.push_str(";7");
     }
 
