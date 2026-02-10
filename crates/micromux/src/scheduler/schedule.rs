@@ -23,6 +23,7 @@ pub(super) struct ScheduleContext<'a> {
     pub(super) current_pty_size: portable_pty::PtySize,
     pub(super) restart_backoff_until: &'a HashMap<ServiceID, tokio::time::Instant>,
     pub(super) events_tx: &'a mpsc::Sender<Event>,
+    pub(super) ui_tx: &'a mpsc::Sender<Event>,
     pub(super) shutdown: &'a CancellationToken,
 }
 
@@ -68,7 +69,8 @@ pub(super) fn update_state(
         Event::LogLine { .. }
         | Event::HealthCheckStarted { .. }
         | Event::HealthCheckLogLine { .. }
-        | Event::HealthCheckFinished { .. } => {}
+        | Event::HealthCheckFinished { .. }
+        | Event::ClearLogs(_) => {}
     }
 
     for service_id in services.keys() {
@@ -202,7 +204,7 @@ fn apply_on_failure_decrement(
     }
 }
 
-async fn start_service_if_ready(
+fn start_service_if_ready(
     ctx: &mut ScheduleContext<'_>,
     service_id: &ServiceID,
     service: &crate::service::Service,
@@ -227,17 +229,21 @@ async fn start_service_if_ready(
 
     match pty::start_service_with_pty_size(
         service,
-        ctx.events_tx.clone(),
-        ctx.shutdown.clone(),
-        terminate,
+        ctx.events_tx,
+        ctx.shutdown,
+        &terminate,
         ctx.current_pty_size,
-    )
-    .await
-    {
+    ) {
         Ok(handles) => {
             ctx.pty_masters.insert(service_id.clone(), handles.master);
             ctx.pty_writers.insert(service_id.clone(), handles.writer);
             ctx.pty_sizes.insert(service_id.clone(), handles.size);
+            if let Some(state) = ctx.service_state.get_mut(service_id.as_str()) {
+                *state = State::Running { health: None };
+            }
+            let _ = ctx.ui_tx.try_send(Event::Started {
+                service_id: service_id.clone(),
+            });
         }
         Err(err) => {
             tracing::error!(?err, service_id, "failed to start service");
@@ -248,7 +254,7 @@ async fn start_service_if_ready(
     }
 }
 
-pub(super) async fn schedule_ready(ctx: &mut ScheduleContext<'_>) {
+pub(super) fn schedule_ready(ctx: &mut ScheduleContext<'_>) {
     for (service_id, service) in ctx.services {
         let exited_code = match should_consider_start(ctx, service_id, service) {
             StartCheck::Skip => continue,
@@ -261,6 +267,6 @@ pub(super) async fn schedule_ready(ctx: &mut ScheduleContext<'_>) {
             "evaluating service"
         );
 
-        start_service_if_ready(ctx, service_id, service, exited_code).await;
+        start_service_if_ready(ctx, service_id, service, exited_code);
     }
 }

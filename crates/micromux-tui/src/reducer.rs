@@ -86,6 +86,14 @@ pub fn apply(state: &mut state::State, event: Event) {
                 service.exec_state = state::Execution::Disabled;
             }
         }
+        Event::ClearLogs(service_id) => {
+            if let Some(service) = state.services.get_mut(&service_id) {
+                service.logs.clear();
+                service.cached_num_lines = 0;
+                service.cached_logs.clear();
+                service.logs_dirty = true;
+            }
+        }
         Event::HealthCheckStarted {
             service_id,
             attempt,

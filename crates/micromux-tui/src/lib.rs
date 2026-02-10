@@ -273,7 +273,7 @@ impl App {
 
         match key.code {
             // Quit
-            KeyCode::Char('q') | KeyCode::Esc => self.exit(),
+            KeyCode::Char('q') => self.exit(),
 
             // Toggle focus
             KeyCode::Tab => self.toggle_focus(),

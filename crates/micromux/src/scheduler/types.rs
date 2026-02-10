@@ -107,6 +107,8 @@ pub enum Event {
     Unhealthy(ServiceID),
     /// A service was disabled.
     Disabled(ServiceID),
+    /// Clear the log buffer for a service (e.g. on restart).
+    ClearLogs(ServiceID),
 }
 
 /// The kind of log update.
@@ -141,7 +143,8 @@ impl Event {
             | Self::Exited(service_id, _)
             | Self::Healthy(service_id)
             | Self::Unhealthy(service_id)
-            | Self::Disabled(service_id) => service_id,
+            | Self::Disabled(service_id)
+            | Self::ClearLogs(service_id) => service_id,
         }
     }
 }
@@ -181,6 +184,7 @@ impl std::fmt::Display for Event {
             Self::Healthy(service_id) => write!(f, "Healthy({service_id})"),
             Self::Unhealthy(service_id) => write!(f, "Unhealthy({service_id})"),
             Self::Disabled(service_id) => write!(f, "Disabled({service_id})"),
+            Self::ClearLogs(service_id) => write!(f, "ClearLogs({service_id})"),
         }
     }
 }

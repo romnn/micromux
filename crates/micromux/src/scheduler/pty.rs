@@ -799,11 +799,11 @@ fn spawn_termination_task(args: TerminationTaskArgs) {
 }
 
 #[allow(clippy::too_many_lines)]
-pub(super) async fn start_service_with_pty_size(
+pub(super) fn start_service_with_pty_size(
     service: &Service,
-    events_tx: mpsc::Sender<Event>,
-    shutdown: CancellationToken,
-    terminate: CancellationToken,
+    events_tx: &mpsc::Sender<Event>,
+    shutdown: &CancellationToken,
+    terminate: &CancellationToken,
     pty_size: portable_pty::PtySize,
 ) -> eyre::Result<PtyHandles> {
     use portable_pty::{CommandBuilder, PtySize};
@@ -868,12 +868,6 @@ pub(super) async fn start_service_with_pty_size(
     let size = Arc::new(AtomicU32::new(
         (u32::from(pty_size.rows) << 16) | u32::from(pty_size.cols),
     ));
-
-    let _ = events_tx
-        .send(Event::Started {
-            service_id: service_id.clone(),
-        })
-        .await;
 
     spawn_log_reader_thread(
         service_id.clone(),

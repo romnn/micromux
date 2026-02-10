@@ -88,7 +88,7 @@ impl<'a> SchedulerRuntime<'a> {
         }
     }
 
-    async fn schedule_pass(&mut self, services: &ServiceMap) {
+    fn schedule_pass(&mut self, services: &ServiceMap) {
         schedule::schedule_ready(&mut schedule::ScheduleContext {
             services,
             graph: &self.graph.inner,
@@ -103,13 +103,16 @@ impl<'a> SchedulerRuntime<'a> {
             current_pty_size: self.current_pty_size,
             restart_backoff_until: &self.restart_backoff_until,
             events_tx: &self.events_tx,
+            ui_tx: &self.ui_tx,
             shutdown: &self.shutdown,
-        })
-        .await;
+        });
     }
 
     fn apply_restart_backoff(&mut self, service_id: &ServiceID, code: i32) {
-        if code != 0 && !self.desired_disabled.contains(service_id) {
+        if code != 0
+            && !self.desired_disabled.contains(service_id)
+            && !self.restart_requested.contains(service_id)
+        {
             let delay = self
                 .restart_backoff_delay
                 .entry(service_id.clone())
@@ -127,11 +130,12 @@ impl<'a> SchedulerRuntime<'a> {
 
     async fn handle_command(&mut self, services: &ServiceMap, command: Command) {
         match command {
-            Command::Restart(service_id) => {
+            Command::Restart(service_id) | Command::Enable(service_id) => {
                 self.desired_disabled.remove(&service_id);
                 self.restart_requested.insert(service_id.clone());
                 self.restart_backoff_until.remove(&service_id);
                 self.restart_backoff_delay.remove(&service_id);
+                let _ = self.ui_tx.try_send(Event::ClearLogs(service_id.clone()));
                 if let Some(terminate) = self.terminate_tokens.get(&service_id) {
                     terminate.cancel();
                 }
@@ -142,6 +146,7 @@ impl<'a> SchedulerRuntime<'a> {
                     self.restart_requested.insert(service_id.clone());
                     self.restart_backoff_until.remove(service_id);
                     self.restart_backoff_delay.remove(service_id);
+                    let _ = self.ui_tx.try_send(Event::ClearLogs(service_id.clone()));
                     if let Some(terminate) = self.terminate_tokens.get(service_id) {
                         terminate.cancel();
                     }
@@ -155,12 +160,6 @@ impl<'a> SchedulerRuntime<'a> {
                 if let Some(terminate) = self.terminate_tokens.get(&service_id) {
                     terminate.cancel();
                 }
-            }
-            Command::Enable(service_id) => {
-                self.desired_disabled.remove(&service_id);
-                self.restart_requested.insert(service_id.clone());
-                self.restart_backoff_until.remove(&service_id);
-                self.restart_backoff_delay.remove(&service_id);
             }
             Command::SendInput(service_id, data) => {
                 let Some(writer) = self.pty_writers.get(&service_id) else {
@@ -212,6 +211,7 @@ impl<'a> SchedulerRuntime<'a> {
             self.terminate_tokens.remove(&service_id);
             self.pty_masters.remove(&service_id);
             self.pty_writers.remove(&service_id);
+            self.pty_sizes.remove(&service_id);
             self.apply_restart_backoff(&service_id, *code);
         }
 
@@ -237,7 +237,7 @@ pub async fn scheduler(
 
     // Initial scheduling pass
     tracing::debug!("started initial scheduling pass");
-    rt.schedule_pass(services).await;
+    rt.schedule_pass(services);
     tracing::debug!("completed initial scheduling pass");
 
     // Whenever an event comes in, try to (re)start any services whose deps are now healthy
@@ -262,7 +262,7 @@ pub async fn scheduler(
             }
         }
 
-        rt.schedule_pass(services).await;
+        rt.schedule_pass(services);
     }
     Ok(())
 }

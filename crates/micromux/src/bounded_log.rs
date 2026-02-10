@@ -169,6 +169,16 @@ impl AsyncBoundedLog {
         (lines, log.full_text())
     }
 
+    /// Clear all entries and notify subscribers.
+    pub fn clear(&self) {
+        {
+            let mut log = self.inner.write();
+            log.clear();
+        }
+        let ver = self.tx.borrow().wrapping_add(1);
+        let _ = self.tx.send(ver);
+    }
+
     /// Subscribe to updates; resolves when a new line is pushed.
     #[must_use]
     pub fn subscribe(&self) -> watch::Receiver<u64> {
