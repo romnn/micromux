@@ -13,6 +13,8 @@ homebrew_casks:
     ids:
       - *micromux
     description: "Micromux is a local process supervisor with a terminal UI"
+    custom_block: |
+      os macos: "darwin", linux: "linux"
     directory: Casks
     commit_author:
       name: romnn
