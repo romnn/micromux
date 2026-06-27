@@ -182,11 +182,12 @@ async fn start_service_if_ready(
         &terminate,
         ctx.current_pty_size,
     ) {
-        Ok(pty) => {
+        Ok(started) => {
             runtime.running = Some(RunningService {
                 run_id,
                 terminate,
-                pty,
+                log_reader: started.log_reader,
+                pty: started.handles,
                 since: tokio::time::Instant::now(),
             });
             runtime.state = State::Running { health: None };

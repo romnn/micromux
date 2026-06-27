@@ -3,7 +3,7 @@ use crate::{health_check, service::Service};
 use color_eyre::eyre;
 use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::thread;
@@ -19,16 +19,32 @@ use alacritty_terminal::{
 };
 
 #[cfg(unix)]
-use nix::sys::signal::Signal;
+use nix::{errno::Errno, sys::signal::Signal, unistd::Pid};
 
 #[cfg(unix)]
-use nix::unistd::Pid;
+use filedescriptor::{
+    AsRawFileDescriptor, FileDescriptor, POLLERR, POLLHUP, POLLIN, Pipe, poll, pollfd,
+};
+
+#[cfg(unix)]
+use portable_pty::unix::RawFd;
+
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
+
+#[cfg(unix)]
+const POLL_EVENTS: i16 = POLLIN | POLLHUP | POLLERR;
 
 #[derive(Clone)]
 pub(super) struct PtyHandles {
     master: Arc<Mutex<Box<dyn portable_pty::MasterPty + Send>>>,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     size: Arc<AtomicU32>,
+}
+
+pub(super) struct StartedPty {
+    pub(super) handles: PtyHandles,
+    pub(super) log_reader: LogReaderHandle,
 }
 
 impl PtyHandles {
@@ -374,10 +390,220 @@ fn push_sgr(snapshot: &mut String, style: CellStyle) {
     snapshot.push('m');
 }
 
+enum PtyRead {
+    Bytes(usize),
+    Eof,
+    Cancelled,
+}
+
+enum PtyOutputReader {
+    #[cfg(unix)]
+    Polling(PollingPtyReader),
+    #[cfg(not(unix))]
+    Blocking(std::io::BufReader<Box<dyn Read + Send>>),
+}
+
+impl PtyOutputReader {
+    fn new(master: &(dyn portable_pty::MasterPty + Send)) -> eyre::Result<(Self, LogReaderHandle)> {
+        #[cfg(unix)]
+        {
+            let (cancel_read, log_reader) = LogReaderHandle::pipe()?;
+            let reader = PollingPtyReader::new(master, cancel_read)?;
+            Ok((Self::Polling(reader), log_reader))
+        }
+
+        #[cfg(not(unix))]
+        {
+            let reader = master
+                .try_clone_reader()
+                .map_err(|err| eyre::eyre!("failed to clone pty reader: {err}"))?;
+            Ok((
+                Self::Blocking(std::io::BufReader::new(reader)),
+                LogReaderHandle::new(),
+            ))
+        }
+    }
+
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<PtyRead> {
+        match self {
+            #[cfg(unix)]
+            Self::Polling(reader) => reader.read(buf),
+            #[cfg(not(unix))]
+            Self::Blocking(reader) => match reader.read(buf)? {
+                0 => Ok(PtyRead::Eof),
+                n => Ok(PtyRead::Bytes(n)),
+            },
+        }
+    }
+}
+
+pub(super) struct LogReaderHandle {
+    #[cfg(unix)]
+    cancel_write: Option<FileDescriptor>,
+}
+
+impl LogReaderHandle {
+    #[cfg(unix)]
+    fn pipe() -> eyre::Result<(FileDescriptor, Self)> {
+        let pipe = Pipe::new()
+            .map_err(|err| eyre::eyre!("failed to create pty reader cancellation pipe: {err}"))?;
+        Ok((
+            pipe.read,
+            Self {
+                cancel_write: Some(pipe.write),
+            },
+        ))
+    }
+
+    #[cfg(not(unix))]
+    fn new() -> Self {
+        Self {}
+    }
+
+    pub(super) fn cancel(&mut self) {
+        #[cfg(unix)]
+        {
+            self.cancel_write.take();
+        }
+    }
+}
+
+impl Drop for LogReaderHandle {
+    fn drop(&mut self) {
+        self.cancel();
+    }
+}
+
+#[cfg(unix)]
+struct PollingPtyReader {
+    reader: Box<dyn Read + Send>,
+    poll_read: FileDescriptor,
+    cancel_read: FileDescriptor,
+}
+
+#[cfg(unix)]
+struct BorrowedRawFd(RawFd);
+
+#[cfg(unix)]
+impl AsRawFileDescriptor for BorrowedRawFd {
+    fn as_raw_file_descriptor(&self) -> filedescriptor::RawFileDescriptor {
+        self.0
+    }
+}
+
+#[cfg(unix)]
+impl PollingPtyReader {
+    fn new(
+        master: &(dyn portable_pty::MasterPty + Send),
+        cancel_read: FileDescriptor,
+    ) -> eyre::Result<Self> {
+        let pty_fd = master
+            .as_raw_fd()
+            .ok_or_else(|| eyre::eyre!("native pty master did not expose a raw fd"))?;
+        let poll_read = FileDescriptor::dup(&BorrowedRawFd(pty_fd))
+            .map_err(|err| eyre::eyre!("failed to clone pty poll fd: {err}"))?;
+        let reader = master
+            .try_clone_reader()
+            .map_err(|err| eyre::eyre!("failed to clone pty reader: {err}"))?;
+        Ok(Self {
+            reader,
+            poll_read,
+            cancel_read,
+        })
+    }
+
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<PtyRead> {
+        loop {
+            let mut fds = [
+                pollfd {
+                    fd: self.poll_read.as_raw_fd(),
+                    events: POLL_EVENTS,
+                    revents: 0,
+                },
+                pollfd {
+                    fd: self.cancel_read.as_raw_fd(),
+                    events: POLL_EVENTS,
+                    revents: 0,
+                },
+            ];
+
+            match poll(&mut fds, None) {
+                Ok(_) => {}
+                Err(filedescriptor::Error::Poll(err))
+                    if err.kind() == io::ErrorKind::Interrupted =>
+                {
+                    continue;
+                }
+                Err(err) => return Err(io::Error::other(err)),
+            }
+
+            let mut events = fds.iter().map(|fd| fd.revents);
+            let pty_events = events.next().unwrap_or_default();
+            let cancel_events = events.next().unwrap_or_default();
+
+            if cancel_events & POLL_EVENTS != 0 {
+                return Ok(PtyRead::Cancelled);
+            }
+
+            if pty_events & POLL_EVENTS != 0 {
+                match self.reader.read(buf) {
+                    Ok(0) => return Ok(PtyRead::Eof),
+                    Ok(n) => return Ok(PtyRead::Bytes(n)),
+                    Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+                    Err(err) if err.kind() == io::ErrorKind::WouldBlock => {}
+                    Err(err) if err.raw_os_error() == Some(Errno::EIO as i32) => {
+                        return Ok(PtyRead::Eof);
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+fn active_log_readers() -> &'static Mutex<std::collections::HashSet<(ServiceID, RunId)>> {
+    static ACTIVE: std::sync::OnceLock<Mutex<std::collections::HashSet<(ServiceID, RunId)>>> =
+        std::sync::OnceLock::new();
+    ACTIVE.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+
+#[cfg(test)]
+pub(super) fn log_reader_active(service_id: &ServiceID, run_id: RunId) -> bool {
+    active_log_readers()
+        .lock()
+        .contains(&(service_id.clone(), run_id))
+}
+
+#[cfg(test)]
+struct ActiveLogReaderGuard {
+    service_id: ServiceID,
+    run_id: RunId,
+}
+
+#[cfg(test)]
+impl ActiveLogReaderGuard {
+    fn new(service_id: ServiceID, run_id: RunId) -> Self {
+        active_log_readers()
+            .lock()
+            .insert((service_id.clone(), run_id));
+        Self { service_id, run_id }
+    }
+}
+
+#[cfg(test)]
+impl Drop for ActiveLogReaderGuard {
+    fn drop(&mut self) {
+        active_log_readers()
+            .lock()
+            .remove(&(self.service_id.clone(), self.run_id));
+    }
+}
+
 struct LogReaderArgs {
     service_id: ServiceID,
     run_id: RunId,
-    reader: Box<dyn std::io::Read + Send>,
+    reader: PtyOutputReader,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     events_tx: mpsc::Sender<ProcessEvent>,
     pty_rows: u16,
@@ -626,6 +852,22 @@ fn spawn_log_reader_thread(args: LogReaderArgs) {
             line.clear();
         }
 
+        fn finish_stream(
+            interactive: bool,
+            term: &Term<PtyEventProxy>,
+            rate: &mut RateLimit,
+            events_tx: &mpsc::Sender<ProcessEvent>,
+            service_id: &ServiceID,
+            run_id: RunId,
+            line: &mut Vec<u8>,
+        ) {
+            if interactive {
+                emit_snapshot(term, rate, events_tx, service_id, run_id, true);
+            } else {
+                flush(line, events_tx, service_id, run_id);
+            }
+        }
+
         const ALT_SCREEN_MAX_UPDATES_PER_SEC: u32 = 4;
 
         let LogReaderArgs {
@@ -639,7 +881,10 @@ fn spawn_log_reader_thread(args: LogReaderArgs) {
             pty_size,
         } = args;
 
-        let mut reader = std::io::BufReader::new(reader);
+        #[cfg(test)]
+        let _active_reader = ActiveLogReaderGuard::new(service_id.clone(), run_id);
+
+        let mut reader = reader;
         let mut buf = [0u8; 4096];
         let mut line: Vec<u8> = Vec::new();
         let mut scratch: Vec<u8> = Vec::new();
@@ -682,16 +927,32 @@ fn spawn_log_reader_thread(args: LogReaderArgs) {
                 dirty = true;
             }
 
-            let n = match reader.read(&mut buf) {
-                Ok(n) => n,
-                Err(err) => return Err::<_, std::io::Error>(err),
-            };
-            if n == 0 {
-                if interactive {
-                    emit_snapshot(&term, &mut rate, &events_tx, &service_id, run_id, true);
-                } else {
-                    flush(&mut line, &events_tx, &service_id, run_id);
+            let n = match reader.read(&mut buf)? {
+                PtyRead::Bytes(n) => n,
+                PtyRead::Eof | PtyRead::Cancelled => {
+                    finish_stream(
+                        interactive,
+                        &term,
+                        &mut rate,
+                        &events_tx,
+                        &service_id,
+                        run_id,
+                        &mut line,
+                    );
+                    break;
                 }
+            };
+
+            if n == 0 {
+                finish_stream(
+                    interactive,
+                    &term,
+                    &mut rate,
+                    &events_tx,
+                    &service_id,
+                    run_id,
+                    &mut line,
+                );
                 break;
             }
 
@@ -856,6 +1117,38 @@ impl TerminationTarget {
     }
 }
 
+struct SpawnedChildGuard {
+    target: Option<TerminationTarget>,
+}
+
+impl SpawnedChildGuard {
+    fn new(
+        killer: Box<dyn portable_pty::ChildKiller + Send + Sync>,
+        pid: Option<u32>,
+        process_group_leader_id: Option<i32>,
+    ) -> Self {
+        Self {
+            target: Some(TerminationTarget {
+                killer,
+                pid,
+                process_group_leader_id,
+            }),
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.target = None;
+    }
+}
+
+impl Drop for SpawnedChildGuard {
+    fn drop(&mut self) {
+        if let Some(mut target) = self.target.take() {
+            target.force_kill();
+        }
+    }
+}
+
 fn spawn_termination_task(args: TerminationTaskArgs) {
     tokio::spawn(async move {
         let TerminationTaskArgs {
@@ -944,7 +1237,7 @@ pub(super) fn start_service_with_pty_size(
     shutdown: &CancellationToken,
     terminate: &CancellationToken,
     pty_size: portable_pty::PtySize,
-) -> eyre::Result<PtyHandles> {
+) -> eyre::Result<StartedPty> {
     use portable_pty::{CommandBuilder, PtySize};
 
     let service_id = service.id.clone();
@@ -988,20 +1281,20 @@ pub(super) fn start_service_with_pty_size(
     let pid = child.process_id();
     let killer = child.clone_killer();
 
-    let reader = pair
-        .master
-        .try_clone_reader()
-        .map_err(|err| eyre::eyre!("failed to clone pty reader: {err}"))?;
+    #[cfg(unix)]
+    let process_group_leader = pair.master.process_group_leader();
+    #[cfg(not(unix))]
+    let process_group_leader = None;
+
+    let mut child_guard = SpawnedChildGuard::new(child.clone_killer(), pid, process_group_leader);
+
+    let (reader, log_reader) = PtyOutputReader::new(pair.master.as_ref())?;
 
     let writer = pair
         .master
         .take_writer()
         .map_err(|err| eyre::eyre!("failed to take pty writer: {err}"))?;
 
-    #[cfg(unix)]
-    let process_group_leader = pair.master.process_group_leader();
-    #[cfg(not(unix))]
-    let process_group_leader = None;
     let master = Arc::new(Mutex::new(pair.master));
     let writer = Arc::new(Mutex::new(writer));
     let size = Arc::new(AtomicU32::new(
@@ -1030,6 +1323,7 @@ pub(super) fn start_service_with_pty_size(
         process_group_leader_id: process_group_leader,
         child,
     });
+    child_guard.disarm();
 
     if let Some(health_check) = service.health_check.clone() {
         tokio::spawn({
@@ -1061,9 +1355,12 @@ pub(super) fn start_service_with_pty_size(
         });
     }
 
-    Ok(PtyHandles {
-        master,
-        writer,
-        size,
+    Ok(StartedPty {
+        handles: PtyHandles {
+            master,
+            writer,
+            size,
+        },
+        log_reader,
     })
 }

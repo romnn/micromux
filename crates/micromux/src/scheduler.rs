@@ -108,6 +108,7 @@ impl RestartTracker {
 pub(super) struct RunningService {
     run_id: RunId,
     terminate: CancellationToken,
+    log_reader: pty::LogReaderHandle,
     pty: pty::PtyHandles,
     since: tokio::time::Instant,
 }
@@ -125,6 +126,7 @@ impl RunningService {
 impl Drop for RunningService {
     fn drop(&mut self) {
         self.terminate.cancel();
+        self.log_reader.cancel();
     }
 }
 
@@ -1162,6 +1164,81 @@ mod tests {
                 Ok(None) => break,
             }
         }
+
+        shutdown.cancel();
+        handle.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pty_reader_exits_after_child_exit_when_grandchild_holds_slave() -> eyre::Result<()> {
+        let config_dir = Path::new(".");
+        let service_id = "leaky-pty-reader".to_string();
+        let mut services: ServiceMap = ServiceMap::new();
+        services.insert(
+            service_id.clone(),
+            Service::new(
+                &service_id,
+                config_dir,
+                service_config(
+                    &service_id,
+                    (
+                        "sh",
+                        &["-c", "(trap '' HUP TERM; sleep 2) & sleep 0.1; exit 0"],
+                    ),
+                ),
+            )?,
+        );
+
+        let shutdown = CancellationToken::new();
+        let (ui_tx, ui_rx) = mpsc::channel(128);
+        let (events_tx, events_rx) = mpsc::channel(128);
+        let (_commands_tx, commands_rx) = mpsc::channel(128);
+
+        let handle = tokio::spawn({
+            let shutdown = shutdown.clone();
+            async move {
+                scheduler(
+                    &services,
+                    commands_rx,
+                    events_rx,
+                    events_tx,
+                    ui_tx,
+                    shutdown,
+                )
+                .await
+            }
+        });
+
+        let run_id = RunId::new(1);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        while tokio::time::Instant::now() < deadline && !pty::log_reader_active(&service_id, run_id)
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(pty::log_reader_active(&service_id, run_id));
+
+        let mut ui_rx = ui_rx;
+        let mut saw_exit = false;
+        for _ in 0..20 {
+            let (event, next_rx) = recv_event(ui_rx).await?;
+            ui_rx = next_rx;
+            if matches!(event, Event::Exited(id, 0) if id == service_id) {
+                saw_exit = true;
+                break;
+            }
+        }
+        assert!(saw_exit);
+
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+        while tokio::time::Instant::now() < deadline && pty::log_reader_active(&service_id, run_id)
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            !pty::log_reader_active(&service_id, run_id),
+            "pty reader stayed alive after run ownership ended"
+        );
 
         shutdown.cancel();
         handle.await??;

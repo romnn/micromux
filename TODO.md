@@ -2,11 +2,6 @@
 
 ## Known limitations
 
-- **PTY log-reader thread can leak.** Each service's PTY output is read by a dedicated
-  std thread that exits only on EOF of the master. If a service spawns a grandchild/daemon
-  that inherits the slave and outlives the direct child, EOF never arrives and the reader
-  thread (plus its dup'd fd) lingers until process exit. A cancellable read loop
-  (non-blocking fd + `poll` against the terminate/shutdown tokens) would fix this.
 - **Interactive snapshots use a lossy channel.** Alt-screen frames are delivered with
   `try_send` using an Append/ReplaceLast protocol. A dropped frame under heavy load can
   briefly desync the live snapshot line. Tagging snapshots with a per-run generation id (or

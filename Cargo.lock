@@ -1681,6 +1681,7 @@ dependencies = [
  "codespan-reporting",
  "color-eyre",
  "directories",
+ "filedescriptor",
  "futures",
  "humantime",
  "indexmap",
