@@ -1725,6 +1725,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "micromux-screenshot"
+version = "0.0.7"
+dependencies = [
+ "color-eyre",
+ "portable-pty",
+ "vt100",
+]
+
+[[package]]
 name = "micromux-tui"
 version = "0.0.7"
 dependencies = [
@@ -3540,6 +3549,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5c3082ca00d5a5ef149bb8b555a72ae84c9c59f7250f013ac822ac2e49b19c64"
 
 [[package]]
+name = "vt100"
+version = "0.16.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "054ff75fb8fa83e609e685106df4faeffdf3a735d3c74ebce97ec557d5d36fd9"
+dependencies = [
+ "itoa",
+ "unicode-width",
+ "vte 0.15.0",
+]
+
+[[package]]
 name = "vte"
 version = "0.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3978,7 +3998,7 @@ checksum = "48df29917f67a777c67df15650631c215c71699232e1c44e38010afb0dda90cf"
 dependencies = [
  "codespan-reporting",
  "indexmap",
- "itertools 0.14.0",
+ "itertools 0.15.0",
  "itoa",
  "libyaml-safer",
  "ryu",

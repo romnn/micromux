@@ -11,7 +11,7 @@
  Think of it as **Docker Compose for local processes** (not containers) — like **preconfigured tmux panes** that come with Compose-style dependencies, healthchecks, and restarts.
 
  <p align="center">
-   <img src="https://raw.githubusercontent.com/romnn/micromux/main/screenshot.png" alt="micromux TUI screenshot" width="800" />
+   <img src="https://raw.githubusercontent.com/romnn/micromux/main/docs/overview.png" alt="micromux TUI" width="900" />
  </p>
 
  It runs multiple long-lived commands (your dev “services”) on your machine, tracks their state, and gives you a single place to:
@@ -19,6 +19,18 @@
  - **restart/disable services**
  - **gate startup by dependencies + healthchecks**
  - **send input to a service** (PTY-backed “attach” mode)
+
+ <p align="center">
+   <img src="https://raw.githubusercontent.com/romnn/micromux/main/docs/healthcheck.png" alt="micromux healthcheck pane showing a failed probe" width="820" />
+   <br />
+   <sub>Per-service healthcheck pane — a failing probe with its command and output.</sub>
+ </p>
+
+ <p align="center">
+   <img src="https://raw.githubusercontent.com/romnn/micromux/main/docs/disable.png" alt="micromux with a service disabled" width="820" />
+   <br />
+   <sub>Disable a service on the fly — it stops and its row turns gray.</sub>
+ </p>
 
  
  ## Install

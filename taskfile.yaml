@@ -55,6 +55,14 @@ tasks:
         trap fix_perms EXIT;
         ./release.sh && goreleaser release --clean'
 
+  screenshots:
+    desc: "regenerate the docs screenshots from examples/ (needs charmbracelet/freeze)"
+    cmds:
+      # micromux-screenshot drives the real micromux binary in a pty, so build it first; it is
+      # found as a sibling in target/debug (override with MICROMUX_BIN).
+      - cargo build -p micromux-cli
+      - cargo run -p micromux-screenshot
+
   typos:
     desc: "check repository for typos"
     aliases: [spellcheck]

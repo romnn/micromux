@@ -5,6 +5,7 @@ members = [
 	"crates/micromux",
 	"crates/micromux-tui",
 	"crates/micromux-cli",
+	"crates/micromux-screenshot",
 ]
 default-members = [
 	"crates/micromux-cli",
