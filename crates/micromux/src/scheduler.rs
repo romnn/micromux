@@ -491,7 +491,12 @@ pub async fn scheduler(
 
     // Initial scheduling pass
     tracing::debug!("started initial scheduling pass");
-    rt.schedule_pass(services).await?;
+    if let Err(err) = rt.schedule_pass(services).await {
+        tracing::debug!(?err, "stopping scheduler after ui channel closed");
+        rt.cancel_all_running();
+        rt.drain_on_shutdown(services, &mut events_rx).await;
+        return Ok(());
+    }
     tracing::debug!("completed initial scheduling pass");
 
     // Whenever an event comes in, try to (re)start any services whose deps are now healthy
@@ -515,7 +520,10 @@ pub async fn scheduler(
                 let Some(event) = event else {
                     break;
                 };
-                rt.handle_event(services, event).await?;
+                if let Err(err) = rt.handle_event(services, event).await {
+                    tracing::debug!(?err, "stopping scheduler after ui channel closed");
+                    break;
+                }
             }
             () = async {
                 match next_backoff {
@@ -525,7 +533,10 @@ pub async fn scheduler(
             } => {}
         }
 
-        rt.schedule_pass(services).await?;
+        if let Err(err) = rt.schedule_pass(services).await {
+            tracing::debug!(?err, "stopping scheduler after ui channel closed");
+            break;
+        }
     }
 
     rt.cancel_all_running();
@@ -879,6 +890,82 @@ mod tests {
 
         shutdown.cancel();
         handle.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ui_drop_still_drains_running_service() -> eyre::Result<()> {
+        use nix::errno::Errno;
+        use nix::sys::signal::kill;
+        use nix::unistd::Pid;
+
+        let dir = unique_tmp_dir("ui-drop-drain");
+        fs::create_dir_all(&dir)?;
+        let pid_path = dir.join("pid");
+        let command = format!(
+            "trap '' TERM; echo $$ > {}; sleep 60",
+            pid_path.to_string_lossy()
+        );
+
+        let config_dir = Path::new(".");
+        let mut services: ServiceMap = ServiceMap::new();
+        services.insert(
+            "svc".to_string(),
+            Service::new(
+                "svc",
+                config_dir,
+                service_config("svc", ("sh", &["-c", &command])),
+            )?,
+        );
+
+        let shutdown = CancellationToken::new();
+        let (ui_tx, ui_rx) = mpsc::channel(64);
+        let (events_tx, events_rx) = mpsc::channel(64);
+        let (commands_tx, commands_rx) = mpsc::channel(64);
+
+        let handle = tokio::spawn({
+            let shutdown = shutdown.clone();
+            async move {
+                scheduler(
+                    &services,
+                    commands_rx,
+                    events_rx,
+                    events_tx,
+                    ui_tx,
+                    shutdown,
+                )
+                .await
+            }
+        });
+
+        let (event, ui_rx) = recv_event(ui_rx).await?;
+        assert!(matches!(event, Event::Started { .. }));
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        let pid = loop {
+            if let Ok(pid_str) = fs::read_to_string(&pid_path) {
+                break pid_str.trim().parse::<i32>()?;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                eyre::bail!("service did not write pid file");
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+
+        drop(ui_rx);
+        commands_tx
+            .send(Command::Disable("svc".to_string()))
+            .await?;
+
+        timeout(Duration::from_secs(3), handle)
+            .await
+            .map_err(|_| eyre::eyre!("scheduler did not drain after ui drop"))???;
+
+        match kill(Pid::from_raw(pid), None) {
+            Err(Errno::ESRCH) => {}
+            other => eyre::bail!("expected service process to be reaped, got {other:?}"),
+        }
+
         Ok(())
     }
 
