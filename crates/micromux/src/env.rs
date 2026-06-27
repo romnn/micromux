@@ -50,39 +50,50 @@ fn strip_export_prefix(line: &str) -> &str {
     }
 }
 
-fn strip_inline_comment_outside_quotes(line: &str) -> String {
-    let mut in_single = false;
-    let mut in_double = false;
-    let mut last_was_ws = false;
-    let mut cleaned = String::with_capacity(line.len());
+/// Strip a trailing inline comment from a dotenv *value* (the part after the first `=`).
+///
+/// The key/value split happens before this is called, so a stray quote in an unrelated part of
+/// the line can no longer flip the parser into a never-closed "quoted" state that swallows the
+/// comment marker. If the value begins with a quote, the comment (if any) starts after the
+/// matching close quote; otherwise the comment starts at the first `#` preceded by whitespace.
+fn strip_value_inline_comment(value: &str) -> &str {
+    let trimmed = value.trim_start();
+    let quote = match trimmed.chars().next() {
+        Some(c @ ('\'' | '"')) => Some(c),
+        _ => None,
+    };
 
-    for ch in line.chars() {
-        if ch == '\'' && !in_double {
-            in_single = !in_single;
-            cleaned.push(ch);
-            last_was_ws = false;
-            continue;
-        }
-
-        if ch == '"' && !in_single {
-            in_double = !in_double;
-            cleaned.push(ch);
-            last_was_ws = false;
-            continue;
-        }
-
-        if ch == '#' && !in_single && !in_double && last_was_ws {
-            while cleaned.ends_with(char::is_whitespace) {
-                cleaned.pop();
+    if let Some(quote) = quote {
+        let mut chars = trimmed.char_indices();
+        let _ = chars.next(); // skip the opening quote
+        let mut escaped = false;
+        for (i, c) in chars {
+            if escaped {
+                // The previous char was a backslash escape (double-quoted values only).
+                escaped = false;
+                continue;
             }
-            break;
+            if quote == '"' && c == '\\' {
+                escaped = true;
+                continue;
+            }
+            if c == quote {
+                // Value runs up to and including the closing quote; the rest is a comment.
+                return trimmed.get(..=i).unwrap_or(trimmed);
+            }
         }
-
-        last_was_ws = ch.is_whitespace();
-        cleaned.push(ch);
+        // No closing quote: treat the whole thing as the value.
+        trimmed
+    } else {
+        let mut prev_was_ws = false;
+        for (i, ch) in trimmed.char_indices() {
+            if ch == '#' && prev_was_ws {
+                return trimmed.get(..i).unwrap_or(trimmed).trim_end();
+            }
+            prev_was_ws = ch.is_whitespace();
+        }
+        trimmed
     }
-
-    cleaned
 }
 
 fn unescape_double_quoted_value(inner: &str) -> String {
@@ -119,7 +130,10 @@ fn parse_value(raw_value: &str) -> String {
     }
 
     if let Some(inner) = value.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')) {
-        return inner.to_string();
+        // Single quotes are fully literal (POSIX/dotenv semantics): no interpolation. Values
+        // always pass through `interpolate` later, so escape every `$` as `$$` (which
+        // `interpolate` collapses back to a single `$`) to keep the literal intact.
+        return inner.replace('$', "$$");
     }
 
     value
@@ -136,10 +150,8 @@ pub fn parse_dotenv(contents: &str) -> eyre::Result<EnvMap> {
         }
 
         let line = strip_export_prefix(line);
-        let cleaned = strip_inline_comment_outside_quotes(line);
-        let line = cleaned.trim();
 
-        let (key, value) = line
+        let (key, raw_value) = line
             .split_once('=')
             .ok_or_else(|| eyre::eyre!("invalid env file line {line_no}: missing '='"))?;
 
@@ -148,7 +160,7 @@ pub fn parse_dotenv(contents: &str) -> eyre::Result<EnvMap> {
             return Err(eyre::eyre!("invalid env file line {line_no}: empty key"));
         }
 
-        let value = parse_value(value);
+        let value = parse_value(strip_value_inline_comment(raw_value));
 
         env.insert(key.to_string(), value);
     }
@@ -334,6 +346,37 @@ mod tests {
     fn dotenv_double_quote_unescapes_common_sequences() -> eyre::Result<()> {
         let env = parse_dotenv("A=\"x\\n\\\"y\\\"\\\\z\"\n")?;
         assert_eq!(env.inner.get("A").map(String::as_str), Some("x\n\"y\"\\z"));
+        Ok(())
+    }
+
+    #[test]
+    fn single_quoted_values_are_literal_after_expansion() -> eyre::Result<()> {
+        let env = parse_dotenv("PASS='s3cr$t!'\nLIT='${X}'\nDOLLARS='$$'\n")?;
+        let out = expand_env_values(&env, &HashMap::new());
+        assert_eq!(out.inner.get("PASS").map(String::as_str), Some("s3cr$t!"));
+        assert_eq!(out.inner.get("LIT").map(String::as_str), Some("${X}"));
+        assert_eq!(out.inner.get("DOLLARS").map(String::as_str), Some("$$"));
+        Ok(())
+    }
+
+    #[test]
+    fn double_quoted_values_still_interpolate() -> eyre::Result<()> {
+        let mut base = HashMap::new();
+        base.insert("X".to_string(), "world".to_string());
+        let env = parse_dotenv("GREETING=\"hello ${X}\"\n")?;
+        let out = expand_env_values(&env, &base);
+        assert_eq!(
+            out.inner.get("GREETING").map(String::as_str),
+            Some("hello world")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn dotenv_stray_quote_does_not_disable_comment_stripping() -> eyre::Result<()> {
+        let env = parse_dotenv("FOO=don't # comment\nPRICE=5\" # usd\n")?;
+        assert_eq!(env.inner.get("FOO").map(String::as_str), Some("don't"));
+        assert_eq!(env.inner.get("PRICE").map(String::as_str), Some("5\""));
         Ok(())
     }
 }
