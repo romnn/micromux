@@ -12,6 +12,11 @@ pub enum Health {
     Unhealthy,
 }
 
+/// Default probe interval when none is configured (matches Docker Compose).
+const DEFAULT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+/// Default probe timeout when none is configured (matches Docker Compose).
+const DEFAULT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -147,6 +152,14 @@ enum Completion {
     Status(Result<std::process::ExitStatus, std::io::Error>),
 }
 
+/// The result of a single successful (or cancelled) probe run.
+enum Outcome {
+    /// The probe completed successfully.
+    Healthy,
+    /// The probe was cancelled because the service is shutting down or restarting.
+    Cancelled,
+}
+
 pub async fn run_loop(
     health_check: crate::config::HealthCheck,
     service_id: &ServiceID,
@@ -166,7 +179,7 @@ pub async fn run_loop(
         .interval
         .as_deref()
         .copied()
-        .unwrap_or_default();
+        .unwrap_or(DEFAULT_INTERVAL);
     tracing::info!(
         service_id,
         ?start_delay,
@@ -184,6 +197,7 @@ pub async fn run_loop(
     }
 
     let mut attempt = 0;
+    let mut unhealthy = false;
     let mut run_id: u64 = 0;
     loop {
         run_id = run_id.wrapping_add(1);
@@ -203,9 +217,11 @@ pub async fn run_loop(
         )
         .await;
         match res {
-            Ok(()) => {
+            Ok(Outcome::Cancelled) => return,
+            Ok(Outcome::Healthy) => {
                 let _ = events_tx.send(Event::Healthy(service_id.clone())).await;
                 attempt = 0;
+                unhealthy = false;
             }
             Err(err) => {
                 match err.source {
@@ -237,11 +253,14 @@ pub async fn run_loop(
                     }
                 }
 
+                // Mark unhealthy once on the failing transition, then keep probing so the
+                // service can recover back to healthy (and unblock `condition: healthy`
+                // dependents) instead of giving up permanently.
                 if attempt < max_retries {
                     attempt = attempt.saturating_add(1);
-                } else {
+                } else if !unhealthy {
+                    unhealthy = true;
                     let _ = events_tx.send(Event::Unhealthy(service_id.clone())).await;
-                    return;
                 }
             }
         }
@@ -451,7 +470,7 @@ async fn run(
     service_id: &ServiceID,
     attempt: u64,
     params: RunParams<'_>,
-) -> Result<(), Error> {
+) -> Result<Outcome, Error> {
     let (prog, args) = &health_check.test;
     let command = command_string(health_check);
 
@@ -504,7 +523,13 @@ async fn run(
     let child_pid = process.id().and_then(|pid| i32::try_from(pid).ok());
     let kill_token = CancellationToken::new();
     let mut wait_handle = spawn_wait_task(process, &kill_token);
-    let timeout = health_check.timeout.as_ref().map(|t| t.inner);
+    // Always bound the probe so a hung command cannot block the loop (and dependents) forever.
+    let timeout = Some(
+        health_check
+            .timeout
+            .as_ref()
+            .map_or(DEFAULT_TIMEOUT, |t| t.inner),
+    );
 
     let completion = select_completion(
         timeout,
@@ -529,9 +554,11 @@ async fn run(
 
     match completion {
         Completion::Shutdown => {
+            // The service is being stopped/restarted: this is a cancellation, not a probe
+            // result. Tear down the probe but do NOT report it as healthy or unhealthy.
             cleanup_after_cancel(&mut running).await;
             emit_finished(&running.events_tx, &running.service_id, attempt, false, -1).await;
-            Ok(())
+            Ok(Outcome::Cancelled)
         }
         Completion::Timeout => {
             cleanup_after_cancel(&mut running).await;
@@ -544,7 +571,7 @@ async fn run(
         }
         Completion::Status(Ok(status)) if status.success() => {
             finish_with_exit(&mut running, true, status.code().unwrap_or(0)).await;
-            Ok(())
+            Ok(Outcome::Healthy)
         }
         Completion::Status(Ok(status)) => {
             let exit_code = status.code().unwrap_or(-1);
