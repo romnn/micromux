@@ -133,7 +133,7 @@ impl App {
         let [_header_area, main_area, _footer_area] = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(0),
+                Constraint::Length(1), // header (must match render's vertical layout)
                 Constraint::Min(0),
                 Constraint::Length(1),
             ])
@@ -177,9 +177,16 @@ impl App {
             return;
         }
 
-        self.last_pty_cols = cols;
-        self.last_pty_rows = rows;
-        let _ = self.commands_tx.try_send(Command::ResizeAll { cols, rows });
+        // Only advance the dedup cache once the resize is actually queued; otherwise a dropped
+        // ResizeAll (full channel) would leave the cache claiming the new size and never retry.
+        if self
+            .commands_tx
+            .try_send(Command::ResizeAll { cols, rows })
+            .is_ok()
+        {
+            self.last_pty_cols = cols;
+            self.last_pty_rows = rows;
+        }
     }
 
     /// Run the TUI event loop.
@@ -423,8 +430,8 @@ impl App {
     }
 
     fn log_viewport_height(&self) -> u16 {
-        // total rows minus footer (1) minus logs block borders (2)
-        self.terminal_rows.saturating_sub(3)
+        // total rows minus header (1) minus footer (1) minus logs block borders (2)
+        self.terminal_rows.saturating_sub(4)
     }
 
     fn scroll_logs_up(&mut self, lines: u16) {
@@ -437,7 +444,9 @@ impl App {
         let Some(service) = self.state.current_service() else {
             return;
         };
-        let (num_lines, _) = service.logs.full_text();
+        // Wrap-aware count persisted by the renderer, so scrolling reaches the true bottom
+        // even when wrapping is enabled (the raw entry count would stop short).
+        let num_lines = service.cached_num_lines;
         let viewport = self.log_viewport_height();
         let max_off = num_lines.saturating_sub(viewport);
         self.log_view.scroll_offset = self

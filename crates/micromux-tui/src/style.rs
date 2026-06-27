@@ -19,6 +19,8 @@ pub fn service_style(state: state::Execution) -> Style {
         state::Execution::Disabled => Style::default().fg(Color::White).fg(tailwind::GRAY.c500),
         state::Execution::Pending => Style::default().fg(Color::White).fg(tailwind::BLUE.c500),
         state::Execution::Running { health, .. } => health_style(health),
-        state::Execution::Killed | state::Execution::Exited => health_style(None),
+        // Distinct from the green "running" styling so a stopped service is obvious at a glance.
+        state::Execution::Killed => Style::default().fg(tailwind::AMBER.c500),
+        state::Execution::Exited => Style::default().fg(tailwind::RED.c400),
     }
 }

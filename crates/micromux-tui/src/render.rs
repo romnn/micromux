@@ -184,7 +184,7 @@ impl Widget for &mut App {
         let [header_area, main_area, footer_area] = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(0), // header
+                Constraint::Length(1), // header
                 Constraint::Min(0),    // main area
                 Constraint::Length(1), // footer
             ])
@@ -306,8 +306,15 @@ impl App {
             height: scrollbar_area.height.saturating_sub(2),
         };
 
-        self.log_view
-            .render(logs_area, scrollbar_area, num_lines, current_logs, buf);
+        let rendered_lines =
+            self.log_view
+                .render(logs_area, scrollbar_area, num_lines, current_logs, buf);
+
+        // Persist the wrap-aware rendered line count so keyboard scrolling (scroll_logs_down)
+        // clamps to the same bottom the scrollbar uses, even when wrapping is enabled.
+        if let Some(current_service) = self.state.current_service_mut() {
+            current_service.cached_num_lines = rendered_lines;
+        }
     }
 
     fn render_healthchecks(&mut self, area: Rect, buf: &mut Buffer) {
@@ -500,9 +507,11 @@ impl App {
     /// - The underlying event loop (`App::run`) fails.
     pub async fn render(self) -> eyre::Result<()> {
         let terminal = ratatui::init();
-        self.run(terminal).await?;
+        // Always restore the terminal, even when the event loop returns an error, so a failure
+        // never leaves the user's shell stuck in raw mode / the alternate screen.
+        let result = self.run(terminal).await;
         ratatui::restore();
-        Ok(())
+        result
     }
 }
 
@@ -541,6 +550,8 @@ pub mod log_view {
     }
 
     impl LogView {
+        /// Render the log view and return the wrap-aware rendered line count, so callers can
+        /// clamp keyboard scrolling consistently with the scrollbar/follow-tail behavior.
         pub fn render(
             &mut self,
             log_area: Rect,
@@ -548,7 +559,7 @@ pub mod log_view {
             _num_lines: u16,
             logs: &str,
             buf: &mut Buffer,
-        ) {
+        ) -> u16 {
             Clear.render(log_area, buf);
             Clear.render(scrollbar_area, buf);
 
@@ -601,6 +612,8 @@ pub mod log_view {
                 .thumb_symbol("▐");
 
             StatefulWidget::render(scrollbar, scrollbar_area, buf, &mut self.scrollbar_state);
+
+            num_lines
         }
     }
 }

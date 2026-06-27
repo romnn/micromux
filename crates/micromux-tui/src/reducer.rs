@@ -67,15 +67,22 @@ pub fn apply(state: &mut state::State, event: Event) {
                 service.exec_state = state::Execution::Exited;
             }
         }
+        // A late health event from a probe that was racing a disable must not flip a disabled
+        // service back to Running. (Started is intentionally not guarded: Enable relies on the
+        // subsequent Started event to clear the Disabled state.)
         Event::Healthy(service_id) => {
-            if let Some(service) = state.services.get_mut(&service_id) {
+            if let Some(service) = state.services.get_mut(&service_id)
+                && service.exec_state != state::Execution::Disabled
+            {
                 service.exec_state = state::Execution::Running {
                     health: Some(state::Health::Healthy),
                 };
             }
         }
         Event::Unhealthy(service_id) => {
-            if let Some(service) = state.services.get_mut(&service_id) {
+            if let Some(service) = state.services.get_mut(&service_id)
+                && service.exec_state != state::Execution::Disabled
+            {
                 service.exec_state = state::Execution::Running {
                     health: Some(state::Health::Unhealthy),
                 };
