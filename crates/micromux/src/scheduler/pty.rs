@@ -449,8 +449,11 @@ fn spawn_log_reader_thread(
             rate: &mut RateLimit,
             events_tx: &mpsc::Sender<Event>,
             service_id: &ServiceID,
+            force: bool,
         ) {
-            if rate.alt_screen {
+            // `force` bypasses the rate limiter so the program's final frame at EOF is never
+            // dropped just because the current window's update budget was already spent.
+            if rate.alt_screen && !force {
                 let now = Instant::now();
                 if now.duration_since(rate.window_start) >= Duration::from_secs(1) {
                     rate.window_start = now;
@@ -466,6 +469,9 @@ fn spawn_log_reader_thread(
                             LogUpdateKind::Append,
                             "[micromux] interactive output rate-limited".to_string(),
                         );
+                        // The warning was Appended as a new line; the next snapshot must start
+                        // a fresh live line (Append) rather than ReplaceLast-ing the warning.
+                        rate.have_snapshot = false;
                     }
                     return;
                 }
@@ -571,6 +577,21 @@ fn spawn_log_reader_thread(
             line.clear();
         }
 
+        /// Emit a complete newline-terminated record, preserving blank/whitespace-only lines.
+        ///
+        /// Unlike [`flush`] (used for partial lines at EOF / the 16 KiB overflow guard), this
+        /// emits the record even when empty so intentional blank lines are not silently dropped.
+        /// `line` never contains the terminating newline bytes themselves.
+        fn flush_record(
+            line: &mut Vec<u8>,
+            events_tx: &mpsc::Sender<Event>,
+            service_id: &ServiceID,
+        ) {
+            let s = String::from_utf8_lossy(line).to_string();
+            send_log(events_tx, service_id, LogUpdateKind::Append, s);
+            line.clear();
+        }
+
         const ALT_SCREEN_MAX_UPDATES_PER_SEC: u32 = 4;
 
         let mut reader = std::io::BufReader::new(reader);
@@ -597,6 +618,9 @@ fn spawn_log_reader_thread(
         let mut dirty = false;
         let mut last_size = 0u32;
         let mut last_alt_screen = false;
+        // Tracks a pending CR so a following LF (i.e. a \r\n pair) does not emit a second,
+        // spurious blank record after the \r already flushed the line.
+        let mut prev_was_cr = false;
 
         let mut rate = RateLimit::new();
 
@@ -619,7 +643,7 @@ fn spawn_log_reader_thread(
             };
             if n == 0 {
                 if interactive {
-                    emit_snapshot(&term, &mut rate, &events_tx, &service_id);
+                    emit_snapshot(&term, &mut rate, &events_tx, &service_id, true);
                 } else {
                     flush(&mut line, &events_tx, &service_id);
                 }
@@ -646,19 +670,25 @@ fn spawn_log_reader_thread(
 
             for &b in chunk {
                 match b {
-                    // Both \n and \r trigger a flush. This handles:
-                    // - Normal programs: \r\n pairs (flushes on \r,
-                    //   then \n flushes empty = noop).
-                    // - ncurses apps (watch): ESC[B + \r for line
-                    //   breaks (text flushed on \r).
-                    // - Cursor-positioned text is also flushed by the
-                    //   CSI H/f/J boundary detection in AnsiFilter.
-                    b'\n' | b'\r' => {
+                    // \r and \n both terminate a line. A \r\n pair is coalesced (the \r flushes,
+                    // the trailing \n is swallowed) so it produces one record, while a lone \n
+                    // still flushes — preserving intentional blank lines. ncurses apps (watch)
+                    // use ESC[B + \r for line breaks; cursor-positioned text is additionally
+                    // flushed by the CSI H/f/J boundary detection in AnsiFilter.
+                    b'\r' => {
                         if !interactive {
-                            flush(&mut line, &events_tx, &service_id);
+                            flush_record(&mut line, &events_tx, &service_id);
                         }
+                        prev_was_cr = true;
+                    }
+                    b'\n' => {
+                        if !interactive && !prev_was_cr {
+                            flush_record(&mut line, &events_tx, &service_id);
+                        }
+                        prev_was_cr = false;
                     }
                     _ => {
+                        prev_was_cr = false;
                         if interactive {
                             scratch.clear();
                             let _ = filter.push(b, &mut scratch);
@@ -684,7 +714,7 @@ fn spawn_log_reader_thread(
                 let now = Instant::now();
                 let due = last_snapshot_at.is_none_or(|t| now.duration_since(t) >= interval);
                 if dirty && due {
-                    emit_snapshot(&term, &mut rate, &events_tx, &service_id);
+                    emit_snapshot(&term, &mut rate, &events_tx, &service_id, false);
                     last_snapshot_at = Some(now);
                     dirty = false;
                 }
@@ -775,7 +805,23 @@ fn spawn_termination_task(args: TerminationTaskArgs) {
                 && let Some(deadline) = kill_deadline
                 && tokio::time::Instant::now() >= deadline
             {
-                let _ = killer.kill();
+                // Escalate to SIGKILL on the whole process group (mirroring the SIGTERM path),
+                // not just the group leader. Otherwise a leader that ignored SIGTERM is killed
+                // while its descendants survive and are orphaned once try_wait reaps the leader.
+                #[cfg(unix)]
+                {
+                    if let Some(pgid) = process_group_leader_id {
+                        let _ = nix::sys::signal::killpg(Pid::from_raw(pgid), Signal::SIGKILL);
+                    } else if let Some(pid) = pid.and_then(|pid| i32::try_from(pid).ok()) {
+                        let _ = nix::sys::signal::kill(Pid::from_raw(pid), Signal::SIGKILL);
+                    } else {
+                        let _ = killer.kill();
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = killer.kill();
+                }
                 hard_killed = true;
             }
 
