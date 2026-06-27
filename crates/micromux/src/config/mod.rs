@@ -656,8 +656,8 @@ mod tests {
 
         // restart parsing
         match &app.restart {
-            Some(crate::service::RestartPolicy::OnFailure { remaining_attempts }) => {
-                assert_eq!(*remaining_attempts, 3);
+            Some(crate::service::RestartPolicy::OnFailure { max_attempts }) => {
+                assert_eq!(*max_attempts, Some(3));
             }
             other => {
                 return Err(color_eyre::eyre::eyre!(format!(

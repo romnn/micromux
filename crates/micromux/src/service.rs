@@ -174,7 +174,10 @@ pub enum RestartPolicy {
     #[default]
     Never,
     OnFailure {
-        remaining_attempts: usize,
+        /// Maximum number of automatic restarts after a non-zero exit.
+        ///
+        /// `None` means unlimited (matching Docker Compose `on-failure` without a count).
+        max_attempts: Option<usize>,
     },
 }
 
@@ -184,9 +187,9 @@ impl std::fmt::Display for RestartPolicy {
             Self::Always => write!(f, "Always"),
             Self::UnlessStopped => write!(f, "UnlessStopped"),
             Self::Never => write!(f, "Never"),
-            Self::OnFailure { remaining_attempts } => f
+            Self::OnFailure { max_attempts } => f
                 .debug_struct("OnFailure")
-                .field("remaining", remaining_attempts)
+                .field("max_attempts", max_attempts)
                 .finish(),
         }
     }

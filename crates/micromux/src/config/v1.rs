@@ -1,9 +1,52 @@
 use super::{Config, ConfigError, Service, UiConfig, parse, parse_duration, parse_optional};
+use crate::diagnostics::DiagnosticExt;
 use crate::{config::InvalidCommandReason, service::RestartPolicy};
-use codespan_reporting::diagnostic::Diagnostic;
+use codespan_reporting::diagnostic::{Diagnostic, Label};
 use indexmap::IndexMap;
 use itertools::Itertools;
 use yaml_spanned::{Mapping, Sequence, Spanned, Value, value::Kind};
+
+/// Known top-level keys for a service definition (including accepted aliases). Used to warn
+/// about typos that would otherwise silently drop an entire config block.
+const KNOWN_SERVICE_KEYS: &[&str] = &[
+    "name",
+    "command",
+    "working_dir",
+    "cwd",
+    "directory",
+    "env_file",
+    "environment",
+    "depends_on",
+    "healthcheck",
+    "ports",
+    "restart",
+    "color",
+];
+
+/// Warn (or, in strict mode, error) about mapping keys that the parser does not recognize.
+fn warn_unknown_keys<F: Copy>(
+    mapping: &Mapping,
+    known: &[&str],
+    context: &str,
+    file_id: F,
+    strict: bool,
+    diagnostics: &mut Vec<Diagnostic<F>>,
+) {
+    for (key, _value) in mapping {
+        let Some(key_name) = key.as_str() else {
+            continue;
+        };
+        if !known.contains(&key_name) {
+            diagnostics.push(
+                Diagnostic::warning_or_error(strict)
+                    .with_message(format!("unknown {context} field `{key_name}`"))
+                    .with_labels(vec![
+                        Label::primary(file_id, key.span).with_message("unknown field"),
+                    ]),
+            );
+        }
+    }
+}
 
 fn parse_string_value(
     value: &yaml_spanned::Spanned<Value>,
@@ -201,18 +244,20 @@ fn parse_restart(mapping: &yaml_spanned::Mapping) -> Result<Option<RestartPolicy
                 .or_else(|| normalized.strip_prefix("on_failure"))
             {
                 let rest = rest.trim_start_matches([':', '=']).trim();
-                let attempts = if rest.is_empty() {
-                    1
+                // Bare `on-failure` means restart indefinitely on non-zero exit (Compose
+                // semantics); `on-failure:N` caps the number of automatic restarts at N.
+                let max_attempts = if rest.is_empty() {
+                    None
                 } else {
-                    rest.parse::<usize>()
-                        .map_err(|_| ConfigError::InvalidValue {
-                            message: format!("invalid restart policy `{raw}`"),
-                            span: value.span().into(),
-                        })?
+                    Some(
+                        rest.parse::<usize>()
+                            .map_err(|_| ConfigError::InvalidValue {
+                                message: format!("invalid restart policy `{raw}`"),
+                                span: value.span().into(),
+                            })?,
+                    )
                 };
-                RestartPolicy::OnFailure {
-                    remaining_attempts: attempts,
-                }
+                RestartPolicy::OnFailure { max_attempts }
             } else {
                 return Err(ConfigError::InvalidValue {
                     message: format!("invalid restart policy `{raw}`"),
@@ -268,16 +313,17 @@ pub fn expect_string<'a>(
     Ok((value.span(), string))
 }
 
-pub fn parse_ui_config<F>(
+pub fn parse_ui_config<F: Copy>(
     value: &yaml_spanned::Spanned<Value>,
-    _file_id: F,
-    _strict: bool,
-    _diagnostics: &mut Vec<Diagnostic<F>>,
+    file_id: F,
+    strict: bool,
+    diagnostics: &mut Vec<Diagnostic<F>>,
 ) -> Result<UiConfig, ConfigError> {
     let Some(value) = value.get("ui") else {
         return Ok(UiConfig::default());
     };
     let (_span, mapping) = expect_mapping(value, "ui config must be a mapping".into())?;
+    warn_unknown_keys(mapping, &["width"], "ui", file_id, strict, diagnostics);
     let width = parse_optional::<usize>(mapping.get("width"))?;
     Ok(UiConfig { width })
 }
@@ -526,14 +572,22 @@ pub fn parse_health_check(
         .transpose()
 }
 
-pub fn parse_service<F>(
+pub fn parse_service<F: Copy>(
     value: &yaml_spanned::Spanned<Value>,
     name: &yaml_spanned::Spanned<String>,
-    _file_id: F,
-    _strict: bool,
-    _diagnostics: &mut Vec<Diagnostic<F>>,
+    file_id: F,
+    strict: bool,
+    diagnostics: &mut Vec<Diagnostic<F>>,
 ) -> Result<Service, ConfigError> {
     let (span, mapping) = expect_mapping(value, "service config must be a mapping".into())?;
+    warn_unknown_keys(
+        mapping,
+        KNOWN_SERVICE_KEYS,
+        "service",
+        file_id,
+        strict,
+        diagnostics,
+    );
     let name = parse_optional::<String>(mapping.get("name"))?.unwrap_or_else(|| name.clone());
     let color = parse_optional::<bool>(mapping.get("color"))?;
     let working_dir = mapping
@@ -579,12 +633,14 @@ pub fn parse_services<F: Copy>(
 ) -> Result<IndexMap<Spanned<String>, Service>, ConfigError> {
     match value.get("services") {
         None => {
-            // let diagnostic = Diagnostic::warning_or_error(strict)
-            //     .with_message("empty languages")
-            //     .with_labels(vec![Label::primary(file_id, value.span).with_message(
-            //         "no languages specified - no JSON translation file will be generated",
-            //     )]);
-            // diagnostics.push(diagnostic);
+            diagnostics.push(
+                Diagnostic::warning_or_error(strict)
+                    .with_message("no services defined")
+                    .with_labels(vec![
+                        Label::primary(file_id, value.span)
+                            .with_message("config defines zero services to supervise"),
+                    ]),
+            );
             Ok(IndexMap::default())
         }
         Some(value) => {
@@ -786,6 +842,55 @@ mod tests {
                 Some("echo \"a b\"")
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn unknown_service_key_warns() -> eyre::Result<()> {
+        let yaml = indoc! {r#"
+            version: 1
+            services:
+              app:
+                command: ["sh", "-c", "true"]
+                dependson:
+                  - db
+              db:
+                command: ["sh", "-c", "true"]
+        "#};
+
+        let mut diagnostics: Vec<Diagnostic<usize>> = vec![];
+        let _ = config::from_str(yaml, Path::new("."), 0, None, &mut diagnostics)?;
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("unknown service field `dependson`")),
+            "expected an unknown-field diagnostic, got: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn bare_on_failure_is_unlimited() -> eyre::Result<()> {
+        let yaml = indoc! {r#"
+            version: 1
+            services:
+              app:
+                command: ["sh", "-c", "true"]
+                restart: on-failure
+        "#};
+
+        let mut diagnostics: Vec<Diagnostic<usize>> = vec![];
+        let parsed = config::from_str(yaml, Path::new("."), 0, None, &mut diagnostics)?;
+        let app = get_service(&parsed.config, "app")?;
+        assert!(
+            matches!(
+                app.restart,
+                Some(crate::service::RestartPolicy::OnFailure { max_attempts: None })
+            ),
+            "expected unlimited on-failure, got {:?}",
+            app.restart
+        );
         Ok(())
     }
 

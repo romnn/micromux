@@ -20,6 +20,7 @@ pub(super) struct ScheduleContext<'a> {
         &'a mut HashMap<ServiceID, Arc<Mutex<Box<dyn portable_pty::MasterPty + Send>>>>,
     pub(super) pty_writers: &'a mut HashMap<ServiceID, Arc<Mutex<Box<dyn Write + Send>>>>,
     pub(super) pty_sizes: &'a mut HashMap<ServiceID, Arc<AtomicU32>>,
+    pub(super) running_since: &'a mut HashMap<ServiceID, tokio::time::Instant>,
     pub(super) current_pty_size: portable_pty::PtySize,
     pub(super) restart_backoff_until: &'a HashMap<ServiceID, tokio::time::Instant>,
     pub(super) events_tx: &'a mpsc::Sender<Event>,
@@ -36,21 +37,26 @@ pub(super) fn update_state(
         Event::Started { service_id } => {
             service_state.insert(service_id.clone(), State::Running { health: None });
         }
+        // Health events must never resurrect a service that has already left the running
+        // state (a stale probe result arriving after Exited/Killed/Disabled would otherwise
+        // flip it back to Running and block restart/disable).
         Event::Healthy(service_id) => {
-            service_state.insert(
-                service_id.clone(),
-                State::Running {
+            if let Some(state @ (State::Running { .. } | State::Starting)) =
+                service_state.get_mut(service_id)
+            {
+                *state = State::Running {
                     health: Some(Health::Healthy),
-                },
-            );
+                };
+            }
         }
         Event::Unhealthy(service_id) => {
-            service_state.insert(
-                service_id.clone(),
-                State::Running {
+            if let Some(state @ (State::Running { .. } | State::Starting)) =
+                service_state.get_mut(service_id)
+            {
+                *state = State::Running {
                     health: Some(Health::Unhealthy),
-                },
-            );
+                };
+            }
         }
         Event::Killed(service_id) => {
             service_state.insert(service_id.clone(), State::Killed);
@@ -160,20 +166,25 @@ fn should_consider_start(
                     RestartPolicy::Always | RestartPolicy::UnlessStopped => StartCheck::Consider {
                         exited_code: Some(*exit_code),
                     },
-                    RestartPolicy::OnFailure { remaining_attempts } => {
+                    RestartPolicy::OnFailure { max_attempts } => {
                         if *exit_code == 0 {
                             StartCheck::Skip
-                        } else {
+                        } else if let Some(max_attempts) = max_attempts {
                             let remaining = ctx
                                 .restart_on_failure_remaining
                                 .entry(service_id.clone())
-                                .or_insert(*remaining_attempts);
+                                .or_insert(*max_attempts);
                             if *remaining > 0 {
                                 StartCheck::Consider {
                                     exited_code: Some(*exit_code),
                                 }
                             } else {
                                 StartCheck::Skip
+                            }
+                        } else {
+                            // Unlimited on-failure: always restart on non-zero exit.
+                            StartCheck::Consider {
+                                exited_code: Some(*exit_code),
                             }
                         }
                     }
@@ -215,6 +226,9 @@ fn start_service_if_ready(
     }
 
     tracing::info!(service_id, "starting service");
+    // Clear logs only on a user-initiated restart, not on automatic crash restarts (where the
+    // previous run's output is exactly what the user wants to inspect).
+    let user_restart = ctx.restart_requested.contains(service_id);
     apply_on_failure_decrement(ctx, service_id, service, exited_code);
 
     ctx.restart_requested.remove(service_id);
@@ -238,8 +252,13 @@ fn start_service_if_ready(
             ctx.pty_masters.insert(service_id.clone(), handles.master);
             ctx.pty_writers.insert(service_id.clone(), handles.writer);
             ctx.pty_sizes.insert(service_id.clone(), handles.size);
+            ctx.running_since
+                .insert(service_id.clone(), tokio::time::Instant::now());
             if let Some(state) = ctx.service_state.get_mut(service_id.as_str()) {
                 *state = State::Running { health: None };
+            }
+            if user_restart {
+                let _ = ctx.ui_tx.try_send(Event::ClearLogs(service_id.clone()));
             }
             let _ = ctx.ui_tx.try_send(Event::Started {
                 service_id: service_id.clone(),
@@ -247,9 +266,13 @@ fn start_service_if_ready(
         }
         Err(err) => {
             tracing::error!(?err, service_id, "failed to start service");
-            if let Some(state) = ctx.service_state.get_mut(service_id.as_str()) {
-                *state = State::Exited { exit_code: -1 };
-            }
+            // Route the failure through the normal exit path so handle_event applies
+            // restart backoff, drops the lingering terminate token, and notifies the UI.
+            // Leave the state as Starting until the queued Exited event is processed.
+            ctx.terminate_tokens.remove(service_id);
+            let _ = ctx
+                .events_tx
+                .try_send(Event::Exited(service_id.clone(), -1));
         }
     }
 }
