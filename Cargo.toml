@@ -52,7 +52,7 @@ strip = "symbols"
 [workspace.dependencies]
 color-eyre = "0"
 thiserror = "2"
-itertools = "0"
+itertools = "0.15.0"
 rand = "0"
 indexmap = "2"
 indoc = "2"
@@ -74,4 +74,4 @@ tokio-util = "0"
 futures = "0"
 
 # testing
-similar-asserts = "1"
+similar-asserts = "2.0.0"

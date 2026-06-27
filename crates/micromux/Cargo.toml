@@ -32,11 +32,11 @@ indexmap.workspace = true
 parking_lot.workspace = true
 
 # command and process management
-shlex = "1"
-nix = { version = "0", features = ["signal"] }
+shlex = "2.0.1"
+nix = { version = "0.31.3", features = ["signal"] }
 
 # terminal emulation
-alacritty_terminal = "0.25"
+alacritty_terminal = "0.26.0"
 portable-pty = "0.9"
 
 # graph
