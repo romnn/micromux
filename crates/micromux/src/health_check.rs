@@ -1,4 +1,4 @@
-use crate::scheduler::{Event, OutputStream, ServiceID};
+use crate::scheduler::{OutputStream, ProcessEvent, RunId, ServiceID};
 use itertools::Itertools;
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -78,6 +78,7 @@ mod tests {
         let res = super::run(
             &hc,
             &service_id,
+            RunId::new(1),
             1,
             RunParams {
                 working_dir: Some(&dir),
@@ -103,7 +104,7 @@ mod tests {
         let mut saw_finished = false;
         for _ in 0..50 {
             if let Some(ev) = events_rx.recv().await
-                && let Event::HealthCheckFinished { success: false, .. } = ev
+                && let ProcessEvent::HealthCheckFinished { success: false, .. } = ev
             {
                 saw_finished = true;
                 break;
@@ -141,7 +142,17 @@ pub struct Error {
 struct RunParams<'a> {
     pub working_dir: Option<&'a std::path::Path>,
     pub environment: &'a std::collections::HashMap<String, String>,
-    pub events_tx: mpsc::Sender<Event>,
+    pub events_tx: mpsc::Sender<ProcessEvent>,
+    pub shutdown: CancellationToken,
+    pub terminate: CancellationToken,
+}
+
+pub(crate) struct RunLoopParams {
+    pub service_id: ServiceID,
+    pub run_id: RunId,
+    pub working_dir: Option<std::path::PathBuf>,
+    pub environment: std::collections::HashMap<String, String>,
+    pub events_tx: mpsc::Sender<ProcessEvent>,
     pub shutdown: CancellationToken,
     pub terminate: CancellationToken,
 }
@@ -160,15 +171,69 @@ enum Outcome {
     Cancelled,
 }
 
-pub async fn run_loop(
-    health_check: crate::config::HealthCheck,
+fn log_probe_error(
+    source: &ErrorReason,
     service_id: &ServiceID,
-    working_dir: Option<std::path::PathBuf>,
-    environment: std::collections::HashMap<String, String>,
-    events_tx: mpsc::Sender<Event>,
-    shutdown: CancellationToken,
-    terminate: CancellationToken,
+    attempt: usize,
+    max_retries: usize,
 ) {
+    match source {
+        ErrorReason::Failed { exit_code } => {
+            tracing::warn!(
+                service_id,
+                code = exit_code,
+                attempt,
+                max_attempts = max_retries,
+                "health check failed",
+            );
+        }
+        ErrorReason::Spawn(err) => {
+            tracing::warn!(
+                ?err,
+                service_id,
+                attempt,
+                max_attempts = max_retries,
+                "failed to run health check",
+            );
+        }
+        ErrorReason::Timeout => {
+            tracing::warn!(
+                service_id,
+                attempt,
+                max_attempts = max_retries,
+                "health check timed out",
+            );
+        }
+    }
+}
+
+async fn record_probe_failure(
+    params: &RunLoopParams,
+    source: &ErrorReason,
+    attempt: &mut usize,
+    max_retries: usize,
+    unhealthy: &mut bool,
+) {
+    log_probe_error(source, &params.service_id, *attempt, max_retries);
+
+    // Mark unhealthy once on the failing transition, then keep probing so the service can
+    // recover back to healthy (and unblock `condition: healthy` dependents) instead of giving
+    // up permanently.
+    if *attempt < max_retries {
+        *attempt = attempt.saturating_add(1);
+    } else if !*unhealthy {
+        *unhealthy = true;
+        let _ = params
+            .events_tx
+            .send(ProcessEvent::Unhealthy {
+                service_id: params.service_id.clone(),
+                run_id: params.run_id,
+            })
+            .await;
+    }
+}
+
+pub async fn run_loop(health_check: crate::config::HealthCheck, params: RunLoopParams) {
     let max_retries = health_check.retries.as_deref().copied().unwrap_or(1);
     let start_delay = health_check
         .start_delay
@@ -181,7 +246,7 @@ pub async fn run_loop(
         .copied()
         .unwrap_or(DEFAULT_INTERVAL);
     tracing::info!(
-        service_id,
+        service_id = params.service_id,
         ?start_delay,
         ?interval,
         max_retries,
@@ -190,84 +255,60 @@ pub async fn run_loop(
 
     if !start_delay.is_zero() {
         tokio::select! {
-            () = shutdown.cancelled() => return,
-            () = terminate.cancelled() => return,
+            () = params.shutdown.cancelled() => return,
+            () = params.terminate.cancelled() => return,
             () = tokio::time::sleep(start_delay) => {},
         };
     }
 
     let mut attempt = 0;
     let mut unhealthy = false;
-    let mut run_id: u64 = 0;
+    let mut attempt_id: u64 = 0;
     loop {
-        run_id = run_id.wrapping_add(1);
-        let attempt_id = run_id;
+        attempt_id = attempt_id.wrapping_add(1);
 
         let res = run(
             &health_check,
-            service_id,
+            &params.service_id,
+            params.run_id,
             attempt_id,
             RunParams {
-                working_dir: working_dir.as_deref(),
-                environment: &environment,
-                events_tx: events_tx.clone(),
-                shutdown: shutdown.clone(),
-                terminate: terminate.clone(),
+                working_dir: params.working_dir.as_deref(),
+                environment: &params.environment,
+                events_tx: params.events_tx.clone(),
+                shutdown: params.shutdown.clone(),
+                terminate: params.terminate.clone(),
             },
         )
         .await;
         match res {
             Ok(Outcome::Cancelled) => return,
             Ok(Outcome::Healthy) => {
-                let _ = events_tx.send(Event::Healthy(service_id.clone())).await;
+                let _ = params
+                    .events_tx
+                    .send(ProcessEvent::Healthy {
+                        service_id: params.service_id.clone(),
+                        run_id: params.run_id,
+                    })
+                    .await;
                 attempt = 0;
                 unhealthy = false;
             }
             Err(err) => {
-                match err.source {
-                    ErrorReason::Failed { exit_code } => {
-                        tracing::warn!(
-                            service_id,
-                            code = exit_code,
-                            attempt,
-                            max_attempts = max_retries,
-                            "health check failed",
-                        );
-                    }
-                    ErrorReason::Spawn(err) => {
-                        tracing::warn!(
-                            ?err,
-                            service_id,
-                            attempt,
-                            max_attempts = max_retries,
-                            "failed to run health check",
-                        );
-                    }
-                    ErrorReason::Timeout => {
-                        tracing::warn!(
-                            service_id,
-                            attempt,
-                            max_attempts = max_retries,
-                            "health check timed out",
-                        );
-                    }
-                }
-
-                // Mark unhealthy once on the failing transition, then keep probing so the
-                // service can recover back to healthy (and unblock `condition: healthy`
-                // dependents) instead of giving up permanently.
-                if attempt < max_retries {
-                    attempt = attempt.saturating_add(1);
-                } else if !unhealthy {
-                    unhealthy = true;
-                    let _ = events_tx.send(Event::Unhealthy(service_id.clone())).await;
-                }
+                record_probe_failure(
+                    &params,
+                    &err.source,
+                    &mut attempt,
+                    max_retries,
+                    &mut unhealthy,
+                )
+                .await;
             }
         }
 
         tokio::select! {
-            () = shutdown.cancelled() => return,
-            () = terminate.cancelled() => return,
+            () = params.shutdown.cancelled() => return,
+            () = params.terminate.cancelled() => return,
             () = tokio::time::sleep(interval) => {},
         };
     }
@@ -283,14 +324,16 @@ fn command_string(health_check: &crate::config::HealthCheck) -> String {
 }
 
 async fn emit_started(
-    events_tx: &mpsc::Sender<Event>,
+    events_tx: &mpsc::Sender<ProcessEvent>,
     service_id: &ServiceID,
+    run_id: RunId,
     attempt: u64,
     command: String,
 ) {
     let _ = events_tx
-        .send(Event::HealthCheckStarted {
+        .send(ProcessEvent::HealthCheckStarted {
             service_id: service_id.clone(),
+            run_id,
             attempt,
             command,
         })
@@ -298,15 +341,17 @@ async fn emit_started(
 }
 
 async fn emit_finished(
-    events_tx: &mpsc::Sender<Event>,
+    events_tx: &mpsc::Sender<ProcessEvent>,
     service_id: &ServiceID,
+    run_id: RunId,
     attempt: u64,
     success: bool,
     exit_code: i32,
 ) {
     let _ = events_tx
-        .send(Event::HealthCheckFinished {
+        .send(ProcessEvent::HealthCheckFinished {
             service_id: service_id.clone(),
+            run_id,
             attempt,
             success,
             exit_code,
@@ -315,19 +360,22 @@ async fn emit_finished(
 }
 
 fn try_emit_spawn_failed(
-    events_tx: &mpsc::Sender<Event>,
+    events_tx: &mpsc::Sender<ProcessEvent>,
     service_id: &ServiceID,
+    run_id: RunId,
     attempt: u64,
     source: &std::io::Error,
 ) {
-    let _ = events_tx.try_send(Event::HealthCheckLogLine {
+    let _ = events_tx.try_send(ProcessEvent::HealthCheckLogLine {
         service_id: service_id.clone(),
+        run_id,
         attempt,
         stream: OutputStream::Stderr,
         line: source.to_string(),
     });
-    let _ = events_tx.try_send(Event::HealthCheckFinished {
+    let _ = events_tx.try_send(ProcessEvent::HealthCheckFinished {
         service_id: service_id.clone(),
+        run_id,
         attempt,
         success: false,
         exit_code: -1,
@@ -337,17 +385,19 @@ fn try_emit_spawn_failed(
 fn spawn_output_task(
     mut lines: tokio::io::Lines<BufReader<impl tokio::io::AsyncRead + Unpin + Send + 'static>>,
     service_id: ServiceID,
+    run_id: RunId,
     attempt: u64,
     stream: OutputStream,
-    events_tx: mpsc::Sender<Event>,
+    events_tx: mpsc::Sender<ProcessEvent>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::task::spawn(async move {
         loop {
             match lines.next_line().await {
                 Ok(Some(line)) => {
                     let _ = events_tx
-                        .send(Event::HealthCheckLogLine {
+                        .send(ProcessEvent::HealthCheckLogLine {
                             service_id: service_id.clone(),
+                            run_id,
                             attempt,
                             stream,
                             line,
@@ -373,9 +423,10 @@ async fn join_tasks(tasks: &mut [Option<tokio::task::JoinHandle<()>>]) {
 
 struct Running {
     service_id: ServiceID,
+    run_id: RunId,
     attempt: u64,
     command: String,
-    events_tx: mpsc::Sender<Event>,
+    events_tx: mpsc::Sender<ProcessEvent>,
     stdout_task: Option<tokio::task::JoinHandle<()>>,
     stderr_task: Option<tokio::task::JoinHandle<()>>,
     wait_handle: tokio::task::JoinHandle<Result<std::process::ExitStatus, std::io::Error>>,
@@ -450,6 +501,7 @@ async fn finish_with_exit(running: &mut Running, success: bool, exit_code: i32) 
     emit_finished(
         &running.events_tx,
         &running.service_id,
+        running.run_id,
         running.attempt,
         success,
         exit_code,
@@ -468,13 +520,21 @@ fn kill_process_group(pid: i32) {
 async fn run(
     health_check: &crate::config::HealthCheck,
     service_id: &ServiceID,
+    run_id: RunId,
     attempt: u64,
     params: RunParams<'_>,
 ) -> Result<Outcome, Error> {
     let (prog, args) = &health_check.test;
     let command = command_string(health_check);
 
-    emit_started(&params.events_tx, service_id, attempt, command.clone()).await;
+    emit_started(
+        &params.events_tx,
+        service_id,
+        run_id,
+        attempt,
+        command.clone(),
+    )
+    .await;
 
     let mut cmd = Command::new(prog.as_ref());
     cmd.args(args.iter().map(std::convert::AsRef::as_ref))
@@ -490,7 +550,7 @@ async fn run(
     }
 
     let mut process = cmd.spawn().map_err(|source| {
-        try_emit_spawn_failed(&params.events_tx, service_id, attempt, &source);
+        try_emit_spawn_failed(&params.events_tx, service_id, run_id, attempt, &source);
         Error {
             command: command.clone(),
             source: ErrorReason::Spawn(source),
@@ -502,6 +562,7 @@ async fn run(
         stderr_task = Some(spawn_output_task(
             BufReader::new(stderr).lines(),
             service_id.clone(),
+            run_id,
             attempt,
             OutputStream::Stderr,
             params.events_tx.clone(),
@@ -513,6 +574,7 @@ async fn run(
         stdout_task = Some(spawn_output_task(
             BufReader::new(stdout).lines(),
             service_id.clone(),
+            run_id,
             attempt,
             OutputStream::Stdout,
             params.events_tx.clone(),
@@ -541,6 +603,7 @@ async fn run(
 
     let mut running = Running {
         service_id: service_id.clone(),
+        run_id,
         attempt,
         command,
         events_tx: params.events_tx.clone(),
@@ -557,12 +620,28 @@ async fn run(
             // The service is being stopped/restarted: this is a cancellation, not a probe
             // result. Tear down the probe but do NOT report it as healthy or unhealthy.
             cleanup_after_cancel(&mut running).await;
-            emit_finished(&running.events_tx, &running.service_id, attempt, false, -1).await;
+            emit_finished(
+                &running.events_tx,
+                &running.service_id,
+                run_id,
+                attempt,
+                false,
+                -1,
+            )
+            .await;
             Ok(Outcome::Cancelled)
         }
         Completion::Timeout => {
             cleanup_after_cancel(&mut running).await;
-            emit_finished(&running.events_tx, &running.service_id, attempt, false, -1).await;
+            emit_finished(
+                &running.events_tx,
+                &running.service_id,
+                run_id,
+                attempt,
+                false,
+                -1,
+            )
+            .await;
             let command = std::mem::take(&mut running.command);
             Err(Error {
                 command,

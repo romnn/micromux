@@ -1,89 +1,20 @@
-use super::{Event, ServiceID, State, pty};
+use super::{
+    DesiredState, Event, ProcessEvent, RunningService, ServiceID, ServiceRuntime, State, pty,
+};
 use crate::{ServiceMap, health_check::Health};
-use parking_lot::Mutex;
-use std::collections::{HashMap, HashSet};
-use std::io::Write;
-use std::sync::Arc;
-use std::sync::atomic::AtomicU32;
+use color_eyre::eyre;
+use std::collections::HashMap;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 pub(super) struct ScheduleContext<'a> {
     pub(super) services: &'a ServiceMap,
     pub(super) graph: &'a petgraph::graphmap::DiGraphMap<&'a str, ()>,
-    pub(super) service_state: &'a mut HashMap<ServiceID, State>,
-    pub(super) desired_disabled: &'a HashSet<ServiceID>,
-    pub(super) restart_requested: &'a mut HashSet<ServiceID>,
-    pub(super) restart_on_failure_remaining: &'a mut HashMap<ServiceID, usize>,
-    pub(super) terminate_tokens: &'a mut HashMap<ServiceID, CancellationToken>,
-    pub(super) pty_masters:
-        &'a mut HashMap<ServiceID, Arc<Mutex<Box<dyn portable_pty::MasterPty + Send>>>>,
-    pub(super) pty_writers: &'a mut HashMap<ServiceID, Arc<Mutex<Box<dyn Write + Send>>>>,
-    pub(super) pty_sizes: &'a mut HashMap<ServiceID, Arc<AtomicU32>>,
-    pub(super) running_since: &'a mut HashMap<ServiceID, tokio::time::Instant>,
+    pub(super) runtimes: &'a mut HashMap<ServiceID, ServiceRuntime>,
     pub(super) current_pty_size: portable_pty::PtySize,
-    pub(super) restart_backoff_until: &'a HashMap<ServiceID, tokio::time::Instant>,
-    pub(super) events_tx: &'a mpsc::Sender<Event>,
+    pub(super) events_tx: &'a mpsc::Sender<ProcessEvent>,
     pub(super) ui_tx: &'a mpsc::Sender<Event>,
     pub(super) shutdown: &'a CancellationToken,
-}
-
-pub(super) fn update_state(
-    services: &ServiceMap,
-    service_state: &mut HashMap<ServiceID, State>,
-    event: &Event,
-) {
-    match event {
-        Event::Started { service_id } => {
-            service_state.insert(service_id.clone(), State::Running { health: None });
-        }
-        // Health events must never resurrect a service that has already left the running
-        // state (a stale probe result arriving after Exited/Killed/Disabled would otherwise
-        // flip it back to Running and block restart/disable).
-        Event::Healthy(service_id) => {
-            if let Some(state @ (State::Running { .. } | State::Starting)) =
-                service_state.get_mut(service_id)
-            {
-                *state = State::Running {
-                    health: Some(Health::Healthy),
-                };
-            }
-        }
-        Event::Unhealthy(service_id) => {
-            if let Some(state @ (State::Running { .. } | State::Starting)) =
-                service_state.get_mut(service_id)
-            {
-                *state = State::Running {
-                    health: Some(Health::Unhealthy),
-                };
-            }
-        }
-        Event::Killed(service_id) => {
-            service_state.insert(service_id.clone(), State::Killed);
-        }
-        Event::Exited(service_id, exit_code) => {
-            service_state.insert(
-                service_id.clone(),
-                State::Exited {
-                    exit_code: *exit_code,
-                },
-            );
-        }
-        Event::Disabled(service_id) => {
-            service_state.insert(service_id.clone(), State::Disabled);
-        }
-        Event::LogLine { .. }
-        | Event::HealthCheckStarted { .. }
-        | Event::HealthCheckLogLine { .. }
-        | Event::HealthCheckFinished { .. }
-        | Event::ClearLogs(_) => {}
-    }
-
-    for service_id in services.keys() {
-        service_state
-            .entry(service_id.clone())
-            .or_insert(State::Pending);
-    }
 }
 
 fn dependencies_ready(
@@ -104,21 +35,25 @@ fn dependencies_ready(
                 .map(std::convert::AsRef::as_ref)
                 .copied()
                 .unwrap_or_default();
-            let Some(state) = ctx.service_state.get(dep) else {
+            let Some(runtime) = ctx.runtimes.get(dep) else {
                 return false;
             };
 
+            if runtime.desired == DesiredState::Disabled || runtime.start_requested {
+                return false;
+            }
+
             match condition {
-                DependencyCondition::Started => matches!(state, State::Running { .. }),
+                DependencyCondition::Started => matches!(runtime.state, State::Running { .. }),
                 DependencyCondition::Healthy => matches!(
-                    state,
+                    runtime.state,
                     State::Running {
                         health: Some(Health::Healthy),
                         ..
                     }
                 ),
                 DependencyCondition::CompletedSuccessfully => {
-                    matches!(state, State::Exited { exit_code: 0, .. })
+                    matches!(runtime.state, State::Exited { exit_code: 0, .. })
                 }
             }
         })
@@ -130,61 +65,61 @@ enum StartCheck {
 }
 
 fn should_consider_start(
-    ctx: &mut ScheduleContext<'_>,
+    ctx: &ScheduleContext<'_>,
     service_id: &ServiceID,
     service: &crate::service::Service,
 ) -> StartCheck {
     use crate::service::RestartPolicy;
 
-    if ctx.desired_disabled.contains(service_id) {
+    let Some(runtime) = ctx.runtimes.get(service_id) else {
+        return StartCheck::Skip;
+    };
+
+    if runtime.desired == DesiredState::Disabled || runtime.running.is_some() {
         return StartCheck::Skip;
     }
 
-    if !ctx.restart_requested.contains(service_id)
-        && let Some(until) = ctx.restart_backoff_until.get(service_id)
-        && tokio::time::Instant::now() < *until
+    if !runtime.start_requested
+        && let Some(until) = runtime.restart.backoff_until
+        && tokio::time::Instant::now() < until
     {
         return StartCheck::Skip;
     }
 
-    let Some(state) = ctx.service_state.get(service_id.as_str()) else {
-        return StartCheck::Skip;
-    };
-    match state {
+    match runtime.state {
         State::Pending => StartCheck::Consider { exited_code: None },
         State::Starting | State::Running { .. } | State::Killed | State::Disabled => {
             StartCheck::Skip
         }
         State::Exited { exit_code } => {
-            if ctx.restart_requested.contains(service_id) {
+            if runtime.start_requested {
                 StartCheck::Consider {
-                    exited_code: Some(*exit_code),
+                    exited_code: Some(exit_code),
                 }
             } else {
                 match &service.restart_policy {
                     RestartPolicy::Never => StartCheck::Skip,
                     RestartPolicy::Always | RestartPolicy::UnlessStopped => StartCheck::Consider {
-                        exited_code: Some(*exit_code),
+                        exited_code: Some(exit_code),
                     },
                     RestartPolicy::OnFailure { max_attempts } => {
-                        if *exit_code == 0 {
+                        if exit_code == 0 {
                             StartCheck::Skip
-                        } else if let Some(max_attempts) = max_attempts {
-                            let remaining = ctx
-                                .restart_on_failure_remaining
-                                .entry(service_id.clone())
-                                .or_insert(*max_attempts);
-                            if *remaining > 0 {
+                        } else if max_attempts.is_some() {
+                            if runtime
+                                .restart
+                                .remaining_failure_restarts(&service.restart_policy)
+                                .is_some_and(|remaining| remaining > 0)
+                            {
                                 StartCheck::Consider {
-                                    exited_code: Some(*exit_code),
+                                    exited_code: Some(exit_code),
                                 }
                             } else {
                                 StartCheck::Skip
                             }
                         } else {
-                            // Unlimited on-failure: always restart on non-zero exit.
                             StartCheck::Consider {
-                                exited_code: Some(*exit_code),
+                                exited_code: Some(exit_code),
                             }
                         }
                     }
@@ -194,90 +129,89 @@ fn should_consider_start(
     }
 }
 
-fn apply_on_failure_decrement(
-    ctx: &mut ScheduleContext<'_>,
-    service_id: &ServiceID,
+fn decrement_failure_budget(
+    runtime: &mut ServiceRuntime,
     service: &crate::service::Service,
+    explicit_start: bool,
     exited_code: Option<i32>,
 ) {
-    use crate::service::RestartPolicy;
-
-    let Some(exit_code) = exited_code else {
-        return;
-    };
-
-    if matches!(service.restart_policy, RestartPolicy::OnFailure { .. })
-        && !ctx.restart_requested.contains(service_id)
-        && exit_code != 0
-        && let Some(remaining) = ctx.restart_on_failure_remaining.get_mut(service_id)
+    if !explicit_start
+        && exited_code.is_some_and(|exit_code| exit_code != 0)
+        && matches!(
+            service.restart_policy,
+            crate::service::RestartPolicy::OnFailure { .. }
+        )
     {
-        *remaining = remaining.saturating_sub(1);
+        runtime
+            .restart
+            .decrement_failure_restart(&service.restart_policy);
     }
 }
 
-fn start_service_if_ready(
+async fn start_service_if_ready(
     ctx: &mut ScheduleContext<'_>,
     service_id: &ServiceID,
     service: &crate::service::Service,
     exited_code: Option<i32>,
-) {
+) -> eyre::Result<()> {
     if !dependencies_ready(ctx, service_id.as_str(), service) {
-        return;
+        return Ok(());
     }
 
     tracing::info!(service_id, "starting service");
-    // Clear logs only on a user-initiated restart, not on automatic crash restarts (where the
-    // previous run's output is exactly what the user wants to inspect).
-    let user_restart = ctx.restart_requested.contains(service_id);
-    apply_on_failure_decrement(ctx, service_id, service, exited_code);
 
-    ctx.restart_requested.remove(service_id);
+    let Some(runtime) = ctx.runtimes.get_mut(service_id) else {
+        return Ok(());
+    };
+    let explicit_start = runtime.start_requested;
+    let clear_logs = runtime.clear_logs_on_start;
+    decrement_failure_budget(runtime, service, explicit_start, exited_code);
 
-    if let Some(state) = ctx.service_state.get_mut(service_id.as_str()) {
-        *state = State::Starting;
-    }
+    runtime.start_requested = false;
+    runtime.clear_logs_on_start = false;
+    runtime.state = State::Starting;
 
+    let run_id = runtime.allocate_run_id();
     let terminate = CancellationToken::new();
-    ctx.terminate_tokens
-        .insert(service_id.clone(), terminate.clone());
 
     match pty::start_service_with_pty_size(
         service,
+        run_id,
         ctx.events_tx,
         ctx.shutdown,
         &terminate,
         ctx.current_pty_size,
     ) {
-        Ok(handles) => {
-            ctx.pty_masters.insert(service_id.clone(), handles.master);
-            ctx.pty_writers.insert(service_id.clone(), handles.writer);
-            ctx.pty_sizes.insert(service_id.clone(), handles.size);
-            ctx.running_since
-                .insert(service_id.clone(), tokio::time::Instant::now());
-            if let Some(state) = ctx.service_state.get_mut(service_id.as_str()) {
-                *state = State::Running { health: None };
-            }
-            if user_restart {
-                let _ = ctx.ui_tx.try_send(Event::ClearLogs(service_id.clone()));
-            }
-            let _ = ctx.ui_tx.try_send(Event::Started {
-                service_id: service_id.clone(),
+        Ok(pty) => {
+            runtime.running = Some(RunningService {
+                run_id,
+                terminate,
+                pty,
+                since: tokio::time::Instant::now(),
             });
+            runtime.state = State::Running { health: None };
+            if clear_logs {
+                ctx.ui_tx.send(Event::ClearLogs(service_id.clone())).await?;
+            }
+            ctx.ui_tx
+                .send(Event::Started {
+                    service_id: service_id.clone(),
+                })
+                .await?;
         }
         Err(err) => {
             tracing::error!(?err, service_id, "failed to start service");
-            // Route the failure through the normal exit path so handle_event applies
-            // restart backoff, drops the lingering terminate token, and notifies the UI.
-            // Leave the state as Starting until the queued Exited event is processed.
-            ctx.terminate_tokens.remove(service_id);
-            let _ = ctx
-                .events_tx
-                .try_send(Event::Exited(service_id.clone(), -1));
+            runtime.finish_current_run(&service.restart_policy, -1);
+            ctx.ui_tx
+                .send(Event::Exited(service_id.clone(), -1))
+                .await?;
         }
     }
+
+    Ok(())
 }
 
-pub(super) fn schedule_ready(ctx: &mut ScheduleContext<'_>) {
+pub(super) async fn schedule_ready(ctx: &mut ScheduleContext<'_>) -> eyre::Result<()> {
     for (service_id, service) in ctx.services {
         let exited_code = match should_consider_start(ctx, service_id, service) {
             StartCheck::Skip => continue,
@@ -286,10 +220,12 @@ pub(super) fn schedule_ready(ctx: &mut ScheduleContext<'_>) {
 
         tracing::debug!(
             service_id,
-            state = ?ctx.service_state.get(service_id.as_str()),
+            state = ?ctx.runtimes.get(service_id).map(|runtime| &runtime.state),
             "evaluating service"
         );
 
-        start_service_if_ready(ctx, service_id, service, exited_code);
+        start_service_if_ready(ctx, service_id, service, exited_code).await?;
     }
+
+    Ok(())
 }

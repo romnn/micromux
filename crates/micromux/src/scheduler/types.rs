@@ -11,8 +11,17 @@ use crate::health_check::Health;
 /// Unique identifier for a service.
 pub type ServiceID = String;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) struct RunId(u64);
+
+impl RunId {
+    pub(crate) const fn new(value: u64) -> Self {
+        Self(value)
+    }
+}
+
 /// The lifecycle state of a service.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum State {
     /// Service has not yet started.
     Pending,
@@ -40,6 +49,141 @@ impl std::fmt::Display for State {
             Self::Disabled => write!(f, "Disabled"),
             Self::Exited { exit_code } => write!(f, "Exited({exit_code})"),
             Self::Killed => write!(f, "Killed"),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum ProcessEvent {
+    LogLine {
+        service_id: ServiceID,
+        run_id: RunId,
+        stream: OutputStream,
+        update: LogUpdateKind,
+        line: String,
+    },
+    HealthCheckStarted {
+        service_id: ServiceID,
+        run_id: RunId,
+        attempt: u64,
+        command: String,
+    },
+    HealthCheckLogLine {
+        service_id: ServiceID,
+        run_id: RunId,
+        attempt: u64,
+        stream: OutputStream,
+        line: String,
+    },
+    HealthCheckFinished {
+        service_id: ServiceID,
+        run_id: RunId,
+        attempt: u64,
+        success: bool,
+        exit_code: i32,
+    },
+    Killed {
+        service_id: ServiceID,
+        run_id: RunId,
+    },
+    Exited {
+        service_id: ServiceID,
+        run_id: RunId,
+        exit_code: i32,
+    },
+    Healthy {
+        service_id: ServiceID,
+        run_id: RunId,
+    },
+    Unhealthy {
+        service_id: ServiceID,
+        run_id: RunId,
+    },
+}
+
+impl ProcessEvent {
+    pub(crate) fn service_id(&self) -> &ServiceID {
+        match self {
+            Self::LogLine { service_id, .. }
+            | Self::HealthCheckStarted { service_id, .. }
+            | Self::HealthCheckLogLine { service_id, .. }
+            | Self::HealthCheckFinished { service_id, .. }
+            | Self::Killed { service_id, .. }
+            | Self::Exited { service_id, .. }
+            | Self::Healthy { service_id, .. }
+            | Self::Unhealthy { service_id, .. } => service_id,
+        }
+    }
+
+    pub(crate) fn run_id(&self) -> RunId {
+        match self {
+            Self::LogLine { run_id, .. }
+            | Self::HealthCheckStarted { run_id, .. }
+            | Self::HealthCheckLogLine { run_id, .. }
+            | Self::HealthCheckFinished { run_id, .. }
+            | Self::Killed { run_id, .. }
+            | Self::Exited { run_id, .. }
+            | Self::Healthy { run_id, .. }
+            | Self::Unhealthy { run_id, .. } => *run_id,
+        }
+    }
+
+    pub(crate) fn into_ui_event(self) -> Event {
+        match self {
+            Self::LogLine {
+                service_id,
+                stream,
+                update,
+                line,
+                ..
+            } => Event::LogLine {
+                service_id,
+                stream,
+                update,
+                line,
+            },
+            Self::HealthCheckStarted {
+                service_id,
+                attempt,
+                command,
+                ..
+            } => Event::HealthCheckStarted {
+                service_id,
+                attempt,
+                command,
+            },
+            Self::HealthCheckLogLine {
+                service_id,
+                attempt,
+                stream,
+                line,
+                ..
+            } => Event::HealthCheckLogLine {
+                service_id,
+                attempt,
+                stream,
+                line,
+            },
+            Self::HealthCheckFinished {
+                service_id,
+                attempt,
+                success,
+                exit_code,
+                ..
+            } => Event::HealthCheckFinished {
+                service_id,
+                attempt,
+                success,
+                exit_code,
+            },
+            Self::Killed { service_id, .. } => Event::Killed(service_id),
+            Self::Exited {
+                service_id,
+                exit_code,
+                ..
+            } => Event::Exited(service_id, exit_code),
+            Self::Healthy { service_id, .. } => Event::Healthy(service_id),
+            Self::Unhealthy { service_id, .. } => Event::Unhealthy(service_id),
         }
     }
 }

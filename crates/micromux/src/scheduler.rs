@@ -4,11 +4,7 @@ use crate::{
     service::{self},
 };
 use color_eyre::eyre;
-use parking_lot::Mutex;
-use std::collections::{HashMap, HashSet};
-use std::io::Write;
-use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::collections::HashMap;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -23,6 +19,7 @@ const RESTART_BACKOFF_RESET: Duration = RESTART_BACKOFF_MAX;
 #[path = "scheduler/types.rs"]
 mod types;
 pub use types::{Command, Event, LogUpdateKind, OutputStream, ServiceID, State};
+pub(crate) use types::{ProcessEvent, RunId};
 
 #[path = "scheduler/pty.rs"]
 mod pty;
@@ -30,23 +27,227 @@ mod pty;
 #[path = "scheduler/schedule.rs"]
 mod schedule;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DesiredState {
+    Enabled,
+    Disabled,
+}
+
+struct RestartTracker {
+    backoff_until: Option<tokio::time::Instant>,
+    backoff_delay: Option<Duration>,
+    on_failure_max: Option<usize>,
+    on_failure_remaining: Option<usize>,
+}
+
+impl RestartTracker {
+    fn new(policy: &service::RestartPolicy) -> Self {
+        let on_failure_max = match policy {
+            service::RestartPolicy::OnFailure {
+                max_attempts: Some(max_attempts),
+            } => Some(*max_attempts),
+            service::RestartPolicy::Always
+            | service::RestartPolicy::UnlessStopped
+            | service::RestartPolicy::Never
+            | service::RestartPolicy::OnFailure { max_attempts: None } => None,
+        };
+
+        Self {
+            backoff_until: None,
+            backoff_delay: None,
+            on_failure_max,
+            on_failure_remaining: on_failure_max,
+        }
+    }
+
+    fn clear_backoff(&mut self) {
+        self.backoff_until = None;
+        self.backoff_delay = None;
+    }
+
+    fn reset_failure_budget(&mut self) {
+        self.on_failure_remaining = self.on_failure_max;
+    }
+
+    fn apply_backoff(&mut self, stable: bool) {
+        if stable {
+            self.backoff_delay = None;
+            self.reset_failure_budget();
+        }
+
+        let next = self.backoff_delay.map_or(RESTART_BACKOFF_BASE, |delay| {
+            (delay * 2).min(RESTART_BACKOFF_MAX)
+        });
+        self.backoff_delay = Some(next);
+        self.backoff_until = Some(tokio::time::Instant::now() + next);
+    }
+
+    fn remaining_failure_restarts(&self, policy: &service::RestartPolicy) -> Option<usize> {
+        match policy {
+            service::RestartPolicy::OnFailure {
+                max_attempts: Some(max_attempts),
+            } => Some(self.on_failure_remaining.unwrap_or(*max_attempts)),
+            service::RestartPolicy::Always
+            | service::RestartPolicy::UnlessStopped
+            | service::RestartPolicy::Never
+            | service::RestartPolicy::OnFailure { max_attempts: None } => None,
+        }
+    }
+
+    fn decrement_failure_restart(&mut self, policy: &service::RestartPolicy) {
+        if let service::RestartPolicy::OnFailure {
+            max_attempts: Some(max_attempts),
+        } = policy
+        {
+            let remaining = self.on_failure_remaining.get_or_insert(*max_attempts);
+            *remaining = remaining.saturating_sub(1);
+        }
+    }
+}
+
+pub(super) struct RunningService {
+    run_id: RunId,
+    terminate: CancellationToken,
+    pty: pty::PtyHandles,
+    since: tokio::time::Instant,
+}
+
+impl RunningService {
+    fn cancel(&self) {
+        self.terminate.cancel();
+    }
+
+    fn stable(&self) -> bool {
+        self.since.elapsed() >= RESTART_BACKOFF_RESET
+    }
+}
+
+impl Drop for RunningService {
+    fn drop(&mut self) {
+        self.terminate.cancel();
+    }
+}
+
+pub(super) struct ServiceRuntime {
+    desired: DesiredState,
+    start_requested: bool,
+    clear_logs_on_start: bool,
+    next_run_id: u64,
+    running: Option<RunningService>,
+    restart: RestartTracker,
+    state: State,
+}
+
+impl ServiceRuntime {
+    fn new(policy: &service::RestartPolicy) -> Self {
+        Self {
+            desired: DesiredState::Enabled,
+            start_requested: false,
+            clear_logs_on_start: false,
+            next_run_id: 0,
+            running: None,
+            restart: RestartTracker::new(policy),
+            state: State::Pending,
+        }
+    }
+
+    fn current_run_id(&self) -> Option<RunId> {
+        self.running.as_ref().map(|running| running.run_id)
+    }
+
+    fn allocate_run_id(&mut self) -> RunId {
+        self.next_run_id = self.next_run_id.checked_add(1).unwrap_or(1);
+        RunId::new(self.next_run_id)
+    }
+
+    fn request_restart(&mut self) {
+        self.desired = DesiredState::Enabled;
+        self.start_requested = true;
+        self.clear_logs_on_start = true;
+        self.restart.clear_backoff();
+        self.restart.reset_failure_budget();
+        if matches!(self.state, State::Disabled) && self.running.is_none() {
+            self.state = State::Pending;
+        }
+        if let Some(running) = &self.running {
+            running.cancel();
+            self.state = State::Killed;
+        }
+    }
+
+    fn request_enable(&mut self) {
+        self.desired = DesiredState::Enabled;
+        self.restart.clear_backoff();
+        self.restart.reset_failure_budget();
+
+        if self.running.is_some() && !matches!(self.state, State::Disabled | State::Killed) {
+            return;
+        }
+
+        self.start_requested = true;
+        self.clear_logs_on_start = false;
+        if matches!(self.state, State::Disabled) && self.running.is_none() {
+            self.state = State::Pending;
+        }
+        if let Some(running) = &self.running {
+            running.cancel();
+            self.state = State::Killed;
+        }
+    }
+
+    fn disable(&mut self) {
+        self.desired = DesiredState::Disabled;
+        self.start_requested = false;
+        self.clear_logs_on_start = false;
+        self.restart.clear_backoff();
+        self.state = State::Disabled;
+        if let Some(running) = &self.running {
+            running.cancel();
+        }
+    }
+
+    fn finish_current_run(&mut self, policy: &service::RestartPolicy, exit_code: i32) {
+        let stable = self.running.as_ref().is_some_and(RunningService::stable);
+        self.running.take();
+        if self.desired == DesiredState::Disabled {
+            self.state = State::Disabled;
+            self.restart.clear_backoff();
+        } else {
+            self.state = State::Exited { exit_code };
+            if self.start_requested {
+                self.restart.clear_backoff();
+            } else if self.will_auto_restart(policy, exit_code) {
+                self.restart.apply_backoff(stable);
+            } else {
+                self.restart.clear_backoff();
+            }
+        }
+    }
+
+    fn will_auto_restart(&self, policy: &service::RestartPolicy, exit_code: i32) -> bool {
+        match policy {
+            service::RestartPolicy::Always | service::RestartPolicy::UnlessStopped => true,
+            service::RestartPolicy::Never => false,
+            service::RestartPolicy::OnFailure { max_attempts } => {
+                if exit_code == 0 {
+                    false
+                } else if max_attempts.is_none() {
+                    true
+                } else {
+                    self.restart
+                        .remaining_failure_restarts(policy)
+                        .is_some_and(|remaining| remaining > 0)
+                }
+            }
+        }
+    }
+}
+
 struct SchedulerRuntime<'a> {
     graph: ServiceGraph<'a>,
-    desired_disabled: HashSet<ServiceID>,
-    restart_requested: HashSet<ServiceID>,
-    terminate_tokens: HashMap<ServiceID, CancellationToken>,
-    pty_masters: HashMap<ServiceID, Arc<Mutex<Box<dyn portable_pty::MasterPty + Send>>>>,
-    pty_writers: HashMap<ServiceID, Arc<Mutex<Box<dyn Write + Send>>>>,
-    pty_sizes: HashMap<ServiceID, Arc<std::sync::atomic::AtomicU32>>,
+    services: HashMap<ServiceID, ServiceRuntime>,
     current_pty_size: portable_pty::PtySize,
-    restart_backoff_until: HashMap<ServiceID, tokio::time::Instant>,
-    restart_backoff_delay: HashMap<ServiceID, Duration>,
-    /// When each currently-running service was last (re)started, used to reset the restart
-    /// backoff once a service has stayed up long enough.
-    running_since: HashMap<ServiceID, tokio::time::Instant>,
-    restart_on_failure_remaining: HashMap<ServiceID, usize>,
-    service_state: HashMap<ServiceID, State>,
-    events_tx: mpsc::Sender<Event>,
+    events_tx: mpsc::Sender<ProcessEvent>,
     ui_tx: mpsc::Sender<Event>,
     shutdown: CancellationToken,
 }
@@ -55,151 +256,82 @@ impl<'a> SchedulerRuntime<'a> {
     fn new(
         services: &ServiceMap,
         graph: ServiceGraph<'a>,
-        events_tx: mpsc::Sender<Event>,
+        events_tx: mpsc::Sender<ProcessEvent>,
         ui_tx: mpsc::Sender<Event>,
         shutdown: CancellationToken,
     ) -> Self {
-        // Only finite `on-failure:N` policies are tracked here; unlimited `on-failure`
-        // (max_attempts: None) is never seeded and therefore never exhausted.
-        let restart_on_failure_remaining: HashMap<ServiceID, usize> = services
+        let services = services
             .iter()
-            .filter_map(|(service_id, service)| match service.restart_policy {
-                service::RestartPolicy::OnFailure {
-                    max_attempts: Some(max_attempts),
-                } => Some((service_id.clone(), max_attempts)),
-                _ => None,
+            .map(|(service_id, service)| {
+                (
+                    service_id.clone(),
+                    ServiceRuntime::new(&service.restart_policy),
+                )
             })
-            .collect();
-
-        let service_state: HashMap<ServiceID, State> = services
-            .keys()
-            .map(|service_id| (service_id.clone(), State::Pending))
             .collect();
 
         Self {
             graph,
-            desired_disabled: HashSet::new(),
-            restart_requested: HashSet::new(),
-            terminate_tokens: HashMap::new(),
-            pty_masters: HashMap::new(),
-            pty_writers: HashMap::new(),
-            pty_sizes: HashMap::new(),
+            services,
             current_pty_size: portable_pty::PtySize {
                 rows: 24,
                 cols: 80,
                 pixel_width: 0,
                 pixel_height: 0,
             },
-            restart_backoff_until: HashMap::new(),
-            restart_backoff_delay: HashMap::new(),
-            running_since: HashMap::new(),
-            restart_on_failure_remaining,
-            service_state,
             events_tx,
             ui_tx,
             shutdown,
         }
     }
 
-    fn schedule_pass(&mut self, services: &ServiceMap) {
+    async fn schedule_pass(&mut self, services: &ServiceMap) -> eyre::Result<()> {
         schedule::schedule_ready(&mut schedule::ScheduleContext {
             services,
             graph: &self.graph.inner,
-            service_state: &mut self.service_state,
-            desired_disabled: &self.desired_disabled,
-            restart_requested: &mut self.restart_requested,
-            restart_on_failure_remaining: &mut self.restart_on_failure_remaining,
-            terminate_tokens: &mut self.terminate_tokens,
-            pty_masters: &mut self.pty_masters,
-            pty_writers: &mut self.pty_writers,
-            pty_sizes: &mut self.pty_sizes,
-            running_since: &mut self.running_since,
+            runtimes: &mut self.services,
             current_pty_size: self.current_pty_size,
-            restart_backoff_until: &self.restart_backoff_until,
             events_tx: &self.events_tx,
             ui_tx: &self.ui_tx,
             shutdown: &self.shutdown,
-        });
-    }
-
-    fn apply_restart_backoff(&mut self, service_id: &ServiceID) {
-        // User-initiated stop/restart must take effect immediately, with no backoff.
-        if self.desired_disabled.contains(service_id) || self.restart_requested.contains(service_id)
-        {
-            self.restart_backoff_until.remove(service_id);
-            self.restart_backoff_delay.remove(service_id);
-            return;
-        }
-
-        // Apply backoff to *any* policy-driven auto-restart (including clean exit-0 restarts
-        // of `always`/`unless-stopped`), so a fast-exiting service cannot respawn in a tight
-        // zero-delay loop. Policies that will not restart (`never`, `on-failure` after a clean
-        // exit) simply never consult this entry.
-        //
-        // Reset the delay once a service has stayed up long enough to be considered stable, so
-        // a service that fails far apart is not permanently throttled to the maximum delay.
-        let stable = self
-            .running_since
-            .get(service_id)
-            .is_some_and(|since| since.elapsed() >= RESTART_BACKOFF_RESET);
-        if stable {
-            self.restart_backoff_delay.remove(service_id);
-        }
-
-        let delay = self
-            .restart_backoff_delay
-            .entry(service_id.clone())
-            .and_modify(|d| {
-                *d = (*d * 2).min(RESTART_BACKOFF_MAX);
-            })
-            .or_insert(RESTART_BACKOFF_BASE);
-        self.restart_backoff_until
-            .insert(service_id.clone(), tokio::time::Instant::now() + *delay);
+        })
+        .await
     }
 
     async fn handle_command(&mut self, services: &ServiceMap, command: Command) {
         match command {
-            Command::Restart(service_id) | Command::Enable(service_id) => {
-                self.desired_disabled.remove(&service_id);
-                self.restart_requested.insert(service_id.clone());
-                self.restart_backoff_until.remove(&service_id);
-                self.restart_backoff_delay.remove(&service_id);
-                // Logs are cleared when the service is actually (re)started in
-                // `start_service_if_ready`, after the old process has drained its output.
-                if let Some(terminate) = self.terminate_tokens.get(&service_id) {
-                    terminate.cancel();
+            Command::Restart(service_id) => {
+                if let Some(runtime) = self.services.get_mut(&service_id) {
+                    // Logs are cleared when the service is actually (re)started in
+                    // `start_service_if_ready`, after the old process has drained its output.
+                    runtime.request_restart();
+                }
+            }
+            Command::Enable(service_id) => {
+                if let Some(runtime) = self.services.get_mut(&service_id) {
+                    runtime.request_enable();
                 }
             }
             Command::RestartAll => {
                 for service_id in services.keys() {
-                    self.desired_disabled.remove(service_id);
-                    self.restart_requested.insert(service_id.clone());
-                    self.restart_backoff_until.remove(service_id);
-                    self.restart_backoff_delay.remove(service_id);
-                    if let Some(terminate) = self.terminate_tokens.get(service_id) {
-                        terminate.cancel();
+                    if let Some(runtime) = self.services.get_mut(service_id)
+                        && runtime.desired == DesiredState::Enabled
+                    {
+                        runtime.request_restart();
                     }
                 }
             }
             Command::Disable(service_id) => {
-                self.desired_disabled.insert(service_id.clone());
-                let _ = self.ui_tx.send(Event::Disabled(service_id.clone())).await;
-                self.restart_backoff_until.remove(&service_id);
-                self.restart_backoff_delay.remove(&service_id);
-                if let Some(terminate) = self.terminate_tokens.get(&service_id) {
-                    terminate.cancel();
+                if let Some(runtime) = self.services.get_mut(&service_id) {
+                    runtime.disable();
+                    let _ = self.ui_tx.send(Event::Disabled(service_id)).await;
                 }
             }
             Command::SendInput(service_id, data) => {
-                let Some(writer) = self.pty_writers.get(&service_id) else {
-                    return;
-                };
-                let mut guard = writer.lock();
-                if let Err(err) = guard.write_all(&data) {
-                    tracing::warn!(?err, service_id, "failed to write to pty");
-                }
-                if let Err(err) = guard.flush() {
-                    tracing::warn!(?err, service_id, "failed to flush pty");
+                if let Some(runtime) = self.services.get(&service_id)
+                    && let Some(running) = &runtime.running
+                {
+                    running.pty.write_input(&service_id, &data);
                 }
             }
             Command::ResizeAll { cols, rows } => {
@@ -209,80 +341,129 @@ impl<'a> SchedulerRuntime<'a> {
                     pixel_width: 0,
                     pixel_height: 0,
                 };
-                for (service_id, master) in &self.pty_masters {
-                    let guard = master.lock();
-                    let res = guard.resize(portable_pty::PtySize {
-                        rows,
-                        cols,
-                        pixel_width: 0,
-                        pixel_height: 0,
-                    });
-                    if let Err(err) = res {
-                        tracing::warn!(?err, service_id, "failed to resize pty");
+                for (service_id, runtime) in &self.services {
+                    if let Some(running) = &runtime.running {
+                        running.pty.resize(service_id, self.current_pty_size);
                     }
-                }
-
-                let packed = (u32::from(rows) << 16) | u32::from(cols);
-                for size in self.pty_sizes.values() {
-                    size.store(packed, Ordering::Relaxed);
                 }
             }
         }
     }
 
-    async fn handle_event(&mut self, services: &ServiceMap, event: Event) -> eyre::Result<()> {
-        tracing::debug!(%event, "received event");
+    async fn handle_event(
+        &mut self,
+        services: &ServiceMap,
+        event: ProcessEvent,
+    ) -> eyre::Result<()> {
+        tracing::debug!(?event, "received process event");
 
         let service_id = event.service_id().clone();
-        schedule::update_state(services, &mut self.service_state, &event);
-
-        if let Event::Exited(_, _) = &event {
-            // Cancel (not just drop) the terminate token so the per-service health-check loop
-            // and any in-flight probe spawned alongside this service are torn down. Without
-            // this, a crashed service's health loop keeps emitting events for a dead process.
-            if let Some(token) = self.terminate_tokens.remove(&service_id) {
-                token.cancel();
-            }
-            self.pty_masters.remove(&service_id);
-            self.pty_writers.remove(&service_id);
-            self.pty_sizes.remove(&service_id);
-            self.apply_restart_backoff(&service_id);
-            self.running_since.remove(&service_id);
+        let Some(runtime) = self.services.get_mut(&service_id) else {
+            return Ok(());
+        };
+        if runtime.current_run_id() != Some(event.run_id()) {
+            tracing::debug!(
+                service_id,
+                event_run_id = ?event.run_id(),
+                current_run_id = ?runtime.current_run_id(),
+                "ignoring stale process event"
+            );
+            return Ok(());
         }
 
-        if matches!(&event, Event::LogLine { .. }) {
-            let _ = self.ui_tx.try_send(event);
+        let ui_event = event.into_ui_event();
+        match &ui_event {
+            Event::Healthy(_) => {
+                if matches!(runtime.state, State::Running { .. } | State::Starting) {
+                    runtime.state = State::Running {
+                        health: Some(crate::health_check::Health::Healthy),
+                    };
+                }
+            }
+            Event::Unhealthy(_) => {
+                if matches!(runtime.state, State::Running { .. } | State::Starting) {
+                    runtime.state = State::Running {
+                        health: Some(crate::health_check::Health::Unhealthy),
+                    };
+                }
+            }
+            Event::Killed(_) => {
+                if runtime.desired == DesiredState::Enabled {
+                    runtime.state = State::Killed;
+                }
+            }
+            Event::Exited(_, exit_code) => {
+                let Some(service) = services.get(&service_id) else {
+                    return Ok(());
+                };
+                runtime.finish_current_run(&service.restart_policy, *exit_code);
+            }
+            Event::LogLine { .. }
+            | Event::Started { .. }
+            | Event::HealthCheckStarted { .. }
+            | Event::HealthCheckLogLine { .. }
+            | Event::HealthCheckFinished { .. }
+            | Event::Disabled(_)
+            | Event::ClearLogs(_) => {}
+        }
+
+        if matches!(&ui_event, Event::LogLine { .. }) {
+            let _ = self.ui_tx.try_send(ui_event);
         } else {
-            self.ui_tx.send(event).await?;
+            self.ui_tx.send(ui_event).await?;
         }
         Ok(())
     }
 
+    fn next_backoff(&self) -> Option<tokio::time::Instant> {
+        let now = tokio::time::Instant::now();
+        self.services
+            .values()
+            .filter_map(|runtime| runtime.restart.backoff_until)
+            .filter(|deadline| *deadline > now)
+            .min()
+    }
+
+    fn running_count(&self) -> usize {
+        self.services
+            .values()
+            .filter(|runtime| runtime.running.is_some())
+            .count()
+    }
+
+    fn cancel_all_running(&self) {
+        for runtime in self.services.values() {
+            if let Some(running) = &runtime.running {
+                running.cancel();
+            }
+        }
+    }
+
     /// Keep the runtime alive after a shutdown so the per-service termination tasks can finish
-    /// their SIGTERM → deadline → SIGKILL escalation and reap their children.
+    /// their SIGTERM -> deadline -> SIGKILL escalation and reap their children.
     ///
     /// Without this drain the tokio runtime would be dropped the instant the scheduler returns,
     /// aborting those detached tasks mid-escalation and orphaning any process that ignores
-    /// SIGTERM. Each `Event::Exited` removes the service's terminate token, so the drain ends as
+    /// SIGTERM. Each matching `Exited` event removes the service's run handle, so the drain ends as
     /// soon as every child has been reaped (bounded by an overall timeout).
     async fn drain_on_shutdown(
         &mut self,
         services: &ServiceMap,
-        events_rx: &mut mpsc::Receiver<Event>,
+        events_rx: &mut mpsc::Receiver<ProcessEvent>,
     ) {
-        if self.terminate_tokens.is_empty() {
+        if self.running_count() == 0 {
             return;
         }
         tracing::debug!(
-            remaining = self.terminate_tokens.len(),
+            remaining = self.running_count(),
             "draining services on shutdown"
         );
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-        while !self.terminate_tokens.is_empty() {
+        while self.running_count() > 0 {
             tokio::select! {
                 () = tokio::time::sleep_until(deadline) => {
                     tracing::warn!(
-                        remaining = self.terminate_tokens.len(),
+                        remaining = self.running_count(),
                         "timed out waiting for services to exit"
                     );
                     break;
@@ -300,8 +481,8 @@ impl<'a> SchedulerRuntime<'a> {
 pub async fn scheduler(
     services: &ServiceMap,
     mut commands_rx: mpsc::Receiver<Command>,
-    mut events_rx: mpsc::Receiver<Event>,
-    events_tx: mpsc::Sender<Event>,
+    mut events_rx: mpsc::Receiver<ProcessEvent>,
+    events_tx: mpsc::Sender<ProcessEvent>,
     ui_tx: mpsc::Sender<Event>,
     shutdown: CancellationToken,
 ) -> eyre::Result<()> {
@@ -310,7 +491,7 @@ pub async fn scheduler(
 
     // Initial scheduling pass
     tracing::debug!("started initial scheduling pass");
-    rt.schedule_pass(services);
+    rt.schedule_pass(services).await?;
     tracing::debug!("completed initial scheduling pass");
 
     // Whenever an event comes in, try to (re)start any services whose deps are now healthy
@@ -318,13 +499,7 @@ pub async fn scheduler(
         tracing::debug!("waiting for scheduling event");
         // Wake the loop when the nearest pending restart backoff expires; without this a
         // backed-off service would never restart unless some unrelated event happened to arrive.
-        let now = tokio::time::Instant::now();
-        let next_backoff = rt
-            .restart_backoff_until
-            .values()
-            .filter(|deadline| **deadline > now)
-            .min()
-            .copied();
+        let next_backoff = rt.next_backoff();
         tokio::select! {
             () = shutdown.cancelled() => {
                 tracing::debug!("exiting scheduler");
@@ -350,9 +525,10 @@ pub async fn scheduler(
             } => {}
         }
 
-        rt.schedule_pass(services);
+        rt.schedule_pass(services).await?;
     }
 
+    rt.cancel_all_running();
     rt.drain_on_shutdown(services, &mut events_rx).await;
     Ok(())
 }
@@ -808,6 +984,412 @@ mod tests {
         }
 
         assert!(starts >= 2, "expected an automatic restart after a crash");
+        shutdown.cancel();
+        handle.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stale_log_from_previous_run_is_ignored() -> eyre::Result<()> {
+        let dir = unique_tmp_dir("stale-run-log");
+        fs::create_dir_all(&dir)?;
+        let marker = dir.join("run-count");
+        let script = format!(
+            "n=$(cat {marker} 2>/dev/null || echo 0); \
+             n=$((n + 1)); \
+             echo \"$n\" > {marker}; \
+             if [ \"$n\" = 1 ]; then \
+               (trap '' HUP TERM; sleep 0.7; echo stale-from-first-run) & \
+               exit 1; \
+             else \
+               echo second-run; \
+               sleep 60; \
+             fi",
+            marker = marker.to_string_lossy()
+        );
+
+        let mut cfg = service_config("svc", ("sh", &["-c", "true"]));
+        cfg.command = (
+            spanned_string("sh"),
+            vec![spanned_string("-c"), spanned_string(&script)],
+        );
+        cfg.restart = Some(crate::service::RestartPolicy::Always);
+
+        let mut services: ServiceMap = ServiceMap::new();
+        services.insert("svc".to_string(), Service::new("svc", &dir, cfg)?);
+
+        let shutdown = CancellationToken::new();
+        let (ui_tx, mut ui_rx) = mpsc::channel(256);
+        let (events_tx, events_rx) = mpsc::channel(256);
+        let (_commands_tx, commands_rx) = mpsc::channel(256);
+
+        let handle = tokio::spawn({
+            let shutdown = shutdown.clone();
+            async move {
+                scheduler(
+                    &services,
+                    commands_rx,
+                    events_rx,
+                    events_tx,
+                    ui_tx,
+                    shutdown,
+                )
+                .await
+            }
+        });
+
+        let mut starts = 0;
+        let mut saw_second_run = false;
+        for _ in 0..100 {
+            let event = timeout(Duration::from_secs(5), ui_rx.recv())
+                .await
+                .map_err(|_| eyre::eyre!("timeout waiting for event"))?
+                .ok_or_else(|| eyre::eyre!("event channel closed"))?;
+            match event {
+                Event::Started { .. } => {
+                    starts += 1;
+                }
+                Event::LogLine { line, .. } if line.contains("second-run") => {
+                    saw_second_run = true;
+                }
+                Event::LogLine { line, .. } if line.contains("stale-from-first-run") => {
+                    eyre::bail!("stale first-run output reached the UI");
+                }
+                _ => {}
+            }
+
+            if starts >= 2 && saw_second_run {
+                break;
+            }
+        }
+        assert!(starts >= 2);
+        assert!(saw_second_run);
+
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(1200);
+        while tokio::time::Instant::now() < deadline {
+            match timeout(Duration::from_millis(100), ui_rx.recv()).await {
+                Ok(Some(Event::LogLine { line, .. })) if line.contains("stale-from-first-run") => {
+                    eyre::bail!("stale first-run output reached the UI");
+                }
+                Ok(Some(_)) | Err(_) => {}
+                Ok(None) => break,
+            }
+        }
+
+        shutdown.cancel();
+        handle.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn enable_after_disable_starts_service_again() -> eyre::Result<()> {
+        let config_dir = Path::new(".");
+        let mut services: ServiceMap = ServiceMap::new();
+        services.insert(
+            "svc".to_string(),
+            Service::new(
+                "svc",
+                config_dir,
+                service_config("svc", ("sh", &["-c", "sleep 60"])),
+            )?,
+        );
+
+        let shutdown = CancellationToken::new();
+        let (ui_tx, ui_rx) = mpsc::channel(128);
+        let (events_tx, events_rx) = mpsc::channel(128);
+        let (commands_tx, commands_rx) = mpsc::channel(128);
+
+        let handle = tokio::spawn({
+            let shutdown = shutdown.clone();
+            async move {
+                scheduler(
+                    &services,
+                    commands_rx,
+                    events_rx,
+                    events_tx,
+                    ui_tx,
+                    shutdown,
+                )
+                .await
+            }
+        });
+
+        let (event, mut ui_rx) = recv_event(ui_rx).await?;
+        assert!(matches!(event, Event::Started { .. }));
+
+        commands_tx
+            .send(Command::Disable("svc".to_string()))
+            .await?;
+
+        loop {
+            let (event, next_rx) = recv_event(ui_rx).await?;
+            ui_rx = next_rx;
+            if matches!(event, Event::Exited(_, _)) {
+                break;
+            }
+        }
+
+        commands_tx.send(Command::Enable("svc".to_string())).await?;
+
+        let mut restarted = false;
+        for _ in 0..20 {
+            let (event, next_rx) = recv_event(ui_rx).await?;
+            ui_rx = next_rx;
+            if matches!(event, Event::Started { .. }) {
+                restarted = true;
+                break;
+            }
+        }
+
+        assert!(restarted);
+        shutdown.cancel();
+        handle.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn enable_after_disable_does_not_clear_logs() -> eyre::Result<()> {
+        let config_dir = Path::new(".");
+        let mut services: ServiceMap = ServiceMap::new();
+        services.insert(
+            "svc".to_string(),
+            Service::new(
+                "svc",
+                config_dir,
+                service_config("svc", ("sh", &["-c", "echo first-run; sleep 60"])),
+            )?,
+        );
+
+        let shutdown = CancellationToken::new();
+        let (ui_tx, ui_rx) = mpsc::channel(128);
+        let (events_tx, events_rx) = mpsc::channel(128);
+        let (commands_tx, commands_rx) = mpsc::channel(128);
+
+        let handle = tokio::spawn({
+            let shutdown = shutdown.clone();
+            async move {
+                scheduler(
+                    &services,
+                    commands_rx,
+                    events_rx,
+                    events_tx,
+                    ui_tx,
+                    shutdown,
+                )
+                .await
+            }
+        });
+
+        let mut ui_rx = ui_rx;
+        let mut saw_log = false;
+        for _ in 0..20 {
+            let (event, next_rx) = recv_event(ui_rx).await?;
+            ui_rx = next_rx;
+            if matches!(event, Event::LogLine { line, .. } if line.contains("first-run")) {
+                saw_log = true;
+                break;
+            }
+        }
+        assert!(saw_log);
+
+        commands_tx
+            .send(Command::Disable("svc".to_string()))
+            .await?;
+        loop {
+            let (event, next_rx) = recv_event(ui_rx).await?;
+            ui_rx = next_rx;
+            if matches!(event, Event::Exited(_, _)) {
+                break;
+            }
+        }
+
+        commands_tx.send(Command::Enable("svc".to_string())).await?;
+
+        let mut restarted = false;
+        for _ in 0..20 {
+            let (event, next_rx) = recv_event(ui_rx).await?;
+            ui_rx = next_rx;
+            match event {
+                Event::ClearLogs(_) => eyre::bail!("enable unexpectedly cleared logs"),
+                Event::Started { .. } => {
+                    restarted = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        assert!(restarted);
+        shutdown.cancel();
+        handle.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn restart_all_skips_disabled_services() -> eyre::Result<()> {
+        let config_dir = Path::new(".");
+        let mut services: ServiceMap = ServiceMap::new();
+        services.insert(
+            "enabled".to_string(),
+            Service::new(
+                "enabled",
+                config_dir,
+                service_config("enabled", ("sh", &["-c", "sleep 60"])),
+            )?,
+        );
+        services.insert(
+            "disabled".to_string(),
+            Service::new(
+                "disabled",
+                config_dir,
+                service_config("disabled", ("sh", &["-c", "sleep 60"])),
+            )?,
+        );
+
+        let shutdown = CancellationToken::new();
+        let (ui_tx, ui_rx) = mpsc::channel(256);
+        let (events_tx, events_rx) = mpsc::channel(256);
+        let (commands_tx, commands_rx) = mpsc::channel(256);
+
+        let handle = tokio::spawn({
+            let shutdown = shutdown.clone();
+            async move {
+                scheduler(
+                    &services,
+                    commands_rx,
+                    events_rx,
+                    events_tx,
+                    ui_tx,
+                    shutdown,
+                )
+                .await
+            }
+        });
+
+        let mut ui_rx = ui_rx;
+        let mut started = std::collections::HashSet::new();
+        while started.len() < 2 {
+            let (event, next_rx) = recv_event(ui_rx).await?;
+            ui_rx = next_rx;
+            if let Event::Started { service_id } = event {
+                started.insert(service_id);
+            }
+        }
+
+        commands_tx
+            .send(Command::Disable("disabled".to_string()))
+            .await?;
+        loop {
+            let (event, next_rx) = recv_event(ui_rx).await?;
+            ui_rx = next_rx;
+            if matches!(event, Event::Exited(service_id, _) if service_id == "disabled") {
+                break;
+            }
+        }
+
+        commands_tx.send(Command::RestartAll).await?;
+
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(800);
+        let mut saw_enabled_restart = false;
+        while tokio::time::Instant::now() < deadline {
+            match timeout(Duration::from_millis(100), ui_rx.recv()).await {
+                Ok(Some(Event::Started { service_id })) if service_id == "disabled" => {
+                    eyre::bail!("RestartAll restarted a disabled service");
+                }
+                Ok(Some(Event::Started { service_id })) if service_id == "enabled" => {
+                    saw_enabled_restart = true;
+                }
+                Ok(Some(_)) | Err(_) => {}
+                Ok(None) => break,
+            }
+        }
+
+        assert!(saw_enabled_restart);
+        shutdown.cancel();
+        handle.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn disabling_dependency_blocks_pending_dependents_immediately() -> eyre::Result<()> {
+        let config_dir = Path::new(".");
+        let mut services: ServiceMap = ServiceMap::new();
+
+        services.insert(
+            "dep".to_string(),
+            Service::new(
+                "dep",
+                config_dir,
+                service_config("dep", ("sh", &["-c", "trap '' TERM; sleep 5"])),
+            )?,
+        );
+
+        services.insert(
+            "gate".to_string(),
+            Service::new(
+                "gate",
+                config_dir,
+                service_config("gate", ("sh", &["-c", "sleep 0.4; exit 0"])),
+            )?,
+        );
+
+        let mut app_cfg = service_config("app", ("sh", &["-c", "echo app-started; sleep 60"]));
+        app_cfg.depends_on = vec![
+            config::Dependency {
+                name: spanned_string("dep"),
+                condition: Some(Spanned {
+                    span: yaml_spanned::spanned::Span::default(),
+                    inner: config::DependencyCondition::Started,
+                }),
+            },
+            config::Dependency {
+                name: spanned_string("gate"),
+                condition: Some(Spanned {
+                    span: yaml_spanned::spanned::Span::default(),
+                    inner: config::DependencyCondition::CompletedSuccessfully,
+                }),
+            },
+        ];
+        services.insert("app".to_string(), Service::new("app", config_dir, app_cfg)?);
+
+        let shutdown = CancellationToken::new();
+        let (ui_tx, ui_rx) = mpsc::channel(256);
+        let (events_tx, events_rx) = mpsc::channel(256);
+        let (commands_tx, commands_rx) = mpsc::channel(256);
+
+        let handle = tokio::spawn({
+            let shutdown = shutdown.clone();
+            async move {
+                scheduler(
+                    &services,
+                    commands_rx,
+                    events_rx,
+                    events_tx,
+                    ui_tx,
+                    shutdown,
+                )
+                .await
+            }
+        });
+
+        let (event, mut ui_rx) = recv_event(ui_rx).await?;
+        assert!(matches!(event, Event::Started { service_id } if service_id == "dep"));
+
+        commands_tx
+            .send(Command::Disable("dep".to_string()))
+            .await?;
+
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(700);
+        while tokio::time::Instant::now() < deadline {
+            match timeout(Duration::from_millis(100), ui_rx.recv()).await {
+                Ok(Some(Event::Started { service_id })) if service_id == "app" => {
+                    eyre::bail!("dependent app started after its dependency was disabled");
+                }
+                Ok(Some(_)) | Err(_) => {}
+                Ok(None) => break,
+            }
+        }
+
         shutdown.cancel();
         handle.await??;
         Ok(())

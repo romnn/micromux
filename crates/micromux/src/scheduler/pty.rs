@@ -1,4 +1,4 @@
-use super::{Event, LogUpdateKind, OutputStream, ServiceID};
+use super::{LogUpdateKind, OutputStream, ProcessEvent, RunId, ServiceID};
 use crate::{health_check, service::Service};
 use color_eyre::eyre;
 use parking_lot::Mutex;
@@ -26,9 +26,30 @@ use nix::unistd::Pid;
 
 #[derive(Clone)]
 pub(super) struct PtyHandles {
-    pub(super) master: Arc<Mutex<Box<dyn portable_pty::MasterPty + Send>>>,
-    pub(super) writer: Arc<Mutex<Box<dyn Write + Send>>>,
-    pub(super) size: Arc<AtomicU32>,
+    master: Arc<Mutex<Box<dyn portable_pty::MasterPty + Send>>>,
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    size: Arc<AtomicU32>,
+}
+
+impl PtyHandles {
+    pub(super) fn write_input(&self, service_id: &ServiceID, data: &[u8]) {
+        let mut guard = self.writer.lock();
+        if let Err(err) = guard.write_all(data) {
+            tracing::warn!(?err, service_id, "failed to write to pty");
+        }
+        if let Err(err) = guard.flush() {
+            tracing::warn!(?err, service_id, "failed to flush pty");
+        }
+    }
+
+    pub(super) fn resize(&self, service_id: &ServiceID, size: portable_pty::PtySize) {
+        let guard = self.master.lock();
+        if let Err(err) = guard.resize(size) {
+            tracing::warn!(?err, service_id, "failed to resize pty");
+        }
+        let packed = (u32::from(size.rows) << 16) | u32::from(size.cols);
+        self.size.store(packed, Ordering::Relaxed);
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -353,16 +374,19 @@ fn push_sgr(snapshot: &mut String, style: CellStyle) {
     snapshot.push('m');
 }
 
-#[allow(clippy::too_many_lines)]
-fn spawn_log_reader_thread(
+struct LogReaderArgs {
     service_id: ServiceID,
+    run_id: RunId,
     reader: Box<dyn std::io::Read + Send>,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
-    events_tx: mpsc::Sender<Event>,
+    events_tx: mpsc::Sender<ProcessEvent>,
     pty_rows: u16,
     pty_cols: u16,
     pty_size: Arc<AtomicU32>,
-) {
+}
+
+#[allow(clippy::too_many_lines)]
+fn spawn_log_reader_thread(args: LogReaderArgs) {
     thread::spawn(move || {
         #[derive(Clone)]
         struct PtyEventProxy {
@@ -431,13 +455,15 @@ fn spawn_log_reader_thread(
         }
 
         fn send_log(
-            events_tx: &mpsc::Sender<Event>,
+            events_tx: &mpsc::Sender<ProcessEvent>,
             service_id: &ServiceID,
+            run_id: RunId,
             update: LogUpdateKind,
             text: String,
         ) {
-            let _ = events_tx.try_send(Event::LogLine {
+            let _ = events_tx.try_send(ProcessEvent::LogLine {
                 service_id: service_id.clone(),
+                run_id,
                 stream: OutputStream::Stdout,
                 update,
                 line: text,
@@ -447,8 +473,9 @@ fn spawn_log_reader_thread(
         fn emit_snapshot(
             term: &Term<PtyEventProxy>,
             rate: &mut RateLimit,
-            events_tx: &mpsc::Sender<Event>,
+            events_tx: &mpsc::Sender<ProcessEvent>,
             service_id: &ServiceID,
+            run_id: RunId,
             force: bool,
         ) {
             // `force` bypasses the rate limiter so the program's final frame at EOF is never
@@ -466,6 +493,7 @@ fn spawn_log_reader_thread(
                         send_log(
                             events_tx,
                             service_id,
+                            run_id,
                             LogUpdateKind::Append,
                             "[micromux] interactive output rate-limited".to_string(),
                         );
@@ -552,13 +580,18 @@ fn spawn_log_reader_thread(
                 LogUpdateKind::Append
             };
 
-            send_log(events_tx, service_id, update, snapshot);
+            send_log(events_tx, service_id, run_id, update, snapshot);
             if rate.alt_screen {
                 rate.sent_in_window = rate.sent_in_window.saturating_add(1);
             }
         }
 
-        fn flush(line: &mut Vec<u8>, events_tx: &mpsc::Sender<Event>, service_id: &ServiceID) {
+        fn flush(
+            line: &mut Vec<u8>,
+            events_tx: &mpsc::Sender<ProcessEvent>,
+            service_id: &ServiceID,
+            run_id: RunId,
+        ) {
             if line.is_empty() {
                 return;
             }
@@ -573,7 +606,7 @@ fn spawn_log_reader_thread(
             }
 
             let s = String::from_utf8_lossy(line).to_string();
-            send_log(events_tx, service_id, LogUpdateKind::Append, s);
+            send_log(events_tx, service_id, run_id, LogUpdateKind::Append, s);
             line.clear();
         }
 
@@ -584,15 +617,27 @@ fn spawn_log_reader_thread(
         /// `line` never contains the terminating newline bytes themselves.
         fn flush_record(
             line: &mut Vec<u8>,
-            events_tx: &mpsc::Sender<Event>,
+            events_tx: &mpsc::Sender<ProcessEvent>,
             service_id: &ServiceID,
+            run_id: RunId,
         ) {
             let s = String::from_utf8_lossy(line).to_string();
-            send_log(events_tx, service_id, LogUpdateKind::Append, s);
+            send_log(events_tx, service_id, run_id, LogUpdateKind::Append, s);
             line.clear();
         }
 
         const ALT_SCREEN_MAX_UPDATES_PER_SEC: u32 = 4;
+
+        let LogReaderArgs {
+            service_id,
+            run_id,
+            reader,
+            writer,
+            events_tx,
+            pty_rows,
+            pty_cols,
+            pty_size,
+        } = args;
 
         let mut reader = std::io::BufReader::new(reader);
         let mut buf = [0u8; 4096];
@@ -643,9 +688,9 @@ fn spawn_log_reader_thread(
             };
             if n == 0 {
                 if interactive {
-                    emit_snapshot(&term, &mut rate, &events_tx, &service_id, true);
+                    emit_snapshot(&term, &mut rate, &events_tx, &service_id, run_id, true);
                 } else {
-                    flush(&mut line, &events_tx, &service_id);
+                    flush(&mut line, &events_tx, &service_id, run_id);
                 }
                 break;
             }
@@ -677,13 +722,13 @@ fn spawn_log_reader_thread(
                     // flushed by the CSI H/f/J boundary detection in AnsiFilter.
                     b'\r' => {
                         if !interactive {
-                            flush_record(&mut line, &events_tx, &service_id);
+                            flush_record(&mut line, &events_tx, &service_id, run_id);
                         }
                         prev_was_cr = true;
                     }
                     b'\n' => {
                         if !interactive && !prev_was_cr {
-                            flush_record(&mut line, &events_tx, &service_id);
+                            flush_record(&mut line, &events_tx, &service_id, run_id);
                         }
                         prev_was_cr = false;
                     }
@@ -703,7 +748,7 @@ fn spawn_log_reader_thread(
                         }
 
                         if !interactive && line.len() >= 16 * 1024 {
-                            flush(&mut line, &events_tx, &service_id);
+                            flush(&mut line, &events_tx, &service_id, run_id);
                         }
                     }
                 }
@@ -714,7 +759,7 @@ fn spawn_log_reader_thread(
                 let now = Instant::now();
                 let due = last_snapshot_at.is_none_or(|t| now.duration_since(t) >= interval);
                 if dirty && due {
-                    emit_snapshot(&term, &mut rate, &events_tx, &service_id, false);
+                    emit_snapshot(&term, &mut rate, &events_tx, &service_id, run_id, false);
                     last_snapshot_at = Some(now);
                     dirty = false;
                 }
@@ -727,7 +772,8 @@ fn spawn_log_reader_thread(
 
 struct TerminationTaskArgs {
     service_id: ServiceID,
-    events_tx: mpsc::Sender<Event>,
+    run_id: RunId,
+    events_tx: mpsc::Sender<ProcessEvent>,
     shutdown: CancellationToken,
     terminate: CancellationToken,
     killer: Box<dyn portable_pty::ChildKiller + Send + Sync>,
@@ -736,65 +782,114 @@ struct TerminationTaskArgs {
     child: Box<dyn portable_pty::Child + Send + Sync>,
 }
 
+struct TerminationStart {
+    kill_deadline: Option<tokio::time::Instant>,
+    hard_killed: bool,
+}
+
+struct TerminationTarget {
+    killer: Box<dyn portable_pty::ChildKiller + Send + Sync>,
+    pid: Option<u32>,
+    process_group_leader_id: Option<i32>,
+}
+
+impl TerminationTarget {
+    async fn request(
+        &mut self,
+        events_tx: &mpsc::Sender<ProcessEvent>,
+        service_id: &ServiceID,
+        run_id: RunId,
+    ) -> TerminationStart {
+        tracing::info!(pid = self.pid, service_id, "killing process");
+        let _ = events_tx
+            .send(ProcessEvent::Killed {
+                service_id: service_id.clone(),
+                run_id,
+            })
+            .await;
+
+        #[cfg(unix)]
+        {
+            let _ = self.signal(Signal::SIGTERM);
+            TerminationStart {
+                kill_deadline: Some(tokio::time::Instant::now() + Duration::from_millis(750)),
+                hard_killed: false,
+            }
+        }
+
+        #[cfg(not(unix))]
+        {
+            let _ = self.process_group_leader_id;
+            let _ = self.killer.kill();
+            TerminationStart {
+                kill_deadline: None,
+                hard_killed: true,
+            }
+        }
+    }
+
+    fn force_kill(&mut self) {
+        #[cfg(unix)]
+        {
+            if !self.signal(Signal::SIGKILL) {
+                let _ = self.killer.kill();
+            }
+        }
+
+        #[cfg(not(unix))]
+        {
+            let _ = self.killer.kill();
+        }
+    }
+
+    #[cfg(unix)]
+    fn signal(&self, signal: Signal) -> bool {
+        if let Some(pgid) = self.process_group_leader_id {
+            let _ = nix::sys::signal::killpg(Pid::from_raw(pgid), signal);
+            true
+        } else if let Some(pid) = self.pid.and_then(|pid| i32::try_from(pid).ok()) {
+            let _ = nix::sys::signal::kill(Pid::from_raw(pid), signal);
+            true
+        } else {
+            false
+        }
+    }
+}
+
 fn spawn_termination_task(args: TerminationTaskArgs) {
     tokio::spawn(async move {
         let TerminationTaskArgs {
             service_id,
+            run_id,
             events_tx,
             shutdown,
             terminate,
-            mut killer,
             pid,
             process_group_leader_id,
+            killer,
             mut child,
         } = args;
 
+        let mut target = TerminationTarget {
+            killer,
+            pid,
+            process_group_leader_id,
+        };
         let mut termination_started = false;
         let mut hard_killed = false;
-        #[cfg(unix)]
         let mut kill_deadline: Option<tokio::time::Instant> = None;
-        #[cfg(not(unix))]
-        let kill_deadline: Option<tokio::time::Instant> = None;
         loop {
             tokio::select! {
                 () = shutdown.cancelled(), if !termination_started => {
-                    tracing::info!(pid, service_id, "killing process");
-                    let _ = events_tx.send(Event::Killed(service_id.clone())).await;
-                    #[cfg(unix)]
-                    {
-                        if let Some(pgid) = process_group_leader_id {
-                            let _ = nix::sys::signal::killpg(Pid::from_raw(pgid), Signal::SIGTERM);
-                        } else if let Some(pid) = pid.and_then(|pid| i32::try_from(pid).ok()) {
-                            let _ = nix::sys::signal::kill(Pid::from_raw(pid), Signal::SIGTERM);
-                        }
-                        kill_deadline = Some(tokio::time::Instant::now() + Duration::from_millis(750));
-                    }
-                    #[cfg(not(unix))]
-                    {
-                        let _ = process_group_leader_id;
-                        let _ = killer.kill();
-                        hard_killed = true;
-                    }
+                    let started = target.request(&events_tx, &service_id, run_id).await;
+                    kill_deadline = started.kill_deadline;
+                    hard_killed = started.hard_killed;
                     termination_started = true;
                 }
                 () = terminate.cancelled(), if !termination_started => {
-                    tracing::info!(pid, service_id, "killing process");
-                    let _ = events_tx.send(Event::Killed(service_id.clone())).await;
-                    #[cfg(unix)]
-                    {
-                        if let Some(pgid) = process_group_leader_id {
-                            let _ = nix::sys::signal::killpg(Pid::from_raw(pgid), Signal::SIGTERM);
-                        } else if let Some(pid) = pid.and_then(|pid| i32::try_from(pid).ok()) {
-                            let _ = nix::sys::signal::kill(Pid::from_raw(pid), Signal::SIGTERM);
-                        }
-                        kill_deadline = Some(tokio::time::Instant::now() + Duration::from_millis(750));
-                    }
-                    #[cfg(not(unix))]
-                    {
-                        let _ = process_group_leader_id;
-                        let _ = killer.kill();
-                        hard_killed = true;
-                    }
+                    let started = target.request(&events_tx, &service_id, run_id).await;
+                    kill_deadline = started.kill_deadline;
+                    hard_killed = started.hard_killed;
                     termination_started = true;
                 }
                 () = tokio::time::sleep(std::time::Duration::from_millis(25)) => {}
@@ -808,20 +903,7 @@ fn spawn_termination_task(args: TerminationTaskArgs) {
                 // Escalate to SIGKILL on the whole process group (mirroring the SIGTERM path),
                 // not just the group leader. Otherwise a leader that ignored SIGTERM is killed
                 // while its descendants survive and are orphaned once try_wait reaps the leader.
-                #[cfg(unix)]
-                {
-                    if let Some(pgid) = process_group_leader_id {
-                        let _ = nix::sys::signal::killpg(Pid::from_raw(pgid), Signal::SIGKILL);
-                    } else if let Some(pid) = pid.and_then(|pid| i32::try_from(pid).ok()) {
-                        let _ = nix::sys::signal::kill(Pid::from_raw(pid), Signal::SIGKILL);
-                    } else {
-                        let _ = killer.kill();
-                    }
-                }
-                #[cfg(not(unix))]
-                {
-                    let _ = killer.kill();
-                }
+                target.force_kill();
                 hard_killed = true;
             }
 
@@ -829,14 +911,24 @@ fn spawn_termination_task(args: TerminationTaskArgs) {
                 Ok(Some(status)) => {
                     let code = i32::try_from(status.exit_code()).unwrap_or(i32::MAX);
                     let _ = events_tx
-                        .send(Event::Exited(service_id.clone(), code))
+                        .send(ProcessEvent::Exited {
+                            service_id: service_id.clone(),
+                            run_id,
+                            exit_code: code,
+                        })
                         .await;
                     break;
                 }
                 Ok(None) => {}
                 Err(err) => {
                     tracing::error!(?err, "failed to poll process status");
-                    let _ = events_tx.send(Event::Exited(service_id.clone(), -1)).await;
+                    let _ = events_tx
+                        .send(ProcessEvent::Exited {
+                            service_id: service_id.clone(),
+                            run_id,
+                            exit_code: -1,
+                        })
+                        .await;
                     break;
                 }
             }
@@ -847,7 +939,8 @@ fn spawn_termination_task(args: TerminationTaskArgs) {
 #[allow(clippy::too_many_lines)]
 pub(super) fn start_service_with_pty_size(
     service: &Service,
-    events_tx: &mpsc::Sender<Event>,
+    run_id: RunId,
+    events_tx: &mpsc::Sender<ProcessEvent>,
     shutdown: &CancellationToken,
     terminate: &CancellationToken,
     pty_size: portable_pty::PtySize,
@@ -915,18 +1008,20 @@ pub(super) fn start_service_with_pty_size(
         (u32::from(pty_size.rows) << 16) | u32::from(pty_size.cols),
     ));
 
-    spawn_log_reader_thread(
-        service_id.clone(),
+    spawn_log_reader_thread(LogReaderArgs {
+        service_id: service_id.clone(),
+        run_id,
         reader,
-        writer.clone(),
-        events_tx.clone(),
-        pty_size.rows,
-        pty_size.cols,
-        size.clone(),
-    );
+        writer: writer.clone(),
+        events_tx: events_tx.clone(),
+        pty_rows: pty_size.rows,
+        pty_cols: pty_size.cols,
+        pty_size: size.clone(),
+    });
 
     spawn_termination_task(TerminationTaskArgs {
         service_id: service_id.clone(),
+        run_id,
         events_tx: events_tx.clone(),
         shutdown: shutdown.clone(),
         terminate: terminate.clone(),
@@ -951,12 +1046,15 @@ pub(super) fn start_service_with_pty_size(
             async move {
                 health_check::run_loop(
                     health_check,
-                    &service_id,
-                    working_dir,
-                    environment,
-                    events_tx,
-                    shutdown,
-                    terminate,
+                    health_check::RunLoopParams {
+                        service_id,
+                        run_id,
+                        working_dir,
+                        environment,
+                        events_tx,
+                        shutdown,
+                        terminate,
+                    },
                 )
                 .await;
             }
