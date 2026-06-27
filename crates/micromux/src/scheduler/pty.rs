@@ -35,6 +35,8 @@ use std::os::fd::AsRawFd;
 #[cfg(unix)]
 const POLL_EVENTS: i16 = POLLIN | POLLHUP | POLLERR;
 
+const ALT_SCREEN_MAX_UPDATES_PER_SEC: u32 = 4;
+
 #[derive(Clone)]
 pub(super) struct PtyHandles {
     master: Arc<Mutex<Box<dyn portable_pty::MasterPty + Send>>>,
@@ -390,6 +392,81 @@ fn push_sgr(snapshot: &mut String, style: CellStyle) {
     snapshot.push('m');
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SnapshotDecision {
+    Emit,
+    Warn,
+    Drop,
+}
+
+#[derive(Debug)]
+struct RateLimit {
+    alt_screen: bool,
+    window_start: Instant,
+    sent_in_window: u32,
+    warned_in_window: bool,
+    snapshot_id: u64,
+}
+
+impl RateLimit {
+    fn new() -> Self {
+        Self {
+            alt_screen: false,
+            window_start: Instant::now(),
+            sent_in_window: 0,
+            warned_in_window: false,
+            snapshot_id: 0,
+        }
+    }
+
+    fn set_alt_screen(&mut self, alt_screen: bool) {
+        self.alt_screen = alt_screen;
+        self.window_start = Instant::now();
+        self.sent_in_window = 0;
+        self.warned_in_window = false;
+        self.start_snapshot_line();
+    }
+
+    fn start_snapshot_line(&mut self) {
+        self.snapshot_id = self.snapshot_id.wrapping_add(1).max(1);
+    }
+
+    const fn snapshot_id(&self) -> u64 {
+        self.snapshot_id
+    }
+
+    fn snapshot_decision(&mut self, force: bool, now: Instant) -> SnapshotDecision {
+        // `force` bypasses the rate limiter so the program's final frame at EOF is never
+        // dropped just because the current window's update budget was already spent.
+        if !self.alt_screen || force {
+            return SnapshotDecision::Emit;
+        }
+
+        if now.duration_since(self.window_start) >= Duration::from_secs(1) {
+            self.window_start = now;
+            self.sent_in_window = 0;
+            self.warned_in_window = false;
+        }
+
+        if self.sent_in_window < ALT_SCREEN_MAX_UPDATES_PER_SEC {
+            return SnapshotDecision::Emit;
+        }
+
+        if self.warned_in_window {
+            SnapshotDecision::Drop
+        } else {
+            self.warned_in_window = true;
+            SnapshotDecision::Warn
+        }
+    }
+
+    fn record_snapshot_sent(&mut self) {
+        if self.alt_screen {
+            self.sent_in_window = self.sent_in_window.saturating_add(1);
+        }
+    }
+}
+
 enum PtyRead {
     Bytes(usize),
     Eof,
@@ -652,34 +729,6 @@ fn spawn_log_reader_thread(args: LogReaderArgs) {
             }
         }
 
-        struct RateLimit {
-            alt_screen: bool,
-            window_start: Instant,
-            sent_in_window: u32,
-            warned_in_window: bool,
-            have_snapshot: bool,
-        }
-
-        impl RateLimit {
-            fn new() -> Self {
-                Self {
-                    alt_screen: false,
-                    window_start: Instant::now(),
-                    sent_in_window: 0,
-                    warned_in_window: false,
-                    have_snapshot: false,
-                }
-            }
-
-            fn set_alt_screen(&mut self, alt_screen: bool) {
-                self.alt_screen = alt_screen;
-                self.window_start = Instant::now();
-                self.sent_in_window = 0;
-                self.warned_in_window = false;
-                self.have_snapshot = false;
-            }
-        }
-
         fn send_log(
             events_tx: &mpsc::Sender<ProcessEvent>,
             service_id: &ServiceID,
@@ -704,31 +753,19 @@ fn spawn_log_reader_thread(args: LogReaderArgs) {
             run_id: RunId,
             force: bool,
         ) {
-            // `force` bypasses the rate limiter so the program's final frame at EOF is never
-            // dropped just because the current window's update budget was already spent.
-            if rate.alt_screen && !force {
-                let now = Instant::now();
-                if now.duration_since(rate.window_start) >= Duration::from_secs(1) {
-                    rate.window_start = now;
-                    rate.sent_in_window = 0;
-                    rate.warned_in_window = false;
-                }
-                if rate.sent_in_window >= ALT_SCREEN_MAX_UPDATES_PER_SEC {
-                    if !rate.warned_in_window {
-                        rate.warned_in_window = true;
-                        send_log(
-                            events_tx,
-                            service_id,
-                            run_id,
-                            LogUpdateKind::Append,
-                            "[micromux] interactive output rate-limited".to_string(),
-                        );
-                        // The warning was Appended as a new line; the next snapshot must start
-                        // a fresh live line (Append) rather than ReplaceLast-ing the warning.
-                        rate.have_snapshot = false;
-                    }
+            match rate.snapshot_decision(force, Instant::now()) {
+                SnapshotDecision::Emit => {}
+                SnapshotDecision::Warn => {
+                    send_log(
+                        events_tx,
+                        service_id,
+                        run_id,
+                        LogUpdateKind::Append,
+                        "[micromux] interactive output rate-limited".to_string(),
+                    );
                     return;
                 }
+                SnapshotDecision::Drop => return,
             }
 
             let _rows = term.screen_lines();
@@ -799,17 +836,16 @@ fn spawn_log_reader_thread(args: LogReaderArgs) {
                 }
             }
 
-            let update = if rate.have_snapshot {
-                LogUpdateKind::ReplaceLast
-            } else {
-                rate.have_snapshot = true;
-                LogUpdateKind::Append
-            };
-
-            send_log(events_tx, service_id, run_id, update, snapshot);
-            if rate.alt_screen {
-                rate.sent_in_window = rate.sent_in_window.saturating_add(1);
-            }
+            send_log(
+                events_tx,
+                service_id,
+                run_id,
+                LogUpdateKind::LiveSnapshot {
+                    id: rate.snapshot_id(),
+                },
+                snapshot,
+            );
+            rate.record_snapshot_sent();
         }
 
         fn flush(
@@ -867,8 +903,6 @@ fn spawn_log_reader_thread(args: LogReaderArgs) {
                 flush(line, events_tx, service_id, run_id);
             }
         }
-
-        const ALT_SCREEN_MAX_UPDATES_PER_SEC: u32 = 4;
 
         let LogReaderArgs {
             service_id,
@@ -1003,7 +1037,7 @@ fn spawn_log_reader_thread(args: LogReaderArgs) {
                             if boundary || filter.take_saw_non_sgr_csi() {
                                 interactive = true;
                                 dirty = true;
-                                rate.have_snapshot = false;
+                                rate.start_snapshot_line();
                                 line.clear();
                             }
                         }
@@ -1363,4 +1397,76 @@ pub(super) fn start_service_with_pty_size(
         },
         log_reader,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use similar_asserts::assert_eq;
+
+    #[test]
+    fn rate_limit_increments_id_on_alt_screen_transition() {
+        let mut rate = RateLimit::new();
+
+        assert_eq!(rate.snapshot_id(), 0);
+        rate.set_alt_screen(true);
+        assert_eq!(rate.snapshot_id(), 1);
+        rate.set_alt_screen(false);
+        assert_eq!(rate.snapshot_id(), 2);
+    }
+
+    #[test]
+    fn rate_limit_boundary_transition_increments_id() {
+        let mut rate = RateLimit::new();
+
+        rate.start_snapshot_line();
+        assert_eq!(rate.snapshot_id(), 1);
+        rate.start_snapshot_line();
+        assert_eq!(rate.snapshot_id(), 2);
+    }
+
+    #[test]
+    fn rate_limit_window_reset_keeps_snapshot_id() {
+        let mut rate = RateLimit::new();
+        let start = Instant::now();
+        rate.set_alt_screen(true);
+        rate.window_start = start;
+        let snapshot_id = rate.snapshot_id();
+
+        for _ in 0..ALT_SCREEN_MAX_UPDATES_PER_SEC {
+            assert_eq!(rate.snapshot_decision(false, start), SnapshotDecision::Emit);
+            rate.record_snapshot_sent();
+        }
+
+        assert_eq!(
+            rate.snapshot_decision(false, start + Duration::from_secs(1)),
+            SnapshotDecision::Emit
+        );
+        assert_eq!(rate.snapshot_id(), snapshot_id);
+    }
+
+    #[test]
+    fn rate_limit_warning_keeps_snapshot_id() {
+        let mut rate = RateLimit::new();
+        let start = Instant::now();
+        rate.set_alt_screen(true);
+        rate.window_start = start;
+        let snapshot_id = rate.snapshot_id();
+
+        for _ in 0..ALT_SCREEN_MAX_UPDATES_PER_SEC {
+            assert_eq!(rate.snapshot_decision(false, start), SnapshotDecision::Emit);
+            rate.record_snapshot_sent();
+        }
+
+        assert_eq!(
+            rate.snapshot_decision(false, start + Duration::from_millis(100)),
+            SnapshotDecision::Warn
+        );
+        assert_eq!(rate.snapshot_id(), snapshot_id);
+        assert_eq!(
+            rate.snapshot_decision(false, start + Duration::from_millis(100)),
+            SnapshotDecision::Drop
+        );
+        assert_eq!(rate.snapshot_id(), snapshot_id);
+    }
 }

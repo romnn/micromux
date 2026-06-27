@@ -30,6 +30,7 @@ pub struct Service {
     pub exec_state: Execution,
     pub open_ports: Vec<u16>,
     pub logs: AsyncBoundedLog,
+    pub live_snapshot_id: Option<u64>,
     pub cached_num_lines: u16,
     pub cached_logs: String,
     pub logs_dirty: bool,

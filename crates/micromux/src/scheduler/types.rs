@@ -262,6 +262,11 @@ pub enum LogUpdateKind {
     Append,
     /// Replace the most recent line in the log buffer.
     ReplaceLast,
+    /// Update a live snapshot line, appending it first if the target line is absent.
+    LiveSnapshot {
+        /// Stable identifier for the live snapshot line within one process run.
+        id: u64,
+    },
 }
 
 /// Origin stream of output.

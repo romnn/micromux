@@ -83,6 +83,7 @@ impl App {
                     exec_state: state::Execution::Pending,
                     open_ports: service.open_ports.clone(),
                     logs: BoundedLog::with_limits(1000, 64 * MIB).into(),
+                    live_snapshot_id: None,
                     cached_num_lines: 0,
                     cached_logs: String::new(),
                     logs_dirty: true,
