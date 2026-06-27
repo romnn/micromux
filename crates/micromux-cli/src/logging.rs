@@ -64,10 +64,9 @@ pub fn setup(
         .with_default_directive(default_log_level.into())
         .parse(default_log_directive)?;
 
-    let use_rust_log_override = std::env::var(EnvFilter::DEFAULT_ENV)
-        .ok()
-        .map(|s| !s.is_empty())
-        .is_some();
+    // Only honor RUST_LOG when it is set *and* non-empty; an empty value must fall back to the
+    // default filter rather than building an empty directive that silences everything.
+    let use_rust_log_override = std::env::var(EnvFilter::DEFAULT_ENV).is_ok_and(|s| !s.is_empty());
     let env_filter = if use_rust_log_override {
         match tracing_subscriber::filter::EnvFilter::builder()
             .with_env_var(EnvFilter::DEFAULT_ENV)

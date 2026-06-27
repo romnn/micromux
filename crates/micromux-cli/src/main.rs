@@ -40,7 +40,27 @@ fn spawn_shutdown_handler(shutdown: micromux::CancellationToken) {
     });
 }
 
-fn setup_logging(options: &options::Options) -> eyre::Result<()> {
+/// Derive an effective log level from the configured `--log` level and the `-v`/`-q` counts.
+///
+/// `--log`/`RUST_LOG` take precedence; otherwise `-v`/`-q` adjust a `WARN` baseline.
+fn effective_log_level(options: &options::Options) -> tracing::metadata::Level {
+    use tracing::metadata::Level;
+    if let Some(level) = options.log_level {
+        return level;
+    }
+    let delta = i16::from(options.verbosity.verbose) - i16::from(options.verbosity.quiet);
+    match delta {
+        i16::MIN..=-1 => Level::ERROR,
+        0 => Level::WARN,
+        1 => Level::INFO,
+        2 => Level::DEBUG,
+        _ => Level::TRACE,
+    }
+}
+
+fn setup_logging(
+    options: &options::Options,
+) -> eyre::Result<tracing_appender::non_blocking::WorkerGuard> {
     let project_dir =
         micromux::project_dir().ok_or_else(|| eyre::eyre!("failed to create project directory"))?;
     let log_file = match options.log_file.as_deref() {
@@ -49,8 +69,8 @@ fn setup_logging(options: &options::Options) -> eyre::Result<()> {
             cache_dir: project_dir.cache_dir(),
         },
     };
-    let _guard = logging::setup(options.log_level, &log_file)?;
-    Ok(())
+    let guard = logging::setup(Some(effective_log_level(options)), &log_file)?;
+    Ok(guard)
 }
 
 async fn load_config(
@@ -113,7 +133,9 @@ async fn run() -> eyre::Result<()> {
     spawn_shutdown_handler(shutdown.clone());
 
     let color_choice = options.color_choice.unwrap_or(termcolor::ColorChoice::Auto);
-    setup_logging(&options)?;
+    // Hold the guard for the whole program: dropping it shuts down the non-blocking log writer
+    // thread, after which nothing is written to the log file.
+    let _log_guard = setup_logging(&options)?;
 
     let config = load_config(&options, color_choice).await?;
 
@@ -141,8 +163,11 @@ async fn run() -> eyre::Result<()> {
         }
         mux_res = &mut mux_handle => {
             shutdown.cancel();
+            // Let the TUI exit its loop and restore the terminal before propagating any
+            // scheduler error, otherwise the terminal is left in raw mode / alternate screen.
+            let tui_res = tui_handle.await;
             mux_res??;
-            tui_handle.await??;
+            tui_res??;
         }
     }
 
