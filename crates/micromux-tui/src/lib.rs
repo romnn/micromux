@@ -249,7 +249,9 @@ impl App {
 
     fn handle_input_event(&mut self, input_event: event::Input) {
         match input_event {
-            event::Input::Tick => self.tick(),
+            // Ticks exist only to drive a periodic redraw, which the run loop already does
+            // after handling any input event.
+            event::Input::Tick => {}
             event::Input::Event(event) => self.handle_crossterm_event(&event),
         }
     }
@@ -477,9 +479,6 @@ impl App {
             .min(max_off);
     }
 
-    /// Handles the tick event of the terminal.
-    pub fn tick(&self) {}
-
     fn is_running(&self) -> bool {
         self.running
     }
@@ -593,6 +592,7 @@ mod tests {
     use codespan_reporting::diagnostic::Diagnostic;
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
     use indoc::indoc;
+    use similar_asserts::assert_eq;
     use std::path::Path;
     use tokio::sync::mpsc;
 

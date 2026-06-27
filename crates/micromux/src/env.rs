@@ -280,6 +280,7 @@ fn is_var_continue(c: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use similar_asserts::assert_eq;
 
     #[test]
     fn dotenv_parse_basic() -> eyre::Result<()> {

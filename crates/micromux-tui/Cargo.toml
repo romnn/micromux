@@ -49,3 +49,4 @@ futures.workspace = true
 [dev-dependencies]
 codespan-reporting.workspace = true
 indoc.workspace = true
+similar-asserts.workspace = true

@@ -9,7 +9,7 @@ tasks:
     desc: "run"
     interactive: true
     cmds:
-      - cargo run -p micromux-cli -- {{.CLI_ARGS}}
+      - cargo run -- {{.CLI_ARGS}}
 
   build:
     desc: "build in debug mode"
@@ -78,6 +78,16 @@ tasks:
     cmds:
       - cargo clean {{.CLI_ARGS}}
 
+  clean:build:
+    desc: "remove zigbuild/cc probe garbage object files"
+    cmds:
+      # prettier-ignore
+      - >-
+        find .
+        -type f
+        \( -name '.intentionally-empty-file.o' -o -name '*detect_compiler_family.o' \)
+        -delete
+
   docs:
     desc: "open documentation preview"
     env:
@@ -88,7 +98,8 @@ tasks:
   outdated:
     desc: "check for outdated cargo workspace dependencies"
     cmds:
-      - cargo outdated --workspace --ignore-external-rel --exit-code 1 -v {{.CLI_ARGS}}
+      - cooldown --tool cargo outdated {{.CLI_ARGS}}
+      # - cargo outdated --workspace --ignore-external-rel --exit-code 1 -v {{.CLI_ARGS}}
 
   unused:
     desc: "check for unused cargo workspace dependencies"
@@ -109,44 +120,33 @@ tasks:
   test:
     desc: "test cargo workspace"
     cmds:
-      - cargo test --workspace --all-targets {{.CLI_ARGS}}
+      - cargo nextest run --workspace --all-targets --no-tests "warn" {{.CLI_ARGS}}
 
   test:fc:
     desc: "test cargo workspace for all combinations of features"
     cmds:
-      - cargo fc test --workspace --all-targets {{.CLI_ARGS}}
+      - cargo fc nextest run --workspace --all-targets --no-tests "warn" {{.CLI_ARGS}}
+
+  test:doc:
+    desc: "run doctests in cargo workspace"
+    cmds:
+      - cargo test --doc --workspace {{.CLI_ARGS}}
 
   lint:
     desc: "lint cargo workspace"
     cmds:
-      # prettier-ignore
-      - >-
-        cargo clippy
-        --workspace --all-targets --all-features
-        {{.CLI_ARGS}}
-        -- -Dclippy::all -Dclippy::pedantic
+      - cargo lint --workspace --all-features {{.CLI_ARGS}}
 
   lint:fc:
     desc: "lint cargo workspace for all combinations of features"
     cmds:
-      # prettier-ignore
-      - >-
-        cargo fc clippy
-        --workspace --all-targets
-        {{.CLI_ARGS}}
-        -- -Dclippy::all -Dclippy::pedantic
+      - cargo fc lint --dedup {{.CLI_ARGS}}
 
   lint:fix:
     desc: "lint and fix cargo workspace"
     aliases: [fix]
     cmds:
-      # prettier-ignore
-      - >-
-        cargo clippy
-        --fix --allow-dirty --allow-staged
-        --workspace --all-targets --all-features
-        {{.CLI_ARGS}}
-        -- -Dclippy::all -Dclippy::pedantic
+      - cargo fixit --workspace --all-features {{.CLI_ARGS}}
 
   lint:actions:
     desc: "lint github actions"

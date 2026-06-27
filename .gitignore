@@ -1,7 +1,14 @@
 .DS_Store
+*.log
+
+# rust
 target/
+
+# goreleaser
 target-goreleaser/
 goreleaser-dist/
-
 .intentionally-empty-file.o
-*.log
+
+# cooldown
+.cooldown.lock
+.cooldown-versions-*

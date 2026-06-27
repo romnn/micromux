@@ -29,6 +29,7 @@ fn wrapped_text_height(text: &ratatui::text::Text, wrap_width: u16) -> u16 {
 mod tests {
     use super::{log_view::LogView, wrapped_text_height};
     use ratatui::{buffer::Buffer, layout::Rect};
+    use similar_asserts::assert_eq;
 
     fn count_thumb(buf: &Buffer, area: Rect) -> usize {
         let mut n = 0;

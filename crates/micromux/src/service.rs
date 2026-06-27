@@ -13,6 +13,7 @@ mod tests {
     use super::*;
     use crate::config;
     use indexmap::IndexMap;
+    use similar_asserts::assert_eq;
     use std::fs;
 
     use std::time::{SystemTime, UNIX_EPOCH};

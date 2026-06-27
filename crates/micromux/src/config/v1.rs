@@ -702,6 +702,7 @@ mod tests {
     use codespan_reporting::diagnostic::Diagnostic;
     use color_eyre::eyre;
     use indoc::indoc;
+    use similar_asserts::assert_eq;
     use std::path::Path;
 
     fn get_service<'a>(cfg: &'a config::Config, name: &str) -> eyre::Result<&'a config::Service> {

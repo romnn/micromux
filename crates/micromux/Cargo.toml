@@ -71,3 +71,4 @@ indoc.workspace = true
 jsonschema = "0"
 serde_json = "1"
 serde_yaml = "0"
+similar-asserts.workspace = true

@@ -1,12 +1,12 @@
 [workspace]
 resolver = "2"
-default-members = [
-	"crates/micromux-cli",
-]
 members = [
 	"crates/clippy-wrapper",
 	"crates/micromux",
 	"crates/micromux-tui",
+	"crates/micromux-cli",
+]
+default-members = [
 	"crates/micromux-cli",
 ]
 
@@ -21,11 +21,14 @@ homepage = "https://github.com/romnn/micromux"
 repository = "https://github.com/romnn/micromux"
 
 [workspace.lints.rust]
+warnings = { level = "deny", priority = -1 }
 unsafe_code = "deny"
 unused_must_use = "deny"
 missing_docs = "warn"
 
 [workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
 unwrap_used      = "deny"
 expect_used      = "deny"
 panic            = "deny"
@@ -34,6 +37,11 @@ unimplemented    = "deny"
 todo             = "deny"
 indexing_slicing = "deny"
 missing_errors_doc = "warn"
+
+# Allowed
+map_unwrap_or = "allow"
+assigning_clones = "allow"
+struct_excessive_bools = "allow"
 
 [profile.release]
 opt-level = 3
@@ -64,3 +72,6 @@ serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0"
 futures = "0"
+
+# testing
+similar-asserts = "1"

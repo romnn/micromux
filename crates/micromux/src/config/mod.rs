@@ -317,7 +317,7 @@ pub enum ConfigError {
     },
     #[error(transparent)]
     /// A YAML parser error occurred.
-    YAML(#[from] yaml_spanned::Error),
+    Yaml(#[from] yaml_spanned::Error),
 }
 
 impl ToDiagnostics for ConfigError {
@@ -344,7 +344,7 @@ impl ToDiagnostics for ConfigError {
                 Self::invalid_value_diagnostics(file_id, message, span)
             }
             Self::Serde { source, span } => Self::serde_diagnostics(file_id, self, source, span),
-            Self::YAML(source) => {
+            Self::Yaml(source) => {
                 use yaml_spanned::error::ToDiagnostics;
                 source.to_diagnostics(file_id)
             }
@@ -526,7 +526,7 @@ pub fn from_str<F: Copy + PartialEq>(
     strict: Option<bool>,
     diagnostics: &mut Vec<Diagnostic<F>>,
 ) -> Result<ConfigFile<F>, ConfigError> {
-    let value = yaml_spanned::from_str(raw_config).map_err(ConfigError::YAML)?;
+    let value = yaml_spanned::from_str(raw_config).map_err(ConfigError::Yaml)?;
     let version = parse_version(&value, file_id, strict, diagnostics)?;
     let config = match version {
         Version::Latest | Version::V1 => v1::parse_config(&value, file_id, strict, diagnostics)?,
@@ -543,6 +543,7 @@ pub fn from_str<F: Copy + PartialEq>(
 mod tests {
     use indoc::indoc;
     use jsonschema::{Draft, Validator};
+    use similar_asserts::assert_eq;
     use std::path::Path;
 
     fn compiled_schema() -> color_eyre::eyre::Result<Validator> {
