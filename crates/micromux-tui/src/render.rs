@@ -8,28 +8,28 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     prelude::*,
     style::{Color, Modifier, Style, Styled, palette::tailwind},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Scrollbar, Widget},
+    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Scrollbar, Widget, Wrap},
 };
 
-fn wrapped_text_height(text: &ratatui::text::Text, wrap_width: u16) -> u16 {
-    let wrap_width = (wrap_width.max(1)) as usize;
-    let height = text
-        .lines
-        .iter()
-        .map(|line| {
-            let width = line.width();
-            let rows = width.saturating_add(wrap_width.saturating_sub(1)) / wrap_width;
-            rows.max(1)
-        })
-        .sum::<usize>();
+fn rendered_line_count(paragraph: &Paragraph<'_>, width: u16) -> u16 {
+    let height = paragraph.line_count(width);
     u16::try_from(height).unwrap_or(u16::MAX)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{log_view::LogView, wrapped_text_height};
-    use ratatui::{buffer::Buffer, layout::Rect};
+    use super::{log_view::LogView, rendered_line_count};
+    use ratatui::{
+        buffer::Buffer,
+        layout::Rect,
+        widgets::{Paragraph, Wrap},
+    };
     use similar_asserts::assert_eq;
+
+    fn wrapped_text_height(text: ratatui::text::Text, wrap_width: u16) -> u16 {
+        let paragraph = Paragraph::new(text).wrap(Wrap { trim: false });
+        rendered_line_count(&paragraph, wrap_width)
+    }
 
     fn count_thumb(buf: &Buffer, area: Rect) -> usize {
         let mut n = 0;
@@ -47,12 +47,34 @@ mod tests {
         buf.cell((x, y)).map(ratatui::buffer::Cell::symbol) == Some("▐")
     }
 
+    fn row_text(buf: &Buffer, x: u16, y: u16, width: u16) -> String {
+        let mut out = String::new();
+        for col in x..x.saturating_add(width) {
+            if let Some(cell) = buf.cell((col, y)) {
+                out.push_str(cell.symbol());
+            }
+        }
+        out
+    }
+
     #[test]
     fn wrapped_text_height_matches_expected_rows() {
         let text: ratatui::text::Text = "abcdefghij".into();
-        assert_eq!(wrapped_text_height(&text, 4), 3);
-        assert_eq!(wrapped_text_height(&text, 5), 2);
-        assert_eq!(wrapped_text_height(&text, 10), 1);
+        assert_eq!(wrapped_text_height(text.clone(), 4), 3);
+        assert_eq!(wrapped_text_height(text.clone(), 5), 2);
+        assert_eq!(wrapped_text_height(text, 10), 1);
+    }
+
+    #[test]
+    fn wrapped_text_height_uses_word_boundaries() {
+        let text: ratatui::text::Text = "aaaaaa aaaaaa aaaaaa".into();
+        assert_eq!(wrapped_text_height(text, 10), 3);
+    }
+
+    #[test]
+    fn wrapped_text_height_matches_zero_width_paragraph() {
+        let text: ratatui::text::Text = "abcdefghij".into();
+        assert_eq!(wrapped_text_height(text, 0), 0);
     }
 
     #[test]
@@ -167,6 +189,48 @@ mod tests {
         let thumb_wrapped = count_thumb(&buf2, scrollbar_area);
 
         assert!(thumb_wrapped <= thumb_unwrapped);
+    }
+
+    #[test]
+    fn wrapped_follow_tail_reaches_final_rendered_row() {
+        let mut view = LogView {
+            wrap: true,
+            follow_tail: true,
+            ..LogView::default()
+        };
+
+        let buf_area = Rect {
+            x: 0,
+            y: 0,
+            width: 9,
+            height: 4,
+        };
+        let mut buf = Buffer::empty(buf_area);
+        let log_area = Rect {
+            x: 0,
+            y: 0,
+            width: 8,
+            height: 4,
+        };
+        let scrollbar_area = Rect {
+            x: 8,
+            y: 1,
+            width: 1,
+            height: 2,
+        };
+
+        let rendered = view.render(
+            log_area,
+            scrollbar_area,
+            0,
+            "abcdefghijklmnopqrstuvwx",
+            &mut buf,
+        );
+
+        assert_eq!(rendered, 4);
+        assert_eq!(view.scroll_offset, 2);
+        assert_eq!(row_text(&buf, 1, 1, 6), "mnopqr");
+        assert_eq!(row_text(&buf, 1, 2, 6), "stuvwx");
     }
 }
 
@@ -390,11 +454,16 @@ impl App {
             escaped.into()
         });
 
+        let raw_num_lines = u16::try_from(tui_text.height()).unwrap_or(u16::MAX);
         let wrap_width = pane_area.width.saturating_sub(2);
+        let mut paragraph = Paragraph::new(tui_text);
+        if self.healthcheck_view.wrap {
+            paragraph = paragraph.wrap(Wrap { trim: false });
+        }
         let num_lines: u16 = if self.healthcheck_view.wrap {
-            wrapped_text_height(&tui_text, wrap_width)
+            rendered_line_count(&paragraph, wrap_width)
         } else {
-            u16::try_from(tui_text.height()).unwrap_or(u16::MAX)
+            raw_num_lines
         };
         current_service.healthcheck_cached_num_lines = num_lines;
 
@@ -414,12 +483,9 @@ impl App {
             .viewport_content_length(viewport_height.into())
             .position(self.healthcheck_view.scroll_offset as usize);
 
-        let mut paragraph = Paragraph::new(tui_text)
+        let paragraph = paragraph
             .block(Block::default().borders(Borders::ALL).title("Healthcheck"))
             .scroll((self.healthcheck_view.scroll_offset, 0));
-        if self.healthcheck_view.wrap {
-            paragraph = paragraph.wrap(ratatui::widgets::Wrap { trim: false });
-        }
         Widget::render(&paragraph, pane_area, buf);
 
         let scrollbar = Scrollbar::new(ratatui::widgets::ScrollbarOrientation::VerticalRight)
@@ -572,11 +638,16 @@ pub mod log_view {
                 escaped.into()
             });
 
+            let raw_num_lines = u16::try_from(text.height()).unwrap_or(u16::MAX);
             let wrap_width = log_area.width.saturating_sub(2);
+            let mut paragraph = Paragraph::new(text);
+            if self.wrap {
+                paragraph = paragraph.wrap(Wrap { trim: false });
+            }
             let num_lines = if self.wrap {
-                super::wrapped_text_height(&text, wrap_width)
+                super::rendered_line_count(&paragraph, wrap_width)
             } else {
-                u16::try_from(text.height()).unwrap_or(u16::MAX)
+                raw_num_lines
             };
 
             let viewport_height = scrollbar_area.height;
@@ -595,14 +666,9 @@ pub mod log_view {
                 .viewport_content_length(viewport_height.into())
                 .position(self.scroll_offset as usize);
 
-            // Build paragraph
-            let mut paragraph = Paragraph::new(text)
+            let paragraph = paragraph
                 .block(Block::default().borders(Borders::ALL).title("Logs"))
                 .scroll((self.scroll_offset, 0)); // scroll by lines then cols
-
-            if self.wrap {
-                paragraph = paragraph.wrap(Wrap { trim: false });
-            }
 
             Widget::render(&paragraph, log_area, buf);
 
