@@ -26,6 +26,9 @@ jobs:
 
   audit:
     runs-on: ubuntu-24.04
+    # Advisories can appear for transitive deps we can't immediately patch; surface them without
+    # failing the workflow (and turning the badge red).
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v6
       - uses: arduino/setup-task@v2
