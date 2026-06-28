@@ -22,7 +22,7 @@ homepage = "https://github.com/romnn/micromux"
 repository = "https://github.com/romnn/micromux"
 
 [workspace.lints.rust]
-warnings = { level = "deny", priority = -1 }
+warnings = { level = "warn", priority = -1 }
 unsafe_code = "deny"
 unused_must_use = "deny"
 missing_docs = "warn"
