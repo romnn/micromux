@@ -470,6 +470,7 @@ impl RateLimit {
 enum PtyRead {
     Bytes(usize),
     Eof,
+    #[cfg(unix)]
     Cancelled,
 }
 
@@ -961,9 +962,23 @@ fn spawn_log_reader_thread(args: LogReaderArgs) {
                 dirty = true;
             }
 
-            let n = match reader.read(&mut buf)? {
+            let read = reader.read(&mut buf)?;
+            let n = match read {
                 PtyRead::Bytes(n) => n,
-                PtyRead::Eof | PtyRead::Cancelled => {
+                PtyRead::Eof => {
+                    finish_stream(
+                        interactive,
+                        &term,
+                        &mut rate,
+                        &events_tx,
+                        &service_id,
+                        run_id,
+                        &mut line,
+                    );
+                    break;
+                }
+                #[cfg(unix)]
+                PtyRead::Cancelled => {
                     finish_stream(
                         interactive,
                         &term,
