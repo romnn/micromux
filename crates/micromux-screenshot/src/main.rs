@@ -102,7 +102,11 @@ fn micromux_bin(workspace: &Path) -> eyre::Result<PathBuf> {
     let dir = exe
         .parent()
         .ok_or_else(|| eyre!("current executable has no parent directory"))?;
-    let name = if cfg!(windows) { "micromux.exe" } else { "micromux" };
+    let name = if cfg!(windows) {
+        "micromux.exe"
+    } else {
+        "micromux"
+    };
     let candidate = dir.join(name);
     if candidate.exists() {
         return Ok(candidate);
@@ -194,7 +198,9 @@ fn capture(micromux: &Path, example_dir: &Path, scenario: &Scenario) -> eyre::Re
     }
 
     for keys in scenario.keys {
-        writer.write_all(keys).wrap_err("failed to send keystroke")?;
+        writer
+            .write_all(keys)
+            .wrap_err("failed to send keystroke")?;
         writer.flush().ok();
         settle(&rx, &mut parser);
     }
