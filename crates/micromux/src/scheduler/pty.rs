@@ -538,6 +538,9 @@ impl LogReaderHandle {
         Self {}
     }
 
+    // On Unix this drops the cancellation pipe's write end, waking the reader's poll; other
+    // platforms have no such pipe, so cancellation is a no-op and the receiver goes unused there.
+    #[cfg_attr(not(unix), allow(clippy::unused_self))]
     pub(super) fn cancel(&mut self) {
         #[cfg(unix)]
         {
@@ -646,7 +649,9 @@ fn active_log_readers() -> &'static Mutex<std::collections::HashSet<(ServiceID, 
     ACTIVE.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
 }
 
-#[cfg(test)]
+// Only the Unix-gated scheduler tests query this, so gate it to `unix` as well; otherwise the
+// Windows test build compiles it with no callers and flags it as dead code.
+#[cfg(all(test, unix))]
 pub(super) fn log_reader_active(service_id: &ServiceID, run_id: RunId) -> bool {
     active_log_readers()
         .lock()
