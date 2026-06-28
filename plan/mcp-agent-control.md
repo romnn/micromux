@@ -94,12 +94,13 @@ Two transports, deliberately different:
 - **MCP server ↔ micromux sessions: a local control endpoint** (Unix domain
   socket on Unix/macOS; named pipe on Windows), keyed by filesystem path / pipe
   name. N sessions never collide, no port allocation, user-permission scoped, no
-  network. **The port-conflict problem disappears.** On Unix/macOS the **socket is
-  the only on-disk artifact** — its name is derived deterministically from the
-  project's config path and all metadata is fetched live via `Describe`, so there
-  is no registry file to drift, race, or leak. (Windows named pipes are not
-  filesystem-enumerable, so they need a small sentinel index — see spec; the
-  "socket-only" invariant is Unix/macOS-specific.)
+  network. **The port-conflict problem disappears.** On Unix/macOS there is **no
+  metadata registry — discovery uses sockets only**: the socket name is derived
+  deterministically from the project's config path and all metadata is fetched live
+  via `Describe`. (The only other on-disk file is a permanent per-hash `.lock` used
+  *solely* for ownership coordination — never read for discovery or metadata.)
+  Windows is not socket-enumerable, so it uses a per-hash sentinel file instead — see
+  spec.
 
 Rejected alternative — *each session is its own HTTP/SSE MCP server*: agent
 config needs a stable URL; a per-session ephemeral port has none, reintroducing
@@ -111,9 +112,9 @@ the discovery + allocation problem the proxy already solves for free.
 
 | Component | Crate | Responsibility |
 |---|---|---|
-| Authoritative session model | `micromux` (core) | Private `Inner`; possession-scoped `SessionModelWriter` + `Clone` `SessionModelReader`; split `ServiceControlSink`/`TuiCommandSink` ports; `SessionChange` notifications. The enabling refactor. |
-| Control protocol + client/server | `micromux-control` (new) | Wire DTOs, `Describe`/discovery, `ControlEndpoint` + `ControlClient`/`ControlServer` framing, path derivation. Shared by server + MCP. |
-| Control endpoint adapter | `micromux-cli` | Bind the endpoint (race-safe dance) and clean up on exit; run `ControlServer` over a `Reader` + `ServiceControlSink` (no writer, no input-forwarding). |
+| Authoritative session model | `micromux` (core) | Private `Inner`; possession-scoped `SessionModelWriter` + `Clone` `SessionModelReader`; narrow `ServiceControl` adapter for untrusted frontends; `SessionChange` notifications. The enabling refactor. |
+| Control protocol + client/server | `micromux-control` (new) | Wire envelopes, `Describe`/discovery, concrete `ControlEndpoint` enum + client/server framing, path derivation. Shared by server + MCP. |
+| Control endpoint adapter | `micromux-cli` | Bind the endpoint (race-safe dance) and clean up on exit; run `ControlServer` over a `Reader` + `ServiceControl` (no writer, no input-forwarding). |
 | `micromux ctl` (optional) | `micromux-cli` | Tiny CLI client that dogfoods the socket; validates the protocol; nice for humans/scripts. |
 | MCP server | `micromux-mcp` (new lib) + `micromux mcp` subcommand | Discover sessions, expose MCP tools, proxy to endpoints. |
 
@@ -133,9 +134,10 @@ Each milestone is independently mergeable and leaves `main` shippable.
 
 ### M0 — Enabling refactor: the authoritative session model
 
-**No user-visible behavior change. TUI unchanged in this milestone.** This is the
-structurally important part: the model becomes the single source of truth, and it
-is **written by the scheduler from its own state transitions** — not a second
+**No user-visible behavior change for a responsive TUI; a wedged TUI no longer
+stalls supervision.** The TUI is otherwise unchanged in this milestone. This is
+the structurally important part: the model becomes the single source of truth, and
+it is **written by the scheduler from its own state transitions** — not a second
 reducer that independently re-derives lifecycle from thin events (which is what
 would drift).
 
@@ -178,15 +180,15 @@ runtime. The model's `run_generation` = the current run's id if running, else
 ```rust
 // crates/micromux/src/model.rs  (sketch)
 pub enum Desired   { Enabled, Disabled }
-pub enum Execution { Pending, Starting, Running, Stopping, Exited } // Stopping = today's Killed (awaiting exit)
+pub enum Execution { Pending, Starting, Running, Stopping, Exited } // promoted from the TUI's domain state
 
 pub struct ServiceSnapshot {
     pub id: ServiceID,
     pub name: String,
     pub desired: Desired,             // requested state (Disabled is a *desire*, not an execution)
     pub execution: Execution,         // observed lifecycle
-    pub health: Option<Health>,       // Healthy/Unhealthy, None until first probe resolves
-    pub run_generation: u64,          // scheduler RunId; bumps on every (re)start
+    pub health: Option<Health>,       // reuses core health_check::Health; None until first probe resolves
+    pub run_generation: u64,          // public name for scheduler RunId; bumps on every (re)start
     pub open_ports: Vec<u16>,
     pub healthcheck_configured: bool,
     pub last_exit_code: Option<i32>,
@@ -195,8 +197,9 @@ pub struct ServiceSnapshot {
 }
 
 // Private shared state. Neither handle exposes the lock; both wrap the same Arc<Inner>.
-struct Inner { /* RwLock per service: snapshot + BoundedLog + live_snapshot_id
-                 + bounded HealthCheck history; broadcast::Sender<SessionChange>; global seq */ }
+struct Inner { /* one RwLock<IndexMap<ServiceID, ServiceEntry>>:
+                 snapshot + BoundedLog + live_snapshot_id + bounded HealthCheck history;
+                 broadcast::Sender<SessionChange> */ }
 
 /// READ capability. `Clone`, handed to every adapter (TUI, control server, MCP).
 /// It has no write methods — the lack is the security boundary.
@@ -214,11 +217,11 @@ impl SessionModelReader {
 /// (`pub(in crate::scheduler)` would NOT compile here: a restricted path must name an
 /// *ancestor* module, and `crate::scheduler` is a sibling of `crate::model`.) Instead:
 /// `SessionModelWriter` is `pub(crate)`, has NO public constructor and is `!Clone`, and
-/// the ONLY way to obtain one is `channel()` below — which hands it straight into the
+/// the ONLY way to obtain one is `SessionModel::new()` below — which hands it straight into the
 /// scheduler future. It never appears in `Handles`, so no adapter can hold one.
 pub(crate) struct SessionModelWriter { inner: Arc<Inner> }
 impl SessionModelWriter {
-    pub(crate) fn write_snapshot(&self, snap: ServiceSnapshot);     // bumps seq, publishes Change{Status}
+    pub(crate) fn write_snapshot(&self, snap: ServiceSnapshot);     // publishes Change{Status}
     pub(crate) fn append_log(&self, id: &ServiceID, update: LogUpdateKind, line: String);
     // healthcheck lifecycle mirrors the scheduler's events (Started/LogLine/Finished),
     // so ordering and the result update stay structurally explicit:
@@ -229,15 +232,17 @@ impl SessionModelWriter {
 
 /// The ONLY constructor for the model — returns the paired handles. `start_with_handles`
 /// moves the writer into the scheduler future and returns only the reader.
-pub(crate) fn channel() -> (SessionModelReader, SessionModelWriter);
+impl SessionModel {
+    pub(crate) fn new() -> (SessionModelReader, SessionModelWriter);
+}
 
-pub struct SessionChange { pub seq: u64, pub service_id: ServiceID, pub kind: ChangeKind } // Status | Logs | Health
+pub struct SessionChange { pub service_id: ServiceID, pub kind: ChangeKind } // Status | Logs | Health
 ```
 
 **Capability flow.** The writer is unforgeable (no public constructor, `!Clone`) and
 is moved into the scheduler future, never into `Handles` — so the reader is the only
 model handle an adapter ever sees. The only path by which an adapter can affect state
-is: *adapter → `ServiceControlSink` → scheduler → `Writer` → model → `Reader` →
+is: *adapter → `ServiceControl` → scheduler → `Writer` → model → `Reader` →
 adapter*. An adapter cannot shortcut into a model mutation; that is enforced by *who
 holds the writer*, not by review.
 
@@ -252,14 +257,14 @@ cases later:
 - **Bounded healthcheck history**, not just the last attempt (the TUI shows
   history). `get_health` returns the latest; M4 reads the whole ring.
 - **Public types are deliberate.** Export stable `Desired`, `Execution`, `Health`,
-  `RestartPolicy` from the crate root for the model API; the wire crate has its own
-  `serde` DTO mirrors. The public model surface must not leak private/internal
-  modules.
+  `RestartPolicy` from the crate root for the model API; the control crate reuses
+  those stable payloads inside its protocol envelopes. The public model surface
+  must not leak private/internal modules.
 
 **Why `SessionChange`, not the full `Event`, on the broadcast:** the broadcast is
 liveness-only. `broadcast` drops for lagging receivers, so it must not be the
 carrier of content (log strings, etc.). Subscribers receive a tiny
-`{ seq, service_id, kind }` and **re-query the model**, which holds the content.
+`{ service_id, kind }` and **re-query the model**, which holds the content.
 A lagging subscriber loses nothing but a coalescible notification.
 
 **What "lossless" means here (corrected).** Logs are appended to the model in the
@@ -272,40 +277,67 @@ rather than pretend otherwise.
 
 **Invariant: the scheduler never awaits a frontend.** Today non-log events use
 `ui_tx.send(..).await`, so a wedged-but-open TUI channel could pause the scheduler —
-which would mean an adapter *can* affect the core. Forbid it: every scheduler→TUI
-send becomes non-blocking (`try_send`, like logs already are; or the legacy `ui_tx`
-is isolated behind a small **bridge task** that owns the backpressure). The model is
-written *before* the forward, so a dropped frame is only a transient visual glitch
-the TUI self-corrects from on the next event — and is gone entirely after M4, when
-the TUI consumes `SessionChange` (a non-blocking broadcast) instead of `ui_tx`. This
-is the structural form of "adapters cannot stall the core."
+which would mean an adapter *can* affect the core. M0 uses a small **legacy TUI
+bridge task**: the scheduler writes the model, then non-blockingly hands legacy
+events to the bridge; the bridge owns any await on the old TUI channel. The drop
+policy is **not uniform**, because the pre-M4 reducer still depends on ordered
+lifecycle events:
 
-**Core API — capability handles only, with the command port *also* split.** A
-single `Command`-sending port would let any adapter send `SendInput`/`ResizeAll`,
-so "no raw input forwarding" would be policy, not types. Split it:
+- **While the bridge is healthy:** log frames (`LogLine`/live snapshots) may be
+  dropped or coalesced (already best-effort, fact #3), but lifecycle/status events
+  (`Started`, `Exited`, `Killed`, `Disabled`, `ClearLogs`, health transitions) are
+  delivered **in order and not silently coalesced** — the pre-M4 reducer depends on
+  them.
+- **If the lifecycle bridge overflows (the TUI is wedged):** the old reducer is
+  treated as **degraded** — explicitly, by detaching that frontend (a frozen UI,
+  not a silently-corrupted one) rather than dropping lifecycle events mid-stream or
+  growing unbounded. The honest claim is *not* "the old reducer is always perfect
+  under backpressure"; it is "**the model stays authoritative**, the scheduler never
+  blocks, and a degraded frontend is visibly degraded." After M4 the TUI reads
+  `SessionModelReader` + `SessionChange` directly and the path disappears.
+
+This makes "adapters cannot stall the core" honest without pretending the legacy
+reducer is perfect under sustained backpressure.
+
+**Core API — capability handles only.** The TUI is trusted, in-process, and keeps
+the full `mpsc::Sender<Command>` capability it already needs today for
+`SendInput`/`ResizeAll`. The untrusted boundary is the control/MCP adapter
+constructor, which receives a narrow `ServiceControl` wrapper exposing only safe
+service operations:
 
 ```rust
 // Restricted capability — the ONLY command port handed to untrusted adapters
-// (control server, MCP). Each method constructs a safe Command variant internally;
-// there is no method that emits SendInput or ResizeAll, so they are unreachable.
+// (control server, MCP). Each method builds a safe Command variant internally (no
+// SendInput/ResizeAll method exists, so they are unreachable) and is **request/response**:
+// the command carries a oneshot reply, so the *scheduler* validates and latches the
+// generation at the exact moment it processes the command — no pre-queue snapshot race.
 #[derive(Clone)]
-pub struct ServiceControlSink { tx: mpsc::Sender<Command> }    // restart, restart_all, enable, disable
-
-// Full capability — TUI only (attach-mode input, terminal resize).
-pub struct TuiCommandSink { tx: mpsc::Sender<Command> }        // service control + send_input + resize_all
-impl TuiCommandSink { pub fn service_control(&self) -> ServiceControlSink; /* downgrade */ }
+pub struct ServiceControl { tx: mpsc::Sender<Command> }    // restart, restart_all, enable, disable
+pub enum CommandRejection { UnknownService, InvalidState }  // e.g. restart on a Disabled service
+type ServiceCommandResult = Result<Vec<ServiceCommandAck>, CommandRejection>; // Vec covers RestartAll
+impl ServiceControl {
+    pub async fn restart(&self, id: &ServiceID) -> Result<ServiceCommandResult, SchedulerStopped>;
+    pub async fn restart_all(&self)             -> Result<ServiceCommandResult, SchedulerStopped>;
+    pub async fn enable(&self, id: &ServiceID)  -> Result<ServiceCommandResult, SchedulerStopped>;
+    pub async fn disable(&self, id: &ServiceID) -> Result<ServiceCommandResult, SchedulerStopped>;
+}
+// Two nested Results: the OUTER Err is transport (the scheduler dropped the reply → SchedulerStopped);
+// the INNER Err is the scheduler's typed rejection; Ok(Ok(acks)) carries each affected service's
+// latched observed_generation (a Vec, so RestartAll fits). The control server maps
+// Ok(Ok)→Accepted, Ok(Err)→Error{code}, Err(SchedulerStopped)→Error{SchedulerStopped}. The Command
+// service-control variants gain an Option<oneshot::Sender<ServiceCommandResult>>; the TUI passes
+// None (fire-and-forget, unchanged).
 
 pub struct Handles {
     pub reader: SessionModelReader,        // READ: query + subscribe()
-    pub commands: ServiceControlSink,      // SEND (restricted): the safe default for adapters
+    pub commands: mpsc::Sender<Command>,   // full trusted in-process command sender for the TUI/CLI
 }
 
 impl Micromux {
     /// Non-async: builds the model (`Inner` + `Writer` kept by the scheduler) and the
-    /// command channel internally, returns the `Reader` + restricted `ServiceControlSink`
+    /// command channel internally, returns the `Reader` + command sender
     /// alongside the runner future. `Arc<Self>` makes the future `'static` so the caller
-    /// can `tokio::spawn` it while holding the Handles. The `Writer` never leaves the core;
-    /// the full `TuiCommandSink` is obtained only via the dedicated TUI wiring path.
+    /// can `tokio::spawn` it while holding the Handles. The `Writer` never leaves the core.
     pub fn start_with_handles(
         self: std::sync::Arc<Self>,
         ui_tx: mpsc::Sender<Event>,        // transitional: feeds the unchanged TUI until M4
@@ -315,11 +347,13 @@ impl Micromux {
 ```
 
 The enforcement point is **type, not discipline**: `ControlServer::new` and the MCP
-adapter take a `ServiceControlSink`, which has no `send_input`/`resize_all` method
-and cannot construct those variants — so input forwarding is *unreachable* for them,
-even from trusted wiring. The TUI is the sole holder of `TuiCommandSink`. The
-existing `start(ui_tx, commands_rx, shutdown)` stays as a thin compatibility wrapper
-over the same internal runner (it just doesn't expose the reader).
+adapter take `ServiceControl`, which has no `send_input`/`resize_all` method and
+cannot construct those variants — so input forwarding is *unreachable* for them.
+The TUI keeps the full sender because it is the trusted in-process frontend that
+already owns PTY input and resize today. `micromux` is still pre-1.0; once the CLI
+migrates to `start_with_handles`, prefer changing/removing the old `start(...)`
+signature instead of carrying a compatibility shim for a hypothetical external
+consumer.
 
 **Tests:** projection unit tests (each `ServiceRuntime` transition →
 expected snapshot: desired vs execution, run_generation bump on restart, exit
@@ -328,8 +362,9 @@ capacity and assert the scheduler keeps **processing further commands and
 transitions** (not merely that the model saw the first one), while TUI frames may
 drop; a `SessionChange`/re-query round-trip.
 
-**Acceptance:** TUI behaves identically; `cargo test` green; model reflects
-scheduler truth under load.
+**Acceptance:** behavior is identical for a responsive TUI; under a wedged TUI the
+bridge may drop/coalesce legacy visual frames instead of stalling supervision.
+`cargo test` green; model reflects scheduler truth under load.
 
 ### M1 — Control plane: the per-session control endpoint
 
@@ -338,14 +373,13 @@ opt-out two ways (decided):** a CLI flag (`--no-control`) and a config-file
 setting (top-level `control: { enabled: false }`). Also auto-disabled if no
 runtime dir is resolvable. The CLI flag wins over the config setting.
 
-Define the **transport abstraction now** (even though only Unix lands first), so
-the seam exists and Windows is not a retrofit:
+Define the **endpoint enum now** (even though only Unix lands first), so Windows is
+not a retrofit without adding speculative trait/generic machinery:
 
 ```rust
 enum ControlEndpoint { Unix(PathBuf), WindowsNamedPipe(String) }
-// micromux-control exposes transport-agnostic `ControlServer` (bind/accept) and
-// `ControlClient` (connect) over this. Unix sockets, Windows named pipes, and any
-// future daemon endpoint satisfy the same API. The core knows none of it.
+// micromux-control exposes concrete bind/accept/connect functions that match on
+// this closed set. The core knows none of it.
 ```
 
 On startup (the session is the *only* writer on disk — the proxy never writes):
@@ -353,21 +387,20 @@ On startup (the session is the *only* writer on disk — the proxy never writes)
    platform-appropriate perms.
 2. Compute the endpoint deterministically from the canonical config path:
    `…/micromux/<hash>.sock` (Unix) / `\\.\pipe\micromux-<hash>` (Windows). Bind it
-   via the **race-safe dance** (see spec: lifetime-held `flock` + inode-ownership),
+   via the **race-safe dance** (see spec: lifetime-held lock),
    so concurrent same-config starts and crash-leaked sockets are handled without
    ever unlinking a live peer's socket.
 3. Spawn an accept loop (one task per connection). The `ControlServer` is
    constructed with exactly two capabilities — a `SessionModelReader` (queries +
-   `subscribe()`) and a `ServiceControlSink` (mutations). It holds **no writer** (so
+   `subscribe()`) and a `ServiceControl` (mutations). It holds **no writer** (so
    it cannot mutate the model — a command becomes a write only after the scheduler
    processes it) and **no input port** (`SendInput`/`ResizeAll` are not expressible
-   through `ServiceControlSink`). `Describe` returns session identity (pid,
+   through `ServiceControl`). `Describe` returns session identity (pid,
    start_time, name, working_dir, config_path, services, protocol version).
 
-On shutdown (hook the existing `CancellationToken`): unlink the socket **only if
-it still points at the inode this process bound** (see spec). A crash that skips
-this leaves an inert socket that the next same-project start reclaims via the
-dance — no background reaper.
+On shutdown (hook the existing `CancellationToken`): unlink the socket while still
+holding the lifetime lock. A crash that skips this leaves an inert socket that the
+next same-project start reclaims after acquiring the lock — no background reaper.
 
 Optional in this milestone: `micromux ctl {ls|logs|restart|…}` — a tiny client in
 the same binary (not feature-gated). Exercises the protocol end-to-end with no
@@ -376,9 +409,8 @@ MCP/agent in the loop and gives humans/scripts a CLI.
 **Tests:** boot the core against a temp config, connect, assert
 `list_services` / `restart` / `get_logs` / `Describe`; **concurrent same-config
 startup** (two cores race the same hash → exactly one acquires the lifetime lock
-and binds; the other runs with control disabled, no second endpoint); **shutdown
-unlinks only its own socket** (A leaks, B rebinds the path, A's shutdown must not
-remove B's socket).
+and binds; the other runs with control disabled, no second endpoint); leaked
+socket reclaim after crash/forced exit.
 
 **Acceptance:** with micromux running, `micromux ctl` lists services, tails logs,
 restarts a service; the socket is cleaned up on exit and a leaked one is reclaimed
@@ -403,23 +435,62 @@ Tools (v1):
 
 | Tool | Args | Returns | Backed by |
 |---|---|---|---|
-| `list_sessions` | — | id, name, cwd, pid, services | endpoint scan + `Describe` |
-| `list_services` | `session?` | name, desired, execution, health, ports, uptime, restart policy, last exit, run_generation | `SessionModelReader::services` |
+| `list_sessions` | — | id, name, cwd, **config_path**, pid, services | endpoint scan + `Describe` |
+| `list_services` | `session?` | **resolved session config_path**; per service: name, desired, execution, health, ports, uptime, restart policy, last exit, run_generation | `SessionModelReader::services` |
 | `get_logs` | `service`, `session?`, `tail?` (default + capped) | recent log lines | `SessionModelReader::logs` |
-| `restart_service` | `service`, `session?` | `Accepted` → `G` | `Command::Restart` |
-| `restart_all` | `session?` | `Accepted` (all **enabled** services; disabled skipped) | `Command::RestartAll` |
-| `enable_service` | `service`, `session?` | `Accepted` | `Command::Enable` |
-| `disable_service` | `service`, `session?` | `Accepted` | `Command::Disable` |
+| `restart_service` | `service`, `session?` | `Accepted` → `G` (gen *before* restart); `InvalidState` if disabled | `Command::Restart` |
+| `restart_all` | `session?` | `Accepted` (enabled services only; disabled skipped) | `Command::RestartAll` |
+| `enable_service` | `service`, `session?` | `Accepted` → `G` (gen *before* enable) | `Command::Enable` |
+| `disable_service` | `service`, `session?` | `Accepted` (gen informational; no healthy wait implied) | `Command::Disable` |
 | `get_health` | `service`, `session?` | latest probe: success, exit code, command, output | HC history (latest) |
+| `wait_for_healthy` | `service`, `after_generation?`, `timeout`, `session?` | healthy / exited(code) / timeout / typed error | see below |
 
-Mutations are **`Accepted`, not done**: the server validates the service(s) exist,
-forwards the command, and returns each affected service's *observed* generation.
-"Accepted" means queued, not that the service restarted (see `wait_for_healthy`).
+Mutations are **`Accepted`, not done**, and **validation + the generation come from
+the scheduler, not a pre-queue reader snapshot** — otherwise an auto-restart or a
+prior queued command could advance the generation between a server-side snapshot and
+the scheduler actually processing the command, and `wait_for_healthy(after_generation
+= G)` would key off the wrong run. So the `ServiceControl` call is request/response:
+the scheduler **validates and latches `observed_generation` at the exact moment it
+processes the command** and replies. A closed reply (scheduler shutting down) →
+**`SchedulerStopped`**, never a spurious `Accepted`. Per-command semantics:
+- `restart_service` / `enable_service`: the latched generation *before* the action,
+  used as `G` in `wait_for_healthy`.
+- **`restart_service` on a `Disabled` service → `InvalidState`** (not a silent
+  re-enable): `enable_service` is the operation that starts a disabled service, so
+  `desired == Disabled` keeps its meaning. **Milestone boundary (explicit):** the
+  scheduler enforces this strict rule only for **acknowledged commands** (those
+  carrying a reply — i.e. `ServiceControl`, from M2). The **TUI's fire-and-forget
+  restart key keeps today's behavior unchanged through M0–M3** (it has no reply
+  channel to receive a rejection on), so M0's "no behavior change" claim holds; the
+  two paths are unified at M4 when the TUI moves onto the model.
+- `disable_service`: generation informational (no healthy wait implied).
+- `restart_all`: acks only the enabled services it actually restarted.
 
 `get_logs` is **bounded independently of the request frame**: `tail: None` could
 otherwise exceed the 1 MiB frame cap. Apply a default tail (e.g. 200 lines), a max
 tail, and a `max_bytes` response cap (drop oldest beyond it). Large histories are
-paged by the caller, not returned whole.
+paged by the caller, not returned whole. **`get_health` is capped the same way** —
+even though the model already stores bounded HC history, the *response* applies its
+own max lines / `max_bytes` so a chatty probe can't blow the frame.
+
+**`wait_for_healthy` — the other half of the control loop** (here in M2, not M3:
+`restart_service` without it is only half a loop). It is **generation-aware** to
+avoid the restart race: an agent that calls `restart_service` (returns `G`) then
+`wait_for_healthy(after_generation = G)` must not observe the *pre-restart* Healthy
+state.
+
+- With `after_generation = G`: resolve when, for a run with `run_generation > G`,
+  `execution == Running && (healthcheck_configured ? health == Healthy : true)`.
+- **`after_generation` omitted**: accept the *current* state (no new run required) —
+  this is the "is it healthy right now?" query.
+- **`run_generation == 0`** means never started; the wait then blocks for the first
+  run to come up (or times out / fails fast per below).
+- **Fails fast with `InvalidState`** (not a timeout) if `desired == Disabled` and no
+  generation past `G` is in flight — a disabled service will never become healthy.
+- Fails on `Exited` (returns the exit code) or `timeout`.
+- **Race-free**: subscribe → query snapshot → wait on changes (re-query each; treat
+  `broadcast::RecvError::Lagged` as "re-query now"), so a transition between the
+  read and the subscription can't strand the wait. Not a fixed-interval poll.
 
 **Tests:** in-process core + endpoint, call tool handlers, assert each behavior; a
 discovery test with two fake endpoints (stub listeners) asserting cwd-derived
@@ -431,26 +502,14 @@ with zero selector args when launched in that project's dir.
 
 ### M3 — Ergonomics & polish
 
-- **`wait_for_healthy(service, after_generation?, timeout, session?)`** — the
-  highest-value tool, and **generation-aware** to avoid the restart race: an agent
-  that calls `restart_service` (returns generation `G`) then
-  `wait_for_healthy(after_generation = G)` must not observe the *pre-restart*
-  Healthy state. Resolves when, for a run with `run_generation > G`:
-  `execution == Running && (healthcheck_configured ? health == Healthy : true)`.
-  Fails on `Exited` (returns the exit code) or timeout. **Fails fast with a typed
-  state error** (not a timeout) if `desired == Disabled` and no generation past `G`
-  is in flight — a disabled service will never become healthy, so that should be an
-  immediate `UnknownService`/disabled-style error, not a `timeout`. Implemented with the
-  **race-free subscribe sequence** so a transition between the first read and the
-  subscription can't strand the wait until timeout: **subscribe first, then query
-  the snapshot, then wait on changes** (re-querying on each), and treat
-  `broadcast::RecvError::Lagged` as "re-query now," not an error. Not a
-  fixed-interval poll.
 - **Optional config `name:`** — top-level identifier surfaced as the session id;
   add to the v1 parser (`config/v1.rs`) and known top-level keys. Falls back to
   `basename(working_dir)`, disambiguated by pid.
-- **Optional log streaming** — a `follow_logs` tool over the existing `Subscribe`
-  stream, once there's a need.
+- **Optional log streaming** — a `follow_logs` tool. It must **not** rely on
+  `SessionChange` ordering for log content: that broadcast is a coalescible liveness
+  signal (re-query is correct for *snapshots*, lossy for a byte stream). Streaming
+  uses an **explicit cursor / monotonic log-entry id** so a follower resumes exactly
+  where it left off without gaps or dupes.
 - Docs: README section + agent config snippets (Claude Code + Codex) for the
   `~/dev/configuration` repo.
 
@@ -509,7 +568,7 @@ is what actually gates access (a peer must traverse the dir to `connect`):
 
 - **Unix:** directory mode `0700`; set the socket `0600` too, defensively.
 - **Windows:** secure the named pipe with an ACL restricting it to the current
-  user's SID (there is no `chmod`); the sentinel-index dir uses a current-user ACL.
+  user's SID (there is no `chmod`); the sentinel dir uses a current-user ACL.
 
 ### Endpoint layout & the `Describe` handshake
 
@@ -535,22 +594,48 @@ Describe → { protocol_version, pid, start_time, name, working_dir,
              config_path, services: [..], micromux_version }
 ```
 
-`pid` + `start_time` form a **start token** that defends against PID reuse (for the
-inode/start-token ownership checks and Windows sentinel records). `name` is the
-config `name:` (M3) else `basename(working_dir)`.
+`pid` + `start_time` form a **start token** that defends against PID reuse for
+Windows sentinel records. `name` is the config `name:` (M3) else
+`basename(working_dir)`.
 
-- **Unix/macOS — socket-only invariant.** The socket is the only on-disk artifact;
-  there is no metadata file to drift, race, or leak. Enumeration = `readdir` the
-  dir for `*.sock` + connect + `Describe`.
-- **Windows — named pipes + sentinel index.** Named pipes are not
-  filesystem-enumerable, so `list_sessions` reads a small **sentinel/index file**
-  (one record per session, carrying the start token) and verifies each record by
-  connect + `Describe`. To stay consistent with the read-only proxy, the **proxy
-  only *skips* records that fail to connect** — it never edits the file; the
-  sentinel is written/compacted solely by session startup/shutdown under the
-  per-hash lock. **Loopback TCP is a last resort only**, and only with a random
-  per-session auth token and a 127.0.0.1 bind — otherwise it violates the
-  no-network-exposure goal.
+The supported transports are a **closed set** — no network transport, ever (so no
+TCP, no per-session auth token, no browser-style local-trust problem):
+
+- **Unix/macOS — Unix domain socket; no metadata registry.** Discovery uses sockets
+  only (`readdir` `*.sock` + connect + `Describe`); there is no metadata file to
+  drift, race, or leak. The only other file is the permanent per-hash `.lock`, which
+  exists solely for ownership coordination and is never read for discovery.
+- **Windows — named pipe with a current-user ACL + a sentinel *directory*.** Named
+  pipes are not filesystem-enumerable, so each session writes **one sentinel file per
+  hash** (`…/micromux/<hash>.json`, carrying pipe name + start token) — mirroring the
+  one-socket-per-hash Unix layout, **not** a single global index. `list_sessions`
+  `readdir`s the sentinel dir, reads each, and verifies it by connect + `Describe`.
+  This sidesteps the cross-session write race a global index would have (two projects
+  hold *different* per-hash locks, so they could atomically clobber a shared file):
+  - each session writes/removes **only its own `<hash>` sentinel**, under its own
+    per-hash lifetime lock — single-writer-per-file, no global lock, no compaction;
+  - creation/update is an **atomic replace** (write temp → fsync as appropriate →
+    rename) under the per-hash lock, so `list_sessions` never observes a half-written
+    sentinel (no transient false negative);
+  - the **proxy only skips** sentinels that fail to connect (read-only, never edits);
+  - **malformed/partial sentinels are ignored** on read, never fatal (belt-and-braces
+    behind the atomic replace);
+  - a leaked sentinel (crash) is reclaimed when the next same-hash session takes the
+    lock and rewrites it.
+- **Any other platform — unsupported.** The control plane / MCP is cleanly absent
+  (see the gating note below); the TUI still works.
+
+If the Windows named-pipe + sentinel work feels disproportionate to ship first,
+**gate the control plane off on Windows** initially (treat it like an unsupported
+platform) — a cleaner trade than weakening the transport model with TCP.
+
+**Unsupported must be explicit, not silent.** On a platform without a transport, do
+not let `micromux mcp` look like "nothing is running." Prefer **compiling the `mcp`
+/ control subcommands out** of unsupported builds, so `micromux mcp` is simply not a
+command. If they are present, every tool returns a clear **`UnsupportedPlatform`**
+diagnostic ("control plane is not supported on this platform"), distinct from an
+empty session list. Same for the session-side: a control-disabled session advertises
+nothing and logs why.
 
 ### The race-safe bind / reclaim dance
 
@@ -559,19 +644,22 @@ A naive "see stale socket → unlink → bind" has three failure modes: a TOCTOU
 race (an old process unlinks a successor's fresh socket), and a
 **misclassification risk** — connect-probing a live-but-overloaded listener whose
 backlog is full can look "refused." Close all three by making a **lifetime-held
-advisory lock the authoritative ownership signal**, not connect-probing:
+ownership lock the authoritative ownership signal**, not connect-probing:
 
-1. A session acquires an exclusive advisory **`flock` on `…/micromux/<hash>.lock`**
-   and **holds it for its entire lifetime**. The kernel releases it automatically
-   on process exit, *including crash*, so "lock acquirable" ⇔ "no live owner" —
-   more robust than connect-probing, which can misread a wedged listener. (Runtime
-   dirs are local — tmpfs / `$XDG_RUNTIME_DIR` — so advisory `flock` is reliable.)
+1. A session acquires an exclusive ownership lock for `<hash>` and **holds it for
+   its entire lifetime**. On Unix/macOS this is a permanent
+   `…/micromux/<hash>.lock` file locked with `flock` and never unlinked. On Windows
+   M1-Windows uses the platform equivalent (named mutex or lock file compatible
+   with the sentinel index). The OS releases it automatically on process exit,
+   *including crash*, so "lock acquirable" ⇔ "no live owner" — more robust than
+   connect-probing, which can misread a wedged listener.
 2. **Acquired the lock** ⇒ no live owner: `unlink` any stale endpoint and bind.
    **Could not acquire** ⇒ a live owner holds this project; do **not** touch its
    endpoint (second-instance policy below).
-3. After binding, record the endpoint's `(st_dev, st_ino)` (Unix) / start token
-   (Windows). On shutdown, while still holding the lifetime lock, `stat` and
-   **unlink only if it still matches** what this process bound — never a successor's.
+3. On shutdown, while still holding the lifetime lock, unlink the endpoint. A
+   successor cannot have bound the same path yet because it cannot acquire the lock
+   until this process exits/releases it. Windows start tokens remain useful as
+   sentinel identity, not as an ownership guard.
 
 **Same-config second-instance policy (decided):** there is **at most one control
 endpoint per project**, matching `Current` selection (which connects only
@@ -587,18 +675,19 @@ endpoint, one writer of it.
 **A session's liveness is decided by the kernel's connection result, never by how
 fast it replies.**
 
-- `connect()` → `ECONNREFUSED` / `ENOENT` ⇒ unambiguously dead. (A unix socket
-  file outlives its process; an orphan refuses connections.)
-- A session alive but *busy* still accepts at the kernel level (the listen backlog
-  is in-kernel), so it connects fine even while its loop is slow.
-- A timeout governs only "how long I wait for a *reply* to a request I already
-  delivered." Hitting it returns a `Busy` error to the agent — it **never deletes
-  or de-lists the session.**
+- Only a **hard connection error** — `ECONNREFUSED` / `ENOENT` — means **dead** (a
+  unix socket file outlives its process; an orphan refuses connections).
+- A live-but-busy session usually still accepts at the kernel level (the backlog is
+  in-kernel), so it connects while its loop is slow. But a **saturated backlog** can
+  make `connect()` block or time out — that is **`Busy`/unknown, never `dead`**, and
+  **never eligible for cleanup**. Cleanup keys only on the hard errors above.
+- A *reply* timeout (a request already delivered) likewise returns `Busy` — it
+  **never deletes or de-lists the session.**
 
 Corollary: a laggy session can never be "healed away." Only connection-level
 failure (refused / gone / start-token mismatch) marks a session absent. Note this
 governs the **read path** (the proxy, which never mutates). The **write path** (a
-session reclaiming a stale endpoint) uses the lifetime `flock` as its ownership
+session reclaiming a stale endpoint) uses the lifetime ownership lock as its
 signal instead — robust even when connect would be ambiguous under backlog
 pressure.
 
@@ -647,12 +736,13 @@ enum Response {
     Services(Vec<ServiceSnapshot>),
     Logs { lines: Vec<LogLine> },
     Health(Option<HealthAttempt>),
-    Accepted { seq: u64, services: Vec<ServiceCommandAck> }, // queued (validated) — NOT "completed"
+    Accepted { services: Vec<ServiceCommandAck> }, // queued (validated) — NOT "completed"
     Change(SessionChange),              // only after Subscribe
     Error { code: ErrorCode, message: String },
 }
 struct ServiceCommandAck { service: ServiceID, observed_generation: u64 }
-enum ErrorCode { UnknownService, NoSession, Busy, Timeout, ProtocolVersionMismatch, BadRequest, Internal }
+enum ErrorCode { UnknownService, NoSession, Ambiguous, Busy, Timeout, InvalidState,
+                 SchedulerStopped, UnsupportedPlatform, ProtocolVersionMismatch, BadRequest, Internal }
 ```
 
 `Accepted` carries a list so it fits `RestartAll` (every affected service) as well
@@ -660,10 +750,17 @@ as single-service mutations and enable/disable. The MCP `restart_service` tool
 flattens the single ack and surfaces its `observed_generation` as `G` for
 `wait_for_healthy(after_generation = G)`.
 
-`Describe` carries `protocol_version`; a mismatch yields `ProtocolVersionMismatch`
-so an old proxy against a new session (or vice versa) fails loudly, not weirdly.
-Snapshot/health/log DTOs are plain `serde::Serialize` mirrors of core types so the
-core does not depend on the wire crate.
+`Describe` carries `protocol_version`; a mismatch yields a hard
+`ProtocolVersionMismatch` so an old proxy against a new session (or vice versa)
+fails loudly, not weirdly. **Compatibility expectation:** the session and the proxy
+are expected to be the *same installed binary version* (they are literally the same
+binary, `micromux mcp` vs `micromux`); there is **no cross-version compatibility
+guarantee pre-1.0**, and a mismatch is a hard error, not a negotiation. Protocol
+envelopes (`Request`, `Response`, `Describe`) live in `micromux-control`; domain
+payloads (`ServiceSnapshot`, `HealthAttempt`, `LogLine`, etc.) are stable core
+types that derive serde and are reused directly. If compatibility pressure appears
+later, DTO mirrors can be introduced then; v1 should not duplicate payload structs
+for a same-version internal protocol.
 
 ### Session selection (MCP server) — read-only, connect-to-verify, typed selector
 
@@ -674,7 +771,9 @@ enum SessionSelector { Current, Name(String), Pid(u32), ConfigHash(String) } // 
 The proxy never mutates the filesystem; it only connects.
 
 1. Explicit selector (`Name`/`Pid`/`ConfigHash`) → resolve to its endpoint (scan +
-   `Describe` to match); error `NoSession` if it does not answer.
+   `Describe` to match); error `NoSession` if none answers. **If a `Name` matches
+   more than one live session, return `Ambiguous` — never silently pick one** (two
+   projects could share a `name:`; picking arbitrarily could drive the wrong one).
 2. Else `MICROMUX_SESSION` env → parsed as a selector.
 3. Else `Current`: run micromux's own `find_config_file` upward from the proxy's
    cwd (the project root the client launched it in), canonicalize, hash, connect.
@@ -683,6 +782,18 @@ The proxy never mutates the filesystem; it only connects.
 4. `list_sessions` / disambiguation scan, connect, `Describe`, and silently skip
    the ones that refuse.
 
+**Selection is ambient, so make the target legible.** cwd, `MICROMUX_SESSION`, or a
+shared `name:` can all point at the wrong project. The endpoint is same-user only
+(so this is a *wrong-target* risk, not a privilege one), but to keep the agent and
+human honest, `Describe` always carries `config_path`, and `list_sessions` /
+`list_services` **surface the resolved session's `config_path` prominently** so it
+is obvious which micromux is being driven before any mutation.
+
+If a session was started with `--config /elsewhere/micromux.yaml`, the cwd-derived
+happy path will not find it unless the proxy is launched from a directory whose
+config search resolves to the same canonical path. That is expected; use an
+explicit selector or `list_sessions` for non-default config locations.
+
 ---
 
 ## Crate / module layout
@@ -690,14 +801,14 @@ The proxy never mutates the filesystem; it only connects.
 ```
 crates/
   micromux/                 # core — knows nothing about sockets/pipes/MCP/JSON/discovery
-    src/model.rs            # NEW: Inner (private) + SessionModelReader (pub, Clone) + SessionModelWriter (pub(in scheduler)); ServiceSnapshot; SessionChange; pure &ServiceRuntime->ServiceSnapshot projection
-    src/scheduler.rs        # private runtime state; transition methods mutate runtime + write_snapshot via the Writer; append_log on LogLine
-    src/scheduler/types.rs  # surface RunId as run_generation; desired/execution projection
-    src/lib.rs              # start_with_handles(self: Arc<Self>, ui_tx, shutdown) -> (future, Handles{reader, commands: ServiceControlSink}); ServiceControlSink/TuiCommandSink; model::channel()
-  micromux-control/         # NEW lib: wire DTOs + Describe; ControlEndpoint; ControlClient/ControlServer framing; path derivation; dir resolution
+    src/model.rs            # NEW: Inner (private) + SessionModelReader (pub, Clone) + possession-scoped SessionModelWriter; ServiceSnapshot; SessionChange; pure &ServiceRuntime->ServiceSnapshot projection; SessionModel::new()
+    src/scheduler.rs        # private runtime state; transition methods mutate runtime + write_snapshot via the Writer; append_log on LogLine; handle_command validates + latches observed_generation, replies on the command's oneshot
+    src/scheduler/types.rs  # internal RunId, surfaced publicly as run_generation; desired/execution projection
+    src/lib.rs              # start_with_handles(self: Arc<Self>, ui_tx, shutdown) -> (future, Handles{reader, commands: mpsc::Sender<Command>}); ServiceControl wrapper for untrusted adapters
+  micromux-control/         # NEW lib: wire envelopes + Describe; ControlEndpoint; concrete client/server framing; path derivation; dir resolution
   micromux-cli/
     Cargo.toml              # [features] default = ["mcp"]; mcp = ["dep:micromux-mcp"]
-    src/control/mod.rs      # NEW: run ControlServer over a Reader + ServiceControlSink; race-safe bind/reclaim; inode-guarded unlink
+    src/control/mod.rs      # NEW: run ControlServer over a Reader + ServiceControl; race-safe lifetime-lock bind/reclaim
     src/control/ctl.rs      # OPTIONAL: `micromux ctl` client subcommand (not feature-gated)
     src/mcp.rs              # NEW: `#[cfg(feature = "mcp")]` thin shim → micromux-mcp; gated at the top
     src/options.rs          # control flags; `ctl` subcommand; `Mcp` variant under #[cfg(feature = "mcp")]
@@ -713,8 +824,9 @@ crates/
   enabled by the default-on `mcp` feature (`mcp = ["dep:micromux-mcp"]`), so `rmcp`
   is built only when the feature is on.
 - `micromux-control`: `serde`/`serde_json`, `tokio` (UnixListener/UnixStream;
-  named pipes on Windows), `directories` (already used). A small advisory-lock dep
-  (`fs2`/`fd-lock`) for the bind `flock`.
+  named pipes on Windows), `directories` (already used). A small lock dependency
+  (`fs2`/`fd-lock` or platform-specific equivalent) for the lifetime ownership
+  lock.
 - `micromux` core: `tokio::sync::broadcast` (tokio already present).
 
 Mind the workspace lints (`unwrap_used`, `expect_used`, `panic`, `indexing_slicing`
@@ -729,16 +841,17 @@ across `.await`" (see robustness).
 - **Endpoint perms (platform-specific):** Unix dir `0700` (the dir gates `connect`)
   + socket `0600`; Windows named-pipe ACL to the current user. No network, no
   other-user access by construction.
-- **Liveness invariant:** a session is alive iff its endpoint connects; lag never
-  de-lists it (see spec). Reaping keys on connection failure, not reply latency.
-- **Race-safe ownership:** a session holds the per-hash `flock` for its whole
-  lifetime — the authoritative "is there a live owner" signal, auto-released on
-  crash. Unlink is additionally inode (Unix) / start-token (Windows) guarded so a
-  process never removes a successor's endpoint. The reclaim path never relies on
-  connect-probing (which a wedged listener can fool).
+- **Liveness invariant:** only **hard connection errors** (`ECONNREFUSED`/`ENOENT`)
+  mark a session dead; **reply or connect timeouts (incl. backlog saturation) mark
+  `Busy`/unknown and never trigger cleanup** (see spec). Lag never de-lists.
+- **Race-safe ownership:** a session holds the per-hash ownership lock for its
+  whole lifetime — the authoritative "is there a live owner" signal, auto-released
+  on crash. A successor cannot bind until the lock is released, so shutdown cleanup
+  can unlink under the lock without an inode/start-token guard. The reclaim path
+  never relies on connect-probing (which a wedged listener can fool).
 - **Read-only proxy:** the MCP proxy never writes or deletes on disk — it *skips*
-  dead endpoints/sentinel records, never prunes them. Only sessions mutate (and
-  compact the Windows sentinel), each under its own lifetime lock, touching only
+  dead endpoints/sentinel files, never prunes them. Only sessions mutate (each
+  writes its own Windows sentinel file), under its own lifetime lock, touching only
   its own endpoint — single-writer-per-file.
 - **Cleanup:** unlink on graceful shutdown; no reaper task — a crash-leaked socket
   is inert and reclaimed by the next same-project start's dance.
@@ -771,16 +884,30 @@ across `.await`" (see robustness).
   - **concurrent same-config startup**: two cores race one hash → exactly one
     acquires the lifetime lock and binds; the other runs with control disabled; no
     live socket is ever unlinked;
-  - **shutdown unlinks only its own socket**: A leaks, B rebinds the path, A's
-    shutdown leaves B's socket intact (inode guard);
+  - **leaked socket reclaim**: a crashed process leaves a socket file; the next
+    same-config session acquires the released lifetime lock, unlinks the stale
+    endpoint, and binds;
   - **restart-then-wait**: `restart_service` (gen `G`) then
     `wait_for_healthy(after_generation = G)` does **not** return on the pre-restart
-    Healthy — only on the new run;
-  - **model under TUI backpressure**: a full `ui_tx` does not stop status
-    transitions from reaching the model;
+    Healthy — only on the new run; `G` is **latched by the scheduler at processing
+    time**, so an auto-restart racing between enqueue and processing can't hand back
+    a stale generation;
+  - **restart on disabled** → `InvalidState` (not a silent re-enable);
+  - **legacy TUI backpressure isolation**: a full/wedged `ui_tx` does not stop the
+    scheduler from processing later commands/transitions; a responsive TUI still
+    receives lifecycle events **in order**; a wedged frontend is **detached** rather
+    than fed a gap in `Started`/`Exited` (no silent reducer desync);
+  - **command acceptance failure**: a mutation against a closed command channel
+    returns `SchedulerStopped`, never a spurious `Accepted`;
   - **Windows endpoint selection** (`cfg`-gated): `ControlEndpoint` picks the named
-    pipe; sentinel-index record round-trips, the proxy **skips** records that fail
-    to connect (never edits the file), and session startup/shutdown compacts it.
+    pipe; a **per-hash sentinel file** round-trips; the proxy **skips** sentinels
+    that fail to connect (read-only, never edits); a leaked sentinel is reclaimed by
+    the next same-hash session — no global index, no compaction race;
+  - **unsupported-platform path is explicit, not empty**: with control gated off
+    (e.g. Windows pre-M1-Windows), `micromux mcp` is either **absent** or returns a
+    clear **`UnsupportedPlatform`** diagnostic — *never* an empty session list that
+    reads as "nothing running"; no tool path half-starts then fails late; the TUI
+    runs normally.
 - **MCP:** in-process core + endpoint, call tool handlers, assert outputs and
   cwd-derived discovery.
 - **Manual:** `micromux mcp` in Claude Code against `examples/demo`.
@@ -824,7 +951,7 @@ across `.await`" (see robustness).
    setting (`control: { enabled: false }`); CLI flag wins. ✅
 3. **No `send_input`:** the surface is fully typed — no raw stdin/keystroke
    forwarding, now **type-enforced** (untrusted adapters hold only
-   `ServiceControlSink`, which cannot express `SendInput`/`ResizeAll`; see #8). ✅
+   `ServiceControl`, which cannot express `SendInput`/`ResizeAll`; see #8). ✅
 4. **Model is scheduler-authoritative:** the core model is written by the scheduler
    (via `SessionModelWriter`) from its own transitions — one lifecycle model, not a
    second reducer re-deriving it. ✅
@@ -832,26 +959,26 @@ across `.await`" (see robustness).
    control APIs are unambiguous and `wait_for_healthy` can be race-free. ✅
 6. **TUI consolidation (M4) is required**, not optional — it removes the duplicate
    model. The TUI keeps view state; domain state moves to the model. ✅
-7. **Transport abstraction from M1** (`ControlEndpoint`): Unix sockets / macOS,
-   Windows named pipes; **no plain TCP** (loopback-TCP only as a last resort with a
-   per-session auth token). "Socket-only" is a Unix/macOS invariant; Windows uses a
-   verified sentinel index. Windows named-pipe support is its **own milestone
-   (M1-Windows)** gating Windows control-plane release; until it lands the Windows
-   binary runs control-disabled (never half-working). ✅
+7. **Closed transport set, no network ever** (`ControlEndpoint`): Unix/macOS = Unix
+   domain socket; Windows = named pipe with a current-user ACL; any other platform =
+   **unsupported** (control plane cleanly absent). **No TCP fallback, no auth tokens.**
+   Windows named pipes + sentinel discovery are their **own milestone (M1-Windows)**;
+   until it lands — or as a deliberate first-ship choice — Windows is gated like an
+   unsupported platform (control-disabled, never half-working). ✅
 8. **Capability-split model + ports (compiler-enforced).** The model is a private
    `Inner` behind two handles: a **possession-scoped** `SessionModelWriter` (no
-   public constructor, `!Clone`, built only by `model::channel()` and moved into the
-   scheduler future — *not* a `pub(in …)` path, which can't name a sibling module)
+   public constructor, `!Clone`, built only by `SessionModel::new()` and moved into
+   the scheduler future — *not* a `pub(in …)` path, which can't name a sibling module)
    and a `Clone` `SessionModelReader` (read + `subscribe()`) given to every adapter.
-   Adapters affect state only through a send-only **`ServiceControlSink`** — through
+   Adapters affect state only through a narrow **`ServiceControl`** — through
    which `SendInput`/`ResizeAll` are not even expressible, so "no raw input
-   forwarding" is type-enforced, not policy (the TUI alone holds the full
-   `TuiCommandSink`). Lifecycle changes go through transition methods that update
+   forwarding" is type-enforced, not policy (the trusted TUI keeps the full
+   `mpsc::Sender<Command>`). Lifecycle changes go through transition methods that update
    runtime **and** model together (no direct `state =`), so "forgot to sync" is
    impossible, not just discouraged. The core depends on no transport/protocol
-   crate; `micromux-control` owns `ControlEndpoint` + `ControlClient`/`ControlServer`,
-   so the same protocol boundary serves Unix sockets, Windows pipes, and a future
-   daemon. ✅
+   crate; `micromux-control` owns the `ControlEndpoint` enum and concrete
+   client/server framing, so the same protocol boundary serves Unix sockets and
+   Windows pipes. ✅
 
 ## Open questions to confirm before coding
 
@@ -870,20 +997,26 @@ the model is *complete* before the agent adapters are built on it:
 
 1. **M0** authoritative model written by the scheduler (private state + transition
    methods that write the model, persisted generation); capability-split
-   `Reader`/`Writer` + `ServiceControlSink`/`TuiCommandSink`; `start_with_handles` +
-   `Handles`; `SessionChange`. No behavior change.
+   `Reader`/`Writer` + narrow `ServiceControl` for untrusted adapters;
+   `start_with_handles` + `Handles`; `SessionChange`. Responsive-TUI behavior is
+   unchanged; a wedged legacy TUI cannot stall supervision.
 2. **M1** `micromux-control` + endpoint adapter for **Unix/macOS** (deterministic
-   name, lifetime-lock dance, `Describe`, transport abstraction) (+ optional `ctl`).
+   name, lifetime-lock dance, `Describe`, concrete endpoint enum) (+ optional `ctl`).
 3. **M4** fold the TUI onto the model; delete the duplicate domain reducer —
    **validates model completeness** against the hardest consumer.
 4. **M1-Windows** named-pipe transport + sentinel index behind the M1 abstraction.
    **Gates advertising Windows control-plane support**, so it lands before M2 *if*
    Windows parity is required at release; until then the Windows binary runs with
    the control plane **auto-disabled** (TUI works normally — never half-working).
-5. **M2** `micromux-mcp` + `micromux mcp` with the core tool set.
-6. **M3** `wait_for_healthy` (generation-aware), config `name`, docs/agent snippets,
-   optional log streaming.
+5. **M2** `micromux-mcp` + `micromux mcp` with the full tool set **including
+   `wait_for_healthy`** (generation-aware) — restart without it is only half the
+   control loop.
+6. **M3** config `name`, docs/agent snippets, optional log streaming.
 
 Shipping M2 before M4 is acceptable if the agent loop is urgent, but it knowingly
 carries duplicate domain state longer — so the default is M4 first. M4 is required
 either way to reach one model, many adapters.
+
+**M2 is the MCP release boundary**, and it now includes `wait_for_healthy` precisely
+because restart-then-wait is the core agent workflow — the feature is not "done"
+without generation-aware waiting. M3 is pure ergonomics layered on a complete loop.
