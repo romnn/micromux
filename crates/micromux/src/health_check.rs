@@ -16,11 +16,37 @@ pub enum Health {
 const DEFAULT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 /// Default probe timeout when none is configured (matches Docker Compose).
 const DEFAULT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// How long to wait for stdout/stderr readers to flush after the probe process exits.
+const OUTPUT_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
 
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use similar_asserts::assert_eq;
+    use std::path::PathBuf;
     use yaml_spanned::Spanned;
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(prefix: &str) -> color_eyre::eyre::Result<Self> {
+            use std::time::{SystemTime, UNIX_EPOCH};
+
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            let dir = std::env::temp_dir().join(format!("{prefix}-{nanos}"));
+            std::fs::create_dir_all(&dir)?;
+            Ok(Self(dir))
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
 
     fn spanned_string(value: &str) -> Spanned<String> {
         Spanned {
@@ -35,15 +61,9 @@ mod tests {
         use nix::errno::Errno;
         use nix::sys::signal::kill;
         use nix::unistd::Pid;
-        use std::time::{SystemTime, UNIX_EPOCH};
 
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("micromux-hc-timeout-{nanos}"));
-        std::fs::create_dir_all(&dir)?;
-        let pid_path = dir.join("pid");
+        let dir = TempDir::new("micromux-hc-timeout")?;
+        let pid_path = dir.0.join("pid");
 
         let hc = crate::config::HealthCheck {
             test: (
@@ -81,7 +101,7 @@ mod tests {
             RunId::new(1),
             1,
             RunParams {
-                working_dir: Some(&dir),
+                working_dir: Some(dir.0.as_path()),
                 environment: &env,
                 events_tx,
                 shutdown,
@@ -117,6 +137,176 @@ mod tests {
             other => color_eyre::eyre::bail!("expected ESRCH for dead pid, got {other:?}"),
         }
 
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn successful_probe_does_not_wait_for_background_stdout_holder()
+    -> color_eyre::eyre::Result<()> {
+        use nix::errno::Errno;
+        use nix::sys::signal::kill;
+        use nix::unistd::Pid;
+
+        let dir = TempDir::new("micromux-hc-bg-stdout")?;
+        let pid_path = dir.0.join("pid");
+
+        let hc = crate::config::HealthCheck {
+            test: (
+                spanned_string("sh"),
+                vec![
+                    spanned_string("-c"),
+                    spanned_string(&format!(
+                        "(trap '' TERM HUP; sleep 5) & echo $! > {}; echo healthy; exit 0",
+                        pid_path.to_string_lossy()
+                    )),
+                ],
+            ),
+            start_delay: None,
+            interval: None,
+            timeout: Some(Spanned {
+                span: yaml_spanned::spanned::Span::default(),
+                inner: std::time::Duration::from_secs(5),
+            }),
+            retries: Some(Spanned {
+                span: yaml_spanned::spanned::Span::default(),
+                inner: 1,
+            }),
+        };
+
+        let (events_tx, _events_rx) = mpsc::channel(64);
+        let shutdown = CancellationToken::new();
+        let terminate = CancellationToken::new();
+        let env = std::collections::HashMap::new();
+        let service_id: ServiceID = "svc".to_string();
+
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            super::run(
+                &hc,
+                &service_id,
+                RunId::new(1),
+                1,
+                RunParams {
+                    working_dir: Some(dir.0.as_path()),
+                    environment: &env,
+                    events_tx,
+                    shutdown,
+                    terminate,
+                },
+            ),
+        )
+        .await
+        .map_err(|_| {
+            color_eyre::eyre::eyre!("healthcheck waited for a background stdout holder")
+        })?;
+
+        assert!(matches!(res, Ok(Outcome::Healthy)));
+
+        let pid_str = std::fs::read_to_string(&pid_path)?;
+        let pid: i32 = pid_str.trim().parse()?;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            match kill(Pid::from_raw(pid), None) {
+                Err(Errno::ESRCH) => break,
+                other if tokio::time::Instant::now() < deadline => {
+                    if !matches!(other, Ok(())) {
+                        color_eyre::eyre::bail!(
+                            "unexpected signal probe result for background process: {other:?}"
+                        );
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                other => {
+                    color_eyre::eyre::bail!(
+                        "expected background healthcheck process to be gone, got {other:?}"
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn started_attempts_before_unhealthy(retries: usize) -> color_eyre::eyre::Result<usize> {
+        let hc = crate::config::HealthCheck {
+            test: (
+                spanned_string("sh"),
+                vec![spanned_string("-c"), spanned_string("exit 1")],
+            ),
+            start_delay: None,
+            interval: Some(Spanned {
+                span: yaml_spanned::spanned::Span::default(),
+                inner: std::time::Duration::from_secs(10),
+            }),
+            timeout: Some(Spanned {
+                span: yaml_spanned::spanned::Span::default(),
+                inner: std::time::Duration::from_millis(500),
+            }),
+            retries: Some(Spanned {
+                span: yaml_spanned::spanned::Span::default(),
+                inner: retries,
+            }),
+        };
+
+        let (events_tx, mut events_rx) = mpsc::channel(64);
+        let shutdown = CancellationToken::new();
+        let terminate = CancellationToken::new();
+        let service_id: ServiceID = "svc".to_string();
+        let run_id = RunId::new(1);
+
+        let handle = tokio::spawn({
+            let terminate = terminate.clone();
+            async move {
+                run_loop(
+                    hc,
+                    RunLoopParams {
+                        service_id,
+                        run_id,
+                        working_dir: None,
+                        environment: std::collections::HashMap::new(),
+                        events_tx,
+                        shutdown,
+                        terminate,
+                    },
+                )
+                .await;
+            }
+        });
+
+        let mut starts = 0;
+        loop {
+            let event = tokio::time::timeout(std::time::Duration::from_secs(2), events_rx.recv())
+                .await?
+                .ok_or_else(|| color_eyre::eyre::eyre!("healthcheck event channel closed"))?;
+            match event {
+                ProcessEvent::HealthCheckStarted { .. } => {
+                    starts += 1;
+                    if starts > 1 {
+                        color_eyre::eyre::bail!(
+                            "healthcheck needed more than one failure to become unhealthy"
+                        );
+                    }
+                }
+                ProcessEvent::Unhealthy { .. } => break,
+                _ => {}
+            }
+        }
+
+        terminate.cancel();
+        handle.await?;
+        Ok(starts)
+    }
+
+    #[tokio::test]
+    async fn retries_is_number_of_failures_before_unhealthy() -> color_eyre::eyre::Result<()> {
+        assert_eq!(started_attempts_before_unhealthy(1).await?, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn zero_retries_is_floored_to_one_failure() -> color_eyre::eyre::Result<()> {
+        assert_eq!(started_attempts_before_unhealthy(0).await?, 1);
         Ok(())
     }
 }
@@ -219,9 +409,12 @@ async fn record_probe_failure(
     // Mark unhealthy once on the failing transition, then keep probing so the service can
     // recover back to healthy (and unblock `condition: healthy` dependents) instead of giving
     // up permanently.
-    if *attempt < max_retries {
-        *attempt = attempt.saturating_add(1);
-    } else if !*unhealthy {
+    if *unhealthy {
+        return;
+    }
+
+    *attempt = attempt.saturating_add(1);
+    if *attempt >= max_retries {
         *unhealthy = true;
         let _ = params
             .events_tx
@@ -234,7 +427,7 @@ async fn record_probe_failure(
 }
 
 pub async fn run_loop(health_check: crate::config::HealthCheck, params: RunLoopParams) {
-    let max_retries = health_check.retries.as_deref().copied().unwrap_or(1);
+    let max_retries = health_check.retries.as_deref().copied().unwrap_or(1).max(1);
     let start_delay = health_check
         .start_delay
         .as_deref()
@@ -413,10 +606,70 @@ fn spawn_output_task(
     })
 }
 
-async fn join_tasks(tasks: &mut [Option<tokio::task::JoinHandle<()>>]) {
-    for task in tasks {
+#[derive(Default)]
+struct OutputReaders {
+    stdout: Option<tokio::task::JoinHandle<()>>,
+    stderr: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl OutputReaders {
+    fn set_stdout(&mut self, task: tokio::task::JoinHandle<()>) {
+        self.stdout = Some(task);
+    }
+
+    fn set_stderr(&mut self, task: tokio::task::JoinHandle<()>) {
+        self.stderr = Some(task);
+    }
+
+    async fn drain(&mut self, timeout: std::time::Duration) -> bool {
+        let (stdout_drained, stderr_drained) = tokio::join!(
+            Self::join_with_timeout(&mut self.stdout, timeout),
+            Self::join_with_timeout(&mut self.stderr, timeout),
+        );
+        stdout_drained && stderr_drained
+    }
+
+    async fn abort_and_join(&mut self) {
+        Self::abort_task(&mut self.stdout).await;
+        Self::abort_task(&mut self.stderr).await;
+    }
+
+    async fn join_with_timeout(
+        task: &mut Option<tokio::task::JoinHandle<()>>,
+        timeout: std::time::Duration,
+    ) -> bool {
+        let Some(mut handle) = task.take() else {
+            return true;
+        };
+
+        match tokio::time::timeout(timeout, &mut handle).await {
+            Ok(Ok(())) => true,
+            Ok(Err(err)) => {
+                tracing::error!(?err, "health check output reader task failed");
+                true
+            }
+            Err(_) => {
+                *task = Some(handle);
+                false
+            }
+        }
+    }
+
+    async fn abort_task(task: &mut Option<tokio::task::JoinHandle<()>>) {
         if let Some(task) = task.take() {
+            task.abort();
             let _ = task.await;
+        }
+    }
+}
+
+impl Drop for OutputReaders {
+    fn drop(&mut self) {
+        if let Some(task) = self.stdout.take() {
+            task.abort();
+        }
+        if let Some(task) = self.stderr.take() {
+            task.abort();
         }
     }
 }
@@ -427,8 +680,7 @@ struct Running {
     attempt: u64,
     command: String,
     events_tx: mpsc::Sender<ProcessEvent>,
-    stdout_task: Option<tokio::task::JoinHandle<()>>,
-    stderr_task: Option<tokio::task::JoinHandle<()>>,
+    output_readers: OutputReaders,
     wait_handle: tokio::task::JoinHandle<Result<std::process::ExitStatus, std::io::Error>>,
     kill_token: CancellationToken,
     #[cfg(unix)]
@@ -493,11 +745,25 @@ async fn cleanup_after_cancel(running: &mut Running) {
         kill_process_group(pid);
     }
     let _ = tokio::time::timeout(std::time::Duration::from_secs(1), &mut running.wait_handle).await;
-    join_tasks(&mut [running.stdout_task.take(), running.stderr_task.take()]).await;
+    running.output_readers.abort_and_join().await;
 }
 
 async fn finish_with_exit(running: &mut Running, success: bool, exit_code: i32) {
-    join_tasks(&mut [running.stdout_task.take(), running.stderr_task.take()]).await;
+    let drained = running.output_readers.drain(OUTPUT_DRAIN_TIMEOUT).await;
+
+    #[cfg(unix)]
+    if !drained && let Some(pid) = running.child_pid {
+        kill_reaped_probe_group(pid);
+        running.output_readers.abort_and_join().await;
+    }
+
+    #[cfg(not(unix))]
+    if !drained {
+        // Windows has no process-group kill path here; still abort the reader tasks so a
+        // descendant that inherited the pipe cannot block the healthcheck loop.
+        running.output_readers.abort_and_join().await;
+    }
+
     emit_finished(
         &running.events_tx,
         &running.service_id,
@@ -514,6 +780,12 @@ fn kill_process_group(pid: i32) {
     let pid = nix::unistd::Pid::from_raw(pid);
     let _ = nix::sys::signal::killpg(pid, nix::sys::signal::Signal::SIGKILL);
     let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
+}
+
+#[cfg(unix)]
+fn kill_reaped_probe_group(pid: i32) {
+    let pid = nix::unistd::Pid::from_raw(pid);
+    let _ = nix::sys::signal::killpg(pid, nix::sys::signal::Signal::SIGKILL);
 }
 
 #[allow(clippy::too_many_lines)]
@@ -557,9 +829,9 @@ async fn run(
         }
     })?;
 
-    let mut stderr_task = None;
+    let mut output_readers = OutputReaders::default();
     if let Some(stderr) = process.stderr.take() {
-        stderr_task = Some(spawn_output_task(
+        output_readers.set_stderr(spawn_output_task(
             BufReader::new(stderr).lines(),
             service_id.clone(),
             run_id,
@@ -569,9 +841,8 @@ async fn run(
         ));
     }
 
-    let mut stdout_task = None;
     if let Some(stdout) = process.stdout.take() {
-        stdout_task = Some(spawn_output_task(
+        output_readers.set_stdout(spawn_output_task(
             BufReader::new(stdout).lines(),
             service_id.clone(),
             run_id,
@@ -607,8 +878,7 @@ async fn run(
         attempt,
         command,
         events_tx: params.events_tx.clone(),
-        stdout_task,
-        stderr_task,
+        output_readers,
         wait_handle,
         kill_token,
         #[cfg(unix)]
