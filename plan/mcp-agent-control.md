@@ -35,6 +35,12 @@ lifecycle truth — M0 surfaces it as a queryable model; later milestones add
 adapters and fold the TUI onto the same model so there is exactly one source of
 truth, not two reducers that can drift.
 
+The core exposes that model as a **write capability** (scheduler-only) and a
+**read capability** (every adapter), with commands flowing the other way through a
+send-only port — capability security by Rust visibility, not convention. The core
+knows nothing about sockets, pipes, MCP, JSON, or filesystem discovery; those live
+entirely in `micromux-control` and `micromux-mcp`.
+
 micromux is already split into a frontend-agnostic core and a command/event
 interface (`crates/micromux/src/lib.rs`, `scheduler/types.rs`):
 
@@ -105,9 +111,9 @@ the discovery + allocation problem the proxy already solves for free.
 
 | Component | Crate | Responsibility |
 |---|---|---|
-| Authoritative session model | `micromux` (core) | Scheduler-written per-service status + bounded logs + health; `SessionChange` notifications. The enabling refactor. |
-| Control protocol + client | `micromux-control` (new) | Wire types, `Describe`/discovery, endpoint abstraction + path derivation, async client. Shared by server + MCP. |
-| Control socket frontend | `micromux-cli` | Bind the endpoint (race-safe dance) and clean up on exit; serve it against the model. |
+| Authoritative session model | `micromux` (core) | Private `Inner`; possession-scoped `SessionModelWriter` + `Clone` `SessionModelReader`; split `ServiceControlSink`/`TuiCommandSink` ports; `SessionChange` notifications. The enabling refactor. |
+| Control protocol + client/server | `micromux-control` (new) | Wire DTOs, `Describe`/discovery, `ControlEndpoint` + `ControlClient`/`ControlServer` framing, path derivation. Shared by server + MCP. |
+| Control endpoint adapter | `micromux-cli` | Bind the endpoint (race-safe dance) and clean up on exit; run `ControlServer` over a `Reader` + `ServiceControlSink` (no writer, no input-forwarding). |
 | `micromux ctl` (optional) | `micromux-cli` | Tiny CLI client that dogfoods the socket; validates the protocol; nice for humans/scripts. |
 | MCP server | `micromux-mcp` (new lib) + `micromux mcp` subcommand | Discover sessions, expose MCP tools, proxy to endpoints. |
 
@@ -133,19 +139,31 @@ is **written by the scheduler from its own state transitions** — not a second
 reducer that independently re-derives lifecycle from thin events (which is what
 would drift).
 
-**Scheduler writes the model — through a type boundary that makes "forgot to
-sync" hard.** Today lifecycle changes happen both via methods (`request_restart`,
-`disable`, `finish_current_run`) *and* via direct `runtime.state = …` assignments
-in `handle_event` (Healthy/Unhealthy/Killed). Make `ServiceRuntime`'s
-`state`/`desired` **private** and route *every* transition through typed methods
-(`request_restart`, `request_enable`, `disable`, `mark_started`, `mark_health`,
-`mark_killed`, `finish_run`). Each returns a `#[must_use] StatusDelta` that the
-scheduler's single sink applies with `model.sync_status(delta)`. With no
-`runtime.state = …` outside those methods and a `#[must_use]` delta, you cannot
-change lifecycle without producing a projection the compiler forces you to
-consume — the structural guarantee, not a "remember to call `sync_model`"
-convention. For `ProcessEvent::LogLine`, the scheduler calls `model.append_log(…)`
-**before** forwarding to the TUI (lossless into the model; see below).
+**Scheduler writes the model — by construction, not by discipline.** Today
+lifecycle changes happen both via methods (`request_restart`, `disable`,
+`finish_current_run`) *and* via direct `runtime.state = …` assignments in
+`handle_event` (Healthy/Unhealthy/Killed). Two changes make "forgot to sync the
+model" *impossible* rather than merely discouraged:
+
+1. **Private state + transition methods that update runtime *and* model together.**
+   `ServiceRuntime`'s `state`/`desired` become module-private; the *only* way to
+   change them is a `SchedulerRuntime` transition method — `mark_started`,
+   `mark_health`, `mark_killed`, `finish_run`, `request_restart`, `request_enable`,
+   `disable` — and each one mutates the runtime and then calls a single private
+   `write_snapshot(service_id)` that projects the runtime through the
+   desired/execution table and writes it via the model **writer handle**. No
+   separate "apply the delta" step to forget; no `runtime.state = …` anywhere else.
+2. **Only the scheduler holds the writer** (capability-by-possession below), so it
+   is *provably* the sole writer — adapters never possess a write handle.
+
+`write_snapshot` is the single projection site, and the projection itself
+(`&ServiceRuntime -> ServiceSnapshot`) is a **pure function**, unit-tested in
+isolation from any lock or writer. For `ProcessEvent::LogLine` the scheduler calls
+`writer.append_log(…)` **before** forwarding to the TUI (lossless into the model;
+see below). Healthchecks go through the writer's **lifecycle methods**
+(`start_health_attempt` → `append_health_line` → `finish_health_attempt`), mirroring
+the existing `HealthCheckStarted`/`HealthCheckLogLine`/`HealthCheckFinished` events
+so output ordering and the result update stay structurally explicit.
 
 **Generation & uptime must survive exit.** `finish_current_run` currently does
 `self.running.take()`, discarding the only `RunId` and start instant — so an
@@ -176,25 +194,52 @@ pub struct ServiceSnapshot {
     pub restart_policy: RestartPolicy,
 }
 
-pub struct SessionModel {
-    // Arc<RwLock<…>> per service: snapshot + BoundedLog + live_snapshot_id
-    //                            + bounded HealthCheck history (not just last) + global seq
-}
+// Private shared state. Neither handle exposes the lock; both wrap the same Arc<Inner>.
+struct Inner { /* RwLock per service: snapshot + BoundedLog + live_snapshot_id
+                 + bounded HealthCheck history; broadcast::Sender<SessionChange>; global seq */ }
 
-impl SessionModel {
-    // written by the scheduler:
-    pub fn sync_status(&self, delta: StatusDelta);      // bumps seq, publishes a SessionChange{Status}
-    pub fn append_log(&self, id: &ServiceID, update: LogUpdateKind, line: String); // see note
-    pub fn push_health_attempt(&self, id: &ServiceID, attempt: HealthAttempt);     // bounded history
-    // read by adapters (snapshot/copy under lock, drop lock, THEN serialize — never hold across .await):
+/// READ capability. `Clone`, handed to every adapter (TUI, control server, MCP).
+/// It has no write methods — the lack is the security boundary.
+#[derive(Clone)]
+pub struct SessionModelReader { inner: Arc<Inner> }
+impl SessionModelReader {
+    // snapshot/copy under the lock, drop it, THEN serialize — never hold the guard across .await:
     pub fn services(&self) -> Vec<ServiceSnapshot>;
     pub fn logs(&self, id: &ServiceID, tail: Option<usize>) -> Vec<LogLine>;
     pub fn healthchecks(&self, id: &ServiceID) -> Vec<HealthAttempt>; // get_health returns the latest
     pub fn subscribe(&self) -> broadcast::Receiver<SessionChange>;
 }
 
+/// WRITE capability — capability-by-possession, NOT by a restricted-visibility path.
+/// (`pub(in crate::scheduler)` would NOT compile here: a restricted path must name an
+/// *ancestor* module, and `crate::scheduler` is a sibling of `crate::model`.) Instead:
+/// `SessionModelWriter` is `pub(crate)`, has NO public constructor and is `!Clone`, and
+/// the ONLY way to obtain one is `channel()` below — which hands it straight into the
+/// scheduler future. It never appears in `Handles`, so no adapter can hold one.
+pub(crate) struct SessionModelWriter { inner: Arc<Inner> }
+impl SessionModelWriter {
+    pub(crate) fn write_snapshot(&self, snap: ServiceSnapshot);     // bumps seq, publishes Change{Status}
+    pub(crate) fn append_log(&self, id: &ServiceID, update: LogUpdateKind, line: String);
+    // healthcheck lifecycle mirrors the scheduler's events (Started/LogLine/Finished),
+    // so ordering and the result update stay structurally explicit:
+    pub(crate) fn start_health_attempt(&self, id: &ServiceID, attempt: u64, command: String);
+    pub(crate) fn append_health_line(&self, id: &ServiceID, attempt: u64, stream: OutputStream, line: String);
+    pub(crate) fn finish_health_attempt(&self, id: &ServiceID, attempt: u64, success: bool, exit_code: i32);
+}
+
+/// The ONLY constructor for the model — returns the paired handles. `start_with_handles`
+/// moves the writer into the scheduler future and returns only the reader.
+pub(crate) fn channel() -> (SessionModelReader, SessionModelWriter);
+
 pub struct SessionChange { pub seq: u64, pub service_id: ServiceID, pub kind: ChangeKind } // Status | Logs | Health
 ```
+
+**Capability flow.** The writer is unforgeable (no public constructor, `!Clone`) and
+is moved into the scheduler future, never into `Handles` — so the reader is the only
+model handle an adapter ever sees. The only path by which an adapter can affect state
+is: *adapter → `ServiceControlSink` → scheduler → `Writer` → model → `Reader` →
+adapter*. An adapter cannot shortcut into a model mutation; that is enforced by *who
+holds the writer*, not by review.
 
 The model owns **all domain state M4 will need**, so M4 doesn't rediscover edge
 cases later:
@@ -223,25 +268,44 @@ model reflects everything the scheduler received, regardless of TUI backpressure
 But the PTY-reader→scheduler hop is already a bounded `try_send` (fact #3), so
 end-to-end logs remain **best-effort by design**. The model is authoritative over
 "everything the scheduler saw," not "every byte the child wrote." We document this
-rather than pretend otherwise. (Forwarding scheduler→TUI keeps today's lossy
-`try_send` for `LogLine`.)
+rather than pretend otherwise.
 
-**Corrected core API.** The original sketch tried to return a `commands` *sender*
-recovered from a supplied *receiver* — impossible. Create the channels internally
-and hand back the senders:
+**Invariant: the scheduler never awaits a frontend.** Today non-log events use
+`ui_tx.send(..).await`, so a wedged-but-open TUI channel could pause the scheduler —
+which would mean an adapter *can* affect the core. Forbid it: every scheduler→TUI
+send becomes non-blocking (`try_send`, like logs already are; or the legacy `ui_tx`
+is isolated behind a small **bridge task** that owns the backpressure). The model is
+written *before* the forward, so a dropped frame is only a transient visual glitch
+the TUI self-corrects from on the next event — and is gone entirely after M4, when
+the TUI consumes `SessionChange` (a non-blocking broadcast) instead of `ui_tx`. This
+is the structural form of "adapters cannot stall the core."
+
+**Core API — capability handles only, with the command port *also* split.** A
+single `Command`-sending port would let any adapter send `SendInput`/`ResizeAll`,
+so "no raw input forwarding" would be policy, not types. Split it:
 
 ```rust
+// Restricted capability — the ONLY command port handed to untrusted adapters
+// (control server, MCP). Each method constructs a safe Command variant internally;
+// there is no method that emits SendInput or ResizeAll, so they are unreachable.
+#[derive(Clone)]
+pub struct ServiceControlSink { tx: mpsc::Sender<Command> }    // restart, restart_all, enable, disable
+
+// Full capability — TUI only (attach-mode input, terminal resize).
+pub struct TuiCommandSink { tx: mpsc::Sender<Command> }        // service control + send_input + resize_all
+impl TuiCommandSink { pub fn service_control(&self) -> ServiceControlSink; /* downgrade */ }
+
 pub struct Handles {
-    pub model: SessionModel,                       // Arc-backed, Clone
-    pub changes: broadcast::Sender<SessionChange>,
-    pub commands: mpsc::Sender<Command>,           // clone per adapter (mpsc is multi-producer)
+    pub reader: SessionModelReader,        // READ: query + subscribe()
+    pub commands: ServiceControlSink,      // SEND (restricted): the safe default for adapters
 }
 
 impl Micromux {
-    /// Non-async: creates the command + change channels and the model internally
-    /// and returns Handles immediately, alongside the runner future.
-    /// `Arc<Self>` makes the future `'static` so the caller can `tokio::spawn` it
-    /// while holding the Handles.
+    /// Non-async: builds the model (`Inner` + `Writer` kept by the scheduler) and the
+    /// command channel internally, returns the `Reader` + restricted `ServiceControlSink`
+    /// alongside the runner future. `Arc<Self>` makes the future `'static` so the caller
+    /// can `tokio::spawn` it while holding the Handles. The `Writer` never leaves the core;
+    /// the full `TuiCommandSink` is obtained only via the dedicated TUI wiring path.
     pub fn start_with_handles(
         self: std::sync::Arc<Self>,
         ui_tx: mpsc::Sender<Event>,        // transitional: feeds the unchanged TUI until M4
@@ -250,14 +314,19 @@ impl Micromux {
 }
 ```
 
-The existing `start(ui_tx, commands_rx, shutdown)` stays as a thin compatibility
-wrapper delegating to the same internal runner (it just doesn't expose the model).
+The enforcement point is **type, not discipline**: `ControlServer::new` and the MCP
+adapter take a `ServiceControlSink`, which has no `send_input`/`resize_all` method
+and cannot construct those variants — so input forwarding is *unreachable* for them,
+even from trusted wiring. The TUI is the sole holder of `TuiCommandSink`. The
+existing `start(ui_tx, commands_rx, shutdown)` stays as a thin compatibility wrapper
+over the same internal runner (it just doesn't expose the reader).
 
 **Tests:** projection unit tests (each `ServiceRuntime` transition →
 expected snapshot: desired vs execution, run_generation bump on restart, exit
-code, uptime anchor); **model survives TUI backpressure** — fill `ui_tx` to
-capacity and assert every status transition still lands in the model while TUI log
-frames may drop; a `SessionChange`/re-query round-trip.
+code, uptime anchor); **a wedged TUI cannot stall the scheduler** — fill `ui_tx` to
+capacity and assert the scheduler keeps **processing further commands and
+transitions** (not merely that the model saw the first one), while TUI frames may
+drop; a `SessionChange`/re-query round-trip.
 
 **Acceptance:** TUI behaves identically; `cargo test` green; model reflects
 scheduler truth under load.
@@ -274,7 +343,9 @@ the seam exists and Windows is not a retrofit:
 
 ```rust
 enum ControlEndpoint { Unix(PathBuf), WindowsNamedPipe(String) }
-// + a small trait: server bind/accept, client connect — implemented per platform.
+// micromux-control exposes transport-agnostic `ControlServer` (bind/accept) and
+// `ControlClient` (connect) over this. Unix sockets, Windows named pipes, and any
+// future daemon endpoint satisfy the same API. The core knows none of it.
 ```
 
 On startup (the session is the *only* writer on disk — the proxy never writes):
@@ -285,9 +356,12 @@ On startup (the session is the *only* writer on disk — the proxy never writes)
    via the **race-safe dance** (see spec: lifetime-held `flock` + inode-ownership),
    so concurrent same-config starts and crash-leaked sockets are handled without
    ever unlinking a live peer's socket.
-3. Spawn an accept loop (one task per connection) speaking the control protocol
-   against the `SessionModel` (queries), the `commands` sender (mutations), and the
-   `changes` broadcast (subscribe). `Describe` returns session identity (pid,
+3. Spawn an accept loop (one task per connection). The `ControlServer` is
+   constructed with exactly two capabilities — a `SessionModelReader` (queries +
+   `subscribe()`) and a `ServiceControlSink` (mutations). It holds **no writer** (so
+   it cannot mutate the model — a command becomes a write only after the scheduler
+   processes it) and **no input port** (`SendInput`/`ResizeAll` are not expressible
+   through `ServiceControlSink`). `Describe` returns session identity (pid,
    start_time, name, working_dir, config_path, services, protocol version).
 
 On shutdown (hook the existing `CancellationToken`): unlink the socket **only if
@@ -330,10 +404,10 @@ Tools (v1):
 | Tool | Args | Returns | Backed by |
 |---|---|---|---|
 | `list_sessions` | — | id, name, cwd, pid, services | endpoint scan + `Describe` |
-| `list_services` | `session?` | name, desired, execution, health, ports, uptime, restart policy, last exit, run_generation | `SessionModel::services` |
-| `get_logs` | `service`, `session?`, `tail?` (default + capped) | recent log lines | `SessionModel::logs` |
+| `list_services` | `session?` | name, desired, execution, health, ports, uptime, restart policy, last exit, run_generation | `SessionModelReader::services` |
+| `get_logs` | `service`, `session?`, `tail?` (default + capped) | recent log lines | `SessionModelReader::logs` |
 | `restart_service` | `service`, `session?` | `Accepted` → `G` | `Command::Restart` |
-| `restart_all` | `session?` | `Accepted` (all services) | `Command::RestartAll` |
+| `restart_all` | `session?` | `Accepted` (all **enabled** services; disabled skipped) | `Command::RestartAll` |
 | `enable_service` | `service`, `session?` | `Accepted` | `Command::Enable` |
 | `disable_service` | `service`, `session?` | `Accepted` | `Command::Disable` |
 | `get_health` | `service`, `session?` | latest probe: success, exit code, command, output | HC history (latest) |
@@ -363,7 +437,10 @@ with zero selector args when launched in that project's dir.
   `wait_for_healthy(after_generation = G)` must not observe the *pre-restart*
   Healthy state. Resolves when, for a run with `run_generation > G`:
   `execution == Running && (healthcheck_configured ? health == Healthy : true)`.
-  Fails on `Exited` (returns the exit code) or timeout. Implemented with the
+  Fails on `Exited` (returns the exit code) or timeout. **Fails fast with a typed
+  state error** (not a timeout) if `desired == Disabled` and no generation past `G`
+  is in flight — a disabled service will never become healthy, so that should be an
+  immediate `UnknownService`/disabled-style error, not a `timeout`. Implemented with the
   **race-free subscribe sequence** so a transition between the first read and the
   subscription can't strand the wait until timeout: **subscribe first, then query
   the snapshot, then wait on changes** (re-querying on each), and treat
@@ -381,7 +458,7 @@ with zero selector args when launched in that project's dir.
 
 Make "one lifecycle model, many adapters" real by deleting the duplicate. The TUI
 stops reducing the event stream into its own *domain* state and instead reads
-`SessionModel` snapshots and subscribes to `SessionChange`. **This is not a visual
+`SessionModelReader` snapshots and subscribes to `SessionChange`. **This is not a visual
 rewrite** — `render.rs` and the look stay; only the domain-state plumbing moves.
 
 State split:
@@ -422,7 +499,10 @@ no domain reducer remains in `micromux-tui`.
   (already on `directories = "6"`).
 - **macOS / Windows:** `runtime_dir()` is `None`. Fall back to a per-user dir
   (`std::env::temp_dir()/micromux-<uid>/`).
-- If none resolvable, warn and run with the control plane disabled (TUI still works).
+- If none resolvable — or the platform's transport is not yet implemented (e.g.
+  Windows before **M1-Windows**) — warn and run with the control plane **disabled**
+  (TUI still works). The binary is never half-working: control is either fully
+  available or cleanly absent.
 
 Permissions are **platform-specific**, and for Unix sockets the **directory** mode
 is what actually gates access (a peer must traverse the dir to `connect`):
@@ -609,21 +689,21 @@ The proxy never mutates the filesystem; it only connects.
 
 ```
 crates/
-  micromux/                 # core
-    src/model.rs            # NEW: SessionModel (scheduler-written), ServiceSnapshot, SessionChange
-    src/scheduler.rs        # private state + typed transitions returning #[must_use] StatusDelta → model.sync_status; append_log on LogLine
-    src/scheduler/types.rs  # add run_generation to Started (or surface RunId); desired/execution mapping
-    src/lib.rs              # start_with_handles(self: Arc<Self>, ui_tx, shutdown) -> (future, Handles)
-  micromux-control/         # NEW lib: wire Request/Response + Describe, ControlEndpoint + path derivation, async Client, dir resolution
+  micromux/                 # core — knows nothing about sockets/pipes/MCP/JSON/discovery
+    src/model.rs            # NEW: Inner (private) + SessionModelReader (pub, Clone) + SessionModelWriter (pub(in scheduler)); ServiceSnapshot; SessionChange; pure &ServiceRuntime->ServiceSnapshot projection
+    src/scheduler.rs        # private runtime state; transition methods mutate runtime + write_snapshot via the Writer; append_log on LogLine
+    src/scheduler/types.rs  # surface RunId as run_generation; desired/execution projection
+    src/lib.rs              # start_with_handles(self: Arc<Self>, ui_tx, shutdown) -> (future, Handles{reader, commands: ServiceControlSink}); ServiceControlSink/TuiCommandSink; model::channel()
+  micromux-control/         # NEW lib: wire DTOs + Describe; ControlEndpoint; ControlClient/ControlServer framing; path derivation; dir resolution
   micromux-cli/
     Cargo.toml              # [features] default = ["mcp"]; mcp = ["dep:micromux-mcp"]
-    src/control/mod.rs      # NEW: endpoint server adapter; race-safe bind/reclaim; inode-guarded unlink
+    src/control/mod.rs      # NEW: run ControlServer over a Reader + ServiceControlSink; race-safe bind/reclaim; inode-guarded unlink
     src/control/ctl.rs      # OPTIONAL: `micromux ctl` client subcommand (not feature-gated)
     src/mcp.rs              # NEW: `#[cfg(feature = "mcp")]` thin shim → micromux-mcp; gated at the top
     src/options.rs          # control flags; `ctl` subcommand; `Mcp` variant under #[cfg(feature = "mcp")]
     src/main.rs             # wire adapters off start_with_handles; dispatch subcommands
-  micromux-mcp/             # NEW lib (optional dep): rmcp server, tool defs, discovery; driven by `micromux mcp`
-  micromux-tui/             # M4: read SessionModel + SessionChange; delete domain reducer, keep view state
+  micromux-mcp/             # NEW lib (optional dep): rmcp tool adapter, discovery; no supervision state; driven by `micromux mcp`
+  micromux-tui/             # M4: read SessionModelReader + SessionChange; delete domain reducer, keep view state
 ```
 
 ### New dependencies
@@ -662,7 +742,7 @@ across `.await`" (see robustness).
   its own endpoint — single-writer-per-file.
 - **Cleanup:** unlink on graceful shutdown; no reaper task — a crash-leaked socket
   is inert and reclaimed by the next same-project start's dance.
-- **No locks across `.await`:** `SessionModel` uses `parking_lot::RwLock` (sync).
+- **No locks across `.await`:** the model's `Inner` uses `parking_lot::RwLock` (sync).
   Adapters snapshot/clone (or copy the log tail) **under the lock, drop it, then
   serialize and write to the socket** — never hold the guard across an await or
   JSON serialization. Enforced by `clippy::await_holding_lock`.
@@ -681,9 +761,9 @@ across `.await`" (see robustness).
 
 ## Testing strategy
 
-- **Unit:** the `StatusDelta` projection (each `ServiceRuntime` transition →
-  expected snapshot, incl. the desired/execution mapping table and persisted
-  `run_generation` across exit); wire +
+- **Unit:** the pure projection `&ServiceRuntime -> ServiceSnapshot` (each
+  transition → expected snapshot, incl. the desired/execution mapping table and
+  persisted `run_generation` across exit), tested without a lock or writer; wire +
   `Describe` serde round-trip incl. version mismatch; endpoint-name derivation from
   a config path; selector resolution.
 - **Integration (the hard parts):** boot the core against a temp config (pattern
@@ -699,7 +779,8 @@ across `.await`" (see robustness).
   - **model under TUI backpressure**: a full `ui_tx` does not stop status
     transitions from reaching the model;
   - **Windows endpoint selection** (`cfg`-gated): `ControlEndpoint` picks the named
-    pipe; sentinel-index record round-trips and prunes on failed connect.
+    pipe; sentinel-index record round-trips, the proxy **skips** records that fail
+    to connect (never edits the file), and session startup/shutdown compacts it.
 - **MCP:** in-process core + endpoint, call tool handlers, assert outputs and
   cwd-derived discovery.
 - **Manual:** `micromux mcp` in Claude Code against `examples/demo`.
@@ -742,10 +823,11 @@ across `.await`" (see robustness).
 2. **Control plane:** default on; opt-out via CLI flag (`--no-control`) *or* config
    setting (`control: { enabled: false }`); CLI flag wins. ✅
 3. **No `send_input`:** the surface is fully typed — no raw stdin/keystroke
-   forwarding. ✅
-4. **Model is scheduler-authoritative:** the core `SessionModel` is written by the
-   scheduler from its own transitions — one lifecycle model, not a second reducer
-   re-deriving it. ✅
+   forwarding, now **type-enforced** (untrusted adapters hold only
+   `ServiceControlSink`, which cannot express `SendInput`/`ResizeAll`; see #8). ✅
+4. **Model is scheduler-authoritative:** the core model is written by the scheduler
+   (via `SessionModelWriter`) from its own transitions — one lifecycle model, not a
+   second reducer re-deriving it. ✅
 5. **Snapshot models desired vs execution separately**, plus `run_generation`, so
    control APIs are unambiguous and `wait_for_healthy` can be race-free. ✅
 6. **TUI consolidation (M4) is required**, not optional — it removes the duplicate
@@ -753,7 +835,23 @@ across `.await`" (see robustness).
 7. **Transport abstraction from M1** (`ControlEndpoint`): Unix sockets / macOS,
    Windows named pipes; **no plain TCP** (loopback-TCP only as a last resort with a
    per-session auth token). "Socket-only" is a Unix/macOS invariant; Windows uses a
-   verified sentinel index. ✅
+   verified sentinel index. Windows named-pipe support is its **own milestone
+   (M1-Windows)** gating Windows control-plane release; until it lands the Windows
+   binary runs control-disabled (never half-working). ✅
+8. **Capability-split model + ports (compiler-enforced).** The model is a private
+   `Inner` behind two handles: a **possession-scoped** `SessionModelWriter` (no
+   public constructor, `!Clone`, built only by `model::channel()` and moved into the
+   scheduler future — *not* a `pub(in …)` path, which can't name a sibling module)
+   and a `Clone` `SessionModelReader` (read + `subscribe()`) given to every adapter.
+   Adapters affect state only through a send-only **`ServiceControlSink`** — through
+   which `SendInput`/`ResizeAll` are not even expressible, so "no raw input
+   forwarding" is type-enforced, not policy (the TUI alone holds the full
+   `TuiCommandSink`). Lifecycle changes go through transition methods that update
+   runtime **and** model together (no direct `state =`), so "forgot to sync" is
+   impossible, not just discouraged. The core depends on no transport/protocol
+   crate; `micromux-control` owns `ControlEndpoint` + `ControlClient`/`ControlServer`,
+   so the same protocol boundary serves Unix sockets, Windows pipes, and a future
+   daemon. ✅
 
 ## Open questions to confirm before coding
 
@@ -770,15 +868,20 @@ consolidation). The **recommended build order interleaves M4 early**, because th
 TUI is the most demanding consumer and folding it onto the model is the best proof
 the model is *complete* before the agent adapters are built on it:
 
-1. **M0** authoritative model written by the scheduler (typed `StatusDelta`
-   mutations, persisted generation); `start_with_handles` + `Handles`;
-   `SessionChange`. No behavior change.
-2. **M1** `micromux-control` + endpoint adapter (deterministic name, lifetime-lock
-   dance, `Describe`, transport abstraction) (+ optional `ctl`).
+1. **M0** authoritative model written by the scheduler (private state + transition
+   methods that write the model, persisted generation); capability-split
+   `Reader`/`Writer` + `ServiceControlSink`/`TuiCommandSink`; `start_with_handles` +
+   `Handles`; `SessionChange`. No behavior change.
+2. **M1** `micromux-control` + endpoint adapter for **Unix/macOS** (deterministic
+   name, lifetime-lock dance, `Describe`, transport abstraction) (+ optional `ctl`).
 3. **M4** fold the TUI onto the model; delete the duplicate domain reducer —
    **validates model completeness** against the hardest consumer.
-4. **M2** `micromux-mcp` + `micromux mcp` with the core tool set.
-5. **M3** `wait_for_healthy` (generation-aware), config `name`, docs/agent snippets,
+4. **M1-Windows** named-pipe transport + sentinel index behind the M1 abstraction.
+   **Gates advertising Windows control-plane support**, so it lands before M2 *if*
+   Windows parity is required at release; until then the Windows binary runs with
+   the control plane **auto-disabled** (TUI works normally — never half-working).
+5. **M2** `micromux-mcp` + `micromux mcp` with the core tool set.
+6. **M3** `wait_for_healthy` (generation-aware), config `name`, docs/agent snippets,
    optional log streaming.
 
 Shipping M2 before M4 is acceptable if the agent loop is urgent, but it knowingly
