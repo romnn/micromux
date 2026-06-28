@@ -223,6 +223,6 @@ mod tests {
         log.push("old".to_string());
         log.replace_last("replacement".to_string());
 
-        assert_eq!(log.full_text(), "ment");
+        assert_eq!(log.full_text(), "ment"); // spellcheck:ignore-line
     }
 }
