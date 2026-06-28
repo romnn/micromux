@@ -2,7 +2,24 @@ use itertools::Itertools;
 use parking_lot::RwLock;
 use std::collections::VecDeque;
 use std::sync::Arc;
-use tokio::sync::watch;
+
+fn trim_to_last_bytes(line: String, max_bytes: usize) -> String {
+    if line.len() <= max_bytes {
+        return line;
+    }
+    if max_bytes == 0 {
+        return String::new();
+    }
+
+    let min_start = line.len().saturating_sub(max_bytes);
+    let start = line
+        .char_indices()
+        .map(|(idx, _)| idx)
+        .find(|idx| *idx >= min_start)
+        .unwrap_or(line.len());
+    let mut line = line;
+    line.split_off(start)
+}
 
 /// A log buffer that retains only the most recent entries, bounded by line count and/or total bytes.
 #[derive(Debug)]
@@ -60,6 +77,11 @@ impl BoundedLog {
 
     /// Push a new log line into the buffer, evicting old entries as needed.
     pub fn push(&mut self, line: String) {
+        let line = if let Some(max_bytes) = self.max_bytes {
+            trim_to_last_bytes(line, max_bytes)
+        } else {
+            line
+        };
         let line_len = line.len();
 
         // Enforce byte limit first (evict from front until under the limit)
@@ -113,11 +135,10 @@ impl BoundedLog {
     }
 }
 
-/// An async wrapper around `BoundedLog` that supports subscriptions.
+/// A shared, lock-protected wrapper around `BoundedLog`.
 #[derive(Debug, Clone)]
 pub struct AsyncBoundedLog {
     inner: Arc<RwLock<BoundedLog>>,
-    tx: watch::Sender<u64>,
 }
 
 impl From<BoundedLog> for AsyncBoundedLog {
@@ -130,35 +151,21 @@ impl AsyncBoundedLog {
     /// Create with optional limits.
     #[must_use]
     pub fn new(log: BoundedLog) -> Self {
-        let (tx, _) = watch::channel(0);
         AsyncBoundedLog {
             inner: Arc::new(RwLock::new(log)),
-            tx,
         }
     }
 
-    /// Push a line and notify subscribers.
+    /// Push a line.
     pub fn push(&self, line: String) {
-        {
-            let mut log = self.inner.write();
-            log.push(line);
-        }
-        // bump version to signal update
-        let ver = self.tx.borrow().wrapping_add(1);
-        let _ = self.tx.send(ver);
+        self.inner.write().push(line);
     }
 
-    /// Replace the last line in the buffer and notify subscribers.
+    /// Replace the last line in the buffer.
     ///
     /// If the buffer is empty, this behaves like [`push`].
     pub fn replace_last(&self, line: String) {
-        {
-            let mut log = self.inner.write();
-            log.replace_last(line);
-        }
-        // bump version to signal update
-        let ver = self.tx.borrow().wrapping_add(1);
-        let _ = self.tx.send(ver);
+        self.inner.write().replace_last(line);
     }
 
     /// Return the number of lines and full text joined with `\n`.
@@ -169,19 +176,53 @@ impl AsyncBoundedLog {
         (lines, log.full_text())
     }
 
-    /// Clear all entries and notify subscribers.
+    /// Clear all entries.
     pub fn clear(&self) {
-        {
-            let mut log = self.inner.write();
-            log.clear();
-        }
-        let ver = self.tx.borrow().wrapping_add(1);
-        let _ = self.tx.send(ver);
+        self.inner.write().clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BoundedLog;
+    use similar_asserts::assert_eq;
+
+    #[test]
+    fn byte_limit_evicts_old_entries() {
+        let mut log = BoundedLog::with_max_bytes(6);
+
+        log.push("abc".to_string());
+        log.push("def".to_string());
+        log.push("gh".to_string());
+
+        assert_eq!(log.full_text(), "def\ngh");
     }
 
-    /// Subscribe to updates; resolves when a new line is pushed.
-    #[must_use]
-    pub fn subscribe(&self) -> watch::Receiver<u64> {
-        self.tx.subscribe()
+    #[test]
+    fn byte_limit_truncates_single_oversized_entry() {
+        let mut log = BoundedLog::with_max_bytes(5);
+
+        log.push("0123456789".to_string());
+
+        assert_eq!(log.full_text(), "56789");
+    }
+
+    #[test]
+    fn byte_limit_truncates_on_utf8_boundary() {
+        let mut log = BoundedLog::with_max_bytes(3);
+
+        log.push("aé日".to_string());
+
+        assert_eq!(log.full_text(), "日");
+    }
+
+    #[test]
+    fn replace_last_respects_byte_limit() {
+        let mut log = BoundedLog::with_max_bytes(4);
+
+        log.push("old".to_string());
+        log.replace_last("replacement".to_string());
+
+        assert_eq!(log.full_text(), "ment");
     }
 }
