@@ -36,19 +36,11 @@ pub const fn transport_supported() -> bool {
 /// `sun_path` budget under control.
 #[must_use]
 pub fn endpoint_hash(config_path: &Path) -> String {
-    fn hex_nibble(nibble: u8) -> char {
-        match nibble {
-            0..=9 => char::from(b'0' + nibble),
-            10..=15 => char::from(b'a' + (nibble - 10)),
-            _ => '?',
-        }
-    }
-
     let digest = Sha256::digest(config_path.to_string_lossy().as_bytes());
     let mut out = String::with_capacity(16);
     for byte in digest.iter().take(8) {
-        out.push(hex_nibble(byte >> 4));
-        out.push(hex_nibble(byte & 0x0f));
+        use std::fmt::Write as _;
+        let _ = write!(out, "{byte:02x}");
     }
     out
 }

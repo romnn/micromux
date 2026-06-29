@@ -1,11 +1,20 @@
 //! Mapping control responses into tool outputs, and the `wait_for_healthy` evaluation.
 
 use micromux::{
-    Desired, Execution, Health, HealthAttempt, LogLine, ServiceCommandAck, ServiceSnapshot,
+    Desired, Execution, Health, HealthAttempt, LogLine, LogRunSummary, ServiceCommandAck,
+    ServiceSnapshot,
 };
 use micromux_control::{ErrorCode, Response};
 
 use crate::select::ToolError;
+
+/// Log payload returned by the control plane.
+pub struct LogsResult {
+    /// Returned log lines.
+    pub lines: Vec<LogLine>,
+    /// Whether server-side response limits dropped older content.
+    pub truncated: bool,
+}
 
 fn remote_error(code: ErrorCode, message: String) -> ToolError {
     match code {
@@ -35,9 +44,22 @@ pub fn services(response: Response) -> Result<Vec<ServiceSnapshot>, ToolError> {
 /// # Errors
 ///
 /// Returns a [`ToolError`] if the session replied with an error or an unexpected response.
-pub fn logs(response: Response) -> Result<Vec<LogLine>, ToolError> {
+pub fn logs(response: Response) -> Result<LogsResult, ToolError> {
     match response {
-        Response::Logs { lines } => Ok(lines),
+        Response::Logs { lines, truncated } => Ok(LogsResult { lines, truncated }),
+        Response::Error { code, message } => Err(remote_error(code, message)),
+        other => Err(ToolError::Unexpected(format!("{other:?}"))),
+    }
+}
+
+/// Extract retained log run summaries.
+///
+/// # Errors
+///
+/// Returns a [`ToolError`] if the session replied with an error or an unexpected response.
+pub fn log_runs(response: Response) -> Result<Vec<LogRunSummary>, ToolError> {
+    match response {
+        Response::LogRuns { runs } => Ok(runs),
         Response::Error { code, message } => Err(remote_error(code, message)),
         other => Err(ToolError::Unexpected(format!("{other:?}"))),
     }
@@ -122,19 +144,16 @@ mod tests {
     use similar_asserts::assert_eq;
 
     fn snapshot() -> ServiceSnapshot {
-        ServiceSnapshot {
-            id: "svc".to_string(),
-            name: "svc".to_string(),
-            desired: Desired::Enabled,
-            execution: Execution::Running,
-            health: None,
-            run_generation: 1,
-            open_ports: Vec::new(),
-            healthcheck_configured: false,
-            last_exit_code: None,
-            uptime: None,
-            restart_policy: RestartPolicy::Never,
-        }
+        let mut snapshot = ServiceSnapshot::initial(
+            "svc".to_string(),
+            "svc".to_string(),
+            Vec::new(),
+            false,
+            RestartPolicy::Never,
+        );
+        snapshot.execution = Execution::Running;
+        snapshot.run_generation = 1;
+        snapshot
     }
 
     #[test]

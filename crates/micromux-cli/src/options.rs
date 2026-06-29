@@ -95,9 +95,17 @@ pub enum CtlAction {
     Logs {
         /// The service to read logs from.
         service: String,
+        /// Read a specific retained run generation.
+        #[arg(long)]
+        run_generation: Option<u64>,
         /// Bound the result to the most recent lines.
         #[arg(long)]
         tail: Option<usize>,
+    },
+    /// List retained log runs for a service.
+    LogRuns {
+        /// The service to inspect.
+        service: String,
     },
     /// Restart a service.
     Restart {

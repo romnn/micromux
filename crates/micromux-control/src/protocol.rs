@@ -6,12 +6,13 @@
 //! [`PROTOCOL_VERSION`] so a mismatch fails loudly rather than weirdly.
 
 use micromux::{
-    HealthAttempt, LogLine, ServiceCommandAck, ServiceID, ServiceSnapshot, SessionChange,
+    HealthAttempt, LogLine, LogRunSummary, ServiceCommandAck, ServiceID, ServiceSnapshot,
+    SessionChange,
 };
 use serde::{Deserialize, Serialize};
 
-/// The control protocol version. Bumped on any breaking envelope change. There is no cross-version
-/// compatibility guarantee pre-1.0; a mismatch is a hard error, not a negotiation.
+/// The control protocol version. Bumped on any envelope change. The session and proxy are expected
+/// to be from the same build; a mismatch is a hard error, not a negotiation.
 pub const PROTOCOL_VERSION: u32 = 1;
 
 /// A request from a client (the `micromux ctl` CLI or the MCP proxy) to a session's control server.
@@ -25,6 +26,9 @@ pub enum Request {
     GetLogs {
         /// Target service.
         service: ServiceID,
+        /// Specific disk-retained run generation to read. Omit to read the bounded visible log
+        /// stream.
+        run_generation: Option<u64>,
         /// Bound the result to the most recent lines.
         tail: Option<usize>,
     },
@@ -32,8 +36,16 @@ pub enum Request {
     FollowLogs {
         /// Target service.
         service: ServiceID,
+        /// Specific disk-retained run generation to follow. Omit to follow the bounded visible log
+        /// stream.
+        run_generation: Option<u64>,
         /// Return only lines with `seq` greater than this cursor (all retained lines if `None`).
         after: Option<u64>,
+    },
+    /// Return summaries of retained log runs for a service.
+    ListLogRuns {
+        /// Target service.
+        service: ServiceID,
     },
     /// Return the latest healthcheck attempt for a service.
     GetHealth {
@@ -98,6 +110,8 @@ pub struct SessionInfo {
 pub enum ErrorCode {
     /// No service with the given id exists.
     UnknownService,
+    /// The requested service run is no longer retained or never existed.
+    UnknownRun,
     /// No session answered the request.
     NoSession,
     /// More than one live session matched the selector.
@@ -131,6 +145,13 @@ pub enum Response {
     Logs {
         /// The recent log lines.
         lines: Vec<LogLine>,
+        /// Whether the session had to drop older lines to respect server response limits.
+        truncated: bool,
+    },
+    /// Reply to [`Request::ListLogRuns`].
+    LogRuns {
+        /// Retained runs, oldest first.
+        runs: Vec<LogRunSummary>,
     },
     /// Reply to [`Request::GetHealth`].
     Health(Option<HealthAttempt>),

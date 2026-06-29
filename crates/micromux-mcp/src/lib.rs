@@ -36,11 +36,13 @@ const MAX_WAIT_TIMEOUT_SECS: u64 = 600;
 const WAIT_POLL_FLOOR: Duration = Duration::from_secs(1);
 
 const INSTRUCTIONS: &str = "Discover and control running micromux sessions. \
-List services, read logs, restart/enable/disable them, check health, and wait for a service to \
-become healthy. When no `session` is given, the tools target the micromux running in the current \
-project directory. Actions are routed through micromux, so they respect dependency gating and \
-restart policy — prefer them over `kill`+rerun. `restart_service`/`enable_service` return a \
-`generation`; pass it to `wait_for_healthy` as `after_generation` to wait for the *new* run.";
+List services, inspect current and previous run logs, restart/enable/disable services, check \
+health, and wait for a service to become healthy. When no `session` is given, the tools target the \
+micromux running in the current project directory. Use `list_log_runs` to find retained previous \
+runs, and `follow_logs` with `next_seq` for gap-aware tailing. Actions are routed through \
+micromux, so they respect dependency gating and restart policy — prefer them over `kill`+rerun. \
+`restart_service`/`enable_service` return a `generation`; pass it to `wait_for_healthy` as \
+`after_generation` to wait for the *new* run.";
 
 /// The MCP server handler. Cheap to clone; holds no supervision state.
 #[derive(Clone)]
@@ -73,6 +75,10 @@ struct LogsArgs {
     /// Optional session selector; omit for the current project.
     #[serde(default)]
     session: Option<String>,
+    /// Optional run generation. Omit to read the bounded visible log stream; pass a retained run
+    /// generation to read a bounded tail from that disk-backed run.
+    #[serde(default)]
+    run_generation: Option<u64>,
     /// Number of most recent lines to return (default 200, capped by the session).
     #[serde(default)]
     tail: Option<usize>,
@@ -85,6 +91,10 @@ struct FollowArgs {
     /// Optional session selector; omit for the current project.
     #[serde(default)]
     session: Option<String>,
+    /// Optional run generation. Omit to follow the bounded visible log stream; pass a retained run
+    /// generation to page through that disk-backed run.
+    #[serde(default)]
+    run_generation: Option<u64>,
     /// Return only log lines after this cursor. Pass the `next_seq` from the previous call to
     /// resume without gaps or duplicates; omit to start from the retained history.
     #[serde(default)]
@@ -182,7 +192,12 @@ impl McpServer {
         }))
     }
 
-    #[tool(description = "Read the most recent log lines for a service.")]
+    #[tool(
+        description = "Read recent log lines for a service. Omit run_generation for the visible \
+        bounded log stream; pass a retained run_generation from list_log_runs to inspect a \
+        bounded tail of a current or previous disk-backed run. Use follow_logs to page through a \
+        retained run with a cursor."
+    )]
     async fn get_logs(&self, args: Parameters<LogsArgs>) -> Result<String, ErrorData> {
         let Parameters(args) = args;
         let resolved = select::resolve(&self.cwd, args.session)
@@ -192,17 +207,57 @@ impl McpServer {
             &resolved.endpoint,
             Request::GetLogs {
                 service: args.service.clone(),
+                run_generation: args.run_generation,
                 tail: args.tail,
             },
         )
         .await
         .map_err(error_data)?;
-        let lines = convert::logs(response).map_err(error_data)?;
-        let text: Vec<&str> = lines.iter().map(|line| line.line.as_str()).collect();
+        let logs = convert::logs(response).map_err(error_data)?;
+        let entries: Vec<Value> = logs
+            .lines
+            .iter()
+            .map(|line| {
+                json!({
+                    "seq": line.seq,
+                    "run_generation": line.run_generation,
+                    "line": line.line,
+                })
+            })
+            .collect();
+        ok_json(&json!({
+            "service": args.service,
+            "run_generation": args.run_generation,
+            "config_path": resolved.info.config_path,
+            "entries": entries,
+            "truncated": logs.truncated,
+        }))
+    }
+
+    #[tool(
+        description = "List retained log runs for a service, including run generations and \
+        sequence ranges. Use a returned run_generation with get_logs/follow_logs to inspect or \
+        page through disk-backed run logs."
+    )]
+    async fn list_log_runs(&self, args: Parameters<ServiceArgs>) -> Result<String, ErrorData> {
+        let Parameters(args) = args;
+        let resolved = select::resolve(&self.cwd, args.session)
+            .await
+            .map_err(error_data)?;
+        let response = send_request(
+            &resolved.endpoint,
+            Request::ListLogRuns {
+                service: args.service.clone(),
+            },
+        )
+        .await
+        .map_err(error_data)?;
+        let runs = convert::log_runs(response).map_err(error_data)?;
+        let runs = serde_json::to_value(&runs).map_err(internal)?;
         ok_json(&json!({
             "service": args.service,
             "config_path": resolved.info.config_path,
-            "lines": text,
+            "runs": runs,
         }))
     }
 
@@ -269,7 +324,8 @@ impl McpServer {
     #[tool(
         description = "Read log lines after a cursor for incremental following. Returns the new \
         lines and a next_seq; pass next_seq as after_seq on the next call. If retention already \
-        evicted unread lines, the response includes a gap object."
+        evicted unread lines, the response includes a gap object. Pass run_generation for a full \
+        disk-backed retained run page; omit it for the bounded visible stream."
     )]
     async fn follow_logs(&self, args: Parameters<FollowArgs>) -> Result<String, ErrorData> {
         let Parameters(args) = args;
@@ -280,23 +336,33 @@ impl McpServer {
             &resolved.endpoint,
             Request::FollowLogs {
                 service: args.service.clone(),
+                run_generation: args.run_generation,
                 after: args.after_seq,
             },
         )
         .await
         .map_err(error_data)?;
-        let lines = convert::logs(response).map_err(error_data)?;
-        let next_seq = next_follow_cursor(&lines, args.after_seq);
-        let gap = follow_gap(&lines, args.after_seq);
-        let entries: Vec<Value> = lines
+        let logs = convert::logs(response).map_err(error_data)?;
+        let next_seq = next_follow_cursor(&logs.lines, args.after_seq);
+        let gap = follow_gap(&logs.lines, args.after_seq, args.run_generation);
+        let entries: Vec<Value> = logs
+            .lines
             .iter()
-            .map(|line| json!({ "seq": line.seq, "line": line.line }))
+            .map(|line| {
+                json!({
+                    "seq": line.seq,
+                    "run_generation": line.run_generation,
+                    "line": line.line,
+                })
+            })
             .collect();
         ok_json(&json!({
             "service": args.service,
+            "run_generation": args.run_generation,
             "lines": entries,
             "next_seq": next_seq,
             "gap": gap,
+            "truncated": logs.truncated,
         }))
     }
 
@@ -451,7 +517,14 @@ fn next_follow_cursor(lines: &[micromux::LogLine], after_seq: Option<u64>) -> Op
     lines.last().map(|line| line.seq).or(after_seq)
 }
 
-fn follow_gap(lines: &[micromux::LogLine], after_seq: Option<u64>) -> Option<Value> {
+fn follow_gap(
+    lines: &[micromux::LogLine],
+    after_seq: Option<u64>,
+    run_generation: Option<u64>,
+) -> Option<Value> {
+    if run_generation.is_some() {
+        return None;
+    }
     let after_seq = after_seq?;
     let first = lines.first()?;
     if first.seq > after_seq.saturating_add(1) {
@@ -514,10 +587,12 @@ mod tests {
         let lines = vec![
             LogLine {
                 seq: 10,
+                run_generation: 1,
                 line: "a".to_string(),
             },
             LogLine {
                 seq: 11,
+                run_generation: 1,
                 line: "b".to_string(),
             },
         ];
@@ -531,12 +606,14 @@ mod tests {
     fn follow_gap_reports_evicted_lines() {
         let lines = vec![LogLine {
             seq: 15,
+            run_generation: 2,
             line: "newest retained".to_string(),
         }];
 
-        assert!(follow_gap(&lines, Some(10)).is_some());
-        assert!(follow_gap(&lines, Some(14)).is_none());
-        assert!(follow_gap(&[], Some(10)).is_none());
-        assert!(follow_gap(&lines, None).is_none());
+        assert!(follow_gap(&lines, Some(10), None).is_some());
+        assert!(follow_gap(&lines, Some(14), None).is_none());
+        assert!(follow_gap(&[], Some(10), None).is_none());
+        assert!(follow_gap(&lines, None, None).is_none());
+        assert!(follow_gap(&lines, Some(10), Some(2)).is_none());
     }
 }

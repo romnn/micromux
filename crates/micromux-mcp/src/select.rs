@@ -256,7 +256,6 @@ mod tests {
 
     struct Running {
         shutdown: CancellationToken,
-        _ui_rx: tokio::sync::mpsc::Receiver<micromux::Event>,
         _runner: tokio::task::JoinHandle<color_eyre::eyre::Result<()>>,
     }
 
@@ -277,9 +276,8 @@ mod tests {
         let config = micromux::from_str(yaml, Path::new("."), 0usize, None, &mut diagnostics)
             .map_err(|err| color_eyre::eyre::eyre!("parse: {err}"))?;
         let mux = Arc::new(micromux::Micromux::new(&config)?);
-        let (ui_tx, ui_rx) = tokio::sync::mpsc::channel(64);
         let shutdown = CancellationToken::new();
-        let (runner, handles) = mux.clone().start_with_handles(ui_tx, shutdown.clone());
+        let (runner, handles) = mux.clone().start(shutdown.clone());
         let runner = tokio::spawn(runner);
 
         let endpoint = endpoint_for(runtime_dir, config_path);
@@ -298,7 +296,6 @@ mod tests {
         });
         Ok(Running {
             shutdown,
-            _ui_rx: ui_rx,
             _runner: runner,
         })
     }

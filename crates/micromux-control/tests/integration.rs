@@ -12,7 +12,6 @@ use micromux_control::{
     Client, ControlEndpoint, ControlServer, Request, Response, SessionIdentity, bind,
 };
 use similar_asserts::assert_eq;
-use tokio::sync::mpsc;
 
 fn unique_dir(prefix: &str) -> eyre::Result<PathBuf> {
     let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
@@ -24,8 +23,6 @@ fn unique_dir(prefix: &str) -> eyre::Result<PathBuf> {
 struct Session {
     endpoint: ControlEndpoint,
     shutdown: CancellationToken,
-    // Held so the channels / model stay alive for the lifetime of the session.
-    _ui_rx: mpsc::Receiver<micromux::Event>,
     _runner: tokio::task::JoinHandle<eyre::Result<()>>,
 }
 
@@ -37,9 +34,8 @@ fn build_session(dir: &Path, command: &str) -> eyre::Result<Session> {
         .map_err(|err| eyre::eyre!("parse config: {err}"))?;
     let mux = Arc::new(micromux::Micromux::new(&config)?);
 
-    let (ui_tx, ui_rx) = mpsc::channel(1024);
     let shutdown = CancellationToken::new();
-    let (runner, handles) = mux.clone().start_with_handles(ui_tx, shutdown.clone());
+    let (runner, handles) = mux.clone().start(shutdown.clone());
     let runner = tokio::spawn(runner);
 
     let config_path = dir.join("micromux.yaml");
@@ -59,7 +55,6 @@ fn build_session(dir: &Path, command: &str) -> eyre::Result<Session> {
     Ok(Session {
         endpoint,
         shutdown,
-        _ui_rx: ui_rx,
         _runner: runner,
     })
 }
@@ -119,10 +114,11 @@ async fn describe_list_logs_and_restart_over_the_socket() -> eyre::Result<()> {
         &session.endpoint,
         Request::GetLogs {
             service: "svc".to_string(),
+            run_generation: None,
             tail: None,
         },
         |response| {
-            matches!(response, Response::Logs { lines }
+            matches!(response, Response::Logs { lines, .. }
                 if lines.iter().any(|line| line.line.contains("hello-from-svc")))
         },
     )
@@ -158,6 +154,7 @@ async fn describe_list_logs_and_restart_over_the_socket() -> eyre::Result<()> {
     let unknown_logs = client
         .request(Request::GetLogs {
             service: "nope".to_string(),
+            run_generation: None,
             tail: None,
         })
         .await?;
@@ -181,6 +178,72 @@ async fn describe_list_logs_and_restart_over_the_socket() -> eyre::Result<()> {
             ..
         }
     ));
+
+    session.shutdown.cancel();
+    Ok(())
+}
+
+#[tokio::test]
+async fn retained_run_logs_are_queryable_after_restart() -> eyre::Result<()> {
+    let dir = unique_dir("run-logs")?;
+    let counter = dir.join("counter");
+    let command = format!(
+        "n=$(cat {} 2>/dev/null || echo 0); n=$((n+1)); echo $n > {}; echo run-$n; sleep 60",
+        counter.display(),
+        counter.display()
+    );
+    let session = build_session(&dir, &command)?;
+
+    request_until(
+        &session.endpoint,
+        Request::GetLogs {
+            service: "svc".to_string(),
+            run_generation: None,
+            tail: None,
+        },
+        |response| {
+            matches!(response, Response::Logs { lines, .. }
+                if lines.iter().any(|line| line.line.contains("run-1")))
+        },
+    )
+    .await?;
+
+    let mut client = Client::connect(&session.endpoint).await?;
+    let restart = client
+        .request(Request::Restart {
+            service: "svc".to_string(),
+        })
+        .await?;
+    assert!(matches!(restart, Response::Accepted { .. }));
+
+    request_until(&session.endpoint, Request::ListServices, |response| {
+        matches!(response, Response::Services(services)
+            if services.first().is_some_and(|svc| svc.run_generation == 2))
+    })
+    .await?;
+
+    let runs = client
+        .request(Request::ListLogRuns {
+            service: "svc".to_string(),
+        })
+        .await?;
+    match runs {
+        Response::LogRuns { runs } => {
+            let generations: Vec<u64> = runs.into_iter().map(|run| run.run_generation).collect();
+            assert_eq!(generations, vec![1, 2]);
+        }
+        other => eyre::bail!("expected LogRuns, got {other:?}"),
+    }
+
+    let previous = client
+        .request(Request::GetLogs {
+            service: "svc".to_string(),
+            run_generation: Some(1),
+            tail: None,
+        })
+        .await?;
+    assert!(matches!(previous, Response::Logs { lines, .. }
+        if lines.iter().any(|line| line.line.contains("run-1"))));
 
     session.shutdown.cancel();
     Ok(())

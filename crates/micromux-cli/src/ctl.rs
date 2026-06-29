@@ -10,9 +10,17 @@ use crate::options::CtlAction;
 fn request_for(action: &CtlAction) -> Request {
     match action {
         CtlAction::Ls => Request::ListServices,
-        CtlAction::Logs { service, tail } => Request::GetLogs {
+        CtlAction::Logs {
+            service,
+            run_generation,
+            tail,
+        } => Request::GetLogs {
             service: service.clone(),
+            run_generation: *run_generation,
             tail: *tail,
+        },
+        CtlAction::LogRuns { service } => Request::ListLogRuns {
+            service: service.clone(),
         },
         CtlAction::Restart { service } => Request::Restart {
             service: service.clone(),
@@ -48,9 +56,20 @@ fn print_response(response: &Response) -> eyre::Result<()> {
                 );
             }
         }
-        Response::Logs { lines } => {
+        Response::Logs { lines, truncated } => {
             for line in lines {
                 println!("{}", line.line);
+            }
+            if *truncated {
+                eprintln!("log response truncated by server limits");
+            }
+        }
+        Response::LogRuns { runs } => {
+            for run in runs {
+                println!(
+                    "generation={} current={} lines={} seq={:?}..{:?}",
+                    run.run_generation, run.current, run.line_count, run.first_seq, run.last_seq
+                );
             }
         }
         Response::Health(Some(attempt)) => {

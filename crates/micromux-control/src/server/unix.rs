@@ -220,37 +220,23 @@ async fn dispatch(server: &ControlServer, request: Request) -> Response {
     match request {
         Request::Describe => Response::Description(describe(server)),
         Request::ListServices => Response::Services(server.reader.services()),
-        Request::GetLogs { service, tail } => {
+        Request::GetLogs {
+            service,
+            run_generation,
+            tail,
+        } => get_logs(server, &service, run_generation, tail),
+        Request::FollowLogs {
+            service,
+            run_generation,
+            after,
+        } => follow_logs(server, &service, run_generation, after),
+        Request::ListLogRuns { service } => {
             if server.reader.service(&service).is_none() {
                 return unknown_service(&service);
             }
-            let tail = tail.unwrap_or(DEFAULT_LOG_TAIL).min(MAX_LOG_TAIL);
-            let mut lines = server.reader.logs(&service, Some(tail));
-            bound_tail_response_lines(&mut lines);
-            Response::Logs { lines }
-        }
-        Request::FollowLogs { service, after } => {
-            if server.reader.service(&service).is_none() {
-                return unknown_service(&service);
+            Response::LogRuns {
+                runs: server.reader.log_runs(&service),
             }
-            let mut lines = server.reader.logs(&service, None);
-            if let Some(cursor) = after {
-                lines.retain(|line| line.seq > cursor);
-            }
-            if after.is_some() {
-                // Cursor reads are pages: return the oldest contiguous unread prefix so the caller
-                // can advance `next_seq` and continue without gaps.
-                lines.truncate(MAX_LOG_TAIL);
-                bound_follow_response_lines(&mut lines);
-            } else {
-                // A cold first read is a tail view of retained history.
-                if lines.len() > MAX_LOG_TAIL {
-                    let drop = lines.len() - MAX_LOG_TAIL;
-                    lines.drain(0..drop);
-                }
-                bound_tail_response_lines(&mut lines);
-            }
-            Response::Logs { lines }
         }
         Request::GetHealth { service } => {
             if server.reader.service(&service).is_none() {
@@ -270,6 +256,96 @@ async fn dispatch(server: &ControlServer, request: Request) -> Response {
             "subscribe must be the only request on a connection",
         ),
     }
+}
+
+fn get_logs(
+    server: &ControlServer,
+    service: &str,
+    run_generation: Option<u64>,
+    tail: Option<usize>,
+) -> Response {
+    if server.reader.service(service).is_none() {
+        return unknown_service(service);
+    }
+    let requested_tail = tail.unwrap_or(if run_generation.is_some() {
+        MAX_LOG_TAIL
+    } else {
+        DEFAULT_LOG_TAIL
+    });
+    let tail = requested_tail.min(MAX_LOG_TAIL);
+    let mut truncated = requested_tail > MAX_LOG_TAIL;
+    let mut lines = match run_generation {
+        Some(run_generation) => {
+            let Some(run) = server.reader.run_log(service, run_generation, Some(tail)) else {
+                return unknown_run(service, run_generation);
+            };
+            run.lines
+        }
+        None => server.reader.logs(service, Some(tail)),
+    };
+    if let Some(run_generation) = run_generation
+        && tail == MAX_LOG_TAIL
+    {
+        truncated |= server
+            .reader
+            .log_runs(service)
+            .into_iter()
+            .find(|run| run.run_generation == run_generation)
+            .is_some_and(|run| run.line_count > lines.len());
+    }
+    truncated |= bound_tail_response_lines(&mut lines);
+    Response::Logs { lines, truncated }
+}
+
+fn follow_logs(
+    server: &ControlServer,
+    service: &str,
+    run_generation: Option<u64>,
+    after: Option<u64>,
+) -> Response {
+    if server.reader.service(service).is_none() {
+        return unknown_service(service);
+    }
+    let mut lines = match run_generation {
+        Some(run_generation) if after.is_some() => {
+            let Some(run) =
+                server
+                    .reader
+                    .run_log_after(service, run_generation, after, Some(MAX_LOG_TAIL))
+            else {
+                return unknown_run(service, run_generation);
+            };
+            run.lines
+        }
+        Some(run_generation) => {
+            let Some(run) = server
+                .reader
+                .run_log(service, run_generation, Some(MAX_LOG_TAIL))
+            else {
+                return unknown_run(service, run_generation);
+            };
+            run.lines
+        }
+        None => server.reader.logs(service, None),
+    };
+    if let Some(cursor) = after {
+        lines.retain(|line| line.seq > cursor);
+    }
+    if after.is_some() {
+        let capped = lines.len() > MAX_LOG_TAIL;
+        lines.truncate(MAX_LOG_TAIL);
+        let truncated = capped || bound_follow_response_lines(&mut lines);
+        return Response::Logs { lines, truncated };
+    }
+
+    let mut truncated = false;
+    if lines.len() > MAX_LOG_TAIL {
+        let drop = lines.len() - MAX_LOG_TAIL;
+        lines.drain(0..drop);
+        truncated = true;
+    }
+    truncated |= bound_tail_response_lines(&mut lines);
+    Response::Logs { lines, truncated }
 }
 
 fn describe(server: &ControlServer) -> SessionInfo {
@@ -302,8 +378,15 @@ fn unknown_service(service: &str) -> Response {
     )
 }
 
+fn unknown_run(service: &str, run_generation: u64) -> Response {
+    Response::error(
+        ErrorCode::UnknownRun,
+        format!("service `{service}` has no retained run `{run_generation}`"),
+    )
+}
+
 /// Drop oldest log lines until the payload fits the response byte budget.
-fn bound_tail_response_lines(lines: &mut Vec<micromux::LogLine>) {
+fn bound_tail_response_lines(lines: &mut Vec<micromux::LogLine>) -> bool {
     let mut total: usize = lines.iter().map(|line| line.line.len()).sum();
     let mut drop_count = 0;
     for line in lines.iter() {
@@ -316,15 +399,18 @@ fn bound_tail_response_lines(lines: &mut Vec<micromux::LogLine>) {
     if drop_count > 0 {
         lines.drain(0..drop_count);
     }
+    let mut truncated = drop_count > 0;
     if total > RESPONSE_MAX_BYTES
         && let Some(line) = lines.first_mut()
     {
         line.line = trim_to_last_bytes(std::mem::take(&mut line.line), RESPONSE_MAX_BYTES);
+        truncated = true;
     }
+    truncated
 }
 
 /// Keep the oldest contiguous log page after a cursor, bounded by response bytes.
-fn bound_follow_response_lines(lines: &mut Vec<micromux::LogLine>) {
+fn bound_follow_response_lines(lines: &mut Vec<micromux::LogLine>) -> bool {
     let mut total = 0usize;
     let mut keep = 0usize;
     for line in lines.iter_mut() {
@@ -340,7 +426,9 @@ fn bound_follow_response_lines(lines: &mut Vec<micromux::LogLine>) {
         total += line_len;
         keep += 1;
     }
+    let truncated = keep < lines.len();
     lines.truncate(keep);
+    truncated
 }
 
 fn trim_to_last_bytes(line: String, max_bytes: usize) -> String {
@@ -415,6 +503,7 @@ mod tests {
     fn line(seq: u64, len: usize) -> LogLine {
         LogLine {
             seq,
+            run_generation: 1,
             line: "x".repeat(len),
         }
     }
@@ -428,7 +517,7 @@ mod tests {
             line(3, 200 * 1024),
         ];
 
-        bound_tail_response_lines(&mut lines);
+        assert!(bound_tail_response_lines(&mut lines));
 
         let seqs: Vec<u64> = lines.into_iter().map(|line| line.seq).collect();
         assert_eq!(seqs, vec![2, 3]);
@@ -443,7 +532,7 @@ mod tests {
             line(3, 200 * 1024),
         ];
 
-        bound_follow_response_lines(&mut lines);
+        assert!(bound_follow_response_lines(&mut lines));
 
         let seqs: Vec<u64> = lines.into_iter().map(|line| line.seq).collect();
         assert_eq!(seqs, vec![0, 1]);
@@ -453,7 +542,7 @@ mod tests {
     fn follow_bounding_trims_an_oversized_first_line_so_the_cursor_can_advance() {
         let mut lines = vec![line(7, RESPONSE_MAX_BYTES + 10), line(8, 1)];
 
-        bound_follow_response_lines(&mut lines);
+        assert!(bound_follow_response_lines(&mut lines));
 
         assert_eq!(lines.len(), 1);
         assert_eq!(lines.first().map(|line| line.seq), Some(7));
