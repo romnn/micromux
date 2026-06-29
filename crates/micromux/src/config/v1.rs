@@ -328,6 +328,32 @@ pub fn parse_ui_config<F: Copy>(
     Ok(UiConfig { width })
 }
 
+/// Parse the optional top-level `control: { enabled: <bool> }` section. Defaults to enabled.
+pub fn parse_control_enabled<F: Copy>(
+    value: &yaml_spanned::Spanned<Value>,
+    file_id: F,
+    strict: bool,
+    diagnostics: &mut Vec<Diagnostic<F>>,
+) -> Result<bool, ConfigError> {
+    let Some(value) = value.get("control") else {
+        return Ok(true);
+    };
+    let (_span, mapping) = expect_mapping(value, "control config must be a mapping".into())?;
+    warn_unknown_keys(
+        mapping,
+        &["enabled"],
+        "control",
+        file_id,
+        strict,
+        diagnostics,
+    );
+    let enabled = parse_optional::<bool>(mapping.get("enabled"))?;
+    Ok(match enabled {
+        Some(spanned) => spanned.into_inner(),
+        None => true,
+    })
+}
+
 fn invalid_empty_command(raw_command: &str, span: yaml_spanned::spanned::Span) -> ConfigError {
     ConfigError::InvalidCommand {
         command: raw_command.to_string(),
@@ -678,7 +704,9 @@ pub fn parse_config<F: Copy + PartialEq>(
 ) -> Result<Config, ConfigError> {
     // let strict_config = parse_optional::<bool>(value.get("strict"))?.map(Spanned::into_inner);
     let strict = strict_override.unwrap_or(false);
+    let name = parse_optional::<String>(value.get("name"))?.map(Spanned::into_inner);
     let ui_config = parse_ui_config(value, file_id, strict, diagnostics)?;
+    let control_enabled = parse_control_enabled(value, file_id, strict, diagnostics)?;
     let services = parse_services(value, file_id, strict, diagnostics)?;
     // let template_engine = parse_optional::<model::TemplateEngine>(
     //     value.get("engine").or_else(|| value.get("template_engine")),
@@ -690,7 +718,9 @@ pub fn parse_config<F: Copy + PartialEq>(
 
     // let config = Config { version, services };
     Ok(Config {
+        name,
         ui_config,
+        control_enabled,
         services,
     })
 }
@@ -892,6 +922,37 @@ mod tests {
             "expected unlimited on-failure, got {:?}",
             app.restart
         );
+        Ok(())
+    }
+
+    #[test]
+    fn parses_top_level_name_and_control() -> eyre::Result<()> {
+        let yaml = indoc! {r#"
+            version: 1
+            name: my-project
+            control:
+              enabled: false
+            services:
+              app:
+                command: ["sh", "-c", "true"]
+        "#};
+
+        let mut diagnostics: Vec<Diagnostic<usize>> = vec![];
+        let parsed = config::from_str(yaml, Path::new("."), 0, None, &mut diagnostics)?;
+        assert_eq!(parsed.config.name.as_deref(), Some("my-project"));
+        assert!(!parsed.config.control_enabled);
+
+        // Defaults: no name, control enabled.
+        let yaml = indoc! {r#"
+            version: 1
+            services:
+              app:
+                command: ["sh", "-c", "true"]
+        "#};
+        let mut diagnostics: Vec<Diagnostic<usize>> = vec![];
+        let parsed = config::from_str(yaml, Path::new("."), 0, None, &mut diagnostics)?;
+        assert_eq!(parsed.config.name, None);
+        assert!(parsed.config.control_enabled);
         Ok(())
     }
 

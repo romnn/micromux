@@ -6,6 +6,7 @@
 //! - [`Command`]: a request issued to the scheduler.
 //! - [`State`]: the current lifecycle state of a service.
 
+use super::control::CommandAck;
 use crate::health_check::Health;
 
 /// Unique identifier for a service.
@@ -17,6 +18,11 @@ pub(crate) struct RunId(u64);
 impl RunId {
     pub(crate) const fn new(value: u64) -> Self {
         Self(value)
+    }
+
+    /// The underlying monotonic value, surfaced publicly as `run_generation`.
+    pub(crate) const fn get(self) -> u64 {
+        self.0
     }
 }
 
@@ -270,7 +276,7 @@ pub enum LogUpdateKind {
 }
 
 /// Origin stream of output.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum OutputStream {
     /// Standard output.
     Stdout,
@@ -339,16 +345,39 @@ impl std::fmt::Display for Event {
 }
 
 /// A command sent to the scheduler.
-#[derive(Debug, Clone)]
+///
+/// The service-control variants carry an optional [`CommandAck`]: the trusted in-process TUI passes
+/// `None` (fire-and-forget, unchanged), while the narrow [`super::ServiceControl`] port attaches an
+/// ack so the scheduler validates and latches the generation request/response. `Command` is not
+/// `Clone` because an ack is single-shot.
+#[derive(Debug)]
 pub enum Command {
     /// Restart a single service.
-    Restart(ServiceID),
-    /// Restart all services.
-    RestartAll,
+    Restart {
+        /// Service to restart.
+        service: ServiceID,
+        /// Optional reply channel for acknowledged commands.
+        ack: Option<CommandAck>,
+    },
+    /// Restart all enabled services.
+    RestartAll {
+        /// Optional reply channel for acknowledged commands.
+        ack: Option<CommandAck>,
+    },
     /// Disable a single service.
-    Disable(ServiceID),
+    Disable {
+        /// Service to disable.
+        service: ServiceID,
+        /// Optional reply channel for acknowledged commands.
+        ack: Option<CommandAck>,
+    },
     /// Enable a single service.
-    Enable(ServiceID),
+    Enable {
+        /// Service to enable.
+        service: ServiceID,
+        /// Optional reply channel for acknowledged commands.
+        ack: Option<CommandAck>,
+    },
     /// Send a raw input payload to a service.
     SendInput(ServiceID, Vec<u8>),
     /// Resize all PTYs.
@@ -358,4 +387,36 @@ pub enum Command {
         /// Terminal height in rows.
         rows: u16,
     },
+}
+
+impl Command {
+    /// Fire-and-forget restart (no acknowledgement). Used by the trusted in-process TUI.
+    #[must_use]
+    pub fn restart(service: ServiceID) -> Self {
+        Self::Restart { service, ack: None }
+    }
+
+    /// Fire-and-forget restart-all (no acknowledgement).
+    #[must_use]
+    pub fn restart_all() -> Self {
+        Self::RestartAll { ack: None }
+    }
+
+    /// Fire-and-forget disable (no acknowledgement).
+    #[must_use]
+    pub fn disable(service: ServiceID) -> Self {
+        Self::Disable { service, ack: None }
+    }
+
+    /// Fire-and-forget enable (no acknowledgement).
+    #[must_use]
+    pub fn enable(service: ServiceID) -> Self {
+        Self::Enable { service, ack: None }
+    }
+
+    /// Send a raw input payload to a service.
+    #[must_use]
+    pub fn send_input(service: ServiceID, data: Vec<u8>) -> Self {
+        Self::SendInput(service, data)
+    }
 }

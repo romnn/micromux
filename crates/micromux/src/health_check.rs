@@ -6,9 +6,24 @@ use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, strum::Display)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    strum::Display,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+/// The resolved health verdict for a service.
 pub enum Health {
+    /// The service's healthcheck is currently passing.
     Healthy,
+    /// The service's healthcheck is currently failing.
     Unhealthy,
 }
 

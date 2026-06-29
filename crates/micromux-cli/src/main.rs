@@ -5,7 +5,11 @@
 //! - Emitting diagnostics.
 //! - Starting the TUI and scheduler.
 
+mod control;
+mod ctl;
 mod logging;
+#[cfg(feature = "mcp")]
+mod mcp;
 mod options;
 
 use clap::Parser;
@@ -128,7 +132,21 @@ async fn load_config(
 
 async fn run() -> eyre::Result<()> {
     color_eyre::install()?;
-    let options = options::Options::parse();
+    let mut options = options::Options::parse();
+
+    match options.command.take() {
+        Some(options::Command::Ctl { action }) => {
+            return ctl::run(action, options.config_path.as_deref()).await;
+        }
+        #[cfg(feature = "mcp")]
+        Some(options::Command::Mcp) => {
+            // Logs go to a file (never stdout — stdout is the JSON-RPC channel).
+            let _log_guard = setup_logging(&options).ok();
+            return mcp::run().await;
+        }
+        None => {}
+    }
+
     let shutdown = micromux::CancellationToken::new();
     spawn_shutdown_handler(shutdown.clone());
 
@@ -140,17 +158,46 @@ async fn run() -> eyre::Result<()> {
     let config = load_config(&options, color_choice).await?;
 
     let (ui_tx, ui_rx) = mpsc::channel(1024);
-    let (commands_tx, commands_rx) = mpsc::channel(1024);
-    let mux = micromux::Micromux::new(&config)?;
+    let mux = std::sync::Arc::new(micromux::Micromux::new(&config)?);
     let services = mux.services();
-    let tui = micromux_tui::App::new(&services, ui_rx, commands_tx, shutdown.clone());
+    let (runner, handles) = mux.clone().start_with_handles(ui_tx, shutdown.clone());
+
+    // The TUI now reads the authoritative model directly; drain the legacy event channel so the
+    // scheduler's bridge stays healthy (dropping the receiver would cancel the session). Retiring
+    // the granular event path entirely is future work.
+    tokio::spawn(async move {
+        let mut ui_rx = ui_rx;
+        while ui_rx.recv().await.is_some() {}
+    });
+
+    // Default-on control plane, opt out via `--no-control` or `control: { enabled: false }`.
+    if !options.no_control && config.config.control_enabled {
+        let working_dir = std::env::current_dir()?;
+        match control::resolve_config_path(options.config_path.as_deref(), &working_dir).await {
+            Ok(config_path) => control::spawn(
+                &handles,
+                &config_path,
+                &working_dir,
+                config.config.name.clone(),
+                shutdown.clone(),
+            ),
+            Err(err) => tracing::warn!(
+                ?err,
+                "control plane disabled: could not resolve config path"
+            ),
+        }
+    }
+
+    let tui = micromux_tui::App::new(
+        &services,
+        handles.reader.clone(),
+        handles.commands.clone(),
+        shutdown.clone(),
+    );
 
     let tui_handle = tokio::task::spawn(async move { tui.render().await });
 
-    let mux_handle = tokio::task::spawn({
-        let shutdown = shutdown.clone();
-        async move { mux.start(ui_tx, commands_rx, shutdown).await }
-    });
+    let mux_handle = tokio::task::spawn(runner);
 
     let mut tui_handle = tui_handle;
     let mut mux_handle = mux_handle;
@@ -158,8 +205,9 @@ async fn run() -> eyre::Result<()> {
     tokio::select! {
         render_res = &mut tui_handle => {
             shutdown.cancel();
+            let mux_res = mux_handle.await;
             render_res??;
-            mux_handle.await??;
+            mux_res??;
         }
         mux_res = &mut mux_handle => {
             shutdown.cancel();

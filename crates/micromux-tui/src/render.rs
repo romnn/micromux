@@ -232,6 +232,110 @@ mod tests {
         assert_eq!(row_text(&buf, 1, 1, 6), "mnopqr");
         assert_eq!(row_text(&buf, 1, 2, 6), "stuvwx");
     }
+
+    #[test]
+    fn healthcheck_text_matches_the_reducer_format() {
+        use super::build_healthcheck_text;
+        use micromux::{HealthAttempt, HealthLine, HealthResult, OutputStream};
+
+        assert_eq!(
+            build_healthcheck_text(false, &[]),
+            "no healthcheck configured"
+        );
+        assert_eq!(build_healthcheck_text(true, &[]), "healthcheck pending");
+
+        let ok = HealthAttempt {
+            attempt: 1,
+            command: "curl -f localhost".to_string(),
+            output: vec![
+                HealthLine {
+                    stream: OutputStream::Stdout,
+                    line: "ok".to_string(),
+                },
+                HealthLine {
+                    stream: OutputStream::Stderr,
+                    line: "warn".to_string(),
+                },
+            ],
+            result: Some(HealthResult {
+                success: true,
+                exit_code: 0,
+            }),
+        };
+        assert_eq!(
+            build_healthcheck_text(true, std::slice::from_ref(&ok)),
+            "\x1b[32m[healthcheck ok exit_code=0]\x1b[0m curl -f localhost\n\nok\n[stderr] warn"
+        );
+
+        let running = HealthAttempt {
+            attempt: 2,
+            command: "probe".to_string(),
+            output: vec![],
+            result: None,
+        };
+        assert_eq!(
+            build_healthcheck_text(true, std::slice::from_ref(&running)),
+            "\x1b[33m[healthcheck running]\x1b[0m probe\n\n"
+        );
+    }
+}
+
+/// Build the healthcheck pane text from the model's bounded attempt history. The *per-attempt*
+/// formatting mirrors the previous reducer exactly (stderr `[stderr]` prefix, ANSI status
+/// separators, command suffix, blank-line spacing); the displayed history depth is now the model's
+/// retained history rather than the TUI's old fixed window.
+fn build_healthcheck_text(configured: bool, attempts: &[micromux::HealthAttempt]) -> String {
+    let mut out = String::new();
+    if !configured {
+        out.push_str("no healthcheck configured");
+        return out;
+    }
+    if attempts.is_empty() {
+        out.push_str("healthcheck pending");
+        return out;
+    }
+    for (idx, attempt) in attempts.iter().enumerate() {
+        if idx > 0 {
+            out.push('\n');
+        }
+
+        let (success, exit_code) = attempt.result.map_or((None, None), |result| {
+            (Some(result.success), Some(result.exit_code))
+        });
+
+        // Separator line rendered with ANSI so ansi_to_tui can color it reliably.
+        let status = match (success, exit_code) {
+            (Some(true), Some(code)) => {
+                format!("\x1b[32m[healthcheck ok exit_code={code}]\x1b[0m")
+            }
+            (Some(false), Some(code)) => {
+                format!("\x1b[31m[healthcheck failed exit_code={code}]\x1b[0m")
+            }
+            _ => "\x1b[33m[healthcheck running]\x1b[0m".to_string(),
+        };
+
+        out.push_str(&status);
+        if !attempt.command.is_empty() {
+            out.push(' ');
+            out.push_str(&attempt.command);
+        }
+        out.push('\n');
+        out.push('\n');
+
+        let attempt_text = attempt
+            .output
+            .iter()
+            .map(|line| match line.stream {
+                micromux::OutputStream::Stderr => format!("[stderr] {}", line.line),
+                micromux::OutputStream::Stdout => line.line.clone(),
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !attempt_text.is_empty() {
+            out.push_str(&attempt_text);
+        }
+    }
+    out
 }
 
 #[must_use]
@@ -340,16 +444,36 @@ impl App {
     }
 
     fn render_logs(&mut self, area: Rect, buf: &mut Buffer) {
-        let Some(current_service) = self.state.current_service_mut() else {
+        let Some(current_id) = self
+            .state
+            .current_service()
+            .map(|service| service.id.clone())
+        else {
             return;
         };
-        if current_service.logs_dirty {
-            let (num_lines, logs) = current_service.logs.full_text();
-            current_service.cached_num_lines = num_lines;
-            current_service.cached_logs = logs;
-            current_service.logs_dirty = false;
+        // Rebuild the cached log text from the model only when this service's logs changed.
+        let dirty = self
+            .state
+            .current_service()
+            .is_some_and(|service| service.logs_dirty);
+        if dirty {
+            let lines = self.reader.logs(&current_id, None);
+            let count = u16::try_from(lines.len()).unwrap_or(u16::MAX);
+            let text = lines
+                .into_iter()
+                .map(|line| line.line)
+                .collect::<Vec<_>>()
+                .join("\n");
+            if let Some(service) = self.state.current_service_mut() {
+                service.cached_num_lines = count;
+                service.cached_logs = text;
+                service.logs_dirty = false;
+            }
         }
 
+        let Some(current_service) = self.state.current_service() else {
+            return;
+        };
         let num_lines = current_service.cached_num_lines;
         let current_logs = current_service.cached_logs.as_str();
         tracing::trace!(service_id = current_service.id, num_lines, "collected logs");
@@ -383,57 +507,34 @@ impl App {
     }
 
     fn render_healthchecks(&mut self, area: Rect, buf: &mut Buffer) {
-        let Some(current_service) = self.state.current_service_mut() else {
+        let Some(current_id) = self
+            .state
+            .current_service()
+            .map(|service| service.id.clone())
+        else {
             return;
         };
-        if current_service.healthcheck_dirty {
-            let mut out = String::new();
-
-            if !current_service.healthcheck_configured {
-                out.push_str("no healthcheck configured");
-            } else if current_service.healthcheck_attempts.is_empty() {
-                out.push_str("healthcheck pending");
-            } else {
-                for (idx, attempt) in current_service.healthcheck_attempts.iter().enumerate() {
-                    if idx > 0 {
-                        out.push('\n');
-                    }
-
-                    let (success, exit_code) = attempt
-                        .result
-                        .map_or((None, None), |r| (Some(r.success), Some(r.exit_code)));
-
-                    // Separator line rendered with ANSI so ansi_to_tui can color it reliably.
-                    let status = match (success, exit_code) {
-                        (Some(true), Some(code)) => {
-                            format!("\x1b[32m[healthcheck ok exit_code={code}]\x1b[0m")
-                        }
-                        (Some(false), Some(code)) => {
-                            format!("\x1b[31m[healthcheck failed exit_code={code}]\x1b[0m")
-                        }
-                        _ => "\x1b[33m[healthcheck running]\x1b[0m".to_string(),
-                    };
-
-                    out.push_str(&status);
-                    if !attempt.command.is_empty() {
-                        out.push(' ');
-                        out.push_str(&attempt.command);
-                    }
-                    out.push('\n');
-                    out.push('\n');
-
-                    let attempt_text = attempt.output.full_text();
-                    if !attempt_text.is_empty() {
-                        out.push_str(&attempt_text);
-                    }
-                }
+        let (dirty, configured) = self
+            .state
+            .current_service()
+            .map_or((false, false), |service| {
+                (service.healthcheck_dirty, service.healthcheck_configured)
+            });
+        if dirty {
+            let attempts = self.reader.healthchecks(&current_id);
+            let out = build_healthcheck_text(configured, &attempts);
+            if let Some(service) = self.state.current_service_mut() {
+                service.healthcheck_cached_text = out;
+                service.healthcheck_dirty = false;
             }
-
-            current_service.healthcheck_cached_text = out;
-            current_service.healthcheck_dirty = false;
         }
 
-        let text = current_service.healthcheck_cached_text.as_str();
+        let cached_text = self
+            .state
+            .current_service()
+            .map(|service| service.healthcheck_cached_text.clone())
+            .unwrap_or_default();
+        let text = cached_text.as_str();
 
         let [pane_area, scrollbar_area] = Layout::default()
             .direction(Direction::Horizontal)
@@ -465,7 +566,9 @@ impl App {
         } else {
             raw_num_lines
         };
-        current_service.healthcheck_cached_num_lines = num_lines;
+        if let Some(service) = self.state.current_service_mut() {
+            service.healthcheck_cached_num_lines = num_lines;
+        }
 
         let viewport_height = scrollbar_area.height;
         let max_off = num_lines.saturating_sub(viewport_height);

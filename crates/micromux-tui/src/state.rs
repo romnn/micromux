@@ -1,6 +1,4 @@
-use std::collections::VecDeque;
-
-use micromux::{AsyncBoundedLog, BoundedLog, ServiceID};
+use micromux::ServiceID;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, strum::Display, strum::IntoStaticStr)]
 pub enum Health {
@@ -24,35 +22,22 @@ pub enum Execution {
     Exited,
 }
 
+/// View state for one service. Domain state (execution, health, logs, healthchecks) lives in the
+/// core's `SessionModelReader`; this is the per-service *render cache* the TUI keeps. `exec_state`
+/// and `open_ports` are refreshed from the model on a `SessionChange`; the cached log/healthcheck
+/// text is rebuilt lazily (when `*_dirty`) from the model snapshot for the selected service.
 #[derive(Debug)]
 pub struct Service {
     pub id: ServiceID,
     pub exec_state: Execution,
     pub open_ports: Vec<u16>,
-    pub logs: AsyncBoundedLog,
-    pub live_snapshot_id: Option<u64>,
+    pub healthcheck_configured: bool,
     pub cached_num_lines: u16,
     pub cached_logs: String,
     pub logs_dirty: bool,
-    pub healthcheck_configured: bool,
-    pub healthcheck_attempts: VecDeque<HealthCheckAttempt>,
     pub healthcheck_cached_num_lines: u16,
     pub healthcheck_cached_text: String,
     pub healthcheck_dirty: bool,
-}
-
-#[derive(Debug)]
-pub struct HealthCheckAttempt {
-    pub id: u64,
-    pub command: String,
-    pub output: BoundedLog,
-    pub result: Option<HealthCheckResult>,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct HealthCheckResult {
-    pub success: bool,
-    pub exit_code: i32,
 }
 
 #[derive(Debug)]

@@ -137,9 +137,18 @@ pub struct UiConfig {
 
 /// Parsed configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
+// `ui_config` predates the other fields and is public API; renaming it to satisfy the
+// suffix-repeats-the-struct-name heuristic is not worth the churn.
+#[allow(clippy::struct_field_names)]
 pub struct Config {
+    /// Optional session name, surfaced as the session identity to agents. Falls back to
+    /// `basename(working_dir)` when unset.
+    pub name: Option<String>,
     /// Configuration for the UI.
     pub ui_config: UiConfig,
+    /// Whether the agent control plane is enabled (default `true`; opt out with
+    /// `control: { enabled: false }`).
+    pub control_enabled: bool,
     /// Service definitions keyed by service name.
     pub services: IndexMap<Spanned<String>, Service>,
 }

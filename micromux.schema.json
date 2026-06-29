@@ -8,50 +8,102 @@
     "version": {
       "description": "Configuration file format version.",
       "anyOf": [
-        { "type": "string", "enum": ["1", "v1", "V1", "latest"] },
-        { "type": "number", "enum": [1] }
+        {
+          "type": "string",
+          "enum": [
+            "1",
+            "v1",
+            "V1",
+            "latest"
+          ]
+        },
+        {
+          "type": "number",
+          "enum": [
+            1
+          ]
+        }
       ]
+    },
+    "name": {
+      "type": "string",
+      "description": "Optional session name, surfaced to coding agents via the MCP/control plane. Falls back to the working directory name."
     },
     "ui": {
       "type": "object",
       "additionalProperties": true,
       "properties": {
-        "width": { "type": "integer", "minimum": 0 }
+        "width": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "control": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Agent control plane settings.",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Enable the local control endpoint (default true)."
+        }
       }
     },
     "services": {
       "type": "object",
-      "additionalProperties": { "$ref": "#/definitions/service" }
+      "additionalProperties": {
+        "$ref": "#/definitions/service"
+      }
     }
   },
   "definitions": {
     "scalar": {
       "anyOf": [
-        { "type": "string" },
-        { "type": "number" },
-        { "type": "boolean" }
+        {
+          "type": "string"
+        },
+        {
+          "type": "number"
+        },
+        {
+          "type": "boolean"
+        }
       ]
     },
     "command": {
       "description": "Command to execute. Either a shell-like string or an argv-like sequence.",
       "anyOf": [
-        { "type": "string", "minLength": 1 },
+        {
+          "type": "string",
+          "minLength": 1
+        },
         {
           "type": "array",
           "minItems": 1,
-          "items": { "$ref": "#/definitions/scalar" }
+          "items": {
+            "$ref": "#/definitions/scalar"
+          }
         }
       ]
     },
     "dependency": {
       "anyOf": [
-        { "type": "string", "minLength": 1 },
+        {
+          "type": "string",
+          "minLength": 1
+        },
         {
           "type": "object",
           "additionalProperties": true,
-          "required": ["name"],
+          "required": [
+            "name"
+          ],
           "properties": {
-            "name": { "type": "string", "minLength": 1 },
+            "name": {
+              "type": "string",
+              "minLength": 1
+            },
             "condition": {
               "type": "string",
               "enum": [
@@ -75,35 +127,72 @@
     },
     "env_file_entry": {
       "anyOf": [
-        { "type": "string", "minLength": 1 },
+        {
+          "type": "string",
+          "minLength": 1
+        },
         {
           "type": "object",
           "additionalProperties": true,
-          "required": ["path"],
+          "required": [
+            "path"
+          ],
           "properties": {
-            "path": { "type": "string", "minLength": 1 }
+            "path": {
+              "type": "string",
+              "minLength": 1
+            }
           }
         }
       ]
     },
     "env_file": {
       "anyOf": [
-        { "$ref": "#/definitions/env_file_entry" },
-        { "type": "array", "items": { "$ref": "#/definitions/env_file_entry" } }
+        {
+          "$ref": "#/definitions/env_file_entry"
+        },
+        {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/env_file_entry"
+          }
+        }
       ]
     },
     "healthcheck": {
       "type": "object",
       "additionalProperties": true,
-      "required": ["test"],
+      "required": [
+        "test"
+      ],
       "properties": {
-        "test": { "$ref": "#/definitions/command" },
-        "start_delay": { "type": "string", "minLength": 1 },
-        "startup_delay": { "type": "string", "minLength": 1 },
-        "initial_delay": { "type": "string", "minLength": 1 },
-        "interval": { "type": "string", "minLength": 1 },
-        "timeout": { "type": "string", "minLength": 1 },
-        "retries": { "type": "integer", "minimum": 0 }
+        "test": {
+          "$ref": "#/definitions/command"
+        },
+        "start_delay": {
+          "type": "string",
+          "minLength": 1
+        },
+        "startup_delay": {
+          "type": "string",
+          "minLength": 1
+        },
+        "initial_delay": {
+          "type": "string",
+          "minLength": 1
+        },
+        "interval": {
+          "type": "string",
+          "minLength": 1
+        },
+        "timeout": {
+          "type": "string",
+          "minLength": 1
+        },
+        "retries": {
+          "type": "integer",
+          "minimum": 0
+        }
       }
     },
     "restart": {
@@ -113,29 +202,55 @@
     "service": {
       "type": "object",
       "additionalProperties": true,
-      "required": ["command"],
+      "required": [
+        "command"
+      ],
       "properties": {
-        "name": { "type": "string" },
-        "command": { "$ref": "#/definitions/command" },
-        "working_dir": { "type": "string" },
-        "cwd": { "type": "string" },
-        "directory": { "type": "string" },
-        "env_file": { "$ref": "#/definitions/env_file" },
+        "name": {
+          "type": "string"
+        },
+        "command": {
+          "$ref": "#/definitions/command"
+        },
+        "working_dir": {
+          "type": "string"
+        },
+        "cwd": {
+          "type": "string"
+        },
+        "directory": {
+          "type": "string"
+        },
+        "env_file": {
+          "$ref": "#/definitions/env_file"
+        },
         "environment": {
           "type": "object",
-          "additionalProperties": { "$ref": "#/definitions/scalar" }
+          "additionalProperties": {
+            "$ref": "#/definitions/scalar"
+          }
         },
         "depends_on": {
           "type": "array",
-          "items": { "$ref": "#/definitions/dependency" }
+          "items": {
+            "$ref": "#/definitions/dependency"
+          }
         },
-        "healthcheck": { "$ref": "#/definitions/healthcheck" },
+        "healthcheck": {
+          "$ref": "#/definitions/healthcheck"
+        },
         "ports": {
           "type": "array",
-          "items": { "$ref": "#/definitions/scalar" }
+          "items": {
+            "$ref": "#/definitions/scalar"
+          }
         },
-        "restart": { "$ref": "#/definitions/restart" },
-        "color": { "type": "boolean" }
+        "restart": {
+          "$ref": "#/definitions/restart"
+        },
+        "color": {
+          "type": "boolean"
+        }
       }
     }
   }

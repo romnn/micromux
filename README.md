@@ -94,6 +94,48 @@
  - **Logs**: wrap `w`, follow-tail `t`
  - **Quit**: `q` (or `Esc`)
  
+ ## Agent control (MCP)
+
+Micromux exposes an **MCP server** so coding agents (Claude Code, Codex) can discover and control your running sessions — list services, read logs, restart/enable/disable them, check health, and wait for a service to become healthy. Actions go through the **same control plane the TUI uses**, so dependency gating, healthchecks, and restart policy are respected — restarting a service via micromux is *more correct* than `kill` + rerun.
+
+Every running `micromux` opens a local, per-project control endpoint (a Unix domain socket under `$XDG_RUNTIME_DIR/micromux/`, same-user only, no network). The MCP server is a thin stdio proxy. Configure it once, like `playwright-mcp`:
+
+**Claude Code** (`.mcp.json`, or `claude mcp add micromux -- micromux mcp`):
+
+```json
+{
+  "mcpServers": {
+    "micromux": { "command": "micromux", "args": ["mcp"] }
+  }
+}
+```
+
+**Codex** (`~/.codex/config.toml`):
+
+```toml
+[mcp_servers.micromux]
+command = "micromux"
+args = ["mcp"]
+```
+
+Launched in a project directory, the tools target that project's session automatically. Target another with a `session` argument (`name:<n>`, `pid:<n>`, or `hash:<h>`) or the `MICROMUX_SESSION` env var. Tools: `list_sessions`, `list_services`, `get_logs`, `follow_logs`, `restart_service`, `restart_all`, `enable_service`, `disable_service`, `get_health`, `wait_for_healthy`. `restart_service`/`enable_service` return a run **generation**; pass it to `wait_for_healthy(after_generation=…)` to wait for the *new* run, not the old one.
+
+Name a session so agents can find it by name:
+
+```yaml
+name: my-project
+```
+
+The control plane is **on by default**; opt out with `--no-control` or `control: { enabled: false }`. Dogfood it from the shell without an agent:
+
+```bash
+micromux ctl ls
+micromux ctl logs api --tail 50
+micromux ctl restart api
+```
+
+Build a lean TUI-only binary with the MCP server compiled out via `cargo install --no-default-features micromux-cli`.
+
  ## How it differs from Docker Compose
  
  Micromux is **not a container orchestrator**.

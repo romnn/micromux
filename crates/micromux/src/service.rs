@@ -168,12 +168,28 @@ mod tests {
     }
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug,
+    Default,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+/// How a service should be restarted after it exits.
 pub enum RestartPolicy {
+    /// Always restart the service when it exits.
     Always,
+    /// Restart the service unless it was explicitly stopped.
     UnlessStopped,
+    /// Never restart the service automatically.
     #[default]
     Never,
+    /// Restart only after a non-zero exit.
     OnFailure {
         /// Maximum number of automatic restarts after a non-zero exit.
         ///

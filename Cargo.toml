@@ -3,6 +3,8 @@ resolver = "2"
 members = [
 	"crates/clippy-wrapper",
 	"crates/micromux",
+	"crates/micromux-control",
+	"crates/micromux-mcp",
 	"crates/micromux-tui",
 	"crates/micromux-cli",
 	"crates/micromux-screenshot",
@@ -38,6 +40,7 @@ unimplemented    = "deny"
 todo             = "deny"
 indexing_slicing = "deny"
 missing_errors_doc = "warn"
+await_holding_lock = "deny"
 
 # Allowed
 map_unwrap_or = "allow"

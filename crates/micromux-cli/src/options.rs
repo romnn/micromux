@@ -1,4 +1,4 @@
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 /// Logging flags to `#[command(flatten)]` into your CLI
@@ -29,7 +29,12 @@ pub struct Verbosity {
 #[derive(Debug, Parser)]
 #[command(author, version)]
 pub struct Options {
-    #[clap(short = 'c', long = "config", help = "path to config file")]
+    #[clap(
+        short = 'c',
+        long = "config",
+        help = "path to config file",
+        global = true
+    )]
     pub config_path: Option<PathBuf>,
 
     #[arg(long = "strict", env = "MICROMUX_STRICT", help = "enable strict mode")]
@@ -55,4 +60,67 @@ pub struct Options {
 
     #[arg(long = "log-file", env = "MICROMUX_LOG_FILE", help = "Log file")]
     pub log_file: Option<PathBuf>,
+
+    #[arg(
+        long = "no-control",
+        env = "MICROMUX_NO_CONTROL",
+        help = "disable the agent control plane (also configurable via `control: { enabled: false }`)"
+    )]
+    pub no_control: bool,
+
+    #[command(subcommand)]
+    pub command: Option<Command>,
+}
+
+/// A micromux subcommand. With no subcommand, micromux runs the TUI for the current project.
+#[derive(Debug, Subcommand)]
+pub enum Command {
+    /// Control a running micromux session over its local endpoint (dogfoods the control protocol).
+    Ctl {
+        /// The action to perform.
+        #[command(subcommand)]
+        action: CtlAction,
+    },
+    /// Run the MCP server over stdio (configure once in Claude Code / Codex like playwright-mcp).
+    #[cfg(feature = "mcp")]
+    Mcp,
+}
+
+/// An action for the `micromux ctl` client.
+#[derive(Debug, Subcommand)]
+pub enum CtlAction {
+    /// List the services in the session.
+    Ls,
+    /// Print recent log lines for a service.
+    Logs {
+        /// The service to read logs from.
+        service: String,
+        /// Bound the result to the most recent lines.
+        #[arg(long)]
+        tail: Option<usize>,
+    },
+    /// Restart a service.
+    Restart {
+        /// The service to restart.
+        service: String,
+    },
+    /// Restart all enabled services.
+    RestartAll,
+    /// Enable (and start) a service.
+    Enable {
+        /// The service to enable.
+        service: String,
+    },
+    /// Disable a service.
+    Disable {
+        /// The service to disable.
+        service: String,
+    },
+    /// Show the latest healthcheck attempt for a service.
+    Health {
+        /// The service to inspect.
+        service: String,
+    },
+    /// Show the session identity.
+    Describe,
 }
