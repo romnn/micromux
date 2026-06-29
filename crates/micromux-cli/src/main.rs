@@ -16,7 +16,6 @@ use clap::Parser;
 use codespan_reporting::diagnostic::Diagnostic;
 use color_eyre::eyre;
 use micromux::{Printer as DiagnosticsPrinter, ToDiagnostics};
-use tokio::sync::mpsc;
 
 fn spawn_shutdown_handler(shutdown: micromux::CancellationToken) {
     tokio::spawn(async move {
@@ -157,18 +156,8 @@ async fn run() -> eyre::Result<()> {
 
     let config = load_config(&options, color_choice).await?;
 
-    let (ui_tx, ui_rx) = mpsc::channel(1024);
     let mux = std::sync::Arc::new(micromux::Micromux::new(&config)?);
-    let services = mux.services();
-    let (runner, handles) = mux.clone().start_with_handles(ui_tx, shutdown.clone());
-
-    // The TUI now reads the authoritative model directly; drain the legacy event channel so the
-    // scheduler's bridge stays healthy (dropping the receiver would cancel the session). Retiring
-    // the granular event path entirely is future work.
-    tokio::spawn(async move {
-        let mut ui_rx = ui_rx;
-        while ui_rx.recv().await.is_some() {}
-    });
+    let (runner, handles) = mux.clone().start(shutdown.clone());
 
     // Default-on control plane, opt out via `--no-control` or `control: { enabled: false }`.
     if !options.no_control && config.config.control_enabled {
@@ -189,7 +178,6 @@ async fn run() -> eyre::Result<()> {
     }
 
     let tui = micromux_tui::App::new(
-        &services,
         handles.reader.clone(),
         handles.commands.clone(),
         shutdown.clone(),

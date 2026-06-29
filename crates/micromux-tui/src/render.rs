@@ -234,7 +234,7 @@ mod tests {
     }
 
     #[test]
-    fn healthcheck_text_matches_the_reducer_format() {
+    fn healthcheck_text_matches_the_model_format() {
         use super::build_healthcheck_text;
         use micromux::{HealthAttempt, HealthLine, HealthResult, OutputStream};
 
@@ -280,10 +280,7 @@ mod tests {
     }
 }
 
-/// Build the healthcheck pane text from the model's bounded attempt history. The *per-attempt*
-/// formatting mirrors the previous reducer exactly (stderr `[stderr]` prefix, ANSI status
-/// separators, command suffix, blank-line spacing); the displayed history depth is now the model's
-/// retained history rather than the TUI's old fixed window.
+/// Build the healthcheck pane text from the model's bounded attempt history.
 fn build_healthcheck_text(configured: bool, attempts: &[micromux::HealthAttempt]) -> String {
     let mut out = String::new();
     if !configured {
@@ -338,13 +335,21 @@ fn build_healthcheck_text(configured: bool, attempts: &[micromux::HealthAttempt]
     out
 }
 
-#[must_use]
-pub fn state_name(service: crate::state::Execution) -> &'static str {
-    match service {
-        crate::state::Execution::Running {
-            health: Some(health),
-        } => health.into(),
-        state => state.into(),
+fn state_name(snapshot: &micromux::ServiceSnapshot) -> &'static str {
+    if snapshot.desired == micromux::Desired::Disabled {
+        return "DISABLED";
+    }
+
+    match snapshot.execution {
+        micromux::Execution::Pending => "PENDING",
+        micromux::Execution::Starting => "RUNNING",
+        micromux::Execution::Running => match snapshot.health {
+            Some(micromux::Health::Healthy) => "HEALTHY",
+            Some(micromux::Health::Unhealthy) => "UNHEALTHY",
+            None => "RUNNING",
+        },
+        micromux::Execution::Stopping => "KILLED",
+        micromux::Execution::Exited => "EXITED",
     }
 }
 
@@ -403,17 +408,18 @@ impl App {
             .state
             .services
             .iter()
-            .map(|(_name, service)| {
-                let status = format!("{: >10}", state_name(service.exec_state))
-                    .set_style(crate::style::service_style(service.exec_state));
+            .map(|service| {
+                let status = format!("{: >10}", state_name(&service.snapshot))
+                    .set_style(crate::style::service_style(&service.snapshot));
 
                 // Combine into one line.
                 let ports = service
+                    .snapshot
                     .open_ports
                     .iter()
                     .map(|i| format!(":{i}").fg(tailwind::GRAY.c400));
 
-                let line = [status, " ".into(), service.id.as_str().into()]
+                let line = [status, " ".into(), service.snapshot.id.as_str().into()]
                     .into_iter()
                     .chain(if ports.len() > 0 {
                         [" [".into()]
@@ -447,7 +453,7 @@ impl App {
         let Some(current_id) = self
             .state
             .current_service()
-            .map(|service| service.id.clone())
+            .map(|service| service.snapshot.id.clone())
         else {
             return;
         };
@@ -476,7 +482,11 @@ impl App {
         };
         let num_lines = current_service.cached_num_lines;
         let current_logs = current_service.cached_logs.as_str();
-        tracing::trace!(service_id = current_service.id, num_lines, "collected logs");
+        tracing::trace!(
+            service_id = current_service.snapshot.id,
+            num_lines,
+            "collected logs"
+        );
 
         // Split into a main pane and a thin scrollbar pane
         let [logs_area, scrollbar_area] = Layout::default()
@@ -510,7 +520,7 @@ impl App {
         let Some(current_id) = self
             .state
             .current_service()
-            .map(|service| service.id.clone())
+            .map(|service| service.snapshot.id.clone())
         else {
             return;
         };
@@ -518,7 +528,10 @@ impl App {
             .state
             .current_service()
             .map_or((false, false), |service| {
-                (service.healthcheck_dirty, service.healthcheck_configured)
+                (
+                    service.healthcheck_dirty,
+                    service.snapshot.healthcheck_configured,
+                )
             });
         if dirty {
             let attempts = self.reader.healthchecks(&current_id);

@@ -1,37 +1,8 @@
-use micromux::ServiceID;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, strum::Display, strum::IntoStaticStr)]
-pub enum Health {
-    #[strum(serialize = "HEALTHY")]
-    Healthy,
-    #[strum(serialize = "UNHEALTHY")]
-    Unhealthy,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, strum::Display, strum::IntoStaticStr)]
-pub enum Execution {
-    #[strum(serialize = "DISABLED")]
-    Disabled,
-    #[strum(serialize = "PENDING")]
-    Pending,
-    #[strum(serialize = "RUNNING")]
-    Running { health: Option<Health> },
-    #[strum(serialize = "KILLED")]
-    Killed,
-    #[strum(serialize = "EXITED")]
-    Exited,
-}
-
 /// View state for one service. Domain state (execution, health, logs, healthchecks) lives in the
-/// core's `SessionModelReader`; this is the per-service *render cache* the TUI keeps. `exec_state`
-/// and `open_ports` are refreshed from the model on a `SessionChange`; the cached log/healthcheck
-/// text is rebuilt lazily (when `*_dirty`) from the model snapshot for the selected service.
+/// core's `SessionModelReader`; this is the per-service render cache the TUI keeps.
 #[derive(Debug)]
 pub struct Service {
-    pub id: ServiceID,
-    pub exec_state: Execution,
-    pub open_ports: Vec<u16>,
-    pub healthcheck_configured: bool,
+    pub snapshot: micromux::ServiceSnapshot,
     pub cached_num_lines: u16,
     pub cached_logs: String,
     pub logs_dirty: bool,
@@ -42,7 +13,7 @@ pub struct Service {
 
 #[derive(Debug)]
 pub struct State {
-    pub services: indexmap::IndexMap<ServiceID, Service>,
+    pub services: Vec<Service>,
     pub services_sidebar_width: u16,
     pub selected_service: usize,
 }
@@ -50,7 +21,7 @@ pub struct State {
 impl Default for State {
     fn default() -> Self {
         Self {
-            services: indexmap::IndexMap::new(),
+            services: Vec::new(),
             services_sidebar_width: crate::style::INITIAL_SIDEBAR_WIDTH,
             selected_service: 0,
         }
@@ -59,7 +30,7 @@ impl Default for State {
 
 impl State {
     #[must_use]
-    pub fn new(services: indexmap::IndexMap<ServiceID, Service>) -> Self {
+    pub fn new(services: Vec<Service>) -> Self {
         Self {
             services,
             ..Self::default()
@@ -68,16 +39,12 @@ impl State {
 
     #[must_use]
     pub fn current_service(&self) -> Option<&Service> {
-        self.services
-            .get_index(self.selected_service)
-            .map(|(_id, service)| service)
+        self.services.get(self.selected_service)
     }
 
     #[must_use]
     pub fn current_service_mut(&mut self) -> Option<&mut Service> {
-        self.services
-            .get_index_mut(self.selected_service)
-            .map(|(_id, service)| service)
+        self.services.get_mut(self.selected_service)
     }
 
     /// Update the selection index.

@@ -9,11 +9,13 @@
 pub mod v1;
 
 use crate::diagnostics::{DiagnosticExt, Span, ToDiagnostics};
+use crate::model::LogRetention;
 use crate::service::RestartPolicy;
 use codespan_reporting::diagnostic::{Diagnostic, Label};
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use yaml_spanned::{Spanned, Value};
 
 /// Parse a value into a typed, spanned value.
@@ -149,6 +151,12 @@ pub struct Config {
     /// Whether the agent control plane is enabled (default `true`; opt out with
     /// `control: { enabled: false }`).
     pub control_enabled: bool,
+    /// Retention limits for service logs exposed to the TUI/control plane/MCP.
+    pub log_retention: LogRetention,
+    /// Default restart policy inherited by services that do not set `restart`.
+    pub restart_policy: RestartPolicy,
+    /// Default healthcheck timing inherited by services that configure a healthcheck test.
+    pub healthcheck_defaults: HealthCheckDefaults,
     /// Service definitions keyed by service name.
     pub services: IndexMap<Spanned<String>, Service>,
 }
@@ -229,10 +237,27 @@ pub struct Service {
     pub healthcheck: Option<HealthCheck>,
     /// Port mappings / port specs.
     pub ports: Vec<Spanned<String>>,
-    /// Restart policy for this service.
+    /// Raw restart policy configured directly on this service, if any.
     pub restart: Option<RestartPolicy>,
+    /// Effective restart policy after applying the global default.
+    pub restart_policy: RestartPolicy,
     /// Whether this service should be rendered in color.
     pub color: Option<Spanned<bool>>,
+    /// Effective log retention after applying global defaults and this service's overrides.
+    pub log_retention: LogRetention,
+}
+
+/// Healthcheck timing defaults shared by services that define a healthcheck test.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HealthCheckDefaults {
+    /// Optional delay before the first healthcheck.
+    pub start_delay: Option<Spanned<Duration>>,
+    /// Healthcheck interval.
+    pub interval: Option<Spanned<Duration>>,
+    /// Healthcheck timeout.
+    pub timeout: Option<Spanned<Duration>>,
+    /// Number of retries before marking unhealthy.
+    pub retries: Option<Spanned<usize>>,
 }
 
 /// Healthcheck configuration for a service.
@@ -243,11 +268,11 @@ pub struct HealthCheck {
     /// For example, `( "pg_isready", ["-U", "postgres"] )`.
     pub test: (Spanned<String>, Vec<Spanned<String>>),
     /// Optional delay before the first healthcheck.
-    pub start_delay: Option<Spanned<std::time::Duration>>,
+    pub start_delay: Option<Spanned<Duration>>,
     /// Healthcheck interval (e.g. `"30s"`).
-    pub interval: Option<Spanned<std::time::Duration>>,
+    pub interval: Option<Spanned<Duration>>,
     /// Healthcheck timeout (e.g. `"10s"`).
-    pub timeout: Option<Spanned<std::time::Duration>>,
+    pub timeout: Option<Spanned<Duration>>,
     /// Number of retries before marking unhealthy.
     pub retries: Option<Spanned<usize>>,
 }
@@ -733,6 +758,16 @@ mod tests {
             version: 1
             ui:
               width: 120
+            logs:
+              retained_runs: 4
+              memory:
+                max_lines: 5000
+                max_bytes: 2097152
+            restart: unless-stopped
+            healthcheck:
+              interval: "15s"
+              timeout: "3s"
+              retries: 2
             services:
               api:
                 command: ["CMD", "sh", "-c", "echo api"]

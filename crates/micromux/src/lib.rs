@@ -20,7 +20,6 @@
 //! # Ok(()) }
 //! ```
 
-mod bounded_log;
 mod config;
 mod diagnostics;
 mod env;
@@ -37,41 +36,28 @@ use tokio::sync::mpsc;
 
 pub use tokio_util::sync::CancellationToken;
 
-pub use bounded_log::{AsyncBoundedLog, BoundedLog};
 pub use config::{ConfigError, ConfigFile, config_file_names, find_config_file, from_str};
 pub use diagnostics::{Printer, ToDiagnostics};
 pub use health_check::Health;
 pub use model::{
-    ChangeKind, Desired, Execution, HealthAttempt, HealthLine, HealthResult, LogLine,
-    ServiceSnapshot, SessionChange, SessionModelReader,
+    ChangeKind, Desired, DiskLogRetention, Execution, HealthAttempt, HealthLine, HealthResult,
+    LogLimit, LogLine, LogRetention, LogRun, LogRunSummary, MemoryLogRetention, ServiceSnapshot,
+    SessionChange, SessionModelReader,
 };
 pub use scheduler::{
-    Command, CommandRejection, Event, LogUpdateKind, OutputStream, SchedulerStopped,
-    ServiceCommandAck, ServiceCommandResult, ServiceControl, ServiceID,
+    Command, CommandRejection, OutputStream, SchedulerStopped, ServiceCommandAck,
+    ServiceCommandResult, ServiceControl, ServiceID,
 };
 pub use service::RestartPolicy;
 
 pub(crate) type ServiceMap = indexmap::IndexMap<ServiceID, service::Service>;
-
-/// A simplified view of a service for presentation (e.g. in a UI).
-#[derive(Debug, Clone)]
-pub struct ServiceDescriptor {
-    /// Unique identifier of the service.
-    pub id: ServiceID,
-    /// Human-readable name of the service.
-    pub name: String,
-    /// Parsed and validated open ports.
-    pub open_ports: Vec<u16>,
-    /// Whether this service has a healthcheck configured.
-    pub healthcheck_configured: bool,
-}
 
 /// Main entry point to run a micromux session.
 pub struct Micromux {
     services: ServiceMap,
 }
 
-/// Capability handles returned by [`Micromux::start_with_handles`].
+/// Capability handles returned by [`Micromux::start`].
 ///
 /// The model writer never escapes the core, so the only handles an adapter can hold are the read
 /// capability and a command sender. The narrow [`ServiceControl`] port (no input forwarding) is
@@ -135,34 +121,20 @@ impl Micromux {
     ///
     /// The returned descriptors intentionally omit internal details required only by the
     /// scheduler.
-    #[must_use]
-    pub fn services(&self) -> Vec<ServiceDescriptor> {
+    fn initial_model_entries(&self) -> Vec<(ServiceSnapshot, LogRetention)> {
         self.services
             .iter()
-            .map(|(service_id, service)| ServiceDescriptor {
-                id: service_id.clone(),
-                name: service.name.as_ref().clone(),
-                open_ports: service.open_ports.clone(),
-                healthcheck_configured: service.health_check.is_some(),
-            })
-            .collect()
-    }
-
-    fn initial_snapshots(&self) -> Vec<ServiceSnapshot> {
-        self.services
-            .iter()
-            .map(|(id, service)| ServiceSnapshot {
-                id: id.clone(),
-                name: service.name.as_ref().clone(),
-                desired: Desired::Enabled,
-                execution: Execution::Pending,
-                health: None,
-                run_generation: 0,
-                open_ports: service.open_ports.clone(),
-                healthcheck_configured: service.health_check.is_some(),
-                last_exit_code: None,
-                uptime: None,
-                restart_policy: service.restart_policy.clone(),
+            .map(|(id, service)| {
+                (
+                    ServiceSnapshot::initial(
+                        id.clone(),
+                        service.name.as_ref().clone(),
+                        service.open_ports.clone(),
+                        service.health_check.is_some(),
+                        service.restart_policy.clone(),
+                    ),
+                    service.log_retention,
+                )
             })
             .collect()
     }
@@ -173,12 +145,11 @@ impl Micromux {
     /// moved into the runner future and never leaves the core, so adapters can only read the model
     /// or send commands. `Arc<Self>` makes the future `'static`, so the caller can `tokio::spawn` it
     /// while holding the handles.
-    pub fn start_with_handles(
+    pub fn start(
         self: Arc<Self>,
-        ui_tx: mpsc::Sender<scheduler::Event>,
         shutdown: CancellationToken,
     ) -> (impl Future<Output = eyre::Result<()>> + 'static, Handles) {
-        let (reader, writer) = model::new(self.initial_snapshots());
+        let (reader, writer) = model::new(self.initial_model_entries());
         let (commands_tx, commands_rx) = mpsc::channel(1024);
         let handles = Handles {
             reader,
@@ -202,7 +173,8 @@ impl Micromux {
                 commands_rx,
                 events_rx,
                 events_tx,
-                ui_tx,
+                #[cfg(test)]
+                None,
                 writer,
                 shutdown.clone(),
             )

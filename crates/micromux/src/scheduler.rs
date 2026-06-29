@@ -11,10 +11,6 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-/// Buffer between the scheduler and the legacy TUI event forwarder. Large enough to absorb bursts
-/// for a responsive frontend; a wedged frontend that overflows it on a lifecycle event is detached.
-const LEGACY_BRIDGE_CAPACITY: usize = 1024;
-
 /// Initial delay before automatically restarting a service after it exits.
 const RESTART_BACKOFF_BASE: Duration = Duration::from_millis(250);
 /// Maximum delay the (exponentially doubling) restart backoff grows to.
@@ -24,8 +20,10 @@ const RESTART_BACKOFF_RESET: Duration = RESTART_BACKOFF_MAX;
 
 #[path = "scheduler/types.rs"]
 mod types;
-pub use types::{Command, Event, LogUpdateKind, OutputStream, ServiceID, State};
-pub(crate) use types::{ProcessEvent, RunId};
+#[cfg(test)]
+pub(crate) use types::Event;
+pub use types::{Command, OutputStream, ServiceID};
+pub(crate) use types::{LogUpdateKind, ProcessEvent, RunId, State};
 
 #[path = "scheduler/control.rs"]
 mod control;
@@ -274,12 +272,32 @@ impl ServiceRuntime {
         let stable = self.running.as_ref().is_some_and(RunningService::stable);
         // Preserve the generation and exit code before dropping the run handle so an exited or
         // disabled service can still be projected with an accurate `run_generation`/`last_exit_code`.
-        if let Some(running) = &self.running {
-            self.last_run_id = Some(running.run_id);
+        let finished_run_id = self.running.as_ref().map(|running| running.run_id);
+        self.running.take();
+        self.finish_run_state(policy, exit_code, finished_run_id, stable);
+    }
+
+    fn finish_failed_start(
+        &mut self,
+        policy: &service::RestartPolicy,
+        run_id: RunId,
+        exit_code: i32,
+    ) {
+        self.finish_run_state(policy, exit_code, Some(run_id), false);
+    }
+
+    fn finish_run_state(
+        &mut self,
+        policy: &service::RestartPolicy,
+        exit_code: i32,
+        finished_run_id: Option<RunId>,
+        stable: bool,
+    ) {
+        if let Some(run_id) = finished_run_id {
+            self.last_run_id = Some(run_id);
         }
         self.last_started_at = None;
         self.last_exit_code = Some(exit_code);
-        self.running.take();
         if self.desired == DesiredState::Disabled {
             self.state = State::Disabled;
             self.restart.clear_backoff();
@@ -382,53 +400,20 @@ fn sync_model(writer: &SessionModelWriter, service: &Service, runtime: &ServiceR
     writer.write_snapshot(snapshot, started_at);
 }
 
-/// Forwards scheduler events to the legacy TUI without ever letting a wedged frontend stall the
-/// scheduler. Log frames are best-effort (dropped on overflow); a lifecycle event that overflows
-/// means the frontend is wedged, so it is detached (frozen) rather than fed a gap in the stream.
-struct LegacyBridge {
-    tx: Option<mpsc::Sender<Event>>,
+#[cfg(test)]
+struct TestEventSink {
+    tx: mpsc::Sender<Event>,
 }
 
-impl LegacyBridge {
+#[cfg(test)]
+impl TestEventSink {
     fn new(tx: mpsc::Sender<Event>) -> Self {
-        Self { tx: Some(tx) }
+        Self { tx }
     }
 
-    fn forward(&mut self, event: Event) {
-        let Some(tx) = self.tx.as_ref() else {
-            return;
-        };
-        match tx.try_send(event) {
-            Ok(()) => {}
-            Err(mpsc::error::TrySendError::Full(event)) => {
-                if !matches!(event, Event::LogLine { .. }) {
-                    // A lifecycle event did not fit: the frontend is wedged. Detach it so the
-                    // reducer freezes at a consistent point instead of desyncing on a dropped event.
-                    self.tx = None;
-                }
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                self.tx = None;
-            }
-        }
+    fn forward(&self, event: Event) {
+        let _ = self.tx.try_send(event);
     }
-}
-
-fn spawn_legacy_bridge(
-    mut rx: mpsc::Receiver<Event>,
-    ui_tx: mpsc::Sender<Event>,
-    shutdown: CancellationToken,
-) {
-    tokio::spawn(async move {
-        while let Some(event) = rx.recv().await {
-            if ui_tx.send(event).await.is_err() {
-                // The frontend is gone (channel closed). Stop the session so its services are
-                // drained/reaped rather than orphaned.
-                shutdown.cancel();
-                break;
-            }
-        }
-    });
 }
 
 struct SchedulerRuntime<'a> {
@@ -436,7 +421,8 @@ struct SchedulerRuntime<'a> {
     services: HashMap<ServiceID, ServiceRuntime>,
     current_pty_size: portable_pty::PtySize,
     events_tx: mpsc::Sender<ProcessEvent>,
-    bridge: LegacyBridge,
+    #[cfg(test)]
+    test_events: TestEventSink,
     writer: SessionModelWriter,
     shutdown: CancellationToken,
 }
@@ -446,7 +432,7 @@ impl<'a> SchedulerRuntime<'a> {
         services: &ServiceMap,
         graph: ServiceGraph<'a>,
         events_tx: mpsc::Sender<ProcessEvent>,
-        bridge: LegacyBridge,
+        #[cfg(test)] test_events: TestEventSink,
         writer: SessionModelWriter,
         shutdown: CancellationToken,
     ) -> Self {
@@ -470,7 +456,8 @@ impl<'a> SchedulerRuntime<'a> {
                 pixel_height: 0,
             },
             events_tx,
-            bridge,
+            #[cfg(test)]
+            test_events,
             writer,
             shutdown,
         }
@@ -493,7 +480,8 @@ impl<'a> SchedulerRuntime<'a> {
             runtimes: &mut self.services,
             current_pty_size: self.current_pty_size,
             events_tx: &self.events_tx,
-            bridge: &mut self.bridge,
+            #[cfg(test)]
+            test_events: &mut self.test_events,
             writer: &self.writer,
             shutdown: &self.shutdown,
         });
@@ -602,8 +590,9 @@ impl<'a> SchedulerRuntime<'a> {
             }
             Command::Disable { service, ack } => {
                 let result = self.apply_disable(services, &service);
+                #[cfg(test)]
                 if result.is_ok() {
-                    self.bridge.forward(Event::Disabled(service.clone()));
+                    self.test_events.forward(Event::Disabled(service.clone()));
                 }
                 Self::reply(ack, result);
             }
@@ -630,7 +619,7 @@ impl<'a> SchedulerRuntime<'a> {
         }
     }
 
-    fn handle_event(&mut self, services: &ServiceMap, event: ProcessEvent) {
+    fn handle_event(&mut self, services: &ServiceMap, event: &ProcessEvent) {
         tracing::debug!(?event, "received process event");
 
         let service_id = event.service_id().clone();
@@ -649,17 +638,20 @@ impl<'a> SchedulerRuntime<'a> {
             }
         }
 
-        // Write the model from the scheduler's own task — lossless from the scheduler onward — then
-        // forward the (best-effort) legacy event to the bridge.
+        #[cfg(test)]
+        let test_event = event.to_test_event();
+
+        // Write the model from the scheduler's own task — lossless from the scheduler onward.
         match &event {
             ProcessEvent::LogLine {
+                run_id,
                 stream,
                 update,
                 line,
                 ..
             } => {
                 self.writer
-                    .append_log(&service_id, *stream, *update, line.clone());
+                    .append_log(&service_id, run_id.get(), *stream, *update, line.clone());
             }
             ProcessEvent::HealthCheckStarted {
                 attempt, command, ..
@@ -713,7 +705,8 @@ impl<'a> SchedulerRuntime<'a> {
             }
         }
 
-        self.bridge.forward(event.into_ui_event());
+        #[cfg(test)]
+        self.test_events.forward(test_event);
     }
 
     fn next_backoff(&self) -> Option<tokio::time::Instant> {
@@ -771,7 +764,7 @@ impl<'a> SchedulerRuntime<'a> {
                 }
                 event = events_rx.recv() => {
                     let Some(event) = event else { break };
-                    self.handle_event(services, event);
+                    self.handle_event(services, &event);
                 }
             }
         }
@@ -783,20 +776,25 @@ pub async fn scheduler(
     mut commands_rx: mpsc::Receiver<Command>,
     mut events_rx: mpsc::Receiver<ProcessEvent>,
     events_tx: mpsc::Sender<ProcessEvent>,
-    ui_tx: mpsc::Sender<Event>,
+    #[cfg(test)] test_events_tx: Option<mpsc::Sender<Event>>,
     writer: SessionModelWriter,
     shutdown: CancellationToken,
 ) -> eyre::Result<()> {
     let graph = ServiceGraph::new(services)?;
-    // The bridge owns the only await on the legacy TUI channel, so the scheduler never blocks on a
-    // frontend; a closed frontend cancels the session, a wedged one is detached.
-    let (bridge_tx, bridge_rx) = mpsc::channel::<Event>(LEGACY_BRIDGE_CAPACITY);
-    spawn_legacy_bridge(bridge_rx, ui_tx, shutdown.clone());
+    #[cfg(test)]
+    let test_events = {
+        let tx = test_events_tx.unwrap_or_else(|| {
+            let (tx, _rx) = mpsc::channel(1);
+            tx
+        });
+        TestEventSink::new(tx)
+    };
     let mut rt = SchedulerRuntime::new(
         services,
         graph,
         events_tx,
-        LegacyBridge::new(bridge_tx),
+        #[cfg(test)]
+        test_events,
         writer,
         shutdown.clone(),
     );
@@ -827,7 +825,7 @@ pub async fn scheduler(
                 let Some(event) = event else {
                     break;
                 };
-                rt.handle_event(services, event);
+                rt.handle_event(services, &event);
             }
             () = async {
                 match next_backoff {
@@ -861,33 +859,33 @@ mod tests {
     use crate::model::{Desired, Execution};
     use similar_asserts::assert_eq;
 
-    fn test_initial_snapshots(services: &ServiceMap) -> Vec<crate::model::ServiceSnapshot> {
+    fn test_initial_snapshots(
+        services: &ServiceMap,
+    ) -> Vec<(crate::model::ServiceSnapshot, crate::LogRetention)> {
         services
             .iter()
-            .map(|(id, service)| crate::model::ServiceSnapshot {
-                id: id.clone(),
-                name: service.name.as_ref().clone(),
-                desired: crate::model::Desired::Enabled,
-                execution: crate::model::Execution::Pending,
-                health: None,
-                run_generation: 0,
-                open_ports: service.open_ports.clone(),
-                healthcheck_configured: service.health_check.is_some(),
-                last_exit_code: None,
-                uptime: None,
-                restart_policy: service.restart_policy.clone(),
+            .map(|(id, service)| {
+                (
+                    crate::model::ServiceSnapshot::initial(
+                        id.clone(),
+                        service.name.as_ref().clone(),
+                        service.open_ports.clone(),
+                        service.health_check.is_some(),
+                        service.restart_policy.clone(),
+                    ),
+                    service.log_retention,
+                )
             })
             .collect()
     }
 
-    /// Run the real scheduler with a throwaway model writer (discarding the reader). Lets the
-    /// existing tests keep their call shape after the `writer` parameter was added.
+    /// Run the real scheduler with a test-only transition event sink.
     async fn run_test_scheduler(
         services: &ServiceMap,
         commands_rx: mpsc::Receiver<Command>,
         events_rx: mpsc::Receiver<ProcessEvent>,
         events_tx: mpsc::Sender<ProcessEvent>,
-        ui_tx: mpsc::Sender<Event>,
+        test_events_tx: mpsc::Sender<Event>,
         shutdown: CancellationToken,
     ) -> eyre::Result<()> {
         let (_reader, writer) = crate::model::new(test_initial_snapshots(services));
@@ -896,27 +894,23 @@ mod tests {
             commands_rx,
             events_rx,
             events_tx,
-            ui_tx,
+            Some(test_events_tx),
             writer,
             shutdown,
         )
         .await
     }
 
-    /// A scheduler running against a temp config plus the M0 handles, for the model/control tests.
+    /// A scheduler running against a temp config plus model/control handles.
     #[allow(dead_code)]
     struct Harness {
         reader: crate::model::SessionModelReader,
         control: ServiceControl,
-        // Kept alive but never drained in some tests (a wedged frontend). Dropping it would close
-        // the channel and cancel the session, so the harness owns it.
-        ui_rx: mpsc::Receiver<Event>,
         shutdown: CancellationToken,
         handle: tokio::task::JoinHandle<eyre::Result<()>>,
     }
 
-    fn spawn_harness(services: ServiceMap, ui_capacity: usize) -> Harness {
-        let (ui_tx, ui_rx) = mpsc::channel(ui_capacity);
+    fn spawn_harness(services: ServiceMap) -> Harness {
         let (commands_tx, commands_rx) = mpsc::channel(64);
         let (events_tx, events_rx) = mpsc::channel(256);
         let (reader, writer) = crate::model::new(test_initial_snapshots(&services));
@@ -930,7 +924,7 @@ mod tests {
                     commands_rx,
                     events_rx,
                     events_tx,
-                    ui_tx,
+                    None,
                     writer,
                     shutdown,
                 )
@@ -940,7 +934,6 @@ mod tests {
         Harness {
             reader,
             control,
-            ui_rx,
             shutdown,
             handle,
         }
@@ -963,7 +956,7 @@ mod tests {
     {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
-            if let Some(snapshot) = reader.service(&id.to_string())
+            if let Some(snapshot) = reader.service(id)
                 && predicate(&snapshot)
             {
                 return Ok(snapshot);
@@ -1012,6 +1005,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn failed_start_advances_generation_and_records_exit() {
+        let mut runtime = ServiceRuntime::new(&crate::service::RestartPolicy::Never);
+        runtime.mark_starting();
+        let run_id = runtime.allocate_run_id();
+
+        runtime.finish_failed_start(&crate::service::RestartPolicy::Never, run_id, -1);
+
+        assert_eq!(runtime.run_generation(), 1);
+        assert_eq!(runtime.last_exit_code, Some(-1));
+        assert!(matches!(runtime.state, State::Exited { exit_code: -1 }));
+    }
+
     #[tokio::test]
     async fn service_control_latches_generation_and_rejects_restart_when_disabled()
     -> eyre::Result<()> {
@@ -1024,7 +1030,7 @@ mod tests {
                 service_config("svc", ("sh", &["-c", "sleep 60"])),
             )?,
         );
-        let harness = spawn_harness(services, 64);
+        let harness = spawn_harness(services);
         let id = "svc".to_string();
 
         let snapshot = wait_until(&harness.reader, "svc", |s| {
@@ -1064,7 +1070,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wedged_tui_does_not_stall_the_scheduler() -> eyre::Result<()> {
+    async fn commands_do_not_depend_on_event_subscribers() -> eyre::Result<()> {
         let mut services: ServiceMap = ServiceMap::new();
         services.insert(
             "svc".to_string(),
@@ -1074,16 +1080,15 @@ mod tests {
                 service_config("svc", ("sh", &["-c", "sleep 60"])),
             )?,
         );
-        // ui capacity 1, never drained: a wedged frontend.
-        let harness = spawn_harness(services, 1);
+        let harness = spawn_harness(services);
         let id = "svc".to_string();
 
         wait_until(&harness.reader, "svc", |s| {
             s.execution == Execution::Running
         })
         .await?;
-        // Despite the never-drained TUI channel, an acknowledged command round-trips and the model
-        // advances: the scheduler keeps processing transitions and never blocks on the frontend.
+        // Acknowledged commands round-trip and advance the model without any event-channel
+        // subscriber; the model is the scheduler's only runtime publication path.
         let acks = accepted(harness.control.restart(&id).await)?;
         assert_eq!(acks.first().map(|a| a.observed_generation), Some(1));
         wait_until(&harness.reader, "svc", |s| s.run_generation == 2).await?;
@@ -1118,7 +1123,9 @@ mod tests {
             healthcheck: None,
             ports: vec![],
             restart: None,
+            restart_policy: crate::service::RestartPolicy::Never,
             color: None,
+            log_retention: crate::LogRetention::default(),
         }
     }
 
@@ -1195,7 +1202,7 @@ mod tests {
         services.insert("svc".to_string(), Service::new("svc", config_dir, cfg)?);
 
         let shutdown = CancellationToken::new();
-        let (ui_tx, mut ui_rx) = mpsc::channel(128);
+        let (test_events_tx, mut test_events_rx) = mpsc::channel(128);
         let (events_tx, events_rx) = mpsc::channel(128);
         let (_commands_tx, commands_rx) = mpsc::channel(128);
 
@@ -1207,7 +1214,7 @@ mod tests {
                     commands_rx,
                     events_rx,
                     events_tx,
-                    ui_tx,
+                    test_events_tx,
                     shutdown,
                 )
                 .await
@@ -1216,8 +1223,8 @@ mod tests {
 
         let mut saw_hc_success = false;
         for _ in 0..200 {
-            let (event, next_rx) = recv_event(ui_rx).await?;
-            ui_rx = next_rx;
+            let (event, next_rx) = recv_event(test_events_rx).await?;
+            test_events_rx = next_rx;
             if let Event::HealthCheckFinished { success: true, .. } = event {
                 saw_hc_success = true;
                 break;
@@ -1262,7 +1269,7 @@ mod tests {
         services.insert("svc".to_string(), Service::new("svc", &dir, cfg)?);
 
         let shutdown = CancellationToken::new();
-        let (ui_tx, mut ui_rx) = mpsc::channel(128);
+        let (test_events_tx, mut test_events_rx) = mpsc::channel(128);
         let (events_tx, events_rx) = mpsc::channel(128);
         let (_commands_tx, commands_rx) = mpsc::channel(128);
 
@@ -1274,7 +1281,7 @@ mod tests {
                     commands_rx,
                     events_rx,
                     events_tx,
-                    ui_tx,
+                    test_events_tx,
                     shutdown,
                 )
                 .await
@@ -1283,8 +1290,8 @@ mod tests {
 
         let mut saw_hc_success = false;
         for _ in 0..200 {
-            let (event, next_rx) = recv_event(ui_rx).await?;
-            ui_rx = next_rx;
+            let (event, next_rx) = recv_event(test_events_rx).await?;
+            test_events_rx = next_rx;
             if let Event::HealthCheckFinished { success: true, .. } = event {
                 saw_hc_success = true;
                 break;
@@ -1325,7 +1332,7 @@ mod tests {
         services.insert("svc".to_string(), Service::new("svc", config_dir, cfg)?);
 
         let shutdown = CancellationToken::new();
-        let (ui_tx, mut ui_rx) = mpsc::channel(128);
+        let (test_events_tx, mut test_events_rx) = mpsc::channel(128);
         let (events_tx, events_rx) = mpsc::channel(128);
         let (_commands_tx, commands_rx) = mpsc::channel(128);
 
@@ -1337,7 +1344,7 @@ mod tests {
                     commands_rx,
                     events_rx,
                     events_tx,
-                    ui_tx,
+                    test_events_tx,
                     shutdown,
                 )
                 .await
@@ -1347,8 +1354,8 @@ mod tests {
         let mut saw_log_line = false;
         let mut saw_finished = false;
         for _ in 0..200 {
-            let (event, next_rx) = recv_event(ui_rx).await?;
-            ui_rx = next_rx;
+            let (event, next_rx) = recv_event(test_events_rx).await?;
+            test_events_rx = next_rx;
             match event {
                 Event::HealthCheckLogLine { stream, line, .. }
                     if matches!(stream, OutputStream::Stderr) && !line.is_empty() =>
@@ -1390,7 +1397,7 @@ mod tests {
         );
 
         let shutdown = CancellationToken::new();
-        let (ui_tx, ui_rx) = mpsc::channel(64);
+        let (test_events_tx, test_events_rx) = mpsc::channel(64);
         let (events_tx, events_rx) = mpsc::channel(64);
         let (commands_tx, commands_rx) = mpsc::channel(64);
 
@@ -1402,14 +1409,14 @@ mod tests {
                     commands_rx,
                     events_rx,
                     events_tx,
-                    ui_tx,
+                    test_events_tx,
                     shutdown,
                 )
                 .await
             }
         });
 
-        let (event, mut ui_rx) = recv_event(ui_rx).await?;
+        let (event, mut test_events_rx) = recv_event(test_events_rx).await?;
         assert!(matches!(event, Event::Started { .. }));
 
         commands_tx
@@ -1417,8 +1424,8 @@ mod tests {
             .await?;
 
         loop {
-            let (event, next_rx) = recv_event(ui_rx).await?;
-            ui_rx = next_rx;
+            let (event, next_rx) = recv_event(test_events_rx).await?;
+            test_events_rx = next_rx;
             if matches!(event, Event::Killed(_) | Event::Exited(_, _)) {
                 break;
             }
@@ -1430,7 +1437,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ui_drop_still_drains_running_service() -> eyre::Result<()> {
+    async fn shutdown_drains_running_service() -> eyre::Result<()> {
         use nix::errno::Errno;
         use nix::sys::signal::kill;
         use nix::unistd::Pid;
@@ -1455,9 +1462,9 @@ mod tests {
         );
 
         let shutdown = CancellationToken::new();
-        let (ui_tx, ui_rx) = mpsc::channel(64);
+        let (test_events_tx, test_events_rx) = mpsc::channel(64);
         let (events_tx, events_rx) = mpsc::channel(64);
-        let (commands_tx, commands_rx) = mpsc::channel(64);
+        let (_commands_tx, commands_rx) = mpsc::channel(64);
 
         let handle = tokio::spawn({
             let shutdown = shutdown.clone();
@@ -1467,14 +1474,14 @@ mod tests {
                     commands_rx,
                     events_rx,
                     events_tx,
-                    ui_tx,
+                    test_events_tx,
                     shutdown,
                 )
                 .await
             }
         });
 
-        let (event, ui_rx) = recv_event(ui_rx).await?;
+        let (event, _test_events_rx) = recv_event(test_events_rx).await?;
         assert!(matches!(event, Event::Started { .. }));
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
@@ -1488,14 +1495,11 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         };
 
-        drop(ui_rx);
-        commands_tx
-            .send(Command::disable("svc".to_string()))
-            .await?;
+        shutdown.cancel();
 
         timeout(Duration::from_secs(3), handle)
             .await
-            .map_err(|_| eyre::eyre!("scheduler did not drain after ui drop"))???;
+            .map_err(|_| eyre::eyre!("scheduler did not drain after shutdown"))???;
 
         match kill(Pid::from_raw(pid), None) {
             Err(Errno::ESRCH) => {}
@@ -1519,7 +1523,7 @@ mod tests {
         );
 
         let shutdown = CancellationToken::new();
-        let (ui_tx, ui_rx) = mpsc::channel(64);
+        let (test_events_tx, test_events_rx) = mpsc::channel(64);
         let (events_tx, events_rx) = mpsc::channel(64);
         let (commands_tx, commands_rx) = mpsc::channel(64);
 
@@ -1531,14 +1535,14 @@ mod tests {
                     commands_rx,
                     events_rx,
                     events_tx,
-                    ui_tx,
+                    test_events_tx,
                     shutdown,
                 )
                 .await
             }
         });
 
-        let (event, mut ui_rx) = recv_event(ui_rx).await?;
+        let (event, mut test_events_rx) = recv_event(test_events_rx).await?;
         assert!(matches!(event, Event::Started { .. }));
 
         commands_tx
@@ -1547,8 +1551,8 @@ mod tests {
 
         let mut saw_second_start = false;
         for _ in 0..10 {
-            let (event, next_rx) = recv_event(ui_rx).await?;
-            ui_rx = next_rx;
+            let (event, next_rx) = recv_event(test_events_rx).await?;
+            test_events_rx = next_rx;
             if matches!(event, Event::Started { .. }) {
                 saw_second_start = true;
                 break;
@@ -1566,12 +1570,13 @@ mod tests {
         let config_dir = Path::new(".");
         let mut cfg = service_config("svc", ("sh", &["-c", "exit 1"]));
         cfg.restart = Some(crate::service::RestartPolicy::Always);
+        cfg.restart_policy = crate::service::RestartPolicy::Always;
 
         let mut services: ServiceMap = ServiceMap::new();
         services.insert("svc".to_string(), Service::new("svc", config_dir, cfg)?);
 
         let shutdown = CancellationToken::new();
-        let (ui_tx, ui_rx) = mpsc::channel(256);
+        let (test_events_tx, test_events_rx) = mpsc::channel(256);
         let (events_tx, events_rx) = mpsc::channel(256);
         let (_commands_tx, commands_rx) = mpsc::channel(256);
 
@@ -1583,7 +1588,7 @@ mod tests {
                     commands_rx,
                     events_rx,
                     events_tx,
-                    ui_tx,
+                    test_events_tx,
                     shutdown,
                 )
                 .await
@@ -1594,10 +1599,10 @@ mod tests {
         // so only the backoff timer can wake the scheduler to restart it. Seeing a second
         // Started with no manual Restart command proves the timer fires.
         let mut starts = 0;
-        let mut ui_rx = ui_rx;
+        let mut test_events_rx = test_events_rx;
         for _ in 0..100 {
-            let (event, next_rx) = recv_event(ui_rx).await?;
-            ui_rx = next_rx;
+            let (event, next_rx) = recv_event(test_events_rx).await?;
+            test_events_rx = next_rx;
             if matches!(event, Event::Started { .. }) {
                 starts += 1;
                 if starts >= 2 {
@@ -1637,12 +1642,13 @@ mod tests {
             vec![spanned_string("-c"), spanned_string(&script)],
         );
         cfg.restart = Some(crate::service::RestartPolicy::Always);
+        cfg.restart_policy = crate::service::RestartPolicy::Always;
 
         let mut services: ServiceMap = ServiceMap::new();
         services.insert("svc".to_string(), Service::new("svc", &dir, cfg)?);
 
         let shutdown = CancellationToken::new();
-        let (ui_tx, mut ui_rx) = mpsc::channel(256);
+        let (test_events_tx, mut test_events_rx) = mpsc::channel(256);
         let (events_tx, events_rx) = mpsc::channel(256);
         let (_commands_tx, commands_rx) = mpsc::channel(256);
 
@@ -1654,7 +1660,7 @@ mod tests {
                     commands_rx,
                     events_rx,
                     events_tx,
-                    ui_tx,
+                    test_events_tx,
                     shutdown,
                 )
                 .await
@@ -1664,7 +1670,7 @@ mod tests {
         let mut starts = 0;
         let mut saw_second_run = false;
         for _ in 0..100 {
-            let event = timeout(Duration::from_secs(5), ui_rx.recv())
+            let event = timeout(Duration::from_secs(5), test_events_rx.recv())
                 .await
                 .map_err(|_| eyre::eyre!("timeout waiting for event"))?
                 .ok_or_else(|| eyre::eyre!("event channel closed"))?;
@@ -1690,7 +1696,7 @@ mod tests {
 
         let deadline = tokio::time::Instant::now() + Duration::from_millis(1200);
         while tokio::time::Instant::now() < deadline {
-            match timeout(Duration::from_millis(100), ui_rx.recv()).await {
+            match timeout(Duration::from_millis(100), test_events_rx.recv()).await {
                 Ok(Some(Event::LogLine { line, .. })) if line.contains("stale-from-first-run") => {
                     eyre::bail!("stale first-run output reached the UI");
                 }
@@ -1725,7 +1731,7 @@ mod tests {
         );
 
         let shutdown = CancellationToken::new();
-        let (ui_tx, ui_rx) = mpsc::channel(128);
+        let (test_events_tx, test_events_rx) = mpsc::channel(128);
         let (events_tx, events_rx) = mpsc::channel(128);
         let (_commands_tx, commands_rx) = mpsc::channel(128);
 
@@ -1737,7 +1743,7 @@ mod tests {
                     commands_rx,
                     events_rx,
                     events_tx,
-                    ui_tx,
+                    test_events_tx,
                     shutdown,
                 )
                 .await
@@ -1752,11 +1758,11 @@ mod tests {
         }
         assert!(pty::log_reader_active(&service_id, run_id));
 
-        let mut ui_rx = ui_rx;
+        let mut test_events_rx = test_events_rx;
         let mut saw_exit = false;
         for _ in 0..20 {
-            let (event, next_rx) = recv_event(ui_rx).await?;
-            ui_rx = next_rx;
+            let (event, next_rx) = recv_event(test_events_rx).await?;
+            test_events_rx = next_rx;
             if matches!(event, Event::Exited(id, 0) if id == service_id) {
                 saw_exit = true;
                 break;
@@ -1793,7 +1799,7 @@ mod tests {
         );
 
         let shutdown = CancellationToken::new();
-        let (ui_tx, ui_rx) = mpsc::channel(128);
+        let (test_events_tx, test_events_rx) = mpsc::channel(128);
         let (events_tx, events_rx) = mpsc::channel(128);
         let (commands_tx, commands_rx) = mpsc::channel(128);
 
@@ -1805,14 +1811,14 @@ mod tests {
                     commands_rx,
                     events_rx,
                     events_tx,
-                    ui_tx,
+                    test_events_tx,
                     shutdown,
                 )
                 .await
             }
         });
 
-        let (event, mut ui_rx) = recv_event(ui_rx).await?;
+        let (event, mut test_events_rx) = recv_event(test_events_rx).await?;
         assert!(matches!(event, Event::Started { .. }));
 
         commands_tx
@@ -1820,8 +1826,8 @@ mod tests {
             .await?;
 
         loop {
-            let (event, next_rx) = recv_event(ui_rx).await?;
-            ui_rx = next_rx;
+            let (event, next_rx) = recv_event(test_events_rx).await?;
+            test_events_rx = next_rx;
             if matches!(event, Event::Exited(_, _)) {
                 break;
             }
@@ -1831,8 +1837,8 @@ mod tests {
 
         let mut restarted = false;
         for _ in 0..20 {
-            let (event, next_rx) = recv_event(ui_rx).await?;
-            ui_rx = next_rx;
+            let (event, next_rx) = recv_event(test_events_rx).await?;
+            test_events_rx = next_rx;
             if matches!(event, Event::Started { .. }) {
                 restarted = true;
                 break;
@@ -1859,7 +1865,7 @@ mod tests {
         );
 
         let shutdown = CancellationToken::new();
-        let (ui_tx, ui_rx) = mpsc::channel(128);
+        let (test_events_tx, test_events_rx) = mpsc::channel(128);
         let (events_tx, events_rx) = mpsc::channel(128);
         let (commands_tx, commands_rx) = mpsc::channel(128);
 
@@ -1871,18 +1877,18 @@ mod tests {
                     commands_rx,
                     events_rx,
                     events_tx,
-                    ui_tx,
+                    test_events_tx,
                     shutdown,
                 )
                 .await
             }
         });
 
-        let mut ui_rx = ui_rx;
+        let mut test_events_rx = test_events_rx;
         let mut saw_log = false;
         for _ in 0..20 {
-            let (event, next_rx) = recv_event(ui_rx).await?;
-            ui_rx = next_rx;
+            let (event, next_rx) = recv_event(test_events_rx).await?;
+            test_events_rx = next_rx;
             if matches!(event, Event::LogLine { line, .. } if line.contains("first-run")) {
                 saw_log = true;
                 break;
@@ -1894,8 +1900,8 @@ mod tests {
             .send(Command::disable("svc".to_string()))
             .await?;
         loop {
-            let (event, next_rx) = recv_event(ui_rx).await?;
-            ui_rx = next_rx;
+            let (event, next_rx) = recv_event(test_events_rx).await?;
+            test_events_rx = next_rx;
             if matches!(event, Event::Exited(_, _)) {
                 break;
             }
@@ -1905,8 +1911,8 @@ mod tests {
 
         let mut restarted = false;
         for _ in 0..20 {
-            let (event, next_rx) = recv_event(ui_rx).await?;
-            ui_rx = next_rx;
+            let (event, next_rx) = recv_event(test_events_rx).await?;
+            test_events_rx = next_rx;
             match event {
                 Event::ClearLogs(_) => eyre::bail!("enable unexpectedly cleared logs"),
                 Event::Started { .. } => {
@@ -1937,7 +1943,7 @@ mod tests {
         );
 
         let shutdown = CancellationToken::new();
-        let (ui_tx, ui_rx) = mpsc::channel(128);
+        let (test_events_tx, test_events_rx) = mpsc::channel(128);
         let (events_tx, events_rx) = mpsc::channel(128);
         let (commands_tx, commands_rx) = mpsc::channel(128);
 
@@ -1949,17 +1955,17 @@ mod tests {
                     commands_rx,
                     events_rx,
                     events_tx,
-                    ui_tx,
+                    test_events_tx,
                     shutdown,
                 )
                 .await
             }
         });
 
-        let mut ui_rx = ui_rx;
+        let mut test_events_rx = test_events_rx;
         loop {
-            let (event, next_rx) = recv_event(ui_rx).await?;
-            ui_rx = next_rx;
+            let (event, next_rx) = recv_event(test_events_rx).await?;
+            test_events_rx = next_rx;
             if matches!(event, Event::Started { .. }) {
                 break;
             }
@@ -1969,8 +1975,8 @@ mod tests {
             .send(Command::disable("svc".to_string()))
             .await?;
         loop {
-            let (event, next_rx) = recv_event(ui_rx).await?;
-            ui_rx = next_rx;
+            let (event, next_rx) = recv_event(test_events_rx).await?;
+            test_events_rx = next_rx;
             if matches!(event, Event::Exited(_, _)) {
                 break;
             }
@@ -1982,7 +1988,7 @@ mod tests {
 
         let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
         while tokio::time::Instant::now() < deadline {
-            match timeout(Duration::from_millis(50), ui_rx.recv()).await {
+            match timeout(Duration::from_millis(50), test_events_rx.recv()).await {
                 Ok(Some(Event::Started { .. })) => {
                     eyre::bail!("restart re-enabled a disabled service");
                 }
@@ -2021,7 +2027,7 @@ mod tests {
         );
 
         let shutdown = CancellationToken::new();
-        let (ui_tx, ui_rx) = mpsc::channel(256);
+        let (test_events_tx, test_events_rx) = mpsc::channel(256);
         let (events_tx, events_rx) = mpsc::channel(256);
         let (commands_tx, commands_rx) = mpsc::channel(256);
 
@@ -2033,18 +2039,18 @@ mod tests {
                     commands_rx,
                     events_rx,
                     events_tx,
-                    ui_tx,
+                    test_events_tx,
                     shutdown,
                 )
                 .await
             }
         });
 
-        let mut ui_rx = ui_rx;
+        let mut test_events_rx = test_events_rx;
         let mut started = std::collections::HashSet::new();
         while started.len() < 2 {
-            let (event, next_rx) = recv_event(ui_rx).await?;
-            ui_rx = next_rx;
+            let (event, next_rx) = recv_event(test_events_rx).await?;
+            test_events_rx = next_rx;
             if let Event::Started { service_id } = event {
                 started.insert(service_id);
             }
@@ -2054,8 +2060,8 @@ mod tests {
             .send(Command::disable("disabled".to_string()))
             .await?;
         loop {
-            let (event, next_rx) = recv_event(ui_rx).await?;
-            ui_rx = next_rx;
+            let (event, next_rx) = recv_event(test_events_rx).await?;
+            test_events_rx = next_rx;
             if matches!(event, Event::Exited(service_id, _) if service_id == "disabled") {
                 break;
             }
@@ -2066,7 +2072,7 @@ mod tests {
         let deadline = tokio::time::Instant::now() + Duration::from_millis(800);
         let mut saw_enabled_restart = false;
         while tokio::time::Instant::now() < deadline {
-            match timeout(Duration::from_millis(100), ui_rx.recv()).await {
+            match timeout(Duration::from_millis(100), test_events_rx.recv()).await {
                 Ok(Some(Event::Started { service_id })) if service_id == "disabled" => {
                     eyre::bail!("RestartAll restarted a disabled service");
                 }
@@ -2127,7 +2133,7 @@ mod tests {
         services.insert("app".to_string(), Service::new("app", config_dir, app_cfg)?);
 
         let shutdown = CancellationToken::new();
-        let (ui_tx, ui_rx) = mpsc::channel(256);
+        let (test_events_tx, test_events_rx) = mpsc::channel(256);
         let (events_tx, events_rx) = mpsc::channel(256);
         let (commands_tx, commands_rx) = mpsc::channel(256);
 
@@ -2139,14 +2145,14 @@ mod tests {
                     commands_rx,
                     events_rx,
                     events_tx,
-                    ui_tx,
+                    test_events_tx,
                     shutdown,
                 )
                 .await
             }
         });
 
-        let (event, mut ui_rx) = recv_event(ui_rx).await?;
+        let (event, mut test_events_rx) = recv_event(test_events_rx).await?;
         assert!(matches!(event, Event::Started { service_id } if service_id == "dep"));
 
         commands_tx
@@ -2155,7 +2161,7 @@ mod tests {
 
         let deadline = tokio::time::Instant::now() + Duration::from_millis(700);
         while tokio::time::Instant::now() < deadline {
-            match timeout(Duration::from_millis(100), ui_rx.recv()).await {
+            match timeout(Duration::from_millis(100), test_events_rx.recv()).await {
                 Ok(Some(Event::Started { service_id })) if service_id == "app" => {
                     eyre::bail!("dependent app started after its dependency was disabled");
                 }
@@ -2183,7 +2189,7 @@ mod tests {
         );
 
         let shutdown = CancellationToken::new();
-        let (ui_tx, ui_rx) = mpsc::channel(64);
+        let (test_events_tx, test_events_rx) = mpsc::channel(64);
         let (events_tx, events_rx) = mpsc::channel(64);
         let (_commands_tx, commands_rx) = mpsc::channel(64);
 
@@ -2195,21 +2201,21 @@ mod tests {
                     commands_rx,
                     events_rx,
                     events_tx,
-                    ui_tx,
+                    test_events_tx,
                     shutdown,
                 )
                 .await
             }
         });
 
-        let (_event, mut ui_rx) = recv_event(ui_rx).await?;
+        let (_event, mut test_events_rx) = recv_event(test_events_rx).await?;
 
         let mut saw_hello = false;
         let mut saw_err = false;
 
         for _ in 0..50 {
-            let (event, next_rx) = recv_event(ui_rx).await?;
-            ui_rx = next_rx;
+            let (event, next_rx) = recv_event(test_events_rx).await?;
+            test_events_rx = next_rx;
             match event {
                 Event::LogLine { line, .. } if line.contains("hello") => {
                     saw_hello = true;
@@ -2250,7 +2256,7 @@ mod tests {
         );
 
         let shutdown = CancellationToken::new();
-        let (ui_tx, ui_rx) = mpsc::channel(64);
+        let (test_events_tx, test_events_rx) = mpsc::channel(64);
         let (events_tx, events_rx) = mpsc::channel(64);
         let (_commands_tx, commands_rx) = mpsc::channel(64);
 
@@ -2262,19 +2268,19 @@ mod tests {
                     commands_rx,
                     events_rx,
                     events_tx,
-                    ui_tx,
+                    test_events_tx,
                     shutdown,
                 )
                 .await
             }
         });
 
-        let (_event, mut ui_rx) = recv_event(ui_rx).await?;
+        let (_event, mut test_events_rx) = recv_event(test_events_rx).await?;
 
         let mut saw_tty = false;
         for _ in 0..20 {
-            let (event, next_rx) = recv_event(ui_rx).await?;
-            ui_rx = next_rx;
+            let (event, next_rx) = recv_event(test_events_rx).await?;
+            test_events_rx = next_rx;
             match event {
                 Event::LogLine { line, .. } if line.contains("tty") => {
                     saw_tty = true;
@@ -2304,7 +2310,7 @@ mod tests {
         );
 
         let shutdown = CancellationToken::new();
-        let (ui_tx, ui_rx) = mpsc::channel(64);
+        let (test_events_tx, test_events_rx) = mpsc::channel(64);
         let (events_tx, events_rx) = mpsc::channel(64);
         let (commands_tx, commands_rx) = mpsc::channel(64);
 
@@ -2316,14 +2322,14 @@ mod tests {
                     commands_rx,
                     events_rx,
                     events_tx,
-                    ui_tx,
+                    test_events_tx,
                     shutdown,
                 )
                 .await
             }
         });
 
-        let (_event, mut ui_rx) = recv_event(ui_rx).await?;
+        let (_event, mut test_events_rx) = recv_event(test_events_rx).await?;
 
         commands_tx
             .send(Command::SendInput("svc".to_string(), b"hello\r".to_vec()))
@@ -2331,8 +2337,8 @@ mod tests {
 
         let mut saw = false;
         for _ in 0..30 {
-            let (event, next_rx) = recv_event(ui_rx).await?;
-            ui_rx = next_rx;
+            let (event, next_rx) = recv_event(test_events_rx).await?;
+            test_events_rx = next_rx;
             match event {
                 Event::LogLine { line, .. } if line.contains("got:hello") => {
                     saw = true;
@@ -2373,7 +2379,7 @@ mod tests {
         services.insert("app".to_string(), Service::new("app", config_dir, app_cfg)?);
 
         let shutdown = CancellationToken::new();
-        let (ui_tx, ui_rx) = mpsc::channel(256);
+        let (test_events_tx, test_events_rx) = mpsc::channel(256);
         let (events_tx, events_rx) = mpsc::channel(256);
         let (_commands_tx, commands_rx) = mpsc::channel(256);
 
@@ -2385,21 +2391,21 @@ mod tests {
                     commands_rx,
                     events_rx,
                     events_tx,
-                    ui_tx,
+                    test_events_tx,
                     shutdown,
                 )
                 .await
             }
         });
 
-        let (event, mut ui_rx) = recv_event(ui_rx).await?;
+        let (event, mut test_events_rx) = recv_event(test_events_rx).await?;
         assert!(matches!(event, Event::Started { service_id } if service_id == "dep"));
 
         let mut saw_app_started = false;
         let mut saw_dep_healthy = false;
         for _ in 0..40 {
-            let (event, next_rx) = recv_event(ui_rx).await?;
-            ui_rx = next_rx;
+            let (event, next_rx) = recv_event(test_events_rx).await?;
+            test_events_rx = next_rx;
             match event {
                 Event::Healthy(service_id) if service_id == "dep" => {
                     saw_dep_healthy = true;
@@ -2445,7 +2451,7 @@ mod tests {
         services.insert("app".to_string(), Service::new("app", config_dir, app_cfg)?);
 
         let shutdown = CancellationToken::new();
-        let (ui_tx, ui_rx) = mpsc::channel(256);
+        let (test_events_tx, test_events_rx) = mpsc::channel(256);
         let (events_tx, events_rx) = mpsc::channel(256);
         let (commands_tx, commands_rx) = mpsc::channel(256);
 
@@ -2457,7 +2463,7 @@ mod tests {
                     commands_rx,
                     events_rx,
                     events_tx,
-                    ui_tx,
+                    test_events_tx,
                     shutdown,
                 )
                 .await
@@ -2471,13 +2477,13 @@ mod tests {
             })
             .await?;
 
-        let (_event, mut ui_rx) = recv_event(ui_rx).await?;
+        let (_event, mut test_events_rx) = recv_event(test_events_rx).await?;
 
         let mut saw_first = false;
         let mut saw_second = false;
         for _ in 0..80 {
-            let (event, next_rx) = recv_event(ui_rx).await?;
-            ui_rx = next_rx;
+            let (event, next_rx) = recv_event(test_events_rx).await?;
+            test_events_rx = next_rx;
             match event {
                 Event::Started { service_id } if service_id == "app" => {}
                 Event::LogLine {
@@ -2520,7 +2526,7 @@ mod tests {
         services.insert("svc".to_string(), Service::new("svc", &config_dir, cfg)?);
 
         let shutdown = CancellationToken::new();
-        let (ui_tx, mut ui_rx) = mpsc::channel(64);
+        let (test_events_tx, mut test_events_rx) = mpsc::channel(64);
         let (events_tx, events_rx) = mpsc::channel(64);
         let (_commands_tx, commands_rx) = mpsc::channel(64);
 
@@ -2532,7 +2538,7 @@ mod tests {
                     commands_rx,
                     events_rx,
                     events_tx,
-                    ui_tx,
+                    test_events_tx,
                     shutdown,
                 )
                 .await
@@ -2543,7 +2549,7 @@ mod tests {
         let expected = work_abs.canonicalize()?;
 
         for _ in 0..50 {
-            let ev = timeout(Duration::from_secs(5), ui_rx.recv())
+            let ev = timeout(Duration::from_secs(5), test_events_rx.recv())
                 .await
                 .map_err(|_| eyre::eyre!("timeout waiting for event"))?
                 .ok_or_else(|| eyre::eyre!("event channel closed"))?;

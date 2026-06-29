@@ -1,24 +1,16 @@
 //! `micromux-tui` provides the terminal user interface for micromux.
 //!
-//! The main entry point is [`App`], constructed from the service descriptors plus a
-//! [`micromux::SessionModelReader`] (the source of all domain state), a command sender, and a
-//! shutdown token; call [`App::render`] to run it. The TUI holds only view state and reads the model
-//! on each [`micromux::SessionChange`].
+//! The main entry point is [`App`], constructed from a [`micromux::SessionModelReader`] (the source
+//! of all domain state), a command sender, and a shutdown token; call [`App::render`] to run it. The
+//! TUI holds only view state and reads the model on each [`micromux::SessionChange`].
 
 mod event;
 mod render;
 mod state;
 mod style;
 
-/// Re-export of `crossterm` for consumers that need to share types with the TUI.
-pub use crossterm;
-/// Re-export of `ratatui` for consumers that need to share types with the TUI.
-pub use ratatui;
-
 use color_eyre::eyre;
-use micromux::{
-    ChangeKind, Command, ServiceDescriptor, ServiceSnapshot, SessionChange, SessionModelReader,
-};
+use micromux::{ChangeKind, Command, SessionChange, SessionModelReader};
 use ratatui::DefaultTerminal;
 use tokio::sync::broadcast;
 use tokio::sync::mpsc;
@@ -63,29 +55,23 @@ impl App {
     /// Construct a new [`App`] over the authoritative session model.
     #[must_use]
     pub fn new(
-        services: &[ServiceDescriptor],
         reader: SessionModelReader,
         commands_tx: mpsc::Sender<Command>,
         shutdown: micromux::CancellationToken,
     ) -> Self {
         let changes = reader.subscribe();
+        let snapshots = reader.services();
 
-        let services = services
-            .iter()
-            .map(|service| {
-                let service_state = state::Service {
-                    id: service.id.clone(),
-                    exec_state: state::Execution::Pending,
-                    open_ports: service.open_ports.clone(),
-                    healthcheck_configured: service.healthcheck_configured,
-                    cached_num_lines: 0,
-                    cached_logs: String::new(),
-                    logs_dirty: true,
-                    healthcheck_cached_num_lines: 0,
-                    healthcheck_cached_text: String::new(),
-                    healthcheck_dirty: true,
-                };
-                (service.id.clone(), service_state)
+        let services = snapshots
+            .into_iter()
+            .map(|snapshot| state::Service {
+                snapshot,
+                cached_num_lines: 0,
+                cached_logs: String::new(),
+                logs_dirty: true,
+                healthcheck_cached_num_lines: 0,
+                healthcheck_cached_text: String::new(),
+                healthcheck_dirty: true,
             })
             .collect();
 
@@ -238,19 +224,18 @@ impl App {
         match change.kind {
             ChangeKind::Status => {
                 if let Some(snapshot) = self.reader.service(&change.service_id)
-                    && let Some(service) = self.state.services.get_mut(&change.service_id)
+                    && let Some(service) = self.service_mut(&change.service_id)
                 {
-                    service.exec_state = map_execution(&snapshot);
-                    service.open_ports = snapshot.open_ports;
+                    service.snapshot = snapshot;
                 }
             }
             ChangeKind::Logs => {
-                if let Some(service) = self.state.services.get_mut(&change.service_id) {
+                if let Some(service) = self.service_mut(&change.service_id) {
                     service.logs_dirty = true;
                 }
             }
             ChangeKind::Health => {
-                if let Some(service) = self.state.services.get_mut(&change.service_id) {
+                if let Some(service) = self.service_mut(&change.service_id) {
                     service.healthcheck_dirty = true;
                 }
             }
@@ -260,13 +245,19 @@ impl App {
     /// Re-read every service snapshot and mark caches dirty (used on first draw and after a lag).
     fn resync(&mut self) {
         for snapshot in self.reader.services() {
-            if let Some(service) = self.state.services.get_mut(&snapshot.id) {
-                service.exec_state = map_execution(&snapshot);
-                service.open_ports = snapshot.open_ports;
+            if let Some(service) = self.service_mut(&snapshot.id) {
+                service.snapshot = snapshot;
                 service.logs_dirty = true;
                 service.healthcheck_dirty = true;
             }
         }
+    }
+
+    fn service_mut(&mut self, id: &str) -> Option<&mut state::Service> {
+        self.state
+            .services
+            .iter_mut()
+            .find(|service| service.snapshot.id == id)
     }
 
     fn handle_input_event(&mut self, input_event: event::Input) {
@@ -358,7 +349,7 @@ impl App {
                 if let Some(bytes) = key_event_to_bytes(key.code, key.modifiers)
                     && let Some(service) = self.state.current_service()
                 {
-                    let service_id = service.id.clone();
+                    let service_id = service.snapshot.id.clone();
                     let _ = self
                         .commands_tx
                         .try_send(Command::SendInput(service_id, bytes));
@@ -512,10 +503,10 @@ impl App {
         let Some(service) = self.state.current_service() else {
             return;
         };
-        tracing::info!(service_id = service.id, "disabling service");
-        let command = match service.exec_state {
-            state::Execution::Disabled => Command::enable(service.id.clone()),
-            _ => Command::disable(service.id.clone()),
+        tracing::info!(service_id = service.snapshot.id, "disabling service");
+        let command = match service.snapshot.desired {
+            micromux::Desired::Disabled => Command::enable(service.snapshot.id.clone()),
+            micromux::Desired::Enabled => Command::disable(service.snapshot.id.clone()),
         };
         let _ = self.commands_tx.try_send(command);
     }
@@ -525,40 +516,16 @@ impl App {
         let Some(service) = self.state.current_service() else {
             return;
         };
-        tracing::info!(service_id = service.id, "restarting service");
+        tracing::info!(service_id = service.snapshot.id, "restarting service");
         let _ = self
             .commands_tx
-            .try_send(Command::restart(service.id.clone()));
+            .try_send(Command::restart(service.snapshot.id.clone()));
     }
 
     /// Restart all services
     fn restart_all_services(&self) {
         tracing::info!("restarting all services");
         let _ = self.commands_tx.try_send(Command::restart_all());
-    }
-}
-
-fn map_health(health: micromux::Health) -> state::Health {
-    match health {
-        micromux::Health::Healthy => state::Health::Healthy,
-        micromux::Health::Unhealthy => state::Health::Unhealthy,
-    }
-}
-
-/// Project a model snapshot onto the TUI's display state, preserving the labels/colors the reducer
-/// produced (so frames are identical): `Disabled` desire wins; `Starting`/`Running` both render as
-/// the old `Running` (health carried separately); `Stopping` is the old `Killed`.
-fn map_execution(snapshot: &ServiceSnapshot) -> state::Execution {
-    if snapshot.desired == micromux::Desired::Disabled {
-        return state::Execution::Disabled;
-    }
-    match snapshot.execution {
-        micromux::Execution::Pending => state::Execution::Pending,
-        micromux::Execution::Starting | micromux::Execution::Running => state::Execution::Running {
-            health: snapshot.health.map(map_health),
-        },
-        micromux::Execution::Stopping => state::Execution::Killed,
-        micromux::Execution::Exited => state::Execution::Exited,
     }
 }
 
@@ -749,20 +716,12 @@ mod tests {
             micromux::Micromux::new(&parsed)
                 .map_err(|err| color_eyre::eyre::eyre!(err.to_string()))?,
         );
-        let services = mux.services();
-
-        let (ui_tx, _ui_rx) = mpsc::channel(1);
         let shutdown = micromux::CancellationToken::new();
         // The runner is not spawned; the model reader is seeded with initial snapshots and is all
         // the focus test needs.
-        let (_runner, handles) = mux.start_with_handles(ui_tx, shutdown.clone());
+        let (_runner, handles) = mux.start(shutdown.clone());
 
-        let mut app = App::new(
-            &services,
-            handles.reader.clone(),
-            handles.commands.clone(),
-            shutdown,
-        );
+        let mut app = App::new(handles.reader.clone(), handles.commands.clone(), shutdown);
         app.focus = Focus::Services;
         app.show_healthcheck_pane = false;
 
@@ -799,16 +758,13 @@ mod tests {
             micromux::Micromux::new(&parsed)
                 .map_err(|err| color_eyre::eyre::eyre!(err.to_string()))?,
         );
-        let services = mux.services();
-
-        let (ui_tx, _ui_rx) = mpsc::channel(1);
         let shutdown = micromux::CancellationToken::new();
-        let (_runner, handles) = mux.start_with_handles(ui_tx, shutdown.clone());
+        let (_runner, handles) = mux.start(shutdown.clone());
         let (commands_tx, mut commands_rx) = mpsc::channel(4);
 
-        let mut app = App::new(&services, handles.reader.clone(), commands_tx, shutdown);
+        let mut app = App::new(handles.reader.clone(), commands_tx, shutdown);
         if let Some(service) = app.state.current_service_mut() {
-            service.exec_state = state::Execution::Disabled;
+            service.snapshot.desired = micromux::Desired::Disabled;
         }
 
         app.restart_current_service();

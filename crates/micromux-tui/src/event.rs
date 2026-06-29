@@ -25,14 +25,10 @@ impl std::fmt::Display for Input {
             Self::Event(CrosstermEvent::Resize(cols, rows)) => {
                 write!(f, "Resize(cols={cols}, rows={rows})")
             }
-            // TODO match kind
             Self::Event(CrosstermEvent::Mouse(MouseEvent {
-                column,
-                row,
-                kind: _,
-                ..
+                column, row, kind, ..
             })) => {
-                write!(f, "Mouse(col={column}, row={row})")
+                write!(f, "Mouse({kind:?}, col={column}, row={row})")
             }
             other @ Self::Event(_) => std::fmt::Debug::fmt(other, f),
         }
@@ -49,7 +45,7 @@ pub struct InputHandler {
 }
 
 impl InputHandler {
-    /// Constructs a new instance of [`EventHandler`] and spawns a new task to handle events.
+    /// Constructs a new instance of [`InputHandler`] and spawns a task to handle terminal events.
     #[must_use]
     pub fn new() -> Self {
         let (sender, receiver) = mpsc::unbounded_channel();
@@ -68,7 +64,7 @@ impl InputHandler {
     /// # Errors
     ///
     /// This function returns an error if the sender channel is disconnected. This can happen if an
-    /// error occurs in the event thread. In practice, this should not happen unless there is a
+    /// error occurs in the event task. In practice, this should not happen unless there is a
     /// problem with the underlying terminal.
     pub async fn next(&mut self) -> color_eyre::Result<Input> {
         self.receiver
@@ -78,19 +74,19 @@ impl InputHandler {
     }
 }
 
-/// A thread that handles reading crossterm events and emitting tick events on a regular schedule.
+/// Task that forwards terminal events until the receiver is dropped.
 struct EventTask {
     /// Event sender channel.
     sender: mpsc::UnboundedSender<Input>,
 }
 
 impl EventTask {
-    /// Constructs a new instance of [`EventThread`].
+    /// Constructs a new instance of [`EventTask`].
     fn new(sender: mpsc::UnboundedSender<Input>) -> Self {
         Self { sender }
     }
 
-    /// Runs the event thread, forwarding crossterm events until the receiver is dropped.
+    /// Runs the event task, forwarding crossterm events until the receiver is dropped.
     async fn run(self) -> color_eyre::Result<()> {
         let mut reader = crossterm::event::EventStream::new();
         loop {

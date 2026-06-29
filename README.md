@@ -66,20 +66,21 @@
  
  ```yaml
  # yaml-language-server: $schema=https://github.com/romnn/micromux/raw/main/micromux.schema.json
- version: "1"
- services:
-   api:
-     command: ["sh", "-c", "./run-api"]
-     env_file: ".env"
-     restart: unless-stopped
-     healthcheck:
-       test: ["CMD-SHELL", "curl -fsS http://localhost:8080/health || exit 1"]
-       interval: "2s"
-       timeout: "1s"
-       retries: 10
- 
-   worker:
-     command: "./run-worker"
+version: "1"
+restart: unless-stopped
+healthcheck:
+  interval: "2s"
+  timeout: "1s"
+  retries: 10
+services:
+  api:
+    command: ["sh", "-c", "./run-api"]
+    env_file: ".env"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/health || exit 1"]
+
+  worker:
+    command: "./run-worker"
      depends_on:
        - name: api
          condition: healthy
@@ -118,7 +119,7 @@ command = "micromux"
 args = ["mcp"]
 ```
 
-Launched in a project directory, the tools target that project's session automatically. Target another with a `session` argument (`name:<n>`, `pid:<n>`, or `hash:<h>`) or the `MICROMUX_SESSION` env var. Tools: `list_sessions`, `list_services`, `get_logs`, `follow_logs`, `restart_service`, `restart_all`, `enable_service`, `disable_service`, `get_health`, `wait_for_healthy`. `restart_service`/`enable_service` return a run **generation**; pass it to `wait_for_healthy(after_generation=…)` to wait for the *new* run, not the old one.
+Launched in a project directory, the tools target that project's session automatically. Target another with a `session` argument (`name:<n>`, `pid:<n>`, or `hash:<h>`) or the `MICROMUX_SESSION` env var. Tools: `list_sessions`, `list_services`, `list_log_runs`, `get_logs`, `follow_logs`, `restart_service`, `restart_all`, `enable_service`, `disable_service`, `get_health`, `wait_for_healthy`. `restart_service`/`enable_service` return a run **generation**; pass it to `wait_for_healthy(after_generation=…)` to wait for the *new* run, not the old one.
 
 Name a session so agents can find it by name:
 
@@ -126,11 +127,39 @@ Name a session so agents can find it by name:
 name: my-project
 ```
 
+Retain full disk-backed logs for recent runs so agents can inspect crash output after restarts.
+The in-memory TUI/default log stream stays bounded and fast; disk run logs are unbounded and rotate
+by run count. `get_logs` returns a bounded tail; use `follow_logs` with a retained
+`run_generation` and `next_seq` to page through larger run logs. Service-level `logs` overrides
+inherit unspecified fields from the global block:
+
+```yaml
+logs:
+  retained_runs: 5
+  memory:
+    max_lines: 1000
+    max_bytes: 67108864
+
+services:
+  api:
+    command: ["sh", "-c", "./run-api"]
+    logs:
+      retained_runs: 10
+      memory:
+        max_lines: unbounded
+```
+
+`restart` and healthcheck timing (`start_delay`, `interval`, `timeout`, `retries`) can also be
+set globally and overridden per service. A global `healthcheck` block only supplies timing defaults;
+each service still opts in by defining `healthcheck.test`.
+
 The control plane is **on by default**; opt out with `--no-control` or `control: { enabled: false }`. Dogfood it from the shell without an agent:
 
 ```bash
 micromux ctl ls
+micromux ctl log-runs api
 micromux ctl logs api --tail 50
+micromux ctl logs api --run-generation 2 --tail 200
 micromux ctl restart api
 ```
 

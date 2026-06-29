@@ -50,6 +50,16 @@
         }
       }
     },
+    "restart": {
+      "$ref": "#/definitions/restart",
+      "description": "Default restart policy inherited by services that do not set restart."
+    },
+    "healthcheck": {
+      "$ref": "#/definitions/healthcheck_defaults"
+    },
+    "logs": {
+      "$ref": "#/definitions/logs"
+    },
     "services": {
       "type": "object",
       "additionalProperties": {
@@ -159,35 +169,28 @@
         }
       ]
     },
-    "healthcheck": {
+    "duration": {
+      "type": "string",
+      "minLength": 1
+    },
+    "healthcheck_timing": {
       "type": "object",
       "additionalProperties": true,
-      "required": [
-        "test"
-      ],
       "properties": {
-        "test": {
-          "$ref": "#/definitions/command"
-        },
         "start_delay": {
-          "type": "string",
-          "minLength": 1
+          "$ref": "#/definitions/duration"
         },
         "startup_delay": {
-          "type": "string",
-          "minLength": 1
+          "$ref": "#/definitions/duration"
         },
         "initial_delay": {
-          "type": "string",
-          "minLength": 1
+          "$ref": "#/definitions/duration"
         },
         "interval": {
-          "type": "string",
-          "minLength": 1
+          "$ref": "#/definitions/duration"
         },
         "timeout": {
-          "type": "string",
-          "minLength": 1
+          "$ref": "#/definitions/duration"
         },
         "retries": {
           "type": "integer",
@@ -195,9 +198,99 @@
         }
       }
     },
+    "healthcheck_defaults": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/healthcheck_timing"
+        }
+      ],
+      "not": {
+        "required": [
+          "test"
+        ]
+      },
+      "description": "Default healthcheck timing inherited by services that define healthcheck.test. Does not create a healthcheck by itself."
+    },
+    "healthcheck": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/healthcheck_timing"
+        },
+        {
+          "type": "object",
+          "required": [
+            "test"
+          ],
+          "properties": {
+            "test": {
+              "$ref": "#/definitions/command"
+            }
+          }
+        }
+      ]
+    },
     "restart": {
       "type": "string",
       "pattern": "^([Aa][Ll][Ww][Aa][Yy][Ss]|[Uu][Nn][Ll][Ee][Ss][Ss][-_][Ss][Tt][Oo][Pp][Pp][Ee][Dd]|[Nn][Ee][Vv][Ee][Rr]|[Nn][Oo]|[Oo][Nn][-_][Ff][Aa][Ii][Ll][Uu][Rr][Ee]([:=\\s]+[0-9]+)?)$"
+    },
+    "log_limit": {
+      "description": "A positive integer bound, or an explicit unbounded in-memory limit.",
+      "anyOf": [
+        {
+          "type": "integer",
+          "minimum": 1
+        },
+        {
+          "type": "string",
+          "pattern": "^\\s*([Uu][Nn][Bb][Oo][Uu][Nn][Dd][Ee][Dd]|[Uu][Nn][Ll][Ii][Mm][Ii][Tt][Ee][Dd]|[Nn][Oo][Nn][Ee])\\s*$"
+        }
+      ]
+    },
+    "logs_memory": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "In-memory log tail retained for the TUI and default log stream.",
+      "properties": {
+        "max_lines": {
+          "$ref": "#/definitions/log_limit"
+        },
+        "max_bytes": {
+          "$ref": "#/definitions/log_limit"
+        }
+      }
+    },
+    "logs": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Log retention settings. Disk run logs retain full logs and rotate only by run count.",
+      "properties": {
+        "retained_runs": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Number of full disk-backed service runs retained, including the current/latest run (default 5)."
+        },
+        "runs": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Alias for retained_runs."
+        },
+        "history": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Alias for retained_runs."
+        },
+        "memory": {
+          "$ref": "#/definitions/logs_memory"
+        },
+        "max_lines": {
+          "$ref": "#/definitions/log_limit",
+          "description": "Alias for memory.max_lines."
+        },
+        "max_bytes": {
+          "$ref": "#/definitions/log_limit",
+          "description": "Alias for memory.max_bytes."
+        }
+      }
     },
     "service": {
       "type": "object",
@@ -250,6 +343,9 @@
         },
         "color": {
           "type": "boolean"
+        },
+        "logs": {
+          "$ref": "#/definitions/logs"
         }
       }
     }

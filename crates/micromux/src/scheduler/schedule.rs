@@ -1,7 +1,9 @@
 use super::{
-    DesiredState, Event, LegacyBridge, ProcessEvent, RunningService, ServiceID, ServiceRuntime,
-    SessionModelWriter, State, pty, sync_model,
+    DesiredState, ProcessEvent, RunningService, ServiceID, ServiceRuntime, SessionModelWriter,
+    State, pty, sync_model,
 };
+#[cfg(test)]
+use super::{Event, TestEventSink};
 use crate::{ServiceMap, health_check::Health};
 use std::collections::HashMap;
 use tokio::sync::mpsc;
@@ -13,7 +15,8 @@ pub(super) struct ScheduleContext<'a> {
     pub(super) runtimes: &'a mut HashMap<ServiceID, ServiceRuntime>,
     pub(super) current_pty_size: portable_pty::PtySize,
     pub(super) events_tx: &'a mpsc::Sender<ProcessEvent>,
-    pub(super) bridge: &'a mut LegacyBridge,
+    #[cfg(test)]
+    pub(super) test_events: &'a mut TestEventSink,
     pub(super) writer: &'a SessionModelWriter,
     pub(super) shutdown: &'a CancellationToken,
 }
@@ -192,26 +195,31 @@ fn start_service_if_ready(
                 pty: started.handles,
                 since: tokio::time::Instant::now(),
             });
+            sync_model(ctx.writer, service, runtime);
             // Model: clear on restart, and always reset the live-snapshot target so the new run's
             // first frame appends rather than replacing the previous run's final frame.
+            ctx.writer.begin_run(service_id, run_id.get());
             if clear_logs {
                 ctx.writer.clear_logs(service_id);
             }
-            ctx.writer.note_run_started(service_id);
-            sync_model(ctx.writer, service, runtime);
-            // Legacy frontend (best-effort, never blocks the scheduler):
-            if clear_logs {
-                ctx.bridge.forward(Event::ClearLogs(service_id.clone()));
+            #[cfg(test)]
+            {
+                if clear_logs {
+                    ctx.test_events
+                        .forward(Event::ClearLogs(service_id.clone()));
+                }
+                ctx.test_events.forward(Event::Started {
+                    service_id: service_id.clone(),
+                });
             }
-            ctx.bridge.forward(Event::Started {
-                service_id: service_id.clone(),
-            });
         }
         Err(err) => {
             tracing::error!(?err, service_id, "failed to start service");
-            runtime.finish_current_run(&service.restart_policy, -1);
+            runtime.finish_failed_start(&service.restart_policy, run_id, -1);
             sync_model(ctx.writer, service, runtime);
-            ctx.bridge.forward(Event::Exited(service_id.clone(), -1));
+            #[cfg(test)]
+            ctx.test_events
+                .forward(Event::Exited(service_id.clone(), -1));
         }
     }
 }

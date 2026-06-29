@@ -5,6 +5,7 @@ use yaml_spanned::Spanned;
 use crate::{
     config::{self},
     env,
+    model::LogRetention,
     scheduler::ServiceID,
 };
 
@@ -52,7 +53,9 @@ mod tests {
             healthcheck: None,
             ports: vec![],
             restart: None,
+            restart_policy: crate::service::RestartPolicy::Never,
             color: None,
+            log_retention: LogRetention::default(),
         }
     }
 
@@ -224,6 +227,7 @@ pub struct Service {
     pub health_check: Option<config::HealthCheck>,
     pub open_ports: Vec<u16>,
     pub enable_color: bool,
+    pub log_retention: LogRetention,
 }
 
 impl Service {
@@ -297,11 +301,12 @@ impl Service {
             ),
             working_dir,
             open_ports,
-            restart_policy: config.restart.unwrap_or_default(),
+            restart_policy: config.restart_policy,
             depends_on: config.depends_on,
             environment,
             health_check: config.healthcheck,
             enable_color: config.color.as_deref().copied().unwrap_or(true),
+            log_retention: config.log_retention,
         })
     }
 }
