@@ -347,3 +347,43 @@ async fn one_unreachable_endpoint_does_not_de_list_healthy_sessions() -> eyre::R
     session.shutdown.cancel();
     Ok(())
 }
+
+#[tokio::test]
+async fn shutdown_request_stops_the_session_and_removes_the_endpoint() -> eyre::Result<()> {
+    let dir = unique_dir("shutdown")?;
+    let session = build_session(&dir, "sleep 300")?;
+
+    // It is serving before the request.
+    request_until(&session.endpoint, Request::ListServices, |response| {
+        matches!(response, Response::Services(_))
+    })
+    .await?;
+
+    // Shutdown is acknowledged...
+    let mut client = Client::connect(&session.endpoint).await?;
+    let response = client.request(Request::Shutdown).await?;
+    assert!(matches!(response, Response::ShuttingDown));
+
+    // ...the shared session token is cancelled (so the scheduler/TUI also wind down)...
+    tokio::time::timeout(Duration::from_secs(2), session.shutdown.cancelled())
+        .await
+        .map_err(|_| eyre::eyre!("shutdown token was not cancelled"))?;
+
+    // ...and the endpoint stops answering (the guard unlinked the socket on the way out).
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        if Client::connect(&session.endpoint).await.is_err() {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            eyre::bail!("endpoint still answering after shutdown");
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    Ok(())
+}
+
+// Note: the forward-paging fix for a retained run longer than MAX_LOG_TAIL is tested
+// deterministically at the model level — `model::tests::run_log_after_pages_from_the_beginning_*` —
+// because the PTY/terminal capture samples a fast burst (it does not emit one record per line for
+// rapid output), so a service cannot reliably produce >2000 distinct records over the socket.

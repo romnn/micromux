@@ -84,6 +84,9 @@ pub enum Command {
     /// Run the MCP server over stdio (configure once in Claude Code / Codex like playwright-mcp).
     #[cfg(feature = "mcp")]
     Mcp,
+    /// Run the supervisor headless (no TUI), serving the control plane until stopped. Intended for
+    /// agent-managed sessions — see the MCP `start_session`/`stop_session` tools.
+    Serve,
 }
 
 /// An action for the `micromux ctl` client.
@@ -131,4 +134,6 @@ pub enum CtlAction {
     },
     /// Show the session identity.
     Describe,
+    /// Stop the session: stop all services and exit, freeing its ports.
+    Stop,
 }

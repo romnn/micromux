@@ -1,19 +1,28 @@
 //! The micromux MCP server.
 //!
-//! A thin, stateless proxy: it discovers running micromux sessions over their local control
+//! A thin, near-stateless proxy: it discovers running micromux sessions over their local control
 //! endpoints and exposes them as MCP tools. It holds no supervision state — every tool connects to
 //! a session endpoint per call (cheap, local) and speaks the [`micromux_control`] protocol. All
 //! actions go through the same control plane the human uses in the TUI, so dependency gating, health
 //! re-probing, and restart policy are respected.
+//!
+//! The one tool that does more than connect is `start_session`: it spawns a detached, headless
+//! `micromux serve` for a project that has no live session. `stop_session` is its inverse — it asks
+//! a session to exit (freeing its ports), useful when switching between git worktrees that bind the
+//! same ports.
 
 mod convert;
+mod logproc;
 mod select;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use micromux::ChangeKind;
-use micromux_control::{Client, ControlEndpoint, ErrorCode, Request, Response};
+use micromux::{ChangeKind, Execution, Health, HealthAttempt, ServiceSnapshot};
+use micromux_control::{
+    Client, ControlEndpoint, ErrorCode, Request, Response, SessionInfo, endpoint_for, runtime_dir,
+};
+use regex::Regex;
 use rmcp::{
     ErrorData, ServerHandler, ServiceExt,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -29,6 +38,11 @@ use crate::select::ToolError;
 
 const DEFAULT_WAIT_TIMEOUT_SECS: u64 = 60;
 const MAX_WAIT_TIMEOUT_SECS: u64 = 600;
+/// Default number of visual lines returned by `get_logs` when the caller does not pass `tail`.
+const DEFAULT_LOG_TAIL: usize = 200;
+/// Upper bound on lines fetched from the session per call; also the window scanned when a filter is
+/// active, so `grep`/`min_level` can match against more than the returned count.
+const MAX_LOG_TAIL: usize = 2000;
 /// Even if a change notification is missed (the subscription isn't registered server-side until
 /// after we connect, so it can drop the first one), re-poll the lossless model at least this often
 /// so a quiet, healthcheck-less service that becomes healthy is never stranded until the full
@@ -42,7 +56,10 @@ micromux running in the current project directory. Use `list_log_runs` to find r
 runs, and `follow_logs` with `next_seq` for gap-aware tailing. Actions are routed through \
 micromux, so they respect dependency gating and restart policy — prefer them over `kill`+rerun. \
 `restart_service`/`enable_service` return a `generation`; pass it to `wait_for_healthy` as \
-`after_generation` to wait for the *new* run.";
+`after_generation` to wait for the *new* run. Use `start_session`/`stop_session` to bring a \
+project's services up or stop a session and free its ports (e.g. when switching git worktrees that \
+bind the same ports). `get_logs`/`follow_logs` strip ANSI by default and accept a `grep` regex and, \
+for services that emit JSON logs, a `min_level` filter.";
 
 /// The MCP server handler. Cheap to clone; holds no supervision state.
 #[derive(Clone)]
@@ -79,9 +96,20 @@ struct LogsArgs {
     /// generation to read a bounded tail from that disk-backed run.
     #[serde(default)]
     run_generation: Option<u64>,
-    /// Number of most recent lines to return (default 200, capped by the session).
+    /// Number of most recent visual lines to return (default 200, capped at 2000).
     #[serde(default)]
     tail: Option<usize>,
+    /// Keep ANSI color escapes instead of stripping them. Default false (stripped) to save tokens.
+    #[serde(default)]
+    raw: Option<bool>,
+    /// Keep only lines matching this regex (applied after ANSI stripping).
+    #[serde(default)]
+    grep: Option<String>,
+    /// Keep only structured-JSON log lines at or above this level
+    /// (`trace`<`debug`<`info`<`warn`<`error`<`fatal`). Lines that are not JSON with a level field
+    /// are dropped when this is set, so only use it for services that emit JSON logs.
+    #[serde(default)]
+    min_level: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -99,6 +127,26 @@ struct FollowArgs {
     /// resume without gaps or duplicates; omit to start from the retained history.
     #[serde(default)]
     after_seq: Option<u64>,
+    /// Keep ANSI color escapes instead of stripping them. Default false (stripped) to save tokens.
+    #[serde(default)]
+    raw: Option<bool>,
+    /// Keep only lines matching this regex (applied after ANSI stripping). `next_seq` still advances
+    /// past filtered-out lines, so following never re-fetches them.
+    #[serde(default)]
+    grep: Option<String>,
+    /// Keep only structured-JSON log lines at or above this level
+    /// (`trace`<`debug`<`info`<`warn`<`error`<`fatal`). Lines that are not JSON with a level field
+    /// are dropped when this is set.
+    #[serde(default)]
+    min_level: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct StartArgs {
+    /// Project directory or config file to start a session for. A directory is searched upward for a
+    /// micromux config; omit to use the MCP server's working directory.
+    #[serde(default)]
+    path: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -196,41 +244,64 @@ impl McpServer {
         description = "Read recent log lines for a service. Omit run_generation for the visible \
         bounded log stream; pass a retained run_generation from list_log_runs to inspect a \
         bounded tail of a current or previous disk-backed run. Use follow_logs to page through a \
-        retained run with a cursor."
+        retained run with a cursor. ANSI color is stripped by default (raw=true keeps it) and tail \
+        counts visual lines. Filter with grep (regex) or, for JSON-log services, min_level; entries \
+        carry a detected `level` when the line is structured JSON."
     )]
     async fn get_logs(&self, args: Parameters<LogsArgs>) -> Result<String, ErrorData> {
         let Parameters(args) = args;
+        let grep = compile_grep(args.grep.as_deref())?;
+        let min_level = parse_min_level(args.min_level.as_deref())?;
         let resolved = select::resolve(&self.cwd, args.session)
             .await
             .map_err(error_data)?;
+        let filtering = grep.is_some() || min_level.is_some();
+        // A retained disk run defaults to a wide window (matching the session's own default); the
+        // bounded visible stream defaults to 200.
+        let default_tail = if args.run_generation.is_some() {
+            MAX_LOG_TAIL
+        } else {
+            DEFAULT_LOG_TAIL
+        };
+        let requested_tail = args.tail.unwrap_or(default_tail).min(MAX_LOG_TAIL);
+        // When filtering, scan the whole window so matches aren't limited to the last `tail` lines.
+        let fetch_tail = if filtering {
+            MAX_LOG_TAIL
+        } else {
+            requested_tail
+        };
         let response = send_request(
             &resolved.endpoint,
             Request::GetLogs {
                 service: args.service.clone(),
                 run_generation: args.run_generation,
-                tail: args.tail,
+                tail: Some(fetch_tail),
             },
         )
         .await
         .map_err(error_data)?;
         let logs = convert::logs(response).map_err(error_data)?;
-        let entries: Vec<Value> = logs
-            .lines
-            .iter()
-            .map(|line| {
-                json!({
-                    "seq": line.seq,
-                    "run_generation": line.run_generation,
-                    "line": line.line,
-                })
-            })
-            .collect();
+        let entries = logproc::shape(
+            &logs.lines,
+            &logproc::Shape {
+                raw: args.raw.unwrap_or(false),
+                grep: grep.as_ref(),
+                min_level,
+                limit: Some(requested_tail),
+            },
+        );
+        // A full fetched window that was filtered, or that yielded fewer visual lines than asked,
+        // may hide older matches/lines beyond the scan — don't report a capped scan as complete.
+        let window_full = logs.lines.len() >= fetch_tail;
+        let truncated =
+            logs.truncated || (window_full && (filtering || entries.len() < requested_tail));
+        let entries = serde_json::to_value(&entries).map_err(internal)?;
         ok_json(&json!({
             "service": args.service,
             "run_generation": args.run_generation,
             "config_path": resolved.info.config_path,
             "entries": entries,
-            "truncated": logs.truncated,
+            "truncated": truncated,
         }))
     }
 
@@ -322,13 +393,159 @@ impl McpServer {
     }
 
     #[tool(
+        description = "Stop a whole micromux session: every service is stopped and the session \
+        process exits (graceful, like Ctrl-C), freeing its ports. Select with `session` (see \
+        list_sessions); omit for the current project. Use this before start_session for another \
+        worktree that binds the same ports. Returns `stopped: true` once the process has exited."
+    )]
+    async fn stop_session(&self, args: Parameters<SessionArgs>) -> Result<String, ErrorData> {
+        let Parameters(args) = args;
+        let resolved = select::resolve(&self.cwd, args.session)
+            .await
+            .map_err(error_data)?;
+        let response = send_request(&resolved.endpoint, Request::Shutdown)
+            .await
+            .map_err(error_data)?;
+        convert::shutting_down(response).map_err(error_data)?;
+        // Confirm the session process has exited (its supervised services were stopped) before
+        // returning, so the caller can usually start another session on the same ports. A service
+        // that detaches from the session's process group can still outlive it — this is not a hard
+        // guarantee every port is freed.
+        #[cfg(unix)]
+        let stopped = wait_until_stopped(resolved.info.pid, STOP_CONFIRM_TIMEOUT).await;
+        #[cfg(not(unix))]
+        let stopped = true;
+        let note = if stopped {
+            None
+        } else {
+            Some(
+                "shutdown was acknowledged but the process was still terminating after the confirm \
+                 window; its ports may take another moment to free",
+            )
+        };
+        ok_json(&json!({
+            "stopped": stopped,
+            "session": resolved.info.name,
+            "pid": resolved.info.pid,
+            "config_path": resolved.info.config_path,
+            "note": note,
+        }))
+    }
+
+    #[tool(
+        description = "Start a new headless micromux session for a project (brings its services \
+        up). Spawns `micromux serve` detached for the project's config and returns once the session \
+        is reachable; a no-op if one is already running for that config. `path` is a project \
+        directory or a config file — omit for the MCP server's directory. If another worktree's \
+        session binds the same ports, stop it first with stop_session."
+    )]
+    async fn start_session(&self, args: Parameters<StartArgs>) -> Result<String, ErrorData> {
+        let Parameters(args) = args;
+        let target = args
+            .path
+            .as_deref()
+            .map_or_else(|| self.cwd.clone(), PathBuf::from);
+        let config_path = select::config_for_target(&target).await.ok_or_else(|| {
+            ErrorData::invalid_params(
+                format!("no micromux config found at or above {}", target.display()),
+                None,
+            )
+        })?;
+        let runtime_dir = runtime_dir().ok_or_else(|| {
+            ErrorData::internal_error("no runtime directory could be resolved", None)
+        })?;
+        let endpoint = endpoint_for(&runtime_dir, &config_path);
+
+        // Resolve before spawning: never double-start. Anything listening on the endpoint — even a
+        // busy or version-mismatched session that won't answer Describe — already owns it.
+        if let Some(report) = already_running(&endpoint).await {
+            return ok_json(&report);
+        }
+
+        let mut child = spawn_detached_serve(&config_path).map_err(|err| {
+            // On a platform without the control transport, surface the canonical unsupported error
+            // rather than a generic spawn failure.
+            if err.kind() == std::io::ErrorKind::Unsupported {
+                error_data(ToolError::Unsupported)
+            } else {
+                ErrorData::internal_error(format!("failed to spawn `micromux serve`: {err}"), None)
+            }
+        })?;
+
+        let mut deadline = tokio::time::Instant::now() + START_READY_TIMEOUT;
+        let mut child_exit: Option<std::process::ExitStatus> = None;
+        loop {
+            if let Some(info) = describe(&endpoint).await {
+                // Reachable. If our own child is still alive, it is the one that came up. If it had
+                // already exited, a *concurrent* start_session won the endpoint lock and is coming up
+                // instead — report that honestly rather than as our start. Dropping `child` hands any
+                // survivor to tokio's background reaper, so it never zombies.
+                let report = if child_exit.is_some() {
+                    json!({
+                        "started": false,
+                        "already_running": true,
+                        "session": info.name,
+                        "pid": info.pid,
+                        "config_path": info.config_path,
+                    })
+                } else {
+                    json!({
+                        "started": true,
+                        "session": info.name,
+                        "pid": info.pid,
+                        "config_path": info.config_path,
+                    })
+                };
+                return ok_json(&report);
+            }
+            // If our child has exited, note it — but don't fail yet. A concurrent start_session that
+            // won the lifetime-lock race makes our loser child exit too, so keep polling for a short
+            // grace so the winner can become reachable instead of returning a spurious error.
+            if child_exit.is_none()
+                && let Ok(Some(status)) = child.try_wait()
+            {
+                child_exit = Some(status);
+                deadline = deadline.min(tokio::time::Instant::now() + CHILD_EXIT_GRACE);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                if child_exit.is_none() {
+                    // Still running but never bound — don't leak a session that may hold the ports.
+                    let _ = child.kill().await;
+                }
+                return Err(ErrorData::internal_error(
+                    match child_exit {
+                        Some(status) => format!(
+                            "`micromux serve` for {} exited ({status}) before becoming reachable — \
+                             run `micromux serve --config {}` to see why",
+                            config_path.display(),
+                            config_path.display(),
+                        ),
+                        None => format!(
+                            "`micromux serve` for {} did not become reachable within {}s and was \
+                             stopped — run `micromux serve --config {}` to diagnose",
+                            config_path.display(),
+                            START_READY_TIMEOUT.as_secs(),
+                            config_path.display(),
+                        ),
+                    },
+                    None,
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+    }
+
+    #[tool(
         description = "Read log lines after a cursor for incremental following. Returns the new \
-        lines and a next_seq; pass next_seq as after_seq on the next call. If retention already \
+        entries and a next_seq; pass next_seq as after_seq on the next call. If retention already \
         evicted unread lines, the response includes a gap object. Pass run_generation for a full \
-        disk-backed retained run page; omit it for the bounded visible stream."
+        disk-backed retained run page; omit it for the bounded visible stream. Supports the same \
+        raw/grep/min_level filters as get_logs; next_seq still advances past filtered-out lines."
     )]
     async fn follow_logs(&self, args: Parameters<FollowArgs>) -> Result<String, ErrorData> {
         let Parameters(args) = args;
+        let grep = compile_grep(args.grep.as_deref())?;
+        let min_level = parse_min_level(args.min_level.as_deref())?;
         let resolved = select::resolve(&self.cwd, args.session)
             .await
             .map_err(error_data)?;
@@ -343,23 +560,24 @@ impl McpServer {
         .await
         .map_err(error_data)?;
         let logs = convert::logs(response).map_err(error_data)?;
+        // Cursor + gap are computed from the raw records (seq is per record), so `next_seq` advances
+        // past filtered-out lines and following never re-fetches them.
         let next_seq = next_follow_cursor(&logs.lines, args.after_seq);
         let gap = follow_gap(&logs.lines, args.after_seq, args.run_generation);
-        let entries: Vec<Value> = logs
-            .lines
-            .iter()
-            .map(|line| {
-                json!({
-                    "seq": line.seq,
-                    "run_generation": line.run_generation,
-                    "line": line.line,
-                })
-            })
-            .collect();
+        let entries = logproc::shape(
+            &logs.lines,
+            &logproc::Shape {
+                raw: args.raw.unwrap_or(false),
+                grep: grep.as_ref(),
+                min_level,
+                limit: None,
+            },
+        );
+        let entries = serde_json::to_value(&entries).map_err(internal)?;
         ok_json(&json!({
             "service": args.service,
             "run_generation": args.run_generation,
-            "lines": entries,
+            "entries": entries,
             "next_seq": next_seq,
             "gap": gap,
             "truncated": logs.truncated,
@@ -433,6 +651,8 @@ impl McpServer {
                         "status": "exited",
                         "service": args.service,
                         "exit_code": exit_code,
+                        "run_generation": snapshot.run_generation,
+                        "hint": "the run exited before becoming healthy — inspect get_logs for why",
                     }));
                 }
                 WaitOutcome::InvalidState => {
@@ -446,10 +666,25 @@ impl McpServer {
 
             let now = tokio::time::Instant::now();
             if now >= deadline {
+                // Surface the facts we have rather than guessing "still building": the execution
+                // sub-state and the latest healthcheck attempt distinguish "process up, probe
+                // failing" from "still starting" without a heuristic.
+                let latest = latest_health(&resolved.endpoint, &args.service)
+                    .await
+                    .map(|attempt| serde_json::to_value(bounded_attempt(attempt)))
+                    .transpose()
+                    .map_err(internal)?;
                 return ok_json(&json!({
                     "status": "timeout",
                     "service": args.service,
                     "waited_secs": timeout.as_secs(),
+                    "execution": serde_json::to_value(snapshot.execution).map_err(internal)?,
+                    "run_generation": snapshot.run_generation,
+                    "healthcheck_configured": snapshot.healthcheck_configured,
+                    "health": serde_json::to_value(snapshot.health).map_err(internal)?,
+                    "uptime_secs": snapshot.uptime.map(|uptime| uptime.as_secs()),
+                    "latest_healthcheck": latest,
+                    "hint": timeout_hint(&snapshot),
                 }));
             }
             let wait = deadline.saturating_duration_since(now).min(WAIT_POLL_FLOOR);
@@ -505,6 +740,190 @@ impl ServerHandler for McpServer {
 
 fn internal<E: std::fmt::Display>(err: E) -> ErrorData {
     ErrorData::internal_error(err.to_string(), None)
+}
+
+/// Compile an optional `grep` pattern, mapping a bad regex to an invalid-params error.
+fn compile_grep(pattern: Option<&str>) -> Result<Option<Regex>, ErrorData> {
+    pattern
+        .map(|pattern| {
+            Regex::new(pattern).map_err(|err| {
+                ErrorData::invalid_params(format!("invalid grep regex: {err}"), None)
+            })
+        })
+        .transpose()
+}
+
+/// Parse an optional `min_level`, mapping an unknown level to an invalid-params error.
+fn parse_min_level(level: Option<&str>) -> Result<Option<logproc::Level>, ErrorData> {
+    level
+        .map(|level| {
+            logproc::Level::parse(level).ok_or_else(|| {
+                ErrorData::invalid_params(
+                    format!("unknown level `{level}` (use trace|debug|info|warn|error|fatal)"),
+                    None,
+                )
+            })
+        })
+        .transpose()
+}
+
+/// Best-effort fetch of the latest healthcheck attempt, used only to enrich a timeout report. Any
+/// error degrades to `None` — the report is still useful without it.
+async fn latest_health(endpoint: &ControlEndpoint, service: &str) -> Option<HealthAttempt> {
+    let response = send_request(
+        endpoint,
+        Request::GetHealth {
+            service: service.to_string(),
+        },
+    )
+    .await
+    .ok()?;
+    convert::health(response).ok().flatten()
+}
+
+/// Trim a healthcheck attempt's captured output to its last lines, so a chatty probe doesn't bloat
+/// the timeout report.
+fn bounded_attempt(mut attempt: HealthAttempt) -> HealthAttempt {
+    const MAX_OUTPUT_LINES: usize = 20;
+    if attempt.output.len() > MAX_OUTPUT_LINES {
+        let drop = attempt.output.len() - MAX_OUTPUT_LINES;
+        attempt.output.drain(0..drop);
+    }
+    attempt
+}
+
+/// A factual next-step hint for a `wait_for_healthy` timeout, derived from the execution sub-state.
+fn timeout_hint(snapshot: &ServiceSnapshot) -> &'static str {
+    match snapshot.execution {
+        Execution::Running => {
+            if snapshot.healthcheck_configured && snapshot.health != Some(Health::Healthy) {
+                "the process is running but its healthcheck has not passed yet — inspect \
+                 latest_healthcheck (or call get_health); if the command is still compiling/starting, \
+                 wait again with a longer timeout_secs"
+            } else {
+                "the process is running and may still be completing startup — wait again or inspect \
+                 get_logs"
+            }
+        }
+        Execution::Pending | Execution::Starting => {
+            "the process has not finished starting — wait again with a longer timeout_secs or inspect \
+             get_logs"
+        }
+        Execution::Stopping => "the service is stopping",
+        Execution::Exited => {
+            "the run has exited — inspect get_logs and the service's last_exit_code"
+        }
+    }
+}
+
+/// How long `stop_session` waits to confirm the session process actually exited.
+#[cfg(unix)]
+const STOP_CONFIRM_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Whether a process is still alive, via a signal-0 `kill`. Used to confirm a stopped session exited
+/// (so its ports are freed) before reporting success.
+#[cfg(unix)]
+fn process_alive(pid: u32) -> bool {
+    // Reject pid 0: kill(0, …) targets the caller's own process group, never a session process.
+    if pid == 0 {
+        return false;
+    }
+    let Ok(pid) = i32::try_from(pid) else {
+        return false;
+    };
+    // Signal 0 delivers nothing; it only checks existence/permission. ESRCH means the process is
+    // gone; anything else (Ok, or EPERM) means it still exists.
+    !matches!(
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None),
+        Err(nix::errno::Errno::ESRCH)
+    )
+}
+
+/// Poll until `pid` is gone or the timeout elapses; returns whether it exited.
+#[cfg(unix)]
+async fn wait_until_stopped(pid: u32, timeout: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if !process_alive(pid) {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// How long `start_session` waits for a freshly spawned session's control plane to come up.
+const START_READY_TIMEOUT: Duration = Duration::from_secs(15);
+/// After a spawned `serve` exits (e.g. it lost the lifetime-lock race to a concurrent start), how
+/// long to keep polling for a session to become reachable before reporting failure — long enough for
+/// the race winner (which binds within milliseconds) to come up, short enough to fail a bad config
+/// quickly.
+const CHILD_EXIT_GRACE: Duration = Duration::from_secs(3);
+
+/// Best-effort connect + `Describe`; `None` if nothing is listening or it does not answer.
+async fn describe(endpoint: &ControlEndpoint) -> Option<SessionInfo> {
+    let mut client = Client::connect(endpoint).await.ok()?;
+    client.describe().await.ok()
+}
+
+/// Report a session that already owns the endpoint, distinguishing a clean `Describe` from a live but
+/// unanswerable peer (busy or a different version). `None` means nothing is listening, so a new
+/// session can be spawned.
+async fn already_running(endpoint: &ControlEndpoint) -> Option<Value> {
+    if let Some(info) = describe(endpoint).await {
+        return Some(json!({
+            "started": false,
+            "already_running": true,
+            "session": info.name,
+            "pid": info.pid,
+            "config_path": info.config_path,
+        }));
+    }
+    // Describe failed, but a peer that merely won't answer (busy / version mismatch) still holds the
+    // ownership lock — don't spawn a doomed second session.
+    if Client::connect(endpoint).await.is_ok() {
+        return Some(json!({
+            "started": false,
+            "already_running": true,
+            "note": "a session already owns this project but did not answer Describe \
+                     (it may be busy or a different micromux version)",
+        }));
+    }
+    None
+}
+
+/// Spawn `micromux serve` detached for a project's config and return its child handle. A new process
+/// group + null stdio detach it from this ephemeral MCP server and keep it off the JSON-RPC stdio
+/// channel; `--config` pins the same endpoint hash the proxy derives, regardless of the child's
+/// working directory. Using `tokio::process` means the runtime reaps the child in the background once
+/// it exits (no zombie), so a later `kill(pid, 0)` reports it truly gone, and lets `start_session`
+/// observe an early exit.
+#[cfg(unix)]
+fn spawn_detached_serve(config_path: &Path) -> std::io::Result<tokio::process::Child> {
+    use std::process::Stdio;
+
+    let exe = std::env::current_exe()?;
+    let project_dir = config_path.parent().unwrap_or(config_path);
+    tokio::process::Command::new(exe)
+        .arg("serve")
+        .arg("--config")
+        .arg(config_path)
+        .current_dir(project_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn()
+}
+
+#[cfg(not(unix))]
+fn spawn_detached_serve(_config_path: &Path) -> std::io::Result<tokio::process::Child> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "start_session is only supported on unix",
+    ))
 }
 
 /// Serialize a tool result to pretty JSON text. Returned as text content (no structured output

@@ -145,6 +145,15 @@ where
             return;
         }
 
+        if matches!(request, Request::Shutdown) {
+            // Acknowledge first, then cancel the shared session token: the accept loop, scheduler,
+            // and TUI all observe it, so this stops the whole session (the same path as Ctrl-C).
+            // Writing before cancelling ensures the client sees the ack before the endpoint vanishes.
+            let _ = write_message(&mut conn, &Response::ShuttingDown).await;
+            shutdown.cancel();
+            return;
+        }
+
         // Read-only requests return instantly; a mutation awaits the scheduler, so bound it — a
         // wedged scheduler must not pin this task, and shutdown must stay responsive during dispatch.
         let response = tokio::select! {
@@ -255,6 +264,10 @@ async fn dispatch(server: &ControlServer, request: Request) -> Response {
             ErrorCode::BadRequest,
             "subscribe must be the only request on a connection",
         ),
+        // Shutdown is intercepted before dispatch; reaching here is a protocol misuse.
+        Request::Shutdown => {
+            Response::error(ErrorCode::BadRequest, "shutdown is handled before dispatch")
+        }
     }
 }
 

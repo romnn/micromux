@@ -91,6 +91,19 @@ pub fn accepted(response: Response) -> Result<Vec<ServiceCommandAck>, ToolError>
     }
 }
 
+/// Confirm a shutdown was acknowledged.
+///
+/// # Errors
+///
+/// Returns a [`ToolError`] if the session replied with an error or an unexpected response.
+pub fn shutting_down(response: Response) -> Result<(), ToolError> {
+    match response {
+        Response::ShuttingDown => Ok(()),
+        Response::Error { code, message } => Err(remote_error(code, message)),
+        other => Err(ToolError::Unexpected(format!("{other:?}"))),
+    }
+}
+
 /// The verdict of one `wait_for_healthy` evaluation against a fresh snapshot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WaitOutcome {

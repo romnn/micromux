@@ -84,12 +84,24 @@ fn parse_selector(raw: Option<String>) -> Selector {
     }
 }
 
+/// Resolve the config path for a start target: an existing config *file* is used directly; a
+/// directory (or the default cwd) is searched upward. Returns the canonical config path.
+pub(crate) async fn config_for_target(path: &Path) -> Option<PathBuf> {
+    if tokio::fs::metadata(path)
+        .await
+        .is_ok_and(|meta| meta.is_file())
+    {
+        return tokio::fs::canonicalize(path).await.ok();
+    }
+    find_config_upward(path).await
+}
+
 /// Walk upward from `start`, returning the first canonicalized micromux config path found.
 ///
 /// Reimplemented here (rather than calling `micromux::find_config_file`) so the future does not
 /// capture that function's `|name| dir.join(name)` closure, which the rmcp `#[tool]` macro's
 /// higher-ranked `'static` bound on the tool future rejects.
-async fn find_config_upward(start: &Path) -> Option<PathBuf> {
+pub(crate) async fn find_config_upward(start: &Path) -> Option<PathBuf> {
     let mut dir = start.to_path_buf();
     loop {
         for name in micromux::config_file_names() {
@@ -143,7 +155,13 @@ pub(crate) async fn resolve_in(
             let endpoint = endpoint_for(runtime_dir, &config_path);
             verify(endpoint).await.map_err(|err| {
                 map_connect_error(err, || {
-                    "no micromux session for this project; start micromux here".to_string()
+                    let dir = config_path.parent().unwrap_or(config_path.as_path());
+                    format!(
+                        "no running micromux session for {}; start one with the start_session tool, \
+                         or run `micromux` in {}",
+                        config_path.display(),
+                        dir.display(),
+                    )
                 })
             })
         }
@@ -325,6 +343,28 @@ mod tests {
 
         alpha.shutdown.cancel();
         beta.shutdown.cancel();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn already_running_reports_a_live_session_and_skips_a_dead_endpoint()
+    -> color_eyre::eyre::Result<()> {
+        let runtime_dir = temp_dir("already-running")?;
+        let config_path = runtime_dir.join("proj/micromux.yaml");
+        let session = boot(&runtime_dir, "live", &config_path)?;
+
+        // A live session makes start_session a no-op.
+        let endpoint = endpoint_for(&runtime_dir, &config_path);
+        assert!(
+            crate::already_running(&endpoint).await.is_some(),
+            "a live session must be reported as already running"
+        );
+
+        // A project with no listener is free to start.
+        let dead = endpoint_for(&runtime_dir, &runtime_dir.join("absent/micromux.yaml"));
+        assert!(crate::already_running(&dead).await.is_none());
+
+        session.shutdown.cancel();
         Ok(())
     }
 }

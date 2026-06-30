@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 /// The control protocol version. Bumped on any envelope change. The session and proxy are expected
 /// to be from the same build; a mismatch is a hard error, not a negotiation.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// A request from a client (the `micromux ctl` CLI or the MCP proxy) to a session's control server.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -69,6 +69,10 @@ pub enum Request {
         /// Target service.
         service: ServiceID,
     },
+    /// Stop the whole session: stop every service and exit the session process (graceful, like the
+    /// operator pressing Ctrl-C), freeing its ports. Acknowledged with [`Response::ShuttingDown`]
+    /// just before the endpoint goes away.
+    Shutdown,
     /// Stream [`SessionChange`] notifications until the client disconnects.
     Subscribe,
 }
@@ -163,6 +167,8 @@ pub enum Response {
     },
     /// A streamed change notification (only after [`Request::Subscribe`]).
     Change(SessionChange),
+    /// Acknowledgement of [`Request::Shutdown`], written just before the session begins exiting.
+    ShuttingDown,
     /// A typed error.
     Error {
         /// The error code.

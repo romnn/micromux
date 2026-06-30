@@ -143,6 +143,9 @@ async fn run() -> eyre::Result<()> {
             let _log_guard = setup_logging(&options).ok();
             return mcp::run().await;
         }
+        Some(options::Command::Serve) => {
+            return run_headless(options).await;
+        }
         None => {}
     }
 
@@ -163,13 +166,15 @@ async fn run() -> eyre::Result<()> {
     if !options.no_control && config.config.control_enabled {
         let working_dir = std::env::current_dir()?;
         match control::resolve_config_path(options.config_path.as_deref(), &working_dir).await {
-            Ok(config_path) => control::spawn(
-                &handles,
-                &config_path,
-                &working_dir,
-                config.config.name.clone(),
-                shutdown.clone(),
-            ),
+            Ok(config_path) => {
+                control::spawn(
+                    &handles,
+                    &config_path,
+                    &working_dir,
+                    config.config.name.clone(),
+                    shutdown.clone(),
+                );
+            }
             Err(err) => tracing::warn!(
                 ?err,
                 "control plane disabled: could not resolve config path"
@@ -207,6 +212,46 @@ async fn run() -> eyre::Result<()> {
         }
     }
 
+    Ok(())
+}
+
+/// Run the supervisor headless: scheduler + control plane, no TUI, until shutdown (a signal or a
+/// `stop_session`/`Shutdown` request). Intended for agent-managed sessions spawned by the MCP
+/// `start_session` tool.
+async fn run_headless(options: options::Options) -> eyre::Result<()> {
+    let shutdown = micromux::CancellationToken::new();
+    spawn_shutdown_handler(shutdown.clone());
+
+    // Hold the guard for the whole run: dropping it stops the non-blocking log writer.
+    let _log_guard = setup_logging(&options)?;
+    let color_choice = options.color_choice.unwrap_or(termcolor::ColorChoice::Auto);
+    let config = load_config(&options, color_choice).await?;
+
+    let mux = std::sync::Arc::new(micromux::Micromux::new(&config)?);
+    let (runner, handles) = mux.clone().start(shutdown.clone());
+
+    // The control plane is the only way to reach a headless session, so it is mandatory here — the
+    // `--no-control` / `control.enabled` opt-out applies to the TUI, not to `serve`.
+    let working_dir = std::env::current_dir()?;
+    let config_path =
+        control::resolve_config_path(options.config_path.as_deref(), &working_dir).await?;
+    let bound = control::spawn(
+        &handles,
+        &config_path,
+        &working_dir,
+        config.config.name.clone(),
+        shutdown.clone(),
+    );
+    if !bound {
+        // Another live session already owns this project (or there is no transport): a headless
+        // session with no reachable control plane is useless, so don't even start the scheduler.
+        eyre::bail!(
+            "could not start the control plane for `serve` (another micromux may already own this project)"
+        );
+    }
+
+    tracing::info!(config = %config_path.display(), "micromux serve: headless supervisor running");
+    tokio::spawn(runner).await??;
     Ok(())
 }
 

@@ -31,9 +31,16 @@ rmcp = { version = "1", features = ["server", "transport-io", "macros"] }
 schemars = "1"
 
 serde.workspace = true
-serde_json = "1"
+serde_json.workspace = true
+
+regex = "1"
+strip-ansi-escapes.workspace = true
 
 tokio.workspace = true
+
+# Confirm a stopped session's process is gone (safe `kill(pid, 0)` wrapper).
+[target.'cfg(unix)'.dependencies]
+nix = { workspace = true, features = ["signal"] }
 
 [dev-dependencies]
 similar-asserts.workspace = true

@@ -36,6 +36,7 @@ fn request_for(action: &CtlAction) -> Request {
             service: service.clone(),
         },
         CtlAction::Describe => Request::Describe,
+        CtlAction::Stop => Request::Shutdown,
     }
 }
 
@@ -111,6 +112,9 @@ fn print_response(response: &Response) -> eyre::Result<()> {
         Response::Error { code, message } => {
             eyre::bail!("{code:?}: {message}");
         }
+        Response::ShuttingDown => {
+            println!("session is shutting down");
+        }
         Response::Change(_) => {}
     }
     Ok(())
@@ -134,7 +138,12 @@ pub async fn run(action: CtlAction, config_path: Option<&Path>) -> eyre::Result<
     let endpoint = endpoint_for(&runtime_dir, &config_path);
 
     let mut client = Client::connect(&endpoint).await.map_err(|err| {
-        eyre::eyre!("no micromux session for this project ({err}); is micromux running here?")
+        let dir = config_path.parent().unwrap_or(config_path.as_path());
+        eyre::eyre!(
+            "no running micromux session for {} ({err}); start one by running `micromux` in {}",
+            config_path.display(),
+            dir.display(),
+        )
     })?;
 
     let response = client.request(request_for(&action)).await?;

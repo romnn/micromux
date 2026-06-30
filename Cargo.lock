@@ -1843,11 +1843,14 @@ dependencies = [
  "color-eyre",
  "micromux",
  "micromux-control",
+ "nix 0.31.3",
+ "regex",
  "rmcp",
  "schemars",
  "serde",
  "serde_json",
  "similar-asserts",
+ "strip-ansi-escapes",
  "tokio",
 ]
 
