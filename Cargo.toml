@@ -71,11 +71,18 @@ codespan-reporting = "0"
 
 # serde
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 # async runtime
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0"
 futures = "0"
+
+# shared platform / process / terminal deps (features added per crate)
+nix = "0.31.3"
+portable-pty = "0.9"
+directories = "6"
+strip-ansi-escapes = "0.2"
 
 # testing
 similar-asserts = "2.0.0"
