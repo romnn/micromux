@@ -306,32 +306,32 @@ fn follow_logs(
     if server.reader.service(service).is_none() {
         return unknown_service(service);
     }
-    let mut lines = match run_generation {
-        Some(run_generation) if after.is_some() => {
-            let Some(run) =
-                server
-                    .reader
-                    .run_log_after(service, run_generation, after, Some(MAX_LOG_TAIL))
-            else {
-                return unknown_run(service, run_generation);
-            };
-            run.lines
-        }
-        Some(run_generation) => {
-            let Some(run) = server
+
+    // A retained disk run pages strictly forward from `after` — or from the very beginning when it
+    // is omitted — keeping the oldest contiguous page, so a run longer than MAX_LOG_TAIL is fully
+    // reachable by following `next_seq` rather than being pinned to its tail.
+    if let Some(run_generation) = run_generation {
+        let Some(run) =
+            server
                 .reader
-                .run_log(service, run_generation, Some(MAX_LOG_TAIL))
-            else {
-                return unknown_run(service, run_generation);
-            };
-            run.lines
+                .run_log_after(service, run_generation, after, Some(MAX_LOG_TAIL))
+        else {
+            return unknown_run(service, run_generation);
+        };
+        let mut lines = run.lines;
+        if let Some(cursor) = after {
+            lines.retain(|line| line.seq > cursor);
         }
-        None => server.reader.logs(service, None),
-    };
+        let capped = lines.len() > MAX_LOG_TAIL;
+        lines.truncate(MAX_LOG_TAIL);
+        let truncated = capped || bound_follow_response_lines(&mut lines);
+        return Response::Logs { lines, truncated };
+    }
+
+    // The bounded visible stream: page forward from a cursor, else return its most recent tail.
+    let mut lines = server.reader.logs(service, None);
     if let Some(cursor) = after {
         lines.retain(|line| line.seq > cursor);
-    }
-    if after.is_some() {
         let capped = lines.len() > MAX_LOG_TAIL;
         lines.truncate(MAX_LOG_TAIL);
         let truncated = capped || bound_follow_response_lines(&mut lines);

@@ -1613,6 +1613,54 @@ mod tests {
     }
 
     #[test]
+    fn run_log_after_pages_from_the_beginning_while_run_log_returns_the_tail() {
+        // A run with more records than fit one page (the control plane caps a page at
+        // MAX_LOG_TAIL = 2000): follow paging must reach the front, not just the tail.
+        const TOTAL: usize = 2500;
+        const PAGE: usize = 2000;
+
+        let (reader, writer) =
+            new_with_retention([entry("svc")], Some(unique_spool_dir("follow-paging")));
+        let id = "svc".to_string();
+
+        writer.begin_run(&id, 1);
+        for n in 1..=TOTAL {
+            writer.append_log(
+                &id,
+                1,
+                OutputStream::Stdout,
+                LogUpdateKind::Append,
+                n.to_string(),
+            );
+        }
+
+        // run_log_after(after = None) starts at the very beginning of the run.
+        let head = reader
+            .run_log_after(&id, 1, None, Some(PAGE))
+            .expect("run exists");
+        let head_lines: Vec<&str> = head.lines.iter().map(|line| line.line.as_str()).collect();
+        assert_eq!(head_lines.first().copied(), Some("1"));
+        assert!(!head_lines.contains(&"2500"));
+
+        // run_log(tail) returns the end of the run instead.
+        let tail = reader.run_log(&id, 1, Some(PAGE)).expect("run exists");
+        let tail_lines: Vec<&str> = tail.lines.iter().map(|line| line.line.as_str()).collect();
+        assert!(tail_lines.contains(&"2500"));
+        assert!(!tail_lines.contains(&"1"));
+
+        // Paging forward from the head cursor reaches the end of the run.
+        let cursor = head
+            .lines
+            .last()
+            .map(|line| line.seq)
+            .expect("non-empty head");
+        let next = reader
+            .run_log_after(&id, 1, Some(cursor), Some(PAGE))
+            .expect("run exists");
+        assert!(next.lines.iter().any(|line| line.line == "2500"));
+    }
+
+    #[test]
     fn disk_unavailable_does_not_advertise_unqueryable_runs() {
         let (reader, writer) = new_with_retention([entry("svc")], None);
         let id = "svc".to_string();
