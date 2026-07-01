@@ -17,7 +17,7 @@ mod select;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use micromux::{ChangeKind, Execution, Health, HealthAttempt, LogLine, ServiceSnapshot};
 use micromux_control::{
@@ -56,6 +56,7 @@ const MAX_LOG_TAIL: usize = 2000;
 /// so a quiet, healthcheck-less service that becomes healthy is never stranded until the full
 /// timeout.
 const WAIT_POLL_FLOOR: Duration = Duration::from_secs(1);
+const WAIT_LOG_POLL: Duration = Duration::from_millis(250);
 
 const INSTRUCTIONS: &str = "Discover and control running micromux sessions. \
 List services, inspect current and previous run logs, restart/enable/disable services, check \
@@ -66,10 +67,12 @@ action and then `follow_all_logs` with its per-service `next` map to inspect wha
 services. Actions are routed through \
 micromux, so they respect dependency gating and restart policy — prefer them over `kill`+rerun. \
 `restart_service`/`enable_service` return a `generation`; pass it to `wait_for_healthy` as \
-`after_generation` to wait for the *new* run. Use `start_session`/`stop_session` to bring a \
+`after_generation` to wait for the *new* run. Use `wait_for_log` after an external action to block \
+until matching backend evidence appears. Use `start_session`/`stop_session` to bring a \
 project's services up or stop a session and free its ports (e.g. when switching git worktrees that \
 bind the same ports). `get_logs`/`follow_logs`/`follow_all_logs` strip ANSI by default and accept \
-a `grep` regex and, for services that emit JSON logs, a `min_level` filter.";
+a `grep` regex, `since`, `trace_id`, `format=\"compact\"`, and, for services that emit JSON \
+logs, a `min_level` filter.";
 
 /// The MCP server handler. Cheap to clone; holds no supervision state.
 #[derive(Clone)]
@@ -96,6 +99,35 @@ struct ServiceArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+struct LogFilterArgs {
+    /// Keep ANSI color escapes instead of stripping them. Default false (stripped) to save tokens.
+    #[serde(default)]
+    raw: bool,
+    /// Keep only entries matching this regex (applied after ANSI stripping).
+    #[serde(default)]
+    grep: Option<String>,
+    /// Keep only structured-JSON log entries at or above this level
+    /// (`trace`<`debug`<`info`<`warn`<`error`<`fatal`). Entries that are not JSON with a level field
+    /// are dropped when this is set, so only use it for services that emit JSON logs.
+    #[serde(default)]
+    min_level: Option<String>,
+    /// Keep only entries at or after this time. Accepts RFC3339, Unix seconds/ms/us/ns, or relative
+    /// durations like `30s`, `2m`, `1h`, `500ms`.
+    #[serde(default)]
+    since: Option<String>,
+    /// Keep only entries at or after this Unix millisecond timestamp.
+    #[serde(default)]
+    since_unix_ms: Option<u64>,
+    /// Keep only entries containing this trace/correlation id.
+    #[serde(default)]
+    trace_id: Option<String>,
+    /// Output format. `compact` turns structured JSON records into token-efficient text plus typed
+    /// `message`/`fields`; `full` returns the cleaned logical record.
+    #[serde(default)]
+    format: logproc::LogFormat,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 struct LogsArgs {
     /// The id of the target service, or `*` to merge the current visible logs from all services.
     service: String,
@@ -109,17 +141,8 @@ struct LogsArgs {
     /// Number of most recent logical log entries to return (default 200, capped at 2000).
     #[serde(default)]
     tail: Option<usize>,
-    /// Keep ANSI color escapes instead of stripping them. Default false (stripped) to save tokens.
-    #[serde(default)]
-    raw: Option<bool>,
-    /// Keep only entries matching this regex (applied after ANSI stripping).
-    #[serde(default)]
-    grep: Option<String>,
-    /// Keep only structured-JSON log entries at or above this level
-    /// (`trace`<`debug`<`info`<`warn`<`error`<`fatal`). Entries that are not JSON with a level field
-    /// are dropped when this is set, so only use it for services that emit JSON logs.
-    #[serde(default)]
-    min_level: Option<String>,
+    #[serde(flatten)]
+    filters: LogFilterArgs,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -139,18 +162,8 @@ struct FollowArgs {
     /// beginning.
     #[serde(default)]
     after_seq: Option<u64>,
-    /// Keep ANSI color escapes instead of stripping them. Default false (stripped) to save tokens.
-    #[serde(default)]
-    raw: Option<bool>,
-    /// Keep only entries matching this regex (applied after ANSI stripping). `next_seq` still
-    /// advances past filtered-out entries, so following never re-fetches them.
-    #[serde(default)]
-    grep: Option<String>,
-    /// Keep only structured-JSON log entries at or above this level
-    /// (`trace`<`debug`<`info`<`warn`<`error`<`fatal`). Entries that are not JSON with a level field
-    /// are dropped when this is set.
-    #[serde(default)]
-    min_level: Option<String>,
+    #[serde(flatten)]
+    filters: LogFilterArgs,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -166,18 +179,8 @@ struct FollowAllArgs {
     /// Maximum merged entries to return (default 200, capped at 2000).
     #[serde(default)]
     limit: Option<usize>,
-    /// Keep ANSI color escapes instead of stripping them. Default false (stripped) to save tokens.
-    #[serde(default)]
-    raw: Option<bool>,
-    /// Keep only entries matching this regex (applied after ANSI stripping). Returned cursors still
-    /// advance past filtered-out records when the merged page is complete.
-    #[serde(default)]
-    grep: Option<String>,
-    /// Keep only structured-JSON log entries at or above this level
-    /// (`trace`<`debug`<`info`<`warn`<`error`<`fatal`). Entries that are not JSON with a level field
-    /// are dropped when this is set.
-    #[serde(default)]
-    min_level: Option<String>,
+    #[serde(flatten)]
+    filters: LogFilterArgs,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -202,6 +205,43 @@ struct WaitArgs {
     /// Maximum seconds to wait (default 60, capped at 600).
     #[serde(default)]
     timeout_secs: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct WaitLogArgs {
+    /// The id of the target service, or `*` to wait across all current visible service logs.
+    service: String,
+    /// Optional session selector; omit for the current project.
+    #[serde(default)]
+    session: Option<String>,
+    /// Single-service cursor. Omit to start waiting from the current end of that service's visible
+    /// log stream.
+    #[serde(default)]
+    after_seq: Option<u64>,
+    /// Cross-service cursors from `log_cursors` or `follow_all_logs.next`. Used only when
+    /// `service="*"`. Omit to start waiting from the current end of every service.
+    #[serde(default)]
+    after: BTreeMap<String, u64>,
+    /// Maximum seconds to wait (default 60, capped at 600).
+    #[serde(default)]
+    timeout_secs: Option<u64>,
+    /// Maximum matching entries to return once a match is found (default 20, capped at 2000).
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(flatten)]
+    filters: LogFilterArgs,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct LogFilePathArgs {
+    /// The id of the target service.
+    service: String,
+    /// Optional session selector; omit for the current project.
+    #[serde(default)]
+    session: Option<String>,
+    /// Run generation to resolve. Omit to return the current retained run's file path.
+    #[serde(default)]
+    run_generation: Option<u64>,
 }
 
 #[derive(Serialize, JsonSchema)]
@@ -242,6 +282,14 @@ struct LogRunsResult {
     service: String,
     config_path: String,
     runs: Vec<micromux::LogRunSummary>,
+}
+
+#[derive(Serialize, JsonSchema)]
+struct LogFilePathResult {
+    service: String,
+    config_path: String,
+    run_generation: u64,
+    path: String,
 }
 
 #[derive(Serialize, JsonSchema)]
@@ -300,6 +348,30 @@ struct FollowAllLogsResult {
     next: BTreeMap<String, u64>,
     gaps: Vec<ServiceFollowGap>,
     truncated: bool,
+}
+
+#[derive(Serialize, JsonSchema)]
+struct WaitForLogResult {
+    status: WaitForLogStatus,
+    service: String,
+    config_path: String,
+    entries: Vec<logproc::ProcessedEntry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_seq: Option<u64>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    next: BTreeMap<String, u64>,
+    truncated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    waited_secs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hint: Option<&'static str>,
+}
+
+#[derive(Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum WaitForLogStatus {
+    Matched,
+    Timeout,
 }
 
 #[derive(Serialize, JsonSchema)]
@@ -430,6 +502,45 @@ async fn send_request(endpoint: &ControlEndpoint, request: Request) -> Result<Re
     Ok(client.request(request).await?)
 }
 
+struct LogFilters {
+    grep: Option<Regex>,
+    min_level: Option<logproc::Level>,
+    since_unix_ms: Option<u64>,
+    trace_id: Option<String>,
+    format: logproc::LogFormat,
+}
+
+impl LogFilters {
+    fn from_args(args: &LogFilterArgs) -> Result<Self, ErrorData> {
+        Ok(Self {
+            grep: compile_grep(args.grep.as_deref())?,
+            min_level: parse_min_level(args.min_level.as_deref())?,
+            since_unix_ms: parse_since(args.since.as_deref(), args.since_unix_ms)?,
+            trace_id: args.trace_id.clone(),
+            format: args.format,
+        })
+    }
+
+    fn shape(&self, raw: bool, limit: Option<usize>) -> logproc::Shape<'_> {
+        logproc::Shape {
+            raw,
+            grep: self.grep.as_ref(),
+            min_level: self.min_level,
+            since_unix_ms: self.since_unix_ms,
+            trace_id: self.trace_id.as_deref(),
+            limit,
+            format: self.format,
+        }
+    }
+
+    fn filters_records(&self) -> bool {
+        self.grep.is_some()
+            || self.min_level.is_some()
+            || self.since_unix_ms.is_some()
+            || self.trace_id.is_some()
+    }
+}
+
 impl McpServer {
     /// Create a new server, capturing the working directory used for `Current` session resolution.
     #[must_use]
@@ -511,18 +622,18 @@ impl McpServer {
         bounded tail of a current or previous disk-backed run (single-service only). Use follow_logs to page through a \
         retained run with a cursor. ANSI color is stripped by default (raw=true keeps it), terminal \
         padding is trimmed, and tail counts logical log entries, not wrapped terminal rows. Filter \
-        with grep (regex) or, for JSON-log services, min_level; entries carry micromux ingestion \
-        timestamps, a detected `level`, and an optional parsed service timestamp for structured JSON \
-        logs."
+        with grep (regex), since, trace_id, or, for JSON-log services, min_level. Use \
+        format=\"compact\" for token-efficient structured JSON logs; entries carry micromux \
+        ingestion timestamps, a detected `level`, optional parsed service timestamp, and parsed \
+        `message`/`fields` for structured JSON logs."
     )]
     async fn get_logs(&self, args: Parameters<LogsArgs>) -> ToolResult<LogsResult> {
         let Parameters(args) = args;
-        let grep = compile_grep(args.grep.as_deref())?;
-        let min_level = parse_min_level(args.min_level.as_deref())?;
+        let filters = LogFilters::from_args(&args.filters)?;
         let resolved = select::resolve(&self.cwd, args.session)
             .await
             .map_err(error_data)?;
-        let filtering = grep.is_some() || min_level.is_some();
+        let filtering = filters.filters_records();
         // A retained disk run defaults to a wide window (matching the session's own default); the
         // bounded visible stream defaults to 200.
         let default_tail = if args.run_generation.is_some() {
@@ -565,15 +676,8 @@ impl McpServer {
                 let logs = convert::logs(response).map_err(error_data)?;
                 let window_full = logs.lines.len() >= fetch_tail;
                 truncated |= logs.truncated || (window_full && filtering);
-                let mut shaped = logproc::shape(
-                    &logs.lines,
-                    &logproc::Shape {
-                        raw: args.raw.unwrap_or(false),
-                        grep: grep.as_ref(),
-                        min_level,
-                        limit: None,
-                    },
-                );
+                let mut shaped =
+                    logproc::shape(&logs.lines, &filters.shape(args.filters.raw, None));
                 for entry in &mut shaped {
                     entry.service = Some(service.id.clone());
                 }
@@ -606,12 +710,7 @@ impl McpServer {
         let logs = convert::logs(response).map_err(error_data)?;
         let entries = logproc::shape(
             &logs.lines,
-            &logproc::Shape {
-                raw: args.raw.unwrap_or(false),
-                grep: grep.as_ref(),
-                min_level,
-                limit: Some(requested_tail),
-            },
+            &filters.shape(args.filters.raw, Some(requested_tail)),
         );
         // A full fetched window that was filtered, or that yielded fewer entries than asked, may
         // hide older matches/entries beyond the scan — don't report a capped scan as complete.
@@ -654,6 +753,61 @@ impl McpServer {
     }
 
     #[tool(
+        description = "Return the disk JSONL file path for a retained service run. Omit \
+        run_generation to return the current retained run. This is intended as a fallback for \
+        shell-based inspection when MCP log tools are unavailable."
+    )]
+    async fn get_log_file_path(
+        &self,
+        args: Parameters<LogFilePathArgs>,
+    ) -> ToolResult<LogFilePathResult> {
+        let Parameters(args) = args;
+        let resolved = select::resolve(&self.cwd, args.session)
+            .await
+            .map_err(error_data)?;
+        let response = send_request(
+            &resolved.endpoint,
+            Request::ListLogRuns {
+                service: args.service.clone(),
+            },
+        )
+        .await
+        .map_err(error_data)?;
+        let runs = convert::log_runs(response).map_err(error_data)?;
+        let run = match args.run_generation {
+            Some(run_generation) => runs
+                .into_iter()
+                .find(|run| run.run_generation == run_generation),
+            None => runs.into_iter().find(|run| run.current),
+        }
+        .ok_or_else(|| {
+            error_data(ToolError::Remote {
+                code: ErrorCode::UnknownRun,
+                message: format!(
+                    "service `{}` has no retained run `{}`",
+                    args.service,
+                    args.run_generation.map_or_else(
+                        || "current".to_string(),
+                        |generation| generation.to_string()
+                    )
+                ),
+            })
+        })?;
+        let path = run.path.clone().ok_or_else(|| {
+            error_data(ToolError::InvalidState(format!(
+                "service `{}` run `{}` is not disk-backed",
+                args.service, run.run_generation
+            )))
+        })?;
+        Ok(Json(LogFilePathResult {
+            service: args.service,
+            config_path: resolved.info.config_path,
+            run_generation: run.run_generation,
+            path,
+        }))
+    }
+
+    #[tool(
         description = "Return the current visible-log cursor for every service. Call this before \
         an action, then pass the returned `cursors` as `after` to follow_all_logs to see what the \
         action caused across services. Services with no entries return cursor 0."
@@ -663,44 +817,9 @@ impl McpServer {
         let resolved = select::resolve(&self.cwd, args.session)
             .await
             .map_err(error_data)?;
-        let response = send_request(&resolved.endpoint, Request::ListServices)
+        let cursors = current_cursors(&resolved.endpoint)
             .await
             .map_err(error_data)?;
-        let services = convert::services(response).map_err(error_data)?;
-        let mut cursors = BTreeMap::new();
-        for service in services {
-            let response = send_request(
-                &resolved.endpoint,
-                Request::ListLogRuns {
-                    service: service.id.clone(),
-                },
-            )
-            .await
-            .map_err(error_data)?;
-            let cursor = convert::log_runs(response)
-                .map_err(error_data)?
-                .into_iter()
-                .rev()
-                .find(|run| run.current)
-                .and_then(|run| run.last_seq);
-            let cursor = if let Some(cursor) = cursor {
-                cursor
-            } else {
-                let response = send_request(
-                    &resolved.endpoint,
-                    Request::GetLogs {
-                        service: service.id.clone(),
-                        run_generation: None,
-                        tail: Some(1),
-                    },
-                )
-                .await
-                .map_err(error_data)?;
-                let logs = convert::logs(response).map_err(error_data)?;
-                logs.lines.last().map_or(0, |line| line.seq)
-            };
-            cursors.insert(service.id, cursor);
-        }
         Ok(Json(LogCursorsResult {
             config_path: resolved.info.config_path,
             cursors,
@@ -709,7 +828,9 @@ impl McpServer {
 
     #[tool(
         description = "Restart a service. Returns the run generation *before* the restart; pass \
-        it to wait_for_healthy as after_generation. Restarting a disabled service is rejected."
+        it to wait_for_healthy as after_generation. Reloads the latest micromux config before \
+        spawning the replacement, so edited command flags, healthchecks, and log retention take \
+        effect. Restarting a disabled service is rejected."
     )]
     async fn restart_service(&self, args: Parameters<ServiceArgs>) -> ToolResult<MutationResult> {
         let Parameters(args) = args;
@@ -724,7 +845,8 @@ impl McpServer {
     }
 
     #[tool(
-        description = "Restart all enabled services in a session (disabled services are skipped)."
+        description = "Restart all enabled services in a session (disabled services are skipped). \
+        Reloads the latest micromux config before requesting restarts."
     )]
     async fn restart_all(
         &self,
@@ -748,7 +870,9 @@ impl McpServer {
     }
 
     #[tool(
-        description = "Enable (and start) a service. Returns the run generation before enabling."
+        description = "Enable (and start) a service. Returns the run generation before enabling. \
+        Reloads the latest micromux config before spawning, so edited command flags, healthchecks, \
+        and log retention take effect."
     )]
     async fn enable_service(&self, args: Parameters<ServiceArgs>) -> ToolResult<MutationResult> {
         let Parameters(args) = args;
@@ -944,13 +1068,12 @@ impl McpServer {
         evicted unread entries, the response includes a gap object. Pass run_generation for a full \
         disk-backed retained run page; omit it for the bounded visible stream. For the visible \
         stream, omitting after_seq returns the latest tail; pass 0 to start at the first retained \
-        visible entry. Supports the same raw/grep/min_level filters as get_logs; next_seq still \
+        visible entry. Supports the same raw/grep/min_level/since/trace_id/format filters as get_logs; next_seq still \
         advances past filtered-out entries."
     )]
     async fn follow_logs(&self, args: Parameters<FollowArgs>) -> ToolResult<FollowLogsResult> {
         let Parameters(args) = args;
-        let grep = compile_grep(args.grep.as_deref())?;
-        let min_level = parse_min_level(args.min_level.as_deref())?;
+        let filters = LogFilters::from_args(&args.filters)?;
         let resolved = select::resolve(&self.cwd, args.session)
             .await
             .map_err(error_data)?;
@@ -969,15 +1092,7 @@ impl McpServer {
         // past filtered-out entries and following never re-fetches them.
         let next_seq = next_follow_cursor(&logs.lines, args.after_seq);
         let gap = follow_gap(&logs.lines, args.after_seq, args.run_generation);
-        let entries = logproc::shape(
-            &logs.lines,
-            &logproc::Shape {
-                raw: args.raw.unwrap_or(false),
-                grep: grep.as_ref(),
-                min_level,
-                limit: None,
-            },
-        );
+        let entries = logproc::shape(&logs.lines, &filters.shape(args.filters.raw, None));
         Ok(Json(FollowLogsResult {
             service: args.service,
             run_generation: args.run_generation,
@@ -994,67 +1109,26 @@ impl McpServer {
         Returns entries merged by parsed service timestamp when present, otherwise micromux \
         ingestion timestamp, while preserving each service's cursor order. This is additive to \
         follow_logs; retained run paging stays single-service because run_generation and seq are \
-        service-scoped."
+        service-scoped. Supports the same raw/grep/min_level/since/trace_id/format filters as \
+        get_logs."
     )]
     async fn follow_all_logs(
         &self,
         args: Parameters<FollowAllArgs>,
     ) -> ToolResult<FollowAllLogsResult> {
         let Parameters(args) = args;
-        let grep = compile_grep(args.grep.as_deref())?;
-        let min_level = parse_min_level(args.min_level.as_deref())?;
-        let raw = args.raw.unwrap_or(false);
+        let filters = LogFilters::from_args(&args.filters)?;
+        let raw = args.filters.raw;
         let limit = args
             .limit
             .unwrap_or(DEFAULT_LOG_TAIL)
             .clamp(1, MAX_LOG_TAIL);
-        let tail_mode = args.after.is_empty();
         let resolved = select::resolve(&self.cwd, args.session)
             .await
             .map_err(error_data)?;
-        let response = send_request(&resolved.endpoint, Request::ListServices)
+        let merged = follow_all_current_logs(&resolved.endpoint, &args.after, raw, &filters, limit)
             .await
             .map_err(error_data)?;
-        let services = convert::services(response).map_err(error_data)?;
-        let mut pages = Vec::new();
-        for service in services {
-            let after_seq = follow_all_after_seq(&args.after, &service.id);
-            let response = send_request(
-                &resolved.endpoint,
-                Request::FollowLogs {
-                    service: service.id.clone(),
-                    run_generation: None,
-                    after: after_seq,
-                },
-            )
-            .await
-            .map_err(error_data)?;
-            let logs = convert::logs(response).map_err(error_data)?;
-            let raw_next_seq = next_follow_cursor(&logs.lines, after_seq);
-            let gap = follow_gap(&logs.lines, after_seq, None);
-            let mut entries = logproc::shape(
-                &logs.lines,
-                &logproc::Shape {
-                    raw,
-                    grep: grep.as_ref(),
-                    min_level,
-                    limit: None,
-                },
-            );
-            for entry in &mut entries {
-                entry.service = Some(service.id.clone());
-            }
-            pages.push(MergedFollowPage {
-                service: service.id,
-                after_seq,
-                raw_next_seq,
-                gap,
-                entries,
-                truncated: logs.truncated,
-            });
-        }
-
-        let merged = merge_follow_pages(pages, limit, tail_mode);
         Ok(Json(FollowAllLogsResult {
             config_path: resolved.info.config_path,
             entries: merged.entries,
@@ -1062,6 +1136,125 @@ impl McpServer {
             gaps: merged.gaps,
             truncated: merged.truncated,
         }))
+    }
+
+    #[tool(
+        description = "Wait until a matching log entry appears, then return the matching entries \
+        and updated cursors. By default this starts at the current end of the log stream, making it \
+        useful for 'perform an action, then wait for the backend log evidence'. Pass service=\"*\" \
+        with `after` from log_cursors/follow_all_logs to wait across all services. Supports the \
+        same raw/grep/min_level/since/trace_id/format filters as get_logs."
+    )]
+    async fn wait_for_log(&self, args: Parameters<WaitLogArgs>) -> ToolResult<WaitForLogResult> {
+        let Parameters(args) = args;
+        let filters = LogFilters::from_args(&args.filters)?;
+        let raw = args.filters.raw;
+        let limit = args.limit.unwrap_or(20).clamp(1, MAX_LOG_TAIL);
+        let timeout = Duration::from_secs(
+            args.timeout_secs
+                .unwrap_or(DEFAULT_WAIT_TIMEOUT_SECS)
+                .min(MAX_WAIT_TIMEOUT_SECS),
+        );
+        let resolved = select::resolve(&self.cwd, args.session)
+            .await
+            .map_err(error_data)?;
+        let deadline = tokio::time::Instant::now() + timeout;
+
+        if args.service == "*" {
+            let mut cursors = if args.after.is_empty() {
+                current_cursors(&resolved.endpoint)
+                    .await
+                    .map_err(error_data)?
+            } else {
+                args.after
+            };
+            loop {
+                let merged =
+                    follow_all_current_logs(&resolved.endpoint, &cursors, raw, &filters, limit)
+                        .await
+                        .map_err(error_data)?;
+                if !merged.entries.is_empty() {
+                    return Ok(Json(WaitForLogResult {
+                        status: WaitForLogStatus::Matched,
+                        service: "*".to_string(),
+                        config_path: resolved.info.config_path,
+                        entries: merged.entries,
+                        next_seq: None,
+                        next: merged.next,
+                        truncated: merged.truncated,
+                        waited_secs: None,
+                        hint: None,
+                    }));
+                }
+                cursors = merged.next;
+                if tokio::time::Instant::now() >= deadline {
+                    return Ok(Json(WaitForLogResult {
+                        status: WaitForLogStatus::Timeout,
+                        service: "*".to_string(),
+                        config_path: resolved.info.config_path,
+                        entries: Vec::new(),
+                        next_seq: None,
+                        next: cursors,
+                        truncated: merged.truncated,
+                        waited_secs: Some(timeout.as_secs()),
+                        hint: Some("no matching log entry arrived before timeout_secs"),
+                    }));
+                }
+                tokio::time::sleep(WAIT_LOG_POLL).await;
+            }
+        }
+
+        let mut cursor = match args.after_seq {
+            Some(cursor) => cursor,
+            None => current_service_cursor(&resolved.endpoint, &args.service)
+                .await
+                .map_err(error_data)?,
+        };
+        loop {
+            let response = send_request(
+                &resolved.endpoint,
+                Request::FollowLogs {
+                    service: args.service.clone(),
+                    run_generation: None,
+                    after: Some(cursor),
+                },
+            )
+            .await
+            .map_err(error_data)?;
+            let logs = convert::logs(response).map_err(error_data)?;
+            let raw_next_seq = next_follow_cursor(&logs.lines, Some(cursor)).unwrap_or(cursor);
+            let mut entries = logproc::shape(&logs.lines, &filters.shape(raw, None));
+            if !entries.is_empty() {
+                let (next_seq, truncated) =
+                    truncate_wait_matches(&mut entries, raw_next_seq, logs.truncated, limit);
+                return Ok(Json(WaitForLogResult {
+                    status: WaitForLogStatus::Matched,
+                    service: args.service,
+                    config_path: resolved.info.config_path,
+                    entries,
+                    next_seq: Some(next_seq),
+                    next: BTreeMap::new(),
+                    truncated,
+                    waited_secs: None,
+                    hint: None,
+                }));
+            }
+            cursor = raw_next_seq;
+            if tokio::time::Instant::now() >= deadline {
+                return Ok(Json(WaitForLogResult {
+                    status: WaitForLogStatus::Timeout,
+                    service: args.service,
+                    config_path: resolved.info.config_path,
+                    entries: Vec::new(),
+                    next_seq: Some(cursor),
+                    next: BTreeMap::new(),
+                    truncated: logs.truncated,
+                    waited_secs: Some(timeout.as_secs()),
+                    hint: Some("no matching log entry arrived before timeout_secs"),
+                }));
+            }
+            tokio::time::sleep(WAIT_LOG_POLL).await;
+        }
     }
 
     #[tool(
@@ -1234,6 +1427,69 @@ fn parse_min_level(level: Option<&str>) -> Result<Option<logproc::Level>, ErrorD
         .transpose()
 }
 
+fn parse_since(since: Option<&str>, since_unix_ms: Option<u64>) -> Result<Option<u64>, ErrorData> {
+    match (since, since_unix_ms) {
+        (None, None) => Ok(None),
+        (None, Some(timestamp)) => Ok(Some(timestamp)),
+        (Some(_), Some(_)) => Err(ErrorData::invalid_params(
+            "pass either since or since_unix_ms, not both",
+            None,
+        )),
+        (Some(raw), None) => parse_since_text(raw).map(Some),
+    }
+}
+
+fn parse_since_text(raw: &str) -> Result<u64, ErrorData> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Err(ErrorData::invalid_params("since must not be empty", None));
+    }
+    if let Some(duration) = parse_relative_duration(raw) {
+        return Ok(unix_now_ms().saturating_sub(duration_to_millis(duration)));
+    }
+    if let Ok(timestamp) = chrono::DateTime::parse_from_rfc3339(raw)
+        && let Ok(ms) = u64::try_from(timestamp.timestamp_millis())
+    {
+        return Ok(ms);
+    }
+    if let Ok(number) = raw.parse::<u64>() {
+        return Ok(user_timestamp_to_unix_ms(number));
+    }
+    Err(ErrorData::invalid_params(
+        "since must be RFC3339, Unix seconds/ms/us/ns, or a relative duration like 30s, 2m, 1h, 500ms",
+        None,
+    ))
+}
+
+fn user_timestamp_to_unix_ms(value: u64) -> u64 {
+    logproc::numeric_timestamp_to_unix_ms(value).unwrap_or_else(|| value.saturating_mul(1000))
+}
+
+fn parse_relative_duration(raw: &str) -> Option<Duration> {
+    const UNITS: &[(&str, u64)] = &[("ms", 1), ("s", 1_000), ("m", 60_000), ("h", 3_600_000)];
+
+    let raw = raw.trim();
+    for (suffix, multiplier) in UNITS {
+        let Some(number) = raw.strip_suffix(suffix) else {
+            continue;
+        };
+        let value = number.trim().parse::<u64>().ok()?;
+        return Some(Duration::from_millis(value.checked_mul(*multiplier)?));
+    }
+    None
+}
+
+fn duration_to_millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn unix_now_ms() -> u64 {
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    duration_to_millis(duration)
+}
+
 /// Best-effort fetch of the latest healthcheck attempt, used only to enrich a timeout report. Any
 /// error degrades to `None` — the report is still useful without it.
 async fn latest_health(endpoint: &ControlEndpoint, service: &str) -> Option<HealthAttempt> {
@@ -1257,6 +1513,95 @@ fn bounded_attempt(mut attempt: HealthAttempt) -> HealthAttempt {
         attempt.output.drain(0..drop);
     }
     attempt
+}
+
+async fn current_service_cursor(
+    endpoint: &ControlEndpoint,
+    service: &str,
+) -> Result<u64, ToolError> {
+    let response = send_request(
+        endpoint,
+        Request::ListLogRuns {
+            service: service.to_string(),
+        },
+    )
+    .await?;
+    let cursor = convert::log_runs(response)?
+        .into_iter()
+        .rev()
+        .find(|run| run.current)
+        .and_then(|run| run.last_seq);
+    if let Some(cursor) = cursor {
+        return Ok(cursor);
+    }
+
+    let response = send_request(
+        endpoint,
+        Request::GetLogs {
+            service: service.to_string(),
+            run_generation: None,
+            tail: Some(1),
+        },
+    )
+    .await?;
+    Ok(convert::logs(response)?
+        .lines
+        .last()
+        .map_or(0, |line| line.seq))
+}
+
+async fn current_cursors(endpoint: &ControlEndpoint) -> Result<BTreeMap<String, u64>, ToolError> {
+    let response = send_request(endpoint, Request::ListServices).await?;
+    let services = convert::services(response)?;
+    let mut cursors = BTreeMap::new();
+    for service in services {
+        cursors.insert(
+            service.id.clone(),
+            current_service_cursor(endpoint, &service.id).await?,
+        );
+    }
+    Ok(cursors)
+}
+
+async fn follow_all_current_logs(
+    endpoint: &ControlEndpoint,
+    after: &BTreeMap<String, u64>,
+    raw: bool,
+    filters: &LogFilters,
+    limit: usize,
+) -> Result<MergedFollowOutput, ToolError> {
+    let tail_mode = after.is_empty();
+    let response = send_request(endpoint, Request::ListServices).await?;
+    let services = convert::services(response)?;
+    let mut pages = Vec::new();
+    for service in services {
+        let after_seq = follow_all_after_seq(after, &service.id);
+        let response = send_request(
+            endpoint,
+            Request::FollowLogs {
+                service: service.id.clone(),
+                run_generation: None,
+                after: after_seq,
+            },
+        )
+        .await?;
+        let logs = convert::logs(response)?;
+        let raw_next_seq = next_follow_cursor(&logs.lines, after_seq);
+        let gap = follow_gap(&logs.lines, after_seq, None);
+        let mut entries = logproc::shape(&logs.lines, &filters.shape(raw, None));
+        for entry in &mut entries {
+            entry.service = Some(service.id.clone());
+        }
+        pages.push(MergedFollowPage {
+            service: service.id,
+            after_seq,
+            raw_next_seq,
+            gap,
+            entries,
+            truncated: logs.truncated,
+        });
+    }
+    Ok(merge_follow_pages(pages, limit, tail_mode))
 }
 
 /// A factual next-step hint for a `wait_for_healthy` timeout, derived from the execution sub-state.
@@ -1455,6 +1800,20 @@ fn next_follow_cursor(lines: &[LogLine], after_seq: Option<u64>) -> Option<u64> 
     lines.last().map(|line| line.seq).or(after_seq)
 }
 
+fn truncate_wait_matches(
+    entries: &mut Vec<logproc::ProcessedEntry>,
+    raw_next_seq: u64,
+    server_truncated: bool,
+    limit: usize,
+) -> (u64, bool) {
+    if entries.len() <= limit {
+        return (raw_next_seq, server_truncated);
+    }
+    entries.truncate(limit);
+    let next_seq = entries.last().map_or(raw_next_seq, |entry| entry.seq);
+    (next_seq, true)
+}
+
 fn follow_gap(
     lines: &[LogLine],
     after_seq: Option<u64>,
@@ -1598,6 +1957,9 @@ fn error_data(err: ToolError) -> ErrorData {
         ToolError::InvalidState(message) => {
             ErrorData::invalid_params(format!("invalid state: {message}"), None)
         }
+        ToolError::ConfigReload(message) => {
+            ErrorData::invalid_params(format!("config reload failed: {message}"), None)
+        }
         ToolError::Unsupported => ErrorData::internal_error(
             "UnsupportedPlatform: the micromux control plane is not supported on this platform",
             None,
@@ -1626,7 +1988,7 @@ pub async fn serve_stdio() -> Result<(), Box<dyn std::error::Error + Send + Sync
 mod tests {
     use super::{
         McpServer, MergedFollowPage, WaitResult, follow_all_after_seq, follow_gap,
-        merge_follow_pages, next_follow_cursor,
+        merge_follow_pages, next_follow_cursor, parse_since_text, truncate_wait_matches,
     };
     use micromux::{Execution, LogLine, ServiceSnapshot};
     use similar_asserts::assert_eq;
@@ -1714,6 +2076,42 @@ mod tests {
     }
 
     #[test]
+    fn wait_log_limit_advances_only_to_last_returned_match() {
+        let mut entries = vec![
+            entry("api", 11, 100),
+            entry("api", 12, 101),
+            entry("api", 13, 102),
+        ];
+
+        let (next_seq, truncated) = truncate_wait_matches(&mut entries, 20, false, 2);
+
+        assert!(truncated);
+        assert_eq!(next_seq, 12);
+        assert_eq!(entries.len(), 2);
+    }
+
+    #[test]
+    fn wait_log_complete_page_advances_past_filtered_records() {
+        let mut entries = vec![entry("api", 11, 100)];
+
+        let (next_seq, truncated) = truncate_wait_matches(&mut entries, 20, false, 2);
+
+        assert!(!truncated);
+        assert_eq!(next_seq, 20);
+        assert_eq!(entries.len(), 1);
+    }
+
+    #[test]
+    fn since_numeric_accepts_epoch_seconds() {
+        assert_eq!(parse_since_text("0").unwrap(), 0);
+        assert_eq!(parse_since_text("42").unwrap(), 42_000);
+        assert_eq!(
+            parse_since_text("1782911696789").unwrap(),
+            1_782_911_696_789
+        );
+    }
+
+    #[test]
     fn follow_all_cursor_map_reserves_zero_for_before_first_entry() {
         let mut cursors = BTreeMap::new();
         assert_eq!(follow_all_after_seq(&cursors, "api"), None);
@@ -1732,6 +2130,8 @@ mod tests {
             source_timestamp_unix_ms: None,
             line: format!("{service}-{seq}"),
             level: None,
+            message: None,
+            fields: BTreeMap::new(),
         }
     }
 
