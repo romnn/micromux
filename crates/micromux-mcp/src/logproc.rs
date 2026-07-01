@@ -8,96 +8,23 @@
 
 use std::collections::{BTreeMap, VecDeque};
 
-use micromux::LogLine;
+use micromux::{LogLine, StructuredLogLevel, structured_log_level_in_object};
 use regex::Regex;
 use schemars::JsonSchema;
 use serde::Serialize;
 use serde_json::{Map, Value};
 
-/// Object keys, matched case-insensitively, under which structured loggers carry the level.
-const LEVEL_KEYS: &[&str] = &["level", "lvl", "severity", "levelname", "loglevel"];
 /// Object keys, matched case-insensitively, under which structured loggers carry timestamps.
 const TIMESTAMP_KEYS: &[&str] = &["@timestamp", "timestamp", "time", "ts", "datetime", "date"];
 
-/// Textual level synonyms, matched case-insensitively, mapped to a severity rank.
-const LEVEL_WORDS: &[(&str, Level)] = &[
-    ("trace", Level::Trace),
-    ("debug", Level::Debug),
-    ("dbg", Level::Debug),
-    ("info", Level::Info),
-    ("information", Level::Info),
-    ("notice", Level::Info),
-    ("warn", Level::Warn),
-    ("warning", Level::Warn),
-    ("error", Level::Error),
-    ("err", Level::Error),
-    ("fatal", Level::Fatal),
-    ("critical", Level::Fatal),
-    ("crit", Level::Fatal),
-    ("panic", Level::Fatal),
-    ("emerg", Level::Fatal),
-    ("emergency", Level::Fatal),
-    ("alert", Level::Fatal),
-];
-
-/// Severity ranks for structured-log filtering, ordered so `>=` means "at least this severe".
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Level {
-    Trace,
-    Debug,
-    Info,
-    Warn,
-    Error,
-    Fatal,
-}
-
-impl Level {
-    fn canonical(self) -> &'static str {
-        match self {
-            Self::Trace => "trace",
-            Self::Debug => "debug",
-            Self::Info => "info",
-            Self::Warn => "warn",
-            Self::Error => "error",
-            Self::Fatal => "fatal",
-        }
-    }
-
-    /// Parse a textual level (case-insensitive), accepting the common synonyms loggers emit.
-    #[must_use]
-    pub fn parse(word: &str) -> Option<Self> {
-        let word = word.trim();
-        LEVEL_WORDS
-            .iter()
-            .find(|(name, _)| word.eq_ignore_ascii_case(name))
-            .map(|(_, level)| *level)
-    }
-
-    /// Map a numeric level to a rank, following the pino/bunyan convention (trace=10 … fatal=60)
-    /// that dominates JSON loggers emitting numeric levels. Takes `f64` so float-encoded levels
-    /// (`30.0`, `3e1`) classify instead of being treated as level-less.
-    fn from_number(number: f64) -> Self {
-        if number <= 15.0 {
-            Self::Trace
-        } else if number <= 25.0 {
-            Self::Debug
-        } else if number <= 35.0 {
-            Self::Info
-        } else if number <= 45.0 {
-            Self::Warn
-        } else if number <= 55.0 {
-            Self::Error
-        } else {
-            Self::Fatal
-        }
-    }
-}
+/// Severity ranks for structured-log filtering.
+pub type Level = StructuredLogLevel;
 
 /// Detect the level of a line iff it is a JSON object carrying a recognized level field. Returns
 /// `None` for any non-JSON (plain text) line — we never guess a level from unstructured output.
 #[cfg(test)]
 fn detect_level(line: &str) -> Option<Level> {
-    parse_json_object(line).and_then(|object| detect_level_in_object(&object))
+    parse_json_object(line).and_then(|object| structured_log_level_in_object(&object))
 }
 
 fn parse_json_object(line: &str) -> Option<Map<String, Value>> {
@@ -108,27 +35,6 @@ fn parse_json_object(line: &str) -> Option<Map<String, Value>> {
     match serde_json::from_str::<Value>(trimmed).ok()? {
         Value::Object(object) => Some(object),
         _ => None,
-    }
-}
-
-fn detect_level_in_object(object: &Map<String, Value>) -> Option<Level> {
-    object
-        .iter()
-        .filter(|(key, _)| {
-            LEVEL_KEYS
-                .iter()
-                .any(|candidate| key.eq_ignore_ascii_case(candidate))
-        })
-        .find_map(|(_, val)| level_of_value(val))
-}
-
-/// Interpret a JSON level value: a textual synonym, or a numeric (pino/bunyan) rank. Reads numbers
-/// via `as_f64` so integer *and* float/exponential encodings both classify.
-fn level_of_value(value: &Value) -> Option<Level> {
-    if let Some(text) = value.as_str() {
-        Level::parse(text)
-    } else {
-        value.as_f64().map(Level::from_number)
     }
 }
 
@@ -274,7 +180,7 @@ pub fn shape(records: &[LogLine], options: &Shape) -> Vec<ProcessedEntry> {
             continue;
         }
         let json = parse_json_object(&stripped);
-        let level = json.as_ref().and_then(detect_level_in_object);
+        let level = json.as_ref().and_then(structured_log_level_in_object);
         let source_timestamp_unix_ms = json.as_ref().and_then(source_timestamp_in_object);
         if let Some(min) = options.min_level {
             match level {

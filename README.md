@@ -129,6 +129,16 @@ Name a session so agents can find it by name:
 name: my-project
 ```
 
+Use `strict: true` to treat config warnings as errors for the whole project.
+
+Structured JSON service logs stay raw for MCP/control tooling, but the TUI renders them as compact
+colored log lines by default. Opt out per run with `--no-pretty-json-logs`, or for the whole team:
+
+```yaml
+ui:
+  pretty_json_logs: false
+```
+
 Retain full disk-backed logs for recent runs so agents can inspect crash output after restarts.
 The in-memory TUI/default log stream stays bounded and fast; disk run logs are unbounded and rotate
 by run count. `get_logs` returns a bounded tail; use `follow_logs` with a retained

@@ -1679,6 +1679,7 @@ dependencies = [
  "itertools 0.15.0",
  "micromux",
  "ratatui",
+ "serde_json",
  "similar-asserts",
  "strip-ansi-escapes",
  "tokio",

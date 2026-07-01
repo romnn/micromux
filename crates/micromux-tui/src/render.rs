@@ -467,7 +467,7 @@ impl App {
             let count = u16::try_from(lines.len()).unwrap_or(u16::MAX);
             let text = lines
                 .into_iter()
-                .map(|line| line.line)
+                .map(|line| crate::json_log::format_line(&line.line, self.pretty_json_logs))
                 .collect::<Vec<_>>()
                 .join("\n");
             if let Some(service) = self.state.current_service_mut() {

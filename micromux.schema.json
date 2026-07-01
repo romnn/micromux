@@ -29,6 +29,11 @@
       "type": "string",
       "description": "Optional session name, surfaced to coding agents via the MCP/control plane. Falls back to the working directory name."
     },
+    "strict": {
+      "type": "boolean",
+      "default": false,
+      "description": "Treat config warnings as errors."
+    },
     "ui": {
       "type": "object",
       "additionalProperties": true,
@@ -36,6 +41,11 @@
         "width": {
           "type": "integer",
           "minimum": 0
+        },
+        "pretty_json_logs": {
+          "type": "boolean",
+          "default": true,
+          "description": "Render structured JSON service logs as compact colored log lines in the TUI."
         }
       }
     },

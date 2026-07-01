@@ -186,6 +186,7 @@ async fn run() -> eyre::Result<()> {
         handles.reader.clone(),
         handles.commands.clone(),
         shutdown.clone(),
+        config.config.ui_config.pretty_json_logs && !options.no_pretty_json_logs,
     );
 
     let tui_handle = tokio::task::spawn(async move { tui.render().await });

@@ -131,10 +131,21 @@ pub enum Version {
 }
 
 /// User-interface related configuration.
-#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct UiConfig {
     /// Optional desired UI width.
     pub width: Option<Spanned<usize>>,
+    /// Render structured JSON logs as compact colored log lines in the TUI.
+    pub pretty_json_logs: bool,
+}
+
+impl Default for UiConfig {
+    fn default() -> Self {
+        Self {
+            width: None,
+            pretty_json_logs: true,
+        }
+    }
 }
 
 /// Parsed configuration.
@@ -552,6 +563,10 @@ pub fn parse_version<F>(
     }
 }
 
+fn parse_strict(value: &yaml_spanned::Spanned<Value>) -> Result<Option<bool>, ConfigError> {
+    Ok(parse_optional::<bool>(value.get("strict"))?.map(Spanned::into_inner))
+}
+
 /// Parse a micromux configuration from a YAML string.
 ///
 /// # Errors
@@ -566,6 +581,7 @@ pub fn from_str<F: Copy + PartialEq>(
     diagnostics: &mut Vec<Diagnostic<F>>,
 ) -> Result<ConfigFile<F>, ConfigError> {
     let value = yaml_spanned::from_str(raw_config).map_err(ConfigError::Yaml)?;
+    let strict = strict.or(parse_strict(&value)?);
     let version = parse_version(&value, file_id, strict, diagnostics)?;
     let config = match version {
         Version::Latest | Version::V1 => v1::parse_config(&value, file_id, strict, diagnostics)?,
@@ -598,8 +614,6 @@ mod tests {
     fn parse_config_basic_and_special_cases() -> color_eyre::eyre::Result<()> {
         let yaml = indoc! {r#"
             version: "1"
-            ui:
-              width: 80
             services:
               app:
                 # string form command
@@ -637,9 +651,6 @@ mod tests {
         let mut diagnostics = vec![];
         let parsed = super::from_str(yaml, Path::new("."), 0usize, None, &mut diagnostics)?;
         assert!(diagnostics.is_empty());
-
-        // UI config
-        assert_eq!(parsed.config.ui_config.width.as_deref().copied(), Some(80));
 
         // Find services without indexing (clippy::indexing_slicing is denied)
         let app = parsed
@@ -714,6 +725,27 @@ mod tests {
     }
 
     #[test]
+    fn parse_config_ui_options() -> color_eyre::eyre::Result<()> {
+        let yaml = indoc! {r#"
+            version: "1"
+            ui:
+              width: 80
+              pretty_json_logs: false
+            services:
+              app:
+                command: "true"
+        "#};
+
+        let mut diagnostics = vec![];
+        let parsed = super::from_str(yaml, Path::new("."), 0usize, None, &mut diagnostics)?;
+
+        assert!(diagnostics.is_empty());
+        assert_eq!(parsed.config.ui_config.width.as_deref().copied(), Some(80));
+        assert!(!parsed.config.ui_config.pretty_json_logs);
+        Ok(())
+    }
+
+    #[test]
     fn parse_config_missing_version_emits_warning_and_defaults_to_v1()
     -> color_eyre::eyre::Result<()> {
         let yaml = indoc! {r#"
@@ -730,6 +762,31 @@ mod tests {
                 .iter()
                 .any(|d| d.message.contains("missing version"))
         );
+        assert!(
+            parsed
+                .config
+                .services
+                .iter()
+                .any(|(name, _svc)| name.as_ref() == "app")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn config_strict_escalates_early_warnings() -> color_eyre::eyre::Result<()> {
+        let yaml = indoc! {r#"
+            strict: true
+            services:
+              app:
+                command: "echo hello"
+        "#};
+
+        let mut diagnostics = vec![];
+        let parsed = super::from_str(yaml, Path::new("."), 0usize, None, &mut diagnostics)?;
+
+        assert!(diagnostics.iter().any(|d| d.severity
+            == codespan_reporting::diagnostic::Severity::Error
+            && d.message.contains("missing version")));
         assert!(
             parsed
                 .config
@@ -763,6 +820,7 @@ mod tests {
             version: 1
             ui:
               width: 120
+              pretty_json_logs: false
             logs:
               retained_runs: 4
               memory:

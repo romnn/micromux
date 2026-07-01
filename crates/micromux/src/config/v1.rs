@@ -349,9 +349,22 @@ pub fn parse_ui_config<F: Copy>(
         return Ok(UiConfig::default());
     };
     let (_span, mapping) = expect_mapping(value, "ui config must be a mapping".into())?;
-    warn_unknown_keys(mapping, &["width"], "ui", file_id, strict, diagnostics);
+    warn_unknown_keys(
+        mapping,
+        &["width", "pretty_json_logs"],
+        "ui",
+        file_id,
+        strict,
+        diagnostics,
+    );
     let width = parse_optional::<usize>(mapping.get("width"))?;
-    Ok(UiConfig { width })
+    let pretty_json_logs = parse_optional::<bool>(mapping.get("pretty_json_logs"))?
+        .map(Spanned::into_inner)
+        .unwrap_or(true);
+    Ok(UiConfig {
+        width,
+        pretty_json_logs,
+    })
 }
 
 /// Parse the optional top-level `control: { enabled: <bool> }` section. Defaults to enabled.
@@ -923,8 +936,8 @@ pub fn parse_config<F: Copy + PartialEq>(
     strict_override: Option<bool>,
     diagnostics: &mut Vec<Diagnostic<F>>,
 ) -> Result<Config, ConfigError> {
-    // let strict_config = parse_optional::<bool>(value.get("strict"))?.map(Spanned::into_inner);
-    let strict = strict_override.unwrap_or(false);
+    let strict_config = super::parse_strict(value)?;
+    let strict = strict_override.or(strict_config).unwrap_or(false);
     let name = parse_optional::<String>(value.get("name"))?.map(Spanned::into_inner);
     let ui_config = parse_ui_config(value, file_id, strict, diagnostics)?;
     let control_enabled = parse_control_enabled(value, file_id, strict, diagnostics)?;
@@ -1259,6 +1272,8 @@ mod tests {
         let yaml = indoc! {r#"
             version: 1
             name: my-project
+            ui:
+              pretty_json_logs: false
             control:
               enabled: false
             logs:
@@ -1280,6 +1295,7 @@ mod tests {
         let mut diagnostics: Vec<Diagnostic<usize>> = vec![];
         let parsed = config::from_str(yaml, Path::new("."), 0, None, &mut diagnostics)?;
         assert_eq!(parsed.config.name.as_deref(), Some("my-project"));
+        assert!(!parsed.config.ui_config.pretty_json_logs);
         assert!(!parsed.config.control_enabled);
         assert_eq!(parsed.config.log_retention.disk.retained_runs, 5);
         assert_eq!(
@@ -1310,6 +1326,7 @@ mod tests {
         let mut diagnostics: Vec<Diagnostic<usize>> = vec![];
         let parsed = config::from_str(yaml, Path::new("."), 0, None, &mut diagnostics)?;
         assert_eq!(parsed.config.name, None);
+        assert!(parsed.config.ui_config.pretty_json_logs);
         assert!(parsed.config.control_enabled);
         assert_eq!(parsed.config.log_retention, LogRetention::default());
         assert_eq!(

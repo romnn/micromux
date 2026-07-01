@@ -1,10 +1,12 @@
 //! `micromux-tui` provides the terminal user interface for micromux.
 //!
 //! The main entry point is [`App`], constructed from a [`micromux::SessionModelReader`] (the source
-//! of all domain state), a command sender, and a shutdown token; call [`App::render`] to run it. The
-//! TUI holds only view state and reads the model on each [`micromux::SessionChange`].
+//! of all domain state), a command sender, a shutdown token, and display options; call
+//! [`App::render`] to run it. The TUI holds only view state and reads the model on each
+//! [`micromux::SessionChange`].
 
 mod event;
+mod json_log;
 mod render;
 mod state;
 mod style;
@@ -33,6 +35,7 @@ pub struct App {
     log_view: crate::render::log_view::LogView,
     healthcheck_view: crate::render::log_view::LogView,
     show_healthcheck_pane: bool,
+    pretty_json_logs: bool,
     attach_mode: bool,
     focus: Focus,
     terminal_cols: u16,
@@ -58,6 +61,7 @@ impl App {
         reader: SessionModelReader,
         commands_tx: mpsc::Sender<Command>,
         shutdown: micromux::CancellationToken,
+        pretty_json_logs: bool,
     ) -> Self {
         let changes = reader.subscribe();
         let snapshots = reader.services();
@@ -89,6 +93,7 @@ impl App {
             log_view,
             healthcheck_view,
             show_healthcheck_pane: false,
+            pretty_json_logs,
             attach_mode: false,
             focus: Focus::Services,
             terminal_cols: 80,
@@ -721,7 +726,12 @@ mod tests {
         // the focus test needs.
         let (_runner, handles) = mux.start(shutdown.clone());
 
-        let mut app = App::new(handles.reader.clone(), handles.commands.clone(), shutdown);
+        let mut app = App::new(
+            handles.reader.clone(),
+            handles.commands.clone(),
+            shutdown,
+            true,
+        );
         app.focus = Focus::Services;
         app.show_healthcheck_pane = false;
 
@@ -762,7 +772,7 @@ mod tests {
         let (_runner, handles) = mux.start(shutdown.clone());
         let (commands_tx, mut commands_rx) = mpsc::channel(4);
 
-        let mut app = App::new(handles.reader.clone(), commands_tx, shutdown);
+        let mut app = App::new(handles.reader.clone(), commands_tx, shutdown, true);
         if let Some(service) = app.state.current_service_mut() {
             service.snapshot.desired = micromux::Desired::Disabled;
         }

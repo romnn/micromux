@@ -62,6 +62,13 @@ pub struct Options {
     pub log_file: Option<PathBuf>,
 
     #[arg(
+        long = "no-pretty-json-logs",
+        env = "MICROMUX_NO_PRETTY_JSON_LOGS",
+        help = "show structured JSON logs as raw JSON in the TUI (also configurable via `ui: { pretty_json_logs: false }`)"
+    )]
+    pub no_pretty_json_logs: bool,
+
+    #[arg(
         long = "no-control",
         env = "MICROMUX_NO_CONTROL",
         help = "disable the agent control plane (also configurable via `control: { enabled: false }`)"
