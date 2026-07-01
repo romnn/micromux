@@ -272,6 +272,24 @@ mod tests {
     }
 
     #[test]
+    fn non_json_build_output_does_not_disable_later_json_pretty_printing() {
+        let lines = [
+            "   Compiling api-service v0.1.0",
+            r#"{"level":"info","message":"server ready","target":"api"}"#,
+        ];
+
+        let rendered = lines
+            .into_iter()
+            .map(|line| format_line(line, true))
+            .collect::<Vec<_>>();
+
+        assert_eq!(rendered[0], "   Compiling api-service v0.1.0");
+        assert!(rendered[1].contains("\x1b[32m[  INFO]\x1b[0m"));
+        assert!(rendered[1].contains("\x1b[37mserver ready\x1b[0m"));
+        assert!(rendered[1].contains("\x1b[34mtarget\x1b[0m=\x1b[90mapi\x1b[0m"));
+    }
+
+    #[test]
     fn tracing_fields_message_is_promoted_and_other_fields_are_flattened() {
         let line = r#"{"timestamp":"2026-07-01T17:28:02Z","fields":{"severity":"INFO","message":"setup tracer","name":"airtype_api_service"},"filename":"trace.rs","line_number":379,"target":"telemetry::trace"}"#;
 
