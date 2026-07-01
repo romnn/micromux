@@ -18,6 +18,7 @@ use tokio_util::sync::CancellationToken;
     strum::Display,
     serde::Serialize,
     serde::Deserialize,
+    schemars::JsonSchema,
 )]
 /// The resolved health verdict for a service.
 pub enum Health {
@@ -803,7 +804,10 @@ fn kill_reaped_probe_group(pid: i32) {
     let _ = nix::sys::signal::killpg(pid, nix::sys::signal::Signal::SIGKILL);
 }
 
-#[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the probe lifecycle keeps spawn, timeout, output drain, and cleanup ordering together"
+)]
 async fn run(
     health_check: &crate::config::HealthCheck,
     service_id: &ServiceID,

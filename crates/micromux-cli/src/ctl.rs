@@ -1,9 +1,13 @@
 //! The `micromux ctl` client: a thin dogfood of the control protocol for humans and scripts.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use color_eyre::eyre;
-use micromux_control::{Client, Request, Response, endpoint_for, runtime_dir};
+use micromux_control::{
+    Client, ControlEndpoint, EndpointProbe, EndpointProbeResult, Request, Response,
+    RuntimeDirStatus, SessionInfo, answering_session_probes, endpoint_for, probe_endpoints,
+    runtime_dir_statuses, unique_answering_session_probes, usable_runtime_dirs,
+};
 
 use crate::options::CtlAction;
 
@@ -120,6 +124,175 @@ fn print_response(response: &Response) -> eyre::Result<()> {
     Ok(())
 }
 
+fn current_exe_label() -> String {
+    std::env::current_exe()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|_| "<unknown>".to_string())
+}
+
+fn format_session(endpoint: &ControlEndpoint, info: &SessionInfo) -> String {
+    format!(
+        "{} -> session name={} pid={} config={}",
+        endpoint, info.name, info.pid, info.config_path
+    )
+}
+
+fn format_probe(probe: &EndpointProbe) -> String {
+    let result = match &probe.result {
+        EndpointProbeResult::Session(info) => return format_session(&probe.endpoint, info),
+        EndpointProbeResult::Absent(reason) => format!("absent ({reason})"),
+        EndpointProbeResult::Unreachable(reason) => format!("unreachable ({reason})"),
+    };
+    format!("{} -> {result}", probe.endpoint)
+}
+
+fn format_runtime_dirs(dir_statuses: &[RuntimeDirStatus]) -> String {
+    let searched = dir_statuses
+        .iter()
+        .map(|status| {
+            if status.usable {
+                format!("{} (usable)", status.path.display())
+            } else {
+                format!(
+                    "{} (unusable: {})",
+                    status.path.display(),
+                    status.error.as_deref().unwrap_or("unknown error"),
+                )
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n  ");
+    if searched.is_empty() {
+        "none".to_string()
+    } else {
+        searched
+    }
+}
+
+fn diagnostic_context(
+    dir_statuses: &[RuntimeDirStatus],
+    config_path: &Path,
+    working_dir: &Path,
+) -> String {
+    format!(
+        "executable: {} (version {})\n\
+         cwd: {}\n\
+         config_path: {}\n\
+         XDG_RUNTIME_DIR: {}\n\
+         runtime_dirs:\n  {}",
+        current_exe_label(),
+        env!("CARGO_PKG_VERSION"),
+        working_dir.display(),
+        config_path.display(),
+        std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "<unset>".to_string()),
+        format_runtime_dirs(dir_statuses),
+    )
+}
+
+fn no_session_message(
+    dir_statuses: &[RuntimeDirStatus],
+    probes: &[EndpointProbe],
+    config_path: &Path,
+    working_dir: &Path,
+) -> String {
+    let summary = if probes
+        .iter()
+        .any(|probe| matches!(probe.result, EndpointProbeResult::Unreachable(_)))
+    {
+        format!(
+            "no answering micromux session for {}; at least one endpoint was reachable but unusable",
+            config_path.display()
+        )
+    } else {
+        format!("no running micromux session for {}", config_path.display())
+    };
+    let probe_lines = if probes.is_empty() {
+        "none".to_string()
+    } else {
+        probes
+            .iter()
+            .map(format_probe)
+            .collect::<Vec<_>>()
+            .join("\n  ")
+    };
+    format!(
+        "{summary}\n\
+         {}\n\
+         socket_probes:\n  {}",
+        diagnostic_context(dir_statuses, config_path, working_dir),
+        probe_lines,
+    )
+}
+
+fn ambiguous_session_message(
+    dir_statuses: &[RuntimeDirStatus],
+    sessions: &[(ControlEndpoint, SessionInfo)],
+    config_path: &Path,
+    working_dir: &Path,
+) -> String {
+    let session_lines = sessions
+        .iter()
+        .map(|(endpoint, info)| format_session(endpoint, info))
+        .collect::<Vec<_>>()
+        .join("\n  ");
+    format!(
+        "multiple micromux sessions answer for {}; refusing to choose one\n\
+         {}\n\
+         matching_sessions:\n  {}",
+        config_path.display(),
+        diagnostic_context(dir_statuses, config_path, working_dir),
+        session_lines,
+    )
+}
+
+async fn connect_project_session(
+    dir_statuses: &[RuntimeDirStatus],
+    runtime_dirs: &[PathBuf],
+    working_dir: &Path,
+    config_path: &Path,
+) -> eyre::Result<Client> {
+    let endpoints = runtime_dirs
+        .iter()
+        .map(|runtime_dir| endpoint_for(runtime_dir, config_path))
+        .collect::<Vec<_>>();
+    let probes = probe_endpoints(&endpoints).await;
+    let session_probes = answering_session_probes(&probes);
+    let unique_sessions = unique_answering_session_probes(&probes);
+    let mut failed_probes = probes
+        .into_iter()
+        .filter(|probe| !matches!(probe.result, EndpointProbeResult::Session(_)))
+        .collect::<Vec<_>>();
+
+    if unique_sessions.len() > 1 {
+        eyre::bail!(
+            "{}",
+            ambiguous_session_message(dir_statuses, &unique_sessions, config_path, working_dir)
+        );
+    }
+
+    if let Some((_, selected)) = unique_sessions.into_iter().next() {
+        for (endpoint, info) in session_probes {
+            if !info.is_same_instance(&selected) {
+                continue;
+            }
+            match Client::connect(&endpoint).await {
+                Ok(client) => return Ok(client),
+                Err(err) => failed_probes.push(EndpointProbe {
+                    endpoint,
+                    result: EndpointProbeResult::Unreachable(format!(
+                        "connect after Describe: {err}"
+                    )),
+                }),
+            }
+        }
+    }
+
+    eyre::bail!(
+        "{}",
+        no_session_message(dir_statuses, &failed_probes, config_path, working_dir)
+    );
+}
+
 /// Connect to the current project's session endpoint and run a single `ctl` action.
 ///
 /// # Errors
@@ -133,18 +306,16 @@ pub async fn run(action: CtlAction, config_path: Option<&Path>) -> eyre::Result<
 
     let working_dir = std::env::current_dir()?;
     let config_path = crate::control::resolve_config_path(config_path, &working_dir).await?;
-    let runtime_dir =
-        runtime_dir().ok_or_else(|| eyre::eyre!("no runtime directory could be resolved"))?;
-    let endpoint = endpoint_for(&runtime_dir, &config_path);
-
-    let mut client = Client::connect(&endpoint).await.map_err(|err| {
-        let dir = config_path.parent().unwrap_or(config_path.as_path());
-        eyre::eyre!(
-            "no running micromux session for {} ({err}); start one by running `micromux` in {}",
-            config_path.display(),
-            dir.display(),
-        )
-    })?;
+    let dir_statuses = runtime_dir_statuses();
+    let runtime_dirs = usable_runtime_dirs(&dir_statuses);
+    if runtime_dirs.is_empty() {
+        eyre::bail!(
+            "{}",
+            no_session_message(&dir_statuses, &[], &config_path, &working_dir)
+        );
+    }
+    let mut client =
+        connect_project_session(&dir_statuses, &runtime_dirs, &working_dir, &config_path).await?;
 
     let response = client.request(request_for(&action)).await?;
     print_response(&response)

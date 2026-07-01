@@ -1078,7 +1078,7 @@ mod tests {
         match config::from_str(yaml_bad, Path::new("."), 0, None, &mut diagnostics) {
             Ok(_) => return Err(eyre::eyre!("expected error")),
             Err(config::ConfigError::Serde { .. }) => {}
-            Err(other) => return Err(eyre::eyre!("expected serde error, got {other:?}")),
+            Err(other) => return Err(eyre::eyre!("expected serde error, got {other}")),
         }
 
         Ok(())

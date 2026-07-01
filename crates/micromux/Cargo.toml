@@ -67,9 +67,11 @@ yaml-spanned = "0"
 # yaml-spanned = { git = "https://github.com/romnn/yaml-spanned.git" }
 serde.workspace = true
 serde_json.workspace = true
+schemars.workspace = true
+tempfile.workspace = true
 
 [dev-dependencies]
 indoc.workspace = true
-jsonschema = "0"
+jsonschema = { version = "0", default-features = false }
 serde_yaml = "0"
 similar-asserts.workspace = true

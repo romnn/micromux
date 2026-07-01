@@ -19,10 +19,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc;
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use indexmap::IndexMap;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
@@ -46,10 +47,12 @@ const HEALTH_OUTPUT_MAX_LINES: usize = 200;
 /// notifications (it re-queries the model for content), never log bytes.
 const CHANGE_CHANNEL_CAPACITY: usize = 1024;
 const RUN_LOG_OFFSET_CACHE: usize = 4096;
+const DISK_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
+const DISK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// The state a service has been *asked* to be in. `Disabled` is a desire, not an execution state —
 /// a disabled service may still be draining.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub enum Desired {
     /// The service should be running.
     Enabled,
@@ -58,7 +61,7 @@ pub enum Desired {
 }
 
 /// The observed lifecycle phase of a service, independent of whether it is `Desired::Enabled`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub enum Execution {
     /// Not started yet (waiting on dependencies or the initial start), or idle while disabled.
     Pending,
@@ -72,9 +75,19 @@ pub enum Execution {
     Exited,
 }
 
+#[derive(JsonSchema)]
+#[expect(
+    dead_code,
+    reason = "schema-only shape used by #[schemars(with = \"Option<DurationSchema>\")]"
+)]
+struct DurationSchema {
+    secs: u64,
+    nanos: u32,
+}
+
 /// A point-in-time, serializable view of one service. This is the wire payload reused directly by
 /// the control protocol (no DTO mirror).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ServiceSnapshot {
     /// Stable service identifier.
     pub id: ServiceID,
@@ -96,6 +109,7 @@ pub struct ServiceSnapshot {
     /// Exit code of the most recently finished run, if any.
     pub last_exit_code: Option<i32>,
     /// Time since the current run started, refreshed at read time. `None` when not running.
+    #[schemars(with = "Option<DurationSchema>")]
     pub uptime: Option<Duration>,
     /// The configured restart policy.
     pub restart_policy: RestartPolicy,
@@ -197,7 +211,7 @@ pub struct LogRetention {
 }
 
 /// A single retained log line with a monotonic cursor.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct LogLine {
     /// Monotonic sequence number; survives eviction so a follower can resume without gaps or dupes.
     pub seq: u64,
@@ -208,7 +222,7 @@ pub struct LogLine {
 }
 
 /// Summary of one retained service run's logs.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct LogRunSummary {
     /// The scheduler run generation for this service run.
     pub run_generation: u64,
@@ -223,7 +237,7 @@ pub struct LogRunSummary {
 }
 
 /// Retained logs for one service run.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct LogRun {
     /// The scheduler run generation for this service run.
     pub run_generation: u64,
@@ -234,7 +248,7 @@ pub struct LogRun {
 }
 
 /// One healthcheck output line.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct HealthLine {
     /// Which stream produced the output.
     pub stream: OutputStream,
@@ -243,7 +257,7 @@ pub struct HealthLine {
 }
 
 /// The result of a finished healthcheck attempt.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema)]
 pub struct HealthResult {
     /// Whether the probe exited successfully.
     pub success: bool,
@@ -252,7 +266,7 @@ pub struct HealthResult {
 }
 
 /// One healthcheck attempt and its (bounded) output.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct HealthAttempt {
     /// Monotonic attempt number within the current run.
     pub attempt: u64,
@@ -266,7 +280,7 @@ pub struct HealthAttempt {
 
 /// What kind of change a [`SessionChange`] notification coalesces. The broadcast is liveness-only:
 /// subscribers receive the kind and re-query the model for content.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub enum ChangeKind {
     /// The service's status snapshot changed.
     Status,
@@ -278,7 +292,7 @@ pub enum ChangeKind {
 
 /// A liveness-only change notification. `broadcast` drops for lagging receivers, so this must never
 /// be the carrier of content — subscribers re-query the model.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SessionChange {
     /// The service that changed.
     pub service_id: ServiceID,
@@ -338,44 +352,76 @@ impl DiskLogWriter {
 struct DiskLogWorker {
     tx: Option<mpsc::Sender<DiskLogCommand>>,
     handle: Option<thread::JoinHandle<()>>,
+    stopped: Mutex<mpsc::Receiver<()>>,
 }
 
 impl DiskLogWorker {
     fn spawn() -> (Self, DiskLogWriter) {
         let (tx, rx) = mpsc::channel();
-        let handle = thread::spawn(move || run_disk_log_worker(rx));
+        let (stopped_tx, stopped) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            run_disk_log_worker(rx);
+            let _ = stopped_tx.send(());
+        });
         (
             Self {
                 tx: Some(tx.clone()),
                 handle: Some(handle),
+                stopped: Mutex::new(stopped),
             },
             DiskLogWriter { tx },
         )
     }
 
-    fn shutdown(&mut self) {
+    fn shutdown(&mut self) -> bool {
+        self.shutdown_with_timeout(DISK_SHUTDOWN_TIMEOUT)
+    }
+
+    fn shutdown_with_timeout(&mut self, timeout: Duration) -> bool {
         self.tx.take();
-        if let Some(handle) = self.handle.take()
-            && let Err(err) = handle.join()
-        {
+        let Some(handle) = self.handle.take() else {
+            return true;
+        };
+
+        let stopped = self.stopped.get_mut().recv_timeout(timeout).is_ok() || handle.is_finished();
+        if !stopped {
+            tracing::warn!(
+                "timed out shutting down disk log worker; leaving spool directory for safety"
+            );
+            return false;
+        }
+
+        if let Err(err) = handle.join() {
             tracing::debug!(?err, "disk log worker panicked during shutdown");
         }
+        true
     }
 
     fn flush(&self) {
+        self.flush_with_timeout(DISK_FLUSH_TIMEOUT);
+    }
+
+    fn flush_with_timeout(&self, timeout: Duration) {
         let Some(tx) = &self.tx else {
             return;
         };
         let (done, wait) = mpsc::channel();
         if tx.send(DiskLogCommand::Flush { done }).is_ok() {
-            let _ = wait.recv();
+            match wait.recv_timeout(timeout) {
+                Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => {}
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    tracing::warn!(
+                        "timed out flushing disk run logs; returning last flushed content"
+                    );
+                }
+            }
         }
     }
 }
 
 impl Drop for DiskLogWorker {
     fn drop(&mut self) {
-        self.shutdown();
+        let _ = self.shutdown();
     }
 }
 
@@ -694,25 +740,25 @@ fn create_spool_dir() -> Option<PathBuf> {
         tracing::warn!(?err, path = %base.display(), "disk run logs disabled");
         return None;
     }
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let path = base.join(format!("{}-{nanos}", std::process::id()));
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        if let Err(err) = fs::DirBuilder::new().mode(0o700).create(&path) {
-            tracing::warn!(?err, path = %path.display(), "disk run logs disabled");
-            return None;
+    let prefix = format!("{}-", std::process::id());
+    match create_spool_dir_in(&base, &prefix) {
+        Ok(path) => Some(path),
+        Err(err) => {
+            tracing::warn!(?err, path = %base.display(), "disk run logs disabled");
+            None
         }
     }
-    #[cfg(not(unix))]
-    if let Err(err) = fs::create_dir(&path) {
-        tracing::warn!(?err, path = %path.display(), "disk run logs disabled");
-        return None;
+}
+
+fn create_spool_dir_in(base: &Path, prefix: &str) -> std::io::Result<PathBuf> {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(prefix);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(std::fs::Permissions::from_mode(0o700));
     }
-    Some(path)
+    builder.tempdir_in(base).map(tempfile::TempDir::keep)
 }
 
 fn push_log_line(
@@ -1082,10 +1128,13 @@ impl Inner {
 impl Drop for Inner {
     fn drop(&mut self) {
         self.services.get_mut().clear();
-        if let Some(disk) = self.disk.as_mut() {
-            disk.shutdown();
-        }
-        if let Some(path) = self.spool_dir.take()
+        let disk_stopped = if let Some(disk) = self.disk.as_mut() {
+            disk.shutdown()
+        } else {
+            true
+        };
+        if disk_stopped
+            && let Some(path) = self.spool_dir.take()
             && let Err(err) = fs::remove_dir_all(&path)
             && err.kind() != std::io::ErrorKind::NotFound
         {
@@ -1427,12 +1476,66 @@ mod tests {
         (snapshot(id), LogRetention::default())
     }
 
+    #[test]
+    fn disk_flush_returns_when_worker_does_not_ack() {
+        let (tx, _rx) = mpsc::channel();
+        let (_stopped_tx, stopped) = mpsc::channel();
+        let worker = DiskLogWorker {
+            tx: Some(tx),
+            handle: None,
+            stopped: Mutex::new(stopped),
+        };
+
+        let start = Instant::now();
+        worker.flush_with_timeout(Duration::from_millis(1));
+
+        assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn disk_shutdown_observes_worker_exit() {
+        let (mut worker, writer) = DiskLogWorker::spawn();
+        drop(writer);
+
+        assert!(worker.shutdown_with_timeout(Duration::from_secs(1)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn created_spool_dir_is_owner_private() -> color_eyre::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = tempfile::tempdir()?;
+        let path = create_spool_dir_in(base.path(), "micromux-test-")?;
+
+        let mode = std::fs::metadata(&path)?.permissions().mode() & !0o170_000;
+        assert_eq!(mode, 0o700);
+        std::fs::remove_dir_all(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn service_snapshot_uptime_schema_matches_duration_wire_shape() -> color_eyre::Result<()> {
+        let mut snapshot = snapshot("svc");
+        snapshot.uptime = Some(Duration::new(3, 4));
+
+        let value = serde_json::to_value(&snapshot)?;
+        assert!(value.pointer("/uptime/secs").is_some());
+        assert!(value.pointer("/uptime/nanos").is_some());
+
+        let schema = serde_json::to_string(&schemars::schema_for!(ServiceSnapshot))?;
+        assert!(schema.contains("\"secs\""));
+        assert!(schema.contains("\"nanos\""));
+        Ok(())
+    }
+
     fn unique_spool_dir(prefix: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        std::env::temp_dir().join(format!("micromux-{prefix}-{nanos}"))
+        let prefix = format!("micromux-{prefix}-");
+        tempfile::Builder::new()
+            .prefix(&prefix)
+            .tempdir()
+            .expect("create temp spool")
+            .keep()
     }
 
     #[test]

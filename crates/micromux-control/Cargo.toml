@@ -29,6 +29,7 @@ micromux = { path = "../micromux/" }
 # protocol
 serde.workspace = true
 serde_json.workspace = true
+schemars.workspace = true
 
 # async runtime + framing
 tokio.workspace = true
@@ -42,11 +43,12 @@ tracing.workspace = true
 # runtime dir + ownership lock
 directories.workspace = true
 fs2 = "0.4"
-sha2 = "0.10"
+sha2 = "0.11.0"
 
 [target.'cfg(unix)'.dependencies]
-nix = { workspace = true, features = ["user"] }
+nix = { workspace = true, features = ["fs", "user"] }
 
 [dev-dependencies]
 similar-asserts.workspace = true
 color-eyre.workspace = true
+tempfile.workspace = true

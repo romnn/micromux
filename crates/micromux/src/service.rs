@@ -182,6 +182,7 @@ mod tests {
     Hash,
     serde::Serialize,
     serde::Deserialize,
+    schemars::JsonSchema,
 )]
 /// How a service should be restarted after it exits.
 pub enum RestartPolicy {

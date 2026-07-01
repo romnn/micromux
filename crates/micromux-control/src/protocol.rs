@@ -9,6 +9,7 @@ use micromux::{
     HealthAttempt, LogLine, LogRunSummary, ServiceCommandAck, ServiceID, ServiceSnapshot,
     SessionChange,
 };
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// The control protocol version. Bumped on any envelope change. The session and proxy are expected
@@ -16,7 +17,7 @@ use serde::{Deserialize, Serialize};
 pub const PROTOCOL_VERSION: u32 = 2;
 
 /// A request from a client (the `micromux ctl` CLI or the MCP proxy) to a session's control server.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub enum Request {
     /// Return session identity and metadata.
     Describe,
@@ -78,7 +79,7 @@ pub enum Request {
 }
 
 /// A brief, identity-only view of a service for [`SessionInfo`].
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ServiceBrief {
     /// Stable service identifier.
     pub id: ServiceID,
@@ -87,7 +88,7 @@ pub struct ServiceBrief {
 }
 
 /// Live session identity returned by [`Request::Describe`]. Never stored on disk.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SessionInfo {
     /// The protocol version this session speaks.
     pub protocol_version: u32,
@@ -95,7 +96,7 @@ pub struct SessionInfo {
     pub id: String,
     /// Process id of the session.
     pub pid: u32,
-    /// Session start time as a Unix timestamp (seconds). With `pid`, forms a start token.
+    /// Monotonic session start token as Unix nanoseconds. With `pid`, forms a start token.
     pub start_time: u64,
     /// Session name (config `name:` if set, else `basename(working_dir)`).
     pub name: String,
@@ -109,8 +110,16 @@ pub struct SessionInfo {
     pub micromux_version: String,
 }
 
+impl SessionInfo {
+    /// Return whether another `Describe` response names the same running session instance.
+    #[must_use]
+    pub fn is_same_instance(&self, other: &Self) -> bool {
+        self.id == other.id && self.pid == other.pid && self.start_time == other.start_time
+    }
+}
+
 /// A typed error code shared by the protocol and the proxy diagnostics.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub enum ErrorCode {
     /// No service with the given id exists.
     UnknownService,
@@ -139,7 +148,7 @@ pub enum ErrorCode {
 }
 
 /// A response from a session's control server.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub enum Response {
     /// Reply to [`Request::Describe`].
     Description(SessionInfo),
@@ -186,5 +195,33 @@ impl Response {
             code,
             message: message.into(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn session(id: &str, pid: u32, start_time: u64, name: &str) -> SessionInfo {
+        SessionInfo {
+            protocol_version: PROTOCOL_VERSION,
+            id: id.to_string(),
+            pid,
+            start_time,
+            name: name.to_string(),
+            working_dir: ".".to_string(),
+            config_path: "/project/micromux.yaml".to_string(),
+            services: Vec::new(),
+            micromux_version: env!("CARGO_PKG_VERSION").to_string(),
+        }
+    }
+
+    #[test]
+    fn session_instance_identity_uses_stable_start_token() {
+        let first = session("aaa", 42, 100, "app");
+        let alias = session("aaa", 42, 100, "renamed");
+        let replacement = session("aaa", 42, 101, "app");
+
+        assert!(first.is_same_instance(&alias));
+        assert!(!first.is_same_instance(&replacement));
     }
 }

@@ -33,6 +33,9 @@ default = ["mcp"]
 # `cargo install --no-default-features` yields a lean TUI-only binary.
 mcp = ["dep:micromux-mcp"]
 
+[package.metadata.cargo-fc]
+exclude_features = ["default"]
+
 [dependencies]
 color-eyre.workspace = true
 

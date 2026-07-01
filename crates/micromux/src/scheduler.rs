@@ -902,7 +902,6 @@ mod tests {
     }
 
     /// A scheduler running against a temp config plus model/control handles.
-    #[allow(dead_code)]
     struct Harness {
         reader: crate::model::SessionModelReader,
         control: ServiceControl,
@@ -943,7 +942,7 @@ mod tests {
         res: Result<ServiceCommandResult, SchedulerStopped>,
     ) -> eyre::Result<Vec<ServiceCommandAck>> {
         res.map_err(|_| eyre::eyre!("scheduler stopped"))?
-            .map_err(|rejection| eyre::eyre!("unexpected rejection: {rejection:?}"))
+            .map_err(|rejection| eyre::eyre!("unexpected rejection: {rejection}"))
     }
 
     async fn wait_until<F>(

@@ -20,21 +20,27 @@ use std::time::Duration;
 
 use micromux::{ChangeKind, Execution, Health, HealthAttempt, ServiceSnapshot};
 use micromux_control::{
-    Client, ControlEndpoint, ErrorCode, Request, Response, SessionInfo, endpoint_for, runtime_dir,
+    Client, ControlEndpoint, EndpointProbeResult, ErrorCode, Request, Response, SessionInfo,
+    endpoint_for, endpoint_owner_lock_held, probe_endpoints, runtime_dir_statuses,
+    transport_supported, unique_answering_session_probes, usable_runtime_dirs,
 };
 use regex::Regex;
 use rmcp::{
     ErrorData, ServerHandler, ServiceExt,
-    handler::server::{router::tool::ToolRouter, wrapper::Parameters},
+    handler::server::{
+        router::tool::ToolRouter,
+        wrapper::{Json, Parameters},
+    },
     model::{Implementation, ServerCapabilities, ServerInfo},
     tool, tool_handler, tool_router,
 };
 use schemars::JsonSchema;
-use serde::Deserialize;
-use serde_json::{Value, json};
+use serde::{Deserialize, Serialize};
 
 use crate::convert::WaitOutcome;
 use crate::select::ToolError;
+
+type ToolResult<T> = Result<Json<T>, ErrorData>;
 
 const DEFAULT_WAIT_TIMEOUT_SECS: u64 = 60;
 const MAX_WAIT_TIMEOUT_SECS: u64 = 600;
@@ -165,6 +171,204 @@ struct WaitArgs {
     timeout_secs: Option<u64>,
 }
 
+#[derive(Serialize, JsonSchema)]
+struct MutationResult {
+    session: String,
+    id: String,
+    pid: u32,
+    config_path: String,
+    accepted: Vec<micromux::ServiceCommandAck>,
+    service: String,
+    generation: Option<u64>,
+}
+
+#[derive(Serialize, JsonSchema)]
+struct SessionListResult {
+    sessions: Vec<SessionInfo>,
+    diagnostics: select::DiscoveryDiagnostics,
+}
+
+#[derive(Serialize, JsonSchema)]
+struct ServiceListResult {
+    config_path: String,
+    session: String,
+    services: Vec<ServiceSnapshot>,
+}
+
+#[derive(Serialize, JsonSchema)]
+struct LogsResult {
+    service: String,
+    run_generation: Option<u64>,
+    config_path: String,
+    entries: Vec<logproc::ProcessedLine>,
+    truncated: bool,
+}
+
+#[derive(Serialize, JsonSchema)]
+struct LogRunsResult {
+    service: String,
+    config_path: String,
+    runs: Vec<micromux::LogRunSummary>,
+}
+
+#[derive(Serialize, JsonSchema)]
+struct SessionMutationResult {
+    session: String,
+    id: String,
+    pid: u32,
+    config_path: String,
+    accepted: Vec<micromux::ServiceCommandAck>,
+}
+
+#[derive(Serialize, JsonSchema)]
+struct StopSessionResult {
+    stopped: bool,
+    session: String,
+    id: String,
+    pid: u32,
+    config_path: String,
+    note: Option<&'static str>,
+}
+
+#[derive(Serialize, JsonSchema)]
+struct StartSessionResult {
+    started: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    already_running: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reachable: Option<bool>,
+    config_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pid: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    endpoint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+}
+
+#[derive(Serialize, JsonSchema)]
+struct FollowLogsResult {
+    service: String,
+    run_generation: Option<u64>,
+    entries: Vec<logproc::ProcessedLine>,
+    next_seq: Option<u64>,
+    gap: Option<FollowGap>,
+    truncated: bool,
+}
+
+#[derive(Serialize, JsonSchema)]
+struct FollowGap {
+    after_seq: u64,
+    first_seq: u64,
+    lost_lines_at_least: u64,
+}
+
+#[derive(Serialize, JsonSchema)]
+struct HealthResult {
+    service: String,
+    health: Option<HealthAttempt>,
+}
+
+#[derive(Serialize, JsonSchema)]
+#[serde(transparent)]
+struct Nullable<T>(Option<T>);
+
+#[derive(Serialize, JsonSchema)]
+struct WaitResult {
+    status: WaitStatus,
+    service: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    generation: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    exit_code: Option<Nullable<i32>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    waited_secs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    execution: Option<Execution>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    run_generation: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    healthcheck_configured: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    health: Option<Nullable<Health>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    uptime_secs: Option<Nullable<u64>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    latest_healthcheck: Option<Nullable<HealthAttempt>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hint: Option<&'static str>,
+}
+
+#[derive(Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum WaitStatus {
+    Healthy,
+    Exited,
+    Timeout,
+}
+
+impl WaitResult {
+    fn healthy(service: String, generation: u64) -> Self {
+        Self {
+            status: WaitStatus::Healthy,
+            service,
+            generation: Some(generation),
+            exit_code: None,
+            waited_secs: None,
+            execution: None,
+            run_generation: None,
+            healthcheck_configured: None,
+            health: None,
+            uptime_secs: None,
+            latest_healthcheck: None,
+            hint: None,
+        }
+    }
+
+    fn exited(service: String, exit_code: Option<i32>, run_generation: u64) -> Self {
+        Self {
+            status: WaitStatus::Exited,
+            service,
+            generation: None,
+            exit_code: Some(Nullable(exit_code)),
+            waited_secs: None,
+            execution: None,
+            run_generation: Some(run_generation),
+            healthcheck_configured: None,
+            health: None,
+            uptime_secs: None,
+            latest_healthcheck: None,
+            hint: Some("the run exited before becoming healthy — inspect get_logs for why"),
+        }
+    }
+
+    fn timeout(
+        service: String,
+        waited_secs: u64,
+        snapshot: &ServiceSnapshot,
+        latest_healthcheck: Option<HealthAttempt>,
+    ) -> Self {
+        Self {
+            status: WaitStatus::Timeout,
+            service,
+            generation: None,
+            exit_code: None,
+            waited_secs: Some(waited_secs),
+            execution: Some(snapshot.execution),
+            run_generation: Some(snapshot.run_generation),
+            healthcheck_configured: Some(snapshot.healthcheck_configured),
+            health: Some(Nullable(snapshot.health)),
+            uptime_secs: Some(Nullable(snapshot.uptime.map(|uptime| uptime.as_secs()))),
+            latest_healthcheck: Some(Nullable(latest_healthcheck)),
+            hint: Some(timeout_hint(snapshot)),
+        }
+    }
+}
+
 async fn send_request(endpoint: &ControlEndpoint, request: Request) -> Result<Response, ToolError> {
     let mut client = Client::connect(endpoint).await?;
     Ok(client.request(request).await?)
@@ -186,7 +390,7 @@ impl McpServer {
         session: Option<String>,
         request: Request,
         service: &str,
-    ) -> Result<String, ErrorData> {
+    ) -> ToolResult<MutationResult> {
         let resolved = select::resolve(&self.cwd, session)
             .await
             .map_err(error_data)?;
@@ -198,11 +402,14 @@ impl McpServer {
             .iter()
             .find(|ack| ack.service == service)
             .map(|ack| ack.observed_generation);
-        let acks = serde_json::to_value(&acks).map_err(internal)?;
-        ok_json(&json!({
-            "accepted": acks,
-            "service": service,
-            "generation": generation,
+        Ok(Json(MutationResult {
+            session: resolved.info.name,
+            id: resolved.info.id,
+            pid: resolved.info.pid,
+            config_path: resolved.info.config_path,
+            accepted: acks,
+            service: service.to_string(),
+            generation,
         }))
     }
 }
@@ -211,19 +418,21 @@ impl McpServer {
 impl McpServer {
     #[tool(
         description = "List all micromux sessions currently running for this user, with their \
-        name, pid, config path, and working directory."
+        name, pid, config path, working directory, and discovery diagnostics."
     )]
-    async fn list_sessions(&self) -> Result<String, ErrorData> {
-        let sessions = select::list_sessions().await.map_err(error_data)?;
-        let sessions = serde_json::to_value(&sessions).map_err(internal)?;
-        ok_json(&json!({ "sessions": sessions }))
+    async fn list_sessions(&self) -> ToolResult<SessionListResult> {
+        let list = select::list_sessions().await.map_err(error_data)?;
+        Ok(Json(SessionListResult {
+            sessions: list.sessions,
+            diagnostics: list.diagnostics,
+        }))
     }
 
     #[tool(
         description = "List the services in a session with their desired/execution state, health, \
         ports, uptime, restart policy, last exit code, and run generation."
     )]
-    async fn list_services(&self, args: Parameters<SessionArgs>) -> Result<String, ErrorData> {
+    async fn list_services(&self, args: Parameters<SessionArgs>) -> ToolResult<ServiceListResult> {
         let Parameters(args) = args;
         let resolved = select::resolve(&self.cwd, args.session)
             .await
@@ -232,11 +441,10 @@ impl McpServer {
             .await
             .map_err(error_data)?;
         let services = convert::services(response).map_err(error_data)?;
-        let services = serde_json::to_value(&services).map_err(internal)?;
-        ok_json(&json!({
-            "config_path": resolved.info.config_path,
-            "session": resolved.info.name,
-            "services": services,
+        Ok(Json(ServiceListResult {
+            config_path: resolved.info.config_path,
+            session: resolved.info.name,
+            services,
         }))
     }
 
@@ -248,7 +456,7 @@ impl McpServer {
         counts visual lines. Filter with grep (regex) or, for JSON-log services, min_level; entries \
         carry a detected `level` when the line is structured JSON."
     )]
-    async fn get_logs(&self, args: Parameters<LogsArgs>) -> Result<String, ErrorData> {
+    async fn get_logs(&self, args: Parameters<LogsArgs>) -> ToolResult<LogsResult> {
         let Parameters(args) = args;
         let grep = compile_grep(args.grep.as_deref())?;
         let min_level = parse_min_level(args.min_level.as_deref())?;
@@ -295,13 +503,12 @@ impl McpServer {
         let window_full = logs.lines.len() >= fetch_tail;
         let truncated =
             logs.truncated || (window_full && (filtering || entries.len() < requested_tail));
-        let entries = serde_json::to_value(&entries).map_err(internal)?;
-        ok_json(&json!({
-            "service": args.service,
-            "run_generation": args.run_generation,
-            "config_path": resolved.info.config_path,
-            "entries": entries,
-            "truncated": truncated,
+        Ok(Json(LogsResult {
+            service: args.service,
+            run_generation: args.run_generation,
+            config_path: resolved.info.config_path,
+            entries,
+            truncated,
         }))
     }
 
@@ -310,7 +517,7 @@ impl McpServer {
         sequence ranges. Use a returned run_generation with get_logs/follow_logs to inspect or \
         page through disk-backed run logs."
     )]
-    async fn list_log_runs(&self, args: Parameters<ServiceArgs>) -> Result<String, ErrorData> {
+    async fn list_log_runs(&self, args: Parameters<ServiceArgs>) -> ToolResult<LogRunsResult> {
         let Parameters(args) = args;
         let resolved = select::resolve(&self.cwd, args.session)
             .await
@@ -324,11 +531,10 @@ impl McpServer {
         .await
         .map_err(error_data)?;
         let runs = convert::log_runs(response).map_err(error_data)?;
-        let runs = serde_json::to_value(&runs).map_err(internal)?;
-        ok_json(&json!({
-            "service": args.service,
-            "config_path": resolved.info.config_path,
-            "runs": runs,
+        Ok(Json(LogRunsResult {
+            service: args.service,
+            config_path: resolved.info.config_path,
+            runs,
         }))
     }
 
@@ -336,7 +542,7 @@ impl McpServer {
         description = "Restart a service. Returns the run generation *before* the restart; pass \
         it to wait_for_healthy as after_generation. Restarting a disabled service is rejected."
     )]
-    async fn restart_service(&self, args: Parameters<ServiceArgs>) -> Result<String, ErrorData> {
+    async fn restart_service(&self, args: Parameters<ServiceArgs>) -> ToolResult<MutationResult> {
         let Parameters(args) = args;
         self.mutate(
             args.session,
@@ -351,7 +557,10 @@ impl McpServer {
     #[tool(
         description = "Restart all enabled services in a session (disabled services are skipped)."
     )]
-    async fn restart_all(&self, args: Parameters<SessionArgs>) -> Result<String, ErrorData> {
+    async fn restart_all(
+        &self,
+        args: Parameters<SessionArgs>,
+    ) -> ToolResult<SessionMutationResult> {
         let Parameters(args) = args;
         let resolved = select::resolve(&self.cwd, args.session)
             .await
@@ -360,14 +569,19 @@ impl McpServer {
             .await
             .map_err(error_data)?;
         let acks = convert::accepted(response).map_err(error_data)?;
-        let acks = serde_json::to_value(&acks).map_err(internal)?;
-        ok_json(&json!({ "accepted": acks }))
+        Ok(Json(SessionMutationResult {
+            session: resolved.info.name,
+            id: resolved.info.id,
+            pid: resolved.info.pid,
+            config_path: resolved.info.config_path,
+            accepted: acks,
+        }))
     }
 
     #[tool(
         description = "Enable (and start) a service. Returns the run generation before enabling."
     )]
-    async fn enable_service(&self, args: Parameters<ServiceArgs>) -> Result<String, ErrorData> {
+    async fn enable_service(&self, args: Parameters<ServiceArgs>) -> ToolResult<MutationResult> {
         let Parameters(args) = args;
         self.mutate(
             args.session,
@@ -380,7 +594,7 @@ impl McpServer {
     }
 
     #[tool(description = "Disable a service (stop it and keep it stopped).")]
-    async fn disable_service(&self, args: Parameters<ServiceArgs>) -> Result<String, ErrorData> {
+    async fn disable_service(&self, args: Parameters<ServiceArgs>) -> ToolResult<MutationResult> {
         let Parameters(args) = args;
         self.mutate(
             args.session,
@@ -398,7 +612,7 @@ impl McpServer {
         list_sessions); omit for the current project. Use this before start_session for another \
         worktree that binds the same ports. Returns `stopped: true` once the process has exited."
     )]
-    async fn stop_session(&self, args: Parameters<SessionArgs>) -> Result<String, ErrorData> {
+    async fn stop_session(&self, args: Parameters<SessionArgs>) -> ToolResult<StopSessionResult> {
         let Parameters(args) = args;
         let resolved = select::resolve(&self.cwd, args.session)
             .await
@@ -423,12 +637,13 @@ impl McpServer {
                  window; its ports may take another moment to free",
             )
         };
-        ok_json(&json!({
-            "stopped": stopped,
-            "session": resolved.info.name,
-            "pid": resolved.info.pid,
-            "config_path": resolved.info.config_path,
-            "note": note,
+        Ok(Json(StopSessionResult {
+            stopped,
+            session: resolved.info.name,
+            id: resolved.info.id,
+            pid: resolved.info.pid,
+            config_path: resolved.info.config_path,
+            note,
         }))
     }
 
@@ -439,7 +654,10 @@ impl McpServer {
         directory or a config file — omit for the MCP server's directory. If another worktree's \
         session binds the same ports, stop it first with stop_session."
     )]
-    async fn start_session(&self, args: Parameters<StartArgs>) -> Result<String, ErrorData> {
+    async fn start_session(&self, args: Parameters<StartArgs>) -> ToolResult<StartSessionResult> {
+        if !transport_supported() {
+            return Err(error_data(ToolError::Unsupported));
+        }
         let Parameters(args) = args;
         let target = args
             .path
@@ -451,15 +669,33 @@ impl McpServer {
                 None,
             )
         })?;
-        let runtime_dir = runtime_dir().ok_or_else(|| {
-            ErrorData::internal_error("no runtime directory could be resolved", None)
-        })?;
-        let endpoint = endpoint_for(&runtime_dir, &config_path);
+        let dir_statuses = runtime_dir_statuses();
+        let runtime_dirs = usable_runtime_dirs(&dir_statuses);
+        if runtime_dirs.is_empty() {
+            let diagnostics = select::discovery_diagnostics(
+                &self.cwd,
+                "no runtime directory could be resolved".to_string(),
+                Some(&config_path),
+                &dir_statuses,
+                Vec::new(),
+            );
+            return Err(ErrorData::internal_error(
+                "no runtime directory could be resolved",
+                serde_json::to_value(diagnostics).ok(),
+            ));
+        }
+        let endpoints = runtime_dirs
+            .iter()
+            .map(|runtime_dir| endpoint_for(runtime_dir, &config_path))
+            .collect::<Vec<_>>();
 
-        // Resolve before spawning: never double-start. Anything listening on the endpoint — even a
-        // busy or version-mismatched session that won't answer Describe — already owns it.
-        if let Some(report) = already_running(&endpoint).await {
-            return ok_json(&report);
+        // If a session answers, this is a no-op. Otherwise let `serve` try the lifetime lock: that
+        // keeps duplicate prevention in one place and lets it reclaim stale/bad socket files.
+        if let Some(report) = already_running_any(&endpoints, &config_path)
+            .await
+            .map_err(error_data)?
+        {
+            return Ok(Json(report));
         }
 
         let mut child = spawn_detached_serve(&config_path).map_err(|err| {
@@ -475,38 +711,36 @@ impl McpServer {
         let mut deadline = tokio::time::Instant::now() + START_READY_TIMEOUT;
         let mut child_exit: Option<std::process::ExitStatus> = None;
         loop {
-            if let Some(info) = describe(&endpoint).await {
-                // Reachable. If our own child is still alive, it is the one that came up. If it had
-                // already exited, a *concurrent* start_session won the endpoint lock and is coming up
-                // instead — report that honestly rather than as our start. Dropping `child` hands any
-                // survivor to tokio's background reaper, so it never zombies.
-                let report = if child_exit.is_some() {
-                    json!({
-                        "started": false,
-                        "already_running": true,
-                        "session": info.name,
-                        "pid": info.pid,
-                        "config_path": info.config_path,
-                    })
-                } else {
-                    json!({
-                        "started": true,
-                        "session": info.name,
-                        "pid": info.pid,
-                        "config_path": info.config_path,
-                    })
-                };
-                return ok_json(&report);
-            }
-            // If our child has exited, note it — but don't fail yet. A concurrent start_session that
-            // won the lifetime-lock race makes our loser child exit too, so keep polling for a short
-            // grace so the winner can become reachable instead of returning a spurious error.
+            // Observe early exit before deciding whether an answering session is ours; after the
+            // child is reaped, its pid is no longer a trustworthy ownership signal.
             if child_exit.is_none()
                 && let Ok(Some(status)) = child.try_wait()
             {
                 child_exit = Some(status);
                 deadline = deadline.min(tokio::time::Instant::now() + CHILD_EXIT_GRACE);
             }
+            let child_pid = child_exit.is_none().then(|| child.id()).flatten();
+            match reachable_session_for_start(&endpoints, &config_path, child_pid).await {
+                Ok(Some((started, info))) => {
+                    // Reachable. Report `started` only when the answering process is the child this
+                    // call spawned; otherwise a concurrent start won the endpoint lock. If our child
+                    // is still around in that case, stop it so a duplicate session cannot linger.
+                    if !started && child_exit.is_none() {
+                        let _ = child.kill().await;
+                    }
+                    return Ok(Json(start_session_report(&info, started)));
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    if child_exit.is_none() {
+                        let _ = child.kill().await;
+                    }
+                    return Err(error_data(err));
+                }
+            }
+            // If our child exited, keep polling briefly. A concurrent start_session that won the
+            // lifetime-lock race makes our loser child exit too, and the winner may still be
+            // binding.
             if tokio::time::Instant::now() >= deadline {
                 if child_exit.is_none() {
                     // Still running but never bound — don't leak a session that may hold the ports.
@@ -542,7 +776,7 @@ impl McpServer {
         disk-backed retained run page; omit it for the bounded visible stream. Supports the same \
         raw/grep/min_level filters as get_logs; next_seq still advances past filtered-out lines."
     )]
-    async fn follow_logs(&self, args: Parameters<FollowArgs>) -> Result<String, ErrorData> {
+    async fn follow_logs(&self, args: Parameters<FollowArgs>) -> ToolResult<FollowLogsResult> {
         let Parameters(args) = args;
         let grep = compile_grep(args.grep.as_deref())?;
         let min_level = parse_min_level(args.min_level.as_deref())?;
@@ -573,21 +807,20 @@ impl McpServer {
                 limit: None,
             },
         );
-        let entries = serde_json::to_value(&entries).map_err(internal)?;
-        ok_json(&json!({
-            "service": args.service,
-            "run_generation": args.run_generation,
-            "entries": entries,
-            "next_seq": next_seq,
-            "gap": gap,
-            "truncated": logs.truncated,
+        Ok(Json(FollowLogsResult {
+            service: args.service,
+            run_generation: args.run_generation,
+            entries,
+            next_seq,
+            gap,
+            truncated: logs.truncated,
         }))
     }
 
     #[tool(
         description = "Show the latest healthcheck attempt for a service (command, result, output)."
     )]
-    async fn get_health(&self, args: Parameters<ServiceArgs>) -> Result<String, ErrorData> {
+    async fn get_health(&self, args: Parameters<ServiceArgs>) -> ToolResult<HealthResult> {
         let Parameters(args) = args;
         let resolved = select::resolve(&self.cwd, args.session)
             .await
@@ -601,15 +834,17 @@ impl McpServer {
         .await
         .map_err(error_data)?;
         let attempt = convert::health(response).map_err(error_data)?;
-        let attempt = serde_json::to_value(&attempt).map_err(internal)?;
-        ok_json(&json!({ "service": args.service, "health": attempt }))
+        Ok(Json(HealthResult {
+            service: args.service,
+            health: attempt,
+        }))
     }
 
     #[tool(
         description = "Wait until a service becomes healthy (or its run exits, or a timeout). \
         Pass after_generation (from restart_service/enable_service) to wait for the new run."
     )]
-    async fn wait_for_healthy(&self, args: Parameters<WaitArgs>) -> Result<String, ErrorData> {
+    async fn wait_for_healthy(&self, args: Parameters<WaitArgs>) -> ToolResult<WaitResult> {
         let Parameters(args) = args;
         let resolved = select::resolve(&self.cwd, args.session)
             .await
@@ -640,20 +875,17 @@ impl McpServer {
 
             match convert::evaluate(&snapshot, args.after_generation) {
                 WaitOutcome::Healthy => {
-                    return ok_json(&json!({
-                        "status": "healthy",
-                        "service": args.service,
-                        "generation": snapshot.run_generation,
-                    }));
+                    return Ok(Json(WaitResult::healthy(
+                        args.service,
+                        snapshot.run_generation,
+                    )));
                 }
                 WaitOutcome::Exited(exit_code) => {
-                    return ok_json(&json!({
-                        "status": "exited",
-                        "service": args.service,
-                        "exit_code": exit_code,
-                        "run_generation": snapshot.run_generation,
-                        "hint": "the run exited before becoming healthy — inspect get_logs for why",
-                    }));
+                    return Ok(Json(WaitResult::exited(
+                        args.service,
+                        exit_code,
+                        snapshot.run_generation,
+                    )));
                 }
                 WaitOutcome::InvalidState => {
                     return Err(error_data(ToolError::InvalidState(format!(
@@ -671,21 +903,13 @@ impl McpServer {
                 // failing" from "still starting" without a heuristic.
                 let latest = latest_health(&resolved.endpoint, &args.service)
                     .await
-                    .map(|attempt| serde_json::to_value(bounded_attempt(attempt)))
-                    .transpose()
-                    .map_err(internal)?;
-                return ok_json(&json!({
-                    "status": "timeout",
-                    "service": args.service,
-                    "waited_secs": timeout.as_secs(),
-                    "execution": serde_json::to_value(snapshot.execution).map_err(internal)?,
-                    "run_generation": snapshot.run_generation,
-                    "healthcheck_configured": snapshot.healthcheck_configured,
-                    "health": serde_json::to_value(snapshot.health).map_err(internal)?,
-                    "uptime_secs": snapshot.uptime.map(|uptime| uptime.as_secs()),
-                    "latest_healthcheck": latest,
-                    "hint": timeout_hint(&snapshot),
-                }));
+                    .map(bounded_attempt);
+                return Ok(Json(WaitResult::timeout(
+                    args.service,
+                    timeout.as_secs(),
+                    &snapshot,
+                    latest,
+                )));
             }
             let wait = deadline.saturating_duration_since(now).min(WAIT_POLL_FLOOR);
 
@@ -736,10 +960,6 @@ impl ServerHandler for McpServer {
         info.instructions = Some(INSTRUCTIONS.to_string());
         info
     }
-}
-
-fn internal<E: std::fmt::Display>(err: E) -> ErrorData {
-    ErrorData::internal_error(err.to_string(), None)
 }
 
 /// Compile an optional `grep` pattern, mapping a bad regex to an invalid-params error.
@@ -862,36 +1082,94 @@ const START_READY_TIMEOUT: Duration = Duration::from_secs(15);
 /// quickly.
 const CHILD_EXIT_GRACE: Duration = Duration::from_secs(3);
 
-/// Best-effort connect + `Describe`; `None` if nothing is listening or it does not answer.
-async fn describe(endpoint: &ControlEndpoint) -> Option<SessionInfo> {
-    let mut client = Client::connect(endpoint).await.ok()?;
-    client.describe().await.ok()
+async fn already_running_any(
+    endpoints: &[ControlEndpoint],
+    config_path: &Path,
+) -> Result<Option<StartSessionResult>, ToolError> {
+    let probes = probe_endpoints(endpoints).await;
+    let sessions = unique_answering_session_probes(&probes);
+    if sessions.len() > 1 {
+        return Err(ambiguous_start_session(config_path, sessions.len()));
+    }
+    if let Some((_endpoint, info)) = sessions.into_iter().next() {
+        return Ok(Some(already_running_report(&info)));
+    }
+
+    for probe in probes {
+        let EndpointProbeResult::Unreachable(reason) = probe.result else {
+            continue;
+        };
+        if endpoint_owner_lock_held(&probe.endpoint).unwrap_or(false) {
+            return Ok(Some(StartSessionResult {
+                started: false,
+                already_running: Some(true),
+                reachable: Some(false),
+                config_path: config_path.display().to_string(),
+                session: None,
+                id: None,
+                pid: None,
+                endpoint: Some(probe.endpoint.to_string()),
+                reason: Some(reason),
+            }));
+        }
+    }
+
+    Ok(None)
 }
 
-/// Report a session that already owns the endpoint, distinguishing a clean `Describe` from a live but
-/// unanswerable peer (busy or a different version). `None` means nothing is listening, so a new
-/// session can be spawned.
-async fn already_running(endpoint: &ControlEndpoint) -> Option<Value> {
-    if let Some(info) = describe(endpoint).await {
-        return Some(json!({
-            "started": false,
-            "already_running": true,
-            "session": info.name,
-            "pid": info.pid,
-            "config_path": info.config_path,
-        }));
+async fn reachable_session_for_start(
+    endpoints: &[ControlEndpoint],
+    config_path: &Path,
+    child_pid: Option<u32>,
+) -> Result<Option<(bool, SessionInfo)>, ToolError> {
+    let probes = probe_endpoints(endpoints).await;
+    let sessions = unique_answering_session_probes(&probes);
+    if sessions.len() > 1 {
+        return Err(ambiguous_start_session(config_path, sessions.len()));
     }
-    // Describe failed, but a peer that merely won't answer (busy / version mismatch) still holds the
-    // ownership lock — don't spawn a doomed second session.
-    if Client::connect(endpoint).await.is_ok() {
-        return Some(json!({
-            "started": false,
-            "already_running": true,
-            "note": "a session already owns this project but did not answer Describe \
-                     (it may be busy or a different micromux version)",
-        }));
+    let Some((_endpoint, info)) = sessions.into_iter().next() else {
+        return Ok(None);
+    };
+    Ok(Some((child_pid == Some(info.pid), info)))
+}
+
+fn start_session_report(info: &SessionInfo, started: bool) -> StartSessionResult {
+    if started {
+        StartSessionResult {
+            started: true,
+            already_running: None,
+            reachable: None,
+            config_path: info.config_path.clone(),
+            session: Some(info.name.clone()),
+            id: Some(info.id.clone()),
+            pid: Some(info.pid),
+            endpoint: None,
+            reason: None,
+        }
+    } else {
+        already_running_report(info)
     }
-    None
+}
+
+fn already_running_report(info: &SessionInfo) -> StartSessionResult {
+    StartSessionResult {
+        started: false,
+        already_running: Some(true),
+        reachable: None,
+        config_path: info.config_path.clone(),
+        session: Some(info.name.clone()),
+        id: Some(info.id.clone()),
+        pid: Some(info.pid),
+        endpoint: None,
+        reason: None,
+    }
+}
+
+fn ambiguous_start_session(config_path: &Path, sessions: usize) -> ToolError {
+    ToolError::Ambiguous(format!(
+        "config {} matched {sessions} live sessions; use list_sessions and stop the duplicate before starting another",
+        config_path.display(),
+    ))
 }
 
 /// Spawn `micromux serve` detached for a project's config and return its child handle. A new process
@@ -926,12 +1204,6 @@ fn spawn_detached_serve(_config_path: &Path) -> std::io::Result<tokio::process::
     ))
 }
 
-/// Serialize a tool result to pretty JSON text. Returned as text content (no structured output
-/// schema), which agents read directly.
-fn ok_json(value: &Value) -> Result<String, ErrorData> {
-    serde_json::to_string_pretty(value).map_err(internal)
-}
-
 fn next_follow_cursor(lines: &[micromux::LogLine], after_seq: Option<u64>) -> Option<u64> {
     lines.last().map(|line| line.seq).or(after_seq)
 }
@@ -940,18 +1212,18 @@ fn follow_gap(
     lines: &[micromux::LogLine],
     after_seq: Option<u64>,
     run_generation: Option<u64>,
-) -> Option<Value> {
+) -> Option<FollowGap> {
     if run_generation.is_some() {
         return None;
     }
     let after_seq = after_seq?;
     let first = lines.first()?;
     if first.seq > after_seq.saturating_add(1) {
-        Some(json!({
-            "after_seq": after_seq,
-            "first_seq": first.seq,
-            "lost_lines_at_least": first.seq.saturating_sub(after_seq).saturating_sub(1),
-        }))
+        Some(FollowGap {
+            after_seq,
+            first_seq: first.seq,
+            lost_lines_at_least: first.seq.saturating_sub(after_seq).saturating_sub(1),
+        })
     } else {
         None
     }
@@ -959,8 +1231,10 @@ fn follow_gap(
 
 fn error_data(err: ToolError) -> ErrorData {
     match err {
-        ToolError::NoSession(message) => {
-            ErrorData::invalid_params(format!("no session: {message}"), None)
+        ToolError::NoSession(details) => {
+            let message = format!("no session: {}", details.summary);
+            let data = serde_json::to_value(details).ok();
+            ErrorData::invalid_params(message, data)
         }
         ToolError::Ambiguous(message) => {
             ErrorData::invalid_params(format!("ambiguous selector: {message}"), None)
@@ -997,9 +1271,52 @@ pub async fn serve_stdio() -> Result<(), Box<dyn std::error::Error + Send + Sync
 
 #[cfg(test)]
 mod tests {
-    use super::{follow_gap, next_follow_cursor};
-    use micromux::LogLine;
+    use super::{McpServer, WaitResult, follow_gap, next_follow_cursor};
+    use micromux::{Execution, LogLine, ServiceSnapshot};
     use similar_asserts::assert_eq;
+
+    #[test]
+    fn server_builds_typed_tool_schemas() {
+        let _ = McpServer::new();
+    }
+
+    #[test]
+    fn wait_result_keeps_present_null_fields() -> color_eyre::Result<()> {
+        let exited = serde_json::to_value(WaitResult::exited("svc".to_string(), None, 7))?;
+        assert!(
+            exited
+                .get("exit_code")
+                .is_some_and(serde_json::Value::is_null)
+        );
+
+        let mut snapshot = ServiceSnapshot::initial(
+            "svc".to_string(),
+            "svc".to_string(),
+            Vec::new(),
+            false,
+            micromux::RestartPolicy::Never,
+        );
+        snapshot.execution = Execution::Running;
+        snapshot.run_generation = 7;
+        let timeout =
+            serde_json::to_value(WaitResult::timeout("svc".to_string(), 1, &snapshot, None))?;
+        assert!(
+            timeout
+                .get("health")
+                .is_some_and(serde_json::Value::is_null)
+        );
+        assert!(
+            timeout
+                .get("uptime_secs")
+                .is_some_and(serde_json::Value::is_null)
+        );
+        assert!(
+            timeout
+                .get("latest_healthcheck")
+                .is_some_and(serde_json::Value::is_null)
+        );
+        Ok(())
+    }
 
     #[test]
     fn follow_cursor_is_last_delivered_seq_for_strict_after_protocol() {

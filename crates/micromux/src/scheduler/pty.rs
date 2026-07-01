@@ -151,7 +151,6 @@ impl AnsiFilter {
     /// cursor-positioning or screen-clearing CSI sequence just
     /// finished, signalling the caller to flush accumulated text
     /// (this turns ncurses-style screen redraws into discrete lines).
-    #[allow(clippy::too_many_lines)]
     fn push(&mut self, b: u8, out: &mut Vec<u8>) -> bool {
         match self.state {
             AnsiState::Ground => {
@@ -540,7 +539,13 @@ impl LogReaderHandle {
 
     // On Unix this drops the cancellation pipe's write end, waking the reader's poll; other
     // platforms have no such pipe, so cancellation is a no-op and the receiver goes unused there.
-    #[cfg_attr(not(unix), allow(clippy::unused_self))]
+    #[cfg_attr(
+        not(unix),
+        expect(
+            clippy::unused_self,
+            reason = "Unix cancellation consumes an owned pipe fd; unsupported platforms keep the same handle API"
+        )
+    )]
     pub(super) fn cancel(&mut self) {
         #[cfg(unix)]
         {
@@ -694,7 +699,10 @@ struct LogReaderArgs {
     pty_size: Arc<AtomicU32>,
 }
 
-#[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the PTY reader thread owns the terminal emulator and rate-limit state in one loop"
+)]
 fn spawn_log_reader_thread(args: LogReaderArgs) {
     thread::spawn(move || {
         #[derive(Clone)]
@@ -1283,7 +1291,10 @@ fn spawn_termination_task(args: TerminationTaskArgs) {
     });
 }
 
-#[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "process startup wires PTY, reader, waiter, and ownership guards in one fallible path"
+)]
 pub(super) fn start_service_with_pty_size(
     service: &Service,
     run_id: RunId,

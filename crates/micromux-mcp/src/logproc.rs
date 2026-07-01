@@ -9,6 +9,7 @@
 
 use micromux::LogLine;
 use regex::Regex;
+use schemars::JsonSchema;
 use serde::Serialize;
 
 /// Object keys, matched case-insensitively, under which structured loggers carry the level.
@@ -144,7 +145,7 @@ fn strip_ansi(line: &str) -> String {
 
 /// A processed, agent-facing log line: the original cursor/run plus a cleaned `line` and, when the
 /// record was structured JSON, its detected `level`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct ProcessedLine {
     pub seq: u64,
     pub run_generation: u64,

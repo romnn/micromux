@@ -2,22 +2,22 @@
 
 #![cfg(unix)]
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use color_eyre::eyre;
 use micromux::CancellationToken;
 use micromux_control::{
-    Client, ControlEndpoint, ControlServer, Request, Response, SessionIdentity, bind,
+    Client, ControlEndpoint, ControlServer, EndpointProbeResult, Request, Response,
+    SessionIdentity, bind, endpoint_owner_lock_held, probe_runtime_dir,
 };
 use similar_asserts::assert_eq;
 
-fn unique_dir(prefix: &str) -> eyre::Result<PathBuf> {
-    let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-    let dir = std::env::temp_dir().join(format!("micromux-control-{prefix}-{nanos}"));
-    std::fs::create_dir_all(&dir)?;
-    Ok(dir)
+fn unique_dir(prefix: &str) -> eyre::Result<tempfile::TempDir> {
+    Ok(tempfile::Builder::new()
+        .prefix(&format!("micromux-control-{prefix}-"))
+        .tempdir()?)
 }
 
 struct Session {
@@ -85,7 +85,7 @@ where
 #[tokio::test]
 async fn describe_list_logs_and_restart_over_the_socket() -> eyre::Result<()> {
     let dir = unique_dir("e2e")?;
-    let session = build_session(&dir, "echo hello-from-svc; sleep 60")?;
+    let session = build_session(dir.path(), "echo hello-from-svc; sleep 60")?;
 
     // Describe carries identity + the configured service.
     let mut client = Client::connect(&session.endpoint).await?;
@@ -93,7 +93,7 @@ async fn describe_list_logs_and_restart_over_the_socket() -> eyre::Result<()> {
     assert_eq!(info.name, "test");
     assert_eq!(
         info.id,
-        micromux_control::endpoint_hash(&dir.join("micromux.yaml"))
+        micromux_control::endpoint_hash(&dir.path().join("micromux.yaml"))
     );
     assert_eq!(info.services.len(), 1);
     assert_eq!(
@@ -186,13 +186,13 @@ async fn describe_list_logs_and_restart_over_the_socket() -> eyre::Result<()> {
 #[tokio::test]
 async fn retained_run_logs_are_queryable_after_restart() -> eyre::Result<()> {
     let dir = unique_dir("run-logs")?;
-    let counter = dir.join("counter");
+    let counter = dir.path().join("counter");
     let command = format!(
         "n=$(cat {} 2>/dev/null || echo 0); n=$((n+1)); echo $n > {}; echo run-$n; sleep 60",
         counter.display(),
         counter.display()
     );
-    let session = build_session(&dir, &command)?;
+    let session = build_session(dir.path(), &command)?;
 
     request_until(
         &session.endpoint,
@@ -252,7 +252,7 @@ async fn retained_run_logs_are_queryable_after_restart() -> eyre::Result<()> {
 #[tokio::test]
 async fn concurrent_same_config_startup_binds_exactly_once() -> eyre::Result<()> {
     let dir = unique_dir("concurrent")?;
-    let endpoint = ControlEndpoint::Unix(dir.join("a.sock"));
+    let endpoint = ControlEndpoint::Unix(dir.path().join("a.sock"));
 
     let first = bind(&endpoint)?;
     assert!(first.is_some(), "first bind acquires the lock");
@@ -271,7 +271,7 @@ async fn concurrent_same_config_startup_binds_exactly_once() -> eyre::Result<()>
 #[tokio::test]
 async fn leaked_socket_is_reclaimed() -> eyre::Result<()> {
     let dir = unique_dir("leaked")?;
-    let socket_path = dir.join("b.sock");
+    let socket_path = dir.path().join("b.sock");
     let endpoint = ControlEndpoint::Unix(socket_path.clone());
 
     // Simulate a crash-leaked socket: the file exists but no process holds the lock.
@@ -288,9 +288,24 @@ async fn leaked_socket_is_reclaimed() -> eyre::Result<()> {
 }
 
 #[tokio::test]
+async fn endpoint_owner_lock_probe_is_read_only() -> eyre::Result<()> {
+    let dir = unique_dir("owner-lock")?;
+    let endpoint = ControlEndpoint::Unix(dir.path().join("owned.sock"));
+
+    assert!(!endpoint_owner_lock_held(&endpoint)?);
+
+    let guard = bind(&endpoint)?.ok_or_else(|| eyre::eyre!("bind failed"))?;
+    assert!(endpoint_owner_lock_held(&endpoint)?);
+
+    drop(guard);
+    assert!(!endpoint_owner_lock_held(&endpoint)?);
+    Ok(())
+}
+
+#[tokio::test]
 async fn subscribe_streams_liveness_changes() -> eyre::Result<()> {
     let dir = unique_dir("subscribe")?;
-    let session = build_session(&dir, "sleep 60")?;
+    let session = build_session(dir.path(), "sleep 60")?;
 
     request_until(&session.endpoint, Request::ListServices, |response| {
         matches!(response, Response::Services(services)
@@ -320,11 +335,11 @@ async fn one_unreachable_endpoint_does_not_de_list_healthy_sessions() -> eyre::R
     use tokio::io::AsyncWriteExt;
 
     let dir = unique_dir("discover")?;
-    let session = build_session(&dir, "sleep 60")?;
+    let session = build_session(dir.path(), "sleep 60")?;
 
     // A live socket that answers with garbage fails `Describe` fast with a *non-hard* error. It must
     // be counted as unreachable — never abort the scan or hide the healthy session.
-    let garbage_path = dir.join("garbage.sock");
+    let garbage_path = dir.path().join("garbage.sock");
     let listener = tokio::net::UnixListener::bind(&garbage_path)?;
     tokio::spawn(async move {
         while let Ok((mut stream, _)) = listener.accept().await {
@@ -333,15 +348,27 @@ async fn one_unreachable_endpoint_does_not_de_list_healthy_sessions() -> eyre::R
         }
     });
 
-    let discovery = micromux_control::discover_sessions(&dir).await?;
+    let closed_path = dir.path().join("closed.sock");
+    let listener = tokio::net::UnixListener::bind(&closed_path)?;
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            drop(stream);
+        }
+    });
+
+    let probes = probe_runtime_dir(dir.path()).await?;
+    let sessions = probes
+        .iter()
+        .filter(|probe| matches!(&probe.result, EndpointProbeResult::Session(_)))
+        .count();
+    let unreachable = probes
+        .iter()
+        .filter(|probe| matches!(&probe.result, EndpointProbeResult::Unreachable(_)))
+        .count();
+    assert_eq!(sessions, 1, "the healthy session must still be listed");
     assert_eq!(
-        discovery.sessions.len(),
-        1,
-        "the healthy session must still be listed"
-    );
-    assert_eq!(
-        discovery.unreachable, 1,
-        "the garbage endpoint must be counted, not hidden"
+        unreachable, 2,
+        "live-but-bad endpoints must be counted, not hidden"
     );
 
     session.shutdown.cancel();
@@ -351,7 +378,7 @@ async fn one_unreachable_endpoint_does_not_de_list_healthy_sessions() -> eyre::R
 #[tokio::test]
 async fn shutdown_request_stops_the_session_and_removes_the_endpoint() -> eyre::Result<()> {
     let dir = unique_dir("shutdown")?;
-    let session = build_session(&dir, "sleep 300")?;
+    let session = build_session(dir.path(), "sleep 300")?;
 
     // It is serving before the request.
     request_until(&session.endpoint, Request::ListServices, |response| {

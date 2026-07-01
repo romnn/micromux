@@ -242,7 +242,9 @@ pub(crate) enum LogUpdateKind {
 }
 
 /// Origin stream of output.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
 pub enum OutputStream {
     /// Standard output.
     Stdout,

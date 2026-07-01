@@ -18,11 +18,19 @@ pub struct LogsResult {
 
 fn remote_error(code: ErrorCode, message: String) -> ToolError {
     match code {
+        ErrorCode::Ambiguous => ToolError::Ambiguous(message),
+        ErrorCode::Busy | ErrorCode::Timeout | ErrorCode::SchedulerStopped => {
+            ToolError::Busy(format!("{code:?}: {message}"))
+        }
         ErrorCode::InvalidState => ToolError::InvalidState(message),
-        other => ToolError::Remote {
-            code: other,
-            message,
-        },
+        ErrorCode::UnsupportedPlatform => ToolError::Unsupported,
+        ErrorCode::ProtocolVersionMismatch | ErrorCode::Internal => {
+            ToolError::Unexpected(format!("{code:?}: {message}"))
+        }
+        ErrorCode::UnknownService
+        | ErrorCode::UnknownRun
+        | ErrorCode::NoSession
+        | ErrorCode::BadRequest => ToolError::Remote { code, message },
     }
 }
 
@@ -242,5 +250,33 @@ mod tests {
         assert_eq!(evaluate(&snap, None), WaitOutcome::Pending);
         snap.execution = Execution::Stopping;
         assert_eq!(evaluate(&snap, None), WaitOutcome::Pending);
+    }
+
+    #[test]
+    fn remote_error_maps_retryable_errors_to_busy() {
+        let err = remote_error(ErrorCode::Timeout, "scheduler did not respond".to_string());
+
+        assert!(matches!(err, ToolError::Busy(message) if message.contains("Timeout")));
+    }
+
+    #[test]
+    fn remote_error_keeps_request_errors_as_remote() {
+        let err = remote_error(ErrorCode::UnknownRun, "run gone".to_string());
+
+        assert!(
+            matches!(err, ToolError::Remote { code: ErrorCode::UnknownRun, message } if message == "run gone")
+        );
+    }
+
+    #[test]
+    fn remote_error_maps_protocol_failures_to_internal_errors() {
+        let err = remote_error(
+            ErrorCode::ProtocolVersionMismatch,
+            "session speaks v1".to_string(),
+        );
+
+        assert!(
+            matches!(err, ToolError::Unexpected(message) if message.contains("ProtocolVersionMismatch"))
+        );
     }
 }

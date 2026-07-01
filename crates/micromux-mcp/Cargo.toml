@@ -28,10 +28,11 @@ micromux = { path = "../micromux/" }
 micromux-control = { path = "../micromux-control/" }
 
 rmcp = { version = "1", features = ["server", "transport-io", "macros"] }
-schemars = "1"
+schemars.workspace = true
 
 serde.workspace = true
 serde_json.workspace = true
+thiserror.workspace = true
 
 regex = "1"
 strip-ansi-escapes.workspace = true
@@ -45,3 +46,5 @@ nix = { workspace = true, features = ["signal"] }
 [dev-dependencies]
 similar-asserts.workspace = true
 color-eyre.workspace = true
+tempfile.workspace = true
+fs2 = "0.4"

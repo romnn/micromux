@@ -2,10 +2,10 @@
 //!
 //! The session binds a Unix domain socket (Unix/macOS) keyed by a hash of its canonical config
 //! path; clients — the `micromux ctl` CLI and the MCP proxy — connect, speak newline-delimited JSON
-//! ([`Request`]/[`Response`]), and never touch the filesystem beyond connecting. The core knows
-//! nothing about any of this; the server is driven by a [`micromux::SessionModelReader`] (reads) and
-//! a [`micromux::ServiceControl`] (mutations), so it can observe and command but never mutate the
-//! model directly.
+//! ([`Request`]/[`Response`]), and probe local endpoint paths without pruning stale sockets. The
+//! core knows nothing about any of this; the server is driven by a
+//! [`micromux::SessionModelReader`] (reads) and a [`micromux::ServiceControl`] (mutations), so it
+//! can observe and command but never mutate the model directly.
 
 mod client;
 mod endpoint;
@@ -26,13 +26,17 @@ use tokio_util::codec::LinesCodecError;
 #[cfg(unix)]
 use tokio_util::codec::{Framed, LinesCodec};
 
-pub use client::{Client, DiscoveredSession, Discovery, Subscription, discover_sessions};
+pub use client::{
+    Client, EndpointProbe, EndpointProbeResult, Subscription, answering_session_probes,
+    probe_endpoint, probe_endpoints, probe_runtime_dir, probe_runtime_dirs,
+    unique_answering_session_probes,
+};
 pub use endpoint::{
-    ControlEndpoint, endpoint_for, endpoint_from_hash, endpoint_hash, runtime_dir,
-    transport_supported,
+    ControlEndpoint, RuntimeDirStatus, endpoint_for, endpoint_from_hash, endpoint_hash,
+    runtime_dir, runtime_dir_statuses, transport_supported, usable_runtime_dirs,
 };
 pub use protocol::{ErrorCode, PROTOCOL_VERSION, Request, Response, ServiceBrief, SessionInfo};
-pub use server::{ControlServer, EndpointGuard, SessionIdentity, bind};
+pub use server::{ControlServer, EndpointGuard, SessionIdentity, bind, endpoint_owner_lock_held};
 
 /// Maximum size of a single protocol frame. Oversized frames are rejected, not buffered, so a
 /// broken peer cannot pin memory.

@@ -48,6 +48,13 @@ pub(super) fn bind(endpoint: &ControlEndpoint) -> Result<Option<EndpointGuard>, 
     }
 }
 
+pub(super) fn endpoint_owner_lock_held(endpoint: &ControlEndpoint) -> Result<bool, ControlError> {
+    match endpoint {
+        ControlEndpoint::Unix(path) => owner_lock_held_unix(path),
+        ControlEndpoint::WindowsNamedPipe(_) => Err(ControlError::Unsupported),
+    }
+}
+
 fn bind_unix(socket_path: &Path) -> Result<Option<EndpointGuard>, ControlError> {
     use std::os::unix::fs::PermissionsExt;
 
@@ -82,6 +89,25 @@ fn bind_unix(socket_path: &Path) -> Result<Option<EndpointGuard>, ControlError> 
         socket_path: socket_path.to_path_buf(),
         _lock: lock_file,
     }))
+}
+
+fn owner_lock_held_unix(socket_path: &Path) -> Result<bool, ControlError> {
+    let lock_path = socket_path.with_extension("lock");
+    let lock_file = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+    {
+        Ok(lock_file) => lock_file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(err.into()),
+    };
+
+    match fs2::FileExt::try_lock_exclusive(&lock_file) {
+        Ok(()) => Ok(false),
+        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => Ok(true),
+        Err(err) => Err(err.into()),
+    }
 }
 
 pub(super) async fn serve(
@@ -327,7 +353,7 @@ fn follow_logs(
         let Some(run) =
             server
                 .reader
-                .run_log_after(service, run_generation, after, Some(MAX_LOG_TAIL))
+                .run_log_after(service, run_generation, after, Some(MAX_LOG_TAIL + 1))
         else {
             return unknown_run(service, run_generation);
         };
@@ -335,9 +361,7 @@ fn follow_logs(
         if let Some(cursor) = after {
             lines.retain(|line| line.seq > cursor);
         }
-        let capped = lines.len() > MAX_LOG_TAIL;
-        lines.truncate(MAX_LOG_TAIL);
-        let truncated = capped || bound_follow_response_lines(&mut lines);
+        let (lines, truncated) = bound_follow_response_lines_page(lines);
         return Response::Logs { lines, truncated };
     }
 
@@ -345,9 +369,7 @@ fn follow_logs(
     let mut lines = server.reader.logs(service, None);
     if let Some(cursor) = after {
         lines.retain(|line| line.seq > cursor);
-        let capped = lines.len() > MAX_LOG_TAIL;
-        lines.truncate(MAX_LOG_TAIL);
-        let truncated = capped || bound_follow_response_lines(&mut lines);
+        let (lines, truncated) = bound_follow_response_lines_page(lines);
         return Response::Logs { lines, truncated };
     }
 
@@ -359,6 +381,15 @@ fn follow_logs(
     }
     truncated |= bound_tail_response_lines(&mut lines);
     Response::Logs { lines, truncated }
+}
+
+fn bound_follow_response_lines_page(
+    mut lines: Vec<micromux::LogLine>,
+) -> (Vec<micromux::LogLine>, bool) {
+    let capped = lines.len() > MAX_LOG_TAIL;
+    lines.truncate(MAX_LOG_TAIL);
+    let truncated = capped || bound_follow_response_lines(&mut lines);
+    (lines, truncated)
 }
 
 fn describe(server: &ControlServer) -> SessionInfo {
@@ -373,7 +404,7 @@ fn describe(server: &ControlServer) -> SessionInfo {
         .collect();
     SessionInfo {
         protocol_version: PROTOCOL_VERSION,
-        id: crate::endpoint::endpoint_hash(Path::new(&server.identity.config_path)),
+        id: server.identity.id.clone(),
         pid: server.identity.pid,
         start_time: server.identity.start_time,
         name: server.identity.name.clone(),
@@ -511,7 +542,10 @@ mod tests {
     use micromux::LogLine;
     use similar_asserts::assert_eq;
 
-    use super::{RESPONSE_MAX_BYTES, bound_follow_response_lines, bound_tail_response_lines};
+    use super::{
+        MAX_LOG_TAIL, RESPONSE_MAX_BYTES, bound_follow_response_lines,
+        bound_follow_response_lines_page, bound_tail_response_lines,
+    };
 
     fn line(seq: u64, len: usize) -> LogLine {
         LogLine {
@@ -562,6 +596,27 @@ mod tests {
         assert_eq!(
             lines.first().map(|line| line.line.len()),
             Some(RESPONSE_MAX_BYTES)
+        );
+    }
+
+    #[test]
+    fn follow_page_reports_truncated_when_a_sentinel_line_was_fetched() {
+        fn seq(value: usize) -> u64 {
+            u64::try_from(value).unwrap_or(u64::MAX)
+        }
+
+        let lines = (0..=MAX_LOG_TAIL)
+            .map(|value| line(seq(value), 1))
+            .collect::<Vec<_>>();
+
+        let (lines, truncated) = bound_follow_response_lines_page(lines);
+
+        assert!(truncated);
+        assert_eq!(lines.len(), MAX_LOG_TAIL);
+        assert_eq!(lines.first().map(|line| line.seq), Some(0));
+        assert_eq!(
+            lines.last().map(|line| line.seq),
+            Some(seq(MAX_LOG_TAIL.saturating_sub(1)))
         );
     }
 }

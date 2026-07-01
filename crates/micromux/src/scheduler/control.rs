@@ -8,12 +8,13 @@
 //! `mpsc::Sender<Command>` instead.
 
 use super::types::{Command, ServiceID};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 
 /// Acknowledgement for one affected service: the generation the scheduler latched while processing
 /// the command. Reused directly as the control-protocol wire payload.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ServiceCommandAck {
     /// The affected service.
     pub service: ServiceID,
@@ -23,11 +24,13 @@ pub struct ServiceCommandAck {
 }
 
 /// A typed rejection produced by the scheduler when it declines a command.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum CommandRejection {
     /// No service with the given id exists.
+    #[error("unknown service")]
     UnknownService,
     /// The command is not valid in the service's current state (e.g. restart on a disabled service).
+    #[error("command is invalid in the service's current state")]
     InvalidState,
 }
 
@@ -35,16 +38,9 @@ pub enum CommandRejection {
 pub type ServiceCommandResult = Result<Vec<ServiceCommandAck>, CommandRejection>;
 
 /// The scheduler dropped the reply channel (it is shutting down) before acknowledging a command.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("the scheduler has stopped")]
 pub struct SchedulerStopped;
-
-impl std::fmt::Display for SchedulerStopped {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "the scheduler has stopped")
-    }
-}
-
-impl std::error::Error for SchedulerStopped {}
 
 /// The reply half of an acknowledged command. Possession-scoped: there is no public constructor, so
 /// only the crate (the `ServiceControl` dispatch path) can attach an ack to a `Command`, and only

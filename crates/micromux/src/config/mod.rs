@@ -141,7 +141,10 @@ pub struct UiConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 // `ui_config` predates the other fields and is public API; renaming it to satisfy the
 // suffix-repeats-the-struct-name heuristic is not worth the churn.
-#[allow(clippy::struct_field_names)]
+#[expect(
+    clippy::struct_field_names,
+    reason = "the public field name predates this lint and renaming it would churn the config API"
+)]
 pub struct Config {
     /// Optional session name, surfaced as the session identity to agents. Falls back to
     /// `basename(working_dir)` when unset.
@@ -278,18 +281,20 @@ pub struct HealthCheck {
 }
 
 /// Reason why a command is invalid.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, thiserror::Error)]
 pub enum InvalidCommandReason {
     /// The command string could not be split into an argv-like representation.
+    #[error("could not split command")]
     FailedToSplit,
     /// The command is empty.
+    #[error("command is empty")]
     EmptyCommand,
 }
 
 /// Errors that can occur while parsing configuration.
 #[derive(thiserror::Error, Debug)]
 pub enum ConfigError {
-    #[error("invalid command {command}: {reason:?}")]
+    #[error("invalid command {command}: {reason}")]
     /// A command could not be parsed.
     InvalidCommand {
         /// Raw command string.

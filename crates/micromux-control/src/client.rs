@@ -1,9 +1,11 @@
 //! The control client used by `micromux ctl` and the MCP proxy.
 //!
-//! The proxy never mutates the filesystem; it only connects. Discovery skips endpoints that refuse
-//! a connection (dead), surfaces busy/incompatible endpoints, and never prunes them.
+//! Endpoint probing skips sockets that refuse a connection (dead), surfaces busy/incompatible
+//! endpoints, and never prunes them.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+use futures::future;
 
 use crate::ControlError;
 use crate::endpoint::ControlEndpoint;
@@ -23,25 +25,53 @@ pub struct Subscription {
     conn: crate::Framing<tokio::net::UnixStream>,
 }
 
-/// A live session found by [`discover_sessions`].
+/// Probe result for one concrete endpoint.
 #[derive(Debug, Clone)]
-pub struct DiscoveredSession {
-    /// The session's live identity.
-    pub info: SessionInfo,
-    /// The endpoint to reach it.
+pub struct EndpointProbe {
+    /// The endpoint that was probed.
     pub endpoint: ControlEndpoint,
+    /// What happened when it was probed.
+    pub result: EndpointProbeResult,
 }
 
-/// The result of scanning for live sessions: those that answered `Describe`, plus a count of
-/// live-but-unreachable endpoints (busy/timeout/incompatible) that were skipped this scan. A
-/// non-zero `unreachable` means a target *might* be present but could not be described — it is never
-/// de-listed or pruned (the proxy only reads).
-#[derive(Debug, Default)]
-pub struct Discovery {
-    /// Sessions that answered `Describe`.
-    pub sessions: Vec<DiscoveredSession>,
-    /// Number of live endpoints that could not be described this scan (busy/incompatible).
-    pub unreachable: usize,
+/// The outcome of probing one endpoint.
+#[derive(Debug, Clone)]
+pub enum EndpointProbeResult {
+    /// The endpoint answered `Describe`.
+    Session(Box<SessionInfo>),
+    /// Nothing live answered on this endpoint.
+    Absent(String),
+    /// Something was listening, but it was busy or unusable.
+    Unreachable(String),
+}
+
+/// Return every probe that answered `Describe`, preserving probe order.
+#[must_use]
+pub fn answering_session_probes(probes: &[EndpointProbe]) -> Vec<(ControlEndpoint, SessionInfo)> {
+    probes
+        .iter()
+        .filter_map(|probe| match &probe.result {
+            EndpointProbeResult::Session(info) => Some((probe.endpoint.clone(), (**info).clone())),
+            EndpointProbeResult::Absent(_) | EndpointProbeResult::Unreachable(_) => None,
+        })
+        .collect()
+}
+
+/// Return answering sessions deduped by the session start token, preserving first-seen order.
+#[must_use]
+pub fn unique_answering_session_probes(
+    probes: &[EndpointProbe],
+) -> Vec<(ControlEndpoint, SessionInfo)> {
+    let mut sessions = Vec::<(ControlEndpoint, SessionInfo)>::new();
+    for (endpoint, info) in answering_session_probes(probes) {
+        if !sessions
+            .iter()
+            .any(|(_, existing)| existing.is_same_instance(&info))
+        {
+            sessions.push((endpoint, info));
+        }
+    }
+    sessions
 }
 
 impl Client {
@@ -51,7 +81,14 @@ impl Client {
     ///
     /// Returns [`ControlError::Io`] if the endpoint refuses the connection (dead session) or
     /// [`ControlError::Unsupported`] on a platform without a transport.
-    #[cfg_attr(not(unix), allow(unused_variables, clippy::unused_async))]
+    #[cfg_attr(
+        not(unix),
+        expect(
+            unused_variables,
+            clippy::unused_async,
+            reason = "Unix has the async transport implementation; unsupported platforms keep the same API shape"
+        )
+    )]
     pub async fn connect(endpoint: &ControlEndpoint) -> Result<Self, ControlError> {
         match endpoint {
             #[cfg(unix)]
@@ -76,7 +113,14 @@ impl Client {
     ///
     /// Returns [`ControlError::Timeout`] if the peer does not reply in time, [`ControlError::Closed`]
     /// if the connection ends first, or an I/O/serialization error.
-    #[cfg_attr(not(unix), allow(unused_variables, clippy::unused_async))]
+    #[cfg_attr(
+        not(unix),
+        expect(
+            unused_variables,
+            clippy::unused_async,
+            reason = "Unix has the async transport implementation; unsupported platforms keep the same API shape"
+        )
+    )]
     pub async fn request(&mut self, request: Request) -> Result<Response, ControlError> {
         #[cfg(unix)]
         {
@@ -103,7 +147,14 @@ impl Client {
     ///
     /// Returns a transport/protocol error if the endpoint cannot be reached or rejects the
     /// subscription.
-    #[cfg_attr(not(unix), allow(unused_variables, clippy::unused_async))]
+    #[cfg_attr(
+        not(unix),
+        expect(
+            unused_variables,
+            clippy::unused_async,
+            reason = "Unix has the async transport implementation; unsupported platforms keep the same API shape"
+        )
+    )]
     pub async fn subscribe(endpoint: &ControlEndpoint) -> Result<Subscription, ControlError> {
         #[cfg(unix)]
         {
@@ -155,7 +206,13 @@ impl Subscription {
     /// # Errors
     ///
     /// Returns a transport/protocol error if the stream is malformed.
-    #[cfg_attr(not(unix), allow(clippy::unused_async))]
+    #[cfg_attr(
+        not(unix),
+        expect(
+            clippy::unused_async,
+            reason = "Unix reads from an async subscription stream; unsupported platforms keep the same API shape"
+        )
+    )]
     pub async fn recv(&mut self) -> Result<Option<micromux::SessionChange>, ControlError> {
         #[cfg(unix)]
         {
@@ -176,46 +233,112 @@ impl Subscription {
     }
 }
 
-/// Discover every live session by scanning the runtime dir's `*.sock` endpoints, connecting, and
-/// calling `Describe`.
+/// Probe every socket endpoint in one runtime directory.
 ///
-/// Hard-dead endpoints (gone/refused) are skipped. A live-but-unreachable endpoint
-/// (busy/timeout/incompatible) is *counted* in [`Discovery::unreachable`] rather than aborting the
-/// scan — so one wedged session never de-lists the healthy ones, and a busy target is never silently
-/// reported as absent.
+/// Hard-dead endpoints are included as [`EndpointProbeResult::Absent`] instead of being dropped, so
+/// callers can surface detailed discovery diagnostics.
 ///
 /// # Errors
 ///
-/// Returns [`ControlError::Unsupported`] on a platform without a transport. Per-endpoint failures do
-/// not error the scan.
-pub async fn discover_sessions(runtime_dir: &Path) -> Result<Discovery, ControlError> {
+/// Returns [`ControlError::Unsupported`] on platforms without a concrete control transport.
+pub async fn probe_runtime_dir(runtime_dir: &Path) -> Result<Vec<EndpointProbe>, ControlError> {
+    #[cfg(unix)]
+    {
+        let endpoints = runtime_dir_endpoints(runtime_dir);
+        Ok(probe_endpoints(&endpoints).await)
+    }
+
     #[cfg(not(unix))]
     {
         let _ = runtime_dir;
-        return Err(ControlError::Unsupported);
+        Err(ControlError::Unsupported)
     }
+}
 
+/// Probe every socket endpoint across runtime directories in one concurrent batch.
+///
+/// # Errors
+///
+/// Returns [`ControlError::Unsupported`] on platforms without a concrete control transport.
+pub async fn probe_runtime_dirs(
+    runtime_dirs: &[PathBuf],
+) -> Result<Vec<EndpointProbe>, ControlError> {
     #[cfg(unix)]
     {
-        let mut discovery = Discovery::default();
-        let Ok(entries) = std::fs::read_dir(runtime_dir) else {
-            return Ok(discovery);
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|ext| ext.to_str()) != Some("sock") {
-                continue;
-            }
-            match try_describe(&ControlEndpoint::Unix(path)).await {
-                Ok(Some(session)) => discovery.sessions.push(session),
-                Ok(None) => {} // hard-dead (gone/refused): skip
-                Err(err) => {
-                    tracing::debug!(?err, "control: live endpoint unreachable; not de-listing");
-                    discovery.unreachable += 1;
-                }
-            }
+        let mut endpoints = Vec::new();
+        for runtime_dir in runtime_dirs {
+            endpoints.extend(runtime_dir_endpoints(runtime_dir));
         }
-        Ok(discovery)
+        Ok(probe_endpoints(&endpoints).await)
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = runtime_dirs;
+        Err(ControlError::Unsupported)
+    }
+}
+
+/// Probe known endpoints in order.
+pub async fn probe_endpoints(endpoints: &[ControlEndpoint]) -> Vec<EndpointProbe> {
+    future::join_all(endpoints.iter().map(probe_endpoint)).await
+}
+
+/// Probe one known endpoint.
+#[cfg_attr(
+    not(unix),
+    expect(
+        clippy::unused_async,
+        reason = "the Unix transport probes asynchronously; unsupported platforms share the API shape"
+    )
+)]
+pub async fn probe_endpoint(endpoint: &ControlEndpoint) -> EndpointProbe {
+    #[cfg(unix)]
+    {
+        let mut client = match Client::connect(endpoint).await {
+            Ok(client) => client,
+            Err(ControlError::Io(err)) if is_hard_connection_error(&err) => {
+                return EndpointProbe {
+                    endpoint: endpoint.clone(),
+                    result: EndpointProbeResult::Absent(format!("connect: {err}")),
+                };
+            }
+            Err(err) => {
+                return EndpointProbe {
+                    endpoint: endpoint.clone(),
+                    result: EndpointProbeResult::Unreachable(err.to_string()),
+                };
+            }
+        };
+
+        match client.describe().await {
+            Ok(info) => EndpointProbe {
+                endpoint: endpoint.clone(),
+                result: EndpointProbeResult::Session(Box::new(info)),
+            },
+            Err(ControlError::Io(err)) if is_hard_connection_error(&err) => EndpointProbe {
+                endpoint: endpoint.clone(),
+                result: EndpointProbeResult::Absent(format!("describe: {err}")),
+            },
+            Err(ControlError::Closed) => EndpointProbe {
+                endpoint: endpoint.clone(),
+                result: EndpointProbeResult::Unreachable("closed before Describe".to_string()),
+            },
+            Err(err) => EndpointProbe {
+                endpoint: endpoint.clone(),
+                result: EndpointProbeResult::Unreachable(err.to_string()),
+            },
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        EndpointProbe {
+            endpoint: endpoint.clone(),
+            result: EndpointProbeResult::Unreachable(
+                "the control plane is not supported on this platform".to_string(),
+            ),
+        }
     }
 }
 
@@ -228,24 +351,86 @@ fn is_hard_connection_error(err: &std::io::Error) -> bool {
 }
 
 #[cfg(unix)]
-async fn try_describe(
-    endpoint: &ControlEndpoint,
-) -> Result<Option<DiscoveredSession>, ControlError> {
-    let mut client = match Client::connect(endpoint).await {
-        Ok(client) => client,
-        Err(ControlError::Io(err)) if is_hard_connection_error(&err) => return Ok(None),
-        Err(err) => return Err(err),
+fn runtime_dir_endpoints(runtime_dir: &Path) -> Vec<ControlEndpoint> {
+    let Ok(entries) = std::fs::read_dir(runtime_dir) else {
+        return Vec::new();
     };
-    match client.describe().await {
-        Ok(info) => Ok(Some(DiscoveredSession {
-            info,
-            endpoint: endpoint.clone(),
-        })),
-        Err(ControlError::Io(err)) if is_hard_connection_error(&err) => Ok(None),
-        Err(ControlError::Closed) => Ok(None),
-        Err(err) => {
-            tracing::debug!(?err, "control: endpoint failed to describe");
-            Err(err)
+    let mut endpoints = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("sock") {
+            continue;
         }
+        endpoints.push(ControlEndpoint::Unix(path));
+    }
+    endpoints.sort();
+    endpoints
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use similar_asserts::assert_eq;
+    use std::path::PathBuf;
+
+    fn session(id: &str, pid: u32, start_time: u64, name: &str) -> SessionInfo {
+        SessionInfo {
+            protocol_version: PROTOCOL_VERSION,
+            id: id.to_string(),
+            pid,
+            start_time,
+            name: name.to_string(),
+            working_dir: ".".to_string(),
+            config_path: "/project/micromux.yaml".to_string(),
+            services: Vec::new(),
+            micromux_version: env!("CARGO_PKG_VERSION").to_string(),
+        }
+    }
+
+    #[test]
+    fn unique_answering_session_probes_dedupes_aliases() {
+        let first = session("aaa", 42, 100, "first");
+        let alias = session("aaa", 42, 100, "alias");
+        let second = session("bbb", 43, 101, "second");
+        let probes = vec![
+            EndpointProbe {
+                endpoint: ControlEndpoint::Unix(PathBuf::from("/first.sock")),
+                result: EndpointProbeResult::Session(Box::new(first)),
+            },
+            EndpointProbe {
+                endpoint: ControlEndpoint::Unix(PathBuf::from("/alias.sock")),
+                result: EndpointProbeResult::Session(Box::new(alias)),
+            },
+            EndpointProbe {
+                endpoint: ControlEndpoint::Unix(PathBuf::from("/second.sock")),
+                result: EndpointProbeResult::Session(Box::new(second)),
+            },
+        ];
+
+        let sessions = unique_answering_session_probes(&probes);
+
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions[0].1.name, "first");
+        assert_eq!(sessions[1].1.name, "second");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_dir_endpoints_are_sorted() -> color_eyre::Result<()> {
+        let dir = tempfile::tempdir()?;
+        std::fs::write(dir.path().join("z.sock"), b"")?;
+        std::fs::write(dir.path().join("a.sock"), b"")?;
+        std::fs::write(dir.path().join("ignore.txt"), b"")?;
+
+        let endpoints = runtime_dir_endpoints(dir.path());
+
+        assert_eq!(
+            endpoints,
+            vec![
+                ControlEndpoint::Unix(dir.path().join("a.sock")),
+                ControlEndpoint::Unix(dir.path().join("z.sock")),
+            ],
+        );
+        Ok(())
     }
 }
