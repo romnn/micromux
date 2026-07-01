@@ -180,8 +180,12 @@ pub struct Config {
 pub struct ConfigFile<F> {
     /// File identifier used in diagnostics.
     pub file_id: F,
+    /// Path of the loaded config file, when it came from disk.
+    pub config_path: Option<PathBuf>,
     /// Directory the config was loaded from.
     pub config_dir: PathBuf,
+    /// Strict-mode override supplied by the caller (for example CLI `--strict`).
+    pub strict_override: Option<bool>,
     /// Parsed config contents.
     pub config: Config,
 }
@@ -577,19 +581,23 @@ pub fn from_str<F: Copy + PartialEq>(
     raw_config: &str,
     config_dir: &Path,
     file_id: F,
-    strict: Option<bool>,
+    strict_override: Option<bool>,
     diagnostics: &mut Vec<Diagnostic<F>>,
 ) -> Result<ConfigFile<F>, ConfigError> {
     let value = yaml_spanned::from_str(raw_config).map_err(ConfigError::Yaml)?;
-    let strict = strict.or(parse_strict(&value)?);
-    let version = parse_version(&value, file_id, strict, diagnostics)?;
+    let effective_strict = strict_override.or(parse_strict(&value)?);
+    let version = parse_version(&value, file_id, effective_strict, diagnostics)?;
     let config = match version {
-        Version::Latest | Version::V1 => v1::parse_config(&value, file_id, strict, diagnostics)?,
+        Version::Latest | Version::V1 => {
+            v1::parse_config(&value, file_id, strict_override, diagnostics)?
+        }
     };
 
     Ok(ConfigFile {
         file_id,
+        config_path: None,
         config_dir: config_dir.to_path_buf(),
+        strict_override,
         config,
     })
 }

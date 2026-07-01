@@ -32,6 +32,9 @@ pub enum ToolError {
     /// The command is invalid in the service's current state.
     #[error("invalid state: {0}")]
     InvalidState(String),
+    /// The latest micromux config could not be reloaded before a command.
+    #[error("config reload failed: {0}")]
+    ConfigReload(String),
     /// An error reported by the session.
     #[error("{code:?}: {message}")]
     Remote {
@@ -530,17 +533,35 @@ pub async fn list_sessions() -> Result<SessionList, ToolError> {
     }
     let probes = probe_runtime_dirs(&runtime_dirs).await?;
     let sessions = session_infos_from_probes(&probes);
+    let summary = session_list_summary(&sessions, &probes);
     let socket_probes = probes.into_iter().map(probe_detail).collect();
     Ok(SessionList {
         sessions,
-        diagnostics: discovery_diagnostics(
-            &cwd,
-            "session discovery".to_string(),
-            None,
-            &dir_statuses,
-            socket_probes,
-        ),
+        diagnostics: discovery_diagnostics(&cwd, summary, None, &dir_statuses, socket_probes),
     })
+}
+
+fn session_list_summary(sessions: &[SessionInfo], probes: &[EndpointProbe]) -> String {
+    if !sessions.is_empty() {
+        return format!("found {} answering micromux session(s)", sessions.len());
+    }
+    let unreachable = probes
+        .iter()
+        .filter(|probe| matches!(probe.result, EndpointProbeResult::Unreachable(_)))
+        .count();
+    let absent = probes
+        .iter()
+        .filter(|probe| matches!(probe.result, EndpointProbeResult::Absent(_)))
+        .count();
+    if unreachable > 0 {
+        format!(
+            "found {unreachable} socket(s) that exist but could not answer Describe; inspect socket_probes for protocol/version/busy details"
+        )
+    } else if absent > 0 {
+        format!("found {absent} stale socket(s), but no answering micromux session")
+    } else {
+        "no micromux session sockets found".to_string()
+    }
 }
 
 #[cfg(all(test, unix))]

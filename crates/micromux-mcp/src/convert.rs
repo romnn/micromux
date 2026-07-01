@@ -23,6 +23,7 @@ fn remote_error(code: ErrorCode, message: String) -> ToolError {
             ToolError::Busy(format!("{code:?}: {message}"))
         }
         ErrorCode::InvalidState => ToolError::InvalidState(message),
+        ErrorCode::ConfigReload => ToolError::ConfigReload(message),
         ErrorCode::UnsupportedPlatform => ToolError::Unsupported,
         ErrorCode::ProtocolVersionMismatch | ErrorCode::Internal => {
             ToolError::Unexpected(format!("{code:?}: {message}"))
@@ -257,6 +258,13 @@ mod tests {
         let err = remote_error(ErrorCode::Timeout, "scheduler did not respond".to_string());
 
         assert!(matches!(err, ToolError::Busy(message) if message.contains("Timeout")));
+    }
+
+    #[test]
+    fn remote_error_maps_config_reload_separately_from_state_errors() {
+        let err = remote_error(ErrorCode::ConfigReload, "bad yaml".to_string());
+
+        assert!(matches!(err, ToolError::ConfigReload(message) if message == "bad yaml"));
     }
 
     #[test]

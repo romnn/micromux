@@ -531,6 +531,9 @@ fn acknowledge(result: Result<ServiceCommandResult, SchedulerStopped>) -> Respon
             ErrorCode::InvalidState,
             "the command is not valid in the service's current state",
         ),
+        Ok(Err(CommandRejection::ConfigReload(message))) => {
+            Response::error(ErrorCode::ConfigReload, message)
+        }
         Err(SchedulerStopped) => {
             Response::error(ErrorCode::SchedulerStopped, "the scheduler has stopped")
         }

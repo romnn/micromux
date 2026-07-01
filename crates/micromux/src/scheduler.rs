@@ -1,10 +1,11 @@
 use crate::{
-    ServiceMap,
+    ReloadConfig, ServiceMap,
     graph::ServiceGraph,
     health_check::Health,
     model::{Desired, Execution, ServiceSnapshot, SessionModelWriter},
     service::{self, Service},
 };
+use codespan_reporting::diagnostic::Severity;
 use color_eyre::eyre;
 use std::collections::HashMap;
 use std::time::Duration;
@@ -52,8 +53,8 @@ struct RestartTracker {
 }
 
 impl RestartTracker {
-    fn new(policy: &service::RestartPolicy) -> Self {
-        let on_failure_max = match policy {
+    fn on_failure_max(policy: &service::RestartPolicy) -> Option<usize> {
+        match policy {
             service::RestartPolicy::OnFailure {
                 max_attempts: Some(max_attempts),
             } => Some(*max_attempts),
@@ -61,13 +62,25 @@ impl RestartTracker {
             | service::RestartPolicy::UnlessStopped
             | service::RestartPolicy::Never
             | service::RestartPolicy::OnFailure { max_attempts: None } => None,
-        };
+        }
+    }
+
+    fn new(policy: &service::RestartPolicy) -> Self {
+        let on_failure_max = Self::on_failure_max(policy);
 
         Self {
             backoff_until: None,
             backoff_delay: None,
             on_failure_max,
             on_failure_remaining: on_failure_max,
+        }
+    }
+
+    fn reconfigure(&mut self, policy: &service::RestartPolicy) {
+        let on_failure_max = Self::on_failure_max(policy);
+        if self.on_failure_max != on_failure_max {
+            self.on_failure_max = on_failure_max;
+            self.on_failure_remaining = on_failure_max;
         }
     }
 
@@ -172,6 +185,10 @@ impl ServiceRuntime {
             last_started_at: None,
             last_exit_code: None,
         }
+    }
+
+    fn reconfigure(&mut self, policy: &service::RestartPolicy) {
+        self.restart.reconfigure(policy);
     }
 
     fn current_run_id(&self) -> Option<RunId> {
@@ -395,6 +412,71 @@ fn project_execution(running: bool, state: &State, ran_before: bool) -> Executio
     }
 }
 
+fn load_services_from_disk(reload: &ReloadConfig) -> Result<ServiceMap, String> {
+    let raw = std::fs::read_to_string(&reload.config_path)
+        .map_err(|err| format!("read {}: {err}", reload.config_path.display()))?;
+    let config_dir = reload
+        .config_path
+        .parent()
+        .ok_or_else(|| format!("{} has no parent directory", reload.config_path.display()))?;
+    let mut diagnostics = Vec::new();
+    let config = crate::config::from_str(
+        &raw,
+        config_dir,
+        0usize,
+        reload.strict_override,
+        &mut diagnostics,
+    )
+    .map_err(|err| format!("parse {}: {err}", reload.config_path.display()))?;
+    let errors = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.severity == Severity::Error)
+        .map(|diagnostic| diagnostic.message.clone())
+        .collect::<Vec<_>>();
+    if !errors.is_empty() {
+        return Err(format!(
+            "parse {}: {}",
+            reload.config_path.display(),
+            errors.join("; ")
+        ));
+    }
+    let services = crate::service_map_from_config(&config)
+        .map_err(|err| format!("normalize {}: {err}", reload.config_path.display()))?;
+    ServiceGraph::new(&services)
+        .map_err(|err| format!("validate {}: {err}", reload.config_path.display()))?;
+    Ok(services)
+}
+
+fn validate_reloaded_services(current: &ServiceMap, updated: &ServiceMap) -> Result<(), String> {
+    let missing = current
+        .keys()
+        .filter(|service_id| !updated.contains_key(*service_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    let added = updated
+        .keys()
+        .filter(|service_id| !current.contains_key(*service_id))
+        .cloned()
+        .collect::<Vec<_>>();
+
+    match (missing.is_empty(), added.is_empty()) {
+        (true, true) => Ok(()),
+        (false, true) => Err(format!(
+            "config reload cannot remove services while the session is running: {}",
+            missing.join(", ")
+        )),
+        (true, false) => Err(format!(
+            "config reload cannot add services while the session is running: {}",
+            added.join(", ")
+        )),
+        (false, false) => Err(format!(
+            "config reload cannot add/remove services while the session is running; removed: {}; added: {}",
+            missing.join(", "),
+            added.join(", ")
+        )),
+    }
+}
+
 fn sync_model(writer: &SessionModelWriter, service: &Service, runtime: &ServiceRuntime) {
     let (snapshot, started_at) = project_snapshot(service, runtime);
     writer.write_snapshot(snapshot, started_at);
@@ -416,9 +498,9 @@ impl TestEventSink {
     }
 }
 
-struct SchedulerRuntime<'a> {
-    graph: ServiceGraph<'a>,
+struct SchedulerRuntime {
     services: HashMap<ServiceID, ServiceRuntime>,
+    reload_config: Option<ReloadConfig>,
     current_pty_size: portable_pty::PtySize,
     events_tx: mpsc::Sender<ProcessEvent>,
     #[cfg(test)]
@@ -427,10 +509,10 @@ struct SchedulerRuntime<'a> {
     shutdown: CancellationToken,
 }
 
-impl<'a> SchedulerRuntime<'a> {
+impl SchedulerRuntime {
     fn new(
         services: &ServiceMap,
-        graph: ServiceGraph<'a>,
+        reload_config: Option<ReloadConfig>,
         events_tx: mpsc::Sender<ProcessEvent>,
         #[cfg(test)] test_events: TestEventSink,
         writer: SessionModelWriter,
@@ -447,8 +529,8 @@ impl<'a> SchedulerRuntime<'a> {
             .collect();
 
         Self {
-            graph,
             services,
+            reload_config,
             current_pty_size: portable_pty::PtySize {
                 rows: 24,
                 cols: 80,
@@ -473,10 +555,81 @@ impl<'a> SchedulerRuntime<'a> {
         }
     }
 
-    fn schedule_pass(&mut self, services: &ServiceMap) {
+    fn sync_all(&self, services: &ServiceMap) {
+        for service_id in services.keys() {
+            self.sync(services, service_id);
+        }
+    }
+
+    fn reload_services(&mut self, services: &mut ServiceMap) -> Result<(), CommandRejection> {
+        let Some(reload) = &self.reload_config else {
+            return Ok(());
+        };
+        let updated = load_services_from_disk(reload).map_err(CommandRejection::ConfigReload)?;
+        validate_reloaded_services(services, &updated).map_err(CommandRejection::ConfigReload)?;
+
+        for (service_id, runtime) in &mut self.services {
+            if let Some(service) = updated.get(service_id) {
+                runtime.reconfigure(&service.restart_policy);
+                self.writer
+                    .reconfigure_log_retention(service_id, service.log_retention);
+            }
+        }
+        *services = updated;
+        self.sync_all(services);
+        Ok(())
+    }
+
+    fn has_due_auto_restart(&self, services: &ServiceMap) -> bool {
+        let now = tokio::time::Instant::now();
+        services.iter().any(|(service_id, service)| {
+            let Some(runtime) = self.services.get(service_id) else {
+                return false;
+            };
+            if runtime.desired == DesiredState::Disabled
+                || runtime.running.is_some()
+                || runtime.start_requested
+            {
+                return false;
+            }
+            if runtime
+                .restart
+                .backoff_until
+                .is_some_and(|deadline| now < deadline)
+            {
+                return false;
+            }
+            match runtime.state {
+                State::Exited { exit_code } => {
+                    runtime.will_auto_restart(&service.restart_policy, exit_code)
+                }
+                State::Pending
+                | State::Starting
+                | State::Running { .. }
+                | State::Killed
+                | State::Disabled => false,
+            }
+        })
+    }
+
+    fn reload_before_auto_restart(&mut self, services: &mut ServiceMap) {
+        if self.reload_config.is_none() || !self.has_due_auto_restart(services) {
+            return;
+        }
+        if let Err(err) = self.reload_services(services) {
+            tracing::warn!(
+                ?err,
+                "config reload before automatic restart failed; keeping previous service definitions"
+            );
+        }
+    }
+
+    fn schedule_pass(&mut self, services: &mut ServiceMap) -> eyre::Result<()> {
+        self.reload_before_auto_restart(services);
+        let graph = ServiceGraph::new(services)?;
         schedule::schedule_ready(&mut schedule::ScheduleContext {
             services,
-            graph: &self.graph.inner,
+            graph: &graph.inner,
             runtimes: &mut self.services,
             current_pty_size: self.current_pty_size,
             events_tx: &self.events_tx,
@@ -485,6 +638,7 @@ impl<'a> SchedulerRuntime<'a> {
             writer: &self.writer,
             shutdown: &self.shutdown,
         });
+        Ok(())
     }
 
     fn reply(ack: Option<CommandAck>, result: ServiceCommandResult) {
@@ -497,15 +651,24 @@ impl<'a> SchedulerRuntime<'a> {
     /// service is invalid for every caller: `enable` is the operation that starts disabled services.
     fn apply_restart(
         &mut self,
-        services: &ServiceMap,
+        services: &mut ServiceMap,
         service_id: &ServiceID,
     ) -> ServiceCommandResult {
-        let Some(runtime) = self.services.get_mut(service_id) else {
+        if !self.services.contains_key(service_id) {
             return Err(CommandRejection::UnknownService);
-        };
-        if runtime.desired == DesiredState::Disabled {
+        }
+        if self
+            .services
+            .get(service_id)
+            .is_some_and(|runtime| runtime.desired == DesiredState::Disabled)
+        {
             return Err(CommandRejection::InvalidState);
         }
+        self.reload_services(services)?;
+        let runtime = self
+            .services
+            .get_mut(service_id)
+            .ok_or(CommandRejection::UnknownService)?;
         let observed_generation = runtime.run_generation();
         // Logs are cleared when the service is actually (re)started in `start_service_if_ready`,
         // after the old process has drained its output.
@@ -519,12 +682,17 @@ impl<'a> SchedulerRuntime<'a> {
 
     fn apply_enable(
         &mut self,
-        services: &ServiceMap,
+        services: &mut ServiceMap,
         service_id: &ServiceID,
     ) -> ServiceCommandResult {
-        let Some(runtime) = self.services.get_mut(service_id) else {
+        if !self.services.contains_key(service_id) {
             return Err(CommandRejection::UnknownService);
-        };
+        }
+        self.reload_services(services)?;
+        let runtime = self
+            .services
+            .get_mut(service_id)
+            .ok_or(CommandRejection::UnknownService)?;
         let observed_generation = runtime.run_generation();
         runtime.request_enable();
         self.sync(services, service_id);
@@ -551,7 +719,8 @@ impl<'a> SchedulerRuntime<'a> {
         }])
     }
 
-    fn apply_restart_all(&mut self, services: &ServiceMap) -> Vec<ServiceCommandAck> {
+    fn apply_restart_all(&mut self, services: &mut ServiceMap) -> ServiceCommandResult {
+        self.reload_services(services)?;
         let mut acks = Vec::new();
         for service_id in services.keys() {
             let restart = self
@@ -571,10 +740,10 @@ impl<'a> SchedulerRuntime<'a> {
                 });
             }
         }
-        acks
+        Ok(acks)
     }
 
-    fn handle_command(&mut self, services: &ServiceMap, command: Command) {
+    fn handle_command(&mut self, services: &mut ServiceMap, command: Command) {
         match command {
             Command::Restart { service, ack } => {
                 let result = self.apply_restart(services, &service);
@@ -585,7 +754,7 @@ impl<'a> SchedulerRuntime<'a> {
                 Self::reply(ack, result);
             }
             Command::RestartAll { ack } => {
-                let result = Ok(self.apply_restart_all(services));
+                let result = self.apply_restart_all(services);
                 Self::reply(ack, result);
             }
             Command::Disable { service, ack } => {
@@ -771,16 +940,31 @@ impl<'a> SchedulerRuntime<'a> {
     }
 }
 
-pub async fn scheduler(
-    services: &ServiceMap,
-    mut commands_rx: mpsc::Receiver<Command>,
-    mut events_rx: mpsc::Receiver<ProcessEvent>,
-    events_tx: mpsc::Sender<ProcessEvent>,
-    #[cfg(test)] test_events_tx: Option<mpsc::Sender<Event>>,
-    writer: SessionModelWriter,
-    shutdown: CancellationToken,
-) -> eyre::Result<()> {
-    let graph = ServiceGraph::new(services)?;
+pub(crate) struct SchedulerInput {
+    pub(crate) services: ServiceMap,
+    pub(crate) reload_config: Option<ReloadConfig>,
+    pub(crate) commands_rx: mpsc::Receiver<Command>,
+    pub(crate) events_rx: mpsc::Receiver<ProcessEvent>,
+    pub(crate) events_tx: mpsc::Sender<ProcessEvent>,
+    #[cfg(test)]
+    pub(crate) test_events_tx: Option<mpsc::Sender<Event>>,
+    pub(crate) writer: SessionModelWriter,
+    pub(crate) shutdown: CancellationToken,
+}
+
+pub(crate) async fn scheduler(input: SchedulerInput) -> eyre::Result<()> {
+    let SchedulerInput {
+        mut services,
+        reload_config,
+        mut commands_rx,
+        mut events_rx,
+        events_tx,
+        #[cfg(test)]
+        test_events_tx,
+        writer,
+        shutdown,
+    } = input;
+    ServiceGraph::new(&services)?;
     #[cfg(test)]
     let test_events = {
         let tx = test_events_tx.unwrap_or_else(|| {
@@ -790,8 +974,8 @@ pub async fn scheduler(
         TestEventSink::new(tx)
     };
     let mut rt = SchedulerRuntime::new(
-        services,
-        graph,
+        &services,
+        reload_config,
         events_tx,
         #[cfg(test)]
         test_events,
@@ -801,7 +985,7 @@ pub async fn scheduler(
 
     // Initial scheduling pass
     tracing::debug!("started initial scheduling pass");
-    rt.schedule_pass(services);
+    rt.schedule_pass(&mut services)?;
     tracing::debug!("completed initial scheduling pass");
 
     // Whenever an event comes in, try to (re)start any services whose deps are now healthy
@@ -819,13 +1003,13 @@ pub async fn scheduler(
                 let Some(command) = command else {
                     break;
                 };
-                rt.handle_command(services, command);
+                rt.handle_command(&mut services, command);
             }
             event = events_rx.recv() => {
                 let Some(event) = event else {
                     break;
                 };
-                rt.handle_event(services, &event);
+                rt.handle_event(&services, &event);
             }
             () = async {
                 match next_backoff {
@@ -835,11 +1019,11 @@ pub async fn scheduler(
             } => {}
         }
 
-        rt.schedule_pass(services);
+        rt.schedule_pass(&mut services)?;
     }
 
     rt.cancel_all_running();
-    rt.drain_on_shutdown(services, &mut events_rx).await;
+    rt.drain_on_shutdown(&services, &mut events_rx).await;
     Ok(())
 }
 
@@ -851,7 +1035,7 @@ mod tests {
     use color_eyre::eyre;
     use indexmap::IndexMap;
     use std::fs;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
     use tokio::time::{Duration, timeout};
     use yaml_spanned::Spanned;
@@ -889,15 +1073,16 @@ mod tests {
         shutdown: CancellationToken,
     ) -> eyre::Result<()> {
         let (_reader, writer) = crate::model::new(test_initial_snapshots(services));
-        scheduler(
-            services,
+        scheduler(SchedulerInput {
+            services: services.clone(),
+            reload_config: None,
             commands_rx,
             events_rx,
             events_tx,
-            Some(test_events_tx),
+            test_events_tx: Some(test_events_tx),
             writer,
             shutdown,
-        )
+        })
         .await
     }
 
@@ -918,15 +1103,49 @@ mod tests {
         let handle = tokio::spawn({
             let shutdown = shutdown.clone();
             async move {
-                scheduler(
-                    &services,
+                scheduler(SchedulerInput {
+                    services,
+                    reload_config: None,
                     commands_rx,
                     events_rx,
                     events_tx,
-                    None,
+                    test_events_tx: None,
                     writer,
                     shutdown,
-                )
+                })
+                .await
+            }
+        });
+        Harness {
+            reader,
+            control,
+            shutdown,
+            handle,
+        }
+    }
+
+    fn spawn_harness_with_reload(services: ServiceMap, config_path: PathBuf) -> Harness {
+        let (commands_tx, commands_rx) = mpsc::channel(64);
+        let (events_tx, events_rx) = mpsc::channel(256);
+        let (reader, writer) = crate::model::new(test_initial_snapshots(&services));
+        let control = ServiceControl::new(commands_tx);
+        let shutdown = CancellationToken::new();
+        let handle = tokio::spawn({
+            let shutdown = shutdown.clone();
+            async move {
+                scheduler(SchedulerInput {
+                    services,
+                    reload_config: Some(ReloadConfig {
+                        config_path,
+                        strict_override: None,
+                    }),
+                    commands_rx,
+                    events_rx,
+                    events_tx,
+                    test_events_tx: None,
+                    writer,
+                    shutdown,
+                })
                 .await
             }
         });
@@ -962,6 +1181,27 @@ mod tests {
             }
             if tokio::time::Instant::now() >= deadline {
                 eyre::bail!("timed out waiting for a condition on `{id}`");
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    async fn wait_for_log(
+        reader: &crate::model::SessionModelReader,
+        id: &str,
+        needle: &str,
+    ) -> eyre::Result<()> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if reader
+                .logs(id, None)
+                .iter()
+                .any(|line| line.line.contains(needle))
+            {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                eyre::bail!("timed out waiting for `{needle}` in `{id}` logs");
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -1091,6 +1331,167 @@ mod tests {
         let acks = accepted(harness.control.restart(&id).await)?;
         assert_eq!(acks.first().map(|a| a.observed_generation), Some(1));
         wait_until(&harness.reader, "svc", |s| s.run_generation == 2).await?;
+
+        harness.shutdown.cancel();
+        harness.handle.await??;
+        Ok(())
+    }
+
+    fn reload_test_yaml(message: &str) -> String {
+        format!(
+            r#"version: "1"
+services:
+  svc:
+    command: ["sh", "-c", "echo {message}; sleep 60"]
+"#
+        )
+    }
+
+    fn auto_reload_test_yaml(command: &str) -> eyre::Result<String> {
+        let command = serde_json::to_string(command)?;
+        Ok(format!(
+            r#"version: "1"
+services:
+  svc:
+    command: ["sh", "-c", {command}]
+    restart: always
+"#
+        ))
+    }
+
+    fn services_from_config_path(config_path: &Path) -> eyre::Result<ServiceMap> {
+        let raw = fs::read_to_string(config_path)?;
+        let config_dir = config_path
+            .parent()
+            .ok_or_else(|| eyre::eyre!("missing config parent"))?;
+        let mut diagnostics = Vec::new();
+        let config = crate::config::from_str(&raw, config_dir, 0usize, None, &mut diagnostics)?;
+        crate::service_map_from_config(&config)
+    }
+
+    #[test]
+    fn reload_re_reads_file_strict_mode() -> eyre::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let config_path = dir.path().join("micromux.yaml");
+        let yaml = |strict| {
+            format!(
+                r#"version: "1"
+strict: {strict}
+services:
+  svc:
+    command: ["sh", "-c", "true"]
+    unknown_key: true
+"#
+            )
+        };
+        let reload = ReloadConfig {
+            config_path: config_path.clone(),
+            strict_override: None,
+        };
+
+        fs::write(&config_path, yaml("false"))?;
+        load_services_from_disk(&reload).map_err(eyre::Report::msg)?;
+
+        fs::write(&config_path, yaml("true"))?;
+        let err =
+            load_services_from_disk(&reload).expect_err("strict reload should reject warning");
+        assert!(err.contains("unknown service field"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn restart_reloads_latest_service_config_before_spawning() -> eyre::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let config_path = dir.path().join("micromux.yaml");
+        fs::write(&config_path, reload_test_yaml("old-config"))?;
+        let services = services_from_config_path(&config_path)?;
+        let harness = spawn_harness_with_reload(services, config_path.clone());
+        let id = "svc".to_string();
+
+        wait_for_log(&harness.reader, "svc", "old-config").await?;
+        fs::write(&config_path, reload_test_yaml("new-config"))?;
+
+        let acks = accepted(harness.control.restart(&id).await)?;
+        assert_eq!(acks.first().map(|ack| ack.observed_generation), Some(1));
+        wait_until(&harness.reader, "svc", |snapshot| {
+            snapshot.run_generation == 2 && snapshot.execution == Execution::Running
+        })
+        .await?;
+        wait_for_log(&harness.reader, "svc", "new-config").await?;
+
+        let logs = harness.reader.logs("svc", None);
+        assert!(logs.iter().any(|line| line.line.contains("new-config")));
+        assert!(!logs.iter().any(|line| line.line.contains("old-config")));
+
+        harness.shutdown.cancel();
+        harness.handle.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn restart_rejects_invalid_reloaded_config_without_killing_current_run()
+    -> eyre::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let config_path = dir.path().join("micromux.yaml");
+        fs::write(&config_path, reload_test_yaml("still-running"))?;
+        let services = services_from_config_path(&config_path)?;
+        let harness = spawn_harness_with_reload(services, config_path.clone());
+        let id = "svc".to_string();
+
+        wait_for_log(&harness.reader, "svc", "still-running").await?;
+        let before = wait_until(&harness.reader, "svc", |snapshot| {
+            snapshot.run_generation == 1 && snapshot.execution == Execution::Running
+        })
+        .await?;
+        fs::write(
+            &config_path,
+            r#"version: "1"
+services:
+  svc:
+    working_dir: ./
+"#,
+        )?;
+
+        let rejected = harness
+            .control
+            .restart(&id)
+            .await
+            .map_err(|_| eyre::eyre!("scheduler stopped"))?;
+        assert!(matches!(rejected, Err(CommandRejection::ConfigReload(_))));
+
+        let after = wait_until(&harness.reader, "svc", |snapshot| {
+            snapshot.run_generation == 1 && snapshot.execution == Execution::Running
+        })
+        .await?;
+        assert_eq!(after.run_generation, before.run_generation);
+
+        harness.shutdown.cancel();
+        harness.handle.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn automatic_restart_reloads_latest_service_config_before_spawning() -> eyre::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let config_path = dir.path().join("micromux.yaml");
+        fs::write(
+            &config_path,
+            auto_reload_test_yaml("echo old-auto; sleep 1; exit 1")?,
+        )?;
+        let services = services_from_config_path(&config_path)?;
+        let harness = spawn_harness_with_reload(services, config_path.clone());
+
+        wait_for_log(&harness.reader, "svc", "old-auto").await?;
+        fs::write(
+            &config_path,
+            auto_reload_test_yaml("echo new-auto; sleep 60")?,
+        )?;
+
+        wait_for_log(&harness.reader, "svc", "new-auto").await?;
+        wait_until(&harness.reader, "svc", |snapshot| {
+            snapshot.run_generation >= 2 && snapshot.execution == Execution::Running
+        })
+        .await?;
 
         harness.shutdown.cancel();
         harness.handle.await??;

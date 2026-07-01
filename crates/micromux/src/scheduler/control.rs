@@ -24,7 +24,7 @@ pub struct ServiceCommandAck {
 }
 
 /// A typed rejection produced by the scheduler when it declines a command.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum CommandRejection {
     /// No service with the given id exists.
     #[error("unknown service")]
@@ -32,6 +32,9 @@ pub enum CommandRejection {
     /// The command is not valid in the service's current state (e.g. restart on a disabled service).
     #[error("command is invalid in the service's current state")]
     InvalidState,
+    /// The latest config could not be loaded safely before restarting.
+    #[error("config reload failed: {0}")]
+    ConfigReload(String),
 }
 
 /// The inner result of a service-control command: either the per-service acks, or a typed rejection.

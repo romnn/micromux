@@ -216,7 +216,7 @@ impl std::fmt::Display for RestartPolicy {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Service {
     pub id: ServiceID,
     pub name: Spanned<String>,

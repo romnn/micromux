@@ -929,8 +929,6 @@ fn parse_services<F: Copy>(
 }
 
 pub fn parse_config<F: Copy + PartialEq>(
-    // name: Spanned<String>,
-    // config_span: Option<yaml_spanned::spanned::Span>,
     value: &yaml_spanned::Spanned<Value>,
     file_id: F,
     strict_override: Option<bool>,
@@ -965,15 +963,6 @@ pub fn parse_config<F: Copy + PartialEq>(
         strict,
         diagnostics,
     )?;
-    // let template_engine = parse_optional::<model::TemplateEngine>(
-    //     value.get("engine").or_else(|| value.get("template_engine")),
-    // )?;
-    // let check_templates =
-    //     parse_optional::<bool>(value.get("check_templates"))?.map(Spanned::into_inner);
-    // let inputs = parse_inputs(value, config_span, file_id, strict, diagnostics)?;
-    // let outputs = parse_outputs(value, config_span, file_id, strict, diagnostics)?;
-
-    // let config = Config { version, services };
     Ok(Config {
         name,
         ui_config,

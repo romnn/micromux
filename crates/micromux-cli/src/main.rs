@@ -119,13 +119,14 @@ async fn load_config(
         diagnostic_printer.emit(&diagnostic)?;
     }
 
-    let Some(config) = config else {
+    let Some(mut config) = config else {
         eyre::bail!("failed to parse config");
     };
     if has_error {
         eyre::bail!("failed to parse config");
     }
 
+    config.config_path = Some(config_path);
     Ok(config)
 }
 

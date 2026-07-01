@@ -231,6 +231,9 @@ pub struct LogRunSummary {
     pub run_generation: u64,
     /// Whether this is the latest known run for the service.
     pub current: bool,
+    /// Disk-backed JSONL file for this run, when disk retention is enabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
     /// Number of retained lines for this run.
     pub line_count: usize,
     /// Sequence number of the first retained line, if any.
@@ -586,6 +589,15 @@ impl MemoryLogBuffer {
         }
     }
 
+    fn reconfigure(&mut self, retention: MemoryLogRetention) {
+        let entries = std::mem::take(&mut self.entries);
+        self.current_bytes = 0;
+        self.retention = retention;
+        for line in entries {
+            self.push(line);
+        }
+    }
+
     fn clear_before_next_seq(&mut self, next_seq: u64) {
         while self.entries.front().is_some_and(|line| line.seq < next_seq) {
             let Some(old) = self.entries.pop_front() else {
@@ -689,6 +701,7 @@ impl RunLogEntry {
         LogRunSummary {
             run_generation: self.run_generation,
             current,
+            path: self.path.as_ref().map(|path| path.display().to_string()),
             line_count: self.line_count,
             first_seq: self.first_seq,
             last_seq: self.last_seq,
@@ -1058,6 +1071,7 @@ impl ServiceEntry {
             runs.push(LogRunSummary {
                 run_generation: latest,
                 current: true,
+                path: None,
                 line_count: 0,
                 first_seq: None,
                 last_seq: None,
@@ -1116,6 +1130,22 @@ impl ServiceEntry {
 
     fn visible_lines(&self, tail: Option<usize>) -> Vec<LogLine> {
         self.visible.lines(tail)
+    }
+
+    fn reconfigure_log_retention(&mut self, log_retention: LogRetention) {
+        let log_retention = LogRetention {
+            disk: DiskLogRetention {
+                retained_runs: log_retention.disk.retained_runs.max(1),
+            },
+            ..log_retention
+        };
+        self.visible.reconfigure(log_retention.memory);
+        self.log_retention = log_retention;
+        while self.runs.len() > self.log_retention.disk.retained_runs {
+            if let Some(mut evicted) = self.runs.pop_front() {
+                evicted.enqueue_remove(self.disk.as_ref());
+            }
+        }
     }
 }
 
@@ -1362,6 +1392,18 @@ impl SessionModelWriter {
         self.inner.publish(id, ChangeKind::Health);
     }
 
+    /// Apply updated log retention from a reloaded service definition.
+    pub(crate) fn reconfigure_log_retention(&self, id: &ServiceID, log_retention: LogRetention) {
+        {
+            let mut guard = self.inner.services.write();
+            let Some(entry) = guard.get_mut(id) else {
+                return;
+            };
+            entry.reconfigure_log_retention(log_retention);
+        }
+        self.inner.publish(id, ChangeKind::Logs);
+    }
+
     /// Begin a new healthcheck attempt, evicting the oldest beyond the retained history.
     pub(crate) fn start_health_attempt(&self, id: &ServiceID, attempt: u64, command: String) {
         {
@@ -1598,6 +1640,46 @@ mod tests {
             lines.first().map(|l| l.line.clone()),
             Some("[stderr] boom".to_string())
         );
+    }
+
+    #[test]
+    fn reconfigured_memory_retention_trims_existing_visible_logs() {
+        let retention = LogRetention {
+            memory: MemoryLogRetention {
+                max_lines: LogLimit::Bounded(10),
+                max_bytes: LogLimit::Unbounded,
+            },
+            disk: DiskLogRetention::default(),
+        };
+        let (reader, writer) = new([(snapshot("svc"), retention)]);
+        let id = "svc".to_string();
+        for line in ["a", "b", "c"] {
+            writer.append_log(
+                &id,
+                1,
+                OutputStream::Stdout,
+                LogUpdateKind::Append,
+                line.to_string(),
+            );
+        }
+
+        writer.reconfigure_log_retention(
+            &id,
+            LogRetention {
+                memory: MemoryLogRetention {
+                    max_lines: LogLimit::Bounded(1),
+                    max_bytes: LogLimit::Unbounded,
+                },
+                disk: DiskLogRetention::default(),
+            },
+        );
+
+        let lines = reader
+            .logs(&id, None)
+            .into_iter()
+            .map(|line| line.line)
+            .collect::<Vec<_>>();
+        assert_eq!(lines, vec!["c"]);
     }
 
     #[test]

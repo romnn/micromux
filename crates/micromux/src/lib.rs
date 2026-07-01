@@ -32,6 +32,7 @@ mod structured_log;
 
 use color_eyre::eyre;
 use std::future::Future;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -56,9 +57,33 @@ pub use structured_log::{
 
 pub(crate) type ServiceMap = indexmap::IndexMap<ServiceID, service::Service>;
 
+#[derive(Debug, Clone)]
+pub(crate) struct ReloadConfig {
+    pub(crate) config_path: PathBuf,
+    pub(crate) strict_override: Option<bool>,
+}
+
+pub(crate) fn service_map_from_config<F>(
+    config_file: &config::ConfigFile<F>,
+) -> eyre::Result<ServiceMap> {
+    let config_dir = config_file.config_dir.clone();
+    config_file
+        .config
+        .services
+        .iter()
+        .map(|(name, service_config)| {
+            let service_id = name.as_ref().clone();
+            let service =
+                service::Service::new(name.as_ref().clone(), &config_dir, service_config.clone())?;
+            Ok::<_, eyre::Report>((service_id, service))
+        })
+        .collect::<Result<ServiceMap, _>>()
+}
+
 /// Main entry point to run a micromux session.
 pub struct Micromux {
     services: ServiceMap,
+    reload_config: Option<ReloadConfig>,
 }
 
 /// Capability handles returned by [`Micromux::start`].
@@ -100,25 +125,21 @@ impl Micromux {
     /// Returns an error if a service definition in the configuration cannot be normalized
     /// (e.g. invalid environment interpolation, invalid port parsing, etc.).
     pub fn new(config_file: &config::ConfigFile<diagnostics::FileId>) -> eyre::Result<Self> {
-        let config_dir = config_file.config_dir.clone();
-        let services = config_file
-            .config
-            .services
-            .iter()
-            .map(|(name, service_config)| {
-                let service_id = name.as_ref().clone();
-                let service = service::Service::new(
-                    name.as_ref().clone(),
-                    &config_dir,
-                    service_config.clone(),
-                )?;
-                Ok::<_, eyre::Report>((service_id, service))
-            })
-            .collect::<Result<ServiceMap, _>>()?;
+        let services = service_map_from_config(config_file)?;
+        let reload_config = config_file
+            .config_path
+            .clone()
+            .map(|config_path| ReloadConfig {
+                config_path,
+                strict_override: config_file.strict_override,
+            });
 
         graph::ServiceGraph::new(&services)?;
 
-        Ok(Self { services })
+        Ok(Self {
+            services,
+            reload_config,
+        })
     }
 
     /// Return a snapshot of services suitable for presentation.
@@ -172,16 +193,17 @@ impl Micromux {
                 }
             });
 
-            scheduler::scheduler(
-                &self.services,
+            scheduler::scheduler(scheduler::SchedulerInput {
+                services: self.services.clone(),
+                reload_config: self.reload_config.clone(),
                 commands_rx,
                 events_rx,
                 events_tx,
                 #[cfg(test)]
-                None,
+                test_events_tx: None,
                 writer,
-                shutdown.clone(),
-            )
+                shutdown: shutdown.clone(),
+            })
             .await?;
             tracing::info!("exiting");
             Ok(())
