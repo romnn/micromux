@@ -170,6 +170,13 @@ impl ProcessEvent {
 }
 
 #[cfg(test)]
+#[cfg_attr(
+    not(unix),
+    expect(
+        dead_code,
+        reason = "test event payloads are asserted by Unix PTY tests; unsupported-platform test builds keep the shared type"
+    )
+)]
 #[derive(Debug)]
 pub(crate) enum Event {
     /// A service has started.

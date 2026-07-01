@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use indexmap::IndexMap;
 use parking_lot::{Mutex, RwLock};
@@ -213,10 +213,13 @@ pub struct LogRetention {
 /// A single retained log line with a monotonic cursor.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct LogLine {
-    /// Monotonic sequence number; survives eviction so a follower can resume without gaps or dupes.
+    /// Monotonic sequence number; starts at 1 and survives eviction so a follower can resume
+    /// without gaps or dupes. Cursor 0 means "before the first entry".
     pub seq: u64,
     /// The service run that produced this line.
     pub run_generation: u64,
+    /// Wall-clock time when micromux ingested this record, in Unix milliseconds.
+    pub timestamp_unix_ms: u64,
     /// The already-formatted line (stderr lines carry a `[stderr]` prefix, matching the TUI).
     pub line: String,
 }
@@ -310,6 +313,8 @@ enum DiskLogOp {
 struct DiskLogRecord {
     seq: u64,
     run_generation: u64,
+    #[serde(default)]
+    timestamp_unix_ms: u64,
     op: DiskLogOp,
     line: String,
 }
@@ -761,6 +766,14 @@ fn create_spool_dir_in(base: &Path, prefix: &str) -> std::io::Result<PathBuf> {
     builder.tempdir_in(base).map(tempfile::TempDir::keep)
 }
 
+fn unix_timestamp_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| {
+            u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+        })
+}
+
 fn push_log_line(
     lines: &mut VecDeque<LogLine>,
     line: LogLine,
@@ -860,6 +873,7 @@ fn read_run_log_file(
         let line = LogLine {
             seq: record.seq,
             run_generation: record.run_generation,
+            timestamp_unix_ms: record.timestamp_unix_ms,
             line: record.line,
         };
         match record.op {
@@ -913,7 +927,7 @@ impl ServiceEntry {
             started_at: None,
             visible: MemoryLogBuffer::new(log_retention.memory),
             runs: VecDeque::new(),
-            next_log_seq: 0,
+            next_log_seq: 1,
             log_retention,
             spool_dir: spool_dir.map(Path::to_path_buf),
             disk,
@@ -966,6 +980,7 @@ impl ServiceEntry {
     fn append_log(&mut self, run_generation: u64, update: LogUpdateKind, line: String) {
         let mut next_seq = self.next_log_seq;
         let disk = self.disk.clone();
+        let timestamp_unix_ms = unix_timestamp_ms();
         let Some((op, line)) = ({
             let Some(run) = self.ensure_run(run_generation) else {
                 return;
@@ -1001,11 +1016,13 @@ impl ServiceEntry {
             let line = LogLine {
                 seq,
                 run_generation,
+                timestamp_unix_ms,
                 line,
             };
             let record = DiskLogRecord {
                 seq,
                 run_generation,
+                timestamp_unix_ms,
                 op,
                 line: line.line.clone(),
             };
@@ -1559,8 +1576,8 @@ mod tests {
 
         let lines = reader.logs(&id, None);
         assert_eq!(lines.len(), 2);
-        assert_eq!(lines.first().map(|l| l.seq), Some(0));
-        assert_eq!(lines.get(1).map(|l| l.seq), Some(1));
+        assert_eq!(lines.first().map(|l| l.seq), Some(1));
+        assert_eq!(lines.get(1).map(|l| l.seq), Some(2));
         assert_eq!(lines.get(1).map(|l| l.run_generation), Some(1));
         assert_eq!(lines.get(1).map(|l| l.line.clone()), Some("b".to_string()));
     }
@@ -1998,7 +2015,7 @@ mod tests {
         }
 
         let page: Vec<String> = reader
-            .run_log_after(&id, 1, Some(1), Some(2))
+            .run_log_after(&id, 1, Some(2), Some(2))
             .expect("run retained")
             .lines
             .into_iter()
@@ -2024,7 +2041,7 @@ mod tests {
             );
         }
 
-        let first_page = reader.run_log_after(&id, 1, Some(1), Some(2));
+        let first_page = reader.run_log_after(&id, 1, Some(2), Some(2));
         assert_eq!(
             first_page.map(|run| run
                 .lines
@@ -2041,7 +2058,7 @@ mod tests {
                 .map(|run| run.read_index.scanned_to)
         };
 
-        let second_page = reader.run_log_after(&id, 1, Some(3), Some(1));
+        let second_page = reader.run_log_after(&id, 1, Some(4), Some(1));
         assert_eq!(
             second_page.map(|run| run
                 .lines
@@ -2092,7 +2109,7 @@ mod tests {
                 .is_some_and(|run| run.lines.len() == 1)
         );
 
-        let page = reader.run_log_after(&id, 1, Some(10), Some(3));
+        let page = reader.run_log_after(&id, 1, Some(11), Some(3));
         assert_eq!(
             page.map(|run| run
                 .lines

@@ -241,7 +241,7 @@ pub async fn resolve(cwd: &Path, selector: Option<String>) -> Result<Resolved, T
 /// # Errors
 ///
 /// See [`resolve`].
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) async fn resolve_in(
     runtime_dir: &Path,
     cwd: &Path,

@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 
 /// The control protocol version. Bumped on any envelope change. The session and proxy are expected
 /// to be from the same build; a mismatch is a hard error, not a negotiation.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// A request from a client (the `micromux ctl` CLI or the MCP proxy) to a session's control server.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -23,24 +23,25 @@ pub enum Request {
     Describe,
     /// List every service with its current snapshot.
     ListServices,
-    /// Return recent log lines for a service.
+    /// Return recent log records for a service.
     GetLogs {
         /// Target service.
         service: ServiceID,
         /// Specific disk-retained run generation to read. Omit to read the bounded visible log
         /// stream.
         run_generation: Option<u64>,
-        /// Bound the result to the most recent lines.
+        /// Bound the result to the most recent records.
         tail: Option<usize>,
     },
-    /// Return log lines strictly after a monotonic cursor, for gap-free incremental following.
+    /// Return log records strictly after a monotonic cursor, for gap-free incremental following.
     FollowLogs {
         /// Target service.
         service: ServiceID,
         /// Specific disk-retained run generation to follow. Omit to follow the bounded visible log
         /// stream.
         run_generation: Option<u64>,
-        /// Return only lines with `seq` greater than this cursor (all retained lines if `None`).
+        /// Return only records with `seq` greater than this cursor (all retained records if
+        /// `None`).
         after: Option<u64>,
     },
     /// Return summaries of retained log runs for a service.
@@ -156,9 +157,9 @@ pub enum Response {
     Services(Vec<ServiceSnapshot>),
     /// Reply to [`Request::GetLogs`].
     Logs {
-        /// The recent log lines.
+        /// The recent log records.
         lines: Vec<LogLine>,
-        /// Whether the session had to drop older lines to respect server response limits.
+        /// Whether the session had to drop older records to respect server response limits.
         truncated: bool,
     },
     /// Reply to [`Request::ListLogRuns`].

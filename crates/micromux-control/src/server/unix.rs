@@ -551,6 +551,7 @@ mod tests {
         LogLine {
             seq,
             run_generation: 1,
+            timestamp_unix_ms: 1_700_000_000_000 + seq,
             line: "x".repeat(len),
         }
     }

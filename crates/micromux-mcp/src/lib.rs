@@ -15,10 +15,11 @@ mod convert;
 mod logproc;
 mod select;
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use micromux::{ChangeKind, Execution, Health, HealthAttempt, ServiceSnapshot};
+use micromux::{ChangeKind, Execution, Health, HealthAttempt, LogLine, ServiceSnapshot};
 use micromux_control::{
     Client, ControlEndpoint, EndpointProbeResult, ErrorCode, Request, Response, SessionInfo,
     endpoint_for, endpoint_owner_lock_held, probe_endpoints, runtime_dir_statuses,
@@ -44,9 +45,10 @@ type ToolResult<T> = Result<Json<T>, ErrorData>;
 
 const DEFAULT_WAIT_TIMEOUT_SECS: u64 = 60;
 const MAX_WAIT_TIMEOUT_SECS: u64 = 600;
-/// Default number of visual lines returned by `get_logs` when the caller does not pass `tail`.
+/// Default number of logical log entries returned by `get_logs` when the caller does not pass
+/// `tail`.
 const DEFAULT_LOG_TAIL: usize = 200;
-/// Upper bound on lines fetched from the session per call; also the window scanned when a filter is
+/// Upper bound on entries fetched from the session per call; also the window scanned when a filter is
 /// active, so `grep`/`min_level` can match against more than the returned count.
 const MAX_LOG_TAIL: usize = 2000;
 /// Even if a change notification is missed (the subscription isn't registered server-side until
@@ -59,13 +61,15 @@ const INSTRUCTIONS: &str = "Discover and control running micromux sessions. \
 List services, inspect current and previous run logs, restart/enable/disable services, check \
 health, and wait for a service to become healthy. When no `session` is given, the tools target the \
 micromux running in the current project directory. Use `list_log_runs` to find retained previous \
-runs, and `follow_logs` with `next_seq` for gap-aware tailing. Actions are routed through \
+runs, and `follow_logs` with `next_seq` for one-service tailing. Use `log_cursors` before an \
+action and then `follow_all_logs` with its per-service `next` map to inspect what changed across \
+services. Actions are routed through \
 micromux, so they respect dependency gating and restart policy — prefer them over `kill`+rerun. \
 `restart_service`/`enable_service` return a `generation`; pass it to `wait_for_healthy` as \
 `after_generation` to wait for the *new* run. Use `start_session`/`stop_session` to bring a \
 project's services up or stop a session and free its ports (e.g. when switching git worktrees that \
-bind the same ports). `get_logs`/`follow_logs` strip ANSI by default and accept a `grep` regex and, \
-for services that emit JSON logs, a `min_level` filter.";
+bind the same ports). `get_logs`/`follow_logs`/`follow_all_logs` strip ANSI by default and accept \
+a `grep` regex and, for services that emit JSON logs, a `min_level` filter.";
 
 /// The MCP server handler. Cheap to clone; holds no supervision state.
 #[derive(Clone)]
@@ -93,7 +97,7 @@ struct ServiceArgs {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct LogsArgs {
-    /// The id of the target service.
+    /// The id of the target service, or `*` to merge the current visible logs from all services.
     service: String,
     /// Optional session selector; omit for the current project.
     #[serde(default)]
@@ -102,17 +106,17 @@ struct LogsArgs {
     /// generation to read a bounded tail from that disk-backed run.
     #[serde(default)]
     run_generation: Option<u64>,
-    /// Number of most recent visual lines to return (default 200, capped at 2000).
+    /// Number of most recent logical log entries to return (default 200, capped at 2000).
     #[serde(default)]
     tail: Option<usize>,
     /// Keep ANSI color escapes instead of stripping them. Default false (stripped) to save tokens.
     #[serde(default)]
     raw: Option<bool>,
-    /// Keep only lines matching this regex (applied after ANSI stripping).
+    /// Keep only entries matching this regex (applied after ANSI stripping).
     #[serde(default)]
     grep: Option<String>,
-    /// Keep only structured-JSON log lines at or above this level
-    /// (`trace`<`debug`<`info`<`warn`<`error`<`fatal`). Lines that are not JSON with a level field
+    /// Keep only structured-JSON log entries at or above this level
+    /// (`trace`<`debug`<`info`<`warn`<`error`<`fatal`). Entries that are not JSON with a level field
     /// are dropped when this is set, so only use it for services that emit JSON logs.
     #[serde(default)]
     min_level: Option<String>,
@@ -129,19 +133,48 @@ struct FollowArgs {
     /// generation to page through that disk-backed run.
     #[serde(default)]
     run_generation: Option<u64>,
-    /// Return only log lines after this cursor. Pass the `next_seq` from the previous call to
-    /// resume without gaps or duplicates; omit to start from the retained history.
+    /// Return only log entries after this cursor. Pass the `next_seq` from the previous call to
+    /// resume without gaps or duplicates; pass 0 to start before the first entry. For the current
+    /// visible stream, omit to return its latest tail; for a retained run, omit to start at the
+    /// beginning.
     #[serde(default)]
     after_seq: Option<u64>,
     /// Keep ANSI color escapes instead of stripping them. Default false (stripped) to save tokens.
     #[serde(default)]
     raw: Option<bool>,
-    /// Keep only lines matching this regex (applied after ANSI stripping). `next_seq` still advances
-    /// past filtered-out lines, so following never re-fetches them.
+    /// Keep only entries matching this regex (applied after ANSI stripping). `next_seq` still
+    /// advances past filtered-out entries, so following never re-fetches them.
     #[serde(default)]
     grep: Option<String>,
-    /// Keep only structured-JSON log lines at or above this level
-    /// (`trace`<`debug`<`info`<`warn`<`error`<`fatal`). Lines that are not JSON with a level field
+    /// Keep only structured-JSON log entries at or above this level
+    /// (`trace`<`debug`<`info`<`warn`<`error`<`fatal`). Entries that are not JSON with a level field
+    /// are dropped when this is set.
+    #[serde(default)]
+    min_level: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct FollowAllArgs {
+    /// Optional session selector; omit for the current project.
+    #[serde(default)]
+    session: Option<String>,
+    /// Per-service cursors from the previous `follow_all_logs` call. Cursor 0 means "before this
+    /// service's first entry". Omit the whole map to return the latest merged tail; use
+    /// `log_cursors` before an action to capture a "since now" cursor map.
+    #[serde(default)]
+    after: BTreeMap<String, u64>,
+    /// Maximum merged entries to return (default 200, capped at 2000).
+    #[serde(default)]
+    limit: Option<usize>,
+    /// Keep ANSI color escapes instead of stripping them. Default false (stripped) to save tokens.
+    #[serde(default)]
+    raw: Option<bool>,
+    /// Keep only entries matching this regex (applied after ANSI stripping). Returned cursors still
+    /// advance past filtered-out records when the merged page is complete.
+    #[serde(default)]
+    grep: Option<String>,
+    /// Keep only structured-JSON log entries at or above this level
+    /// (`trace`<`debug`<`info`<`warn`<`error`<`fatal`). Entries that are not JSON with a level field
     /// are dropped when this is set.
     #[serde(default)]
     min_level: Option<String>,
@@ -200,7 +233,7 @@ struct LogsResult {
     service: String,
     run_generation: Option<u64>,
     config_path: String,
-    entries: Vec<logproc::ProcessedLine>,
+    entries: Vec<logproc::ProcessedEntry>,
     truncated: bool,
 }
 
@@ -254,17 +287,40 @@ struct StartSessionResult {
 struct FollowLogsResult {
     service: String,
     run_generation: Option<u64>,
-    entries: Vec<logproc::ProcessedLine>,
+    entries: Vec<logproc::ProcessedEntry>,
     next_seq: Option<u64>,
     gap: Option<FollowGap>,
     truncated: bool,
 }
 
 #[derive(Serialize, JsonSchema)]
+struct FollowAllLogsResult {
+    config_path: String,
+    entries: Vec<logproc::ProcessedEntry>,
+    next: BTreeMap<String, u64>,
+    gaps: Vec<ServiceFollowGap>,
+    truncated: bool,
+}
+
+#[derive(Serialize, JsonSchema)]
+struct ServiceFollowGap {
+    service: String,
+    after_seq: u64,
+    first_seq: u64,
+    lost_entries_at_least: u64,
+}
+
+#[derive(Serialize, JsonSchema)]
+struct LogCursorsResult {
+    config_path: String,
+    cursors: BTreeMap<String, u64>,
+}
+
+#[derive(Serialize, JsonSchema)]
 struct FollowGap {
     after_seq: u64,
     first_seq: u64,
-    lost_lines_at_least: u64,
+    lost_entries_at_least: u64,
 }
 
 #[derive(Serialize, JsonSchema)]
@@ -449,12 +505,15 @@ impl McpServer {
     }
 
     #[tool(
-        description = "Read recent log lines for a service. Omit run_generation for the visible \
-        bounded log stream; pass a retained run_generation from list_log_runs to inspect a \
-        bounded tail of a current or previous disk-backed run. Use follow_logs to page through a \
-        retained run with a cursor. ANSI color is stripped by default (raw=true keeps it) and tail \
-        counts visual lines. Filter with grep (regex) or, for JSON-log services, min_level; entries \
-        carry a detected `level` when the line is structured JSON."
+        description = "Read recent log entries for one service, or pass service=\"*\" to merge the \
+        current visible logs from all services with timestamp-guided, cursor-safe ordering. Omit \
+        run_generation for the visible bounded log stream; pass a retained run_generation from list_log_runs to inspect a \
+        bounded tail of a current or previous disk-backed run (single-service only). Use follow_logs to page through a \
+        retained run with a cursor. ANSI color is stripped by default (raw=true keeps it), terminal \
+        padding is trimmed, and tail counts logical log entries, not wrapped terminal rows. Filter \
+        with grep (regex) or, for JSON-log services, min_level; entries carry micromux ingestion \
+        timestamps, a detected `level`, and an optional parsed service timestamp for structured JSON \
+        logs."
     )]
     async fn get_logs(&self, args: Parameters<LogsArgs>) -> ToolResult<LogsResult> {
         let Parameters(args) = args;
@@ -478,6 +537,62 @@ impl McpServer {
         } else {
             requested_tail
         };
+        if args.service == "*" {
+            if args.run_generation.is_some() {
+                return Err(ErrorData::invalid_params(
+                    "service=\"*\" only supports the current visible log stream; retained \
+                     run_generation is service-scoped",
+                    None,
+                ));
+            }
+            let response = send_request(&resolved.endpoint, Request::ListServices)
+                .await
+                .map_err(error_data)?;
+            let services = convert::services(response).map_err(error_data)?;
+            let mut entries = Vec::new();
+            let mut truncated = false;
+            for service in services {
+                let response = send_request(
+                    &resolved.endpoint,
+                    Request::GetLogs {
+                        service: service.id.clone(),
+                        run_generation: None,
+                        tail: Some(fetch_tail),
+                    },
+                )
+                .await
+                .map_err(error_data)?;
+                let logs = convert::logs(response).map_err(error_data)?;
+                let window_full = logs.lines.len() >= fetch_tail;
+                truncated |= logs.truncated || (window_full && filtering);
+                let mut shaped = logproc::shape(
+                    &logs.lines,
+                    &logproc::Shape {
+                        raw: args.raw.unwrap_or(false),
+                        grep: grep.as_ref(),
+                        min_level,
+                        limit: None,
+                    },
+                );
+                for entry in &mut shaped {
+                    entry.service = Some(service.id.clone());
+                }
+                entries.extend(shaped);
+            }
+            let mut entries = logproc::merge_preserving_service_order(entries);
+            if entries.len() > requested_tail {
+                let drop = entries.len() - requested_tail;
+                entries.drain(0..drop);
+                truncated = true;
+            }
+            return Ok(Json(LogsResult {
+                service: args.service,
+                run_generation: args.run_generation,
+                config_path: resolved.info.config_path,
+                entries,
+                truncated,
+            }));
+        }
         let response = send_request(
             &resolved.endpoint,
             Request::GetLogs {
@@ -498,8 +613,8 @@ impl McpServer {
                 limit: Some(requested_tail),
             },
         );
-        // A full fetched window that was filtered, or that yielded fewer visual lines than asked,
-        // may hide older matches/lines beyond the scan — don't report a capped scan as complete.
+        // A full fetched window that was filtered, or that yielded fewer entries than asked, may
+        // hide older matches/entries beyond the scan — don't report a capped scan as complete.
         let window_full = logs.lines.len() >= fetch_tail;
         let truncated =
             logs.truncated || (window_full && (filtering || entries.len() < requested_tail));
@@ -535,6 +650,60 @@ impl McpServer {
             service: args.service,
             config_path: resolved.info.config_path,
             runs,
+        }))
+    }
+
+    #[tool(
+        description = "Return the current visible-log cursor for every service. Call this before \
+        an action, then pass the returned `cursors` as `after` to follow_all_logs to see what the \
+        action caused across services. Services with no entries return cursor 0."
+    )]
+    async fn log_cursors(&self, args: Parameters<SessionArgs>) -> ToolResult<LogCursorsResult> {
+        let Parameters(args) = args;
+        let resolved = select::resolve(&self.cwd, args.session)
+            .await
+            .map_err(error_data)?;
+        let response = send_request(&resolved.endpoint, Request::ListServices)
+            .await
+            .map_err(error_data)?;
+        let services = convert::services(response).map_err(error_data)?;
+        let mut cursors = BTreeMap::new();
+        for service in services {
+            let response = send_request(
+                &resolved.endpoint,
+                Request::ListLogRuns {
+                    service: service.id.clone(),
+                },
+            )
+            .await
+            .map_err(error_data)?;
+            let cursor = convert::log_runs(response)
+                .map_err(error_data)?
+                .into_iter()
+                .rev()
+                .find(|run| run.current)
+                .and_then(|run| run.last_seq);
+            let cursor = if let Some(cursor) = cursor {
+                cursor
+            } else {
+                let response = send_request(
+                    &resolved.endpoint,
+                    Request::GetLogs {
+                        service: service.id.clone(),
+                        run_generation: None,
+                        tail: Some(1),
+                    },
+                )
+                .await
+                .map_err(error_data)?;
+                let logs = convert::logs(response).map_err(error_data)?;
+                logs.lines.last().map_or(0, |line| line.seq)
+            };
+            cursors.insert(service.id, cursor);
+        }
+        Ok(Json(LogCursorsResult {
+            config_path: resolved.info.config_path,
+            cursors,
         }))
     }
 
@@ -770,11 +939,13 @@ impl McpServer {
     }
 
     #[tool(
-        description = "Read log lines after a cursor for incremental following. Returns the new \
+        description = "Read log entries after a cursor for incremental following. Returns the new \
         entries and a next_seq; pass next_seq as after_seq on the next call. If retention already \
-        evicted unread lines, the response includes a gap object. Pass run_generation for a full \
-        disk-backed retained run page; omit it for the bounded visible stream. Supports the same \
-        raw/grep/min_level filters as get_logs; next_seq still advances past filtered-out lines."
+        evicted unread entries, the response includes a gap object. Pass run_generation for a full \
+        disk-backed retained run page; omit it for the bounded visible stream. For the visible \
+        stream, omitting after_seq returns the latest tail; pass 0 to start at the first retained \
+        visible entry. Supports the same raw/grep/min_level filters as get_logs; next_seq still \
+        advances past filtered-out entries."
     )]
     async fn follow_logs(&self, args: Parameters<FollowArgs>) -> ToolResult<FollowLogsResult> {
         let Parameters(args) = args;
@@ -795,7 +966,7 @@ impl McpServer {
         .map_err(error_data)?;
         let logs = convert::logs(response).map_err(error_data)?;
         // Cursor + gap are computed from the raw records (seq is per record), so `next_seq` advances
-        // past filtered-out lines and following never re-fetches them.
+        // past filtered-out entries and following never re-fetches them.
         let next_seq = next_follow_cursor(&logs.lines, args.after_seq);
         let gap = follow_gap(&logs.lines, args.after_seq, args.run_generation);
         let entries = logproc::shape(
@@ -814,6 +985,82 @@ impl McpServer {
             next_seq,
             gap,
             truncated: logs.truncated,
+        }))
+    }
+
+    #[tool(
+        description = "Follow current visible logs across all services with a per-service cursor \
+        map. Pass `after` from log_cursors or from the previous follow_all_logs `next` value. \
+        Returns entries merged by parsed service timestamp when present, otherwise micromux \
+        ingestion timestamp, while preserving each service's cursor order. This is additive to \
+        follow_logs; retained run paging stays single-service because run_generation and seq are \
+        service-scoped."
+    )]
+    async fn follow_all_logs(
+        &self,
+        args: Parameters<FollowAllArgs>,
+    ) -> ToolResult<FollowAllLogsResult> {
+        let Parameters(args) = args;
+        let grep = compile_grep(args.grep.as_deref())?;
+        let min_level = parse_min_level(args.min_level.as_deref())?;
+        let raw = args.raw.unwrap_or(false);
+        let limit = args
+            .limit
+            .unwrap_or(DEFAULT_LOG_TAIL)
+            .clamp(1, MAX_LOG_TAIL);
+        let tail_mode = args.after.is_empty();
+        let resolved = select::resolve(&self.cwd, args.session)
+            .await
+            .map_err(error_data)?;
+        let response = send_request(&resolved.endpoint, Request::ListServices)
+            .await
+            .map_err(error_data)?;
+        let services = convert::services(response).map_err(error_data)?;
+        let mut pages = Vec::new();
+        for service in services {
+            let after_seq = follow_all_after_seq(&args.after, &service.id);
+            let response = send_request(
+                &resolved.endpoint,
+                Request::FollowLogs {
+                    service: service.id.clone(),
+                    run_generation: None,
+                    after: after_seq,
+                },
+            )
+            .await
+            .map_err(error_data)?;
+            let logs = convert::logs(response).map_err(error_data)?;
+            let raw_next_seq = next_follow_cursor(&logs.lines, after_seq);
+            let gap = follow_gap(&logs.lines, after_seq, None);
+            let mut entries = logproc::shape(
+                &logs.lines,
+                &logproc::Shape {
+                    raw,
+                    grep: grep.as_ref(),
+                    min_level,
+                    limit: None,
+                },
+            );
+            for entry in &mut entries {
+                entry.service = Some(service.id.clone());
+            }
+            pages.push(MergedFollowPage {
+                service: service.id,
+                after_seq,
+                raw_next_seq,
+                gap,
+                entries,
+                truncated: logs.truncated,
+            });
+        }
+
+        let merged = merge_follow_pages(pages, limit, tail_mode);
+        Ok(Json(FollowAllLogsResult {
+            config_path: resolved.info.config_path,
+            entries: merged.entries,
+            next: merged.next,
+            gaps: merged.gaps,
+            truncated: merged.truncated,
         }))
     }
 
@@ -1204,12 +1451,12 @@ fn spawn_detached_serve(_config_path: &Path) -> std::io::Result<tokio::process::
     ))
 }
 
-fn next_follow_cursor(lines: &[micromux::LogLine], after_seq: Option<u64>) -> Option<u64> {
+fn next_follow_cursor(lines: &[LogLine], after_seq: Option<u64>) -> Option<u64> {
     lines.last().map(|line| line.seq).or(after_seq)
 }
 
 fn follow_gap(
-    lines: &[micromux::LogLine],
+    lines: &[LogLine],
     after_seq: Option<u64>,
     run_generation: Option<u64>,
 ) -> Option<FollowGap> {
@@ -1222,11 +1469,117 @@ fn follow_gap(
         Some(FollowGap {
             after_seq,
             first_seq: first.seq,
-            lost_lines_at_least: first.seq.saturating_sub(after_seq).saturating_sub(1),
+            lost_entries_at_least: first.seq.saturating_sub(after_seq).saturating_sub(1),
         })
     } else {
         None
     }
+}
+
+fn follow_all_after_seq(cursors: &BTreeMap<String, u64>, service_id: &str) -> Option<u64> {
+    if cursors.is_empty() {
+        None
+    } else {
+        Some(cursors.get(service_id).copied().unwrap_or(0))
+    }
+}
+
+struct MergedFollowPage {
+    service: String,
+    after_seq: Option<u64>,
+    raw_next_seq: Option<u64>,
+    gap: Option<FollowGap>,
+    entries: Vec<logproc::ProcessedEntry>,
+    truncated: bool,
+}
+
+struct MergedFollowOutput {
+    entries: Vec<logproc::ProcessedEntry>,
+    next: BTreeMap<String, u64>,
+    gaps: Vec<ServiceFollowGap>,
+    truncated: bool,
+}
+
+fn merge_follow_pages(
+    mut pages: Vec<MergedFollowPage>,
+    limit: usize,
+    tail_mode: bool,
+) -> MergedFollowOutput {
+    let page_truncated = pages.iter().any(|page| page.truncated);
+    let matched_by_service = pages
+        .iter()
+        .map(|page| (page.service.clone(), !page.entries.is_empty()))
+        .collect::<BTreeMap<_, _>>();
+    let entries = pages
+        .iter_mut()
+        .flat_map(|page| std::mem::take(&mut page.entries))
+        .collect::<Vec<_>>();
+    let mut entries = logproc::merge_preserving_service_order(entries);
+    let mut merge_truncated = false;
+    if entries.len() > limit {
+        merge_truncated = true;
+        if tail_mode {
+            entries.drain(0..entries.len() - limit);
+        } else {
+            entries.truncate(limit);
+        }
+    }
+
+    let returned = returned_cursors(&entries);
+    let mut next = BTreeMap::new();
+    for page in &pages {
+        let cursor = if merge_truncated && !tail_mode {
+            returned
+                .get(&page.service)
+                .copied()
+                .or_else(|| {
+                    matched_by_service
+                        .get(&page.service)
+                        .is_some_and(|matched| !matched)
+                        .then_some(page.raw_next_seq)
+                        .flatten()
+                })
+                .or(page.after_seq)
+        } else {
+            page.raw_next_seq
+                .or(page.after_seq)
+                .or(tail_mode.then_some(0))
+        };
+        if let Some(cursor) = cursor {
+            next.insert(page.service.clone(), cursor);
+        }
+    }
+    let gaps = pages
+        .into_iter()
+        .filter_map(|page| {
+            page.gap.map(|gap| ServiceFollowGap {
+                service: page.service,
+                after_seq: gap.after_seq,
+                first_seq: gap.first_seq,
+                lost_entries_at_least: gap.lost_entries_at_least,
+            })
+        })
+        .collect();
+
+    MergedFollowOutput {
+        entries,
+        next,
+        gaps,
+        truncated: page_truncated || merge_truncated,
+    }
+}
+
+fn returned_cursors(entries: &[logproc::ProcessedEntry]) -> BTreeMap<String, u64> {
+    let mut cursors: BTreeMap<String, u64> = BTreeMap::new();
+    for entry in entries {
+        if let Some(service) = &entry.service {
+            cursors
+                .entry(service.clone())
+                .and_modify(|seq| *seq = (*seq).max(entry.seq))
+                .or_insert(entry.seq);
+        }
+    }
+    cursors
 }
 
 fn error_data(err: ToolError) -> ErrorData {
@@ -1271,9 +1624,13 @@ pub async fn serve_stdio() -> Result<(), Box<dyn std::error::Error + Send + Sync
 
 #[cfg(test)]
 mod tests {
-    use super::{McpServer, WaitResult, follow_gap, next_follow_cursor};
+    use super::{
+        McpServer, MergedFollowPage, WaitResult, follow_all_after_seq, follow_gap,
+        merge_follow_pages, next_follow_cursor,
+    };
     use micromux::{Execution, LogLine, ServiceSnapshot};
     use similar_asserts::assert_eq;
+    use std::collections::BTreeMap;
 
     #[test]
     fn server_builds_typed_tool_schemas() {
@@ -1324,11 +1681,13 @@ mod tests {
             LogLine {
                 seq: 10,
                 run_generation: 1,
+                timestamp_unix_ms: 1_700_000_000_010,
                 line: "a".to_string(),
             },
             LogLine {
                 seq: 11,
                 run_generation: 1,
+                timestamp_unix_ms: 1_700_000_000_011,
                 line: "b".to_string(),
             },
         ];
@@ -1343,6 +1702,7 @@ mod tests {
         let lines = vec![LogLine {
             seq: 15,
             run_generation: 2,
+            timestamp_unix_ms: 1_700_000_000_015,
             line: "newest retained".to_string(),
         }];
 
@@ -1351,5 +1711,158 @@ mod tests {
         assert!(follow_gap(&[], Some(10), None).is_none());
         assert!(follow_gap(&lines, None, None).is_none());
         assert!(follow_gap(&lines, Some(10), Some(2)).is_none());
+    }
+
+    #[test]
+    fn follow_all_cursor_map_reserves_zero_for_before_first_entry() {
+        let mut cursors = BTreeMap::new();
+        assert_eq!(follow_all_after_seq(&cursors, "api"), None);
+
+        cursors.insert("api".to_string(), 12);
+        assert_eq!(follow_all_after_seq(&cursors, "api"), Some(12));
+        assert_eq!(follow_all_after_seq(&cursors, "worker"), Some(0));
+    }
+
+    fn entry(service: &str, seq: u64, timestamp_unix_ms: u64) -> crate::logproc::ProcessedEntry {
+        crate::logproc::ProcessedEntry {
+            service: Some(service.to_string()),
+            seq,
+            run_generation: 1,
+            timestamp_unix_ms,
+            source_timestamp_unix_ms: None,
+            line: format!("{service}-{seq}"),
+            level: None,
+        }
+    }
+
+    fn source_entry(
+        service: &str,
+        seq: u64,
+        timestamp_unix_ms: u64,
+        source_timestamp_unix_ms: u64,
+    ) -> crate::logproc::ProcessedEntry {
+        crate::logproc::ProcessedEntry {
+            source_timestamp_unix_ms: Some(source_timestamp_unix_ms),
+            ..entry(service, seq, timestamp_unix_ms)
+        }
+    }
+
+    fn page(
+        service: &str,
+        after_seq: Option<u64>,
+        raw_next_seq: Option<u64>,
+        entries: Vec<crate::logproc::ProcessedEntry>,
+    ) -> MergedFollowPage {
+        MergedFollowPage {
+            service: service.to_string(),
+            after_seq,
+            raw_next_seq,
+            gap: None,
+            entries,
+            truncated: false,
+        }
+    }
+
+    #[test]
+    fn merged_follow_initial_tail_advances_every_service_cursor() {
+        let merged = merge_follow_pages(
+            vec![
+                page("api", None, Some(10), vec![entry("api", 8, 300)]),
+                page("worker", None, Some(7), vec![entry("worker", 7, 100)]),
+                page("empty", None, None, Vec::new()),
+            ],
+            1,
+            true,
+        );
+
+        assert!(merged.truncated);
+        assert_eq!(merged.entries.len(), 1);
+        assert_eq!(
+            merged
+                .entries
+                .first()
+                .and_then(|entry| entry.service.as_deref()),
+            Some("api")
+        );
+        assert_eq!(merged.next.get("api"), Some(&10));
+        assert_eq!(merged.next.get("worker"), Some(&7));
+        assert_eq!(merged.next.get("empty"), Some(&0));
+    }
+
+    #[test]
+    fn merged_follow_truncated_page_only_advances_returned_entries() {
+        let merged = merge_follow_pages(
+            vec![
+                page(
+                    "api",
+                    Some(4),
+                    Some(20),
+                    vec![entry("api", 5, 100), entry("api", 6, 400)],
+                ),
+                page("worker", Some(9), Some(30), vec![entry("worker", 10, 200)]),
+            ],
+            2,
+            false,
+        );
+
+        assert!(merged.truncated);
+        let returned = merged
+            .entries
+            .iter()
+            .map(|entry| (entry.service.as_deref(), entry.seq))
+            .collect::<Vec<_>>();
+        assert_eq!(returned, vec![(Some("api"), 5), (Some("worker"), 10)]);
+        assert_eq!(merged.next.get("api"), Some(&5));
+        assert_eq!(merged.next.get("worker"), Some(&10));
+    }
+
+    #[test]
+    fn merged_follow_preserves_service_sequence_order_over_source_timestamps() {
+        let merged = merge_follow_pages(
+            vec![page(
+                "api",
+                Some(4),
+                Some(6),
+                vec![
+                    source_entry("api", 5, 200, 300),
+                    source_entry("api", 6, 250, 100),
+                ],
+            )],
+            1,
+            false,
+        );
+
+        assert!(merged.truncated);
+        assert_eq!(merged.entries.first().map(|entry| entry.seq), Some(5));
+        assert_eq!(merged.next.get("api"), Some(&5));
+    }
+
+    #[test]
+    fn merged_follow_truncated_page_advances_services_with_no_matches() {
+        let mut noisy = page("noisy", Some(40), Some(50), Vec::new());
+        noisy.truncated = true;
+        let merged = merge_follow_pages(
+            vec![
+                noisy,
+                page("api", Some(4), Some(5), vec![entry("api", 5, 100)]),
+            ],
+            1,
+            false,
+        );
+
+        assert!(merged.truncated);
+        assert_eq!(merged.next.get("api"), Some(&5));
+        assert_eq!(merged.next.get("noisy"), Some(&50));
+    }
+
+    #[test]
+    fn server_truncated_page_advances_past_filtered_records_when_merged_page_is_complete() {
+        let mut filtered = page("api", Some(4), Some(50), vec![entry("api", 5, 100)]);
+        filtered.truncated = true;
+        let merged = merge_follow_pages(vec![filtered], 10, false);
+
+        assert!(merged.truncated);
+        assert_eq!(merged.entries.len(), 1);
+        assert_eq!(merged.next.get("api"), Some(&50));
     }
 }

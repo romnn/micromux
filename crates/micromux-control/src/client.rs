@@ -84,7 +84,6 @@ impl Client {
     #[cfg_attr(
         not(unix),
         expect(
-            unused_variables,
             clippy::unused_async,
             reason = "Unix has the async transport implementation; unsupported platforms keep the same API shape"
         )
@@ -116,7 +115,6 @@ impl Client {
     #[cfg_attr(
         not(unix),
         expect(
-            unused_variables,
             clippy::unused_async,
             reason = "Unix has the async transport implementation; unsupported platforms keep the same API shape"
         )
@@ -150,7 +148,6 @@ impl Client {
     #[cfg_attr(
         not(unix),
         expect(
-            unused_variables,
             clippy::unused_async,
             reason = "Unix has the async transport implementation; unsupported platforms keep the same API shape"
         )
@@ -285,13 +282,6 @@ pub async fn probe_endpoints(endpoints: &[ControlEndpoint]) -> Vec<EndpointProbe
 }
 
 /// Probe one known endpoint.
-#[cfg_attr(
-    not(unix),
-    expect(
-        clippy::unused_async,
-        reason = "the Unix transport probes asynchronously; unsupported platforms share the API shape"
-    )
-)]
 pub async fn probe_endpoint(endpoint: &ControlEndpoint) -> EndpointProbe {
     #[cfg(unix)]
     {
