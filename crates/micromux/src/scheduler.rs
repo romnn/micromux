@@ -2637,6 +2637,64 @@ services:
     }
 
     #[tokio::test]
+    async fn non_alt_screen_control_sequences_keep_raw_log_records() -> eyre::Result<()> {
+        let json = r#"{"timestamp":"2026-07-01T22:22:21.512105Z","level":"INFO","fields":{"message":"connecting to qdrant","connection_uri":"http://localhost:6334"},"target":"airtype_api_service::setup","filename":"services/airtype-api-service/src/setup.rs","line_number":234}"#;
+        let command = format!("printf '\\033[2Kbuilding\\r'; printf '%s\\n' '{json}'");
+        let config_dir = Path::new(".");
+        let mut services: ServiceMap = ServiceMap::new();
+        services.insert(
+            "svc".to_string(),
+            Service::new(
+                "svc",
+                config_dir,
+                service_config("svc", ("sh", &["-c", &command])),
+            )?,
+        );
+
+        let shutdown = CancellationToken::new();
+        let (test_events_tx, test_events_rx) = mpsc::channel(64);
+        let (events_tx, events_rx) = mpsc::channel(64);
+        let (_commands_tx, commands_rx) = mpsc::channel(64);
+
+        let handle = tokio::spawn({
+            let shutdown = shutdown.clone();
+            async move {
+                run_test_scheduler(
+                    &services,
+                    commands_rx,
+                    events_rx,
+                    events_tx,
+                    test_events_tx,
+                    shutdown,
+                )
+                .await
+            }
+        });
+
+        let (_event, mut test_events_rx) = recv_event(test_events_rx).await?;
+
+        let mut saw_json = false;
+        for _ in 0..50 {
+            let (event, next_rx) = recv_event(test_events_rx).await?;
+            test_events_rx = next_rx;
+            match event {
+                Event::LogLine { line, .. } if line.contains("connecting to qdrant") => {
+                    assert_eq!(line, json);
+                    assert_eq!(line.find('\n'), None);
+                    saw_json = true;
+                }
+                Event::Exited(_, _) if saw_json => break,
+                _ => {}
+            }
+        }
+
+        assert!(saw_json);
+        shutdown.cancel();
+        handle.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn child_sees_tty() -> eyre::Result<()> {
         let config_dir = Path::new(".");
         let mut services: ServiceMap = ServiceMap::new();

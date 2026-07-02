@@ -290,6 +290,13 @@ mod tests {
     }
 
     #[test]
+    fn multiline_non_json_output_stays_raw() {
+        let line = "Error:\n   0: failed";
+
+        assert_eq!(format_line(line, true), line);
+    }
+
+    #[test]
     fn tracing_fields_message_is_promoted_and_other_fields_are_flattened() {
         let line = r#"{"timestamp":"2026-07-01T17:28:02Z","fields":{"severity":"INFO","message":"setup tracer","name":"airtype_api_service"},"filename":"trace.rs","line_number":379,"target":"telemetry::trace"}"#;
 

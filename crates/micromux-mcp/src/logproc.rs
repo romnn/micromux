@@ -2,9 +2,10 @@
 //!
 //! The session returns log *records* exactly as captured. That is the right cursor unit for agents:
 //! one record has one `seq`, and `follow_logs(after_seq = seq)` resumes after it. This module keeps
-//! that unit intact while stripping surviving SGR escapes by default, trimming terminal padding, and
-//! optionally filtering by text, time, trace id, or structured-JSON level. It runs off the control
-//! path: the session stays raw; this shapes what the model reads.
+//! that cursor contract intact while stripping surviving SGR escapes by default, trimming terminal
+//! padding, splitting embedded structured-JSON objects out of legacy/snapshot blobs, and optionally
+//! filtering by text, time, trace id, or structured-JSON level. It runs off the control path: the
+//! session stays raw; this shapes what the model reads.
 
 use std::collections::{BTreeMap, VecDeque};
 
@@ -40,6 +41,91 @@ fn parse_json_object(line: &str) -> Option<Map<String, Value>> {
         Value::Object(object) => Some(object),
         _ => None,
     }
+}
+
+struct RecordSegment {
+    text: String,
+    json: Option<Map<String, Value>>,
+}
+
+struct CandidateEntry {
+    entry: ProcessedEntry,
+    grep_text: String,
+}
+
+fn record_segments(text: &str) -> Vec<RecordSegment> {
+    if let Some(json) = parse_json_object(text) {
+        return vec![RecordSegment {
+            text: text.to_string(),
+            json: Some(json),
+        }];
+    }
+
+    let spans = embedded_json_object_spans(text);
+    if spans.is_empty() {
+        return vec![RecordSegment {
+            text: text.to_string(),
+            json: None,
+        }];
+    }
+
+    let mut segments = Vec::new();
+    let mut cursor = 0;
+    for (start, end, json) in spans {
+        push_plain_segment(&mut segments, text.get(cursor..start).unwrap_or_default());
+        segments.push(RecordSegment {
+            text: text.get(start..end).unwrap_or_default().trim().to_string(),
+            json: Some(json),
+        });
+        cursor = end;
+    }
+    push_plain_segment(&mut segments, text.get(cursor..).unwrap_or_default());
+
+    // `spans` is non-empty here and each span pushes one JSON segment, so `segments` always has at
+    // least one element.
+    segments
+}
+
+fn embedded_json_object_spans(text: &str) -> Vec<(usize, usize, Map<String, Value>)> {
+    let mut spans = Vec::new();
+    let mut cursor = 0;
+    while cursor < text.len() {
+        let Some(relative_start) = text.get(cursor..).and_then(|tail| tail.find('{')) else {
+            break;
+        };
+        let start = cursor + relative_start;
+        let Some(slice) = text.get(start..) else {
+            break;
+        };
+        let mut values = serde_json::Deserializer::from_str(slice).into_iter::<Value>();
+        match values.next() {
+            Some(Ok(Value::Object(object))) => {
+                let consumed = values.byte_offset();
+                if consumed == 0 {
+                    cursor = start.saturating_add(1);
+                    continue;
+                }
+                let end = start.saturating_add(consumed);
+                spans.push((start, end, object));
+                cursor = end;
+            }
+            Some(Ok(_) | Err(_)) | None => {
+                cursor = start.saturating_add(1);
+            }
+        }
+    }
+    spans
+}
+
+fn push_plain_segment(segments: &mut Vec<RecordSegment>, text: &str) {
+    let text = text.trim();
+    if text.is_empty() {
+        return;
+    }
+    segments.push(RecordSegment {
+        text: text.to_string(),
+        json: None,
+    });
 }
 
 fn source_timestamp_in_object(object: &Map<String, Value>) -> Option<u64> {
@@ -341,6 +427,8 @@ pub struct Shape<'a> {
     pub raw: bool,
     /// Keep only entries matching this regex.
     pub grep: Option<&'a Regex>,
+    /// Include this many neighboring entries before and after each grep match.
+    pub context: usize,
     /// Keep only structured-JSON entries at or above this level; drops entries without a JSON
     /// level.
     pub min_level: Option<Level>,
@@ -355,53 +443,99 @@ pub struct Shape<'a> {
     pub format: LogFormat,
 }
 
-/// Apply [`Shape`] to fetched records: clean one session record into one agent-facing entry, filter
-/// by text/time/level/trace id, then tail to `limit`. Filtering and level detection always run on
-/// the ANSI-stripped text (so they are robust to color escapes and to `raw`); `raw` only controls
-/// whether the returned `line` keeps the escapes for non-compact plain text.
+/// Apply [`Shape`] to fetched records: clean session records into agent-facing entries, split
+/// embedded structured-JSON objects out of legacy/snapshot blobs, filter by text/time/level/trace
+/// id, then tail to `limit`. Filtering and level detection always run on the ANSI-stripped text (so
+/// they are robust to color escapes and to `raw`); `raw` only controls whether an unsplit
+/// non-compact plain-text record keeps the escapes.
 #[must_use]
 pub fn shape(records: &[LogLine], options: &Shape) -> Vec<ProcessedEntry> {
-    let mut out = Vec::new();
+    let mut candidates = Vec::new();
+    let apply_grep_per_entry = options.grep.is_none() || options.context == 0;
     for record in records {
         let stripped = normalize_record_text(&strip_ansi(&record.line), true);
-        if let Some(regex) = options.grep
-            && !regex.is_match(&stripped)
-        {
-            continue;
+        let segments = record_segments(&stripped);
+        let raw_line = (options.raw && segments.len() == 1)
+            .then(|| normalize_record_text(&record.line, false));
+        for segment in segments {
+            push_shaped_segment(
+                &mut candidates,
+                record,
+                segment,
+                raw_line.as_deref(),
+                options,
+                apply_grep_per_entry,
+            );
         }
-        let json = parse_json_object(&stripped);
-        let level = json.as_ref().and_then(level_in_object);
-        let source_timestamp_unix_ms = json.as_ref().and_then(source_timestamp);
-        let effective_timestamp = source_timestamp_unix_ms.unwrap_or(record.timestamp_unix_ms);
-        if let Some(since) = options.since_unix_ms
-            && effective_timestamp < since
-        {
-            continue;
+    }
+    if !apply_grep_per_entry && let Some(regex) = options.grep {
+        apply_grep_context(&mut candidates, regex, options.context);
+    }
+    let mut out = candidates
+        .into_iter()
+        .map(|candidate| candidate.entry)
+        .collect::<Vec<_>>();
+    apply_tail_limit(&mut out, options.limit);
+    out
+}
+
+fn push_shaped_segment(
+    out: &mut Vec<CandidateEntry>,
+    record: &LogLine,
+    segment: RecordSegment,
+    raw_line: Option<&str>,
+    options: &Shape,
+    apply_grep: bool,
+) {
+    if apply_grep
+        && let Some(regex) = options.grep
+        && !regex.is_match(&segment.text)
+    {
+        return;
+    }
+    let level = segment.json.as_ref().and_then(level_in_object);
+    let source_timestamp_unix_ms = segment.json.as_ref().and_then(source_timestamp);
+    let effective_timestamp = source_timestamp_unix_ms.unwrap_or(record.timestamp_unix_ms);
+    if let Some(since) = options.since_unix_ms
+        && effective_timestamp < since
+    {
+        return;
+    }
+    if let Some(trace_id) = options.trace_id
+        && !segment.text.contains(trace_id)
+    {
+        return;
+    }
+    if let Some(min) = options.min_level {
+        match level {
+            Some(level) if level >= min => {}
+            _ => return,
         }
-        if let Some(trace_id) = options.trace_id
-            && !stripped.contains(trace_id)
-        {
-            continue;
-        }
-        if let Some(min) = options.min_level {
-            match level {
-                Some(level) if level >= min => {}
-                _ => continue,
-            }
-        }
-        let message = json.as_ref().and_then(message_in_object);
-        let fields = json.as_ref().map_or_else(BTreeMap::new, structured_fields);
-        let line = match (options.raw, options.format, json.as_ref()) {
-            (_, LogFormat::Compact, Some(_)) => compact_line(
-                source_timestamp_unix_ms.unwrap_or(record.timestamp_unix_ms),
-                level,
-                message.as_deref(),
-                &fields,
-            ),
-            (true, _, _) => normalize_record_text(&record.line, false),
-            _ => stripped,
-        };
-        out.push(ProcessedEntry {
+    }
+    // grep_text is only consulted by apply_grep_context on the grep+context path; skip the clone
+    // (up to MAX_LOG_TAIL entries per call) whenever grep is already matched per-entry above.
+    let grep_text = if apply_grep {
+        String::new()
+    } else {
+        segment.text.clone()
+    };
+    let message = segment.json.as_ref().and_then(message_in_object);
+    let fields = segment
+        .json
+        .as_ref()
+        .map_or_else(BTreeMap::new, structured_fields);
+    let line = match (options.raw, options.format, segment.json.as_ref()) {
+        (_, LogFormat::Compact, Some(_)) => compact_line(
+            source_timestamp_unix_ms.unwrap_or(record.timestamp_unix_ms),
+            level,
+            message.as_deref(),
+            &fields,
+        ),
+        (true, _, _) => raw_line.map_or(segment.text, ToString::to_string),
+        _ => segment.text,
+    };
+    out.push(CandidateEntry {
+        entry: ProcessedEntry {
             service: None,
             seq: record.seq,
             run_generation: record.run_generation,
@@ -411,14 +545,113 @@ pub fn shape(records: &[LogLine], options: &Shape) -> Vec<ProcessedEntry> {
             level: level.map(Level::canonical),
             message,
             fields,
-        });
+        },
+        grep_text,
+    });
+}
+
+fn apply_grep_context(out: &mut Vec<CandidateEntry>, regex: &Regex, context: usize) {
+    let mut keep = vec![false; out.len()];
+    for (index, entry) in out.iter().enumerate() {
+        if regex.is_match(&entry.grep_text) {
+            let start = index.saturating_sub(context);
+            let end = index
+                .saturating_add(context)
+                .min(out.len().saturating_sub(1));
+            for slot in keep.iter_mut().take(end + 1).skip(start) {
+                *slot = true;
+            }
+        }
     }
-    if let Some(limit) = options.limit
-        && out.len() > limit
+    let mut keep = keep.into_iter();
+    out.retain(|_| keep.next().unwrap_or(false));
+}
+
+fn apply_tail_limit(out: &mut Vec<ProcessedEntry>, limit: Option<usize>) {
+    let Some(limit) = limit else {
+        return;
+    };
+    tail_preserving_record_boundaries(out, limit);
+}
+
+pub(crate) fn tail_preserving_record_boundaries(
+    entries: &mut Vec<ProcessedEntry>,
+    limit: usize,
+) -> bool {
+    if limit == 0 {
+        let truncated = !entries.is_empty();
+        entries.clear();
+        return truncated;
+    }
+    if entries.len() <= limit {
+        return false;
+    }
+    let mut start = entries.len() - limit;
+    let Some(first_kept) = entries.get(start) else {
+        return false;
+    };
+    let boundary = RecordBoundary::of(first_kept);
+    while start > 0
+        && entries
+            .get(start - 1)
+            .is_some_and(|entry| boundary.matches(entry))
     {
-        out.drain(0..out.len() - limit);
+        start -= 1;
     }
-    out
+    let truncated = start > 0;
+    entries.drain(0..start);
+    truncated
+}
+
+pub(crate) fn truncate_preserving_record_boundaries(
+    entries: &mut Vec<ProcessedEntry>,
+    limit: usize,
+) -> bool {
+    if limit == 0 {
+        let truncated = !entries.is_empty();
+        entries.clear();
+        return truncated;
+    }
+    if entries.len() <= limit {
+        return false;
+    }
+    let mut end = limit;
+    let Some(last_kept) = entries.get(end - 1) else {
+        return false;
+    };
+    let boundary = RecordBoundary::of(last_kept);
+    while end < entries.len()
+        && entries
+            .get(end)
+            .is_some_and(|entry| boundary.matches(entry))
+    {
+        end += 1;
+    }
+    let truncated = end < entries.len();
+    entries.truncate(end);
+    truncated
+}
+
+struct RecordBoundary<'a> {
+    service: Option<&'a str>,
+    run_generation: u64,
+    seq: u64,
+}
+
+impl<'a> RecordBoundary<'a> {
+    fn of(entry: &'a ProcessedEntry) -> Self {
+        Self {
+            service: entry.service.as_deref(),
+            run_generation: entry.run_generation,
+            seq: entry.seq,
+        }
+    }
+
+    fn matches(&self, entry: &ProcessedEntry) -> bool {
+        entry.service.as_deref() == self.service
+            && entry.run_generation == self.run_generation
+            && entry.seq == self.seq
+    }
 }
 
 fn compact_line(
@@ -480,7 +713,22 @@ pub(crate) fn merge_preserving_service_order(entries: Vec<ProcessedEntry>) -> Ve
             break;
         };
         if let Some(entry) = group.pop_front() {
+            // One captured record (a single seq) can shape into several entries when it carries
+            // embedded JSON. Emit them as one contiguous block: interleaving another service
+            // between them would defeat the boundary-preserving tail/truncate helpers, which only
+            // reattach *adjacent* same-seq entries — a split there drops half a record and advances
+            // that service's cursor past the dropped half.
+            let (run_generation, seq) = (entry.run_generation, entry.seq);
             merged.push(entry);
+            while group
+                .front()
+                .is_some_and(|next| next.run_generation == run_generation && next.seq == seq)
+            {
+                let Some(next) = group.pop_front() else {
+                    break;
+                };
+                merged.push(next);
+            }
         }
         if group.is_empty() {
             groups.remove(&service);
@@ -607,6 +855,51 @@ mod tests {
     }
 
     #[test]
+    fn grep_context_includes_neighboring_entries() {
+        let records = vec![
+            record(1, "before"),
+            record(2, "ERROR boom"),
+            record(3, "after"),
+            record(4, "later"),
+        ];
+        let regex = Regex::new("ERROR").unwrap();
+        let out = shape(
+            &records,
+            &Shape {
+                grep: Some(&regex),
+                context: 1,
+                ..Shape::default()
+            },
+        );
+
+        assert_eq!(lines(&out), vec!["before", "ERROR boom", "after"]);
+    }
+
+    #[test]
+    fn grep_context_matches_cleaned_text_not_formatted_line() {
+        let records = vec![
+            record(1, "before"),
+            record(2, r#"{"level":"error","msg":"boom"}"#),
+            record(3, "after"),
+        ];
+        let regex = Regex::new(r#""level":"error""#).unwrap();
+        let out = shape(
+            &records,
+            &Shape {
+                grep: Some(&regex),
+                context: 1,
+                format: LogFormat::Compact,
+                ..Shape::default()
+            },
+        );
+
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0].line, "before");
+        assert!(out[1].line.contains("ERROR boom"));
+        assert_eq!(out[2].line, "after");
+    }
+
+    #[test]
     fn grep_matches_across_wrapped_record_boundaries() {
         let records = vec![record(
             45,
@@ -660,6 +953,164 @@ mod tests {
         assert_eq!(out[0].line, r#"{"level":"error","msg":"bad"}"#);
         assert_eq!(out[0].level, Some("error"));
         assert_eq!(out[1].level, Some("warn"));
+    }
+
+    #[test]
+    fn splits_embedded_json_objects_before_level_filtering() {
+        let records = vec![record(
+            76,
+            concat!(
+                r#"{"timestamp":"2026-07-01T12:00:00Z","level":"INFO","fields":{"message":"setup ok"}}"#,
+                " ",
+                r#"{"timestamp":"2026-07-01T12:00:01Z","level":"ERROR","fields":{"message":"startup backfill failed","code":"missing_relation"}}"#,
+            ),
+        )];
+
+        let out = shape(
+            &records,
+            &Shape {
+                min_level: Some(Level::Error),
+                format: LogFormat::Compact,
+                ..Shape::default()
+            },
+        );
+
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].seq, 76);
+        assert_eq!(out[0].level, Some("error"));
+        assert_eq!(out[0].message.as_deref(), Some("startup backfill failed"));
+        assert_eq!(
+            out[0].line,
+            "2026-07-01T12:00:01.000Z ERROR startup backfill failed code=missing_relation"
+        );
+    }
+
+    #[test]
+    fn split_json_blob_keeps_plain_error_suffix_searchable() {
+        let records = vec![record(
+            76,
+            concat!(
+                r#"{"level":"INFO","fields":{"message":"setup ok"}}"#,
+                " Error: relation \"app.credit_submission_file_classifications\" does not exist",
+            ),
+        )];
+        let regex = Regex::new("credit_submission_file_classifications").unwrap();
+
+        let out = shape(
+            &records,
+            &Shape {
+                grep: Some(&regex),
+                ..Shape::default()
+            },
+        );
+
+        assert_eq!(
+            lines(&out),
+            vec![r#"Error: relation "app.credit_submission_file_classifications" does not exist"#]
+        );
+        assert_eq!(out[0].seq, 76);
+    }
+
+    #[test]
+    fn tail_limit_does_not_split_entries_from_one_record() {
+        let records = vec![record(
+            9,
+            concat!(
+                r#"{"level":"INFO","msg":"one"}"#,
+                " ",
+                r#"{"level":"INFO","msg":"two"}"#,
+                " ",
+                r#"{"level":"INFO","msg":"three"}"#,
+            ),
+        )];
+
+        let out = shape(
+            &records,
+            &Shape {
+                limit: Some(1),
+                ..Shape::default()
+            },
+        );
+
+        assert_eq!(out.len(), 3);
+        assert!(out.iter().all(|entry| entry.seq == 9));
+    }
+
+    #[test]
+    fn tail_boundary_helper_reports_false_when_nothing_is_dropped() {
+        let records = vec![record(
+            9,
+            concat!(
+                r#"{"level":"INFO","msg":"one"}"#,
+                " ",
+                r#"{"level":"INFO","msg":"two"}"#,
+            ),
+        )];
+        let mut out = shape(&records, &Shape::default());
+
+        let truncated = tail_preserving_record_boundaries(&mut out, 1);
+
+        assert!(!truncated);
+        assert_eq!(out.len(), 2);
+        assert!(out.iter().all(|entry| entry.seq == 9));
+    }
+
+    #[test]
+    fn zero_tail_limit_returns_no_entries() {
+        let records = vec![record(1, "one")];
+        let out = shape(
+            &records,
+            &Shape {
+                limit: Some(0),
+                ..Shape::default()
+            },
+        );
+
+        assert_eq!(out.len(), 0);
+    }
+
+    fn processed(service: &str, seq: u64, source_ts: u64) -> ProcessedEntry {
+        ProcessedEntry {
+            service: Some(service.to_string()),
+            seq,
+            run_generation: 1,
+            timestamp_unix_ms: source_ts,
+            source_timestamp_unix_ms: Some(source_ts),
+            line: format!("{service}:{seq}@{source_ts}"),
+            level: None,
+            message: None,
+            fields: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn merge_keeps_split_record_segments_contiguous() {
+        // api's single record (seq 5) shaped into two embedded-JSON entries whose source
+        // timestamps straddle worker's entry. The merge must emit the two seq-5 entries adjacently
+        // rather than interleaving worker between them; otherwise boundary-preserving truncation
+        // would later drop half of record 5 and advance api's cursor past the dropped half.
+        let entries = vec![
+            processed("api", 5, 100),
+            processed("api", 5, 102),
+            processed("worker", 3, 101),
+        ];
+
+        let merged = merge_preserving_service_order(entries);
+
+        let order: Vec<(&str, u64, u64)> = merged
+            .iter()
+            .map(|entry| {
+                (
+                    entry.service.as_deref().unwrap_or_default(),
+                    entry.seq,
+                    entry.source_timestamp_unix_ms.unwrap_or_default(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            order,
+            vec![("api", 5, 100), ("api", 5, 102), ("worker", 3, 101)]
+        );
     }
 
     #[test]
