@@ -8,50 +8,122 @@
     "version": {
       "description": "Configuration file format version.",
       "anyOf": [
-        { "type": "string", "enum": ["1", "v1", "V1", "latest"] },
-        { "type": "number", "enum": [1] }
+        {
+          "type": "string",
+          "enum": [
+            "1",
+            "v1",
+            "V1",
+            "latest"
+          ]
+        },
+        {
+          "type": "number",
+          "enum": [
+            1
+          ]
+        }
       ]
+    },
+    "name": {
+      "type": "string",
+      "description": "Optional session name, surfaced to coding agents via the MCP/control plane. Falls back to the working directory name."
+    },
+    "strict": {
+      "type": "boolean",
+      "default": false,
+      "description": "Treat config warnings as errors."
     },
     "ui": {
       "type": "object",
       "additionalProperties": true,
       "properties": {
-        "width": { "type": "integer", "minimum": 0 }
+        "width": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "pretty_json_logs": {
+          "type": "boolean",
+          "default": true,
+          "description": "Render structured JSON service logs as compact colored log lines in the TUI."
+        }
       }
+    },
+    "control": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Agent control plane settings.",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Enable the local control endpoint (default true)."
+        }
+      }
+    },
+    "restart": {
+      "$ref": "#/definitions/restart",
+      "description": "Default restart policy inherited by services that do not set restart."
+    },
+    "healthcheck": {
+      "$ref": "#/definitions/healthcheck_defaults"
+    },
+    "logs": {
+      "$ref": "#/definitions/logs"
     },
     "services": {
       "type": "object",
-      "additionalProperties": { "$ref": "#/definitions/service" }
+      "additionalProperties": {
+        "$ref": "#/definitions/service"
+      }
     }
   },
   "definitions": {
     "scalar": {
       "anyOf": [
-        { "type": "string" },
-        { "type": "number" },
-        { "type": "boolean" }
+        {
+          "type": "string"
+        },
+        {
+          "type": "number"
+        },
+        {
+          "type": "boolean"
+        }
       ]
     },
     "command": {
       "description": "Command to execute. Either a shell-like string or an argv-like sequence.",
       "anyOf": [
-        { "type": "string", "minLength": 1 },
+        {
+          "type": "string",
+          "minLength": 1
+        },
         {
           "type": "array",
           "minItems": 1,
-          "items": { "$ref": "#/definitions/scalar" }
+          "items": {
+            "$ref": "#/definitions/scalar"
+          }
         }
       ]
     },
     "dependency": {
       "anyOf": [
-        { "type": "string", "minLength": 1 },
+        {
+          "type": "string",
+          "minLength": 1
+        },
         {
           "type": "object",
           "additionalProperties": true,
-          "required": ["name"],
+          "required": [
+            "name"
+          ],
           "properties": {
-            "name": { "type": "string", "minLength": 1 },
+            "name": {
+              "type": "string",
+              "minLength": 1
+            },
             "condition": {
               "type": "string",
               "enum": [
@@ -75,67 +147,216 @@
     },
     "env_file_entry": {
       "anyOf": [
-        { "type": "string", "minLength": 1 },
+        {
+          "type": "string",
+          "minLength": 1
+        },
         {
           "type": "object",
           "additionalProperties": true,
-          "required": ["path"],
+          "required": [
+            "path"
+          ],
           "properties": {
-            "path": { "type": "string", "minLength": 1 }
+            "path": {
+              "type": "string",
+              "minLength": 1
+            }
           }
         }
       ]
     },
     "env_file": {
       "anyOf": [
-        { "$ref": "#/definitions/env_file_entry" },
-        { "type": "array", "items": { "$ref": "#/definitions/env_file_entry" } }
+        {
+          "$ref": "#/definitions/env_file_entry"
+        },
+        {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/env_file_entry"
+          }
+        }
       ]
     },
-    "healthcheck": {
+    "duration": {
+      "type": "string",
+      "minLength": 1
+    },
+    "healthcheck_timing": {
       "type": "object",
       "additionalProperties": true,
-      "required": ["test"],
       "properties": {
-        "test": { "$ref": "#/definitions/command" },
-        "start_delay": { "type": "string", "minLength": 1 },
-        "startup_delay": { "type": "string", "minLength": 1 },
-        "initial_delay": { "type": "string", "minLength": 1 },
-        "interval": { "type": "string", "minLength": 1 },
-        "timeout": { "type": "string", "minLength": 1 },
-        "retries": { "type": "integer", "minimum": 0 }
+        "start_delay": {
+          "$ref": "#/definitions/duration"
+        },
+        "startup_delay": {
+          "$ref": "#/definitions/duration"
+        },
+        "initial_delay": {
+          "$ref": "#/definitions/duration"
+        },
+        "interval": {
+          "$ref": "#/definitions/duration"
+        },
+        "timeout": {
+          "$ref": "#/definitions/duration"
+        },
+        "retries": {
+          "type": "integer",
+          "minimum": 0
+        }
       }
+    },
+    "healthcheck_defaults": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/healthcheck_timing"
+        }
+      ],
+      "not": {
+        "required": [
+          "test"
+        ]
+      },
+      "description": "Default healthcheck timing inherited by services that define healthcheck.test. Does not create a healthcheck by itself."
+    },
+    "healthcheck": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/healthcheck_timing"
+        },
+        {
+          "type": "object",
+          "required": [
+            "test"
+          ],
+          "properties": {
+            "test": {
+              "$ref": "#/definitions/command"
+            }
+          }
+        }
+      ]
     },
     "restart": {
       "type": "string",
       "pattern": "^([Aa][Ll][Ww][Aa][Yy][Ss]|[Uu][Nn][Ll][Ee][Ss][Ss][-_][Ss][Tt][Oo][Pp][Pp][Ee][Dd]|[Nn][Ee][Vv][Ee][Rr]|[Nn][Oo]|[Oo][Nn][-_][Ff][Aa][Ii][Ll][Uu][Rr][Ee]([:=\\s]+[0-9]+)?)$"
     },
+    "log_limit": {
+      "description": "A positive integer bound, or an explicit unbounded in-memory limit.",
+      "anyOf": [
+        {
+          "type": "integer",
+          "minimum": 1
+        },
+        {
+          "type": "string",
+          "pattern": "^\\s*([Uu][Nn][Bb][Oo][Uu][Nn][Dd][Ee][Dd]|[Uu][Nn][Ll][Ii][Mm][Ii][Tt][Ee][Dd]|[Nn][Oo][Nn][Ee])\\s*$"
+        }
+      ]
+    },
+    "logs_memory": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "In-memory log tail retained for the TUI and default log stream.",
+      "properties": {
+        "max_lines": {
+          "$ref": "#/definitions/log_limit"
+        },
+        "max_bytes": {
+          "$ref": "#/definitions/log_limit"
+        }
+      }
+    },
+    "logs": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Log retention settings. Disk run logs retain full logs and rotate only by run count.",
+      "properties": {
+        "retained_runs": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Number of full disk-backed service runs retained, including the current/latest run (default 5)."
+        },
+        "runs": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Alias for retained_runs."
+        },
+        "history": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Alias for retained_runs."
+        },
+        "memory": {
+          "$ref": "#/definitions/logs_memory"
+        },
+        "max_lines": {
+          "$ref": "#/definitions/log_limit",
+          "description": "Alias for memory.max_lines."
+        },
+        "max_bytes": {
+          "$ref": "#/definitions/log_limit",
+          "description": "Alias for memory.max_bytes."
+        }
+      }
+    },
     "service": {
       "type": "object",
       "additionalProperties": true,
-      "required": ["command"],
+      "required": [
+        "command"
+      ],
       "properties": {
-        "name": { "type": "string" },
-        "command": { "$ref": "#/definitions/command" },
-        "working_dir": { "type": "string" },
-        "cwd": { "type": "string" },
-        "directory": { "type": "string" },
-        "env_file": { "$ref": "#/definitions/env_file" },
+        "name": {
+          "type": "string"
+        },
+        "command": {
+          "$ref": "#/definitions/command"
+        },
+        "working_dir": {
+          "type": "string"
+        },
+        "cwd": {
+          "type": "string"
+        },
+        "directory": {
+          "type": "string"
+        },
+        "env_file": {
+          "$ref": "#/definitions/env_file"
+        },
         "environment": {
           "type": "object",
-          "additionalProperties": { "$ref": "#/definitions/scalar" }
+          "additionalProperties": {
+            "$ref": "#/definitions/scalar"
+          }
         },
         "depends_on": {
           "type": "array",
-          "items": { "$ref": "#/definitions/dependency" }
+          "items": {
+            "$ref": "#/definitions/dependency"
+          }
         },
-        "healthcheck": { "$ref": "#/definitions/healthcheck" },
+        "healthcheck": {
+          "$ref": "#/definitions/healthcheck"
+        },
         "ports": {
           "type": "array",
-          "items": { "$ref": "#/definitions/scalar" }
+          "items": {
+            "$ref": "#/definitions/scalar"
+          }
         },
-        "restart": { "$ref": "#/definitions/restart" },
-        "color": { "type": "boolean" }
+        "restart": {
+          "$ref": "#/definitions/restart"
+        },
+        "color": {
+          "type": "boolean"
+        },
+        "logs": {
+          "$ref": "#/definitions/logs"
+        }
       }
     }
   }

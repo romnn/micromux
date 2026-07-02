@@ -20,44 +20,92 @@
 //! # Ok(()) }
 //! ```
 
-mod bounded_log;
 mod config;
 mod diagnostics;
 mod env;
 mod graph;
 mod health_check;
+mod model;
 mod scheduler;
 mod service;
+mod structured_log;
 
 use color_eyre::eyre;
+use std::future::Future;
+use std::path::PathBuf;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 
 pub use tokio_util::sync::CancellationToken;
 
-pub use bounded_log::{AsyncBoundedLog, BoundedLog};
-pub use config::{ConfigError, ConfigFile, find_config_file, from_str};
+pub use config::{ConfigError, ConfigFile, config_file_names, find_config_file, from_str};
 pub use diagnostics::{Printer, ToDiagnostics};
-pub use scheduler::{Command, Event, LogUpdateKind, OutputStream, ServiceID};
+pub use health_check::Health;
+pub use model::{
+    ChangeKind, Desired, DiskLogRetention, Execution, HealthAttempt, HealthLine, HealthResult,
+    LogLimit, LogLine, LogRetention, LogRun, LogRunSummary, MemoryLogRetention, ServiceSnapshot,
+    SessionChange, SessionModelReader,
+};
+pub use scheduler::{
+    Command, CommandRejection, OutputStream, SchedulerStopped, ServiceCommandAck,
+    ServiceCommandResult, ServiceControl, ServiceID,
+};
+pub use service::RestartPolicy;
+pub use structured_log::{
+    StructuredLogLevel, is_structured_log_level_key, structured_log_level_in_object,
+};
 
 pub(crate) type ServiceMap = indexmap::IndexMap<ServiceID, service::Service>;
 
-/// A simplified view of a service for presentation (e.g. in a UI).
 #[derive(Debug, Clone)]
-pub struct ServiceDescriptor {
-    /// Unique identifier of the service.
-    pub id: ServiceID,
-    /// Human-readable name of the service.
-    pub name: String,
-    /// Parsed and validated open ports.
-    pub open_ports: Vec<u16>,
-    /// Whether this service has a healthcheck configured.
-    pub healthcheck_configured: bool,
+pub(crate) struct ReloadConfig {
+    pub(crate) config_path: PathBuf,
+    pub(crate) strict_override: Option<bool>,
+}
+
+pub(crate) fn service_map_from_config<F>(
+    config_file: &config::ConfigFile<F>,
+) -> eyre::Result<ServiceMap> {
+    let config_dir = config_file.config_dir.clone();
+    config_file
+        .config
+        .services
+        .iter()
+        .map(|(name, service_config)| {
+            let service_id = name.as_ref().clone();
+            let service =
+                service::Service::new(name.as_ref().clone(), &config_dir, service_config.clone())?;
+            Ok::<_, eyre::Report>((service_id, service))
+        })
+        .collect::<Result<ServiceMap, _>>()
 }
 
 /// Main entry point to run a micromux session.
-#[derive()]
 pub struct Micromux {
     services: ServiceMap,
+    reload_config: Option<ReloadConfig>,
+}
+
+/// Capability handles returned by [`Micromux::start`].
+///
+/// The model writer never escapes the core, so the only handles an adapter can hold are the read
+/// capability and a command sender. The narrow [`ServiceControl`] port (no input forwarding) is
+/// derived from [`Handles::service_control`] for untrusted adapters; the trusted in-process TUI
+/// keeps the full [`Handles::commands`] sender.
+pub struct Handles {
+    /// Read capability over the session model: query + `subscribe`.
+    pub reader: SessionModelReader,
+    /// Full trusted in-process command sender for the TUI/CLI.
+    pub commands: mpsc::Sender<Command>,
+}
+
+impl Handles {
+    /// A narrow, untrusted command port (restart/enable/disable only) for adapters such as the
+    /// control server and MCP. It cannot express `SendInput`/`ResizeAll`.
+    #[must_use]
+    pub fn service_control(&self) -> ServiceControl {
+        ServiceControl::new(self.commands.clone())
+    }
 }
 
 /// Return the OS-specific project directories for micromux.
@@ -77,76 +125,90 @@ impl Micromux {
     /// Returns an error if a service definition in the configuration cannot be normalized
     /// (e.g. invalid environment interpolation, invalid port parsing, etc.).
     pub fn new(config_file: &config::ConfigFile<diagnostics::FileId>) -> eyre::Result<Self> {
-        let config_dir = config_file.config_dir.clone();
-        let services = config_file
-            .config
-            .services
-            .iter()
-            .map(|(name, service_config)| {
-                let service_id = name.as_ref().clone();
-                let service = service::Service::new(
-                    name.as_ref().clone(),
-                    &config_dir,
-                    service_config.clone(),
-                )?;
-                Ok::<_, eyre::Report>((service_id, service))
-            })
-            .collect::<Result<ServiceMap, _>>()?;
+        let services = service_map_from_config(config_file)?;
+        let reload_config = config_file
+            .config_path
+            .clone()
+            .map(|config_path| ReloadConfig {
+                config_path,
+                strict_override: config_file.strict_override,
+            });
 
         graph::ServiceGraph::new(&services)?;
 
-        Ok(Self { services })
+        Ok(Self {
+            services,
+            reload_config,
+        })
     }
 
     /// Return a snapshot of services suitable for presentation.
     ///
     /// The returned descriptors intentionally omit internal details required only by the
     /// scheduler.
-    #[must_use]
-    pub fn services(&self) -> Vec<ServiceDescriptor> {
+    fn initial_model_entries(&self) -> Vec<(ServiceSnapshot, LogRetention)> {
         self.services
             .iter()
-            .map(|(service_id, service)| ServiceDescriptor {
-                id: service_id.clone(),
-                name: service.name.as_ref().clone(),
-                open_ports: service.open_ports.clone(),
-                healthcheck_configured: service.health_check.is_some(),
+            .map(|(id, service)| {
+                (
+                    ServiceSnapshot::initial(
+                        id.clone(),
+                        service.name.as_ref().clone(),
+                        service.open_ports.clone(),
+                        service.health_check.is_some(),
+                        service.restart_policy.clone(),
+                    ),
+                    service.log_retention,
+                )
             })
             .collect()
     }
 
-    /// Start the scheduler with default options.
+    /// Start the scheduler, returning the runner future and the capability [`Handles`].
     ///
-    /// # Errors
-    ///
-    /// Returns an error if the scheduler fails to start or if any service fails during startup.
-    pub async fn start(
-        &self,
-        ui_tx: mpsc::Sender<scheduler::Event>,
-        commands_rx: mpsc::Receiver<scheduler::Command>,
+    /// The model (`Inner` + `Writer`) and the command channel are built internally; the writer is
+    /// moved into the runner future and never leaves the core, so adapters can only read the model
+    /// or send commands. `Arc<Self>` makes the future `'static`, so the caller can `tokio::spawn` it
+    /// while holding the handles.
+    pub fn start(
+        self: Arc<Self>,
         shutdown: CancellationToken,
-    ) -> eyre::Result<()> {
-        tracing::info!("starting");
-        let (events_tx, events_rx) = mpsc::channel(1024);
+    ) -> (impl Future<Output = eyre::Result<()>> + 'static, Handles) {
+        let (reader, writer) = model::new(self.initial_model_entries());
+        let (commands_tx, commands_rx) = mpsc::channel(1024);
+        let handles = Handles {
+            reader,
+            commands: commands_tx,
+        };
 
-        tokio::spawn({
-            let shutdown = shutdown.clone();
-            async move {
-                shutdown.cancelled().await;
-                tracing::warn!("received shutdown signal");
-            }
-        });
+        let runner = async move {
+            tracing::info!("starting");
+            let (events_tx, events_rx) = mpsc::channel(1024);
 
-        crate::scheduler::scheduler(
-            &self.services,
-            commands_rx,
-            events_rx,
-            events_tx,
-            ui_tx,
-            shutdown.clone(),
-        )
-        .await?;
-        tracing::info!("exiting");
-        Ok(())
+            tokio::spawn({
+                let shutdown = shutdown.clone();
+                async move {
+                    shutdown.cancelled().await;
+                    tracing::warn!("received shutdown signal");
+                }
+            });
+
+            scheduler::scheduler(scheduler::SchedulerInput {
+                services: self.services.clone(),
+                reload_config: self.reload_config.clone(),
+                commands_rx,
+                events_rx,
+                events_tx,
+                #[cfg(test)]
+                test_events_tx: None,
+                writer,
+                shutdown: shutdown.clone(),
+            })
+            .await?;
+            tracing::info!("exiting");
+            Ok(())
+        };
+
+        (runner, handles)
     }
 }

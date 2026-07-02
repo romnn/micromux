@@ -6,9 +6,25 @@ use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, strum::Display)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    strum::Display,
+    serde::Serialize,
+    serde::Deserialize,
+    schemars::JsonSchema,
+)]
+/// The resolved health verdict for a service.
 pub enum Health {
+    /// The service's healthcheck is currently passing.
     Healthy,
+    /// The service's healthcheck is currently failing.
     Unhealthy,
 }
 
@@ -788,7 +804,10 @@ fn kill_reaped_probe_group(pid: i32) {
     let _ = nix::sys::signal::killpg(pid, nix::sys::signal::Signal::SIGKILL);
 }
 
-#[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the probe lifecycle keeps spawn, timeout, output drain, and cleanup ordering together"
+)]
 async fn run(
     health_check: &crate::config::HealthCheck,
     service_id: &ServiceID,

@@ -1,8 +1,10 @@
 use super::{
-    DesiredState, Event, ProcessEvent, RunningService, ServiceID, ServiceRuntime, State, pty,
+    DesiredState, ProcessEvent, RunningService, ServiceID, ServiceRuntime, SessionModelWriter,
+    State, pty, sync_model,
 };
+#[cfg(test)]
+use super::{Event, TestEventSink};
 use crate::{ServiceMap, health_check::Health};
-use color_eyre::eyre;
 use std::collections::HashMap;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -13,7 +15,9 @@ pub(super) struct ScheduleContext<'a> {
     pub(super) runtimes: &'a mut HashMap<ServiceID, ServiceRuntime>,
     pub(super) current_pty_size: portable_pty::PtySize,
     pub(super) events_tx: &'a mpsc::Sender<ProcessEvent>,
-    pub(super) ui_tx: &'a mpsc::Sender<Event>,
+    #[cfg(test)]
+    pub(super) test_events: &'a mut TestEventSink,
+    pub(super) writer: &'a SessionModelWriter,
     pub(super) shutdown: &'a CancellationToken,
 }
 
@@ -148,20 +152,20 @@ fn decrement_failure_budget(
     }
 }
 
-async fn start_service_if_ready(
+fn start_service_if_ready(
     ctx: &mut ScheduleContext<'_>,
     service_id: &ServiceID,
     service: &crate::service::Service,
     exited_code: Option<i32>,
-) -> eyre::Result<()> {
+) {
     if !dependencies_ready(ctx, service_id.as_str(), service) {
-        return Ok(());
+        return;
     }
 
     tracing::info!(service_id, "starting service");
 
     let Some(runtime) = ctx.runtimes.get_mut(service_id) else {
-        return Ok(());
+        return;
     };
     let explicit_start = runtime.start_requested;
     let clear_logs = runtime.clear_logs_on_start;
@@ -169,7 +173,8 @@ async fn start_service_if_ready(
 
     runtime.start_requested = false;
     runtime.clear_logs_on_start = false;
-    runtime.state = State::Starting;
+    runtime.mark_starting();
+    sync_model(ctx.writer, service, runtime);
 
     let run_id = runtime.allocate_run_id();
     let terminate = CancellationToken::new();
@@ -183,36 +188,43 @@ async fn start_service_if_ready(
         ctx.current_pty_size,
     ) {
         Ok(started) => {
-            runtime.running = Some(RunningService {
+            runtime.mark_started(RunningService {
                 run_id,
                 terminate,
                 log_reader: started.log_reader,
                 pty: started.handles,
                 since: tokio::time::Instant::now(),
             });
-            runtime.state = State::Running { health: None };
+            sync_model(ctx.writer, service, runtime);
+            // Model: clear on restart, and always reset the live-snapshot target so the new run's
+            // first frame appends rather than replacing the previous run's final frame.
+            ctx.writer.begin_run(service_id, run_id.get());
             if clear_logs {
-                ctx.ui_tx.send(Event::ClearLogs(service_id.clone())).await?;
+                ctx.writer.clear_logs(service_id);
             }
-            ctx.ui_tx
-                .send(Event::Started {
+            #[cfg(test)]
+            {
+                if clear_logs {
+                    ctx.test_events
+                        .forward(Event::ClearLogs(service_id.clone()));
+                }
+                ctx.test_events.forward(Event::Started {
                     service_id: service_id.clone(),
-                })
-                .await?;
+                });
+            }
         }
         Err(err) => {
             tracing::error!(?err, service_id, "failed to start service");
-            runtime.finish_current_run(&service.restart_policy, -1);
-            ctx.ui_tx
-                .send(Event::Exited(service_id.clone(), -1))
-                .await?;
+            runtime.finish_failed_start(&service.restart_policy, run_id, -1);
+            sync_model(ctx.writer, service, runtime);
+            #[cfg(test)]
+            ctx.test_events
+                .forward(Event::Exited(service_id.clone(), -1));
         }
     }
-
-    Ok(())
 }
 
-pub(super) async fn schedule_ready(ctx: &mut ScheduleContext<'_>) -> eyre::Result<()> {
+pub(super) fn schedule_ready(ctx: &mut ScheduleContext<'_>) {
     for (service_id, service) in ctx.services {
         let exited_code = match should_consider_start(ctx, service_id, service) {
             StartCheck::Skip => continue,
@@ -225,8 +237,6 @@ pub(super) async fn schedule_ready(ctx: &mut ScheduleContext<'_>) -> eyre::Resul
             "evaluating service"
         );
 
-        start_service_if_ready(ctx, service_id, service, exited_code).await?;
+        start_service_if_ready(ctx, service_id, service, exited_code);
     }
-
-    Ok(())
 }

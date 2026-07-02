@@ -129,7 +129,6 @@ struct AnsiFilter {
     state: AnsiState,
     esc_seen: bool,
     csi_buf: Vec<u8>,
-    saw_non_sgr_csi: bool,
 }
 
 impl AnsiFilter {
@@ -138,20 +137,14 @@ impl AnsiFilter {
             state: AnsiState::Ground,
             esc_seen: false,
             csi_buf: Vec::new(),
-            saw_non_sgr_csi: false,
         }
-    }
-
-    fn take_saw_non_sgr_csi(&mut self) -> bool {
-        std::mem::take(&mut self.saw_non_sgr_csi)
     }
 
     /// Feed one byte into the filter. Printable text and SGR color
     /// sequences are appended to `out`. Returns `true` when a
-    /// cursor-positioning or screen-clearing CSI sequence just
-    /// finished, signalling the caller to flush accumulated text
-    /// (this turns ncurses-style screen redraws into discrete lines).
-    #[allow(clippy::too_many_lines)]
+    /// screen-clearing CSI sequence just finished, signalling the caller to flush accumulated
+    /// text. Other cursor/progress controls are filtered but do not change the log record mode:
+    /// wrapping belongs to the TUI renderer, not to captured service logs.
     fn push(&mut self, b: u8, out: &mut Vec<u8>) -> bool {
         match self.state {
             AnsiState::Ground => {
@@ -216,7 +209,6 @@ impl AnsiFilter {
                         self.csi_buf.clear();
                         false
                     } else {
-                        self.saw_non_sgr_csi = true;
                         self.csi_buf.clear();
                         matches!(b, b'J')
                     }
@@ -424,10 +416,6 @@ impl RateLimit {
         self.window_start = Instant::now();
         self.sent_in_window = 0;
         self.warned_in_window = false;
-        self.start_snapshot_line();
-    }
-
-    fn start_snapshot_line(&mut self) {
         self.snapshot_id = self.snapshot_id.wrapping_add(1).max(1);
     }
 
@@ -540,7 +528,13 @@ impl LogReaderHandle {
 
     // On Unix this drops the cancellation pipe's write end, waking the reader's poll; other
     // platforms have no such pipe, so cancellation is a no-op and the receiver goes unused there.
-    #[cfg_attr(not(unix), allow(clippy::unused_self))]
+    #[cfg_attr(
+        not(unix),
+        expect(
+            clippy::unused_self,
+            reason = "Unix cancellation consumes an owned pipe fd; unsupported platforms keep the same handle API"
+        )
+    )]
     pub(super) fn cancel(&mut self) {
         #[cfg(unix)]
         {
@@ -694,7 +688,10 @@ struct LogReaderArgs {
     pty_size: Arc<AtomicU32>,
 }
 
-#[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the PTY reader thread owns the terminal emulator and rate-limit state in one loop"
+)]
 fn spawn_log_reader_thread(args: LogReaderArgs) {
     thread::spawn(move || {
         #[derive(Clone)]
@@ -895,7 +892,7 @@ fn spawn_log_reader_thread(args: LogReaderArgs) {
         }
 
         fn finish_stream(
-            interactive: bool,
+            snapshot_mode: bool,
             term: &Term<PtyEventProxy>,
             rate: &mut RateLimit,
             events_tx: &mpsc::Sender<ProcessEvent>,
@@ -903,7 +900,7 @@ fn spawn_log_reader_thread(args: LogReaderArgs) {
             run_id: RunId,
             line: &mut Vec<u8>,
         ) {
-            if interactive {
+            if snapshot_mode {
                 emit_snapshot(term, rate, events_tx, service_id, run_id, true);
             } else {
                 flush(line, events_tx, service_id, run_id);
@@ -943,7 +940,7 @@ fn spawn_log_reader_thread(args: LogReaderArgs) {
         };
         let mut term: Term<PtyEventProxy> = Term::new(config, &size, proxy);
         let mut processor: ansi::Processor<ansi::StdSyncHandler> = ansi::Processor::default();
-        let mut interactive = false;
+        let mut snapshot_mode = false;
         let mut last_snapshot_at: Option<Instant> = None;
         let mut dirty = false;
         let mut last_size = 0u32;
@@ -972,7 +969,7 @@ fn spawn_log_reader_thread(args: LogReaderArgs) {
                 PtyRead::Bytes(n) => n,
                 PtyRead::Eof => {
                     finish_stream(
-                        interactive,
+                        snapshot_mode,
                         &term,
                         &mut rate,
                         &events_tx,
@@ -985,7 +982,7 @@ fn spawn_log_reader_thread(args: LogReaderArgs) {
                 #[cfg(unix)]
                 PtyRead::Cancelled => {
                     finish_stream(
-                        interactive,
+                        snapshot_mode,
                         &term,
                         &mut rate,
                         &events_tx,
@@ -999,7 +996,7 @@ fn spawn_log_reader_thread(args: LogReaderArgs) {
 
             if n == 0 {
                 finish_stream(
-                    interactive,
+                    snapshot_mode,
                     &term,
                     &mut rate,
                     &events_tx,
@@ -1020,11 +1017,14 @@ fn spawn_log_reader_thread(args: LogReaderArgs) {
             if alt_screen != last_alt_screen {
                 last_alt_screen = alt_screen;
                 rate.set_alt_screen(alt_screen);
-                interactive = true;
-                dirty = true;
+                snapshot_mode = alt_screen;
+                dirty = alt_screen;
                 line.clear();
+                // The cleared line discards any partial record, so a CR seen before the mode flip
+                // must not carry over and swallow the next newline once we are back in line mode.
+                prev_was_cr = false;
             }
-            if interactive {
+            if snapshot_mode {
                 dirty = true;
             }
 
@@ -1032,44 +1032,39 @@ fn spawn_log_reader_thread(args: LogReaderArgs) {
                 match b {
                     // \r and \n both terminate a line. A \r\n pair is coalesced (the \r flushes,
                     // the trailing \n is swallowed) so it produces one record, while a lone \n
-                    // still flushes — preserving intentional blank lines. ncurses apps (watch)
-                    // use ESC[B + \r for line breaks; cursor-positioned text is additionally
-                    // flushed by the CSI H/f/J boundary detection in AnsiFilter.
+                    // still flushes — preserving intentional blank lines.
                     b'\r' => {
-                        if !interactive {
+                        if !snapshot_mode {
                             flush_record(&mut line, &events_tx, &service_id, run_id);
                         }
                         prev_was_cr = true;
                     }
                     b'\n' => {
-                        if !interactive && !prev_was_cr {
+                        if !snapshot_mode && !prev_was_cr {
                             flush_record(&mut line, &events_tx, &service_id, run_id);
                         }
                         prev_was_cr = false;
                     }
                     _ => {
                         prev_was_cr = false;
-                        if interactive {
+                        if snapshot_mode {
                             scratch.clear();
                             let _ = filter.push(b, &mut scratch);
                         } else {
                             let boundary = filter.push(b, &mut line);
-                            if boundary || filter.take_saw_non_sgr_csi() {
-                                interactive = true;
-                                dirty = true;
-                                rate.start_snapshot_line();
-                                line.clear();
+                            if boundary {
+                                flush(&mut line, &events_tx, &service_id, run_id);
                             }
                         }
 
-                        if !interactive && line.len() >= 16 * 1024 {
+                        if !snapshot_mode && line.len() >= 16 * 1024 {
                             flush(&mut line, &events_tx, &service_id, run_id);
                         }
                     }
                 }
             }
 
-            if interactive {
+            if snapshot_mode {
                 let interval = Duration::from_millis(250);
                 let now = Instant::now();
                 let due = last_snapshot_at.is_none_or(|t| now.duration_since(t) >= interval);
@@ -1283,7 +1278,10 @@ fn spawn_termination_task(args: TerminationTaskArgs) {
     });
 }
 
-#[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "process startup wires PTY, reader, waiter, and ownership guards in one fallible path"
+)]
 pub(super) fn start_service_with_pty_size(
     service: &Service,
     run_id: RunId,
@@ -1432,16 +1430,6 @@ mod tests {
         rate.set_alt_screen(true);
         assert_eq!(rate.snapshot_id(), 1);
         rate.set_alt_screen(false);
-        assert_eq!(rate.snapshot_id(), 2);
-    }
-
-    #[test]
-    fn rate_limit_boundary_transition_increments_id() {
-        let mut rate = RateLimit::new();
-
-        rate.start_snapshot_line();
-        assert_eq!(rate.snapshot_id(), 1);
-        rate.start_snapshot_line();
         assert_eq!(rate.snapshot_id(), 2);
     }
 

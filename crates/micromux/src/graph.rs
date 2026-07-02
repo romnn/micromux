@@ -77,7 +77,9 @@ mod tests {
             healthcheck: None,
             ports: vec![],
             restart: None,
+            restart_policy: crate::service::RestartPolicy::Never,
             color: None,
+            log_retention: crate::LogRetention::default(),
         }
     }
 

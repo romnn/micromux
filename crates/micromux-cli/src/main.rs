@@ -5,14 +5,17 @@
 //! - Emitting diagnostics.
 //! - Starting the TUI and scheduler.
 
+mod control;
+mod ctl;
 mod logging;
+#[cfg(feature = "mcp")]
+mod mcp;
 mod options;
 
 use clap::Parser;
 use codespan_reporting::diagnostic::Diagnostic;
 use color_eyre::eyre;
 use micromux::{Printer as DiagnosticsPrinter, ToDiagnostics};
-use tokio::sync::mpsc;
 
 fn spawn_shutdown_handler(shutdown: micromux::CancellationToken) {
     tokio::spawn(async move {
@@ -116,19 +119,37 @@ async fn load_config(
         diagnostic_printer.emit(&diagnostic)?;
     }
 
-    let Some(config) = config else {
+    let Some(mut config) = config else {
         eyre::bail!("failed to parse config");
     };
     if has_error {
         eyre::bail!("failed to parse config");
     }
 
+    config.config_path = Some(config_path);
     Ok(config)
 }
 
 async fn run() -> eyre::Result<()> {
     color_eyre::install()?;
-    let options = options::Options::parse();
+    let mut options = options::Options::parse();
+
+    match options.command.take() {
+        Some(options::Command::Ctl { action }) => {
+            return ctl::run(action, options.config_path.as_deref()).await;
+        }
+        #[cfg(feature = "mcp")]
+        Some(options::Command::Mcp) => {
+            // Logs go to a file (never stdout — stdout is the JSON-RPC channel).
+            let _log_guard = setup_logging(&options).ok();
+            return mcp::run().await;
+        }
+        Some(options::Command::Serve) => {
+            return run_headless(options).await;
+        }
+        None => {}
+    }
+
     let shutdown = micromux::CancellationToken::new();
     spawn_shutdown_handler(shutdown.clone());
 
@@ -139,18 +160,39 @@ async fn run() -> eyre::Result<()> {
 
     let config = load_config(&options, color_choice).await?;
 
-    let (ui_tx, ui_rx) = mpsc::channel(1024);
-    let (commands_tx, commands_rx) = mpsc::channel(1024);
-    let mux = micromux::Micromux::new(&config)?;
-    let services = mux.services();
-    let tui = micromux_tui::App::new(&services, ui_rx, commands_tx, shutdown.clone());
+    let mux = std::sync::Arc::new(micromux::Micromux::new(&config)?);
+    let (runner, handles) = mux.clone().start(shutdown.clone());
+
+    // Default-on control plane, opt out via `--no-control` or `control: { enabled: false }`.
+    if !options.no_control && config.config.control_enabled {
+        let working_dir = std::env::current_dir()?;
+        match control::resolve_config_path(options.config_path.as_deref(), &working_dir).await {
+            Ok(config_path) => {
+                control::spawn(
+                    &handles,
+                    &config_path,
+                    &working_dir,
+                    config.config.name.clone(),
+                    shutdown.clone(),
+                );
+            }
+            Err(err) => tracing::warn!(
+                ?err,
+                "control plane disabled: could not resolve config path"
+            ),
+        }
+    }
+
+    let tui = micromux_tui::App::new(
+        handles.reader.clone(),
+        handles.commands.clone(),
+        shutdown.clone(),
+        config.config.ui_config.pretty_json_logs && !options.no_pretty_json_logs,
+    );
 
     let tui_handle = tokio::task::spawn(async move { tui.render().await });
 
-    let mux_handle = tokio::task::spawn({
-        let shutdown = shutdown.clone();
-        async move { mux.start(ui_tx, commands_rx, shutdown).await }
-    });
+    let mux_handle = tokio::task::spawn(runner);
 
     let mut tui_handle = tui_handle;
     let mut mux_handle = mux_handle;
@@ -158,8 +200,9 @@ async fn run() -> eyre::Result<()> {
     tokio::select! {
         render_res = &mut tui_handle => {
             shutdown.cancel();
+            let mux_res = mux_handle.await;
             render_res??;
-            mux_handle.await??;
+            mux_res??;
         }
         mux_res = &mut mux_handle => {
             shutdown.cancel();
@@ -171,6 +214,46 @@ async fn run() -> eyre::Result<()> {
         }
     }
 
+    Ok(())
+}
+
+/// Run the supervisor headless: scheduler + control plane, no TUI, until shutdown (a signal or a
+/// `stop_session`/`Shutdown` request). Intended for agent-managed sessions spawned by the MCP
+/// `start_session` tool.
+async fn run_headless(options: options::Options) -> eyre::Result<()> {
+    let shutdown = micromux::CancellationToken::new();
+    spawn_shutdown_handler(shutdown.clone());
+
+    // Hold the guard for the whole run: dropping it stops the non-blocking log writer.
+    let _log_guard = setup_logging(&options)?;
+    let color_choice = options.color_choice.unwrap_or(termcolor::ColorChoice::Auto);
+    let config = load_config(&options, color_choice).await?;
+
+    let mux = std::sync::Arc::new(micromux::Micromux::new(&config)?);
+    let (runner, handles) = mux.clone().start(shutdown.clone());
+
+    // The control plane is the only way to reach a headless session, so it is mandatory here — the
+    // `--no-control` / `control.enabled` opt-out applies to the TUI, not to `serve`.
+    let working_dir = std::env::current_dir()?;
+    let config_path =
+        control::resolve_config_path(options.config_path.as_deref(), &working_dir).await?;
+    let bound = control::spawn(
+        &handles,
+        &config_path,
+        &working_dir,
+        config.config.name.clone(),
+        shutdown.clone(),
+    );
+    if !bound {
+        // Another live session already owns this project (or there is no transport): a headless
+        // session with no reachable control plane is useless, so don't even start the scheduler.
+        eyre::bail!(
+            "could not start the control plane for `serve` (another micromux may already own this project)"
+        );
+    }
+
+    tracing::info!(config = %config_path.display(), "micromux serve: headless supervisor running");
+    tokio::spawn(runner).await??;
     Ok(())
 }
 

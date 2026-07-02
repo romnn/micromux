@@ -1,8 +1,8 @@
 [package]
-name = "micromux-tui"
+name = "micromux-mcp"
 license-file = "../../LICENSE"
 readme = "../../README.md"
-documentation = "https://docs.rs/micromux-tui"
+documentation = "https://docs.rs/micromux-mcp"
 publish = true
 
 version.workspace = true
@@ -24,29 +24,28 @@ keywords = [
 workspace = true
 
 [dependencies]
-color-eyre.workspace = true
-itertools.workspace = true
-
-# tracing
-tracing.workspace = true
-
-# micromux
 micromux = { path = "../micromux/" }
+micromux-control = { path = "../micromux-control/" }
 
-# serde
+rmcp = { version = "1", features = ["server", "transport-io", "macros"] }
+schemars.workspace = true
+
+serde.workspace = true
 serde_json.workspace = true
+thiserror.workspace = true
+chrono.workspace = true
 
-# tui
-ratatui = { version = "=0.30.2", features = ["unstable-rendered-line-info"] }
-ansi-to-tui = "8"
+regex = "1"
 strip-ansi-escapes.workspace = true
-crossterm = { version = "0.29", features = ["event-stream"] }
 
-# async runtime
 tokio.workspace = true
-futures.workspace = true
+
+# Confirm a stopped session's process is gone (safe `kill(pid, 0)` wrapper).
+[target.'cfg(unix)'.dependencies]
+nix = { workspace = true, features = ["signal"] }
 
 [dev-dependencies]
-codespan-reporting.workspace = true
-indoc.workspace = true
 similar-asserts.workspace = true
+color-eyre.workspace = true
+tempfile.workspace = true
+fs2 = "0.4"

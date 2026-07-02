@@ -27,6 +27,15 @@ workspace = true
 name = "micromux"
 path = "./src/main.rs"
 
+[features]
+default = ["mcp"]
+# The MCP server pulls in the heavy `rmcp` SDK; gate it so
+# `cargo install --no-default-features` yields a lean TUI-only binary.
+mcp = ["dep:micromux-mcp"]
+
+[package.metadata.cargo-fc]
+exclude_features = ["default"]
+
 [dependencies]
 color-eyre.workspace = true
 
@@ -42,6 +51,8 @@ codespan-reporting.workspace = true
 # micromux
 micromux = { path = "../micromux/" }
 micromux-tui = { path = "../micromux-tui/" }
+micromux-control = { path = "../micromux-control/" }
+micromux-mcp = { path = "../micromux-mcp/", optional = true }
 
 # async runtime
 tokio.workspace = true

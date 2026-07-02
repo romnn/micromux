@@ -1,43 +1,32 @@
 //! `micromux-tui` provides the terminal user interface for micromux.
 //!
-//! The main entry point is [`App`]. Most consumers construct an [`App`] from a list of
-//! [`micromux::ServiceDescriptor`] values, then call [`App::render`].
+//! The main entry point is [`App`], constructed from a [`micromux::SessionModelReader`] (the source
+//! of all domain state), a command sender, a shutdown token, and display options; call
+//! [`App::render`] to run it. The TUI holds only view state and reads the model on each
+//! [`micromux::SessionChange`].
 
 mod event;
-mod reducer;
+mod json_log;
 mod render;
 mod state;
 mod style;
 
-/// Re-export of `crossterm` for consumers that need to share types with the TUI.
-pub use crossterm;
-/// Re-export of `ratatui` for consumers that need to share types with the TUI.
-pub use ratatui;
-
 use color_eyre::eyre;
-use futures::StreamExt;
-use micromux::{BoundedLog, Command, Event as SchedulerEvent, ServiceDescriptor};
+use micromux::{ChangeKind, Command, SessionChange, SessionModelReader};
 use ratatui::DefaultTerminal;
+use tokio::sync::broadcast;
 use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
 
-type UiEventStream = futures::stream::Chain<
-    ReceiverStream<SchedulerEvent>,
-    futures::stream::Pending<SchedulerEvent>,
->;
-
-const KIB: usize = 1024;
-const MIB: usize = 1024 * KIB;
-const HEALTHCHECK_HISTORY: usize = 2;
-
-#[derive()]
 /// Terminal application state.
 pub struct App {
     /// Running state of the TUI application.
     running: bool,
     commands_tx: mpsc::Sender<Command>,
     shutdown: micromux::CancellationToken,
-    ui_rx: UiEventStream,
+    /// Read capability over the authoritative session model — the single source of domain state.
+    reader: SessionModelReader,
+    /// Liveness-only change notifications; the TUI re-queries the model for content.
+    changes: broadcast::Receiver<SessionChange>,
     /// Event handler
     input_event_handler: event::InputHandler,
     /// Current state
@@ -46,6 +35,7 @@ pub struct App {
     log_view: crate::render::log_view::LogView,
     healthcheck_view: crate::render::log_view::LogView,
     show_healthcheck_pane: bool,
+    pretty_json_logs: bool,
     attach_mode: bool,
     focus: Focus,
     terminal_cols: u16,
@@ -65,35 +55,27 @@ enum Focus {
 }
 
 impl App {
-    /// Construct a new [`App`].
+    /// Construct a new [`App`] over the authoritative session model.
     #[must_use]
     pub fn new(
-        services: &[ServiceDescriptor],
-        ui_rx: mpsc::Receiver<SchedulerEvent>,
+        reader: SessionModelReader,
         commands_tx: mpsc::Sender<Command>,
         shutdown: micromux::CancellationToken,
+        pretty_json_logs: bool,
     ) -> Self {
-        let ui_rx = ReceiverStream::new(ui_rx).chain(futures::stream::pending());
+        let changes = reader.subscribe();
+        let snapshots = reader.services();
 
-        let services = services
-            .iter()
-            .map(|service| {
-                let service_state = state::Service {
-                    id: service.id.clone(),
-                    exec_state: state::Execution::Pending,
-                    open_ports: service.open_ports.clone(),
-                    logs: BoundedLog::with_limits(1000, 64 * MIB).into(),
-                    live_snapshot_id: None,
-                    cached_num_lines: 0,
-                    cached_logs: String::new(),
-                    logs_dirty: true,
-                    healthcheck_configured: service.healthcheck_configured,
-                    healthcheck_attempts: std::collections::VecDeque::new(),
-                    healthcheck_cached_num_lines: 0,
-                    healthcheck_cached_text: String::new(),
-                    healthcheck_dirty: true,
-                };
-                (service.id.clone(), service_state)
+        let services = snapshots
+            .into_iter()
+            .map(|snapshot| state::Service {
+                snapshot,
+                cached_num_lines: 0,
+                cached_logs: String::new(),
+                logs_dirty: true,
+                healthcheck_cached_num_lines: 0,
+                healthcheck_cached_text: String::new(),
+                healthcheck_dirty: true,
             })
             .collect();
 
@@ -104,12 +86,14 @@ impl App {
             running: true,
             commands_tx,
             shutdown,
-            ui_rx,
+            reader,
+            changes,
             input_event_handler: event::InputHandler::new(),
             state: state::State::new(services),
             log_view,
             healthcheck_view,
             show_healthcheck_pane: false,
+            pretty_json_logs,
             attach_mode: false,
             focus: Focus::Services,
             terminal_cols: 80,
@@ -198,10 +182,11 @@ impl App {
     /// - Receiving an input event fails.
     /// - The underlying terminal backend fails to draw.
     pub async fn run(mut self, mut terminal: DefaultTerminal) -> eyre::Result<()> {
-        #[derive(Debug, strum::Display)]
-        enum Event {
+        enum Wake {
             Input(event::Input),
-            Scheduler(SchedulerEvent),
+            Change(SessionChange),
+            /// The change broadcast lagged (or this is the initial draw): re-read everything.
+            Resync,
         }
 
         let area = terminal.size()?;
@@ -209,52 +194,80 @@ impl App {
         self.terminal_rows = area.height;
         self.maybe_resize_pty();
 
+        // Seed the view from the model before the first frame.
+        self.resync();
+        terminal.draw(|frame| frame.render_widget(&mut self, frame.area()))?;
+
         while self.is_running() {
-            // Wait until an (input) event is received.
-            let event = tokio::select! {
+            let wake = tokio::select! {
                 () = self.shutdown.cancelled() => None,
-                input = self.input_event_handler.next() => Some(Event::Input(input?)),
-                event = self.ui_rx.next() => event.map(Event::Scheduler),
+                input = self.input_event_handler.next() => Some(Wake::Input(input?)),
+                change = self.changes.recv() => match change {
+                    Ok(change) => Some(Wake::Change(change)),
+                    Err(broadcast::error::RecvError::Lagged(_)) => Some(Wake::Resync),
+                    Err(broadcast::error::RecvError::Closed) => None,
+                },
             };
 
-            match &event {
-                Some(Event::Input(event)) if !event.is_tick() => {
-                    tracing::trace!(%event, "received event");
-                }
-                Some(Event::Scheduler(event)) => {
-                    tracing::debug!(%event, "received event");
-                }
-                _ => {}
-            }
-
-            match event {
-                Some(Event::Input(event)) => {
-                    self.handle_input_event(event);
-                    terminal.draw(|frame| frame.render_widget(&mut self, frame.area()))?;
-                }
-                Some(Event::Scheduler(event)) => {
-                    self.handle_event(event);
-                    terminal.draw(|frame| frame.render_widget(&mut self, frame.area()))?;
-                }
+            match wake {
+                Some(Wake::Input(event)) => self.handle_input_event(event),
+                Some(Wake::Change(change)) => self.apply_change(&change),
+                Some(Wake::Resync) => self.resync(),
                 None => {
                     self.running = false;
+                    continue;
                 }
             }
+            terminal.draw(|frame| frame.render_widget(&mut self, frame.area()))?;
         }
         Ok(())
     }
 
-    fn handle_event(&mut self, event: SchedulerEvent) {
-        reducer::apply(&mut self.state, event);
+    /// Apply a single liveness notification by re-querying the model for the affected service. The
+    /// broadcast carries only `{service_id, kind}`; the content lives in the model.
+    fn apply_change(&mut self, change: &SessionChange) {
+        match change.kind {
+            ChangeKind::Status => {
+                if let Some(snapshot) = self.reader.service(&change.service_id)
+                    && let Some(service) = self.service_mut(&change.service_id)
+                {
+                    service.snapshot = snapshot;
+                }
+            }
+            ChangeKind::Logs => {
+                if let Some(service) = self.service_mut(&change.service_id) {
+                    service.logs_dirty = true;
+                }
+            }
+            ChangeKind::Health => {
+                if let Some(service) = self.service_mut(&change.service_id) {
+                    service.healthcheck_dirty = true;
+                }
+            }
+        }
+    }
+
+    /// Re-read every service snapshot and mark caches dirty (used on first draw and after a lag).
+    fn resync(&mut self) {
+        for snapshot in self.reader.services() {
+            if let Some(service) = self.service_mut(&snapshot.id) {
+                service.snapshot = snapshot;
+                service.logs_dirty = true;
+                service.healthcheck_dirty = true;
+            }
+        }
+    }
+
+    fn service_mut(&mut self, id: &str) -> Option<&mut state::Service> {
+        self.state
+            .services
+            .iter_mut()
+            .find(|service| service.snapshot.id == id)
     }
 
     fn handle_input_event(&mut self, input_event: event::Input) {
-        match input_event {
-            // Ticks exist only to drive a periodic redraw, which the run loop already does
-            // after handling any input event.
-            event::Input::Tick => {}
-            event::Input::Event(event) => self.handle_crossterm_event(&event),
-        }
+        let event::Input::Event(event) = input_event;
+        self.handle_crossterm_event(&event);
     }
 
     fn handle_crossterm_event(&mut self, event: &crossterm::event::Event) {
@@ -341,7 +354,7 @@ impl App {
                 if let Some(bytes) = key_event_to_bytes(key.code, key.modifiers)
                     && let Some(service) = self.state.current_service()
                 {
-                    let service_id = service.id.clone();
+                    let service_id = service.snapshot.id.clone();
                     let _ = self
                         .commands_tx
                         .try_send(Command::SendInput(service_id, bytes));
@@ -495,10 +508,10 @@ impl App {
         let Some(service) = self.state.current_service() else {
             return;
         };
-        tracing::info!(service_id = service.id, "disabling service");
-        let command = match service.exec_state {
-            state::Execution::Disabled => Command::Enable(service.id.clone()),
-            _ => Command::Disable(service.id.clone()),
+        tracing::info!(service_id = service.snapshot.id, "disabling service");
+        let command = match service.snapshot.desired {
+            micromux::Desired::Disabled => Command::enable(service.snapshot.id.clone()),
+            micromux::Desired::Enabled => Command::disable(service.snapshot.id.clone()),
         };
         let _ = self.commands_tx.try_send(command);
     }
@@ -508,21 +521,16 @@ impl App {
         let Some(service) = self.state.current_service() else {
             return;
         };
-        tracing::info!(service_id = service.id, "restarting service");
-        if service.exec_state == state::Execution::Disabled {
-            let _ = self
-                .commands_tx
-                .try_send(Command::Enable(service.id.clone()));
-        }
+        tracing::info!(service_id = service.snapshot.id, "restarting service");
         let _ = self
             .commands_tx
-            .try_send(Command::Restart(service.id.clone()));
+            .try_send(Command::restart(service.snapshot.id.clone()));
     }
 
     /// Restart all services
     fn restart_all_services(&self) {
         tracing::info!("restarting all services");
-        let _ = self.commands_tx.try_send(Command::RestartAll);
+        let _ = self.commands_tx.try_send(Command::restart_all());
     }
 }
 
@@ -709,15 +717,21 @@ mod tests {
         let mut diagnostics: Vec<Diagnostic<usize>> = vec![];
         let parsed = micromux::from_str(yaml, Path::new("."), 0usize, None, &mut diagnostics)
             .map_err(|err| color_eyre::eyre::eyre!(err.to_string()))?;
-        let mux = micromux::Micromux::new(&parsed)
-            .map_err(|err| color_eyre::eyre::eyre!(err.to_string()))?;
-        let services = mux.services();
-
-        let (_ui_tx, ui_rx) = mpsc::channel(1);
-        let (cmd_tx, _cmd_rx) = mpsc::channel(1);
+        let mux = std::sync::Arc::new(
+            micromux::Micromux::new(&parsed)
+                .map_err(|err| color_eyre::eyre::eyre!(err.to_string()))?,
+        );
         let shutdown = micromux::CancellationToken::new();
+        // The runner is not spawned; the model reader is seeded with initial snapshots and is all
+        // the focus test needs.
+        let (_runner, handles) = mux.start(shutdown.clone());
 
-        let mut app = App::new(&services, ui_rx, cmd_tx, shutdown);
+        let mut app = App::new(
+            handles.reader.clone(),
+            handles.commands.clone(),
+            shutdown,
+            true,
+        );
         app.focus = Focus::Services;
         app.show_healthcheck_pane = false;
 
@@ -734,6 +748,45 @@ mod tests {
         assert_eq!(app.focus, Focus::Healthcheck);
         app.handle_input_event(tab_press());
         assert_eq!(app.focus, Focus::Services);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn restart_key_on_disabled_service_does_not_send_enable() -> color_eyre::eyre::Result<()>
+    {
+        let yaml = indoc! {r#"
+            version: 1
+            services:
+              svc:
+                command: ["sh", "-c", "true"]
+        "#};
+        let mut diagnostics: Vec<Diagnostic<usize>> = vec![];
+        let parsed = micromux::from_str(yaml, Path::new("."), 0usize, None, &mut diagnostics)
+            .map_err(|err| color_eyre::eyre::eyre!(err.to_string()))?;
+        let mux = std::sync::Arc::new(
+            micromux::Micromux::new(&parsed)
+                .map_err(|err| color_eyre::eyre::eyre!(err.to_string()))?,
+        );
+        let shutdown = micromux::CancellationToken::new();
+        let (_runner, handles) = mux.start(shutdown.clone());
+        let (commands_tx, mut commands_rx) = mpsc::channel(4);
+
+        let mut app = App::new(handles.reader.clone(), commands_tx, shutdown, true);
+        if let Some(service) = app.state.current_service_mut() {
+            service.snapshot.desired = micromux::Desired::Disabled;
+        }
+
+        app.restart_current_service();
+
+        match commands_rx.try_recv()? {
+            micromux::Command::Restart { service, .. } => assert_eq!(service, "svc"),
+            other => color_eyre::eyre::bail!("expected restart command, got {other:?}"),
+        }
+        assert!(matches!(
+            commands_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
 
         Ok(())
     }

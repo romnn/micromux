@@ -9,11 +9,13 @@
 pub mod v1;
 
 use crate::diagnostics::{DiagnosticExt, Span, ToDiagnostics};
+use crate::model::LogRetention;
 use crate::service::RestartPolicy;
 use codespan_reporting::diagnostic::{Diagnostic, Label};
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use yaml_spanned::{Spanned, Value};
 
 /// Parse a value into a typed, spanned value.
@@ -129,17 +131,46 @@ pub enum Version {
 }
 
 /// User-interface related configuration.
-#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct UiConfig {
     /// Optional desired UI width.
     pub width: Option<Spanned<usize>>,
+    /// Render structured JSON logs as compact colored log lines in the TUI.
+    pub pretty_json_logs: bool,
+}
+
+impl Default for UiConfig {
+    fn default() -> Self {
+        Self {
+            width: None,
+            pretty_json_logs: true,
+        }
+    }
 }
 
 /// Parsed configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
+// `ui_config` predates the other fields and is public API; renaming it to satisfy the
+// suffix-repeats-the-struct-name heuristic is not worth the churn.
+#[expect(
+    clippy::struct_field_names,
+    reason = "the public field name predates this lint and renaming it would churn the config API"
+)]
 pub struct Config {
+    /// Optional session name, surfaced as the session identity to agents. Falls back to
+    /// `basename(working_dir)` when unset.
+    pub name: Option<String>,
     /// Configuration for the UI.
     pub ui_config: UiConfig,
+    /// Whether the agent control plane is enabled (default `true`; opt out with
+    /// `control: { enabled: false }`).
+    pub control_enabled: bool,
+    /// Retention limits for service logs exposed to the TUI/control plane/MCP.
+    pub log_retention: LogRetention,
+    /// Default restart policy inherited by services that do not set `restart`.
+    pub restart_policy: RestartPolicy,
+    /// Default healthcheck timing inherited by services that configure a healthcheck test.
+    pub healthcheck_defaults: HealthCheckDefaults,
     /// Service definitions keyed by service name.
     pub services: IndexMap<Spanned<String>, Service>,
 }
@@ -149,8 +180,12 @@ pub struct Config {
 pub struct ConfigFile<F> {
     /// File identifier used in diagnostics.
     pub file_id: F,
+    /// Path of the loaded config file, when it came from disk.
+    pub config_path: Option<PathBuf>,
     /// Directory the config was loaded from.
     pub config_dir: PathBuf,
+    /// Strict-mode override supplied by the caller (for example CLI `--strict`).
+    pub strict_override: Option<bool>,
     /// Parsed config contents.
     pub config: Config,
 }
@@ -220,10 +255,27 @@ pub struct Service {
     pub healthcheck: Option<HealthCheck>,
     /// Port mappings / port specs.
     pub ports: Vec<Spanned<String>>,
-    /// Restart policy for this service.
+    /// Raw restart policy configured directly on this service, if any.
     pub restart: Option<RestartPolicy>,
+    /// Effective restart policy after applying the global default.
+    pub restart_policy: RestartPolicy,
     /// Whether this service should be rendered in color.
     pub color: Option<Spanned<bool>>,
+    /// Effective log retention after applying global defaults and this service's overrides.
+    pub log_retention: LogRetention,
+}
+
+/// Healthcheck timing defaults shared by services that define a healthcheck test.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HealthCheckDefaults {
+    /// Optional delay before the first healthcheck.
+    pub start_delay: Option<Spanned<Duration>>,
+    /// Healthcheck interval.
+    pub interval: Option<Spanned<Duration>>,
+    /// Healthcheck timeout.
+    pub timeout: Option<Spanned<Duration>>,
+    /// Number of retries before marking unhealthy.
+    pub retries: Option<Spanned<usize>>,
 }
 
 /// Healthcheck configuration for a service.
@@ -234,28 +286,30 @@ pub struct HealthCheck {
     /// For example, `( "pg_isready", ["-U", "postgres"] )`.
     pub test: (Spanned<String>, Vec<Spanned<String>>),
     /// Optional delay before the first healthcheck.
-    pub start_delay: Option<Spanned<std::time::Duration>>,
+    pub start_delay: Option<Spanned<Duration>>,
     /// Healthcheck interval (e.g. `"30s"`).
-    pub interval: Option<Spanned<std::time::Duration>>,
+    pub interval: Option<Spanned<Duration>>,
     /// Healthcheck timeout (e.g. `"10s"`).
-    pub timeout: Option<Spanned<std::time::Duration>>,
+    pub timeout: Option<Spanned<Duration>>,
     /// Number of retries before marking unhealthy.
     pub retries: Option<Spanned<usize>>,
 }
 
 /// Reason why a command is invalid.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, thiserror::Error)]
 pub enum InvalidCommandReason {
     /// The command string could not be split into an argv-like representation.
+    #[error("could not split command")]
     FailedToSplit,
     /// The command is empty.
+    #[error("command is empty")]
     EmptyCommand,
 }
 
 /// Errors that can occur while parsing configuration.
 #[derive(thiserror::Error, Debug)]
 pub enum ConfigError {
-    #[error("invalid command {command}: {reason:?}")]
+    #[error("invalid command {command}: {reason}")]
     /// A command could not be parsed.
     InvalidCommand {
         /// Raw command string.
@@ -513,6 +567,10 @@ pub fn parse_version<F>(
     }
 }
 
+fn parse_strict(value: &yaml_spanned::Spanned<Value>) -> Result<Option<bool>, ConfigError> {
+    Ok(parse_optional::<bool>(value.get("strict"))?.map(Spanned::into_inner))
+}
+
 /// Parse a micromux configuration from a YAML string.
 ///
 /// # Errors
@@ -523,18 +581,23 @@ pub fn from_str<F: Copy + PartialEq>(
     raw_config: &str,
     config_dir: &Path,
     file_id: F,
-    strict: Option<bool>,
+    strict_override: Option<bool>,
     diagnostics: &mut Vec<Diagnostic<F>>,
 ) -> Result<ConfigFile<F>, ConfigError> {
     let value = yaml_spanned::from_str(raw_config).map_err(ConfigError::Yaml)?;
-    let version = parse_version(&value, file_id, strict, diagnostics)?;
+    let effective_strict = strict_override.or(parse_strict(&value)?);
+    let version = parse_version(&value, file_id, effective_strict, diagnostics)?;
     let config = match version {
-        Version::Latest | Version::V1 => v1::parse_config(&value, file_id, strict, diagnostics)?,
+        Version::Latest | Version::V1 => {
+            v1::parse_config(&value, file_id, strict_override, diagnostics)?
+        }
     };
 
     Ok(ConfigFile {
         file_id,
+        config_path: None,
         config_dir: config_dir.to_path_buf(),
+        strict_override,
         config,
     })
 }
@@ -559,8 +622,6 @@ mod tests {
     fn parse_config_basic_and_special_cases() -> color_eyre::eyre::Result<()> {
         let yaml = indoc! {r#"
             version: "1"
-            ui:
-              width: 80
             services:
               app:
                 # string form command
@@ -598,9 +659,6 @@ mod tests {
         let mut diagnostics = vec![];
         let parsed = super::from_str(yaml, Path::new("."), 0usize, None, &mut diagnostics)?;
         assert!(diagnostics.is_empty());
-
-        // UI config
-        assert_eq!(parsed.config.ui_config.width.as_deref().copied(), Some(80));
 
         // Find services without indexing (clippy::indexing_slicing is denied)
         let app = parsed
@@ -675,6 +733,27 @@ mod tests {
     }
 
     #[test]
+    fn parse_config_ui_options() -> color_eyre::eyre::Result<()> {
+        let yaml = indoc! {r#"
+            version: "1"
+            ui:
+              width: 80
+              pretty_json_logs: false
+            services:
+              app:
+                command: "true"
+        "#};
+
+        let mut diagnostics = vec![];
+        let parsed = super::from_str(yaml, Path::new("."), 0usize, None, &mut diagnostics)?;
+
+        assert!(diagnostics.is_empty());
+        assert_eq!(parsed.config.ui_config.width.as_deref().copied(), Some(80));
+        assert!(!parsed.config.ui_config.pretty_json_logs);
+        Ok(())
+    }
+
+    #[test]
     fn parse_config_missing_version_emits_warning_and_defaults_to_v1()
     -> color_eyre::eyre::Result<()> {
         let yaml = indoc! {r#"
@@ -691,6 +770,31 @@ mod tests {
                 .iter()
                 .any(|d| d.message.contains("missing version"))
         );
+        assert!(
+            parsed
+                .config
+                .services
+                .iter()
+                .any(|(name, _svc)| name.as_ref() == "app")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn config_strict_escalates_early_warnings() -> color_eyre::eyre::Result<()> {
+        let yaml = indoc! {r#"
+            strict: true
+            services:
+              app:
+                command: "echo hello"
+        "#};
+
+        let mut diagnostics = vec![];
+        let parsed = super::from_str(yaml, Path::new("."), 0usize, None, &mut diagnostics)?;
+
+        assert!(diagnostics.iter().any(|d| d.severity
+            == codespan_reporting::diagnostic::Severity::Error
+            && d.message.contains("missing version")));
         assert!(
             parsed
                 .config
@@ -724,6 +828,17 @@ mod tests {
             version: 1
             ui:
               width: 120
+              pretty_json_logs: false
+            logs:
+              retained_runs: 4
+              memory:
+                max_lines: 5000
+                max_bytes: 2097152
+            restart: unless-stopped
+            healthcheck:
+              interval: "15s"
+              timeout: "3s"
+              retries: 2
             services:
               api:
                 command: ["CMD", "sh", "-c", "echo api"]

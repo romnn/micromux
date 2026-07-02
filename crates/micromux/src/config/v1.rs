@@ -1,6 +1,11 @@
-use super::{Config, ConfigError, Service, UiConfig, parse, parse_duration, parse_optional};
+use super::{
+    Config, ConfigError, HealthCheckDefaults, Service, UiConfig, parse, parse_duration,
+    parse_optional,
+};
 use crate::diagnostics::DiagnosticExt;
-use crate::{config::InvalidCommandReason, service::RestartPolicy};
+use crate::{
+    DiskLogRetention, LogLimit, LogRetention, config::InvalidCommandReason, service::RestartPolicy,
+};
 use codespan_reporting::diagnostic::{Diagnostic, Label};
 use indexmap::IndexMap;
 use itertools::Itertools;
@@ -21,6 +26,26 @@ const KNOWN_SERVICE_KEYS: &[&str] = &[
     "ports",
     "restart",
     "color",
+    "logs",
+];
+
+const KNOWN_HEALTHCHECK_TIMING_KEYS: &[&str] = &[
+    "start_delay",
+    "startup_delay",
+    "initial_delay",
+    "interval",
+    "timeout",
+    "retries",
+];
+
+const KNOWN_HEALTHCHECK_KEYS: &[&str] = &[
+    "test",
+    "start_delay",
+    "startup_delay",
+    "initial_delay",
+    "interval",
+    "timeout",
+    "retries",
 ];
 
 /// Warn (or, in strict mode, error) about mapping keys that the parser does not recognize.
@@ -227,10 +252,7 @@ fn parse_ports(mapping: &yaml_spanned::Mapping) -> Result<Vec<Spanned<String>>, 
     Ok(ports)
 }
 
-fn parse_restart(mapping: &yaml_spanned::Mapping) -> Result<Option<RestartPolicy>, ConfigError> {
-    let Some(value) = mapping.get("restart") else {
-        return Ok(None);
-    };
+fn parse_restart_value(value: &yaml_spanned::Spanned<Value>) -> Result<RestartPolicy, ConfigError> {
     let raw = parse_string_value(value, "restart must be a string")?;
     let normalized = raw.trim().to_ascii_lowercase();
     let policy = match normalized.as_str() {
@@ -266,7 +288,11 @@ fn parse_restart(mapping: &yaml_spanned::Mapping) -> Result<Option<RestartPolicy
             }
         }
     };
-    Ok(Some(policy))
+    Ok(policy)
+}
+
+fn parse_restart(mapping: &yaml_spanned::Mapping) -> Result<Option<RestartPolicy>, ConfigError> {
+    mapping.get("restart").map(parse_restart_value).transpose()
 }
 
 pub fn expect_sequence<'a>(
@@ -323,9 +349,178 @@ pub fn parse_ui_config<F: Copy>(
         return Ok(UiConfig::default());
     };
     let (_span, mapping) = expect_mapping(value, "ui config must be a mapping".into())?;
-    warn_unknown_keys(mapping, &["width"], "ui", file_id, strict, diagnostics);
+    warn_unknown_keys(
+        mapping,
+        &["width", "pretty_json_logs"],
+        "ui",
+        file_id,
+        strict,
+        diagnostics,
+    );
     let width = parse_optional::<usize>(mapping.get("width"))?;
-    Ok(UiConfig { width })
+    let pretty_json_logs = parse_optional::<bool>(mapping.get("pretty_json_logs"))?
+        .map(Spanned::into_inner)
+        .unwrap_or(true);
+    Ok(UiConfig {
+        width,
+        pretty_json_logs,
+    })
+}
+
+/// Parse the optional top-level `control: { enabled: <bool> }` section. Defaults to enabled.
+pub fn parse_control_enabled<F: Copy>(
+    value: &yaml_spanned::Spanned<Value>,
+    file_id: F,
+    strict: bool,
+    diagnostics: &mut Vec<Diagnostic<F>>,
+) -> Result<bool, ConfigError> {
+    let Some(value) = value.get("control") else {
+        return Ok(true);
+    };
+    let (_span, mapping) = expect_mapping(value, "control config must be a mapping".into())?;
+    warn_unknown_keys(
+        mapping,
+        &["enabled"],
+        "control",
+        file_id,
+        strict,
+        diagnostics,
+    );
+    let enabled = parse_optional::<bool>(mapping.get("enabled"))?;
+    Ok(match enabled {
+        Some(spanned) => spanned.into_inner(),
+        None => true,
+    })
+}
+
+fn parse_positive_usize(
+    value: &yaml_spanned::Spanned<Value>,
+    field: &str,
+) -> Result<usize, ConfigError> {
+    let parsed = parse::<usize>(value)?;
+    let parsed = parsed.into_inner();
+    if parsed == 0 {
+        return Err(ConfigError::InvalidValue {
+            message: format!("{field} must be greater than zero"),
+            span: value.span().into(),
+        });
+    }
+    Ok(parsed)
+}
+
+fn parse_log_limit(
+    value: &yaml_spanned::Spanned<Value>,
+    field: &str,
+) -> Result<LogLimit, ConfigError> {
+    if let Some(raw) = value.as_str() {
+        let normalized = raw.trim().to_ascii_lowercase();
+        if matches!(normalized.as_str(), "unbounded" | "unlimited" | "none") {
+            return Ok(LogLimit::Unbounded);
+        }
+    }
+    Ok(LogLimit::bounded(parse_positive_usize(value, field)?))
+}
+
+fn warn_overridden_log_alias<F: Copy>(
+    mapping: &Mapping,
+    memory: &Mapping,
+    key: &str,
+    file_id: F,
+    strict: bool,
+    diagnostics: &mut Vec<Diagnostic<F>>,
+) {
+    let Some(alias_value) = mapping.get(key) else {
+        return;
+    };
+    let Some(memory_value) = memory.get(key) else {
+        return;
+    };
+
+    diagnostics.push(
+        Diagnostic::warning_or_error(strict)
+            .with_message(format!("logs.{key} is overridden by logs.memory.{key}"))
+            .with_labels(vec![
+                Label::primary(file_id, memory_value.span)
+                    .with_message("this nested value is used"),
+                Label::secondary(file_id, alias_value.span).with_message("this alias is ignored"),
+            ]),
+    );
+}
+
+/// Parse a `logs` config block and apply any specified values to `base`.
+fn parse_log_retention<F: Copy>(
+    value: Option<&yaml_spanned::Spanned<Value>>,
+    base: LogRetention,
+    file_id: F,
+    strict: bool,
+    diagnostics: &mut Vec<Diagnostic<F>>,
+) -> Result<LogRetention, ConfigError> {
+    let Some(value) = value else {
+        return Ok(base);
+    };
+    let (_span, mapping) = expect_mapping(value, "logs config must be a mapping".into())?;
+    warn_unknown_keys(
+        mapping,
+        &[
+            "retained_runs",
+            "runs",
+            "history",
+            "max_lines",
+            "max_bytes",
+            "memory",
+        ],
+        "logs",
+        file_id,
+        strict,
+        diagnostics,
+    );
+
+    let mut retention = base;
+    if let Some(value) = mapping
+        .get("retained_runs")
+        .or_else(|| mapping.get("runs"))
+        .or_else(|| mapping.get("history"))
+    {
+        retention.disk = DiskLogRetention {
+            retained_runs: parse_positive_usize(value, "retained_runs")?,
+        };
+    }
+
+    let memory = mapping
+        .get("memory")
+        .map(|memory| {
+            expect_mapping(memory, "logs.memory must be a mapping".into())
+                .map(|(_span, memory)| memory)
+        })
+        .transpose()?;
+
+    if let Some(value) = mapping.get("max_lines") {
+        retention.memory.max_lines = parse_log_limit(value, "max_lines")?;
+    }
+    if let Some(value) = mapping.get("max_bytes") {
+        retention.memory.max_bytes = parse_log_limit(value, "max_bytes")?;
+    }
+
+    if let Some(memory) = memory {
+        warn_unknown_keys(
+            memory,
+            &["max_lines", "max_bytes"],
+            "logs.memory",
+            file_id,
+            strict,
+            diagnostics,
+        );
+        warn_overridden_log_alias(mapping, memory, "max_lines", file_id, strict, diagnostics);
+        warn_overridden_log_alias(mapping, memory, "max_bytes", file_id, strict, diagnostics);
+        if let Some(value) = memory.get("max_lines") {
+            retention.memory.max_lines = parse_log_limit(value, "memory.max_lines")?;
+        }
+        if let Some(value) = memory.get("max_bytes") {
+            retention.memory.max_bytes = parse_log_limit(value, "memory.max_bytes")?;
+        }
+    }
+
+    Ok(retention)
 }
 
 fn invalid_empty_command(raw_command: &str, span: yaml_spanned::spanned::Span) -> ConfigError {
@@ -498,11 +693,6 @@ pub fn parse_command(
                 .collect::<Vec<_>>();
 
             normalize_command(&command, raw_command.as_str(), *span)
-
-            // Ok(Spanned {
-            //     span: *span,
-            //     inner: command,
-            // })
         }
         Spanned {
             span,
@@ -530,8 +720,12 @@ pub fn parse_command(
     }
 }
 
-pub fn parse_health_check(
+fn parse_health_check<F: Copy>(
     mapping: &yaml_spanned::Mapping,
+    defaults: &HealthCheckDefaults,
+    file_id: F,
+    strict: bool,
+    diagnostics: &mut Vec<Diagnostic<F>>,
 ) -> Result<Option<super::HealthCheck>, ConfigError> {
     mapping
         .get("healthcheck")
@@ -544,6 +738,14 @@ pub fn parse_health_check(
                     expected: vec![Kind::Mapping],
                     span: value.span().into(),
                 })?;
+            warn_unknown_keys(
+                healthcheck,
+                KNOWN_HEALTHCHECK_KEYS,
+                "healthcheck",
+                file_id,
+                strict,
+                diagnostics,
+            );
             let test = match healthcheck.get("test") {
                 None => Err(ConfigError::MissingKey {
                     key: "test".to_string(),
@@ -557,10 +759,14 @@ pub fn parse_health_check(
                     .get("start_delay")
                     .or_else(|| healthcheck.get("startup_delay"))
                     .or_else(|| healthcheck.get("initial_delay")),
-            )?;
-            let interval = parse_duration(healthcheck.get("interval"))?;
-            let retries = parse_optional::<usize>(healthcheck.get("retries"))?;
-            let timeout = parse_duration(healthcheck.get("timeout"))?;
+            )?
+            .or_else(|| defaults.start_delay.clone());
+            let interval =
+                parse_duration(healthcheck.get("interval"))?.or_else(|| defaults.interval.clone());
+            let retries = parse_optional::<usize>(healthcheck.get("retries"))?
+                .or_else(|| defaults.retries.clone());
+            let timeout =
+                parse_duration(healthcheck.get("timeout"))?.or_else(|| defaults.timeout.clone());
             Ok(super::HealthCheck {
                 test,
                 start_delay,
@@ -572,9 +778,48 @@ pub fn parse_health_check(
         .transpose()
 }
 
-pub fn parse_service<F: Copy>(
+fn parse_healthcheck_defaults<F: Copy>(
+    value: &yaml_spanned::Spanned<Value>,
+    file_id: F,
+    strict: bool,
+    diagnostics: &mut Vec<Diagnostic<F>>,
+) -> Result<HealthCheckDefaults, ConfigError> {
+    let Some(value) = value.get("healthcheck") else {
+        return Ok(HealthCheckDefaults::default());
+    };
+    let (_span, mapping) = expect_mapping(value, "healthcheck defaults must be a mapping".into())?;
+    warn_unknown_keys(
+        mapping,
+        KNOWN_HEALTHCHECK_TIMING_KEYS,
+        "healthcheck defaults",
+        file_id,
+        strict,
+        diagnostics,
+    );
+    Ok(HealthCheckDefaults {
+        start_delay: parse_duration(
+            mapping
+                .get("start_delay")
+                .or_else(|| mapping.get("startup_delay"))
+                .or_else(|| mapping.get("initial_delay")),
+        )?,
+        interval: parse_duration(mapping.get("interval"))?,
+        timeout: parse_duration(mapping.get("timeout"))?,
+        retries: parse_optional::<usize>(mapping.get("retries"))?,
+    })
+}
+
+#[derive(Clone, Copy)]
+struct ServiceDefaults<'a> {
+    log_retention: LogRetention,
+    restart_policy: &'a RestartPolicy,
+    healthcheck: &'a HealthCheckDefaults,
+}
+
+fn parse_service<F: Copy>(
     value: &yaml_spanned::Spanned<Value>,
     name: &yaml_spanned::Spanned<String>,
+    defaults: ServiceDefaults<'_>,
     file_id: F,
     strict: bool,
     diagnostics: &mut Vec<Diagnostic<F>>,
@@ -603,13 +848,24 @@ pub fn parse_service<F: Copy>(
         }),
         Some(value) => parse_command(value),
     }?;
-    let healthcheck = parse_health_check(mapping)?;
+    let healthcheck =
+        parse_health_check(mapping, defaults.healthcheck, file_id, strict, diagnostics)?;
 
     let env_file = parse_env_file(mapping)?;
     let environment = parse_environment(mapping)?;
     let depends_on = parse_depends_on(mapping)?;
     let ports = parse_ports(mapping)?;
     let restart = parse_restart(mapping)?;
+    let restart_policy = restart
+        .clone()
+        .unwrap_or_else(|| defaults.restart_policy.clone());
+    let log_retention = parse_log_retention(
+        mapping.get("logs"),
+        defaults.log_retention,
+        file_id,
+        strict,
+        diagnostics,
+    )?;
 
     Ok(Service {
         name,
@@ -621,12 +877,15 @@ pub fn parse_service<F: Copy>(
         healthcheck,
         ports,
         restart,
+        restart_policy,
         color,
+        log_retention,
     })
 }
 
-pub fn parse_services<F: Copy>(
+fn parse_services<F: Copy>(
     value: &yaml_spanned::Spanned<Value>,
+    defaults: ServiceDefaults<'_>,
     file_id: F,
     strict: bool,
     diagnostics: &mut Vec<Diagnostic<F>>,
@@ -657,7 +916,8 @@ pub fn parse_services<F: Copy>(
                 .iter()
                 .map(|(name, service)| {
                     let name = parse::<String>(name)?;
-                    let service = parse_service(service, &name, file_id, strict, diagnostics)?;
+                    let service =
+                        parse_service(service, &name, defaults, file_id, strict, diagnostics)?;
                     Ok::<_, ConfigError>((name, service))
                 })
                 .collect::<Result<Vec<(Spanned<String>, Service)>, _>>()?
@@ -669,28 +929,47 @@ pub fn parse_services<F: Copy>(
 }
 
 pub fn parse_config<F: Copy + PartialEq>(
-    // name: Spanned<String>,
-    // config_span: Option<yaml_spanned::spanned::Span>,
     value: &yaml_spanned::Spanned<Value>,
     file_id: F,
     strict_override: Option<bool>,
     diagnostics: &mut Vec<Diagnostic<F>>,
 ) -> Result<Config, ConfigError> {
-    // let strict_config = parse_optional::<bool>(value.get("strict"))?.map(Spanned::into_inner);
-    let strict = strict_override.unwrap_or(false);
+    let strict_config = super::parse_strict(value)?;
+    let strict = strict_override.or(strict_config).unwrap_or(false);
+    let name = parse_optional::<String>(value.get("name"))?.map(Spanned::into_inner);
     let ui_config = parse_ui_config(value, file_id, strict, diagnostics)?;
-    let services = parse_services(value, file_id, strict, diagnostics)?;
-    // let template_engine = parse_optional::<model::TemplateEngine>(
-    //     value.get("engine").or_else(|| value.get("template_engine")),
-    // )?;
-    // let check_templates =
-    //     parse_optional::<bool>(value.get("check_templates"))?.map(Spanned::into_inner);
-    // let inputs = parse_inputs(value, config_span, file_id, strict, diagnostics)?;
-    // let outputs = parse_outputs(value, config_span, file_id, strict, diagnostics)?;
-
-    // let config = Config { version, services };
+    let control_enabled = parse_control_enabled(value, file_id, strict, diagnostics)?;
+    let restart_policy = value
+        .get("restart")
+        .map(parse_restart_value)
+        .transpose()?
+        .unwrap_or_default();
+    let healthcheck_defaults = parse_healthcheck_defaults(value, file_id, strict, diagnostics)?;
+    let log_retention = parse_log_retention(
+        value.get("logs"),
+        LogRetention::default(),
+        file_id,
+        strict,
+        diagnostics,
+    )?;
+    let services = parse_services(
+        value,
+        ServiceDefaults {
+            log_retention,
+            restart_policy: &restart_policy,
+            healthcheck: &healthcheck_defaults,
+        },
+        file_id,
+        strict,
+        diagnostics,
+    )?;
     Ok(Config {
+        name,
         ui_config,
+        control_enabled,
+        log_retention,
+        restart_policy,
+        healthcheck_defaults,
         services,
     })
 }
@@ -698,7 +977,7 @@ pub fn parse_config<F: Copy + PartialEq>(
 #[cfg(test)]
 mod tests {
 
-    use crate::config;
+    use crate::{LogLimit, LogRetention, config};
     use codespan_reporting::diagnostic::Diagnostic;
     use color_eyre::eyre;
     use indoc::indoc;
@@ -801,7 +1080,7 @@ mod tests {
         match config::from_str(yaml_bad, Path::new("."), 0, None, &mut diagnostics) {
             Ok(_) => return Err(eyre::eyre!("expected error")),
             Err(config::ConfigError::Serde { .. }) => {}
-            Err(other) => return Err(eyre::eyre!("expected serde error, got {other:?}")),
+            Err(other) => return Err(eyre::eyre!("expected serde error, got {other}")),
         }
 
         Ok(())
@@ -892,6 +1171,200 @@ mod tests {
             "expected unlimited on-failure, got {:?}",
             app.restart
         );
+        Ok(())
+    }
+
+    #[test]
+    fn global_restart_and_healthcheck_defaults_are_inherited() -> eyre::Result<()> {
+        let yaml = indoc! {r#"
+            version: 1
+            restart: unless-stopped
+            healthcheck:
+              start_delay: "1s"
+              interval: "30s"
+              timeout: "5s"
+              retries: 3
+            services:
+              app:
+                command: ["sh", "-c", "true"]
+                healthcheck:
+                  test: ["CMD", "true"]
+                  timeout: "1s"
+              worker:
+                command: ["sh", "-c", "true"]
+                restart: never
+        "#};
+
+        let mut diagnostics: Vec<Diagnostic<usize>> = vec![];
+        let parsed = config::from_str(yaml, Path::new("."), 0, None, &mut diagnostics)?;
+        assert_eq!(
+            parsed.config.restart_policy,
+            crate::service::RestartPolicy::UnlessStopped
+        );
+        assert_eq!(
+            parsed
+                .config
+                .healthcheck_defaults
+                .interval
+                .as_ref()
+                .map(|value| value.as_ref().as_secs()),
+            Some(30)
+        );
+
+        let app = get_service(&parsed.config, "app")?;
+        assert_eq!(app.restart, None);
+        assert_eq!(
+            app.restart_policy,
+            crate::service::RestartPolicy::UnlessStopped
+        );
+        let Some(healthcheck) = app.healthcheck.as_ref() else {
+            return Err(eyre::eyre!("missing healthcheck"));
+        };
+        assert_eq!(
+            healthcheck
+                .start_delay
+                .as_ref()
+                .map(|value| value.as_ref().as_secs()),
+            Some(1)
+        );
+        assert_eq!(
+            healthcheck
+                .interval
+                .as_ref()
+                .map(|value| value.as_ref().as_secs()),
+            Some(30)
+        );
+        assert_eq!(
+            healthcheck
+                .timeout
+                .as_ref()
+                .map(|value| value.as_ref().as_secs()),
+            Some(1)
+        );
+        assert_eq!(
+            healthcheck
+                .retries
+                .as_ref()
+                .map(std::convert::AsRef::as_ref),
+            Some(&3)
+        );
+
+        let worker = get_service(&parsed.config, "worker")?;
+        assert_eq!(worker.restart, Some(crate::service::RestartPolicy::Never));
+        assert_eq!(worker.restart_policy, crate::service::RestartPolicy::Never);
+        assert_eq!(worker.healthcheck, None);
+        Ok(())
+    }
+
+    #[test]
+    fn parses_top_level_name_and_control() -> eyre::Result<()> {
+        let yaml = indoc! {r#"
+            version: 1
+            name: my-project
+            ui:
+              pretty_json_logs: false
+            control:
+              enabled: false
+            logs:
+              retained_runs: 5
+              memory:
+                max_lines: 2000
+                max_bytes: 1048576
+            services:
+              app:
+                command: ["sh", "-c", "true"]
+              worker:
+                command: ["sh", "-c", "true"]
+                logs:
+                  retained_runs: 9
+                  memory:
+                    max_lines: unbounded
+        "#};
+
+        let mut diagnostics: Vec<Diagnostic<usize>> = vec![];
+        let parsed = config::from_str(yaml, Path::new("."), 0, None, &mut diagnostics)?;
+        assert_eq!(parsed.config.name.as_deref(), Some("my-project"));
+        assert!(!parsed.config.ui_config.pretty_json_logs);
+        assert!(!parsed.config.control_enabled);
+        assert_eq!(parsed.config.log_retention.disk.retained_runs, 5);
+        assert_eq!(
+            parsed.config.log_retention.memory.max_lines,
+            LogLimit::Bounded(2000)
+        );
+        assert_eq!(
+            parsed.config.log_retention.memory.max_bytes,
+            LogLimit::Bounded(1_048_576)
+        );
+        let app = get_service(&parsed.config, "app")?;
+        assert_eq!(app.log_retention, parsed.config.log_retention);
+        let worker = get_service(&parsed.config, "worker")?;
+        assert_eq!(worker.log_retention.disk.retained_runs, 9);
+        assert_eq!(worker.log_retention.memory.max_lines, LogLimit::Unbounded);
+        assert_eq!(
+            worker.log_retention.memory.max_bytes,
+            LogLimit::Bounded(1_048_576)
+        );
+
+        // Defaults: no name, control enabled.
+        let yaml = indoc! {r#"
+            version: 1
+            services:
+              app:
+                command: ["sh", "-c", "true"]
+        "#};
+        let mut diagnostics: Vec<Diagnostic<usize>> = vec![];
+        let parsed = config::from_str(yaml, Path::new("."), 0, None, &mut diagnostics)?;
+        assert_eq!(parsed.config.name, None);
+        assert!(parsed.config.ui_config.pretty_json_logs);
+        assert!(parsed.config.control_enabled);
+        assert_eq!(parsed.config.log_retention, LogRetention::default());
+        assert_eq!(
+            parsed.config.restart_policy,
+            crate::service::RestartPolicy::Never
+        );
+        assert_eq!(
+            parsed.config.healthcheck_defaults,
+            config::HealthCheckDefaults::default()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn warns_when_logs_memory_overrides_aliases() -> eyre::Result<()> {
+        let yaml = indoc! {r#"
+            version: 1
+            logs:
+              max_lines: 100
+              max_bytes: 1000
+              memory:
+                max_lines: 200
+                max_bytes: 2000
+            services:
+              app:
+                command: ["sh", "-c", "true"]
+        "#};
+
+        let mut diagnostics: Vec<Diagnostic<usize>> = vec![];
+        let parsed = config::from_str(yaml, Path::new("."), 0, None, &mut diagnostics)?;
+
+        assert_eq!(
+            parsed.config.log_retention.memory.max_lines,
+            LogLimit::Bounded(200)
+        );
+        assert_eq!(
+            parsed.config.log_retention.memory.max_bytes,
+            LogLimit::Bounded(2000)
+        );
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("logs.max_lines is overridden by logs.memory.max_lines")
+        }));
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("logs.max_bytes is overridden by logs.memory.max_bytes")
+        }));
         Ok(())
     }
 

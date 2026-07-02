@@ -5,6 +5,7 @@ use yaml_spanned::Spanned;
 use crate::{
     config::{self},
     env,
+    model::LogRetention,
     scheduler::ServiceID,
 };
 
@@ -52,7 +53,9 @@ mod tests {
             healthcheck: None,
             ports: vec![],
             restart: None,
+            restart_policy: crate::service::RestartPolicy::Never,
             color: None,
+            log_retention: LogRetention::default(),
         }
     }
 
@@ -168,12 +171,29 @@ mod tests {
     }
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug,
+    Default,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+    schemars::JsonSchema,
+)]
+/// How a service should be restarted after it exits.
 pub enum RestartPolicy {
+    /// Always restart the service when it exits.
     Always,
+    /// Restart the service unless it was explicitly stopped.
     UnlessStopped,
+    /// Never restart the service automatically.
     #[default]
     Never,
+    /// Restart only after a non-zero exit.
     OnFailure {
         /// Maximum number of automatic restarts after a non-zero exit.
         ///
@@ -196,7 +216,7 @@ impl std::fmt::Display for RestartPolicy {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Service {
     pub id: ServiceID,
     pub name: Spanned<String>,
@@ -208,6 +228,7 @@ pub struct Service {
     pub health_check: Option<config::HealthCheck>,
     pub open_ports: Vec<u16>,
     pub enable_color: bool,
+    pub log_retention: LogRetention,
 }
 
 impl Service {
@@ -281,11 +302,12 @@ impl Service {
             ),
             working_dir,
             open_ports,
-            restart_policy: config.restart.unwrap_or_default(),
+            restart_policy: config.restart_policy,
             depends_on: config.depends_on,
             environment,
             health_check: config.healthcheck,
             enable_color: config.color.as_deref().copied().unwrap_or(true),
+            log_retention: config.log_retention,
         })
     }
 }
