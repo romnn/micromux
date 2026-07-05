@@ -2,7 +2,7 @@
 CARGO_WORKSPACE_DIR = { value = "", relative = true }
 
 [alias]
-clippy-wrapper = "run --package clippy-wrapper --"
+clippy-wrapper = "run -q --package clippy-wrapper --"
 
 # linting
 lint = "clippy-wrapper lint"
