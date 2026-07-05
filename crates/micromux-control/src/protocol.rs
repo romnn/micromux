@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 
 /// The control protocol version. Bumped on any envelope change. The session and proxy are expected
 /// to be from the same build; a mismatch is a hard error, not a negotiation.
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 
 /// A request from a client (the `micromux ctl` CLI or the MCP proxy) to a session's control server.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]

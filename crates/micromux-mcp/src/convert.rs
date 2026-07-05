@@ -172,6 +172,8 @@ mod tests {
             Vec::new(),
             false,
             RestartPolicy::Never,
+            Vec::new(),
+            None,
         );
         snapshot.execution = Execution::Running;
         snapshot.run_generation = 1;

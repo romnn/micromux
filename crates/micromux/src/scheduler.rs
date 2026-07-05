@@ -376,6 +376,8 @@ pub(super) fn project_snapshot(
         open_ports: service.open_ports.clone(),
         healthcheck_configured: service.health_check.is_some(),
         last_exit_code: runtime.last_exit_code,
+        command: service.argv(),
+        working_dir: service.working_dir_display(),
         uptime: None,
         restart_policy: service.restart_policy.clone(),
     };
@@ -1056,6 +1058,8 @@ mod tests {
                         service.open_ports.clone(),
                         service.health_check.is_some(),
                         service.restart_policy.clone(),
+                        service.argv(),
+                        service.working_dir_display(),
                     ),
                     service.log_retention,
                 )

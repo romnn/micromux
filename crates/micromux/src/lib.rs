@@ -157,6 +157,8 @@ impl Micromux {
                         service.open_ports.clone(),
                         service.health_check.is_some(),
                         service.restart_policy.clone(),
+                        service.argv(),
+                        service.working_dir_display(),
                     ),
                     service.log_retention,
                 )

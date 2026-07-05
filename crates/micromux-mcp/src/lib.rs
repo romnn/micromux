@@ -2211,6 +2211,8 @@ mod tests {
             Vec::new(),
             false,
             micromux::RestartPolicy::Never,
+            Vec::new(),
+            None,
         );
         snapshot.execution = Execution::Running;
         snapshot.run_generation = 7;

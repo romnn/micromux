@@ -60,6 +60,17 @@ mod tests {
     }
 
     #[test]
+    fn argv_flattens_program_and_args_and_defaults_working_dir() -> eyre::Result<()> {
+        let dir = unique_tmp_dir("argv");
+        std::fs::create_dir_all(&dir)?;
+        let cfg = service_config("ui", ("task", &["tool:rag:ui:run:release"]));
+        let service = Service::new("ui", &dir, cfg)?;
+        assert_eq!(service.argv(), vec!["task", "tool:rag:ui:run:release"]);
+        assert_eq!(service.working_dir_display(), None);
+        Ok(())
+    }
+
+    #[test]
     fn env_file_missing_is_error() -> eyre::Result<()> {
         let dir = unique_tmp_dir("env-missing");
         std::fs::create_dir_all(&dir)?;
@@ -309,5 +320,23 @@ impl Service {
             enable_color: config.color.as_deref().copied().unwrap_or(true),
             log_retention: config.log_retention,
         })
+    }
+
+    /// The resolved program and arguments this service runs, as a single argv vector.
+    #[must_use]
+    pub fn argv(&self) -> Vec<String> {
+        let (program, args) = &self.command;
+        let mut out = vec![program.clone()];
+        out.extend_from_slice(args);
+        out
+    }
+
+    /// The service's overridden working directory as a display string, or `None` when it inherits
+    /// the session's working directory (the directory micromux was launched in).
+    #[must_use]
+    pub fn working_dir_display(&self) -> Option<String> {
+        self.working_dir
+            .as_ref()
+            .map(|dir| dir.display().to_string())
     }
 }

@@ -108,6 +108,14 @@ pub struct ServiceSnapshot {
     pub healthcheck_configured: bool,
     /// Exit code of the most recently finished run, if any.
     pub last_exit_code: Option<i32>,
+    /// The resolved program and arguments this service runs (argv), so a startup failure can be
+    /// debugged without reopening the config.
+    #[serde(default)]
+    pub command: Vec<String>,
+    /// The service's overridden working directory, if any; `None` means it inherits the session's
+    /// working directory (the directory micromux was launched in).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_dir: Option<String>,
     /// Time since the current run started, refreshed at read time. `None` when not running.
     #[schemars(with = "Option<DurationSchema>")]
     pub uptime: Option<Duration>,
@@ -125,6 +133,8 @@ impl ServiceSnapshot {
         open_ports: Vec<u16>,
         healthcheck_configured: bool,
         restart_policy: RestartPolicy,
+        command: Vec<String>,
+        working_dir: Option<String>,
     ) -> Self {
         Self {
             id,
@@ -136,6 +146,8 @@ impl ServiceSnapshot {
             open_ports,
             healthcheck_configured,
             last_exit_code: None,
+            command,
+            working_dir,
             uptime: None,
             restart_policy,
         }
@@ -1528,6 +1540,8 @@ mod tests {
             Vec::new(),
             false,
             RestartPolicy::Never,
+            Vec::new(),
+            None,
         )
     }
 
