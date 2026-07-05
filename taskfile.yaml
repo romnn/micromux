@@ -148,7 +148,7 @@ tasks:
   lint:fc:
     desc: "lint cargo workspace for all combinations of features"
     cmds:
-      - cargo fc lint --dedup {{.CLI_ARGS}}
+      - cargo fc lint {{.CLI_ARGS}}
 
   lint:fix:
     desc: "lint and fix cargo workspace"
