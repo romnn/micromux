@@ -257,6 +257,9 @@ pub enum OutputStream {
     Stdout,
     /// Standard error.
     Stderr,
+    /// A newer peer sent an output stream this binary does not know yet.
+    #[serde(other)]
+    Unknown,
 }
 
 #[cfg(test)]

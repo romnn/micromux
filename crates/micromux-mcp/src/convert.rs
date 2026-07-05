@@ -31,7 +31,8 @@ fn remote_error(code: ErrorCode, message: String) -> ToolError {
         ErrorCode::UnknownService
         | ErrorCode::UnknownRun
         | ErrorCode::NoSession
-        | ErrorCode::BadRequest => ToolError::Remote { code, message },
+        | ErrorCode::BadRequest
+        | ErrorCode::Unknown => ToolError::Remote { code, message },
     }
 }
 
@@ -155,7 +156,9 @@ pub fn evaluate(snapshot: &ServiceSnapshot, after: Option<u64>) -> WaitOutcome {
                 WaitOutcome::Pending
             }
         }
-        Execution::Pending | Execution::Starting | Execution::Stopping => WaitOutcome::Pending,
+        Execution::Pending | Execution::Starting | Execution::Stopping | Execution::Unknown => {
+            WaitOutcome::Pending
+        }
     }
 }
 

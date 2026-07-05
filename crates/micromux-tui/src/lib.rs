@@ -244,6 +244,7 @@ impl App {
                     service.healthcheck_dirty = true;
                 }
             }
+            ChangeKind::Unknown => self.resync(),
         }
     }
 
@@ -512,6 +513,7 @@ impl App {
         let command = match service.snapshot.desired {
             micromux::Desired::Disabled => Command::enable(service.snapshot.id.clone()),
             micromux::Desired::Enabled => Command::disable(service.snapshot.id.clone()),
+            micromux::Desired::Unknown => return,
         };
         let _ = self.commands_tx.try_send(command);
     }

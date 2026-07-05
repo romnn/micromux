@@ -893,7 +893,7 @@ mod tests {
             crate::already_running_any(&endpoints, &config_path)
                 .await?
                 .is_none(),
-            "an unparseable socket is not ownership proof; serve's lifetime lock decides"
+            "an unparsable socket is not ownership proof; serve's lifetime lock decides"
         );
 
         let locked_garbage = ControlEndpoint::Unix(runtime_dir.path().join("locked-garbage.sock"));

@@ -35,7 +35,9 @@ pub use endpoint::{
     ControlEndpoint, RuntimeDirStatus, endpoint_for, endpoint_from_hash, endpoint_hash,
     runtime_dir, runtime_dir_statuses, transport_supported, usable_runtime_dirs,
 };
-pub use protocol::{ErrorCode, PROTOCOL_VERSION, Request, Response, ServiceBrief, SessionInfo};
+pub use protocol::{
+    ErrorCode, PROTOCOL_VERSION, ProtocolVersion, Request, Response, ServiceBrief, SessionInfo,
+};
 pub use server::{ControlServer, EndpointGuard, SessionIdentity, bind, endpoint_owner_lock_held};
 
 /// Maximum size of a single protocol frame. Oversized frames are rejected, not buffered, so a
@@ -73,9 +75,9 @@ pub enum ControlError {
     #[error("control protocol version mismatch: peer={peer}, ours={ours}")]
     ProtocolMismatch {
         /// The peer's protocol version.
-        peer: u32,
+        peer: ProtocolVersion,
         /// Our protocol version.
-        ours: u32,
+        ours: ProtocolVersion,
     },
     /// The peer sent a response that did not match the request.
     #[error("unexpected control response: {0}")]

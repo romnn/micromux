@@ -174,16 +174,16 @@ impl Client {
         }
     }
 
-    /// Fetch and version-check the session identity.
+    /// Fetch and compatibility-check the session identity.
     ///
     /// # Errors
     ///
-    /// Returns [`ControlError::ProtocolMismatch`] on a version mismatch, or [`ControlError::Unexpected`]
-    /// if the peer replies with something other than a description.
+    /// Returns [`ControlError::ProtocolMismatch`] on an incompatible major version, or
+    /// [`ControlError::Unexpected`] if the peer replies with something other than a description.
     pub async fn describe(&mut self) -> Result<SessionInfo, ControlError> {
         match self.request(Request::Describe).await? {
             Response::Description(info) => {
-                if info.protocol_version == PROTOCOL_VERSION {
+                if PROTOCOL_VERSION.is_compatible_with(info.protocol_version) {
                     Ok(info)
                 } else {
                     Err(ControlError::ProtocolMismatch {

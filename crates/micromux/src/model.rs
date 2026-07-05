@@ -58,6 +58,9 @@ pub enum Desired {
     Enabled,
     /// The service should be stopped and stay stopped.
     Disabled,
+    /// A newer peer sent a desired state this binary does not know yet.
+    #[serde(other)]
+    Unknown,
 }
 
 /// The observed lifecycle phase of a service, independent of whether it is `Desired::Enabled`.
@@ -73,6 +76,9 @@ pub enum Execution {
     Stopping,
     /// The last process has exited (crash, completion, or stop).
     Exited,
+    /// A newer peer sent an execution state this binary does not know yet.
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(JsonSchema)]
@@ -98,15 +104,20 @@ pub struct ServiceSnapshot {
     /// Observed lifecycle phase.
     pub execution: Execution,
     /// Latest resolved health, if a healthcheck is configured and has produced a verdict.
+    #[serde(default)]
     pub health: Option<Health>,
     /// Public name for the scheduler's `RunId`; bumps on every successful (re)start. `0` means the
     /// service has never started.
+    #[serde(default)]
     pub run_generation: u64,
     /// Parsed open ports.
+    #[serde(default)]
     pub open_ports: Vec<u16>,
     /// Whether this service has a healthcheck configured.
+    #[serde(default)]
     pub healthcheck_configured: bool,
     /// Exit code of the most recently finished run, if any.
+    #[serde(default)]
     pub last_exit_code: Option<i32>,
     /// The resolved program and arguments this service runs (argv), so a startup failure can be
     /// debugged without reopening the config.
@@ -118,8 +129,10 @@ pub struct ServiceSnapshot {
     pub working_dir: Option<String>,
     /// Time since the current run started, refreshed at read time. `None` when not running.
     #[schemars(with = "Option<DurationSchema>")]
+    #[serde(default)]
     pub uptime: Option<Duration>,
     /// The configured restart policy.
+    #[serde(default)]
     pub restart_policy: RestartPolicy,
 }
 
@@ -231,6 +244,7 @@ pub struct LogLine {
     /// The service run that produced this line.
     pub run_generation: u64,
     /// Wall-clock time when micromux ingested this record, in Unix milliseconds.
+    #[serde(default)]
     pub timestamp_unix_ms: u64,
     /// The already-formatted line (stderr lines carry a `[stderr]` prefix, matching the TUI).
     pub line: String,
@@ -306,6 +320,9 @@ pub enum ChangeKind {
     Logs,
     /// Healthcheck history changed.
     Health,
+    /// A newer peer sent a change kind this binary does not know yet.
+    #[serde(other)]
+    Unknown,
 }
 
 /// A liveness-only change notification. `broadcast` drops for lagging receivers, so this must never
@@ -1367,7 +1384,7 @@ impl SessionModelWriter {
         line: String,
     ) {
         let line = match stream {
-            OutputStream::Stdout => line,
+            OutputStream::Stdout | OutputStream::Unknown => line,
             OutputStream::Stderr => format!("[stderr] {line}"),
         };
         {
@@ -1531,6 +1548,7 @@ pub(crate) fn new(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use similar_asserts::assert_eq;
 
     fn snapshot(id: &str) -> ServiceSnapshot {
@@ -1547,6 +1565,61 @@ mod tests {
 
     fn entry(id: &str) -> (ServiceSnapshot, LogRetention) {
         (snapshot(id), LogRetention::default())
+    }
+
+    #[test]
+    fn wire_enums_accept_unknown_unit_variants() {
+        assert_eq!(
+            serde_json::from_str::<Desired>("\"Paused\"").unwrap(),
+            Desired::Unknown
+        );
+        assert_eq!(
+            serde_json::from_str::<Execution>("\"Crashed\"").unwrap(),
+            Execution::Unknown
+        );
+        assert_eq!(
+            serde_json::from_str::<Health>("\"Starting\"").unwrap(),
+            Health::Unknown
+        );
+        assert_eq!(
+            serde_json::from_str::<ChangeKind>("\"Metrics\"").unwrap(),
+            ChangeKind::Unknown
+        );
+        assert_eq!(
+            serde_json::from_str::<OutputStream>("\"Combined\"").unwrap(),
+            OutputStream::Unknown
+        );
+    }
+
+    #[test]
+    fn service_snapshot_accepts_missing_additive_fields() {
+        let snapshot = serde_json::from_value::<ServiceSnapshot>(json!({
+            "id": "svc",
+            "name": "svc",
+            "desired": "Enabled",
+            "execution": "Running"
+        }))
+        .unwrap();
+
+        assert_eq!(snapshot.run_generation, 0);
+        assert_eq!(snapshot.open_ports, Vec::<u16>::new());
+        assert!(!snapshot.healthcheck_configured);
+        assert_eq!(snapshot.restart_policy, RestartPolicy::Never);
+        assert_eq!(snapshot.command, Vec::<String>::new());
+        assert_eq!(snapshot.health, None);
+    }
+
+    #[test]
+    fn log_line_accepts_missing_ingest_timestamp() {
+        let line = serde_json::from_value::<LogLine>(json!({
+            "seq": 7,
+            "run_generation": 1,
+            "line": "old payload"
+        }))
+        .unwrap();
+
+        assert_eq!(line.timestamp_unix_ms, 0);
+        assert_eq!(line.line, "old payload");
     }
 
     #[test]

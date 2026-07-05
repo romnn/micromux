@@ -1868,6 +1868,7 @@ fn diagnosis_hint(
                 .to_string()
         }
         Execution::Stopping => "service is stopping".to_string(),
+        Execution::Unknown => "service reported an unknown execution state".to_string(),
         Execution::Running => {
             "service state needs attention; inspect snapshot and logs".to_string()
         }
@@ -1981,6 +1982,9 @@ fn timeout_hint(snapshot: &ServiceSnapshot) -> &'static str {
              get_logs"
         }
         Execution::Stopping => "the service is stopping",
+        Execution::Unknown => {
+            "the session reported an unknown service state — inspect list_services"
+        }
         Execution::Exited => {
             "the run has exited — inspect get_logs and the service's last_exit_code"
         }

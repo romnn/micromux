@@ -2,8 +2,8 @@
 //!
 //! Domain payloads (`ServiceSnapshot`, `HealthAttempt`, `LogLine`, `SessionChange`,
 //! `ServiceCommandAck`) are the stable core types reused directly — no DTO mirror. The session and
-//! the proxy are expected to be the same installed binary version; [`SessionInfo`] carries
-//! [`PROTOCOL_VERSION`] so a mismatch fails loudly rather than weirdly.
+//! the proxy accept peers that speak the same major protocol version, so additive payload changes
+//! do not orphan already-running sessions.
 
 use micromux::{
     HealthAttempt, LogLine, LogRunSummary, ServiceCommandAck, ServiceID, ServiceSnapshot,
@@ -12,9 +12,50 @@ use micromux::{
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-/// The control protocol version. Bumped on any envelope change. The session and proxy are expected
-/// to be from the same build; a mismatch is a hard error, not a negotiation.
-pub const PROTOCOL_VERSION: u32 = 5;
+/// The current control protocol version.
+///
+/// Bump the minor for additive changes (new optional/defaulted fields, new tools that reuse
+/// existing requests), and bump the major for incompatible request/response semantics.
+pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(1, 0);
+
+/// A typed control protocol version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ProtocolVersion {
+    major: u16,
+    minor: u16,
+}
+
+impl ProtocolVersion {
+    /// Build a protocol version from major/minor components.
+    #[must_use]
+    pub const fn new(major: u16, minor: u16) -> Self {
+        Self { major, minor }
+    }
+
+    /// Major compatibility line.
+    #[must_use]
+    pub const fn major(self) -> u16 {
+        self.major
+    }
+
+    /// Additive revision within one major line.
+    #[must_use]
+    pub const fn minor(self) -> u16 {
+        self.minor
+    }
+
+    /// Return whether two peers can speak the same protocol.
+    #[must_use]
+    pub const fn is_compatible_with(self, peer: Self) -> bool {
+        self.major == peer.major
+    }
+}
+
+impl std::fmt::Display for ProtocolVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{}", self.major(), self.minor())
+    }
+}
 
 /// A request from a client (the `micromux ctl` CLI or the MCP proxy) to a session's control server.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -85,6 +126,7 @@ pub struct ServiceBrief {
     /// Stable service identifier.
     pub id: ServiceID,
     /// Human-readable service name.
+    #[serde(default)]
     pub name: String,
 }
 
@@ -92,7 +134,7 @@ pub struct ServiceBrief {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SessionInfo {
     /// The protocol version this session speaks.
-    pub protocol_version: u32,
+    pub protocol_version: ProtocolVersion,
     /// Deterministic session id: the endpoint hash of the canonical config path.
     pub id: String,
     /// Process id of the session.
@@ -100,14 +142,19 @@ pub struct SessionInfo {
     /// Monotonic session start token as Unix nanoseconds. With `pid`, forms a start token.
     pub start_time: u64,
     /// Session name (config `name:` if set, else `basename(working_dir)`).
+    #[serde(default)]
     pub name: String,
     /// The directory the session was launched in.
+    #[serde(default)]
     pub working_dir: String,
     /// The canonical config path that keys this session's endpoint.
+    #[serde(default)]
     pub config_path: String,
     /// The services this session supervises.
+    #[serde(default)]
     pub services: Vec<ServiceBrief>,
     /// The micromux version of the session binary.
+    #[serde(default)]
     pub micromux_version: String,
 }
 
@@ -148,6 +195,9 @@ pub enum ErrorCode {
     BadRequest,
     /// An unexpected internal error.
     Internal,
+    /// A newer peer returned an error code this binary does not know yet.
+    #[serde(other)]
+    Unknown,
 }
 
 /// A response from a session's control server.
@@ -162,6 +212,7 @@ pub enum Response {
         /// The recent log records.
         lines: Vec<LogLine>,
         /// Whether the session had to drop older records to respect server response limits.
+        #[serde(default)]
         truncated: bool,
     },
     /// Reply to [`Request::ListLogRuns`].
@@ -204,6 +255,9 @@ impl Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+    use similar_asserts::assert_eq;
+
     fn session(id: &str, pid: u32, start_time: u64, name: &str) -> SessionInfo {
         SessionInfo {
             protocol_version: PROTOCOL_VERSION,
@@ -226,5 +280,68 @@ mod tests {
 
         assert!(first.is_same_instance(&alias));
         assert!(!first.is_same_instance(&replacement));
+    }
+
+    #[test]
+    fn protocol_version_uses_major_minor_shape_and_accepts_same_major() {
+        assert_eq!(
+            serde_json::to_value(PROTOCOL_VERSION).unwrap(),
+            json!({ "major": 1, "minor": 0 })
+        );
+        assert_eq!(
+            serde_json::from_value::<ProtocolVersion>(json!({ "major": 1, "minor": 0 })).unwrap(),
+            ProtocolVersion::new(1, 0)
+        );
+
+        assert!(PROTOCOL_VERSION.is_compatible_with(ProtocolVersion::new(1, 9)));
+        assert!(!PROTOCOL_VERSION.is_compatible_with(ProtocolVersion::new(2, 0)));
+    }
+
+    #[test]
+    fn protocol_version_rejects_legacy_plain_integer_shape() {
+        let result = serde_json::from_value::<ProtocolVersion>(json!(5));
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn unknown_error_codes_degrade_without_deserialize_failure() {
+        let code = serde_json::from_str::<ErrorCode>("\"FutureError\"").unwrap();
+
+        assert_eq!(code, ErrorCode::Unknown);
+    }
+
+    #[test]
+    fn session_info_accepts_missing_additive_fields() {
+        let info = serde_json::from_value::<SessionInfo>(json!({
+            "protocol_version": { "major": 1, "minor": 0 },
+            "id": "abc",
+            "pid": 42,
+            "start_time": 99
+        }))
+        .unwrap();
+
+        assert_eq!(info.protocol_version, PROTOCOL_VERSION);
+        assert_eq!(info.name, "");
+        assert!(info.services.is_empty());
+        assert_eq!(info.micromux_version, "");
+    }
+
+    #[test]
+    fn logs_response_accepts_missing_truncated_flag() {
+        let response = serde_json::from_value::<Response>(json!({
+            "Logs": {
+                "lines": []
+            }
+        }))
+        .unwrap();
+
+        match response {
+            Response::Logs { lines, truncated } => {
+                assert!(lines.is_empty());
+                assert!(!truncated);
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
     }
 }

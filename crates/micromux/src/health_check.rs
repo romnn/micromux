@@ -26,6 +26,9 @@ pub enum Health {
     Healthy,
     /// The service's healthcheck is currently failing.
     Unhealthy,
+    /// A newer peer sent a health verdict this binary does not know yet.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Default probe interval when none is configured (matches Docker Compose).

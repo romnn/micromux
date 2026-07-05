@@ -324,7 +324,9 @@ fn build_healthcheck_text(configured: bool, attempts: &[micromux::HealthAttempt]
             .iter()
             .map(|line| match line.stream {
                 micromux::OutputStream::Stderr => format!("[stderr] {}", line.line),
-                micromux::OutputStream::Stdout => line.line.clone(),
+                micromux::OutputStream::Stdout | micromux::OutputStream::Unknown => {
+                    line.line.clone()
+                }
             })
             .collect::<Vec<_>>()
             .join("\n");
@@ -346,10 +348,12 @@ fn state_name(snapshot: &micromux::ServiceSnapshot) -> &'static str {
         micromux::Execution::Running => match snapshot.health {
             Some(micromux::Health::Healthy) => "HEALTHY",
             Some(micromux::Health::Unhealthy) => "UNHEALTHY",
+            Some(micromux::Health::Unknown) => "UNKNOWN",
             None => "RUNNING",
         },
         micromux::Execution::Stopping => "KILLED",
         micromux::Execution::Exited => "EXITED",
+        micromux::Execution::Unknown => "UNKNOWN",
     }
 }
 

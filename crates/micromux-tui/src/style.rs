@@ -10,6 +10,7 @@ pub fn health_style(health: Option<micromux::Health>) -> Style {
         Some(micromux::Health::Healthy) => {
             Style::default().fg(Color::White).fg(tailwind::GREEN.c500)
         }
+        Some(micromux::Health::Unknown) => Style::default().fg(tailwind::AMBER.c500),
         None => Style::default().fg(Color::White).fg(tailwind::GREEN.c300),
     }
 }
@@ -26,7 +27,9 @@ pub fn service_style(snapshot: &micromux::ServiceSnapshot) -> Style {
             health_style(snapshot.health)
         }
         // Distinct from the green "running" styling so a stopped service is obvious at a glance.
-        micromux::Execution::Stopping => Style::default().fg(tailwind::AMBER.c500),
+        micromux::Execution::Stopping | micromux::Execution::Unknown => {
+            Style::default().fg(tailwind::AMBER.c500)
+        }
         micromux::Execution::Exited => Style::default().fg(tailwind::RED.c400),
     }
 }
