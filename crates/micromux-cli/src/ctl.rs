@@ -141,6 +141,9 @@ fn format_probe(probe: &EndpointProbe) -> String {
     let result = match &probe.result {
         EndpointProbeResult::Session(info) => return format_session(&probe.endpoint, info),
         EndpointProbeResult::Absent(reason) => format!("absent ({reason})"),
+        EndpointProbeResult::ProtocolMismatch { peer, ours } => {
+            format!("protocol_mismatch (peer={peer}, ours={ours})")
+        }
         EndpointProbeResult::Unreachable(reason) => format!("unreachable ({reason})"),
     };
     format!("{} -> {result}", probe.endpoint)
@@ -195,10 +198,12 @@ fn no_session_message(
     config_path: &Path,
     working_dir: &Path,
 ) -> String {
-    let summary = if probes
-        .iter()
-        .any(|probe| matches!(probe.result, EndpointProbeResult::Unreachable(_)))
-    {
+    let summary = if probes.iter().any(|probe| {
+        matches!(
+            probe.result,
+            EndpointProbeResult::ProtocolMismatch { .. } | EndpointProbeResult::Unreachable(_)
+        )
+    }) {
         format!(
             "no answering micromux session for {}; at least one endpoint was reachable but unusable",
             config_path.display()

@@ -9,7 +9,7 @@ use futures::future;
 
 use crate::ControlError;
 use crate::endpoint::ControlEndpoint;
-use crate::protocol::{PROTOCOL_VERSION, Request, Response, SessionInfo};
+use crate::protocol::{PROTOCOL_VERSION, ProtocolVersion, Request, Response, SessionInfo};
 #[cfg(unix)]
 use crate::{REQUEST_TIMEOUT, read_message, write_message};
 
@@ -41,6 +41,13 @@ pub enum EndpointProbeResult {
     Session(Box<SessionInfo>),
     /// Nothing live answered on this endpoint.
     Absent(String),
+    /// The endpoint answered `Describe`, but its protocol version is incompatible.
+    ProtocolMismatch {
+        /// The peer's protocol version.
+        peer: ProtocolVersion,
+        /// Our protocol version.
+        ours: ProtocolVersion,
+    },
     /// Something was listening, but it was busy or unusable.
     Unreachable(String),
 }
@@ -52,7 +59,9 @@ pub fn answering_session_probes(probes: &[EndpointProbe]) -> Vec<(ControlEndpoin
         .iter()
         .filter_map(|probe| match &probe.result {
             EndpointProbeResult::Session(info) => Some((probe.endpoint.clone(), (**info).clone())),
-            EndpointProbeResult::Absent(_) | EndpointProbeResult::Unreachable(_) => None,
+            EndpointProbeResult::Absent(_)
+            | EndpointProbeResult::ProtocolMismatch { .. }
+            | EndpointProbeResult::Unreachable(_) => None,
         })
         .collect()
 }
@@ -305,6 +314,10 @@ pub async fn probe_endpoint(endpoint: &ControlEndpoint) -> EndpointProbe {
             Ok(info) => EndpointProbe {
                 endpoint: endpoint.clone(),
                 result: EndpointProbeResult::Session(Box::new(info)),
+            },
+            Err(ControlError::ProtocolMismatch { peer, ours }) => EndpointProbe {
+                endpoint: endpoint.clone(),
+                result: EndpointProbeResult::ProtocolMismatch { peer, ours },
             },
             Err(ControlError::Io(err)) if is_hard_connection_error(&err) => EndpointProbe {
                 endpoint: endpoint.clone(),

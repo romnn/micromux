@@ -7,9 +7,9 @@
 use std::path::{Path, PathBuf};
 
 use micromux_control::{
-    ControlEndpoint, ControlError, EndpointProbe, EndpointProbeResult, RuntimeDirStatus,
-    SessionInfo, endpoint_for, endpoint_from_hash, probe_endpoints, probe_runtime_dirs,
-    runtime_dir_statuses, unique_answering_session_probes, usable_runtime_dirs,
+    ControlEndpoint, ControlError, EndpointProbe, EndpointProbeResult, ProtocolVersion,
+    RuntimeDirStatus, SessionInfo, endpoint_for, endpoint_from_hash, probe_endpoints,
+    probe_runtime_dirs, runtime_dir_statuses, unique_answering_session_probes, usable_runtime_dirs,
 };
 use schemars::JsonSchema;
 use serde::Serialize;
@@ -84,6 +84,8 @@ pub struct SocketProbeDetail {
     pub endpoint: String,
     pub status: SocketProbeStatus,
     pub message: Option<String>,
+    pub peer_protocol_version: Option<ProtocolVersion>,
+    pub client_protocol_version: Option<ProtocolVersion>,
     pub session: Option<SessionInfo>,
 }
 
@@ -92,6 +94,7 @@ pub struct SocketProbeDetail {
 pub enum SocketProbeStatus {
     Session,
     Absent,
+    ProtocolMismatch,
     Unreachable,
 }
 
@@ -202,12 +205,12 @@ async fn verify_any(
         return Ok(resolved);
     }
 
-    let unreachable = unreachable_messages(&probes);
-    if !unreachable.is_empty() {
+    let unusable = unusable_messages(&probes);
+    if !unusable.is_empty() {
         return Err(ToolError::Busy(format!(
-            "no answering session matched {describe}; {} live endpoint(s) were unreachable and may be the target: {}",
-            unreachable.len(),
-            unreachable.join("; ")
+            "no answering session matched {describe}; {} live endpoint(s) were reachable but unusable and may be the target: {}",
+            unusable.len(),
+            unusable.join("; ")
         )));
     }
     Err(ToolError::NoSession(Box::new(absent(
@@ -408,12 +411,12 @@ fn resolve_probe_matches(
     disambiguate_hint: &str,
 ) -> Result<Resolved, ToolError> {
     if matches.is_empty() {
-        let unreachable = unreachable_messages(&probes);
-        if !unreachable.is_empty() {
+        let unusable = unusable_messages(&probes);
+        if !unusable.is_empty() {
             return Err(ToolError::Busy(format!(
-                "no answering session matched {describe}; {} live session(s) were unreachable and may be the target: {}",
-                unreachable.len(),
-                unreachable.join("; ")
+                "no answering session matched {describe}; {} live session(s) were reachable but unusable and may be the target: {}",
+                unusable.len(),
+                unusable.join("; ")
             )));
         }
         return Err(ToolError::NoSession(Box::new(discovery_diagnostics(
@@ -473,27 +476,47 @@ fn probe_detail(probe: EndpointProbe) -> SocketProbeDetail {
             endpoint: probe.endpoint.to_string(),
             status: SocketProbeStatus::Session,
             message: None,
+            peer_protocol_version: Some(info.protocol_version),
+            client_protocol_version: Some(micromux_control::PROTOCOL_VERSION),
             session: Some(*info),
         },
         EndpointProbeResult::Absent(reason) => SocketProbeDetail {
             endpoint: probe.endpoint.to_string(),
             status: SocketProbeStatus::Absent,
             message: Some(reason),
+            peer_protocol_version: None,
+            client_protocol_version: Some(micromux_control::PROTOCOL_VERSION),
+            session: None,
+        },
+        EndpointProbeResult::ProtocolMismatch { peer, ours } => SocketProbeDetail {
+            endpoint: probe.endpoint.to_string(),
+            status: SocketProbeStatus::ProtocolMismatch,
+            message: Some(format!(
+                "control protocol version mismatch: peer={peer}, ours={ours}"
+            )),
+            peer_protocol_version: Some(peer),
+            client_protocol_version: Some(ours),
             session: None,
         },
         EndpointProbeResult::Unreachable(reason) => SocketProbeDetail {
             endpoint: probe.endpoint.to_string(),
             status: SocketProbeStatus::Unreachable,
             message: Some(reason),
+            peer_protocol_version: None,
+            client_protocol_version: Some(micromux_control::PROTOCOL_VERSION),
             session: None,
         },
     }
 }
 
-fn unreachable_messages(probes: &[EndpointProbe]) -> Vec<String> {
+fn unusable_messages(probes: &[EndpointProbe]) -> Vec<String> {
     probes
         .iter()
         .filter_map(|probe| match &probe.result {
+            EndpointProbeResult::ProtocolMismatch { peer, ours } => Some(format!(
+                "{} -> protocol mismatch: peer={peer}, ours={ours}",
+                probe.endpoint
+            )),
             EndpointProbeResult::Unreachable(reason) => {
                 Some(format!("{} -> {reason}", probe.endpoint))
             }
@@ -510,7 +533,7 @@ fn session_infos_from_probes(probes: &[EndpointProbe]) -> Vec<SessionInfo> {
 }
 
 /// List every session that answers `Describe`. Endpoints that refuse a connection are skipped;
-/// live-but-unreachable ones are simply not listed this scan (never pruned).
+/// live-but-unusable ones are simply not listed this scan (never pruned).
 ///
 /// # Errors
 ///
@@ -568,17 +591,22 @@ fn session_list_summary(sessions: &[SessionInfo], probes: &[EndpointProbe]) -> S
     if !sessions.is_empty() {
         return format!("found {} answering micromux session(s)", sessions.len());
     }
-    let unreachable = probes
+    let unusable = probes
         .iter()
-        .filter(|probe| matches!(probe.result, EndpointProbeResult::Unreachable(_)))
+        .filter(|probe| {
+            matches!(
+                probe.result,
+                EndpointProbeResult::ProtocolMismatch { .. } | EndpointProbeResult::Unreachable(_)
+            )
+        })
         .count();
     let absent = probes
         .iter()
         .filter(|probe| matches!(probe.result, EndpointProbeResult::Absent(_)))
         .count();
-    if unreachable > 0 {
+    if unusable > 0 {
         format!(
-            "found {unreachable} socket(s) that exist but could not answer Describe; inspect socket_probes for protocol/version/busy details"
+            "found {unusable} socket(s) that exist but could not be used; inspect socket_probes for protocol/version/busy details"
         )
     } else if absent > 0 {
         format!("found {absent} stale socket(s), but no answering micromux session")
@@ -858,6 +886,25 @@ mod tests {
             .map(|session| session.name.as_str())
             .collect::<Vec<_>>();
         assert_eq!(names, vec!["live", "other"]);
+    }
+
+    #[test]
+    fn probe_detail_surfaces_protocol_mismatch_versions() {
+        let peer = ProtocolVersion::new(2, 0);
+        let ours = ProtocolVersion::new(1, 0);
+        let detail = probe_detail(EndpointProbe {
+            endpoint: ControlEndpoint::Unix(PathBuf::from("/newer.sock")),
+            result: EndpointProbeResult::ProtocolMismatch { peer, ours },
+        });
+
+        assert!(matches!(detail.status, SocketProbeStatus::ProtocolMismatch));
+        assert_eq!(detail.peer_protocol_version, Some(peer));
+        assert_eq!(detail.client_protocol_version, Some(ours));
+        assert!(detail.session.is_none());
+        assert_eq!(
+            detail.message.as_deref(),
+            Some("control protocol version mismatch: peer=2.0, ours=1.0"),
+        );
     }
 
     #[tokio::test]

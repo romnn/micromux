@@ -2051,8 +2051,12 @@ async fn already_running_any(
     }
 
     for probe in probes {
-        let EndpointProbeResult::Unreachable(reason) = probe.result else {
-            continue;
+        let reason = match probe.result {
+            EndpointProbeResult::ProtocolMismatch { peer, ours } => {
+                format!("control protocol version mismatch: peer={peer}, ours={ours}")
+            }
+            EndpointProbeResult::Unreachable(reason) => reason,
+            EndpointProbeResult::Session(_) | EndpointProbeResult::Absent(_) => continue,
         };
         if endpoint_owner_lock_held(&probe.endpoint).unwrap_or(false) {
             return Ok(Some(StartSessionResult {
