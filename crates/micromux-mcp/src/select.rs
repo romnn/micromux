@@ -8,8 +8,9 @@ use std::path::{Path, PathBuf};
 
 use micromux_control::{
     ControlEndpoint, ControlError, EndpointProbe, EndpointProbeResult, ProtocolVersion,
-    RuntimeDirStatus, SessionInfo, endpoint_for, endpoint_from_hash, probe_endpoints,
-    probe_runtime_dirs, runtime_dir_statuses, unique_answering_session_probes, usable_runtime_dirs,
+    RuntimeDirStatus, SessionInfo, endpoint_for, endpoint_from_hash, endpoint_hash,
+    probe_endpoints, probe_runtime_dirs, runtime_dir_statuses, unique_answering_session_probes,
+    usable_runtime_dirs,
 };
 use schemars::JsonSchema;
 use serde::Serialize;
@@ -298,7 +299,7 @@ async fn resolve_current(
         .iter()
         .map(|runtime_dir| endpoint_for(runtime_dir, &config_path))
         .collect();
-    verify_any(
+    match verify_any(
         endpoints,
         "the current config",
         |socket_probes| {
@@ -317,6 +318,41 @@ async fn resolve_current(
         },
     )
     .await
+    {
+        Ok(resolved) => Ok(resolved),
+        Err(err @ (ToolError::NoSession(_) | ToolError::Busy(_))) => {
+            match resolve_current_by_scanning(runtime_dirs, &config_path).await? {
+                Some(resolved) => Ok(resolved),
+                None => Err(err),
+            }
+        }
+        Err(err) => Err(err),
+    }
+}
+
+async fn resolve_current_by_scanning(
+    runtime_dirs: &[PathBuf],
+    config_path: &Path,
+) -> Result<Option<Resolved>, ToolError> {
+    let probes = probe_runtime_dirs(runtime_dirs)
+        .await
+        .map_err(ToolError::from)?;
+    let matches = unique_answering_session_probes(&probes)
+        .into_iter()
+        .filter(|(_endpoint, info)| session_matches_config_path(info, config_path))
+        .map(|(endpoint, info)| Resolved { endpoint, info })
+        .collect::<Vec<_>>();
+    if matches.len() > 1 {
+        return Err(ToolError::Ambiguous(format!(
+            "the current config matched {} live sessions; use pid: or name: to disambiguate",
+            matches.len()
+        )));
+    }
+    Ok(matches.into_iter().next())
+}
+
+fn session_matches_config_path(info: &SessionInfo, config_path: &Path) -> bool {
+    info.id == endpoint_hash(config_path)
 }
 
 async fn resolve_hash(
@@ -642,6 +678,14 @@ mod tests {
         name: &str,
         config_path: &Path,
     ) -> color_eyre::eyre::Result<Running> {
+        boot_at_endpoint(&endpoint_for(runtime_dir, config_path), name, config_path)
+    }
+
+    fn boot_at_endpoint(
+        endpoint: &ControlEndpoint,
+        name: &str,
+        config_path: &Path,
+    ) -> color_eyre::eyre::Result<Running> {
         let yaml = "version: 1\nservices:\n  svc:\n    command: [\"sh\", \"-c\", \"sleep 60\"]\n";
         let mut diagnostics = vec![];
         let config = micromux::from_str(yaml, Path::new("."), 0usize, None, &mut diagnostics)
@@ -651,8 +695,7 @@ mod tests {
         let (runner, handles) = mux.clone().start(shutdown.clone());
         let runner = tokio::spawn(runner);
 
-        let endpoint = endpoint_for(runtime_dir, config_path);
-        let guard = bind(&endpoint)?.ok_or_else(|| color_eyre::eyre::eyre!("bind failed"))?;
+        let guard = bind(endpoint)?.ok_or_else(|| color_eyre::eyre::eyre!("bind failed"))?;
         let identity = SessionIdentity::new(name.to_string(), Path::new("."), config_path);
         let server = Arc::new(ControlServer::new(
             handles.reader.clone(),
@@ -756,6 +799,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn current_selector_scans_for_unique_session_when_direct_endpoint_is_unusable()
+    -> color_eyre::eyre::Result<()> {
+        let runtime_dir = temp_dir("current-scan-fallback")?;
+        let project_dir = temp_dir("current-scan-fallback-project")?;
+        std::fs::write(
+            project_dir.path().join("micromux.yaml"),
+            "version: 1\nservices:\n  svc:\n    command: [\"sh\", \"-c\", \"sleep 60\"]\n",
+        )?;
+        let config_path = std::fs::canonicalize(project_dir.path().join("micromux.yaml"))?;
+
+        let ControlEndpoint::Unix(direct_path) = endpoint_for(runtime_dir.path(), &config_path)
+        else {
+            color_eyre::eyre::bail!("expected unix endpoint");
+        };
+        let listener = tokio::net::UnixListener::bind(&direct_path)?;
+        let garbage = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let _ = stream.write_all(b"not json\n").await;
+                let _ = stream.flush().await;
+            }
+        });
+
+        let alias_endpoint = ControlEndpoint::Unix(runtime_dir.path().join("session-alias.sock"));
+        let session = boot_at_endpoint(&alias_endpoint, "live", &config_path)?;
+        let runtime_dirs = vec![runtime_dir.path().to_path_buf()];
+        let dir_statuses = runtime_dirs
+            .iter()
+            .cloned()
+            .map(|path| RuntimeDirStatus {
+                path,
+                usable: true,
+                error: None,
+            })
+            .collect::<Vec<_>>();
+
+        let resolved =
+            resolve_in_dirs(&runtime_dirs, &dir_statuses, project_dir.path(), None).await?;
+        assert_eq!(resolved.info.name, "live");
+        assert_eq!(Path::new(&resolved.info.config_path), config_path);
+
+        garbage.abort();
+        session.shutdown.cancel();
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn current_selector_reports_ambiguous_same_config_across_runtime_dirs()
     -> color_eyre::eyre::Result<()> {
         let first_runtime = temp_dir("current-ambiguous-first")?;
@@ -784,7 +873,13 @@ mod tests {
             .collect::<Vec<_>>();
         let resolved =
             resolve_in_dirs(&runtime_dirs, &dir_statuses, project_dir.path(), None).await;
-        assert!(matches!(resolved, Err(ToolError::Ambiguous(_))));
+        let Err(ToolError::Ambiguous(message)) = resolved else {
+            color_eyre::eyre::bail!("expected ambiguous current session");
+        };
+        assert_eq!(
+            message,
+            "the current config matched 2 live sessions; use pid: or name: to disambiguate"
+        );
 
         first.shutdown.cancel();
         second.shutdown.cancel();
@@ -886,6 +981,24 @@ mod tests {
             .map(|session| session.name.as_str())
             .collect::<Vec<_>>();
         assert_eq!(names, vec!["live", "other"]);
+    }
+
+    #[test]
+    fn session_config_match_uses_identity_hash_not_display_path() {
+        let config_path = PathBuf::from("/workspace/micromux.yaml");
+        let info = SessionInfo {
+            protocol_version: micromux_control::PROTOCOL_VERSION,
+            id: endpoint_hash(&config_path),
+            pid: 42,
+            start_time: 99,
+            name: "live".to_string(),
+            working_dir: "/workspace".to_string(),
+            config_path: "/different/display/path.yaml".to_string(),
+            services: Vec::new(),
+            micromux_version: env!("CARGO_PKG_VERSION").to_string(),
+        };
+
+        assert!(session_matches_config_path(&info, &config_path));
     }
 
     #[test]
