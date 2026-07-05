@@ -134,7 +134,7 @@ pub enum CtlAction {
         /// The service to disable.
         service: String,
     },
-    /// Show the latest healthcheck attempt for a service.
+    /// Show the latest healthcheck attempt for a service's current live run.
     Health {
         /// The service to inspect.
         service: String,

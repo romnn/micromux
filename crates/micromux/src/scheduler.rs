@@ -812,42 +812,13 @@ impl SchedulerRuntime {
         #[cfg(test)]
         let test_event = event.to_test_event();
 
-        // Write the model from the scheduler's own task — lossless from the scheduler onward.
+        self.write_event_to_model(&service_id, event);
+
         match &event {
-            ProcessEvent::LogLine {
-                run_id,
-                stream,
-                update,
-                line,
-                ..
-            } => {
-                self.writer
-                    .append_log(&service_id, run_id.get(), *stream, *update, line.clone());
-            }
-            ProcessEvent::HealthCheckStarted {
-                attempt, command, ..
-            } => {
-                self.writer
-                    .start_health_attempt(&service_id, *attempt, command.clone());
-            }
-            ProcessEvent::HealthCheckLogLine {
-                attempt,
-                stream,
-                line,
-                ..
-            } => {
-                self.writer
-                    .append_health_line(&service_id, *attempt, *stream, line.clone());
-            }
-            ProcessEvent::HealthCheckFinished {
-                attempt,
-                success,
-                exit_code,
-                ..
-            } => {
-                self.writer
-                    .finish_health_attempt(&service_id, *attempt, *success, *exit_code);
-            }
+            ProcessEvent::LogLine { .. }
+            | ProcessEvent::HealthCheckStarted { .. }
+            | ProcessEvent::HealthCheckLogLine { .. }
+            | ProcessEvent::HealthCheckFinished { .. } => {}
             ProcessEvent::Healthy { .. } => {
                 if let Some(runtime) = self.services.get_mut(&service_id) {
                     runtime.mark_health(Health::Healthy);
@@ -878,6 +849,69 @@ impl SchedulerRuntime {
 
         #[cfg(test)]
         self.test_events.forward(test_event);
+    }
+
+    fn write_event_to_model(&self, service_id: &ServiceID, event: &ProcessEvent) {
+        // Write the model from the scheduler's own task — lossless from the scheduler onward.
+        match event {
+            ProcessEvent::LogLine {
+                run_id,
+                stream,
+                update,
+                line,
+                ..
+            } => {
+                self.writer
+                    .append_log(service_id, run_id.get(), *stream, *update, line.clone());
+            }
+            ProcessEvent::HealthCheckStarted {
+                run_id,
+                attempt,
+                command,
+                ..
+            } => {
+                self.writer.start_health_attempt(
+                    service_id,
+                    run_id.get(),
+                    *attempt,
+                    command.clone(),
+                );
+            }
+            ProcessEvent::HealthCheckLogLine {
+                run_id,
+                attempt,
+                stream,
+                line,
+                ..
+            } => {
+                self.writer.append_health_line(
+                    service_id,
+                    run_id.get(),
+                    *attempt,
+                    *stream,
+                    line.clone(),
+                );
+            }
+            ProcessEvent::HealthCheckFinished {
+                run_id,
+                attempt,
+                success,
+                exit_code,
+                ..
+            } => {
+                self.writer.finish_health_attempt(
+                    service_id,
+                    run_id.get(),
+                    *attempt,
+                    *success,
+                    *exit_code,
+                );
+            }
+            ProcessEvent::Healthy { .. }
+            | ProcessEvent::Unhealthy { .. }
+            | ProcessEvent::Killed { .. }
+            | ProcessEvent::Exited { .. } => {}
+        }
     }
 
     fn next_backoff(&self) -> Option<tokio::time::Instant> {

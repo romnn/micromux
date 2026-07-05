@@ -245,6 +245,7 @@ mod tests {
         assert_eq!(build_healthcheck_text(true, &[]), "healthcheck pending");
 
         let ok = HealthAttempt {
+            run_generation: 1,
             attempt: 1,
             command: "curl -f localhost".to_string(),
             output: vec![
@@ -268,6 +269,7 @@ mod tests {
         );
 
         let running = HealthAttempt {
+            run_generation: 1,
             attempt: 2,
             command: "probe".to_string(),
             output: vec![],

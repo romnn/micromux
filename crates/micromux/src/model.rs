@@ -103,7 +103,9 @@ pub struct ServiceSnapshot {
     pub desired: Desired,
     /// Observed lifecycle phase.
     pub execution: Execution,
-    /// Latest resolved health, if a healthcheck is configured and has produced a verdict.
+    /// Latest resolved health for the currently owned live process. This is `None` whenever the
+    /// service is not `Running`; latest-run probe attempts stay in `healthchecks()` until the next
+    /// run begins and must not be presented as current health after exit.
     #[serde(default)]
     pub health: Option<Health>,
     /// Public name for the scheduler's `RunId`; bumps on every successful (re)start. `0` means the
@@ -300,6 +302,8 @@ pub struct HealthResult {
 /// One healthcheck attempt and its (bounded) output.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct HealthAttempt {
+    /// Run generation that produced this attempt.
+    pub run_generation: u64,
     /// Monotonic attempt number within the current run.
     pub attempt: u64,
     /// The command that was executed for this probe.
@@ -1019,6 +1023,18 @@ impl ServiceEntry {
         self.health.clear();
     }
 
+    fn latest_current_health(&self) -> Option<HealthAttempt> {
+        if self.snapshot.execution == Execution::Running {
+            return self
+                .health
+                .iter()
+                .rev()
+                .find(|attempt| attempt.run_generation == self.snapshot.run_generation)
+                .cloned();
+        }
+        None
+    }
+
     fn append_log(&mut self, run_generation: u64, update: LogUpdateKind, line: String) {
         let mut next_seq = self.next_log_seq;
         let disk = self.disk.clone();
@@ -1322,7 +1338,9 @@ impl SessionModelReader {
         self.read_run_log(id, run_generation, None, after, limit)
     }
 
-    /// The full retained healthcheck history for a service (oldest first).
+    /// Retained healthcheck history for a service's current/latest run (oldest first).
+    ///
+    /// This remains queryable after exit for diagnosis, but is cleared when the next run begins.
     #[must_use]
     pub fn healthchecks(&self, id: &str) -> Vec<HealthAttempt> {
         let guard = self.inner.services.read();
@@ -1332,11 +1350,15 @@ impl SessionModelReader {
             .unwrap_or_default()
     }
 
-    /// The most recent healthcheck attempt for a service, if any.
+    /// The most recent healthcheck attempt for a service's current live run, if any.
+    ///
+    /// Health is scoped to the run micromux currently owns. After exit, a probe might still succeed
+    /// against another process or an always-true command, so latest-run attempts remain queryable
+    /// through [`Self::healthchecks`] for diagnosis but are not current health.
     #[must_use]
     pub fn latest_health(&self, id: &str) -> Option<HealthAttempt> {
         let guard = self.inner.services.read();
-        guard.get(id).and_then(|entry| entry.health.back().cloned())
+        guard.get(id).and_then(ServiceEntry::latest_current_health)
     }
 
     /// Subscribe to liveness-only change notifications. Re-query the model for content on each.
@@ -1434,7 +1456,13 @@ impl SessionModelWriter {
     }
 
     /// Begin a new healthcheck attempt, evicting the oldest beyond the retained history.
-    pub(crate) fn start_health_attempt(&self, id: &ServiceID, attempt: u64, command: String) {
+    pub(crate) fn start_health_attempt(
+        &self,
+        id: &ServiceID,
+        run_generation: u64,
+        attempt: u64,
+        command: String,
+    ) {
         {
             let mut guard = self.inner.services.write();
             let Some(entry) = guard.get_mut(id) else {
@@ -1444,6 +1472,7 @@ impl SessionModelWriter {
                 entry.health.pop_front();
             }
             entry.health.push_back(HealthAttempt {
+                run_generation,
                 attempt,
                 command,
                 output: Vec::new(),
@@ -1457,6 +1486,7 @@ impl SessionModelWriter {
     pub(crate) fn append_health_line(
         &self,
         id: &ServiceID,
+        run_generation: u64,
         attempt: u64,
         stream: OutputStream,
         line: String,
@@ -1466,7 +1496,11 @@ impl SessionModelWriter {
             let Some(entry) = guard.get_mut(id) else {
                 return;
             };
-            let Some(attempt_entry) = entry.health.iter_mut().find(|a| a.attempt == attempt) else {
+            let Some(attempt_entry) = entry
+                .health
+                .iter_mut()
+                .find(|a| a.run_generation == run_generation && a.attempt == attempt)
+            else {
                 return;
             };
             while attempt_entry.output.len() >= HEALTH_OUTPUT_MAX_LINES {
@@ -1481,6 +1515,7 @@ impl SessionModelWriter {
     pub(crate) fn finish_health_attempt(
         &self,
         id: &ServiceID,
+        run_generation: u64,
         attempt: u64,
         success: bool,
         exit_code: i32,
@@ -1490,7 +1525,11 @@ impl SessionModelWriter {
             let Some(entry) = guard.get_mut(id) else {
                 return;
             };
-            let Some(attempt_entry) = entry.health.iter_mut().find(|a| a.attempt == attempt) else {
+            let Some(attempt_entry) = entry
+                .health
+                .iter_mut()
+                .find(|a| a.run_generation == run_generation && a.attempt == attempt)
+            else {
                 return;
             };
             attempt_entry.result = Some(HealthResult { success, exit_code });
@@ -1565,6 +1604,14 @@ mod tests {
 
     fn entry(id: &str) -> (ServiceSnapshot, LogRetention) {
         (snapshot(id), LogRetention::default())
+    }
+
+    fn running_snapshot(id: &str) -> ServiceSnapshot {
+        let mut snapshot = snapshot(id);
+        snapshot.execution = Execution::Running;
+        snapshot.healthcheck_configured = true;
+        snapshot.run_generation = 1;
+        snapshot
     }
 
     #[test]
@@ -2340,12 +2387,14 @@ mod tests {
     fn healthcheck_history_is_bounded_and_records_results() {
         let (reader, writer) = new([entry("svc")]);
         let id = "svc".to_string();
+        writer.write_snapshot(running_snapshot(&id), Some(Instant::now()));
         for attempt in 1..=(HEALTH_HISTORY as u64 + 2) {
-            writer.start_health_attempt(&id, attempt, format!("probe {attempt}"));
-            writer.finish_health_attempt(&id, attempt, true, 0);
+            writer.start_health_attempt(&id, 1, attempt, format!("probe {attempt}"));
+            writer.finish_health_attempt(&id, 1, attempt, true, 0);
         }
         let history = reader.healthchecks(&id);
         assert_eq!(history.len(), HEALTH_HISTORY);
+        assert!(history.iter().all(|attempt| attempt.run_generation == 1));
         assert_eq!(
             reader
                 .latest_health(&id)
@@ -2360,13 +2409,117 @@ mod tests {
         let (reader, writer) = new([entry("svc")]);
         let id = "svc".to_string();
 
+        writer.write_snapshot(running_snapshot(&id), Some(Instant::now()));
         writer.begin_run(&id, 1);
-        writer.start_health_attempt(&id, 1, "probe old".to_string());
-        writer.finish_health_attempt(&id, 1, false, 1);
+        writer.start_health_attempt(&id, 1, 1, "probe old".to_string());
+        writer.finish_health_attempt(&id, 1, 1, false, 1);
         assert!(reader.latest_health(&id).is_some());
 
         writer.begin_run(&id, 2);
         assert!(reader.latest_health(&id).is_none());
         assert!(reader.healthchecks(&id).is_empty());
+    }
+
+    #[test]
+    fn latest_health_is_current_only_but_history_remains_after_exit() {
+        let (reader, writer) = new([entry("svc")]);
+        let id = "svc".to_string();
+
+        writer.write_snapshot(running_snapshot(&id), Some(Instant::now()));
+        writer.start_health_attempt(&id, 1, 1, "probe".to_string());
+        writer.finish_health_attempt(&id, 1, 1, true, 0);
+        assert!(reader.latest_health(&id).is_some());
+
+        let mut exited = running_snapshot(&id);
+        exited.execution = Execution::Exited;
+        exited.health = None;
+        exited.last_exit_code = Some(1);
+        writer.write_snapshot(exited, None);
+
+        assert!(reader.latest_health(&id).is_none());
+        let history = reader.healthchecks(&id);
+        assert_eq!(history.len(), 1);
+        let Some(attempt) = history.first() else {
+            panic!("expected one historical healthcheck attempt");
+        };
+        assert_eq!(attempt.run_generation, 1);
+        assert_eq!(attempt.result.map(|result| result.success), Some(true));
+    }
+
+    #[test]
+    fn latest_health_must_match_current_run_generation() {
+        let (reader, writer) = new([entry("svc")]);
+        let id = "svc".to_string();
+
+        writer.write_snapshot(running_snapshot(&id), Some(Instant::now()));
+        writer.start_health_attempt(&id, 1, 1, "probe stale".to_string());
+        writer.finish_health_attempt(&id, 1, 1, true, 0);
+        assert!(reader.latest_health(&id).is_some());
+
+        let mut next_run = running_snapshot(&id);
+        next_run.run_generation = 2;
+        writer.write_snapshot(next_run, Some(Instant::now()));
+
+        assert!(reader.latest_health(&id).is_none());
+        assert_eq!(reader.healthchecks(&id).len(), 1);
+    }
+
+    #[test]
+    fn latest_health_finds_current_attempt_even_if_history_contains_other_generations() {
+        let (reader, writer) = new([entry("svc")]);
+        let id = "svc".to_string();
+
+        let mut current = running_snapshot(&id);
+        current.run_generation = 2;
+        writer.write_snapshot(current, Some(Instant::now()));
+        writer.start_health_attempt(&id, 2, 1, "probe current".to_string());
+        writer.finish_health_attempt(&id, 2, 1, true, 0);
+        writer.start_health_attempt(&id, 1, 2, "probe old".to_string());
+        writer.finish_health_attempt(&id, 1, 2, false, 1);
+
+        let Some(attempt) = reader.latest_health(&id) else {
+            panic!("expected current-run healthcheck attempt");
+        };
+        assert_eq!(attempt.run_generation, 2);
+        assert_eq!(attempt.command, "probe current");
+    }
+
+    #[test]
+    fn health_updates_must_match_run_generation_and_attempt() {
+        let (reader, writer) = new([entry("svc")]);
+        let id = "svc".to_string();
+
+        let mut current = running_snapshot(&id);
+        current.run_generation = 2;
+        writer.write_snapshot(current, Some(Instant::now()));
+        writer.start_health_attempt(&id, 2, 1, "probe current".to_string());
+        writer.start_health_attempt(&id, 1, 1, "probe stale".to_string());
+
+        writer.append_health_line(&id, 1, 1, OutputStream::Stderr, "stale".to_string());
+        let Some(attempt) = reader.latest_health(&id) else {
+            panic!("expected current-run healthcheck attempt");
+        };
+        assert!(attempt.output.is_empty());
+
+        writer.append_health_line(&id, 2, 1, OutputStream::Stdout, "current".to_string());
+        let Some(attempt) = reader.latest_health(&id) else {
+            panic!("expected current-run healthcheck attempt");
+        };
+        assert_eq!(
+            attempt.output.first().map(|line| line.line.as_str()),
+            Some("current")
+        );
+
+        writer.finish_health_attempt(&id, 1, 1, false, 1);
+        let Some(attempt) = reader.latest_health(&id) else {
+            panic!("expected current-run healthcheck attempt");
+        };
+        assert_eq!(attempt.result.as_ref().map(|result| result.success), None);
+
+        writer.finish_health_attempt(&id, 2, 1, true, 0);
+        let Some(attempt) = reader.latest_health(&id) else {
+            panic!("expected current-run healthcheck attempt");
+        };
+        assert_eq!(attempt.result.map(|result| result.success), Some(true));
     }
 }

@@ -76,7 +76,8 @@ micromux, so they respect dependency gating and restart policy — prefer them o
 `restart_service`/`enable_service` return a `generation`; pass it to `wait_for_healthy` as \
 `after_generation` to wait for the *new* run. Use `wait_for_log` after an external action to block \
 until matching backend evidence appears. Use `diagnose` for a one-shot summary of exited or \
-unhealthy services, including latest healthcheck output and likely-cause log lines. Use \
+unhealthy services, including current live-run healthcheck output when applicable and \
+likely-cause log lines. Use \
 `start_session`/`stop_session` to bring a \
 project's services up or stop a session and free its ports (e.g. when switching git worktrees that \
 bind the same ports). `get_logs`/`follow_logs`/`follow_all_logs` strip ANSI by default and accept \
@@ -1453,7 +1454,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "Show the latest healthcheck attempt for a service (command, result, output)."
+        description = "Show the latest healthcheck attempt for a service's current live run (command, result, output)."
     )]
     async fn get_health(&self, args: Parameters<ServiceArgs>) -> ToolResult<HealthResult> {
         let Parameters(args) = args;
@@ -1477,8 +1478,8 @@ impl McpServer {
 
     #[tool(
         description = "Summarize services that need attention in one call. Returns exited, \
-        starting/pending/stopping, or unhealthy services with their full state snapshot, latest \
-        healthcheck output, and a compact tail of likely-cause log lines."
+        starting/pending/stopping, or unhealthy services with their full state snapshot, current \
+        live-run healthcheck output when applicable, and a compact tail of likely-cause log lines."
     )]
     async fn diagnose(&self, args: Parameters<DiagnoseArgs>) -> ToolResult<DiagnoseResult> {
         let Parameters(args) = args;
@@ -1495,7 +1496,7 @@ impl McpServer {
         let services = convert::services(response).map_err(error_data)?;
         let mut diagnoses = Vec::new();
         for snapshot in services.into_iter().filter(service_needs_diagnosis) {
-            let latest_healthcheck = latest_health(&resolved.endpoint, &snapshot.id)
+            let latest_healthcheck = latest_health_for_snapshot(&resolved.endpoint, &snapshot)
                 .await
                 .map(bounded_attempt);
             let (error_log_tail, logs_truncated) =
@@ -1588,7 +1589,7 @@ impl McpServer {
                 // Surface the facts we have rather than guessing "still building": the execution
                 // sub-state and the latest healthcheck attempt distinguish "process up, probe
                 // failing" from "still starting" without a heuristic.
-                let latest = latest_health(&resolved.endpoint, &args.service)
+                let latest = latest_health_for_snapshot(&resolved.endpoint, &snapshot)
                     .await
                     .map(bounded_attempt);
                 return Ok(Json(WaitResult::timeout(
@@ -1737,8 +1738,9 @@ fn unix_now_ms() -> u64 {
     duration_to_millis(duration)
 }
 
-/// Best-effort fetch of the latest healthcheck attempt, used only to enrich a timeout report. Any
-/// error degrades to `None` — the report is still useful without it.
+/// Best-effort fetch of the current live run's latest healthcheck attempt, used only to enrich a
+/// timeout or diagnosis report. Any error degrades to `None` — the report is still useful without
+/// it.
 async fn latest_health(endpoint: &ControlEndpoint, service: &str) -> Option<HealthAttempt> {
     let response = send_request(
         endpoint,
@@ -1749,6 +1751,23 @@ async fn latest_health(endpoint: &ControlEndpoint, service: &str) -> Option<Heal
     .await
     .ok()?;
     convert::health(response).ok().flatten()
+}
+
+async fn latest_health_for_snapshot(
+    endpoint: &ControlEndpoint,
+    snapshot: &ServiceSnapshot,
+) -> Option<HealthAttempt> {
+    if snapshot.execution != Execution::Running {
+        return None;
+    }
+    let attempt = latest_health(endpoint, &snapshot.id).await?;
+    // Diagnose/wait enrichment reads health in a second request; a restart between the snapshot and
+    // health requests must not attach the next run's probe output to the previous run's state.
+    health_attempt_matches_snapshot(snapshot, &attempt).then_some(attempt)
+}
+
+fn health_attempt_matches_snapshot(snapshot: &ServiceSnapshot, attempt: &HealthAttempt) -> bool {
+    snapshot.execution == Execution::Running && attempt.run_generation == snapshot.run_generation
 }
 
 /// Trim a healthcheck attempt's captured output to its last lines, so a chatty probe doesn't bloat
@@ -1864,8 +1883,7 @@ fn diagnosis_hint(
             }
         }
         Execution::Pending | Execution::Starting => {
-            "service has not finished starting; inspect latest_healthcheck and recent logs"
-                .to_string()
+            "service has not finished starting; inspect recent logs".to_string()
         }
         Execution::Stopping => "service is stopping".to_string(),
         Execution::Unknown => "service reported an unknown execution state".to_string(),
@@ -2358,10 +2376,10 @@ pub async fn serve_stdio() -> Result<(), Box<dyn std::error::Error + Send + Sync
 mod tests {
     use super::{
         McpServer, MergedFollowPage, WaitResult, follow_all_after_seq, follow_gap,
-        merge_follow_pages, next_follow_cursor, parse_since_text, session_has_service,
-        session_resolves_service_id, session_selector, truncate_wait_matches,
+        health_attempt_matches_snapshot, merge_follow_pages, next_follow_cursor, parse_since_text,
+        session_has_service, session_resolves_service_id, session_selector, truncate_wait_matches,
     };
-    use micromux::{Execution, LogLine, ServiceSnapshot};
+    use micromux::{Execution, HealthAttempt, LogLine, ServiceSnapshot};
     use micromux_control::{PROTOCOL_VERSION, ServiceBrief, SessionInfo};
     use similar_asserts::assert_eq;
     use std::collections::BTreeMap;
@@ -2461,6 +2479,37 @@ mod tests {
                 .is_some_and(serde_json::Value::is_null)
         );
         Ok(())
+    }
+
+    #[test]
+    fn health_enrichment_is_current_running_generation_only() {
+        let mut snapshot = ServiceSnapshot::initial(
+            "svc".to_string(),
+            "svc".to_string(),
+            Vec::new(),
+            true,
+            micromux::RestartPolicy::Never,
+            Vec::new(),
+            None,
+        );
+        snapshot.execution = Execution::Running;
+        snapshot.run_generation = 2;
+        let mut healthcheck = HealthAttempt {
+            run_generation: 2,
+            attempt: 1,
+            command: "curl -fsS localhost".to_string(),
+            output: Vec::new(),
+            result: None,
+        };
+
+        assert!(health_attempt_matches_snapshot(&snapshot, &healthcheck));
+
+        healthcheck.run_generation = 3;
+        assert!(!health_attempt_matches_snapshot(&snapshot, &healthcheck));
+
+        healthcheck.run_generation = 2;
+        snapshot.execution = Execution::Exited;
+        assert!(!health_attempt_matches_snapshot(&snapshot, &healthcheck));
     }
 
     #[test]
