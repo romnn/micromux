@@ -64,7 +64,11 @@ const WAIT_LOG_POLL: Duration = Duration::from_millis(250);
 const INSTRUCTIONS: &str = "Discover and control running micromux sessions. \
 List services, inspect current and previous run logs, restart/enable/disable services, check \
 health, and wait for a service to become healthy. When no `session` is given, the tools target the \
-micromux running in the current project directory. Use `list_log_runs` to find retained previous \
+micromux running in the current project directory. Use `find_service` to locate a service by id or \
+name across every running session (with each match's copy-pasteable `session_selector`, config \
+path, working dir, and status) instead of the list_sessions -> pick a hash -> list_services dance; \
+service-scoped tools also point at sibling sessions when a service is unknown in the selected one. \
+Use `list_log_runs` to find retained previous \
 runs, and `follow_logs` with `next_seq` for one-service tailing. Use `log_cursors` before an \
 action and then `follow_all_logs` with its per-service `next` map to inspect what changed across \
 services. Actions are routed through \
@@ -101,6 +105,12 @@ struct ServiceArgs {
     /// Optional session selector (see `list_sessions`); omit for the current project.
     #[serde(default)]
     session: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct FindServiceArgs {
+    /// The service id or human name to locate across every running session.
+    service: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -284,7 +294,34 @@ struct SessionListResult {
 struct ServiceListResult {
     config_path: String,
     session: String,
+    /// A copy-pasteable selector (`hash:<id>`) that resolves back to this exact session; pass it as
+    /// `session` on follow-up calls to avoid re-disambiguating.
+    session_selector: String,
     services: Vec<ServiceSnapshot>,
+}
+
+#[derive(Serialize, JsonSchema)]
+struct FindServiceResult {
+    service: String,
+    matches: Vec<ServiceLocation>,
+}
+
+#[derive(Serialize, JsonSchema)]
+struct ServiceLocation {
+    /// The session's name.
+    session: String,
+    /// A copy-pasteable selector (`hash:<id>`) that targets this session.
+    session_selector: String,
+    /// The session's process id.
+    pid: u32,
+    /// The session's config path.
+    config_path: String,
+    /// The directory the session was launched in.
+    working_dir: String,
+    /// The matching service's current snapshot (state, health, run generation, command, ports), or
+    /// `None` if the session did not return a snapshot for it (it stopped answering, returned an
+    /// error, or no longer supervises the service).
+    snapshot: Option<ServiceSnapshot>,
 }
 
 #[derive(Serialize, JsonSchema)]
@@ -423,6 +460,10 @@ struct HealthResult {
 #[derive(Serialize, JsonSchema)]
 struct DiagnoseResult {
     config_path: String,
+    /// The resolved session's name.
+    session: String,
+    /// A copy-pasteable selector (`hash:<id>`) for the diagnosed session.
+    session_selector: String,
     services: Vec<ServiceDiagnosis>,
 }
 
@@ -537,6 +578,74 @@ async fn send_request(endpoint: &ControlEndpoint, request: Request) -> Result<Re
     Ok(client.request(request).await?)
 }
 
+/// A copy-pasteable session selector (`hash:<id>`) that resolves back to this exact session.
+fn session_selector(info: &SessionInfo) -> String {
+    format!("hash:{}", info.id)
+}
+
+/// Whether `info` supervises a service matching `service` by stable id or human name. Used by
+/// `find_service`, where discovery by human name is intended.
+fn session_has_service(info: &SessionInfo, service: &str) -> bool {
+    info.services
+        .iter()
+        .any(|brief| brief.id == service || brief.name == service)
+}
+
+/// Whether retargeting `session=<this>` would resolve `service`, mirroring the session's id-keyed
+/// service lookup. Matches by id only (not name) so an enrichment suggestion is one where the retry
+/// actually succeeds — and so the selected session (which lacks the id, hence the `UnknownService`)
+/// is never suggested back to the caller.
+fn session_resolves_service_id(info: &SessionInfo, service: &str) -> bool {
+    info.services.iter().any(|brief| brief.id == service)
+}
+
+/// Enrich a bare `UnknownService` error with the sibling sessions that *do* resolve the service, so
+/// the agent can retarget instead of guessing. Any other error passes through untouched. Best-effort:
+/// a discovery failure leaves the error as-is rather than masking it.
+async fn enrich_unknown_service(service: &str, mut err: ToolError) -> ToolError {
+    let ToolError::Remote {
+        code: ErrorCode::UnknownService,
+        message,
+    } = &mut err
+    else {
+        return err;
+    };
+    let siblings = select::answering_sessions()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|resolved| session_resolves_service_id(&resolved.info, service))
+        .collect::<Vec<_>>();
+    if !siblings.is_empty() {
+        let locations = siblings
+            .iter()
+            .map(|resolved| {
+                format!(
+                    "{} (config {})",
+                    session_selector(&resolved.info),
+                    resolved.info.config_path
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        *message = format!(
+            "{message}. `{service}` was not found in the selected session but exists in {} other \
+             answering session(s); retarget by passing one as `session`: {locations}",
+            siblings.len()
+        );
+    }
+    err
+}
+
+/// Map a single-service control result into a tool result, enriching an `UnknownService` error with
+/// the sibling sessions that do have the service so the agent can retarget in one hop.
+async fn service_result<T>(service: &str, result: Result<T, ToolError>) -> Result<T, ErrorData> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(err) => Err(error_data(enrich_unknown_service(service, err).await)),
+    }
+}
+
 struct LogFilters {
     grep: Option<Regex>,
     grep_context: usize,
@@ -602,7 +711,7 @@ impl McpServer {
         let response = send_request(&resolved.endpoint, request)
             .await
             .map_err(error_data)?;
-        let acks = convert::accepted(response).map_err(error_data)?;
+        let acks = service_result(service, convert::accepted(response)).await?;
         let generation = acks
             .iter()
             .find(|ack| ack.service == service)
@@ -635,7 +744,8 @@ impl McpServer {
 
     #[tool(
         description = "List the services in a session with their desired/execution state, health, \
-        ports, uptime, restart policy, last exit code, and run generation."
+        ports, uptime, restart policy, last exit code, run generation, resolved command (argv), and \
+        working directory. The result carries a copy-pasteable session_selector."
     )]
     async fn list_services(&self, args: Parameters<SessionArgs>) -> ToolResult<ServiceListResult> {
         let Parameters(args) = args;
@@ -646,10 +756,56 @@ impl McpServer {
             .await
             .map_err(error_data)?;
         let services = convert::services(response).map_err(error_data)?;
+        let session_selector = session_selector(&resolved.info);
         Ok(Json(ServiceListResult {
             config_path: resolved.info.config_path,
             session: resolved.info.name,
+            session_selector,
             services,
+        }))
+    }
+
+    #[tool(
+        description = "Locate a service by id or name across every running micromux session. \
+        Returns each matching session's copy-pasteable selector, config path, working directory, \
+        and the service's current snapshot (state, health, run generation, command, ports), so a \
+        service can be targeted without the list_sessions -> pick a hash -> list_services dance."
+    )]
+    async fn find_service(
+        &self,
+        args: Parameters<FindServiceArgs>,
+    ) -> ToolResult<FindServiceResult> {
+        let Parameters(args) = args;
+        // Source sessions directly so a hard discovery error (e.g. unsupported platform) is
+        // surfaced rather than masked as "no matches"; match by id or name for discovery.
+        let sessions = select::answering_sessions().await.map_err(error_data)?;
+        let mut matches = Vec::new();
+        for resolved in sessions
+            .into_iter()
+            .filter(|resolved| session_has_service(&resolved.info, &args.service))
+        {
+            let snapshot = match send_request(&resolved.endpoint, Request::ListServices).await {
+                Ok(response) => convert::services(response).ok().and_then(|services| {
+                    services
+                        .into_iter()
+                        .find(|snap| snap.id == args.service || snap.name == args.service)
+                }),
+                Err(_) => None,
+            };
+            let session_selector = session_selector(&resolved.info);
+            let info = resolved.info;
+            matches.push(ServiceLocation {
+                session: info.name,
+                session_selector,
+                pid: info.pid,
+                config_path: info.config_path,
+                working_dir: info.working_dir,
+                snapshot,
+            });
+        }
+        Ok(Json(FindServiceResult {
+            service: args.service,
+            matches,
         }))
     }
 
@@ -744,7 +900,7 @@ impl McpServer {
         )
         .await
         .map_err(error_data)?;
-        let logs = convert::logs(response).map_err(error_data)?;
+        let logs = service_result(&args.service, convert::logs(response)).await?;
         let mut entries = logproc::shape(&logs.lines, &filters.shape(args.filters.raw, None));
         // A full fetched window that was filtered, or that yielded fewer entries than asked, may
         // hide older matches/entries beyond the scan — don't report a capped scan as complete.
@@ -783,7 +939,7 @@ impl McpServer {
         )
         .await
         .map_err(error_data)?;
-        let runs = convert::log_runs(response).map_err(error_data)?;
+        let runs = service_result(&args.service, convert::log_runs(response)).await?;
         Ok(Json(LogRunsResult {
             service: args.service,
             config_path: resolved.info.config_path,
@@ -812,7 +968,7 @@ impl McpServer {
         )
         .await
         .map_err(error_data)?;
-        let runs = convert::log_runs(response).map_err(error_data)?;
+        let runs = service_result(&args.service, convert::log_runs(response)).await?;
         let run = match args.run_generation {
             Some(run_generation) => runs
                 .into_iter()
@@ -1126,7 +1282,7 @@ impl McpServer {
         )
         .await
         .map_err(error_data)?;
-        let logs = convert::logs(response).map_err(error_data)?;
+        let logs = service_result(&args.service, convert::logs(response)).await?;
         // Cursor + gap are computed from the raw records (seq is per record), so `next_seq` advances
         // past filtered-out entries and following never re-fetches them.
         let next_seq = next_follow_cursor(&logs.lines, args.after_seq);
@@ -1260,7 +1416,7 @@ impl McpServer {
             )
             .await
             .map_err(error_data)?;
-            let logs = convert::logs(response).map_err(error_data)?;
+            let logs = service_result(&args.service, convert::logs(response)).await?;
             let raw_next_seq = next_follow_cursor(&logs.lines, Some(cursor)).unwrap_or(cursor);
             let mut entries = logproc::shape(&logs.lines, &filters.shape(raw, None));
             if !entries.is_empty() {
@@ -1312,7 +1468,7 @@ impl McpServer {
         )
         .await
         .map_err(error_data)?;
-        let attempt = convert::health(response).map_err(error_data)?;
+        let attempt = service_result(&args.service, convert::health(response)).await?;
         Ok(Json(HealthResult {
             service: args.service,
             health: attempt,
@@ -1356,8 +1512,11 @@ impl McpServer {
                 hint,
             });
         }
+        let session_selector = session_selector(&resolved.info);
         Ok(Json(DiagnoseResult {
             config_path: resolved.info.config_path,
+            session: resolved.info.name,
+            session_selector,
             services: diagnoses,
         }))
     }
@@ -1385,15 +1544,21 @@ impl McpServer {
                 .await
                 .map_err(error_data)?;
             let services = convert::services(response).map_err(error_data)?;
-            let snapshot = services
+            let Some(snapshot) = services
                 .into_iter()
                 .find(|snapshot| snapshot.id == args.service)
-                .ok_or_else(|| {
-                    error_data(ToolError::Remote {
-                        code: ErrorCode::UnknownService,
-                        message: format!("unknown service `{}`", args.service),
-                    })
-                })?;
+            else {
+                return Err(error_data(
+                    enrich_unknown_service(
+                        &args.service,
+                        ToolError::Remote {
+                            code: ErrorCode::UnknownService,
+                            message: format!("unknown service `{}`", args.service),
+                        },
+                    )
+                    .await,
+                ));
+            };
 
             match convert::evaluate(&snapshot, args.after_generation) {
                 WaitOutcome::Healthy => {
@@ -2185,15 +2350,69 @@ pub async fn serve_stdio() -> Result<(), Box<dyn std::error::Error + Send + Sync
 mod tests {
     use super::{
         McpServer, MergedFollowPage, WaitResult, follow_all_after_seq, follow_gap,
-        merge_follow_pages, next_follow_cursor, parse_since_text, truncate_wait_matches,
+        merge_follow_pages, next_follow_cursor, parse_since_text, session_has_service,
+        session_resolves_service_id, session_selector, truncate_wait_matches,
     };
     use micromux::{Execution, LogLine, ServiceSnapshot};
+    use micromux_control::{PROTOCOL_VERSION, ServiceBrief, SessionInfo};
     use similar_asserts::assert_eq;
     use std::collections::BTreeMap;
 
     #[test]
     fn server_builds_typed_tool_schemas() {
         let _ = McpServer::new();
+    }
+
+    fn session_info(id: &str, services: &[&str]) -> SessionInfo {
+        SessionInfo {
+            protocol_version: PROTOCOL_VERSION,
+            id: id.to_string(),
+            pid: 4321,
+            start_time: 0,
+            name: "proj".to_string(),
+            working_dir: "/w".to_string(),
+            config_path: "/w/micromux.yaml".to_string(),
+            services: services
+                .iter()
+                .map(|name| ServiceBrief {
+                    id: (*name).into(),
+                    name: (*name).to_string(),
+                })
+                .collect(),
+            micromux_version: env!("CARGO_PKG_VERSION").to_string(),
+        }
+    }
+
+    #[test]
+    fn session_selector_is_the_hash_form() {
+        let info = session_info("b8b6127be329991b", &["rag-ui"]);
+        assert_eq!(session_selector(&info), "hash:b8b6127be329991b");
+    }
+
+    #[test]
+    fn session_has_service_matches_by_id_or_name_only() {
+        let info = session_info("h", &["rag-ui"]);
+        assert!(session_has_service(&info, "rag-ui"));
+        assert!(!session_has_service(&info, "api"));
+        assert!(!session_has_service(&info, "rag"));
+    }
+
+    #[test]
+    fn enrichment_resolves_by_id_not_name() {
+        // A service whose human name differs from its id. UnknownService enrichment must match by
+        // id only (the session resolves services by id), so a session reachable only by the *name*
+        // is never suggested as a retarget — otherwise the caller loops back to the same session.
+        let mut info = session_info("h", &[]);
+        info.services = vec![ServiceBrief {
+            id: "web".into(),
+            name: "frontend".to_string(),
+        }];
+        // find_service discovery still matches either identifier.
+        assert!(session_has_service(&info, "frontend"));
+        assert!(session_has_service(&info, "web"));
+        // Enrichment resolves by id only.
+        assert!(session_resolves_service_id(&info, "web"));
+        assert!(!session_resolves_service_id(&info, "frontend"));
     }
 
     #[test]

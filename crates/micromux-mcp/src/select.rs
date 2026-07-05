@@ -541,6 +541,29 @@ pub async fn list_sessions() -> Result<SessionList, ToolError> {
     })
 }
 
+/// List every answering session together with the endpoint that drives it. Like [`list_sessions`]
+/// but keeps the endpoint so a caller can query each session — used to locate a service across
+/// sibling sessions. An empty vector means no runtime dir or no answering session, never an error.
+///
+/// # Errors
+///
+/// Returns [`ToolError::Unsupported`] on a platform without a control transport.
+pub async fn answering_sessions() -> Result<Vec<Resolved>, ToolError> {
+    if !micromux_control::transport_supported() {
+        return Err(ToolError::Unsupported);
+    }
+    let dir_statuses = runtime_dir_statuses();
+    let runtime_dirs = usable_runtime_dirs(&dir_statuses);
+    if runtime_dirs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let probes = probe_runtime_dirs(&runtime_dirs).await?;
+    Ok(unique_answering_session_probes(&probes)
+        .into_iter()
+        .map(|(endpoint, info)| Resolved { endpoint, info })
+        .collect())
+}
+
 fn session_list_summary(sessions: &[SessionInfo], probes: &[EndpointProbe]) -> String {
     if !sessions.is_empty() {
         return format!("found {} answering micromux session(s)", sessions.len());
