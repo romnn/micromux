@@ -20,6 +20,7 @@ pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(3, 0);
 
 /// A typed control protocol version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ProtocolVersion {
     major: u16,
     minor: u16,
@@ -298,10 +299,23 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_rejects_legacy_plain_integer_shape() {
-        let result = serde_json::from_value::<ProtocolVersion>(json!(5));
+    fn protocol_version_rejects_plain_integer_shape() {
+        let err = serde_json::from_value::<ProtocolVersion>(json!(5)).unwrap_err();
 
-        assert!(result.is_err());
+        assert!(
+            err.to_string().contains("invalid type"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn protocol_version_rejects_missing_minor() {
+        let err = serde_json::from_value::<ProtocolVersion>(json!({ "major": 5 })).unwrap_err();
+
+        assert!(
+            err.to_string().contains("missing field `minor`"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

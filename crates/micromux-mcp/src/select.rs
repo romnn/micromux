@@ -957,6 +957,154 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn current_selector_rejects_malformed_current_config_protocol_version()
+    -> color_eyre::eyre::Result<()> {
+        let runtime_dir = temp_dir("current-malformed-protocol-no-subconfig-fallback")?;
+        let project_dir = temp_dir("current-malformed-protocol-project")?;
+        std::fs::create_dir(project_dir.path().join("tools"))?;
+        std::fs::write(
+            project_dir.path().join("micromux.yaml"),
+            "version: 1\nservices:\n  stale:\n    command: [\"sh\", \"-c\", \"sleep 60\"]\n",
+        )?;
+        std::fs::write(
+            project_dir.path().join("tools/micromux.yaml"),
+            "version: 1\nservices:\n  live:\n    command: [\"sh\", \"-c\", \"sleep 60\"]\n",
+        )?;
+        let current_config = std::fs::canonicalize(project_dir.path().join("micromux.yaml"))?;
+        let live_config = std::fs::canonicalize(project_dir.path().join("tools/micromux.yaml"))?;
+
+        let ControlEndpoint::Unix(direct_path) = endpoint_for(runtime_dir.path(), &current_config)
+        else {
+            color_eyre::eyre::bail!("expected unix endpoint");
+        };
+        let listener = tokio::net::UnixListener::bind(&direct_path)?;
+        let malformed_response = serde_json::to_vec(&serde_json::json!({
+            "Description": {
+                "protocol_version": 4,
+                "id": endpoint_hash(&current_config),
+                "pid": 42,
+                "start_time": 99,
+                "name": "malformed-root",
+                "working_dir": project_dir.path(),
+                "config_path": current_config,
+                "services": [],
+                "micromux_version": "malformed"
+            }
+        }))?;
+        let malformed_socket = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let _ = stream.write_all(&malformed_response).await;
+                let _ = stream.write_all(b"\n").await;
+                let _ = stream.flush().await;
+            }
+        });
+
+        let alias_endpoint = ControlEndpoint::Unix(runtime_dir.path().join("tools-session.sock"));
+        let session = boot_at_endpoint_with_working_dir(
+            &alias_endpoint,
+            "live",
+            &live_config,
+            project_dir.path(),
+        )?;
+        let runtime_dirs = vec![runtime_dir.path().to_path_buf()];
+        let dir_statuses = runtime_dirs
+            .iter()
+            .cloned()
+            .map(|path| RuntimeDirStatus {
+                path,
+                usable: true,
+                error: None,
+            })
+            .collect::<Vec<_>>();
+
+        let resolved =
+            resolve_in_dirs(&runtime_dirs, &dir_statuses, project_dir.path(), None).await;
+        let Err(ToolError::Busy(message)) = resolved else {
+            color_eyre::eyre::bail!("expected malformed current config socket to block fallback");
+        };
+        assert!(message.contains("the current config"));
+        assert!(message.contains("invalid type"));
+
+        malformed_socket.abort();
+        session.shutdown.cancel();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn current_selector_does_not_retarget_on_current_config_protocol_mismatch()
+    -> color_eyre::eyre::Result<()> {
+        let runtime_dir = temp_dir("current-protocol-mismatch-no-subconfig-fallback")?;
+        let project_dir = temp_dir("current-protocol-mismatch-project")?;
+        std::fs::create_dir(project_dir.path().join("tools"))?;
+        std::fs::write(
+            project_dir.path().join("micromux.yaml"),
+            "version: 1\nservices:\n  stale:\n    command: [\"sh\", \"-c\", \"sleep 60\"]\n",
+        )?;
+        std::fs::write(
+            project_dir.path().join("tools/micromux.yaml"),
+            "version: 1\nservices:\n  live:\n    command: [\"sh\", \"-c\", \"sleep 60\"]\n",
+        )?;
+        let current_config = std::fs::canonicalize(project_dir.path().join("micromux.yaml"))?;
+        let live_config = std::fs::canonicalize(project_dir.path().join("tools/micromux.yaml"))?;
+
+        let ControlEndpoint::Unix(direct_path) = endpoint_for(runtime_dir.path(), &current_config)
+        else {
+            color_eyre::eyre::bail!("expected unix endpoint");
+        };
+        let listener = tokio::net::UnixListener::bind(&direct_path)?;
+        let mismatched_response = serde_json::to_vec(&serde_json::json!({
+            "Description": {
+                "protocol_version": { "major": 2, "minor": 0 },
+                "id": endpoint_hash(&current_config),
+                "pid": 42,
+                "start_time": 99,
+                "name": "old-root",
+                "working_dir": project_dir.path(),
+                "config_path": current_config,
+                "services": [],
+                "micromux_version": "old"
+            }
+        }))?;
+        let mismatched_socket = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let _ = stream.write_all(&mismatched_response).await;
+                let _ = stream.write_all(b"\n").await;
+                let _ = stream.flush().await;
+            }
+        });
+
+        let alias_endpoint = ControlEndpoint::Unix(runtime_dir.path().join("tools-session.sock"));
+        let session = boot_at_endpoint_with_working_dir(
+            &alias_endpoint,
+            "live",
+            &live_config,
+            project_dir.path(),
+        )?;
+        let runtime_dirs = vec![runtime_dir.path().to_path_buf()];
+        let dir_statuses = runtime_dirs
+            .iter()
+            .cloned()
+            .map(|path| RuntimeDirStatus {
+                path,
+                usable: true,
+                error: None,
+            })
+            .collect::<Vec<_>>();
+
+        let resolved =
+            resolve_in_dirs(&runtime_dirs, &dir_statuses, project_dir.path(), None).await;
+        let Err(ToolError::Busy(message)) = resolved else {
+            color_eyre::eyre::bail!("expected protocol mismatch to block fallback");
+        };
+        assert!(message.contains("the current config"));
+        assert!(message.contains("protocol mismatch"));
+
+        mismatched_socket.abort();
+        session.shutdown.cancel();
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn current_selector_does_not_retarget_to_subconfig_when_current_config_is_busy()
     -> color_eyre::eyre::Result<()> {
         let runtime_dir = temp_dir("current-busy-no-subconfig-fallback")?;
