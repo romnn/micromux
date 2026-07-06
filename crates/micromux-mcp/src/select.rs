@@ -320,8 +320,14 @@ async fn resolve_current(
     .await
     {
         Ok(resolved) => Ok(resolved),
-        Err(err @ (ToolError::NoSession(_) | ToolError::Busy(_))) => {
-            match resolve_current_by_scanning(runtime_dirs, &config_path).await? {
+        Err(err @ ToolError::Busy(_)) => {
+            match resolve_current_config_by_scanning(runtime_dirs, &config_path).await? {
+                Some(resolved) => Ok(resolved),
+                None => Err(err),
+            }
+        }
+        Err(err @ ToolError::NoSession(_)) => {
+            match resolve_current_project_by_scanning(runtime_dirs, cwd, &config_path).await? {
                 Some(resolved) => Ok(resolved),
                 None => Err(err),
             }
@@ -330,21 +336,62 @@ async fn resolve_current(
     }
 }
 
-async fn resolve_current_by_scanning(
+async fn resolve_current_config_by_scanning(
     runtime_dirs: &[PathBuf],
     config_path: &Path,
 ) -> Result<Option<Resolved>, ToolError> {
     let probes = probe_runtime_dirs(runtime_dirs)
         .await
         .map_err(ToolError::from)?;
-    let matches = unique_answering_session_probes(&probes)
+    resolve_current_config_matches(&probes, config_path)
+}
+
+async fn resolve_current_project_by_scanning(
+    runtime_dirs: &[PathBuf],
+    cwd: &Path,
+    config_path: &Path,
+) -> Result<Option<Resolved>, ToolError> {
+    let probes = probe_runtime_dirs(runtime_dirs)
+        .await
+        .map_err(ToolError::from)?;
+
+    if let Some(resolved) = resolve_current_config_matches(&probes, config_path)? {
+        return Ok(Some(resolved));
+    }
+
+    let project_matches =
+        current_scan_matches(&probes, |info| session_config_path_is_under(info, cwd));
+    resolve_unique_current_scan_matches(project_matches, "a config under the current directory")
+}
+
+fn resolve_current_config_matches(
+    probes: &[EndpointProbe],
+    config_path: &Path,
+) -> Result<Option<Resolved>, ToolError> {
+    let config_matches = current_scan_matches(probes, |info| {
+        session_matches_config_path(info, config_path)
+    });
+    resolve_unique_current_scan_matches(config_matches, "the current config")
+}
+
+fn current_scan_matches(
+    probes: &[EndpointProbe],
+    matches_session: impl Fn(&SessionInfo) -> bool,
+) -> Vec<Resolved> {
+    unique_answering_session_probes(probes)
         .into_iter()
-        .filter(|(_endpoint, info)| session_matches_config_path(info, config_path))
+        .filter(|(_endpoint, info)| matches_session(info))
         .map(|(endpoint, info)| Resolved { endpoint, info })
-        .collect::<Vec<_>>();
+        .collect()
+}
+
+fn resolve_unique_current_scan_matches(
+    matches: Vec<Resolved>,
+    describe: &str,
+) -> Result<Option<Resolved>, ToolError> {
     if matches.len() > 1 {
         return Err(ToolError::Ambiguous(format!(
-            "the current config matched {} live sessions; use pid: or name: to disambiguate",
+            "{describe} matched {} live sessions; use pid: or name: to disambiguate",
             matches.len()
         )));
     }
@@ -353,6 +400,19 @@ async fn resolve_current_by_scanning(
 
 fn session_matches_config_path(info: &SessionInfo, config_path: &Path) -> bool {
     info.id == endpoint_hash(config_path)
+}
+
+fn session_config_path_is_under(info: &SessionInfo, cwd: &Path) -> bool {
+    if info.config_path.is_empty() {
+        return false;
+    }
+    let session_config_path = canonicalize_for_match(Path::new(&info.config_path));
+    let cwd = canonicalize_for_match(cwd);
+    session_config_path.starts_with(&cwd)
+}
+
+fn canonicalize_for_match(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 async fn resolve_hash(
@@ -686,9 +746,18 @@ mod tests {
         name: &str,
         config_path: &Path,
     ) -> color_eyre::eyre::Result<Running> {
+        boot_at_endpoint_with_working_dir(endpoint, name, config_path, Path::new("."))
+    }
+
+    fn boot_at_endpoint_with_working_dir(
+        endpoint: &ControlEndpoint,
+        name: &str,
+        config_path: &Path,
+        working_dir: &Path,
+    ) -> color_eyre::eyre::Result<Running> {
         let yaml = "version: 1\nservices:\n  svc:\n    command: [\"sh\", \"-c\", \"sleep 60\"]\n";
         let mut diagnostics = vec![];
-        let config = micromux::from_str(yaml, Path::new("."), 0usize, None, &mut diagnostics)
+        let config = micromux::from_str(yaml, working_dir, 0usize, None, &mut diagnostics)
             .map_err(|err| color_eyre::eyre::eyre!("parse: {err}"))?;
         let mux = Arc::new(micromux::Micromux::new(&config)?);
         let shutdown = CancellationToken::new();
@@ -696,7 +765,7 @@ mod tests {
         let runner = tokio::spawn(runner);
 
         let guard = bind(endpoint)?.ok_or_else(|| color_eyre::eyre::eyre!("bind failed"))?;
-        let identity = SessionIdentity::new(name.to_string(), Path::new("."), config_path);
+        let identity = SessionIdentity::new(name.to_string(), working_dir, config_path);
         let server = Arc::new(ControlServer::new(
             handles.reader.clone(),
             handles.service_control(),
@@ -838,6 +907,108 @@ mod tests {
             resolve_in_dirs(&runtime_dirs, &dir_statuses, project_dir.path(), None).await?;
         assert_eq!(resolved.info.name, "live");
         assert_eq!(Path::new(&resolved.info.config_path), config_path);
+
+        garbage.abort();
+        session.shutdown.cancel();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn current_selector_scans_for_unique_subconfig_when_current_config_is_absent()
+    -> color_eyre::eyre::Result<()> {
+        let runtime_dir = temp_dir("current-subconfig-fallback")?;
+        let project_dir = temp_dir("current-subconfig-project")?;
+        std::fs::create_dir(project_dir.path().join("tools"))?;
+        std::fs::write(
+            project_dir.path().join("micromux.yaml"),
+            "version: 1\nservices:\n  stale:\n    command: [\"sh\", \"-c\", \"sleep 60\"]\n",
+        )?;
+        std::fs::write(
+            project_dir.path().join("tools/micromux.yaml"),
+            "version: 1\nservices:\n  live:\n    command: [\"sh\", \"-c\", \"sleep 60\"]\n",
+        )?;
+        let live_config = std::fs::canonicalize(project_dir.path().join("tools/micromux.yaml"))?;
+
+        let alias_endpoint = ControlEndpoint::Unix(runtime_dir.path().join("tools-session.sock"));
+        let session = boot_at_endpoint_with_working_dir(
+            &alias_endpoint,
+            "live",
+            &live_config,
+            project_dir.path(),
+        )?;
+        let runtime_dirs = vec![runtime_dir.path().to_path_buf()];
+        let dir_statuses = runtime_dirs
+            .iter()
+            .cloned()
+            .map(|path| RuntimeDirStatus {
+                path,
+                usable: true,
+                error: None,
+            })
+            .collect::<Vec<_>>();
+
+        let resolved =
+            resolve_in_dirs(&runtime_dirs, &dir_statuses, project_dir.path(), None).await?;
+        assert_eq!(resolved.info.name, "live");
+        assert_eq!(Path::new(&resolved.info.config_path), live_config);
+
+        session.shutdown.cancel();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn current_selector_does_not_retarget_to_subconfig_when_current_config_is_busy()
+    -> color_eyre::eyre::Result<()> {
+        let runtime_dir = temp_dir("current-busy-no-subconfig-fallback")?;
+        let project_dir = temp_dir("current-busy-project")?;
+        std::fs::create_dir(project_dir.path().join("tools"))?;
+        std::fs::write(
+            project_dir.path().join("micromux.yaml"),
+            "version: 1\nservices:\n  stale:\n    command: [\"sh\", \"-c\", \"sleep 60\"]\n",
+        )?;
+        std::fs::write(
+            project_dir.path().join("tools/micromux.yaml"),
+            "version: 1\nservices:\n  live:\n    command: [\"sh\", \"-c\", \"sleep 60\"]\n",
+        )?;
+        let current_config = std::fs::canonicalize(project_dir.path().join("micromux.yaml"))?;
+        let live_config = std::fs::canonicalize(project_dir.path().join("tools/micromux.yaml"))?;
+
+        let ControlEndpoint::Unix(direct_path) = endpoint_for(runtime_dir.path(), &current_config)
+        else {
+            color_eyre::eyre::bail!("expected unix endpoint");
+        };
+        let listener = tokio::net::UnixListener::bind(&direct_path)?;
+        let garbage = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let _ = stream.write_all(b"not json\n").await;
+                let _ = stream.flush().await;
+            }
+        });
+
+        let alias_endpoint = ControlEndpoint::Unix(runtime_dir.path().join("tools-session.sock"));
+        let session = boot_at_endpoint_with_working_dir(
+            &alias_endpoint,
+            "live",
+            &live_config,
+            project_dir.path(),
+        )?;
+        let runtime_dirs = vec![runtime_dir.path().to_path_buf()];
+        let dir_statuses = runtime_dirs
+            .iter()
+            .cloned()
+            .map(|path| RuntimeDirStatus {
+                path,
+                usable: true,
+                error: None,
+            })
+            .collect::<Vec<_>>();
+
+        let resolved =
+            resolve_in_dirs(&runtime_dirs, &dir_statuses, project_dir.path(), None).await;
+        let Err(ToolError::Busy(message)) = resolved else {
+            color_eyre::eyre::bail!("expected busy current config");
+        };
+        assert!(message.contains("the current config"));
 
         garbage.abort();
         session.shutdown.cancel();
@@ -999,6 +1170,33 @@ mod tests {
         };
 
         assert!(session_matches_config_path(&info, &config_path));
+    }
+
+    #[test]
+    fn session_config_path_match_accepts_current_dir_descendant_configs()
+    -> color_eyre::eyre::Result<()> {
+        let project_dir = tempfile::tempdir()?;
+        let nested_dir = project_dir.path().join("tools");
+        std::fs::create_dir(&nested_dir)?;
+        let info = SessionInfo {
+            protocol_version: micromux_control::PROTOCOL_VERSION,
+            id: "live".to_string(),
+            pid: 42,
+            start_time: 99,
+            name: "live".to_string(),
+            working_dir: project_dir.path().display().to_string(),
+            config_path: project_dir
+                .path()
+                .join("tools/micromux.yaml")
+                .display()
+                .to_string(),
+            services: Vec::new(),
+            micromux_version: env!("CARGO_PKG_VERSION").to_string(),
+        };
+
+        assert!(session_config_path_is_under(&info, project_dir.path()));
+        assert!(session_config_path_is_under(&info, &nested_dir));
+        Ok(())
     }
 
     #[test]
