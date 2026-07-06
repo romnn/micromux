@@ -421,7 +421,7 @@ impl App {
                 // Combine into one line.
                 let ports = service
                     .snapshot
-                    .open_ports
+                    .advertised_ports
                     .iter()
                     .map(|i| format!(":{i}").fg(tailwind::GRAY.c400));
 

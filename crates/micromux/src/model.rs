@@ -112,9 +112,9 @@ pub struct ServiceSnapshot {
     /// service has never started.
     #[serde(default)]
     pub run_generation: u64,
-    /// Parsed open ports.
+    /// Ports declared by the service config. These are informational hints, not a liveness signal.
     #[serde(default)]
-    pub open_ports: Vec<u16>,
+    pub advertised_ports: Vec<u16>,
     /// Whether this service has a healthcheck configured.
     #[serde(default)]
     pub healthcheck_configured: bool,
@@ -145,7 +145,7 @@ impl ServiceSnapshot {
     pub fn initial(
         id: ServiceID,
         name: String,
-        open_ports: Vec<u16>,
+        advertised_ports: Vec<u16>,
         healthcheck_configured: bool,
         restart_policy: RestartPolicy,
         command: Vec<String>,
@@ -158,7 +158,7 @@ impl ServiceSnapshot {
             execution: Execution::Pending,
             health: None,
             run_generation: 0,
-            open_ports,
+            advertised_ports,
             healthcheck_configured,
             last_exit_code: None,
             command,
@@ -1649,11 +1649,22 @@ mod tests {
         .unwrap();
 
         assert_eq!(snapshot.run_generation, 0);
-        assert_eq!(snapshot.open_ports, Vec::<u16>::new());
+        assert_eq!(snapshot.advertised_ports, Vec::<u16>::new());
         assert!(!snapshot.healthcheck_configured);
         assert_eq!(snapshot.restart_policy, RestartPolicy::Never);
         assert_eq!(snapshot.command, Vec::<String>::new());
         assert_eq!(snapshot.health, None);
+    }
+
+    #[test]
+    fn service_snapshot_serializes_advertised_ports() -> serde_json::Result<()> {
+        let mut snapshot = snapshot("svc");
+        snapshot.advertised_ports = vec![3100];
+
+        let value = serde_json::to_value(snapshot)?;
+        assert_eq!(value.get("advertised_ports"), Some(&json!([3100])));
+        assert_eq!(value.get("open_ports"), None);
+        Ok(())
     }
 
     #[test]

@@ -373,7 +373,7 @@ pub(super) fn project_snapshot(
         execution,
         health,
         run_generation: runtime.run_generation(),
-        open_ports: service.open_ports.clone(),
+        advertised_ports: service.advertised_ports.clone(),
         healthcheck_configured: service.health_check.is_some(),
         last_exit_code: runtime.last_exit_code,
         command: service.argv(),
@@ -1089,7 +1089,7 @@ mod tests {
                     crate::model::ServiceSnapshot::initial(
                         id.clone(),
                         service.name.as_ref().clone(),
-                        service.open_ports.clone(),
+                        service.advertised_ports.clone(),
                         service.health_check.is_some(),
                         service.restart_policy.clone(),
                         service.argv(),

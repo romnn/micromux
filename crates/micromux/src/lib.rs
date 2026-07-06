@@ -154,7 +154,7 @@ impl Micromux {
                     ServiceSnapshot::initial(
                         id.clone(),
                         service.name.as_ref().clone(),
-                        service.open_ports.clone(),
+                        service.advertised_ports.clone(),
                         service.health_check.is_some(),
                         service.restart_policy.clone(),
                         service.argv(),

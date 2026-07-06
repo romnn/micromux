@@ -319,9 +319,9 @@ struct ServiceLocation {
     config_path: String,
     /// The directory the session was launched in.
     working_dir: String,
-    /// The matching service's current snapshot (state, health, run generation, command, ports), or
-    /// `None` if the session did not return a snapshot for it (it stopped answering, returned an
-    /// error, or no longer supervises the service).
+    /// The matching service's current snapshot (state, health, run generation, command, advertised
+    /// ports), or `None` if the session did not return a snapshot for it (it stopped answering,
+    /// returned an error, or no longer supervises the service).
     snapshot: Option<ServiceSnapshot>,
 }
 
@@ -745,8 +745,8 @@ impl McpServer {
 
     #[tool(
         description = "List the services in a session with their desired/execution state, health, \
-        ports, uptime, restart policy, last exit code, run generation, resolved command (argv), and \
-        working directory. The result carries a copy-pasteable session_selector."
+        advertised ports, uptime, restart policy, last exit code, run generation, resolved command \
+        (argv), and working directory. The result carries a copy-pasteable session_selector."
     )]
     async fn list_services(&self, args: Parameters<SessionArgs>) -> ToolResult<ServiceListResult> {
         let Parameters(args) = args;
@@ -769,8 +769,9 @@ impl McpServer {
     #[tool(
         description = "Locate a service by id or name across every running micromux session. \
         Returns each matching session's copy-pasteable selector, config path, working directory, \
-        and the service's current snapshot (state, health, run generation, command, ports), so a \
-        service can be targeted without the list_sessions -> pick a hash -> list_services dance."
+        and the service's current snapshot (state, health, run generation, command, advertised \
+        ports), so a service can be targeted without the list_sessions -> pick a hash -> \
+        list_services dance."
     )]
     async fn find_service(
         &self,

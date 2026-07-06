@@ -153,7 +153,7 @@ mod tests {
             svc.environment.get("PORT").map(String::as_str),
             Some("1023")
         );
-        assert_eq!(svc.open_ports, vec![1023]);
+        assert_eq!(svc.advertised_ports, vec![1023]);
         Ok(())
     }
 
@@ -237,7 +237,7 @@ pub struct Service {
     pub depends_on: Vec<config::Dependency>,
     pub environment: indexmap::IndexMap<String, String>,
     pub health_check: Option<config::HealthCheck>,
-    pub open_ports: Vec<u16>,
+    pub advertised_ports: Vec<u16>,
     pub enable_color: bool,
     pub log_retention: LogRetention,
 }
@@ -283,7 +283,7 @@ impl Service {
             full_env.insert(k.clone(), v.clone());
         }
 
-        let open_ports = config
+        let advertised_ports = config
             .ports
             .iter()
             .map(|port| {
@@ -312,7 +312,7 @@ impl Service {
                     .collect::<Vec<_>>(),
             ),
             working_dir,
-            open_ports,
+            advertised_ports,
             restart_policy: config.restart_policy,
             depends_on: config.depends_on,
             environment,
