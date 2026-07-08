@@ -26,6 +26,7 @@ workspace = true
 [dependencies]
 micromux = { path = "../micromux/" }
 micromux-control = { path = "../micromux-control/" }
+directories.workspace = true
 
 rmcp = { version = "1", features = ["server", "transport-io", "macros"] }
 schemars.workspace = true

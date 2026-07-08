@@ -171,6 +171,11 @@ pub(crate) async fn config_for_target(path: &Path) -> Option<PathBuf> {
 /// capture that function's `|name| dir.join(name)` closure, which the rmcp `#[tool]` macro's
 /// higher-ranked `'static` bound on the tool future rejects.
 pub(crate) async fn find_config_upward(start: &Path) -> Option<PathBuf> {
+    let home = directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf());
+    find_config_upward_with_home(start, home.as_deref()).await
+}
+
+async fn find_config_upward_with_home(start: &Path, home: Option<&Path>) -> Option<PathBuf> {
     let mut dir = start.to_path_buf();
     loop {
         for name in micromux::config_file_names() {
@@ -178,6 +183,9 @@ pub(crate) async fn find_config_upward(start: &Path) -> Option<PathBuf> {
             if let Ok(canonical) = tokio::fs::canonicalize(&candidate).await {
                 return Some(canonical);
             }
+        }
+        if home.is_some_and(|home| dir == home) {
+            return None;
         }
         match dir.parent() {
             Some(parent) => dir = parent.to_path_buf(),
@@ -196,27 +204,14 @@ async fn verify_any(
         .into_iter()
         .map(|(endpoint, info)| Resolved { endpoint, info })
         .collect::<Vec<_>>();
-    if matches.len() > 1 {
-        return Err(ToolError::Ambiguous(format!(
-            "{describe} matched {} live sessions; use pid: or name: to disambiguate",
-            matches.len()
-        )));
-    }
-    if let Some(resolved) = matches.into_iter().next() {
-        return Ok(resolved);
-    }
-
-    let unusable = unusable_messages(&probes);
-    if !unusable.is_empty() {
-        return Err(ToolError::Busy(format!(
-            "no answering session matched {describe}; {} live endpoint(s) were reachable but unusable and may be the target: {}",
-            unusable.len(),
-            unusable.join("; ")
-        )));
-    }
-    Err(ToolError::NoSession(Box::new(absent(
-        probes.into_iter().map(probe_detail).collect(),
-    ))))
+    classify_probe_matches(
+        matches,
+        probes,
+        describe,
+        "use pid: or name: to disambiguate",
+        "endpoint(s)",
+        absent,
+    )
 }
 
 /// Resolve a selector to a single live session.
@@ -506,36 +501,52 @@ fn resolve_probe_matches(
     describe: &str,
     disambiguate_hint: &str,
 ) -> Result<Resolved, ToolError> {
-    if matches.is_empty() {
-        let unusable = unusable_messages(&probes);
-        if !unusable.is_empty() {
-            return Err(ToolError::Busy(format!(
-                "no answering session matched {describe}; {} live session(s) were reachable but unusable and may be the target: {}",
-                unusable.len(),
-                unusable.join("; ")
-            )));
-        }
-        return Err(ToolError::NoSession(Box::new(discovery_diagnostics(
-            cwd,
-            format!("no session matched {describe}"),
-            None,
-            dir_statuses,
-            probes.into_iter().map(probe_detail).collect(),
-        ))));
-    }
+    classify_probe_matches(
+        matches,
+        probes,
+        describe,
+        disambiguate_hint,
+        "session(s)",
+        |socket_probes| {
+            discovery_diagnostics(
+                cwd,
+                format!("no session matched {describe}"),
+                None,
+                dir_statuses,
+                socket_probes,
+            )
+        },
+    )
+}
+
+fn classify_probe_matches(
+    matches: Vec<Resolved>,
+    probes: Vec<EndpointProbe>,
+    describe: &str,
+    disambiguate_hint: &str,
+    busy_unit: &str,
+    diagnostics: impl FnOnce(Vec<SocketProbeDetail>) -> DiscoveryDiagnostics,
+) -> Result<Resolved, ToolError> {
     if matches.len() > 1 {
         return Err(ToolError::Ambiguous(format!(
             "{describe} matched {} live sessions; {disambiguate_hint}",
             matches.len()
         )));
     }
-    let mut matches = matches.into_iter();
-    let Some(resolved) = matches.next() else {
-        return Err(ToolError::Unexpected(
-            "selector invariant violated: exactly one match expected".to_string(),
-        ));
-    };
-    Ok(resolved)
+    if let Some(resolved) = matches.into_iter().next() {
+        return Ok(resolved);
+    }
+    let unusable = unusable_messages(&probes);
+    if !unusable.is_empty() {
+        return Err(ToolError::Busy(format!(
+            "no answering session matched {describe}; {} live {busy_unit} were reachable but unusable and may be the target: {}",
+            unusable.len(),
+            unusable.join("; ")
+        )));
+    }
+    Err(ToolError::NoSession(Box::new(diagnostics(
+        probes.into_iter().map(probe_detail).collect(),
+    ))))
 }
 
 pub(crate) fn discovery_diagnostics(
@@ -781,6 +792,38 @@ mod tests {
             shutdown,
             _runner: runner,
         })
+    }
+
+    #[tokio::test]
+    async fn upward_config_search_stops_after_checking_home() -> color_eyre::eyre::Result<()> {
+        let root = temp_dir("home-boundary")?;
+        let home = root.path().join("home/me");
+        let project = home.join("repo/subdir");
+        std::fs::create_dir_all(&project)?;
+        std::fs::write(
+            root.path().join("micromux.yaml"),
+            "version: 1\nservices: {}\n",
+        )?;
+
+        let found = find_config_upward_with_home(&project, Some(&home)).await;
+
+        assert_eq!(found, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn upward_config_search_outside_home_still_walks_to_root() -> color_eyre::eyre::Result<()>
+    {
+        let root = temp_dir("outside-home")?;
+        let project = root.path().join("tmp/project");
+        std::fs::create_dir_all(&project)?;
+        let config = root.path().join("micromux.yaml");
+        std::fs::write(&config, "version: 1\nservices: {}\n")?;
+
+        let found = find_config_upward_with_home(&project, Some(Path::new("/home/me"))).await;
+
+        assert_eq!(found, Some(std::fs::canonicalize(config)?));
+        Ok(())
     }
 
     #[tokio::test]
