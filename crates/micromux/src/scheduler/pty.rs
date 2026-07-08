@@ -549,6 +549,39 @@ impl Drop for LogReaderHandle {
     }
 }
 
+#[cfg(all(test, unix))]
+impl LogReaderHandle {
+    /// A handle with no cancellation pipe, for unit tests that only exercise handle bookkeeping.
+    pub(super) fn test_dummy() -> Self {
+        Self { cancel_write: None }
+    }
+}
+
+#[cfg(all(test, unix))]
+impl PtyHandles {
+    /// Handles over a fresh PTY with no child attached, for unit tests that need a
+    /// `RunningService` without spawning a process.
+    pub(super) fn test_dummy() -> eyre::Result<Self> {
+        let pair = portable_pty::native_pty_system()
+            .openpty(portable_pty::PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .map_err(|err| eyre::eyre!("failed to open test pty: {err}"))?;
+        let writer = pair
+            .master
+            .take_writer()
+            .map_err(|err| eyre::eyre!("failed to take test pty writer: {err}"))?;
+        Ok(Self {
+            master: Arc::new(Mutex::new(pair.master)),
+            writer: Arc::new(Mutex::new(writer)),
+            size: Arc::new(AtomicU32::new(0)),
+        })
+    }
+}
+
 #[cfg(unix)]
 struct PollingPtyReader {
     reader: Box<dyn Read + Send>,
@@ -739,12 +772,35 @@ fn spawn_log_reader_thread(args: LogReaderArgs) {
             update: LogUpdateKind,
             text: String,
         ) {
-            let _ = events_tx.try_send(ProcessEvent::LogLine {
+            let event = ProcessEvent::LogLine {
                 service_id: service_id.clone(),
                 run_id,
                 stream: OutputStream::Stdout,
                 update,
                 line: text,
+            };
+            match update {
+                // This function is only called from the dedicated PTY reader OS thread; block it
+                // for durable append records so scheduler backpressure reaches the child instead
+                // of silently dropping complete log lines.
+                LogUpdateKind::Append => {
+                    let _ = events_tx.blocking_send(event);
+                }
+                // Interactive alt-screen frames are snapshots, not a durable line stream.
+                LogUpdateKind::LiveSnapshot { .. } => {
+                    let _ = events_tx.try_send(event);
+                }
+            }
+        }
+
+        fn send_log_reader_finished(
+            events_tx: &mpsc::Sender<ProcessEvent>,
+            service_id: &ServiceID,
+            run_id: RunId,
+        ) {
+            let _ = events_tx.blocking_send(ProcessEvent::LogReaderFinished {
+                service_id: service_id.clone(),
+                run_id,
             });
         }
 
@@ -977,6 +1033,7 @@ fn spawn_log_reader_thread(args: LogReaderArgs) {
                         run_id,
                         &mut line,
                     );
+                    send_log_reader_finished(&events_tx, &service_id, run_id);
                     break;
                 }
                 #[cfg(unix)]
@@ -990,6 +1047,7 @@ fn spawn_log_reader_thread(args: LogReaderArgs) {
                         run_id,
                         &mut line,
                     );
+                    send_log_reader_finished(&events_tx, &service_id, run_id);
                     break;
                 }
             };
@@ -1004,6 +1062,7 @@ fn spawn_log_reader_thread(args: LogReaderArgs) {
                     run_id,
                     &mut line,
                 );
+                send_log_reader_finished(&events_tx, &service_id, run_id);
                 break;
             }
 
@@ -1019,9 +1078,13 @@ fn spawn_log_reader_thread(args: LogReaderArgs) {
                 rate.set_alt_screen(alt_screen);
                 snapshot_mode = alt_screen;
                 dirty = alt_screen;
-                line.clear();
-                // The cleared line discards any partial record, so a CR seen before the mode flip
-                // must not carry over and swallow the next newline once we are back in line mode.
+                if alt_screen {
+                    flush_record(&mut line, &events_tx, &service_id, run_id);
+                } else {
+                    line.clear();
+                }
+                // The mode switch ends the current line record, so a CR seen before the flip must
+                // not carry over and swallow the next newline once we are back in line mode.
                 prev_was_cr = false;
             }
             if snapshot_mode {
@@ -1217,11 +1280,36 @@ fn spawn_termination_task(args: TerminationTaskArgs) {
             pid,
             process_group_leader_id,
         };
+        // A blocking wait consumes one blocking-pool thread until the child is reaped. The
+        // termination guard escalates to SIGKILL, so runtime shutdown is only held up by a process
+        // the OS itself cannot reap.
+        let mut wait_handle = tokio::task::spawn_blocking(move || child.wait());
         let mut termination_started = false;
         let mut hard_killed = false;
         let mut kill_deadline: Option<tokio::time::Instant> = None;
         loop {
             tokio::select! {
+                res = &mut wait_handle => {
+                    let code = match res {
+                        Ok(Ok(status)) => i32::try_from(status.exit_code()).unwrap_or(i32::MAX),
+                        Ok(Err(err)) => {
+                            tracing::error!(?err, "failed to wait for process");
+                            -1
+                        }
+                        Err(err) => {
+                            tracing::error!(?err, "process wait task failed");
+                            -1
+                        }
+                    };
+                    let _ = events_tx
+                        .send(ProcessEvent::Exited {
+                            service_id: service_id.clone(),
+                            run_id,
+                            exit_code: code,
+                        })
+                        .await;
+                    break;
+                }
                 () = shutdown.cancelled(), if !termination_started => {
                     let started = target.request(&events_tx, &service_id, run_id).await;
                     kill_deadline = started.kill_deadline;
@@ -1234,44 +1322,17 @@ fn spawn_termination_task(args: TerminationTaskArgs) {
                     hard_killed = started.hard_killed;
                     termination_started = true;
                 }
-                () = tokio::time::sleep(std::time::Duration::from_millis(25)) => {}
-            }
-
-            if termination_started
-                && !hard_killed
-                && let Some(deadline) = kill_deadline
-                && tokio::time::Instant::now() >= deadline
-            {
-                // Escalate to SIGKILL on the whole process group (mirroring the SIGTERM path),
-                // not just the group leader. Otherwise a leader that ignored SIGTERM is killed
-                // while its descendants survive and are orphaned once try_wait reaps the leader.
-                target.force_kill();
-                hard_killed = true;
-            }
-
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    let code = i32::try_from(status.exit_code()).unwrap_or(i32::MAX);
-                    let _ = events_tx
-                        .send(ProcessEvent::Exited {
-                            service_id: service_id.clone(),
-                            run_id,
-                            exit_code: code,
-                        })
-                        .await;
-                    break;
-                }
-                Ok(None) => {}
-                Err(err) => {
-                    tracing::error!(?err, "failed to poll process status");
-                    let _ = events_tx
-                        .send(ProcessEvent::Exited {
-                            service_id: service_id.clone(),
-                            run_id,
-                            exit_code: -1,
-                        })
-                        .await;
-                    break;
+                () = async {
+                    match kill_deadline {
+                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                }, if termination_started && !hard_killed => {
+                    // Escalate to SIGKILL on the whole process group (mirroring the SIGTERM path),
+                    // not just the group leader. Otherwise a leader that ignored SIGTERM is killed
+                    // while its descendants survive and are orphaned once wait reaps the leader.
+                    target.force_kill();
+                    hard_killed = true;
                 }
             }
         }
@@ -1304,7 +1365,10 @@ pub(super) fn start_service_with_pty_size(
         env_vars
     };
 
-    tracing::info!(service_id, prog, ?args, ?env_vars, "start service");
+    let mut env_keys = env_vars.keys().map(String::as_str).collect::<Vec<_>>();
+    env_keys.sort_unstable();
+    // Values may contain secrets from env files; log only the key names.
+    tracing::info!(service_id, prog, ?args, ?env_keys, "start service");
 
     let pty_system = portable_pty::native_pty_system();
     let pair = pty_system

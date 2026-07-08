@@ -65,6 +65,7 @@ pub(crate) enum ProcessEvent {
         attempt: u64,
         success: bool,
         exit_code: i32,
+        cancelled: bool,
     },
     Killed {
         service_id: ServiceID,
@@ -74,6 +75,10 @@ pub(crate) enum ProcessEvent {
         service_id: ServiceID,
         run_id: RunId,
         exit_code: i32,
+    },
+    LogReaderFinished {
+        service_id: ServiceID,
+        run_id: RunId,
     },
     Healthy {
         service_id: ServiceID,
@@ -94,6 +99,7 @@ impl ProcessEvent {
             | Self::HealthCheckFinished { service_id, .. }
             | Self::Killed { service_id, .. }
             | Self::Exited { service_id, .. }
+            | Self::LogReaderFinished { service_id, .. }
             | Self::Healthy { service_id, .. }
             | Self::Unhealthy { service_id, .. } => service_id,
         }
@@ -107,6 +113,7 @@ impl ProcessEvent {
             | Self::HealthCheckFinished { run_id, .. }
             | Self::Killed { run_id, .. }
             | Self::Exited { run_id, .. }
+            | Self::LogReaderFinished { run_id, .. }
             | Self::Healthy { run_id, .. }
             | Self::Unhealthy { run_id, .. } => *run_id,
         }
@@ -163,6 +170,9 @@ impl ProcessEvent {
                 exit_code,
                 ..
             } => Event::Exited(service_id.clone(), *exit_code),
+            Self::LogReaderFinished { service_id, .. } => {
+                Event::LogReaderFinished(service_id.clone())
+            }
             Self::Healthy { service_id, .. } => Event::Healthy(service_id.clone()),
             Self::Unhealthy { service_id, .. } => Event::Unhealthy(service_id.clone()),
         }
@@ -226,6 +236,8 @@ pub(crate) enum Event {
     Killed(ServiceID),
     /// A service exited.
     Exited(ServiceID, i32),
+    /// A service's PTY reader drained and exited.
+    LogReaderFinished(ServiceID),
     /// A service became healthy.
     Healthy(ServiceID),
     /// A service became unhealthy.
@@ -295,6 +307,7 @@ impl std::fmt::Display for Event {
             ),
             Self::Killed(service_id) => write!(f, "Killed({service_id})"),
             Self::Exited(service_id, _) => write!(f, "Exited({service_id})"),
+            Self::LogReaderFinished(service_id) => write!(f, "LogReaderFinished({service_id})"),
             Self::Healthy(service_id) => write!(f, "Healthy({service_id})"),
             Self::Unhealthy(service_id) => write!(f, "Unhealthy({service_id})"),
             Self::Disabled(service_id) => write!(f, "Disabled({service_id})"),

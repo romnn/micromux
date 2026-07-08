@@ -159,6 +159,73 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn terminated_probe_emits_cancelled_finished() -> color_eyre::eyre::Result<()> {
+        let hc = crate::config::HealthCheck {
+            test: (
+                spanned_string("sh"),
+                vec![spanned_string("-c"), spanned_string("sleep 5")],
+            ),
+            start_delay: None,
+            interval: None,
+            timeout: Some(Spanned {
+                span: yaml_spanned::spanned::Span::default(),
+                inner: std::time::Duration::from_secs(5),
+            }),
+            retries: Some(Spanned {
+                span: yaml_spanned::spanned::Span::default(),
+                inner: 1,
+            }),
+        };
+
+        let (events_tx, mut events_rx) = mpsc::channel(64);
+        let shutdown = CancellationToken::new();
+        let terminate = CancellationToken::new();
+        let run_handle = tokio::spawn({
+            let terminate = terminate.clone();
+            async move {
+                let env = std::collections::HashMap::new();
+                let service_id: ServiceID = "svc".to_string();
+                super::run(
+                    &hc,
+                    &service_id,
+                    RunId::new(1),
+                    1,
+                    RunParams {
+                        working_dir: None,
+                        environment: &env,
+                        events_tx,
+                        shutdown,
+                        terminate,
+                    },
+                )
+                .await
+            }
+        });
+
+        let mut saw_cancelled_finished = false;
+        for _ in 0..50 {
+            let Some(ev) = events_rx.recv().await else {
+                break;
+            };
+            match ev {
+                ProcessEvent::HealthCheckStarted { .. } => terminate.cancel(),
+                ProcessEvent::HealthCheckFinished {
+                    cancelled: true, ..
+                } => {
+                    saw_cancelled_finished = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        let outcome = run_handle.await?;
+        assert!(matches!(outcome, Ok(Outcome::Cancelled)));
+        assert!(saw_cancelled_finished);
+        Ok(())
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn successful_probe_does_not_wait_for_background_stdout_holder()
@@ -559,6 +626,7 @@ async fn emit_finished(
     attempt: u64,
     success: bool,
     exit_code: i32,
+    cancelled: bool,
 ) {
     let _ = events_tx
         .send(ProcessEvent::HealthCheckFinished {
@@ -567,6 +635,7 @@ async fn emit_finished(
             attempt,
             success,
             exit_code,
+            cancelled,
         })
         .await;
 }
@@ -591,6 +660,7 @@ fn try_emit_spawn_failed(
         attempt,
         success: false,
         exit_code: -1,
+        cancelled: false,
     });
 }
 
@@ -790,6 +860,7 @@ async fn finish_with_exit(running: &mut Running, success: bool, exit_code: i32) 
         running.attempt,
         success,
         exit_code,
+        false,
     )
     .await;
 }
@@ -919,6 +990,7 @@ async fn run(
                 attempt,
                 false,
                 -1,
+                true,
             )
             .await;
             Ok(Outcome::Cancelled)
@@ -932,6 +1004,7 @@ async fn run(
                 attempt,
                 false,
                 -1,
+                false,
             )
             .await;
             let command = std::mem::take(&mut running.command);

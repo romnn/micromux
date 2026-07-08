@@ -187,14 +187,6 @@ impl Micromux {
             tracing::info!("starting");
             let (events_tx, events_rx) = mpsc::channel(1024);
 
-            tokio::spawn({
-                let shutdown = shutdown.clone();
-                async move {
-                    shutdown.cancelled().await;
-                    tracing::warn!("received shutdown signal");
-                }
-            });
-
             scheduler::scheduler(scheduler::SchedulerInput {
                 services: self.services.clone(),
                 reload_config: self.reload_config.clone(),

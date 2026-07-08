@@ -3,14 +3,12 @@ use color_eyre::eyre;
 use petgraph::graphmap::DiGraphMap;
 
 #[derive(Debug)]
-pub struct ServiceGraph<'a> {
-    pub inner: DiGraphMap<&'a str, ()>,
-}
+pub struct ServiceGraph;
 
-impl<'a> ServiceGraph<'a> {
-    pub fn new(services: &'a ServiceMap) -> eyre::Result<ServiceGraph<'a>> {
+impl ServiceGraph {
+    pub fn new(services: &ServiceMap) -> eyre::Result<ServiceGraph> {
         // Build an empty directed graph keyed by service name
-        let mut graph = DiGraphMap::new();
+        let mut graph: DiGraphMap<&str, ()> = DiGraphMap::new();
 
         // Add all nodes first so dependency validation is order-independent.
         for (name, _service) in services {
@@ -45,7 +43,7 @@ impl<'a> ServiceGraph<'a> {
             eyre::eyre!("cycle detected at service: `{}`", service)
         })?;
 
-        Ok(Self { inner: graph })
+        Ok(Self)
     }
 }
 
@@ -102,8 +100,7 @@ mod tests {
             Service::new("b", config_dir, service_config("b", vec![]))?,
         );
 
-        let graph = ServiceGraph::new(&services)?;
-        assert!(graph.inner.contains_edge("b", "a"));
+        ServiceGraph::new(&services)?;
         Ok(())
     }
 
