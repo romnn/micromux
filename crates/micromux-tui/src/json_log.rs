@@ -1,4 +1,7 @@
-use micromux::{StructuredLogLevel, is_structured_log_level_key};
+use micromux::{
+    FIELDS_KEY, MESSAGE_KEYS, StructuredLogLevel, find_fields_object, find_key,
+    is_structured_log_level_key, key_matches, render_scalar, sanitize_text,
+};
 use serde_json::{Map, Value};
 
 const RESET: &str = "\x1b[0m";
@@ -12,8 +15,6 @@ const RED: &str = "\x1b[31m";
 const MAGENTA: &str = "\x1b[35m";
 
 const LEVEL_LABEL_WIDTH: usize = 6;
-const MESSAGE_KEYS: &[&str] = &["message", "msg"];
-const FIELDS_KEY: &str = "fields";
 
 #[must_use]
 pub(crate) fn format_line(line: &str, pretty_json: bool) -> String {
@@ -99,39 +100,11 @@ fn append_fields_object(out: &mut String, fields: &Map<String, Value>) {
     }
 }
 
-fn find_key<'a>(
-    object: &'a Map<String, Value>,
-    candidates: &[&str],
-) -> Option<(&'a str, &'a Value)> {
-    object
-        .iter()
-        .find(|(key, _)| key_matches(key, candidates))
-        .map(|(key, value)| (key.as_str(), value))
-}
-
 fn find_level_key(object: &Map<String, Value>) -> Option<(&str, &Value)> {
     object
         .iter()
         .find(|(key, _)| is_structured_log_level_key(key))
         .map(|(key, value)| (key.as_str(), value))
-}
-
-fn find_fields_object(object: &Map<String, Value>) -> Option<&Map<String, Value>> {
-    object.iter().find_map(|(key, value)| {
-        if key.eq_ignore_ascii_case(FIELDS_KEY)
-            && let Value::Object(fields) = value
-        {
-            Some(fields)
-        } else {
-            None
-        }
-    })
-}
-
-fn key_matches(key: &str, candidates: &[&str]) -> bool {
-    candidates
-        .iter()
-        .any(|candidate| key.eq_ignore_ascii_case(candidate))
 }
 
 fn append_key_value(out: &mut String, key: &str, value: &Value) {
@@ -142,37 +115,6 @@ fn append_key_value(out: &mut String, key: &str, value: &Value) {
     out.push_str(GRAY);
     out.push_str(&render_scalar(value));
     out.push_str(RESET);
-}
-
-fn render_scalar(value: &Value) -> String {
-    match value {
-        Value::String(text) => sanitize_text(text),
-        Value::Null => "null".to_string(),
-        Value::Bool(value) => value.to_string(),
-        Value::Number(value) => value.to_string(),
-        Value::Array(_) | Value::Object(_) => value.to_string(),
-    }
-}
-
-fn sanitize_text(text: &str) -> String {
-    if !text.chars().any(char::is_control) {
-        return text.to_string();
-    }
-
-    let mut out = String::with_capacity(text.len());
-    for ch in text.chars() {
-        match ch {
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            ch if ch.is_control() => {
-                use std::fmt::Write as _;
-                let _ = write!(out, "\\u{:04x}", u32::from(ch));
-            }
-            ch => out.push(ch),
-        }
-    }
-    out
 }
 
 fn level_label(value: &Value) -> String {

@@ -28,7 +28,7 @@ mod health_check;
 mod model;
 mod scheduler;
 mod service;
-mod structured_log;
+pub mod structured_log;
 
 use color_eyre::eyre;
 use std::future::Future;
@@ -52,7 +52,9 @@ pub use scheduler::{
 };
 pub use service::RestartPolicy;
 pub use structured_log::{
-    StructuredLogLevel, is_structured_log_level_key, structured_log_level_in_object,
+    FIELDS_KEY, MESSAGE_KEYS, StructuredLogLevel, find_fields_object, find_key,
+    is_structured_log_level_key, key_matches, render_scalar, sanitize_text,
+    structured_log_level_in_object, structured_log_level_in_record,
 };
 
 pub(crate) type ServiceMap = indexmap::IndexMap<ServiceID, service::Service>;

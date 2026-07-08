@@ -10,7 +10,9 @@
 use std::collections::{BTreeMap, VecDeque};
 
 use micromux::{
-    LogLine, StructuredLogLevel, is_structured_log_level_key, structured_log_level_in_object,
+    FIELDS_KEY, LogLine, MESSAGE_KEYS, StructuredLogLevel, find_fields_object, find_key,
+    is_structured_log_level_key, key_matches, render_scalar as render_value, sanitize_text,
+    structured_log_level_in_record,
 };
 use regex::Regex;
 use schemars::JsonSchema;
@@ -19,8 +21,6 @@ use serde_json::{Map, Value};
 
 /// Object keys, matched case-insensitively, under which structured loggers carry timestamps.
 const TIMESTAMP_KEYS: &[&str] = &["@timestamp", "timestamp", "time", "ts", "datetime", "date"];
-const MESSAGE_KEYS: &[&str] = &["message", "msg"];
-const FIELDS_KEY: &str = "fields";
 
 /// Severity ranks for structured-log filtering.
 pub type Level = StructuredLogLevel;
@@ -204,41 +204,12 @@ fn decimal_timestamp_to_unix_ms(raw: &str) -> Option<u64> {
     Some(millis)
 }
 
-fn key_matches(key: &str, candidates: &[&str]) -> bool {
-    candidates
-        .iter()
-        .any(|candidate| key.eq_ignore_ascii_case(candidate))
-}
-
 fn is_timestamp_key(key: &str) -> bool {
     key_matches(key, TIMESTAMP_KEYS)
 }
 
-fn find_key<'a>(
-    object: &'a Map<String, Value>,
-    candidates: &[&str],
-) -> Option<(&'a str, &'a Value)> {
-    object
-        .iter()
-        .find(|(key, _)| key_matches(key, candidates))
-        .map(|(key, value)| (key.as_str(), value))
-}
-
-fn find_fields_object(object: &Map<String, Value>) -> Option<&Map<String, Value>> {
-    object.iter().find_map(|(key, value)| {
-        if key.eq_ignore_ascii_case(FIELDS_KEY)
-            && let Value::Object(fields) = value
-        {
-            Some(fields)
-        } else {
-            None
-        }
-    })
-}
-
 fn level_in_object(object: &Map<String, Value>) -> Option<Level> {
-    structured_log_level_in_object(object)
-        .or_else(|| find_fields_object(object).and_then(structured_log_level_in_object))
+    structured_log_level_in_record(object)
 }
 
 fn source_timestamp(object: &Map<String, Value>) -> Option<u64> {
@@ -280,43 +251,12 @@ fn append_fields(
     }
 }
 
-fn render_value(value: &Value) -> String {
-    match value {
-        Value::String(text) => sanitize_text(text),
-        Value::Null => "null".to_string(),
-        Value::Bool(value) => value.to_string(),
-        Value::Number(value) => value.to_string(),
-        Value::Array(_) | Value::Object(_) => value.to_string(),
-    }
-}
-
 fn render_compact_field_value(value: &Value) -> String {
     match value {
         Value::Array(values) => format!("[array:{}]", values.len()),
         Value::Object(fields) => format!("{{object:{}}}", fields.len()),
         Value::String(_) | Value::Null | Value::Bool(_) | Value::Number(_) => render_value(value),
     }
-}
-
-fn sanitize_text(text: &str) -> String {
-    if !text.chars().any(char::is_control) {
-        return text.to_string();
-    }
-
-    let mut out = String::with_capacity(text.len());
-    for ch in text.chars() {
-        match ch {
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            ch if ch.is_control() => {
-                use std::fmt::Write as _;
-                let _ = write!(out, "\\u{:04x}", u32::from(ch));
-            }
-            ch => out.push(ch),
-        }
-    }
-    out
 }
 
 fn timestamp_label(timestamp_unix_ms: u64) -> String {

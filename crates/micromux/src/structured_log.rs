@@ -1,6 +1,12 @@
+//! Shared helpers for recognizing and displaying structured JSON log records.
+
 use serde_json::{Map, Value};
 
 const STRUCTURED_LOG_LEVEL_KEYS: &[&str] = &["level", "lvl", "severity", "levelname", "loglevel"];
+/// Keys commonly used for a structured log message body.
+pub const MESSAGE_KEYS: &[&str] = &["message", "msg"];
+/// The tracing-subscriber style nested fields object key.
+pub const FIELDS_KEY: &str = "fields";
 
 const LEVEL_WORDS: &[(&str, StructuredLogLevel)] = &[
     ("trace", StructuredLogLevel::Trace),
@@ -104,6 +110,40 @@ pub fn is_structured_log_level_key(key: &str) -> bool {
         .any(|candidate| key.eq_ignore_ascii_case(candidate))
 }
 
+/// Return whether `key` matches one of the candidate keys, case-insensitively.
+#[must_use]
+pub fn key_matches(key: &str, candidates: &[&str]) -> bool {
+    candidates
+        .iter()
+        .any(|candidate| key.eq_ignore_ascii_case(candidate))
+}
+
+/// Find the first object field whose key matches the candidates, case-insensitively.
+#[must_use]
+pub fn find_key<'a>(
+    object: &'a Map<String, Value>,
+    candidates: &[&str],
+) -> Option<(&'a str, &'a Value)> {
+    object
+        .iter()
+        .find(|(key, _)| key_matches(key, candidates))
+        .map(|(key, value)| (key.as_str(), value))
+}
+
+/// Find the tracing-style nested `fields` object, if present.
+#[must_use]
+pub fn find_fields_object(object: &Map<String, Value>) -> Option<&Map<String, Value>> {
+    object.iter().find_map(|(key, value)| {
+        if key.eq_ignore_ascii_case(FIELDS_KEY)
+            && let Value::Object(fields) = value
+        {
+            Some(fields)
+        } else {
+            None
+        }
+    })
+}
+
 /// Detect the level of a JSON log object from its recognized level fields.
 #[must_use]
 pub fn structured_log_level_in_object(object: &Map<String, Value>) -> Option<StructuredLogLevel> {
@@ -113,9 +153,54 @@ pub fn structured_log_level_in_object(object: &Map<String, Value>) -> Option<Str
         .find_map(|(_, value)| StructuredLogLevel::from_value(value))
 }
 
+/// Detect a level on the top-level record, falling back to a nested tracing-style `fields` object.
+#[must_use]
+pub fn structured_log_level_in_record(object: &Map<String, Value>) -> Option<StructuredLogLevel> {
+    structured_log_level_in_object(object)
+        .or_else(|| find_fields_object(object).and_then(structured_log_level_in_object))
+}
+
+/// Escape control characters so a log payload cannot inject terminal control sequences.
+#[must_use]
+pub fn sanitize_text(text: &str) -> String {
+    if !text.chars().any(char::is_control) {
+        return text.to_string();
+    }
+
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        match ch {
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            ch if ch.is_control() => {
+                use std::fmt::Write as _;
+                let _ = write!(out, "\\u{:04x}", u32::from(ch));
+            }
+            ch => out.push(ch),
+        }
+    }
+    out
+}
+
+/// Render a JSON scalar for display; arrays and objects use compact JSON.
+#[must_use]
+pub fn render_scalar(value: &Value) -> String {
+    match value {
+        Value::String(text) => sanitize_text(text),
+        Value::Null => "null".to_string(),
+        Value::Bool(value) => value.to_string(),
+        Value::Number(value) => value.to_string(),
+        Value::Array(_) | Value::Object(_) => value.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{StructuredLogLevel, structured_log_level_in_object};
+    use super::{
+        StructuredLogLevel, sanitize_text, structured_log_level_in_object,
+        structured_log_level_in_record,
+    };
     use similar_asserts::assert_eq;
 
     fn detect(line: &str) -> Option<StructuredLogLevel> {
@@ -143,5 +228,24 @@ mod tests {
     fn detects_numeric_pino_levels() {
         assert_eq!(detect(r#"{"level":30}"#), Some(StructuredLogLevel::Info));
         assert_eq!(detect(r#"{"level":5e1}"#), Some(StructuredLogLevel::Error));
+    }
+
+    #[test]
+    fn falls_back_to_tracing_fields_for_level() {
+        let serde_json::Value::Object(object) =
+            serde_json::from_str::<serde_json::Value>(r#"{"fields":{"level":"error"}}"#).unwrap()
+        else {
+            panic!("expected object");
+        };
+
+        assert_eq!(
+            structured_log_level_in_record(&object),
+            Some(StructuredLogLevel::Error)
+        );
+    }
+
+    #[test]
+    fn sanitize_text_escapes_controls() {
+        assert_eq!(sanitize_text("a\n\u{1b}"), "a\\n\\u001b");
     }
 }
