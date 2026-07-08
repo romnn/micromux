@@ -1151,6 +1151,33 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_service_keys_are_rejected_by_yaml_parser() -> eyre::Result<()> {
+        let yaml = indoc! {r#"
+            version: 1
+            services:
+              app:
+                command: ["sh", "-c", "old"]
+              app:
+                command: ["sh", "-c", "new"]
+        "#};
+
+        let mut diagnostics: Vec<Diagnostic<usize>> = vec![];
+        match config::from_str(yaml, Path::new("."), 0, None, &mut diagnostics) {
+            Ok(_) => Err(eyre::eyre!(
+                "expected duplicate service keys to be rejected before service parsing"
+            )),
+            Err(err) => {
+                let message = err.to_string();
+                assert!(
+                    message.contains("DuplicateKey") && message.contains("app"),
+                    "unexpected error: {message}"
+                );
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
     fn bare_on_failure_is_unlimited() -> eyre::Result<()> {
         let yaml = indoc! {r#"
             version: 1
