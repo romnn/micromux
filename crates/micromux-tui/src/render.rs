@@ -22,6 +22,7 @@ mod tests {
     use ratatui::{
         buffer::Buffer,
         layout::Rect,
+        text::Text,
         widgets::{Paragraph, Wrap},
     };
     use similar_asserts::assert_eq;
@@ -29,6 +30,22 @@ mod tests {
     fn wrapped_text_height(text: ratatui::text::Text, wrap_width: u16) -> u16 {
         let paragraph = Paragraph::new(text).wrap(Wrap { trim: false });
         rendered_line_count(&paragraph, wrap_width)
+    }
+
+    fn render_logs(
+        view: &mut LogView,
+        log_area: Rect,
+        scrollbar_area: Rect,
+        logs: &str,
+        buf: &mut Buffer,
+    ) -> u16 {
+        let text = Text::from(logs.to_string());
+        let num_lines = if view.wrap {
+            wrapped_text_height(text.clone(), log_area.width.saturating_sub(2))
+        } else {
+            u16::try_from(text.height()).unwrap_or(u16::MAX)
+        };
+        view.render(log_area, scrollbar_area, num_lines, text, buf)
     }
 
     fn count_thumb(buf: &Buffer, area: Rect) -> usize {
@@ -105,7 +122,7 @@ mod tests {
             height: 5,
         };
 
-        view.render(log_area, scrollbar_area, 0, "one line", &mut buf);
+        render_logs(&mut view, log_area, scrollbar_area, "one line", &mut buf);
 
         assert_eq!(
             count_thumb(&buf, scrollbar_area),
@@ -142,7 +159,7 @@ mod tests {
             .map(|i| format!("line{i}"))
             .collect::<Vec<_>>()
             .join("\n");
-        view.render(log_area, scrollbar_area, 0, &logs, &mut buf);
+        render_logs(&mut view, log_area, scrollbar_area, &logs, &mut buf);
 
         assert!(count_thumb(&buf, scrollbar_area) < scrollbar_area.height as usize);
         assert!(has_thumb_at(
@@ -180,12 +197,12 @@ mod tests {
 
         let mut buf1 = Buffer::empty(buf_area);
         view.wrap = false;
-        view.render(log_area, scrollbar_area, 0, logs, &mut buf1);
+        render_logs(&mut view, log_area, scrollbar_area, logs, &mut buf1);
         let thumb_unwrapped = count_thumb(&buf1, scrollbar_area);
 
         let mut buf2 = Buffer::empty(buf_area);
         view.wrap = true;
-        view.render(log_area, scrollbar_area, 0, logs, &mut buf2);
+        render_logs(&mut view, log_area, scrollbar_area, logs, &mut buf2);
         let thumb_wrapped = count_thumb(&buf2, scrollbar_area);
 
         assert!(thumb_wrapped <= thumb_unwrapped);
@@ -219,10 +236,10 @@ mod tests {
             height: 2,
         };
 
-        let rendered = view.render(
+        let rendered = render_logs(
+            &mut view,
             log_area,
             scrollbar_area,
-            0,
             "abcdefghijklmnopqrstuvwx",
             &mut buf,
         );
@@ -261,6 +278,7 @@ mod tests {
             result: Some(HealthResult {
                 success: true,
                 exit_code: 0,
+                cancelled: false,
             }),
         };
         assert_eq!(
@@ -278,6 +296,22 @@ mod tests {
         assert_eq!(
             build_healthcheck_text(true, std::slice::from_ref(&running)),
             "\x1b[33m[healthcheck running]\x1b[0m probe\n\n"
+        );
+
+        let cancelled = HealthAttempt {
+            run_generation: 1,
+            attempt: 3,
+            command: "probe".to_string(),
+            output: Vec::new(),
+            result: Some(HealthResult {
+                success: false,
+                exit_code: -1,
+                cancelled: true,
+            }),
+        };
+        assert_eq!(
+            build_healthcheck_text(true, std::slice::from_ref(&cancelled)),
+            "\x1b[90m[healthcheck cancelled]\x1b[0m probe\n\n"
         );
     }
 }
@@ -298,19 +332,22 @@ fn build_healthcheck_text(configured: bool, attempts: &[micromux::HealthAttempt]
             out.push('\n');
         }
 
-        let (success, exit_code) = attempt.result.map_or((None, None), |result| {
-            (Some(result.success), Some(result.exit_code))
-        });
+        let result = attempt.result;
 
         // Separator line rendered with ANSI so ansi_to_tui can color it reliably.
-        let status = match (success, exit_code) {
-            (Some(true), Some(code)) => {
+        let status = match result {
+            Some(result) if result.cancelled => {
+                "\x1b[90m[healthcheck cancelled]\x1b[0m".to_string()
+            }
+            Some(result) if result.success => {
+                let code = result.exit_code;
                 format!("\x1b[32m[healthcheck ok exit_code={code}]\x1b[0m")
             }
-            (Some(false), Some(code)) => {
+            Some(result) => {
+                let code = result.exit_code;
                 format!("\x1b[31m[healthcheck failed exit_code={code}]\x1b[0m")
             }
-            _ => "\x1b[33m[healthcheck running]\x1b[0m".to_string(),
+            None => "\x1b[33m[healthcheck running]\x1b[0m".to_string(),
         };
 
         out.push_str(&status);
@@ -346,7 +383,7 @@ fn state_name(snapshot: &micromux::ServiceSnapshot) -> &'static str {
 
     match snapshot.execution {
         micromux::Execution::Pending => "PENDING",
-        micromux::Execution::Starting => "RUNNING",
+        micromux::Execution::Starting => "STARTING",
         micromux::Execution::Running => match snapshot.health {
             Some(micromux::Health::Healthy) => "HEALTHY",
             Some(micromux::Health::Unhealthy) => "UNHEALTHY",
@@ -463,38 +500,42 @@ impl App {
         else {
             return;
         };
-        // Rebuild the cached log text from the model only when this service's logs changed.
         let dirty = self
             .state
             .current_service()
             .is_some_and(|service| service.logs_dirty);
         if dirty {
-            let lines = self.reader.logs(&current_id, None);
-            let count = u16::try_from(lines.len()).unwrap_or(u16::MAX);
-            let text = lines
-                .into_iter()
-                .map(|line| crate::json_log::format_line(&line.line, self.pretty_json_logs))
-                .collect::<Vec<_>>()
-                .join("\n");
+            let after = self
+                .state
+                .current_service()
+                .and_then(|service| service.cached_lines.back())
+                .map_or(0, |(seq, _)| seq.saturating_sub(1));
+            let (first_retained, new_lines) = self.reader.logs_since(&current_id, after);
             if let Some(service) = self.state.current_service_mut() {
-                service.cached_num_lines = count;
-                service.cached_logs = text;
+                match first_retained {
+                    None => service.cached_lines.clear(),
+                    Some(first) => {
+                        while service
+                            .cached_lines
+                            .front()
+                            .is_some_and(|(seq, _)| *seq < first)
+                        {
+                            service.cached_lines.pop_front();
+                        }
+                    }
+                }
+                for line in new_lines {
+                    let formatted = crate::json_log::format_line(&line.line, self.pretty_json_logs);
+                    match service.cached_lines.back_mut() {
+                        Some((seq, cached)) if *seq == line.seq => *cached = formatted,
+                        _ => service.cached_lines.push_back((line.seq, formatted)),
+                    }
+                }
+                service.text_dirty = true;
                 service.logs_dirty = false;
             }
         }
 
-        let Some(current_service) = self.state.current_service() else {
-            return;
-        };
-        let num_lines = current_service.cached_num_lines;
-        let current_logs = current_service.cached_logs.as_str();
-        tracing::trace!(
-            service_id = current_service.snapshot.id,
-            num_lines,
-            "collected logs"
-        );
-
-        // Split into a main pane and a thin scrollbar pane
         let [logs_area, scrollbar_area] = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
@@ -511,15 +552,47 @@ impl App {
             height: scrollbar_area.height.saturating_sub(2),
         };
 
-        let rendered_lines =
-            self.log_view
-                .render(logs_area, scrollbar_area, num_lines, current_logs, buf);
-
-        // Persist the wrap-aware rendered line count so keyboard scrolling (scroll_logs_down)
-        // clamps to the same bottom the scrollbar uses, even when wrapping is enabled.
-        if let Some(current_service) = self.state.current_service_mut() {
-            current_service.cached_num_lines = rendered_lines;
+        let wrap = self.log_view.wrap;
+        let wrap_width = logs_area.width.saturating_sub(2);
+        if let Some(service) = self.state.current_service_mut()
+            && (service.text_dirty || service.cached_wrap != Some((wrap, wrap_width)))
+        {
+            let joined = service
+                .cached_lines
+                .iter()
+                .map(|(_, line)| line.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            service.cached_text = joined.as_str().into_text().unwrap_or_else(|err| {
+                let escaped = strip_ansi_escapes::strip_str(&joined);
+                tracing::error!(?err, escaped, "failed to sanitize log line");
+                escaped.into()
+            });
+            let raw_num_lines = u16::try_from(service.cached_text.height()).unwrap_or(u16::MAX);
+            service.cached_wrapped_lines = if wrap {
+                let paragraph =
+                    Paragraph::new(service.cached_text.clone()).wrap(Wrap { trim: false });
+                rendered_line_count(&paragraph, wrap_width)
+            } else {
+                raw_num_lines
+            };
+            service.cached_wrap = Some((wrap, wrap_width));
+            service.text_dirty = false;
         }
+
+        let Some(current_service) = self.state.current_service() else {
+            return;
+        };
+        let num_lines = current_service.cached_wrapped_lines;
+        let text = current_service.cached_text.clone();
+        tracing::trace!(
+            service_id = current_service.snapshot.id,
+            num_lines,
+            "collected logs"
+        );
+
+        self.log_view
+            .render(logs_area, scrollbar_area, num_lines, text, buf);
     }
 
     fn render_healthchecks(&mut self, area: Rect, buf: &mut Buffer) {
@@ -705,7 +778,6 @@ impl App {
 }
 
 pub mod log_view {
-    use ansi_to_tui::IntoText;
     use ratatui::{
         buffer::Buffer,
         layout::Rect,
@@ -745,32 +817,17 @@ pub mod log_view {
             &mut self,
             log_area: Rect,
             scrollbar_area: Rect,
-            _num_lines: u16,
-            logs: &str,
+            num_lines: u16,
+            text: ratatui::text::Text<'static>,
             buf: &mut Buffer,
         ) -> u16 {
             Clear.render(log_area, buf);
             Clear.render(scrollbar_area, buf);
 
-            // Strip ANSI control codes that could confuse our TUI
-            let text: ratatui::text::Text = logs.into_text().unwrap_or_else(|err| {
-                // As a fallback, remove all ANSI controls (losing all color)
-                let escaped = strip_ansi_escapes::strip_str(logs);
-                tracing::error!(?err, escaped, "failed to sanitize log line");
-                escaped.into()
-            });
-
-            let raw_num_lines = u16::try_from(text.height()).unwrap_or(u16::MAX);
-            let wrap_width = log_area.width.saturating_sub(2);
             let mut paragraph = Paragraph::new(text);
             if self.wrap {
                 paragraph = paragraph.wrap(Wrap { trim: false });
             }
-            let num_lines = if self.wrap {
-                super::rendered_line_count(&paragraph, wrap_width)
-            } else {
-                raw_num_lines
-            };
 
             let viewport_height = scrollbar_area.height;
             let max_off = num_lines.saturating_sub(viewport_height);

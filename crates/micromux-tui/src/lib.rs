@@ -70,8 +70,11 @@ impl App {
             .into_iter()
             .map(|snapshot| state::Service {
                 snapshot,
-                cached_num_lines: 0,
-                cached_logs: String::new(),
+                cached_lines: std::collections::VecDeque::new(),
+                cached_text: ratatui::text::Text::default(),
+                text_dirty: true,
+                cached_wrapped_lines: 0,
+                cached_wrap: None,
                 logs_dirty: true,
                 healthcheck_cached_num_lines: 0,
                 healthcheck_cached_text: String::new(),
@@ -216,6 +219,16 @@ impl App {
                 None => {
                     self.running = false;
                     continue;
+                }
+            }
+            loop {
+                match self.changes.try_recv() {
+                    Ok(change) => self.apply_change(&change),
+                    Err(broadcast::error::TryRecvError::Lagged(_)) => self.resync(),
+                    Err(
+                        broadcast::error::TryRecvError::Empty
+                        | broadcast::error::TryRecvError::Closed,
+                    ) => break,
                 }
             }
             terminal.draw(|frame| frame.render_widget(&mut self, frame.area()))?;
@@ -463,7 +476,7 @@ impl App {
         };
         // Wrap-aware count persisted by the renderer, so scrolling reaches the true bottom
         // even when wrapping is enabled (the raw entry count would stop short).
-        let num_lines = service.cached_num_lines;
+        let num_lines = service.cached_wrapped_lines;
         let viewport = self.log_viewport_height();
         let max_off = num_lines.saturating_sub(viewport);
         self.log_view.scroll_offset = self

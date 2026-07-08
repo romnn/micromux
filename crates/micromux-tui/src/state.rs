@@ -3,8 +3,11 @@
 #[derive(Debug)]
 pub struct Service {
     pub snapshot: micromux::ServiceSnapshot,
-    pub cached_num_lines: u16,
-    pub cached_logs: String,
+    pub cached_lines: std::collections::VecDeque<(u64, String)>,
+    pub cached_text: ratatui::text::Text<'static>,
+    pub text_dirty: bool,
+    pub cached_wrapped_lines: u16,
+    pub cached_wrap: Option<(bool, u16)>,
     pub logs_dirty: bool,
     pub healthcheck_cached_num_lines: u16,
     pub healthcheck_cached_text: String,
