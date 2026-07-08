@@ -177,6 +177,11 @@ micromux ctl restart api
 
 Build a lean TUI-only binary with the MCP server compiled out via `cargo install --no-default-features micromux-cli`.
 
+**Platform support.** micromux is developed and fully supported on Linux and macOS. On Windows the
+TUI runs, but the agent control plane (`micromux ctl`, `micromux mcp`, `micromux serve`) is not yet
+available, and stopping a service kills it immediately without a graceful-termination phase. Windows
+named-pipe support is planned (`ControlEndpoint::WindowsNamedPipe` reserves the slot).
+
  ## How it differs from Docker Compose
  
  Micromux is **not a container orchestrator**.
