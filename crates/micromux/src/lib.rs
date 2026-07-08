@@ -44,7 +44,7 @@ pub use health_check::Health;
 pub use model::{
     ChangeKind, Desired, DiskLogRetention, Execution, HealthAttempt, HealthLine, HealthResult,
     LogLimit, LogLine, LogRetention, LogRun, LogRunSummary, MemoryLogRetention, ServiceSnapshot,
-    SessionChange, SessionModelReader,
+    SessionChange, SessionModelReader, trim_to_last_bytes,
 };
 pub use scheduler::{
     Command, CommandRejection, OutputStream, SchedulerStopped, ServiceCommandAck,

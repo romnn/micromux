@@ -45,6 +45,7 @@ petgraph = "0"
 
 # cross platform cache and config directories
 directories.workspace = true
+fs2 = "0.4"
 
 # config parsing
 humantime = "2"

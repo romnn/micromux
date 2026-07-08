@@ -11,18 +11,14 @@
 //! `Inner` is behind a synchronous [`parking_lot::RwLock`]; readers snapshot/clone under the lock,
 //! drop it, and only then serialize — never holding the guard across an `.await`.
 
-use std::collections::HashMap;
 use std::collections::VecDeque;
-use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, BufWriter, Seek, SeekFrom, Write};
+use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::mpsc;
-use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use indexmap::IndexMap;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::RwLock;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
@@ -46,9 +42,6 @@ const HEALTH_OUTPUT_MAX_LINES: usize = 200;
 /// Capacity of the liveness-only change broadcast. A lagging subscriber loses only coalescible
 /// notifications (it re-queries the model for content), never log bytes.
 const CHANGE_CHANNEL_CAPACITY: usize = 1024;
-const RUN_LOG_OFFSET_CACHE: usize = 4096;
-const DISK_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
-const DISK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// The state a service has been *asked* to be in. `Disabled` is a desire, not an execution state —
 /// a disabled service may still be draining.
@@ -297,6 +290,9 @@ pub struct HealthResult {
     pub success: bool,
     /// Exit code of the probe process.
     pub exit_code: i32,
+    /// Whether the probe was cancelled because the service run was stopping.
+    #[serde(default)]
+    pub cancelled: bool,
 }
 
 /// One healthcheck attempt and its (bounded) output.
@@ -339,604 +335,18 @@ pub struct SessionChange {
     pub kind: ChangeKind,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-enum DiskLogOp {
-    Append,
-    ReplaceLast,
-}
+mod disk;
+mod memory;
+mod runlog;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct DiskLogRecord {
-    seq: u64,
-    run_generation: u64,
-    #[serde(default)]
-    timestamp_unix_ms: u64,
-    op: DiskLogOp,
-    line: String,
-}
-
-enum DiskLogCommand {
-    Begin {
-        path: PathBuf,
-    },
-    Write {
-        path: PathBuf,
-        record: DiskLogRecord,
-    },
-    Remove {
-        path: PathBuf,
-    },
-    Flush {
-        done: mpsc::Sender<()>,
-    },
-}
-
-#[derive(Clone)]
-struct DiskLogWriter {
-    tx: mpsc::Sender<DiskLogCommand>,
-}
-
-impl DiskLogWriter {
-    fn begin(&self, path: PathBuf) {
-        let _ = self.tx.send(DiskLogCommand::Begin { path });
-    }
-
-    fn write(&self, path: PathBuf, record: DiskLogRecord) {
-        let _ = self.tx.send(DiskLogCommand::Write { path, record });
-    }
-
-    fn remove(&self, path: PathBuf) {
-        let _ = self.tx.send(DiskLogCommand::Remove { path });
-    }
-}
-
-struct DiskLogWorker {
-    tx: Option<mpsc::Sender<DiskLogCommand>>,
-    handle: Option<thread::JoinHandle<()>>,
-    stopped: Mutex<mpsc::Receiver<()>>,
-}
-
-impl DiskLogWorker {
-    fn spawn() -> (Self, DiskLogWriter) {
-        let (tx, rx) = mpsc::channel();
-        let (stopped_tx, stopped) = mpsc::channel();
-        let handle = thread::spawn(move || {
-            run_disk_log_worker(rx);
-            let _ = stopped_tx.send(());
-        });
-        (
-            Self {
-                tx: Some(tx.clone()),
-                handle: Some(handle),
-                stopped: Mutex::new(stopped),
-            },
-            DiskLogWriter { tx },
-        )
-    }
-
-    fn shutdown(&mut self) -> bool {
-        self.shutdown_with_timeout(DISK_SHUTDOWN_TIMEOUT)
-    }
-
-    fn shutdown_with_timeout(&mut self, timeout: Duration) -> bool {
-        self.tx.take();
-        let Some(handle) = self.handle.take() else {
-            return true;
-        };
-
-        let stopped = self.stopped.get_mut().recv_timeout(timeout).is_ok() || handle.is_finished();
-        if !stopped {
-            tracing::warn!(
-                "timed out shutting down disk log worker; leaving spool directory for safety"
-            );
-            return false;
-        }
-
-        if let Err(err) = handle.join() {
-            tracing::debug!(?err, "disk log worker panicked during shutdown");
-        }
-        true
-    }
-
-    fn flush(&self) {
-        self.flush_with_timeout(DISK_FLUSH_TIMEOUT);
-    }
-
-    fn flush_with_timeout(&self, timeout: Duration) {
-        let Some(tx) = &self.tx else {
-            return;
-        };
-        let (done, wait) = mpsc::channel();
-        if tx.send(DiskLogCommand::Flush { done }).is_ok() {
-            match wait.recv_timeout(timeout) {
-                Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => {}
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    tracing::warn!(
-                        "timed out flushing disk run logs; returning last flushed content"
-                    );
-                }
-            }
-        }
-    }
-}
-
-impl Drop for DiskLogWorker {
-    fn drop(&mut self) {
-        let _ = self.shutdown();
-    }
-}
-
-fn open_disk_log_writer(path: &Path, truncate: bool) -> Option<BufWriter<File>> {
-    if let Some(parent) = path.parent()
-        && let Err(err) = fs::create_dir_all(parent)
-    {
-        tracing::warn!(?err, path = %parent.display(), "failed to create log spool dir");
-        return None;
-    }
-
-    let mut options = OpenOptions::new();
-    options.create(true).write(true);
-    if truncate {
-        options.truncate(true);
-    } else {
-        options.append(true);
-    }
-
-    match options.open(path) {
-        Ok(file) => Some(BufWriter::new(file)),
-        Err(err) => {
-            tracing::warn!(?err, path = %path.display(), "failed to open run log file");
-            None
-        }
-    }
-}
-
-fn write_disk_record(
-    writers: &mut HashMap<PathBuf, BufWriter<File>>,
-    path: &Path,
-    record: &DiskLogRecord,
-) {
-    if !writers.contains_key(path) {
-        let Some(writer) = open_disk_log_writer(path, false) else {
-            return;
-        };
-        writers.insert(path.to_path_buf(), writer);
-    }
-
-    let Some(writer) = writers.get_mut(path) else {
-        return;
-    };
-    let result = serde_json::to_writer(&mut *writer, record)
-        .map_err(std::io::Error::other)
-        .and_then(|()| writer.write_all(b"\n"));
-    if let Err(err) = result {
-        tracing::warn!(?err, path = %path.display(), "disabling disk run log writer after write failure");
-        writers.remove(path);
-    }
-}
-
-fn run_disk_log_worker(rx: mpsc::Receiver<DiskLogCommand>) {
-    let mut writers = HashMap::new();
-    for command in rx {
-        match command {
-            DiskLogCommand::Begin { path } => {
-                writers.remove(&path);
-                if let Some(writer) = open_disk_log_writer(&path, true) {
-                    writers.insert(path, writer);
-                }
-            }
-            DiskLogCommand::Write { path, record } => {
-                write_disk_record(&mut writers, &path, &record);
-            }
-            DiskLogCommand::Remove { path } => {
-                writers.remove(&path);
-                if let Err(err) = fs::remove_file(&path)
-                    && err.kind() != std::io::ErrorKind::NotFound
-                {
-                    tracing::debug!(?err, path = %path.display(), "failed to remove evicted run log");
-                }
-            }
-            DiskLogCommand::Flush { done } => {
-                for (path, writer) in &mut writers {
-                    if let Err(err) = writer.flush() {
-                        tracing::warn!(?err, path = %path.display(), "failed to flush run log");
-                    }
-                }
-                let _ = done.send(());
-            }
-        }
-    }
-}
-
-fn trim_to_last_bytes(line: String, max_bytes: usize) -> String {
-    if line.len() <= max_bytes {
-        return line;
-    }
-    if max_bytes == 0 {
-        return String::new();
-    }
-
-    let min_start = line.len().saturating_sub(max_bytes);
-    let start = line
-        .char_indices()
-        .map(|(idx, _)| idx)
-        .find(|idx| *idx >= min_start)
-        .unwrap_or(line.len());
-    let mut line = line;
-    line.split_off(start)
-}
-
-struct MemoryLogBuffer {
-    entries: VecDeque<LogLine>,
-    current_bytes: usize,
-    retention: MemoryLogRetention,
-}
-
-impl MemoryLogBuffer {
-    fn new(retention: MemoryLogRetention) -> Self {
-        Self {
-            entries: VecDeque::new(),
-            current_bytes: 0,
-            retention,
-        }
-    }
-
-    fn push(&mut self, mut line: LogLine) {
-        if let Some(max_bytes) = self.retention.max_bytes.as_option() {
-            line.line = trim_to_last_bytes(line.line, max_bytes);
-        }
-        let line_len = line.line.len();
-
-        if let Some(max_bytes) = self.retention.max_bytes.as_option() {
-            while self.current_bytes.saturating_add(line_len) > max_bytes {
-                let Some(old) = self.entries.pop_front() else {
-                    break;
-                };
-                self.current_bytes = self.current_bytes.saturating_sub(old.line.len());
-            }
-        }
-
-        self.entries.push_back(line);
-        self.current_bytes = self.current_bytes.saturating_add(line_len);
-
-        if let Some(max_lines) = self.retention.max_lines.as_option() {
-            while self.entries.len() > max_lines {
-                let Some(old) = self.entries.pop_front() else {
-                    break;
-                };
-                self.current_bytes = self.current_bytes.saturating_sub(old.line.len());
-            }
-        }
-    }
-
-    fn append(&mut self, line: LogLine) {
-        self.push(line);
-    }
-
-    fn replace_last(&mut self, line: LogLine) {
-        if self.entries.back().is_some_and(|last| last.seq == line.seq) {
-            if let Some(old) = self.entries.pop_back() {
-                self.current_bytes = self.current_bytes.saturating_sub(old.line.len());
-            }
-            self.push(line);
-        }
-    }
-
-    fn reconfigure(&mut self, retention: MemoryLogRetention) {
-        let entries = std::mem::take(&mut self.entries);
-        self.current_bytes = 0;
-        self.retention = retention;
-        for line in entries {
-            self.push(line);
-        }
-    }
-
-    fn clear_before_next_seq(&mut self, next_seq: u64) {
-        while self.entries.front().is_some_and(|line| line.seq < next_seq) {
-            let Some(old) = self.entries.pop_front() else {
-                break;
-            };
-            self.current_bytes = self.current_bytes.saturating_sub(old.line.len());
-        }
-    }
-
-    fn lines(&self, tail: Option<usize>) -> Vec<LogLine> {
-        let len = self.entries.len();
-        let skip = tail.map_or(0, |n| len.saturating_sub(n));
-        self.entries.iter().skip(skip).cloned().collect()
-    }
-}
-
-#[derive(Clone, Debug, Default)]
-struct RunLogReadIndex {
-    scanned_to: u64,
-    last_append_seq: Option<u64>,
-    append_offsets: Vec<(u64, u64)>,
-}
-
-impl RunLogReadIndex {
-    fn reset_if_past_end(&mut self, file_len: u64) {
-        if self.scanned_to > file_len {
-            self.scanned_to = 0;
-            self.last_append_seq = None;
-            self.append_offsets.clear();
-        }
-    }
-
-    fn offset_at_or_before(&self, seq: u64) -> Option<u64> {
-        let idx = self
-            .append_offsets
-            .partition_point(|(known_seq, _offset)| *known_seq <= seq);
-        idx.checked_sub(1)
-            .and_then(|idx| self.append_offsets.get(idx))
-            .map(|(_seq, offset)| *offset)
-    }
-
-    fn observe_append(&mut self, seq: u64, offset: u64) {
-        self.last_append_seq = Some(
-            self.last_append_seq
-                .map_or(seq, |last_seq| last_seq.max(seq)),
-        );
-        match self
-            .append_offsets
-            .binary_search_by_key(&seq, |(known_seq, _offset)| *known_seq)
-        {
-            Ok(_) => {}
-            Err(idx) => self.append_offsets.insert(idx, (seq, offset)),
-        }
-        while self.append_offsets.len() > RUN_LOG_OFFSET_CACHE {
-            self.append_offsets.remove(0);
-        }
-    }
-
-    fn mark_scanned_to(&mut self, offset: u64) {
-        self.scanned_to = self.scanned_to.max(offset);
-    }
-}
-
-struct RunLogEntry {
-    run_generation: u64,
-    path: Option<PathBuf>,
-    line_count: usize,
-    first_seq: Option<u64>,
-    last_seq: Option<u64>,
-    live_snapshot_id: Option<u64>,
-    read_index: RunLogReadIndex,
-}
-
-impl RunLogEntry {
-    fn new(
-        service_id: &ServiceID,
-        run_generation: u64,
-        spool_dir: Option<&Path>,
-        disk: Option<&DiskLogWriter>,
-    ) -> Self {
-        let path = spool_dir.map(|dir| {
-            dir.join(service_log_dir_name(service_id))
-                .join(format!("run-{run_generation}.jsonl"))
-        });
-        if let (Some(path), Some(disk)) = (&path, disk) {
-            disk.begin(path.clone());
-        }
-
-        Self {
-            run_generation,
-            path,
-            line_count: 0,
-            first_seq: None,
-            last_seq: None,
-            live_snapshot_id: None,
-            read_index: RunLogReadIndex::default(),
-        }
-    }
-
-    fn summary(&self, current: bool) -> LogRunSummary {
-        LogRunSummary {
-            run_generation: self.run_generation,
-            current,
-            path: self.path.as_ref().map(|path| path.display().to_string()),
-            line_count: self.line_count,
-            first_seq: self.first_seq,
-            last_seq: self.last_seq,
-        }
-    }
-
-    fn append_metadata(&mut self, seq: u64) {
-        self.line_count = self.line_count.saturating_add(1);
-        self.first_seq.get_or_insert(seq);
-        self.last_seq = Some(seq);
-    }
-
-    fn replace_metadata(&mut self, seq: u64) {
-        if self.line_count == 0 {
-            self.append_metadata(seq);
-        } else {
-            self.last_seq = Some(seq);
-        }
-    }
-
-    fn enqueue_write(&self, disk: Option<&DiskLogWriter>, record: DiskLogRecord) {
-        if let (Some(path), Some(disk)) = (&self.path, disk) {
-            disk.write(path.clone(), record);
-        }
-    }
-
-    fn enqueue_remove(&mut self, disk: Option<&DiskLogWriter>) {
-        if let (Some(path), Some(disk)) = (self.path.take(), disk) {
-            disk.remove(path);
-        }
-    }
-}
-
-fn service_log_dir_name(value: &str) -> String {
-    if value.is_empty() {
-        return "_".to_string();
-    }
-
-    let mut out = String::with_capacity(value.len() * 2);
-    for byte in value.bytes() {
-        use std::fmt::Write as _;
-        let _ = write!(out, "{byte:02x}");
-    }
-    out
-}
-
-fn create_spool_dir() -> Option<PathBuf> {
-    let Some(base) = crate::project_dir().map(|dirs| dirs.cache_dir().join("session-run-logs"))
-    else {
-        tracing::warn!("disk run logs disabled: no project cache directory is available");
-        return None;
-    };
-    if let Err(err) = fs::create_dir_all(&base) {
-        tracing::warn!(?err, path = %base.display(), "disk run logs disabled");
-        return None;
-    }
-    let prefix = format!("{}-", std::process::id());
-    match create_spool_dir_in(&base, &prefix) {
-        Ok(path) => Some(path),
-        Err(err) => {
-            tracing::warn!(?err, path = %base.display(), "disk run logs disabled");
-            None
-        }
-    }
-}
-
-fn create_spool_dir_in(base: &Path, prefix: &str) -> std::io::Result<PathBuf> {
-    let mut builder = tempfile::Builder::new();
-    builder.prefix(prefix);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        builder.permissions(std::fs::Permissions::from_mode(0o700));
-    }
-    builder.tempdir_in(base).map(tempfile::TempDir::keep)
-}
-
-fn unix_timestamp_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| {
-            u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
-        })
-}
-
-fn push_log_line(
-    lines: &mut VecDeque<LogLine>,
-    line: LogLine,
-    tail: Option<usize>,
-    limit: Option<usize>,
-) {
-    if tail == Some(0) || limit == Some(0) {
-        return;
-    }
-    if limit.is_some_and(|limit| lines.len() >= limit) {
-        return;
-    }
-    lines.push_back(line);
-    if let Some(tail) = tail {
-        while lines.len() > tail {
-            lines.pop_front();
-        }
-    }
-}
-
-fn start_offset_for_read(
-    index: &RunLogReadIndex,
-    tail: Option<usize>,
-    after: Option<u64>,
-    file_len: u64,
-) -> u64 {
-    if tail.is_some() {
-        return 0;
-    }
-    let Some(after) = after else {
-        return 0;
-    };
-    if index.last_append_seq.is_some_and(|seq| seq <= after) {
-        return index.scanned_to.min(file_len);
-    }
-    index.offset_at_or_before(after).unwrap_or(0)
-}
-
-fn read_run_log_file(
-    path: &Path,
-    tail: Option<usize>,
-    after: Option<u64>,
-    limit: Option<usize>,
-    mut index: RunLogReadIndex,
-) -> Option<(Vec<LogLine>, RunLogReadIndex)> {
-    let Ok(file) = File::open(path) else {
-        return None;
-    };
-    let file_len = file.metadata().ok()?.len();
-    index.reset_if_past_end(file_len);
-    let start_offset = start_offset_for_read(&index, tail, after, file_len);
-    if start_offset == 0 {
-        index = RunLogReadIndex::default();
-    }
-
-    let mut reader = BufReader::new(file);
-    if reader.seek(SeekFrom::Start(start_offset)).is_err() {
-        return None;
-    }
-
-    let mut offset = start_offset;
-    let mut lines = VecDeque::new();
-    loop {
-        let record_offset = offset;
-        let mut raw = Vec::new();
-        let bytes_read = match reader.read_until(b'\n', &mut raw) {
-            Ok(0) => break,
-            Ok(bytes_read) => bytes_read,
-            Err(err) => {
-                tracing::debug!(?err, path = %path.display(), "skipping unreadable run log record");
-                break;
-            }
-        };
-        offset = offset.saturating_add(u64::try_from(bytes_read).unwrap_or(u64::MAX));
-        index.mark_scanned_to(offset);
-
-        let Ok(raw) = std::str::from_utf8(&raw) else {
-            tracing::debug!(path = %path.display(), "skipping non-utf8 run log record");
-            continue;
-        };
-        let Ok(record) = serde_json::from_str::<DiskLogRecord>(raw) else {
-            tracing::debug!(path = %path.display(), "skipping malformed run log record");
-            continue;
-        };
-        if matches!(record.op, DiskLogOp::Append) {
-            index.observe_append(record.seq, record_offset);
-        }
-        if after.is_some_and(|cursor| record.seq <= cursor) {
-            continue;
-        }
-        if tail.is_none()
-            && limit.is_some_and(|limit| lines.len() >= limit)
-            && !matches!(record.op, DiskLogOp::ReplaceLast)
-        {
-            break;
-        }
-        let line = LogLine {
-            seq: record.seq,
-            run_generation: record.run_generation,
-            timestamp_unix_ms: record.timestamp_unix_ms,
-            line: record.line,
-        };
-        match record.op {
-            DiskLogOp::Append => push_log_line(&mut lines, line, tail, limit),
-            DiskLogOp::ReplaceLast => {
-                if let Some(last) = lines.back_mut()
-                    && last.seq == line.seq
-                {
-                    *last = line;
-                } else if lines.is_empty() {
-                    push_log_line(&mut lines, line, tail, limit);
-                }
-            }
-        }
-    }
-    Some((lines.into_iter().collect(), index))
-}
+use self::disk::{DiskLogOp, DiskLogRecord, DiskLogWorker, DiskLogWriter};
+use self::memory::MemoryLogBuffer;
+pub use self::memory::trim_to_last_bytes;
+#[cfg(test)]
+use self::runlog::RUN_LOG_OFFSET_CACHE;
+use self::runlog::{
+    RunLogEntry, RunLogReadIndex, create_spool_dir, read_run_log_file, unix_timestamp_ms,
+};
 
 struct ServiceEntry {
     snapshot: ServiceSnapshot,
@@ -1177,6 +587,10 @@ impl ServiceEntry {
         self.visible.lines(tail)
     }
 
+    fn visible_lines_since(&self, after: u64) -> (Option<u64>, Vec<LogLine>) {
+        self.visible.lines_since(after)
+    }
+
     fn reconfigure_log_retention(&mut self, log_retention: LogRetention) {
         let log_retention = LogRetention {
             disk: DiskLogRetention {
@@ -1198,6 +612,7 @@ struct Inner {
     services: RwLock<IndexMap<ServiceID, ServiceEntry>>,
     change_tx: broadcast::Sender<SessionChange>,
     spool_dir: Option<PathBuf>,
+    _spool_lock: Option<File>,
     disk: Option<DiskLogWorker>,
 }
 
@@ -1308,6 +723,16 @@ impl SessionModelReader {
             .get(id)
             .map(|entry| entry.visible_lines(tail))
             .unwrap_or_default()
+    }
+
+    /// Visible log records with `seq > after`, plus the first retained sequence so incremental
+    /// consumers can prune entries the visible buffer has evicted or cleared.
+    #[must_use]
+    pub fn logs_since(&self, id: &str, after: u64) -> (Option<u64>, Vec<LogLine>) {
+        let guard = self.inner.services.read();
+        guard
+            .get(id)
+            .map_or((None, Vec::new()), |entry| entry.visible_lines_since(after))
     }
 
     /// Summaries of retained log runs for a service, oldest retained run first.
@@ -1519,6 +944,7 @@ impl SessionModelWriter {
         attempt: u64,
         success: bool,
         exit_code: i32,
+        cancelled: bool,
     ) {
         {
             let mut guard = self.inner.services.write();
@@ -1532,7 +958,11 @@ impl SessionModelWriter {
             else {
                 return;
             };
-            attempt_entry.result = Some(HealthResult { success, exit_code });
+            attempt_entry.result = Some(HealthResult {
+                success,
+                exit_code,
+                cancelled,
+            });
         }
         self.inner.publish(id, ChangeKind::Health);
     }
@@ -1543,6 +973,7 @@ impl SessionModelWriter {
 pub(crate) fn new_with_retention(
     initial: impl IntoIterator<Item = (ServiceSnapshot, LogRetention)>,
     spool_dir: Option<PathBuf>,
+    spool_lock: Option<File>,
 ) -> (SessionModelReader, SessionModelWriter) {
     let (disk, disk_writer) = if spool_dir.is_some() {
         let (worker, writer) = DiskLogWorker::spawn();
@@ -1567,6 +998,7 @@ pub(crate) fn new_with_retention(
         services: RwLock::new(services),
         change_tx,
         spool_dir,
+        _spool_lock: spool_lock,
         disk,
     });
     (
@@ -1581,7 +1013,8 @@ pub(crate) fn new_with_retention(
 pub(crate) fn new(
     initial: impl IntoIterator<Item = (ServiceSnapshot, LogRetention)>,
 ) -> (SessionModelReader, SessionModelWriter) {
-    new_with_retention(initial, create_spool_dir())
+    let (spool_dir, spool_lock) = create_spool_dir().unzip();
+    new_with_retention(initial, spool_dir, spool_lock)
 }
 
 #[cfg(test)]
@@ -1681,41 +1114,14 @@ mod tests {
     }
 
     #[test]
-    fn disk_flush_returns_when_worker_does_not_ack() {
-        let (tx, _rx) = mpsc::channel();
-        let (_stopped_tx, stopped) = mpsc::channel();
-        let worker = DiskLogWorker {
-            tx: Some(tx),
-            handle: None,
-            stopped: Mutex::new(stopped),
-        };
+    fn health_result_accepts_missing_cancelled_field() {
+        let result = serde_json::from_value::<HealthResult>(json!({
+            "success": false,
+            "exit_code": -1
+        }))
+        .unwrap();
 
-        let start = Instant::now();
-        worker.flush_with_timeout(Duration::from_millis(1));
-
-        assert!(start.elapsed() < Duration::from_secs(1));
-    }
-
-    #[test]
-    fn disk_shutdown_observes_worker_exit() {
-        let (mut worker, writer) = DiskLogWorker::spawn();
-        drop(writer);
-
-        assert!(worker.shutdown_with_timeout(Duration::from_secs(1)));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn created_spool_dir_is_owner_private() -> color_eyre::Result<()> {
-        use std::os::unix::fs::PermissionsExt;
-
-        let base = tempfile::tempdir()?;
-        let path = create_spool_dir_in(base.path(), "micromux-test-")?;
-
-        let mode = std::fs::metadata(&path)?.permissions().mode() & !0o170_000;
-        assert_eq!(mode, 0o700);
-        std::fs::remove_dir_all(path)?;
-        Ok(())
+        assert!(!result.cancelled);
     }
 
     #[test]
@@ -1860,6 +1266,95 @@ mod tests {
     }
 
     #[test]
+    fn logs_since_returns_incremental_lines_and_retention_marker() {
+        let (reader, writer) = new([entry("svc")]);
+        let id = "svc".to_string();
+        writer.append_log(
+            &id,
+            1,
+            OutputStream::Stdout,
+            LogUpdateKind::Append,
+            "a".into(),
+        );
+        writer.append_log(
+            &id,
+            1,
+            OutputStream::Stdout,
+            LogUpdateKind::Append,
+            "b".into(),
+        );
+
+        let (first, lines) = reader.logs_since(&id, 0);
+        assert_eq!(first, Some(1));
+        assert_eq!(
+            lines
+                .iter()
+                .map(|line| line.line.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "b"]
+        );
+        let (first, lines) = reader.logs_since(&id, 1);
+        assert_eq!(first, Some(1));
+        assert_eq!(
+            lines
+                .iter()
+                .map(|line| line.line.as_str())
+                .collect::<Vec<_>>(),
+            vec!["b"]
+        );
+
+        writer.append_log(
+            &id,
+            1,
+            OutputStream::Stdout,
+            LogUpdateKind::LiveSnapshot { id: 7 },
+            "frame one".into(),
+        );
+        writer.append_log(
+            &id,
+            1,
+            OutputStream::Stdout,
+            LogUpdateKind::LiveSnapshot { id: 7 },
+            "frame two".into(),
+        );
+        let (first, lines) = reader.logs_since(&id, 2);
+        assert_eq!(first, Some(1));
+        assert_eq!(
+            lines
+                .iter()
+                .map(|line| (line.seq, line.line.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(3, "frame two")]
+        );
+        assert!(reader.logs_since(&id, 3).1.is_empty());
+
+        writer.reconfigure_log_retention(
+            &id,
+            LogRetention {
+                memory: MemoryLogRetention {
+                    max_lines: LogLimit::Bounded(1),
+                    max_bytes: LogLimit::Unbounded,
+                },
+                disk: DiskLogRetention::default(),
+            },
+        );
+        let (first, lines) = reader.logs_since(&id, 0);
+        assert_eq!(first, Some(3));
+        assert_eq!(
+            lines
+                .iter()
+                .map(|line| line.line.as_str())
+                .collect::<Vec<_>>(),
+            vec!["frame two"]
+        );
+
+        writer.clear_logs(&id);
+        let (first, lines) = reader.logs_since(&id, 0);
+        assert_eq!(first, None);
+        assert!(lines.is_empty());
+    }
+
+    #[test]
     fn tail_limits_returned_lines() {
         let (reader, writer) = new([entry("svc")]);
         let id = "svc".to_string();
@@ -1935,6 +1430,7 @@ mod tests {
         let (reader, writer) = new_with_retention(
             [(snapshot("svc"), retention)],
             Some(unique_spool_dir("retained-ring")),
+            None,
         );
         let id = "svc".to_string();
 
@@ -1966,8 +1462,11 @@ mod tests {
         const TOTAL: usize = 2500;
         const PAGE: usize = 2000;
 
-        let (reader, writer) =
-            new_with_retention([entry("svc")], Some(unique_spool_dir("follow-paging")));
+        let (reader, writer) = new_with_retention(
+            [entry("svc")],
+            Some(unique_spool_dir("follow-paging")),
+            None,
+        );
         let id = "svc".to_string();
 
         writer.begin_run(&id, 1);
@@ -2009,7 +1508,7 @@ mod tests {
 
     #[test]
     fn disk_unavailable_does_not_advertise_unqueryable_runs() {
-        let (reader, writer) = new_with_retention([entry("svc")], None);
+        let (reader, writer) = new_with_retention([entry("svc")], None, None);
         let id = "svc".to_string();
 
         writer.begin_run(&id, 1);
@@ -2029,8 +1528,11 @@ mod tests {
 
     #[test]
     fn empty_started_run_is_listed_and_queryable() {
-        let (reader, writer) =
-            new_with_retention([entry("svc")], Some(unique_spool_dir("empty-started-run")));
+        let (reader, writer) = new_with_retention(
+            [entry("svc")],
+            Some(unique_spool_dir("empty-started-run")),
+            None,
+        );
         let id = "svc".to_string();
         let mut snap = snapshot("svc");
         snap.run_generation = 1;
@@ -2060,6 +1562,7 @@ mod tests {
         let (reader, writer) = new_with_retention(
             [(snapshot("svc"), retention)],
             Some(unique_spool_dir("failed-spawn-synthetic")),
+            None,
         );
         let id = "svc".to_string();
 
@@ -2121,6 +1624,7 @@ mod tests {
         let (reader, writer) = new_with_retention(
             [(snapshot("svc"), retention)],
             Some(unique_spool_dir("zero-retention")),
+            None,
         );
         let id = "svc".to_string();
 
@@ -2149,6 +1653,7 @@ mod tests {
         let (reader, writer) = new_with_retention(
             [(snapshot("svc"), retention)],
             Some(unique_spool_dir("disk-full-run")),
+            None,
         );
         let id = "svc".to_string();
         writer.begin_run(&id, 1);
@@ -2184,6 +1689,7 @@ mod tests {
         let (reader, writer) = new_with_retention(
             [entry("a/b"), entry("a_b")],
             Some(unique_spool_dir("disk-collision")),
+            None,
         );
         let slash = "a/b".to_string();
         let underscore = "a_b".to_string();
@@ -2227,7 +1733,7 @@ mod tests {
     #[test]
     fn retained_run_cursor_read_returns_bounded_page() {
         let (reader, writer) =
-            new_with_retention([entry("svc")], Some(unique_spool_dir("disk-cursor")));
+            new_with_retention([entry("svc")], Some(unique_spool_dir("disk-cursor")), None);
         let id = "svc".to_string();
 
         writer.begin_run(&id, 1);
@@ -2253,8 +1759,11 @@ mod tests {
 
     #[test]
     fn retained_run_cursor_read_reuses_scanned_offsets() {
-        let (reader, writer) =
-            new_with_retention([entry("svc")], Some(unique_spool_dir("disk-cursor-index")));
+        let (reader, writer) = new_with_retention(
+            [entry("svc")],
+            Some(unique_spool_dir("disk-cursor-index")),
+            None,
+        );
         let id = "svc".to_string();
 
         writer.begin_run(&id, 1);
@@ -2314,9 +1823,59 @@ mod tests {
     }
 
     #[test]
+    fn retained_run_tail_uses_index_without_changing_results() {
+        let (reader, writer) = new_with_retention(
+            [entry("svc")],
+            Some(unique_spool_dir("disk-tail-index")),
+            None,
+        );
+        let id = "svc".to_string();
+
+        writer.begin_run(&id, 1);
+        for idx in 1..=50 {
+            writer.append_log(
+                &id,
+                1,
+                OutputStream::Stdout,
+                LogUpdateKind::Append,
+                idx.to_string(),
+            );
+        }
+
+        let cold_tail = reader
+            .run_log(&id, 1, Some(10))
+            .expect("run retained")
+            .lines
+            .into_iter()
+            .map(|line| line.line)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            cold_tail,
+            (41..=50).map(|idx| idx.to_string()).collect::<Vec<_>>()
+        );
+
+        assert!(
+            reader
+                .run_log_after(&id, 1, Some(25), Some(10))
+                .is_some_and(|run| !run.lines.is_empty())
+        );
+        let warm_tail = reader
+            .run_log(&id, 1, Some(10))
+            .expect("run retained")
+            .lines
+            .into_iter()
+            .map(|line| line.line)
+            .collect::<Vec<_>>();
+        assert_eq!(warm_tail, cold_tail);
+    }
+
+    #[test]
     fn retained_run_cursor_below_offset_cache_window_does_not_skip_lines() {
-        let (reader, writer) =
-            new_with_retention([entry("svc")], Some(unique_spool_dir("disk-cursor-low")));
+        let (reader, writer) = new_with_retention(
+            [entry("svc")],
+            Some(unique_spool_dir("disk-cursor-low")),
+            None,
+        );
         let id = "svc".to_string();
 
         writer.begin_run(&id, 1);
@@ -2354,7 +1913,7 @@ mod tests {
     #[test]
     fn model_drop_removes_session_spool_dir() {
         let spool = unique_spool_dir("spool-cleanup");
-        let (reader, writer) = new_with_retention([entry("svc")], Some(spool.clone()));
+        let (reader, writer) = new_with_retention([entry("svc")], Some(spool.clone()), None);
         let id = "svc".to_string();
         writer.begin_run(&id, 1);
         writer.append_log(
@@ -2401,7 +1960,7 @@ mod tests {
         writer.write_snapshot(running_snapshot(&id), Some(Instant::now()));
         for attempt in 1..=(HEALTH_HISTORY as u64 + 2) {
             writer.start_health_attempt(&id, 1, attempt, format!("probe {attempt}"));
-            writer.finish_health_attempt(&id, 1, attempt, true, 0);
+            writer.finish_health_attempt(&id, 1, attempt, true, 0, false);
         }
         let history = reader.healthchecks(&id);
         assert_eq!(history.len(), HEALTH_HISTORY);
@@ -2423,7 +1982,7 @@ mod tests {
         writer.write_snapshot(running_snapshot(&id), Some(Instant::now()));
         writer.begin_run(&id, 1);
         writer.start_health_attempt(&id, 1, 1, "probe old".to_string());
-        writer.finish_health_attempt(&id, 1, 1, false, 1);
+        writer.finish_health_attempt(&id, 1, 1, false, 1, false);
         assert!(reader.latest_health(&id).is_some());
 
         writer.begin_run(&id, 2);
@@ -2438,7 +1997,7 @@ mod tests {
 
         writer.write_snapshot(running_snapshot(&id), Some(Instant::now()));
         writer.start_health_attempt(&id, 1, 1, "probe".to_string());
-        writer.finish_health_attempt(&id, 1, 1, true, 0);
+        writer.finish_health_attempt(&id, 1, 1, true, 0, false);
         assert!(reader.latest_health(&id).is_some());
 
         let mut exited = running_snapshot(&id);
@@ -2464,7 +2023,7 @@ mod tests {
 
         writer.write_snapshot(running_snapshot(&id), Some(Instant::now()));
         writer.start_health_attempt(&id, 1, 1, "probe stale".to_string());
-        writer.finish_health_attempt(&id, 1, 1, true, 0);
+        writer.finish_health_attempt(&id, 1, 1, true, 0, false);
         assert!(reader.latest_health(&id).is_some());
 
         let mut next_run = running_snapshot(&id);
@@ -2484,9 +2043,9 @@ mod tests {
         current.run_generation = 2;
         writer.write_snapshot(current, Some(Instant::now()));
         writer.start_health_attempt(&id, 2, 1, "probe current".to_string());
-        writer.finish_health_attempt(&id, 2, 1, true, 0);
+        writer.finish_health_attempt(&id, 2, 1, true, 0, false);
         writer.start_health_attempt(&id, 1, 2, "probe old".to_string());
-        writer.finish_health_attempt(&id, 1, 2, false, 1);
+        writer.finish_health_attempt(&id, 1, 2, false, 1, false);
 
         let Some(attempt) = reader.latest_health(&id) else {
             panic!("expected current-run healthcheck attempt");
@@ -2521,13 +2080,13 @@ mod tests {
             Some("current")
         );
 
-        writer.finish_health_attempt(&id, 1, 1, false, 1);
+        writer.finish_health_attempt(&id, 1, 1, false, 1, false);
         let Some(attempt) = reader.latest_health(&id) else {
             panic!("expected current-run healthcheck attempt");
         };
         assert_eq!(attempt.result.as_ref().map(|result| result.success), None);
 
-        writer.finish_health_attempt(&id, 2, 1, true, 0);
+        writer.finish_health_attempt(&id, 2, 1, true, 0, false);
         let Some(attempt) = reader.latest_health(&id) else {
             panic!("expected current-run healthcheck attempt");
         };

@@ -1567,6 +1567,7 @@ dependencies = [
  "color-eyre",
  "directories",
  "filedescriptor",
+ "fs2",
  "futures",
  "humantime",
  "indexmap",
