@@ -4,6 +4,7 @@ use std::sync::Arc;
 use futures::{SinkExt, StreamExt};
 use micromux::{
     ChangeKind, CommandRejection, SchedulerStopped, ServiceCommandResult, SessionChange,
+    SessionModelReader, trim_to_last_bytes,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::sync::CancellationToken;
@@ -259,12 +260,36 @@ async fn dispatch(server: &ControlServer, request: Request) -> Response {
             service,
             run_generation,
             tail,
-        } => get_logs(server, &service, run_generation, tail),
+        } => {
+            let reader = server.reader.clone();
+            match tokio::task::spawn_blocking(move || {
+                get_logs(&reader, &service, run_generation, tail)
+            })
+            .await
+            {
+                Ok(response) => response,
+                Err(err) => {
+                    Response::error(ErrorCode::Internal, format!("log read task failed: {err}"))
+                }
+            }
+        }
         Request::FollowLogs {
             service,
             run_generation,
             after,
-        } => follow_logs(server, &service, run_generation, after),
+        } => {
+            let reader = server.reader.clone();
+            match tokio::task::spawn_blocking(move || {
+                follow_logs(&reader, &service, run_generation, after)
+            })
+            .await
+            {
+                Ok(response) => response,
+                Err(err) => {
+                    Response::error(ErrorCode::Internal, format!("log read task failed: {err}"))
+                }
+            }
+        }
         Request::ListLogRuns { service } => {
             if server.reader.service(&service).is_none() {
                 return unknown_service(&service);
@@ -298,12 +323,12 @@ async fn dispatch(server: &ControlServer, request: Request) -> Response {
 }
 
 fn get_logs(
-    server: &ControlServer,
+    reader: &SessionModelReader,
     service: &str,
     run_generation: Option<u64>,
     tail: Option<usize>,
 ) -> Response {
-    if server.reader.service(service).is_none() {
+    if reader.service(service).is_none() {
         return unknown_service(service);
     }
     let requested_tail = tail.unwrap_or(if run_generation.is_some() {
@@ -312,21 +337,21 @@ fn get_logs(
         DEFAULT_LOG_TAIL
     });
     let tail = requested_tail.min(MAX_LOG_TAIL);
-    let mut truncated = requested_tail > MAX_LOG_TAIL;
+    let mut truncated = false;
     let mut lines = match run_generation {
         Some(run_generation) => {
-            let Some(run) = server.reader.run_log(service, run_generation, Some(tail)) else {
+            let Some(run) = reader.run_log(service, run_generation, Some(tail)) else {
                 return unknown_run(service, run_generation);
             };
             run.lines
         }
-        None => server.reader.logs(service, Some(tail)),
+        None => reader.logs(service, Some(tail)),
     };
+    truncated |= requested_tail > MAX_LOG_TAIL && lines.len() >= tail;
     if let Some(run_generation) = run_generation
         && tail == MAX_LOG_TAIL
     {
-        truncated |= server
-            .reader
+        truncated |= reader
             .log_runs(service)
             .into_iter()
             .find(|run| run.run_generation == run_generation)
@@ -337,12 +362,12 @@ fn get_logs(
 }
 
 fn follow_logs(
-    server: &ControlServer,
+    reader: &SessionModelReader,
     service: &str,
     run_generation: Option<u64>,
     after: Option<u64>,
 ) -> Response {
-    if server.reader.service(service).is_none() {
+    if reader.service(service).is_none() {
         return unknown_service(service);
     }
 
@@ -351,9 +376,7 @@ fn follow_logs(
     // reachable by following `next_seq` rather than being pinned to its tail.
     if let Some(run_generation) = run_generation {
         let Some(run) =
-            server
-                .reader
-                .run_log_after(service, run_generation, after, Some(MAX_LOG_TAIL + 1))
+            reader.run_log_after(service, run_generation, after, Some(MAX_LOG_TAIL + 1))
         else {
             return unknown_run(service, run_generation);
         };
@@ -366,7 +389,7 @@ fn follow_logs(
     }
 
     // The bounded visible stream: page forward from a cursor, else return its most recent tail.
-    let mut lines = server.reader.logs(service, None);
+    let mut lines = reader.logs(service, None);
     if let Some(cursor) = after {
         lines.retain(|line| line.seq > cursor);
         let (lines, truncated) = bound_follow_response_lines_page(lines);
@@ -473,24 +496,6 @@ fn bound_follow_response_lines(lines: &mut Vec<micromux::LogLine>) -> bool {
     let truncated = keep < lines.len();
     lines.truncate(keep);
     truncated
-}
-
-fn trim_to_last_bytes(line: String, max_bytes: usize) -> String {
-    if line.len() <= max_bytes {
-        return line;
-    }
-    if max_bytes == 0 {
-        return String::new();
-    }
-
-    let min_start = line.len().saturating_sub(max_bytes);
-    let start = line
-        .char_indices()
-        .map(|(idx, _)| idx)
-        .find(|idx| *idx >= min_start)
-        .unwrap_or(line.len());
-    let mut line = line;
-    line.split_off(start)
 }
 
 fn bound_health_attempt(attempt: &mut Option<micromux::HealthAttempt>) {
