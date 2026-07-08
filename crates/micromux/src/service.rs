@@ -264,8 +264,10 @@ impl Service {
             .collect::<Result<Vec<_>, _>>()?;
 
         let base_env: std::collections::HashMap<String, String> = std::env::vars().collect();
+        let mut missing_env = Vec::new();
         let env_file_env = env::load_env_files_sync(&env_files)?;
-        let env_file_env = env::expand_env_values(&env_file_env, &base_env);
+        let env_file_env =
+            env::expand_env_values_tracking(&env_file_env, &base_env, &mut missing_env);
 
         let mut base_with_env_file = base_env.clone();
         for (k, v) in env_file_env.iter() {
@@ -276,7 +278,8 @@ impl Service {
         for (k, v) in &config.environment {
             config_env_map.insert(k.as_ref().clone(), v.as_ref().clone());
         }
-        let config_env_map = env::expand_env_values(&config_env_map, &base_with_env_file);
+        let config_env_map =
+            env::expand_env_values_tracking(&config_env_map, &base_with_env_file, &mut missing_env);
 
         let mut full_env = base_with_env_file.clone();
         for (k, v) in config_env_map.iter() {
@@ -287,12 +290,23 @@ impl Service {
             .ports
             .iter()
             .map(|port| {
-                let expanded = env::interpolate_str(port.as_ref(), &full_env);
+                let expanded =
+                    env::interpolate_str_tracking(port.as_ref(), &full_env, &mut missing_env);
                 expanded
                     .parse::<u16>()
                     .map_err(|err| eyre::eyre!("invalid port `{}`: {err}", expanded))
             })
             .collect::<Result<Vec<_>, _>>()?;
+
+        missing_env.sort_unstable();
+        missing_env.dedup();
+        if !missing_env.is_empty() {
+            tracing::warn!(
+                service_id = %id,
+                missing = ?missing_env,
+                "environment interpolation referenced unset variables"
+            );
+        }
 
         let mut environment = indexmap::IndexMap::new();
         for (k, v) in env_file_env.iter() {
