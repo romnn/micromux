@@ -1,5 +1,6 @@
 use color_eyre::eyre;
 use std::path::Path;
+use std::time::Duration;
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt};
 
@@ -7,6 +8,30 @@ use tracing_subscriber::{EnvFilter, layer::SubscriberExt};
 pub enum LogFile<'a> {
     RollingLog { cache_dir: &'a Path },
     LogFile { path: &'a Path },
+}
+
+fn prune_old_rolling_logs(cache_dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(cache_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if !name.to_string_lossy().starts_with("micromux.log") {
+            continue;
+        }
+        let expired = entry
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .map(|modified| {
+                modified
+                    .elapsed()
+                    .is_ok_and(|age| age > Duration::from_hours(168))
+            })
+            .unwrap_or(false);
+        if expired && let Err(err) = std::fs::remove_file(entry.path()) {
+            tracing::debug!(?err, "failed to remove old rolling log file");
+        }
+    }
 }
 
 /// Setup logging
@@ -20,6 +45,7 @@ pub fn setup(
 ) -> eyre::Result<tracing_appender::non_blocking::WorkerGuard> {
     let (log_writer, guard) = match log_file {
         LogFile::RollingLog { cache_dir } => {
+            prune_old_rolling_logs(cache_dir);
             let file_appender =
                 RollingFileAppender::new(Rotation::DAILY, cache_dir, "micromux.log");
             tracing_appender::non_blocking(file_appender)
