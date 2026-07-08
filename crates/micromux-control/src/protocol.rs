@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// Bump the minor for additive changes (new optional/defaulted fields, new tools that reuse
 /// existing requests), and bump the major for incompatible request/response semantics.
-pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(3, 0);
+pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(3, 1);
 
 /// A typed control protocol version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -287,7 +287,7 @@ mod tests {
     fn protocol_version_uses_major_minor_shape_and_accepts_same_major() {
         assert_eq!(
             serde_json::to_value(PROTOCOL_VERSION).unwrap(),
-            json!({ "major": 3, "minor": 0 })
+            json!({ "major": 3, "minor": 1 })
         );
         assert_eq!(
             serde_json::from_value::<ProtocolVersion>(json!({ "major": 1, "minor": 0 })).unwrap(),
@@ -328,7 +328,7 @@ mod tests {
     #[test]
     fn session_info_accepts_missing_additive_fields() {
         let info = serde_json::from_value::<SessionInfo>(json!({
-            "protocol_version": { "major": 3, "minor": 0 },
+            "protocol_version": { "major": 3, "minor": 1 },
             "id": "abc",
             "pid": 42,
             "start_time": 99

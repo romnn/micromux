@@ -11,7 +11,7 @@ use crate::ControlError;
 use crate::endpoint::ControlEndpoint;
 use crate::protocol::{PROTOCOL_VERSION, ProtocolVersion, Request, Response, SessionInfo};
 #[cfg(unix)]
-use crate::{REQUEST_TIMEOUT, read_message, write_message};
+use crate::{PROBE_TIMEOUT, REQUEST_TIMEOUT, read_message, write_message};
 
 /// A connected control client.
 pub struct Client {
@@ -294,40 +294,54 @@ pub async fn probe_endpoints(endpoints: &[ControlEndpoint]) -> Vec<EndpointProbe
 pub async fn probe_endpoint(endpoint: &ControlEndpoint) -> EndpointProbe {
     #[cfg(unix)]
     {
-        let mut client = match Client::connect(endpoint).await {
-            Ok(client) => client,
-            Err(ControlError::Io(err)) if is_hard_connection_error(&err) => {
-                return EndpointProbe {
-                    endpoint: endpoint.clone(),
-                    result: EndpointProbeResult::Absent(format!("connect: {err}")),
-                };
-            }
-            Err(err) => {
-                return EndpointProbe {
-                    endpoint: endpoint.clone(),
-                    result: EndpointProbeResult::Unreachable(err.to_string()),
-                };
-            }
-        };
+        enum ProbeError {
+            Connect(ControlError),
+            Describe(ControlError),
+        }
 
-        match client.describe().await {
-            Ok(info) => EndpointProbe {
+        let outcome = tokio::time::timeout(PROBE_TIMEOUT, async {
+            let mut client = Client::connect(endpoint)
+                .await
+                .map_err(ProbeError::Connect)?;
+            client.describe().await.map_err(ProbeError::Describe)
+        })
+        .await;
+        match outcome {
+            Err(_) => EndpointProbe {
+                endpoint: endpoint.clone(),
+                result: EndpointProbeResult::Unreachable("probe timed out".to_string()),
+            },
+            Ok(Ok(info)) => EndpointProbe {
                 endpoint: endpoint.clone(),
                 result: EndpointProbeResult::Session(Box::new(info)),
             },
-            Err(ControlError::ProtocolMismatch { peer, ours }) => EndpointProbe {
-                endpoint: endpoint.clone(),
-                result: EndpointProbeResult::ProtocolMismatch { peer, ours },
-            },
-            Err(ControlError::Io(err)) if is_hard_connection_error(&err) => EndpointProbe {
-                endpoint: endpoint.clone(),
-                result: EndpointProbeResult::Absent(format!("describe: {err}")),
-            },
-            Err(ControlError::Closed) => EndpointProbe {
+            Ok(Err(ProbeError::Describe(ControlError::ProtocolMismatch { peer, ours }))) => {
+                EndpointProbe {
+                    endpoint: endpoint.clone(),
+                    result: EndpointProbeResult::ProtocolMismatch { peer, ours },
+                }
+            }
+            Ok(Err(ProbeError::Connect(ControlError::Io(err))))
+                if is_hard_connection_error(&err) =>
+            {
+                EndpointProbe {
+                    endpoint: endpoint.clone(),
+                    result: EndpointProbeResult::Absent(format!("connect: {err}")),
+                }
+            }
+            Ok(Err(ProbeError::Describe(ControlError::Io(err))))
+                if is_hard_connection_error(&err) =>
+            {
+                EndpointProbe {
+                    endpoint: endpoint.clone(),
+                    result: EndpointProbeResult::Absent(format!("describe: {err}")),
+                }
+            }
+            Ok(Err(ProbeError::Describe(ControlError::Closed))) => EndpointProbe {
                 endpoint: endpoint.clone(),
                 result: EndpointProbeResult::Unreachable("closed before Describe".to_string()),
             },
-            Err(err) => EndpointProbe {
+            Ok(Err(ProbeError::Connect(err) | ProbeError::Describe(err))) => EndpointProbe {
                 endpoint: endpoint.clone(),
                 result: EndpointProbeResult::Unreachable(err.to_string()),
             },

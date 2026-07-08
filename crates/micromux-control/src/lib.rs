@@ -47,6 +47,12 @@ pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
 /// How long a client waits for a single response before giving up.
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How long discovery probes wait before classifying an endpoint as busy/unreachable.
+///
+/// This is intentionally shorter than [`REQUEST_TIMEOUT`]: discovery scans multiple endpoints and
+/// a slow probe should not stall selection. Timed-out endpoints are reported, never pruned.
+pub const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// How long a server connection may sit idle (no request) before it is closed.
 pub const IDLE_TIMEOUT: Duration = Duration::from_mins(5);
 
