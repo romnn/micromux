@@ -14,16 +14,16 @@
 mod convert;
 mod logproc;
 mod select;
+mod tools;
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use micromux::{ChangeKind, Execution, Health, HealthAttempt, LogLine, ServiceSnapshot};
+use micromux::{ChangeKind, Execution, Health, HealthAttempt, ServiceSnapshot};
 use micromux_control::{
-    Client, ControlEndpoint, EndpointProbeResult, ErrorCode, Request, Response, SessionInfo,
-    endpoint_for, endpoint_owner_lock_held, probe_endpoints, runtime_dir_statuses,
-    transport_supported, unique_answering_session_probes, usable_runtime_dirs,
+    Client, ControlEndpoint, ControlError, ErrorCode, Request, Response, SessionInfo, endpoint_for,
+    runtime_dir_statuses, transport_supported, usable_runtime_dirs,
 };
 use regex::Regex;
 use rmcp::{
@@ -40,6 +40,20 @@ use serde::{Deserialize, Serialize};
 
 use crate::convert::WaitOutcome;
 use crate::select::ToolError;
+use crate::tools::health::{
+    bounded_attempt, diagnosis_hint, latest_health_for_snapshot, likely_cause_log_tail,
+    service_needs_diagnosis, timeout_hint,
+};
+use crate::tools::logs::{
+    FollowGap, ServiceFollowGap, current_cursors, current_service_cursor, fetch_and_shape_tail,
+    follow_all_current_logs, follow_gap, next_follow_cursor, truncate_wait_matches,
+};
+use crate::tools::sessions::{
+    CHILD_EXIT_GRACE, START_READY_TIMEOUT, already_running_any, reachable_session_for_start,
+    spawn_detached_serve, start_session_report,
+};
+#[cfg(unix)]
+use crate::tools::sessions::{STOP_CONFIRM_TIMEOUT, wait_until_stopped};
 
 type ToolResult<T> = Result<Json<T>, ErrorData>;
 
@@ -275,11 +289,28 @@ struct LogFilePathArgs {
 }
 
 #[derive(Serialize, JsonSchema)]
-struct MutationResult {
+struct SessionRef {
     session: String,
     id: String,
     pid: u32,
     config_path: String,
+}
+
+impl From<&SessionInfo> for SessionRef {
+    fn from(info: &SessionInfo) -> Self {
+        Self {
+            session: info.name.clone(),
+            id: info.id.clone(),
+            pid: info.pid,
+            config_path: info.config_path.clone(),
+        }
+    }
+}
+
+#[derive(Serialize, JsonSchema)]
+struct MutationResult {
+    #[serde(flatten)]
+    session_ref: SessionRef,
     accepted: Vec<micromux::ServiceCommandAck>,
     service: String,
     generation: Option<u64>,
@@ -351,20 +382,16 @@ struct LogFilePathResult {
 
 #[derive(Serialize, JsonSchema)]
 struct SessionMutationResult {
-    session: String,
-    id: String,
-    pid: u32,
-    config_path: String,
+    #[serde(flatten)]
+    session_ref: SessionRef,
     accepted: Vec<micromux::ServiceCommandAck>,
 }
 
 #[derive(Serialize, JsonSchema)]
 struct StopSessionResult {
     stopped: bool,
-    session: String,
-    id: String,
-    pid: u32,
-    config_path: String,
+    #[serde(flatten)]
+    session_ref: SessionRef,
     note: Option<&'static str>,
 }
 
@@ -432,24 +459,9 @@ enum WaitForLogStatus {
 }
 
 #[derive(Serialize, JsonSchema)]
-struct ServiceFollowGap {
-    service: String,
-    after_seq: u64,
-    first_seq: u64,
-    lost_entries_at_least: u64,
-}
-
-#[derive(Serialize, JsonSchema)]
 struct LogCursorsResult {
     config_path: String,
     cursors: BTreeMap<String, u64>,
-}
-
-#[derive(Serialize, JsonSchema)]
-struct FollowGap {
-    after_seq: u64,
-    first_seq: u64,
-    lost_entries_at_least: u64,
 }
 
 #[derive(Serialize, JsonSchema)]
@@ -577,6 +589,31 @@ impl WaitResult {
 async fn send_request(endpoint: &ControlEndpoint, request: Request) -> Result<Response, ToolError> {
     let mut client = Client::connect(endpoint).await?;
     Ok(client.request(request).await?)
+}
+
+struct SessionConn {
+    endpoint: ControlEndpoint,
+    client: Client,
+}
+
+impl SessionConn {
+    async fn connect(endpoint: &ControlEndpoint) -> Result<Self, ToolError> {
+        Ok(Self {
+            endpoint: endpoint.clone(),
+            client: Client::connect(endpoint).await?,
+        })
+    }
+
+    async fn request(&mut self, request: Request) -> Result<Response, ToolError> {
+        match self.client.request(request.clone()).await {
+            Ok(response) => Ok(response),
+            Err(ControlError::Io(_) | ControlError::Closed) => {
+                self.client = Client::connect(&self.endpoint).await?;
+                Ok(self.client.request(request).await?)
+            }
+            Err(err) => Err(err.into()),
+        }
+    }
 }
 
 /// A copy-pasteable session selector (`hash:<id>`) that resolves back to this exact session.
@@ -718,10 +755,7 @@ impl McpServer {
             .find(|ack| ack.service == service)
             .map(|ack| ack.observed_generation);
         Ok(Json(MutationResult {
-            session: resolved.info.name,
-            id: resolved.info.id,
-            pid: resolved.info.pid,
-            config_path: resolved.info.config_path,
+            session_ref: SessionRef::from(&resolved.info),
             accepted: acks,
             service: service.to_string(),
             generation,
@@ -852,28 +886,27 @@ impl McpServer {
                     None,
                 ));
             }
-            let response = send_request(&resolved.endpoint, Request::ListServices)
+            let mut conn = SessionConn::connect(&resolved.endpoint)
+                .await
+                .map_err(error_data)?;
+            let response = conn
+                .request(Request::ListServices)
                 .await
                 .map_err(error_data)?;
             let services = convert::services(response).map_err(error_data)?;
             let mut entries = Vec::new();
             let mut truncated = false;
             for service in services {
-                let response = send_request(
-                    &resolved.endpoint,
-                    Request::GetLogs {
-                        service: service.id.clone(),
-                        run_generation: None,
-                        tail: Some(fetch_tail),
-                    },
+                let (mut shaped, window_full, server_truncated) = fetch_and_shape_tail(
+                    &mut conn,
+                    &service.id,
+                    None,
+                    fetch_tail,
+                    &filters,
+                    args.filters.raw,
                 )
-                .await
-                .map_err(error_data)?;
-                let logs = convert::logs(response).map_err(error_data)?;
-                let window_full = logs.lines.len() >= fetch_tail;
-                truncated |= logs.truncated || (window_full && filtering);
-                let mut shaped =
-                    logproc::shape(&logs.lines, &filters.shape(args.filters.raw, None));
+                .await?;
+                truncated |= server_truncated || (window_full && filtering);
                 for entry in &mut shaped {
                     entry.service = Some(service.id.clone());
                 }
@@ -892,23 +925,22 @@ impl McpServer {
                 truncated,
             }));
         }
-        let response = send_request(
-            &resolved.endpoint,
-            Request::GetLogs {
-                service: args.service.clone(),
-                run_generation: args.run_generation,
-                tail: Some(fetch_tail),
-            },
+        let mut conn = SessionConn::connect(&resolved.endpoint)
+            .await
+            .map_err(error_data)?;
+        let (mut entries, window_full, server_truncated) = fetch_and_shape_tail(
+            &mut conn,
+            &args.service,
+            args.run_generation,
+            fetch_tail,
+            &filters,
+            args.filters.raw,
         )
-        .await
-        .map_err(error_data)?;
-        let logs = service_result(&args.service, convert::logs(response)).await?;
-        let mut entries = logproc::shape(&logs.lines, &filters.shape(args.filters.raw, None));
+        .await?;
         // A full fetched window that was filtered, or that yielded fewer entries than asked, may
         // hide older matches/entries beyond the scan — don't report a capped scan as complete.
-        let window_full = logs.lines.len() >= fetch_tail;
         let mut truncated =
-            logs.truncated || (window_full && (filtering || entries.len() < requested_tail));
+            server_truncated || (window_full && (filtering || entries.len() < requested_tail));
         // Tail here rather than inside shape so that a record splitting into more entries than
         // requested_tail is reported as truncated instead of silently dropping older records.
         if entries.len() > requested_tail {
@@ -1014,9 +1046,10 @@ impl McpServer {
         let resolved = select::resolve(&self.cwd, args.session)
             .await
             .map_err(error_data)?;
-        let cursors = current_cursors(&resolved.endpoint)
+        let mut conn = SessionConn::connect(&resolved.endpoint)
             .await
             .map_err(error_data)?;
+        let cursors = current_cursors(&mut conn).await.map_err(error_data)?;
         Ok(Json(LogCursorsResult {
             config_path: resolved.info.config_path,
             cursors,
@@ -1058,10 +1091,7 @@ impl McpServer {
             .map_err(error_data)?;
         let acks = convert::accepted(response).map_err(error_data)?;
         Ok(Json(SessionMutationResult {
-            session: resolved.info.name,
-            id: resolved.info.id,
-            pid: resolved.info.pid,
-            config_path: resolved.info.config_path,
+            session_ref: SessionRef::from(&resolved.info),
             accepted: acks,
         }))
     }
@@ -1129,10 +1159,7 @@ impl McpServer {
         };
         Ok(Json(StopSessionResult {
             stopped,
-            session: resolved.info.name,
-            id: resolved.info.id,
-            pid: resolved.info.pid,
-            config_path: resolved.info.config_path,
+            session_ref: SessionRef::from(&resolved.info),
             note,
         }))
     }
@@ -1323,7 +1350,10 @@ impl McpServer {
         let resolved = select::resolve(&self.cwd, args.session)
             .await
             .map_err(error_data)?;
-        let merged = follow_all_current_logs(&resolved.endpoint, &args.after, raw, &filters, limit)
+        let mut conn = SessionConn::connect(&resolved.endpoint)
+            .await
+            .map_err(error_data)?;
+        let merged = follow_all_current_logs(&mut conn, &args.after, raw, &filters, limit)
             .await
             .map_err(error_data)?;
         Ok(Json(FollowAllLogsResult {
@@ -1355,21 +1385,21 @@ impl McpServer {
         let resolved = select::resolve(&self.cwd, args.session)
             .await
             .map_err(error_data)?;
+        let mut conn = SessionConn::connect(&resolved.endpoint)
+            .await
+            .map_err(error_data)?;
         let deadline = tokio::time::Instant::now() + timeout;
 
         if args.service == "*" {
             let mut cursors = if args.after.is_empty() {
-                current_cursors(&resolved.endpoint)
-                    .await
-                    .map_err(error_data)?
+                current_cursors(&mut conn).await.map_err(error_data)?
             } else {
                 args.after
             };
             loop {
-                let merged =
-                    follow_all_current_logs(&resolved.endpoint, &cursors, raw, &filters, limit)
-                        .await
-                        .map_err(error_data)?;
+                let merged = follow_all_current_logs(&mut conn, &cursors, raw, &filters, limit)
+                    .await
+                    .map_err(error_data)?;
                 if !merged.entries.is_empty() {
                     return Ok(Json(WaitForLogResult {
                         status: WaitForLogStatus::Matched,
@@ -1403,21 +1433,19 @@ impl McpServer {
 
         let mut cursor = match args.after_seq {
             Some(cursor) => cursor,
-            None => current_service_cursor(&resolved.endpoint, &args.service)
+            None => current_service_cursor(&mut conn, &args.service)
                 .await
                 .map_err(error_data)?,
         };
         loop {
-            let response = send_request(
-                &resolved.endpoint,
-                Request::FollowLogs {
+            let response = conn
+                .request(Request::FollowLogs {
                     service: args.service.clone(),
                     run_generation: None,
                     after: Some(cursor),
-                },
-            )
-            .await
-            .map_err(error_data)?;
+                })
+                .await
+                .map_err(error_data)?;
             let logs = service_result(&args.service, convert::logs(response)).await?;
             let raw_next_seq = next_follow_cursor(&logs.lines, Some(cursor)).unwrap_or(cursor);
             let mut entries = logproc::shape(&logs.lines, &filters.shape(raw, None));
@@ -1491,17 +1519,21 @@ impl McpServer {
             .tail_per_service
             .unwrap_or(DEFAULT_DIAGNOSE_TAIL)
             .clamp(1, MAX_DIAGNOSE_TAIL);
-        let response = send_request(&resolved.endpoint, Request::ListServices)
+        let mut conn = SessionConn::connect(&resolved.endpoint)
+            .await
+            .map_err(error_data)?;
+        let response = conn
+            .request(Request::ListServices)
             .await
             .map_err(error_data)?;
         let services = convert::services(response).map_err(error_data)?;
         let mut diagnoses = Vec::new();
         for snapshot in services.into_iter().filter(service_needs_diagnosis) {
-            let latest_healthcheck = latest_health_for_snapshot(&resolved.endpoint, &snapshot)
+            let latest_healthcheck = latest_health_for_snapshot(&mut conn, &snapshot)
                 .await
                 .map(bounded_attempt);
             let (error_log_tail, logs_truncated) =
-                likely_cause_log_tail(&resolved.endpoint, &snapshot, tail)
+                likely_cause_log_tail(&mut conn, &snapshot, tail)
                     .await
                     .map_err(error_data)?;
             let hint = diagnosis_hint(&snapshot, latest_healthcheck.as_ref(), &error_log_tail);
@@ -1538,11 +1570,15 @@ impl McpServer {
                 .min(MAX_WAIT_TIMEOUT_SECS),
         );
         let deadline = tokio::time::Instant::now() + timeout;
+        let mut conn = SessionConn::connect(&resolved.endpoint)
+            .await
+            .map_err(error_data)?;
         // Best-effort wakeup; `None` (subscribe failed or stream ended) degrades to pure polling.
         let mut subscription = Client::subscribe(&resolved.endpoint).await.ok();
 
         loop {
-            let response = send_request(&resolved.endpoint, Request::ListServices)
+            let response = conn
+                .request(Request::ListServices)
                 .await
                 .map_err(error_data)?;
             let services = convert::services(response).map_err(error_data)?;
@@ -1590,7 +1626,7 @@ impl McpServer {
                 // Surface the facts we have rather than guessing "still building": the execution
                 // sub-state and the latest healthcheck attempt distinguish "process up, probe
                 // failing" from "still starting" without a heuristic.
-                let latest = latest_health_for_snapshot(&resolved.endpoint, &snapshot)
+                let latest = latest_health_for_snapshot(&mut conn, &snapshot)
                     .await
                     .map(bounded_attempt);
                 return Ok(Json(WaitResult::timeout(
@@ -1739,597 +1775,6 @@ fn unix_now_ms() -> u64 {
     duration_to_millis(duration)
 }
 
-/// Best-effort fetch of the current live run's latest healthcheck attempt, used only to enrich a
-/// timeout or diagnosis report. Any error degrades to `None` — the report is still useful without
-/// it.
-async fn latest_health(endpoint: &ControlEndpoint, service: &str) -> Option<HealthAttempt> {
-    let response = send_request(
-        endpoint,
-        Request::GetHealth {
-            service: service.to_string(),
-        },
-    )
-    .await
-    .ok()?;
-    convert::health(response).ok().flatten()
-}
-
-async fn latest_health_for_snapshot(
-    endpoint: &ControlEndpoint,
-    snapshot: &ServiceSnapshot,
-) -> Option<HealthAttempt> {
-    if snapshot.execution != Execution::Running {
-        return None;
-    }
-    let attempt = latest_health(endpoint, &snapshot.id).await?;
-    // Diagnose/wait enrichment reads health in a second request; a restart between the snapshot and
-    // health requests must not attach the next run's probe output to the previous run's state.
-    health_attempt_matches_snapshot(snapshot, &attempt).then_some(attempt)
-}
-
-fn health_attempt_matches_snapshot(snapshot: &ServiceSnapshot, attempt: &HealthAttempt) -> bool {
-    snapshot.execution == Execution::Running && attempt.run_generation == snapshot.run_generation
-}
-
-/// Trim a healthcheck attempt's captured output to its last lines, so a chatty probe doesn't bloat
-/// the timeout report.
-fn bounded_attempt(mut attempt: HealthAttempt) -> HealthAttempt {
-    const MAX_OUTPUT_LINES: usize = 20;
-    if attempt.output.len() > MAX_OUTPUT_LINES {
-        let drop = attempt.output.len() - MAX_OUTPUT_LINES;
-        attempt.output.drain(0..drop);
-    }
-    attempt
-}
-
-fn service_needs_diagnosis(snapshot: &ServiceSnapshot) -> bool {
-    if snapshot.desired == micromux::Desired::Disabled {
-        return false;
-    }
-    snapshot.execution != Execution::Running
-        || (snapshot.healthcheck_configured && snapshot.health != Some(Health::Healthy))
-}
-
-async fn likely_cause_log_tail(
-    endpoint: &ControlEndpoint,
-    snapshot: &ServiceSnapshot,
-    limit: usize,
-) -> Result<(Vec<logproc::ProcessedEntry>, bool), ToolError> {
-    let logs = logs_for_diagnosis(endpoint, snapshot).await?;
-    let mut entries = logproc::shape(
-        &logs.lines,
-        &logproc::Shape {
-            format: logproc::LogFormat::Compact,
-            ..logproc::Shape::default()
-        },
-    )
-    .into_iter()
-    .filter(is_likely_cause_entry)
-    .collect::<Vec<_>>();
-    let mut truncated = logs.truncated;
-    if entries.len() > limit {
-        truncated |= logproc::tail_preserving_record_boundaries(&mut entries, limit);
-    }
-    Ok((entries, truncated))
-}
-
-async fn logs_for_diagnosis(
-    endpoint: &ControlEndpoint,
-    snapshot: &ServiceSnapshot,
-) -> Result<convert::LogsResult, ToolError> {
-    if snapshot.run_generation > 0 {
-        match fetch_log_tail(endpoint, &snapshot.id, Some(snapshot.run_generation)).await {
-            Ok(logs) => return Ok(logs),
-            Err(ToolError::Remote {
-                code: ErrorCode::UnknownRun,
-                ..
-            }) => {}
-            Err(err) => return Err(err),
-        }
-    }
-    fetch_log_tail(endpoint, &snapshot.id, None).await
-}
-
-async fn fetch_log_tail(
-    endpoint: &ControlEndpoint,
-    service: &str,
-    run_generation: Option<u64>,
-) -> Result<convert::LogsResult, ToolError> {
-    let response = send_request(
-        endpoint,
-        Request::GetLogs {
-            service: service.to_string(),
-            run_generation,
-            tail: Some(DIAGNOSE_LOG_SCAN),
-        },
-    )
-    .await?;
-    convert::logs(response)
-}
-
-fn is_likely_cause_entry(entry: &logproc::ProcessedEntry) -> bool {
-    if matches!(entry.level, Some("error" | "fatal")) {
-        return true;
-    }
-    let lower = entry.line.to_ascii_lowercase();
-    lower.contains("[stderr]")
-        || lower.contains("error")
-        || lower.contains("failed")
-        || lower.contains("panic")
-        || lower.contains("exception")
-        || lower.contains("traceback")
-        || lower.contains("does not exist")
-}
-
-fn diagnosis_hint(
-    snapshot: &ServiceSnapshot,
-    latest_healthcheck: Option<&HealthAttempt>,
-    error_log_tail: &[logproc::ProcessedEntry],
-) -> String {
-    match snapshot.execution {
-        Execution::Exited => {
-            if error_log_tail.is_empty() {
-                "service exited; inspect get_logs for the full retained run".to_string()
-            } else {
-                "service exited; error_log_tail contains likely cause lines".to_string()
-            }
-        }
-        Execution::Running if snapshot.healthcheck_configured => {
-            if latest_healthcheck.is_some() {
-                "service is running but healthcheck is not healthy; inspect latest_healthcheck output"
-                    .to_string()
-            } else {
-                "service is running but healthcheck is not healthy yet; no healthcheck attempt has completed"
-                    .to_string()
-            }
-        }
-        Execution::Pending | Execution::Starting => {
-            "service has not finished starting; inspect recent logs".to_string()
-        }
-        Execution::Stopping => "service is stopping".to_string(),
-        Execution::Unknown => "service reported an unknown execution state".to_string(),
-        Execution::Running => {
-            "service state needs attention; inspect snapshot and logs".to_string()
-        }
-    }
-}
-
-async fn current_service_cursor(
-    endpoint: &ControlEndpoint,
-    service: &str,
-) -> Result<u64, ToolError> {
-    let response = send_request(
-        endpoint,
-        Request::ListLogRuns {
-            service: service.to_string(),
-        },
-    )
-    .await?;
-    let cursor = convert::log_runs(response)?
-        .into_iter()
-        .rev()
-        .find(|run| run.current)
-        .and_then(|run| run.last_seq);
-    if let Some(cursor) = cursor {
-        return Ok(cursor);
-    }
-
-    let response = send_request(
-        endpoint,
-        Request::GetLogs {
-            service: service.to_string(),
-            run_generation: None,
-            tail: Some(1),
-        },
-    )
-    .await?;
-    Ok(convert::logs(response)?
-        .lines
-        .last()
-        .map_or(0, |line| line.seq))
-}
-
-async fn current_cursors(endpoint: &ControlEndpoint) -> Result<BTreeMap<String, u64>, ToolError> {
-    let response = send_request(endpoint, Request::ListServices).await?;
-    let services = convert::services(response)?;
-    let mut cursors = BTreeMap::new();
-    for service in services {
-        cursors.insert(
-            service.id.clone(),
-            current_service_cursor(endpoint, &service.id).await?,
-        );
-    }
-    Ok(cursors)
-}
-
-async fn follow_all_current_logs(
-    endpoint: &ControlEndpoint,
-    after: &BTreeMap<String, u64>,
-    raw: bool,
-    filters: &LogFilters,
-    limit: usize,
-) -> Result<MergedFollowOutput, ToolError> {
-    let tail_mode = after.is_empty();
-    let response = send_request(endpoint, Request::ListServices).await?;
-    let services = convert::services(response)?;
-    let mut pages = Vec::new();
-    for service in services {
-        let after_seq = follow_all_after_seq(after, &service.id);
-        let response = send_request(
-            endpoint,
-            Request::FollowLogs {
-                service: service.id.clone(),
-                run_generation: None,
-                after: after_seq,
-            },
-        )
-        .await?;
-        let logs = convert::logs(response)?;
-        let raw_next_seq = next_follow_cursor(&logs.lines, after_seq);
-        let gap = follow_gap(&logs.lines, after_seq, None);
-        let mut entries = logproc::shape(&logs.lines, &filters.shape(raw, None));
-        for entry in &mut entries {
-            entry.service = Some(service.id.clone());
-        }
-        pages.push(MergedFollowPage {
-            service: service.id,
-            after_seq,
-            raw_next_seq,
-            gap,
-            entries,
-            truncated: logs.truncated,
-        });
-    }
-    Ok(merge_follow_pages(pages, limit, tail_mode))
-}
-
-/// A factual next-step hint for a `wait_for_healthy` timeout, derived from the execution sub-state.
-fn timeout_hint(snapshot: &ServiceSnapshot) -> &'static str {
-    match snapshot.execution {
-        Execution::Running => {
-            if snapshot.healthcheck_configured && snapshot.health != Some(Health::Healthy) {
-                "the process is running but its healthcheck has not passed yet — inspect \
-                 latest_healthcheck (or call get_health); if the command is still compiling/starting, \
-                 wait again with a longer timeout_secs"
-            } else {
-                "the process is running and may still be completing startup — wait again or inspect \
-                 get_logs"
-            }
-        }
-        Execution::Pending | Execution::Starting => {
-            "the process has not finished starting — wait again with a longer timeout_secs or inspect \
-             get_logs"
-        }
-        Execution::Stopping => "the service is stopping",
-        Execution::Unknown => {
-            "the session reported an unknown service state — inspect list_services"
-        }
-        Execution::Exited => {
-            "the run has exited — inspect get_logs and the service's last_exit_code"
-        }
-    }
-}
-
-/// How long `stop_session` waits to confirm the session process actually exited.
-#[cfg(unix)]
-const STOP_CONFIRM_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Whether a process is still alive, via a signal-0 `kill`. Used to confirm a stopped session exited
-/// (so its ports are freed) before reporting success.
-#[cfg(unix)]
-fn process_alive(pid: u32) -> bool {
-    // Reject pid 0: kill(0, …) targets the caller's own process group, never a session process.
-    if pid == 0 {
-        return false;
-    }
-    let Ok(pid) = i32::try_from(pid) else {
-        return false;
-    };
-    // Signal 0 delivers nothing; it only checks existence/permission. ESRCH means the process is
-    // gone; anything else (Ok, or EPERM) means it still exists.
-    !matches!(
-        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None),
-        Err(nix::errno::Errno::ESRCH)
-    )
-}
-
-/// Poll until `pid` is gone or the timeout elapses; returns whether it exited.
-#[cfg(unix)]
-async fn wait_until_stopped(pid: u32, timeout: Duration) -> bool {
-    let deadline = tokio::time::Instant::now() + timeout;
-    loop {
-        if !process_alive(pid) {
-            return true;
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return false;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-}
-
-/// How long `start_session` waits for a freshly spawned session's control plane to come up.
-const START_READY_TIMEOUT: Duration = Duration::from_secs(15);
-/// After a spawned `serve` exits (e.g. it lost the lifetime-lock race to a concurrent start), how
-/// long to keep polling for a session to become reachable before reporting failure — long enough for
-/// the race winner (which binds within milliseconds) to come up, short enough to fail a bad config
-/// quickly.
-const CHILD_EXIT_GRACE: Duration = Duration::from_secs(3);
-
-async fn already_running_any(
-    endpoints: &[ControlEndpoint],
-    config_path: &Path,
-) -> Result<Option<StartSessionResult>, ToolError> {
-    let probes = probe_endpoints(endpoints).await;
-    let sessions = unique_answering_session_probes(&probes);
-    if sessions.len() > 1 {
-        return Err(ambiguous_start_session(config_path, sessions.len()));
-    }
-    if let Some((_endpoint, info)) = sessions.into_iter().next() {
-        return Ok(Some(already_running_report(&info)));
-    }
-
-    for probe in probes {
-        let reason = match probe.result {
-            EndpointProbeResult::ProtocolMismatch { peer, ours } => {
-                format!("control protocol version mismatch: peer={peer}, ours={ours}")
-            }
-            EndpointProbeResult::Unreachable(reason) => reason,
-            EndpointProbeResult::Session(_) | EndpointProbeResult::Absent(_) => continue,
-        };
-        if endpoint_owner_lock_held(&probe.endpoint).unwrap_or(false) {
-            return Ok(Some(StartSessionResult {
-                started: false,
-                already_running: Some(true),
-                reachable: Some(false),
-                config_path: config_path.display().to_string(),
-                session: None,
-                id: None,
-                pid: None,
-                endpoint: Some(probe.endpoint.to_string()),
-                reason: Some(reason),
-            }));
-        }
-    }
-
-    Ok(None)
-}
-
-async fn reachable_session_for_start(
-    endpoints: &[ControlEndpoint],
-    config_path: &Path,
-    child_pid: Option<u32>,
-) -> Result<Option<(bool, SessionInfo)>, ToolError> {
-    let probes = probe_endpoints(endpoints).await;
-    let sessions = unique_answering_session_probes(&probes);
-    if sessions.len() > 1 {
-        return Err(ambiguous_start_session(config_path, sessions.len()));
-    }
-    let Some((_endpoint, info)) = sessions.into_iter().next() else {
-        return Ok(None);
-    };
-    Ok(Some((child_pid == Some(info.pid), info)))
-}
-
-fn start_session_report(info: &SessionInfo, started: bool) -> StartSessionResult {
-    if started {
-        StartSessionResult {
-            started: true,
-            already_running: None,
-            reachable: None,
-            config_path: info.config_path.clone(),
-            session: Some(info.name.clone()),
-            id: Some(info.id.clone()),
-            pid: Some(info.pid),
-            endpoint: None,
-            reason: None,
-        }
-    } else {
-        already_running_report(info)
-    }
-}
-
-fn already_running_report(info: &SessionInfo) -> StartSessionResult {
-    StartSessionResult {
-        started: false,
-        already_running: Some(true),
-        reachable: None,
-        config_path: info.config_path.clone(),
-        session: Some(info.name.clone()),
-        id: Some(info.id.clone()),
-        pid: Some(info.pid),
-        endpoint: None,
-        reason: None,
-    }
-}
-
-fn ambiguous_start_session(config_path: &Path, sessions: usize) -> ToolError {
-    ToolError::Ambiguous(format!(
-        "config {} matched {sessions} live sessions; use list_sessions and stop the duplicate before starting another",
-        config_path.display(),
-    ))
-}
-
-/// Spawn `micromux serve` detached for a project's config and return its child handle. A new process
-/// group + null stdio detach it from this ephemeral MCP server and keep it off the JSON-RPC stdio
-/// channel; `--config` pins the same endpoint hash the proxy derives, regardless of the child's
-/// working directory. Using `tokio::process` means the runtime reaps the child in the background once
-/// it exits (no zombie), so a later `kill(pid, 0)` reports it truly gone, and lets `start_session`
-/// observe an early exit.
-#[cfg(unix)]
-fn spawn_detached_serve(config_path: &Path) -> std::io::Result<tokio::process::Child> {
-    use std::process::Stdio;
-
-    let exe = std::env::current_exe()?;
-    let project_dir = config_path.parent().unwrap_or(config_path);
-    tokio::process::Command::new(exe)
-        .arg("serve")
-        .arg("--config")
-        .arg(config_path)
-        .current_dir(project_dir)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .process_group(0)
-        .spawn()
-}
-
-#[cfg(not(unix))]
-fn spawn_detached_serve(_config_path: &Path) -> std::io::Result<tokio::process::Child> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "start_session is only supported on unix",
-    ))
-}
-
-fn next_follow_cursor(lines: &[LogLine], after_seq: Option<u64>) -> Option<u64> {
-    lines.last().map(|line| line.seq).or(after_seq)
-}
-
-fn truncate_wait_matches(
-    entries: &mut Vec<logproc::ProcessedEntry>,
-    raw_next_seq: u64,
-    server_truncated: bool,
-    limit: usize,
-) -> (u64, bool) {
-    if entries.len() <= limit {
-        return (raw_next_seq, server_truncated);
-    }
-    let truncated = logproc::truncate_preserving_record_boundaries(entries, limit);
-    let next_seq = if truncated {
-        entries.last().map_or(raw_next_seq, |entry| entry.seq)
-    } else {
-        raw_next_seq
-    };
-    (next_seq, server_truncated || truncated)
-}
-
-fn follow_gap(
-    lines: &[LogLine],
-    after_seq: Option<u64>,
-    run_generation: Option<u64>,
-) -> Option<FollowGap> {
-    if run_generation.is_some() {
-        return None;
-    }
-    let after_seq = after_seq?;
-    let first = lines.first()?;
-    if first.seq > after_seq.saturating_add(1) {
-        Some(FollowGap {
-            after_seq,
-            first_seq: first.seq,
-            lost_entries_at_least: first.seq.saturating_sub(after_seq).saturating_sub(1),
-        })
-    } else {
-        None
-    }
-}
-
-fn follow_all_after_seq(cursors: &BTreeMap<String, u64>, service_id: &str) -> Option<u64> {
-    if cursors.is_empty() {
-        None
-    } else {
-        Some(cursors.get(service_id).copied().unwrap_or(0))
-    }
-}
-
-struct MergedFollowPage {
-    service: String,
-    after_seq: Option<u64>,
-    raw_next_seq: Option<u64>,
-    gap: Option<FollowGap>,
-    entries: Vec<logproc::ProcessedEntry>,
-    truncated: bool,
-}
-
-struct MergedFollowOutput {
-    entries: Vec<logproc::ProcessedEntry>,
-    next: BTreeMap<String, u64>,
-    gaps: Vec<ServiceFollowGap>,
-    truncated: bool,
-}
-
-fn merge_follow_pages(
-    mut pages: Vec<MergedFollowPage>,
-    limit: usize,
-    tail_mode: bool,
-) -> MergedFollowOutput {
-    let page_truncated = pages.iter().any(|page| page.truncated);
-    let matched_by_service = pages
-        .iter()
-        .map(|page| (page.service.clone(), !page.entries.is_empty()))
-        .collect::<BTreeMap<_, _>>();
-    let entries = pages
-        .iter_mut()
-        .flat_map(|page| std::mem::take(&mut page.entries))
-        .collect::<Vec<_>>();
-    let mut entries = logproc::merge_preserving_service_order(entries);
-    let mut merge_truncated = false;
-    if entries.len() > limit {
-        merge_truncated = if tail_mode {
-            logproc::tail_preserving_record_boundaries(&mut entries, limit)
-        } else {
-            logproc::truncate_preserving_record_boundaries(&mut entries, limit)
-        };
-    }
-
-    let returned = returned_cursors(&entries);
-    let mut next = BTreeMap::new();
-    for page in &pages {
-        let cursor = if merge_truncated && !tail_mode {
-            returned
-                .get(&page.service)
-                .copied()
-                .or_else(|| {
-                    matched_by_service
-                        .get(&page.service)
-                        .is_some_and(|matched| !matched)
-                        .then_some(page.raw_next_seq)
-                        .flatten()
-                })
-                .or(page.after_seq)
-        } else {
-            page.raw_next_seq
-                .or(page.after_seq)
-                .or(tail_mode.then_some(0))
-        };
-        if let Some(cursor) = cursor {
-            next.insert(page.service.clone(), cursor);
-        }
-    }
-    let gaps = pages
-        .into_iter()
-        .filter_map(|page| {
-            page.gap.map(|gap| ServiceFollowGap {
-                service: page.service,
-                after_seq: gap.after_seq,
-                first_seq: gap.first_seq,
-                lost_entries_at_least: gap.lost_entries_at_least,
-            })
-        })
-        .collect();
-
-    MergedFollowOutput {
-        entries,
-        next,
-        gaps,
-        truncated: page_truncated || merge_truncated,
-    }
-}
-
-fn returned_cursors(entries: &[logproc::ProcessedEntry]) -> BTreeMap<String, u64> {
-    let mut cursors: BTreeMap<String, u64> = BTreeMap::new();
-    for entry in entries {
-        if let Some(service) = &entry.service {
-            cursors
-                .entry(service.clone())
-                .and_modify(|seq| *seq = (*seq).max(entry.seq))
-                .or_insert(entry.seq);
-        }
-    }
-    cursors
-}
-
 fn error_data(err: ToolError) -> ErrorData {
     match err {
         ToolError::NoSession(details) => {
@@ -2376,11 +1821,15 @@ pub async fn serve_stdio() -> Result<(), Box<dyn std::error::Error + Send + Sync
 #[cfg(test)]
 mod tests {
     use super::{
-        McpServer, MergedFollowPage, WaitResult, follow_all_after_seq, follow_gap,
-        health_attempt_matches_snapshot, merge_follow_pages, next_follow_cursor, parse_since_text,
-        session_has_service, session_resolves_service_id, session_selector, truncate_wait_matches,
+        McpServer, MutationResult, SessionRef, WaitResult, parse_since_text, session_has_service,
+        session_resolves_service_id, session_selector,
     };
-    use micromux::{Execution, HealthAttempt, LogLine, ServiceSnapshot};
+    use crate::tools::health::health_attempt_matches_snapshot;
+    use crate::tools::logs::{
+        MergedFollowPage, follow_all_after_seq, follow_gap, merge_follow_pages, next_follow_cursor,
+        truncate_wait_matches,
+    };
+    use micromux::{Execution, HealthAttempt, LogLine, ServiceCommandAck, ServiceSnapshot};
     use micromux_control::{PROTOCOL_VERSION, ServiceBrief, SessionInfo};
     use similar_asserts::assert_eq;
     use std::collections::BTreeMap;
@@ -2422,6 +1871,36 @@ mod tests {
         assert!(session_has_service(&info, "rag-ui"));
         assert!(!session_has_service(&info, "api"));
         assert!(!session_has_service(&info, "rag"));
+    }
+
+    #[test]
+    fn mutation_result_serializes_flat_session_fields() -> color_eyre::Result<()> {
+        let result = MutationResult {
+            session_ref: SessionRef {
+                session: "proj".to_string(),
+                id: "abc".to_string(),
+                pid: 123,
+                config_path: "/w/micromux.yaml".to_string(),
+            },
+            accepted: vec![ServiceCommandAck {
+                service: "api".to_string(),
+                observed_generation: 7,
+            }],
+            service: "api".to_string(),
+            generation: Some(7),
+        };
+
+        let value = serde_json::to_value(result)?;
+        assert_eq!(value.get("session"), Some(&serde_json::json!("proj")));
+        assert_eq!(value.get("id"), Some(&serde_json::json!("abc")));
+        assert_eq!(value.get("pid"), Some(&serde_json::json!(123)));
+        assert_eq!(
+            value.get("config_path"),
+            Some(&serde_json::json!("/w/micromux.yaml"))
+        );
+        assert_eq!(value.get("service"), Some(&serde_json::json!("api")));
+        assert_eq!(value.get("generation"), Some(&serde_json::json!(7)));
+        Ok(())
     }
 
     #[test]
