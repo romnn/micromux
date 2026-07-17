@@ -67,6 +67,7 @@ mod tests {
     fn service_config(name: &str, depends_on: Vec<config::Dependency>) -> config::Service {
         config::Service {
             name: spanned_string(name),
+            startup_mode: crate::service::StartupMode::Enabled,
             command: (spanned_string("echo"), vec![spanned_string("hi")]),
             working_dir: None,
             env_file: vec![],

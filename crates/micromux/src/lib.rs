@@ -82,6 +82,28 @@ pub(crate) fn service_map_from_config<F>(
         .collect::<Result<ServiceMap, _>>()
 }
 
+pub(crate) fn initial_model_entries(services: &ServiceMap) -> Vec<(ServiceSnapshot, LogRetention)> {
+    services
+        .iter()
+        .map(|(id, service)| {
+            let mut snapshot = ServiceSnapshot::initial(
+                id.clone(),
+                service.name.as_ref().clone(),
+                service.advertised_ports.clone(),
+                service.health_check.is_some(),
+                service.restart_policy.clone(),
+                service.argv(),
+                service.working_dir_display(),
+            );
+            snapshot.desired = match service.startup_mode {
+                service::StartupMode::Enabled => Desired::Enabled,
+                service::StartupMode::Disabled => Desired::Disabled,
+            };
+            (snapshot, service.log_retention)
+        })
+        .collect()
+}
+
 /// Main entry point to run a micromux session.
 pub struct Micromux {
     services: ServiceMap,
@@ -144,30 +166,6 @@ impl Micromux {
         })
     }
 
-    /// Return a snapshot of services suitable for presentation.
-    ///
-    /// The returned descriptors intentionally omit internal details required only by the
-    /// scheduler.
-    fn initial_model_entries(&self) -> Vec<(ServiceSnapshot, LogRetention)> {
-        self.services
-            .iter()
-            .map(|(id, service)| {
-                (
-                    ServiceSnapshot::initial(
-                        id.clone(),
-                        service.name.as_ref().clone(),
-                        service.advertised_ports.clone(),
-                        service.health_check.is_some(),
-                        service.restart_policy.clone(),
-                        service.argv(),
-                        service.working_dir_display(),
-                    ),
-                    service.log_retention,
-                )
-            })
-            .collect()
-    }
-
     /// Start the scheduler, returning the runner future and the capability [`Handles`].
     ///
     /// The model (`Inner` + `Writer`) and the command channel are built internally; the writer is
@@ -178,7 +176,7 @@ impl Micromux {
         self: Arc<Self>,
         shutdown: CancellationToken,
     ) -> (impl Future<Output = eyre::Result<()>> + 'static, Handles) {
-        let (reader, writer) = model::new(self.initial_model_entries());
+        let (reader, writer) = model::new(initial_model_entries(&self.services));
         let (commands_tx, commands_rx) = mpsc::channel(1024);
         let handles = Handles {
             reader,
@@ -206,5 +204,38 @@ impl Micromux {
         };
 
         (runner, handles)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{Desired, Execution};
+    use similar_asserts::assert_eq;
+    use std::path::Path;
+
+    #[test]
+    fn disabled_config_seeds_disabled_model_state() -> eyre::Result<()> {
+        let raw = r#"
+            version: 1
+            services:
+              worker:
+                command: ["sh", "-c", "sleep 60"]
+                disabled: true
+        "#;
+        let mut diagnostics = Vec::new();
+        let config = from_str(raw, Path::new("."), 0usize, None, &mut diagnostics)?;
+        let mux = Arc::new(Micromux::new(&config)?);
+        let (_runner, handles) = mux.start(CancellationToken::new());
+        let snapshot = handles
+            .reader
+            .service("worker")
+            .ok_or_else(|| eyre::eyre!("missing worker snapshot"))?;
+
+        assert!(diagnostics.is_empty());
+        assert_eq!(snapshot.desired, Desired::Disabled);
+        assert_eq!(snapshot.execution, Execution::Pending);
+        assert_eq!(snapshot.run_generation, 0);
+        Ok(())
     }
 }

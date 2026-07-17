@@ -3,7 +3,7 @@ use crate::{
     graph::ServiceGraph,
     health_check::Health,
     model::{Desired, Execution, ServiceSnapshot, SessionModelWriter},
-    service::{self, Service},
+    service::{self, Service, StartupMode},
 };
 use codespan_reporting::diagnostic::Severity;
 use color_eyre::eyre;
@@ -196,16 +196,40 @@ pub(super) struct ServiceRuntime {
     draining_log_readers: Vec<(RunId, pty::LogReaderHandle)>,
 }
 
-impl ServiceRuntime {
-    fn new(policy: &service::RestartPolicy) -> Self {
+#[derive(Clone, Copy)]
+struct ServiceRuntimeInit<'a> {
+    restart_policy: &'a service::RestartPolicy,
+    startup_mode: StartupMode,
+}
+
+impl<'a> From<&'a Service> for ServiceRuntimeInit<'a> {
+    fn from(service: &'a Service) -> Self {
         Self {
-            desired: DesiredState::Enabled,
+            restart_policy: &service.restart_policy,
+            startup_mode: service.startup_mode,
+        }
+    }
+}
+
+impl ServiceRuntime {
+    fn new(init: ServiceRuntimeInit<'_>) -> Self {
+        let desired = match init.startup_mode {
+            StartupMode::Enabled => DesiredState::Enabled,
+            StartupMode::Disabled => DesiredState::Disabled,
+        };
+        let state = match desired {
+            DesiredState::Enabled => State::Pending,
+            DesiredState::Disabled => State::Disabled,
+        };
+
+        Self {
+            desired,
             start_requested: false,
             clear_logs_on_start: false,
             next_run_id: 0,
             running: None,
-            restart: RestartTracker::new(policy),
-            state: State::Pending,
+            restart: RestartTracker::new(init.restart_policy),
+            state,
             last_run_id: None,
             last_started_at: None,
             last_exit_code: None,
@@ -588,7 +612,7 @@ impl SchedulerRuntime {
             .map(|(service_id, service)| {
                 (
                     service_id.clone(),
-                    ServiceRuntime::new(&service.restart_policy),
+                    ServiceRuntime::new(ServiceRuntimeInit::from(service)),
                 )
             })
             .collect();

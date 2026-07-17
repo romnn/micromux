@@ -10,7 +10,7 @@ pub mod v1;
 
 use crate::diagnostics::{DiagnosticExt, Span, ToDiagnostics};
 use crate::model::LogRetention;
-use crate::service::RestartPolicy;
+use crate::service::{RestartPolicy, StartupMode};
 use codespan_reporting::diagnostic::{Diagnostic, Label};
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
@@ -241,6 +241,8 @@ pub struct EnvFile {
 pub struct Service {
     /// Service name.
     pub name: Spanned<String>,
+    /// Startup behavior for new sessions.
+    pub startup_mode: StartupMode,
     /// Command to execute and its arguments.
     pub command: (Spanned<String>, Vec<Spanned<String>>),
     /// Optional working directory.

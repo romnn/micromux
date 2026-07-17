@@ -312,6 +312,11 @@
         "name": {
           "type": "string"
         },
+        "disabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Leave this service disabled when the micromux session starts."
+        },
         "command": {
           "$ref": "#/definitions/command"
         },

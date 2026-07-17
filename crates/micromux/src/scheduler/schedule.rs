@@ -3,7 +3,7 @@ use super::{
     SessionModelWriter, State, pty, sync_model,
 };
 #[cfg(test)]
-use super::{Event, TestEventSink};
+use super::{Event, ServiceRuntimeInit, TestEventSink};
 use crate::{ServiceMap, health_check::Health};
 use std::collections::HashMap;
 use tokio::sync::mpsc;
@@ -241,6 +241,7 @@ mod tests {
     fn test_service(id: &str) -> color_eyre::Result<Service> {
         let cfg = crate::config::Service {
             name: spanned_string(id),
+            startup_mode: crate::service::StartupMode::Enabled,
             command: (spanned_string("true"), Vec::new()),
             working_dir: None,
             env_file: Vec::new(),
@@ -305,10 +306,13 @@ mod tests {
         services.insert("svc".to_string(), svc.clone());
 
         let mut runtimes = HashMap::new();
-        let mut runtime = ServiceRuntime::new(&dep.restart_policy);
+        let mut runtime = ServiceRuntime::new(ServiceRuntimeInit::from(&dep));
         runtime.state = State::Running { health: None };
         runtimes.insert("dep".to_string(), runtime);
-        runtimes.insert("svc".to_string(), ServiceRuntime::new(&svc.restart_policy));
+        runtimes.insert(
+            "svc".to_string(),
+            ServiceRuntime::new(ServiceRuntimeInit::from(&svc)),
+        );
 
         let (events_tx, _events_rx) = mpsc::channel(1);
         let (_reader, writer) = crate::model::new([]);

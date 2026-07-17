@@ -38,6 +38,7 @@ mod tests {
     fn service_config(name: &str, command: (&str, &[&str])) -> config::Service {
         config::Service {
             name: spanned_string(name),
+            startup_mode: StartupMode::Enabled,
             command: (
                 spanned_string(command.0),
                 command
@@ -227,10 +228,21 @@ impl std::fmt::Display for RestartPolicy {
     }
 }
 
+/// Determines how a service enters a new session.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum StartupMode {
+    /// Start automatically once dependencies are ready.
+    #[default]
+    Enabled,
+    /// Wait for an explicit enable request.
+    Disabled,
+}
+
 #[derive(Debug, Clone)]
 pub struct Service {
     pub id: ServiceID,
     pub name: Spanned<String>,
+    pub startup_mode: StartupMode,
     pub command: (String, Vec<String>),
     pub working_dir: Option<PathBuf>,
     pub restart_policy: RestartPolicy,
@@ -319,6 +331,7 @@ impl Service {
         Ok(Self {
             id,
             name: config.name,
+            startup_mode: config.startup_mode,
             command: (
                 prog.into_inner(),
                 args.into_iter()

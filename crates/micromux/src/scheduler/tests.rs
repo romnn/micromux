@@ -12,28 +12,6 @@ use yaml_spanned::Spanned;
 use crate::model::{Desired, Execution};
 use similar_asserts::assert_eq;
 
-fn test_initial_snapshots(
-    services: &ServiceMap,
-) -> Vec<(crate::model::ServiceSnapshot, crate::LogRetention)> {
-    services
-        .iter()
-        .map(|(id, service)| {
-            (
-                crate::model::ServiceSnapshot::initial(
-                    id.clone(),
-                    service.name.as_ref().clone(),
-                    service.advertised_ports.clone(),
-                    service.health_check.is_some(),
-                    service.restart_policy.clone(),
-                    service.argv(),
-                    service.working_dir_display(),
-                ),
-                service.log_retention,
-            )
-        })
-        .collect()
-}
-
 /// Run the real scheduler with a test-only transition event sink.
 async fn run_test_scheduler(
     services: &ServiceMap,
@@ -43,7 +21,7 @@ async fn run_test_scheduler(
     test_events_tx: mpsc::Sender<Event>,
     shutdown: CancellationToken,
 ) -> eyre::Result<()> {
-    let (_reader, writer) = crate::model::new(test_initial_snapshots(services));
+    let (_reader, writer) = crate::model::new(crate::initial_model_entries(services));
     scheduler(SchedulerInput {
         services: services.clone(),
         reload_config: None,
@@ -68,7 +46,7 @@ struct Harness {
 fn spawn_harness(services: ServiceMap) -> Harness {
     let (commands_tx, commands_rx) = mpsc::channel(64);
     let (events_tx, events_rx) = mpsc::channel(256);
-    let (reader, writer) = crate::model::new(test_initial_snapshots(&services));
+    let (reader, writer) = crate::model::new(crate::initial_model_entries(&services));
     let control = ServiceControl::new(commands_tx);
     let shutdown = CancellationToken::new();
     let handle = tokio::spawn({
@@ -98,7 +76,7 @@ fn spawn_harness(services: ServiceMap) -> Harness {
 fn spawn_harness_with_reload(services: ServiceMap, config_path: PathBuf) -> Harness {
     let (commands_tx, commands_rx) = mpsc::channel(64);
     let (events_tx, events_rx) = mpsc::channel(256);
-    let (reader, writer) = crate::model::new(test_initial_snapshots(&services));
+    let (reader, writer) = crate::model::new(crate::initial_model_entries(&services));
     let control = ServiceControl::new(commands_tx);
     let shutdown = CancellationToken::new();
     let handle = tokio::spawn({
@@ -217,7 +195,10 @@ fn project_execution_maps_the_desired_execution_table() {
 
 #[test]
 fn failed_start_advances_generation_and_records_exit() {
-    let mut runtime = ServiceRuntime::new(&crate::service::RestartPolicy::Never);
+    let mut runtime = ServiceRuntime::new(ServiceRuntimeInit {
+        restart_policy: &crate::service::RestartPolicy::Never,
+        startup_mode: StartupMode::Enabled,
+    });
     runtime.mark_starting();
     let run_id = runtime.allocate_run_id();
 
@@ -249,7 +230,10 @@ fn start_dummy_run(runtime: &mut ServiceRuntime) -> eyre::Result<RunId> {
 #[tokio::test]
 async fn log_reader_finished_leaves_no_draining_handle_in_either_order() -> eyre::Result<()> {
     let policy = crate::service::RestartPolicy::Never;
-    let mut runtime = ServiceRuntime::new(&policy);
+    let mut runtime = ServiceRuntime::new(ServiceRuntimeInit {
+        restart_policy: &policy,
+        startup_mode: StartupMode::Enabled,
+    });
 
     // Reader finishes first (EOF/cancel before the exit is processed).
     let run_id = start_dummy_run(&mut runtime)?;
@@ -264,6 +248,45 @@ async fn log_reader_finished_leaves_no_draining_handle_in_either_order() -> eyre
     runtime.finish_log_reader(run_id);
     assert!(runtime.draining_log_readers.is_empty());
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn initially_disabled_service_stays_stopped_until_enabled() -> eyre::Result<()> {
+    let mut config = service_config("svc", ("sh", &["-c", "sleep 60"]));
+    config.startup_mode = StartupMode::Disabled;
+    let mut services: ServiceMap = ServiceMap::new();
+    services.insert(
+        "svc".to_string(),
+        Service::new("svc", Path::new("."), config)?,
+    );
+    let harness = spawn_harness(services);
+    let id = "svc".to_string();
+
+    let snapshot = harness
+        .reader
+        .service("svc")
+        .ok_or_else(|| eyre::eyre!("missing service snapshot"))?;
+    assert_eq!(snapshot.desired, Desired::Disabled);
+    assert_eq!(snapshot.execution, Execution::Pending);
+    assert_eq!(snapshot.run_generation, 0);
+
+    let rejected = harness
+        .control
+        .restart(&id)
+        .await
+        .map_err(|_| eyre::eyre!("scheduler stopped"))?;
+    assert!(matches!(rejected, Err(CommandRejection::InvalidState)));
+
+    accepted(harness.control.enable(&id).await)?;
+    let snapshot = wait_until(&harness.reader, "svc", |snapshot| {
+        snapshot.desired == Desired::Enabled && snapshot.execution == Execution::Running
+    })
+    .await?;
+    assert_eq!(snapshot.run_generation, 1);
+
+    harness.shutdown.cancel();
+    harness.handle.await??;
     Ok(())
 }
 
@@ -598,6 +621,7 @@ fn spanned_string(value: &str) -> Spanned<String> {
 fn service_config(name: &str, command: (&str, &[&str])) -> config::Service {
     config::Service {
         name: spanned_string(name),
+        startup_mode: StartupMode::Enabled,
         command: (
             spanned_string(command.0),
             command

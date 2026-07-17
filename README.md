@@ -81,10 +81,14 @@ services:
 
   worker:
     command: "./run-worker"
-     depends_on:
-       - name: api
-         condition: healthy
+    disabled: true
+    depends_on:
+      - name: api
+        condition: healthy
  ```
+
+Set `disabled: true` on a service to leave it disabled when the session starts. Enable it later
+from the TUI or with the control plane.
  
  TUI controls:
  - **Navigate**: `j`/`k` (or arrows)

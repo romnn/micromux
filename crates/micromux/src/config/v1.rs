@@ -4,7 +4,9 @@ use super::{
 };
 use crate::diagnostics::DiagnosticExt;
 use crate::{
-    DiskLogRetention, LogLimit, LogRetention, config::InvalidCommandReason, service::RestartPolicy,
+    DiskLogRetention, LogLimit, LogRetention,
+    config::InvalidCommandReason,
+    service::{RestartPolicy, StartupMode},
 };
 use codespan_reporting::diagnostic::{Diagnostic, Label};
 use indexmap::IndexMap;
@@ -15,6 +17,7 @@ use yaml_spanned::{Mapping, Sequence, Spanned, Value, value::Kind};
 /// about typos that would otherwise silently drop an entire config block.
 const KNOWN_SERVICE_KEYS: &[&str] = &[
     "name",
+    "disabled",
     "command",
     "working_dir",
     "cwd",
@@ -834,6 +837,14 @@ fn parse_service<F: Copy>(
         diagnostics,
     );
     let name = parse_optional::<String>(mapping.get("name"))?.unwrap_or_else(|| name.clone());
+    let disabled = parse_optional::<bool>(mapping.get("disabled"))?
+        .map(Spanned::into_inner)
+        .unwrap_or(false);
+    let startup_mode = if disabled {
+        StartupMode::Disabled
+    } else {
+        StartupMode::Enabled
+    };
     let color = parse_optional::<bool>(mapping.get("color"))?;
     let working_dir = mapping
         .get("working_dir")
@@ -869,6 +880,7 @@ fn parse_service<F: Copy>(
 
     Ok(Service {
         name,
+        startup_mode,
         command,
         working_dir,
         env_file,
@@ -977,6 +989,7 @@ pub fn parse_config<F: Copy + PartialEq>(
 #[cfg(test)]
 mod tests {
 
+    use crate::service::StartupMode;
     use crate::{LogLimit, LogRetention, config};
     use codespan_reporting::diagnostic::Diagnostic;
     use color_eyre::eyre;
@@ -990,6 +1003,54 @@ mod tests {
             .find(|(k, _)| k.as_ref() == name)
             .map(|(_, v)| v)
             .ok_or_else(|| eyre::eyre!("missing service {name}"))
+    }
+
+    #[test]
+    fn service_disabled_flag_maps_to_startup_mode() -> eyre::Result<()> {
+        let yaml = indoc! {r#"
+            version: 1
+            services:
+              app:
+                command: ["sh", "-c", "true"]
+                disabled: true
+              worker:
+                command: ["sh", "-c", "true"]
+        "#};
+
+        let mut diagnostics: Vec<Diagnostic<usize>> = vec![];
+        let parsed = config::from_str(yaml, Path::new("."), 0, None, &mut diagnostics)?;
+
+        assert_eq!(
+            get_service(&parsed.config, "app")?.startup_mode,
+            StartupMode::Disabled
+        );
+        assert_eq!(
+            get_service(&parsed.config, "worker")?.startup_mode,
+            StartupMode::Enabled
+        );
+        assert!(diagnostics.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn service_keys_match_schema() -> eyre::Result<()> {
+        let schema: serde_json::Value =
+            serde_json::from_str(include_str!("../../../../micromux.schema.json"))?;
+        let properties = schema
+            .pointer("/definitions/service/properties")
+            .and_then(serde_json::Value::as_object)
+            .ok_or_else(|| eyre::eyre!("schema is missing service properties"))?;
+        let schema_keys = properties
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>();
+        let parser_keys = super::KNOWN_SERVICE_KEYS
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+
+        assert_eq!(schema_keys, parser_keys);
+        Ok(())
     }
 
     #[test]
