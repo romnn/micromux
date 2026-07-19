@@ -39,34 +39,6 @@ pub(crate) enum State {
 
 #[derive(Debug)]
 pub(crate) enum ProcessEvent {
-    LogLine {
-        service_id: ServiceID,
-        run_id: RunId,
-        stream: OutputStream,
-        update: LogUpdateKind,
-        line: String,
-    },
-    HealthCheckStarted {
-        service_id: ServiceID,
-        run_id: RunId,
-        attempt: u64,
-        command: String,
-    },
-    HealthCheckLogLine {
-        service_id: ServiceID,
-        run_id: RunId,
-        attempt: u64,
-        stream: OutputStream,
-        line: String,
-    },
-    HealthCheckFinished {
-        service_id: ServiceID,
-        run_id: RunId,
-        attempt: u64,
-        success: bool,
-        exit_code: i32,
-        cancelled: bool,
-    },
     Killed {
         service_id: ServiceID,
         run_id: RunId,
@@ -93,11 +65,7 @@ pub(crate) enum ProcessEvent {
 impl ProcessEvent {
     pub(crate) fn service_id(&self) -> &ServiceID {
         match self {
-            Self::LogLine { service_id, .. }
-            | Self::HealthCheckStarted { service_id, .. }
-            | Self::HealthCheckLogLine { service_id, .. }
-            | Self::HealthCheckFinished { service_id, .. }
-            | Self::Killed { service_id, .. }
+            Self::Killed { service_id, .. }
             | Self::Exited { service_id, .. }
             | Self::LogReaderFinished { service_id, .. }
             | Self::Healthy { service_id, .. }
@@ -107,11 +75,7 @@ impl ProcessEvent {
 
     pub(crate) fn run_id(&self) -> RunId {
         match self {
-            Self::LogLine { run_id, .. }
-            | Self::HealthCheckStarted { run_id, .. }
-            | Self::HealthCheckLogLine { run_id, .. }
-            | Self::HealthCheckFinished { run_id, .. }
-            | Self::Killed { run_id, .. }
+            Self::Killed { run_id, .. }
             | Self::Exited { run_id, .. }
             | Self::LogReaderFinished { run_id, .. }
             | Self::Healthy { run_id, .. }
@@ -122,48 +86,6 @@ impl ProcessEvent {
     #[cfg(test)]
     pub(crate) fn to_test_event(&self) -> Event {
         match self {
-            Self::LogLine {
-                service_id,
-                stream,
-                line,
-                ..
-            } => Event::LogLine {
-                service_id: service_id.clone(),
-                stream: *stream,
-                line: line.clone(),
-            },
-            Self::HealthCheckStarted {
-                service_id,
-                attempt,
-                ..
-            } => Event::HealthCheckStarted {
-                service_id: service_id.clone(),
-                attempt: *attempt,
-            },
-            Self::HealthCheckLogLine {
-                service_id,
-                attempt,
-                stream,
-                line,
-                ..
-            } => Event::HealthCheckLogLine {
-                service_id: service_id.clone(),
-                attempt: *attempt,
-                stream: *stream,
-                line: line.clone(),
-            },
-            Self::HealthCheckFinished {
-                service_id,
-                attempt,
-                success,
-                exit_code,
-                ..
-            } => Event::HealthCheckFinished {
-                service_id: service_id.clone(),
-                attempt: *attempt,
-                success: *success,
-                exit_code: *exit_code,
-            },
             Self::Killed { service_id, .. } => Event::Killed(service_id.clone()),
             Self::Exited {
                 service_id,
@@ -193,44 +115,6 @@ pub(crate) enum Event {
     Started {
         /// Service that started.
         service_id: ServiceID,
-    },
-    /// A new log line was produced.
-    LogLine {
-        /// Service that produced this output.
-        service_id: ServiceID,
-        /// Which stream produced the output.
-        stream: OutputStream,
-        /// The raw (possibly ANSI-colored) line.
-        line: String,
-    },
-    /// A healthcheck attempt is about to start.
-    HealthCheckStarted {
-        /// Service this healthcheck belongs to.
-        service_id: ServiceID,
-        /// Monotonic attempt number.
-        attempt: u64,
-    },
-    /// A healthcheck produced a log line.
-    HealthCheckLogLine {
-        /// Service this healthcheck belongs to.
-        service_id: ServiceID,
-        /// Monotonic attempt number.
-        attempt: u64,
-        /// Which stream produced the output.
-        stream: OutputStream,
-        /// The output line.
-        line: String,
-    },
-    /// A healthcheck finished.
-    HealthCheckFinished {
-        /// Service this healthcheck belongs to.
-        service_id: ServiceID,
-        /// Monotonic attempt number.
-        attempt: u64,
-        /// Whether the healthcheck exited successfully.
-        success: bool,
-        /// Exit code of the healthcheck process.
-        exit_code: i32,
     },
     /// A service was killed.
     Killed(ServiceID),
@@ -279,32 +163,6 @@ impl std::fmt::Display for Event {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Started { service_id, .. } => write!(f, "Started({service_id})"),
-            Self::LogLine {
-                service_id, stream, ..
-            } => write!(f, "LogLine({service_id}, {stream:?})"),
-            Self::HealthCheckStarted {
-                service_id,
-                attempt,
-                ..
-            } => write!(f, "HealthCheckStarted({service_id}, attempt={attempt})"),
-            Self::HealthCheckLogLine {
-                service_id,
-                stream,
-                attempt,
-                ..
-            } => write!(
-                f,
-                "HealthCheckLogLine({service_id}, {stream:?}, attempt={attempt})"
-            ),
-            Self::HealthCheckFinished {
-                service_id,
-                attempt,
-                success,
-                exit_code,
-            } => write!(
-                f,
-                "HealthCheckFinished({service_id}, attempt={attempt}, success={success}, exit_code={exit_code})"
-            ),
             Self::Killed(service_id) => write!(f, "Killed({service_id})"),
             Self::Exited(service_id, _) => write!(f, "Exited({service_id})"),
             Self::LogReaderFinished(service_id) => write!(f, "LogReaderFinished({service_id})"),

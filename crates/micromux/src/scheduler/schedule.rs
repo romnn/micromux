@@ -138,9 +138,10 @@ fn start_service_if_ready(
 
     runtime.start_requested = false;
     runtime.clear_logs_on_start = false;
-    // Once the new run is current, a previous run's still-draining output would be dropped as
-    // stale anyway, so cancel those readers now instead of letting a descendant that keeps the
-    // PTY slave open pin them (and their handles) indefinitely.
+    // A still-draining reader only feeds the finished run's retained log from here on. That tail
+    // is worth capturing until the replacement run begins, but not worth pinning a reader thread
+    // and its fds for as long as some descendant keeps the PTY slave open — so the new run's start
+    // caps the drain.
     for (_, log_reader) in &mut runtime.draining_log_readers {
         log_reader.cancel();
     }
@@ -155,10 +156,16 @@ fn start_service_if_ready(
 
     let run_id = runtime.allocate_run_id();
     let terminate = CancellationToken::new();
+    ctx.writer.begin_run(service_id, run_id.get());
+    if clear_logs {
+        ctx.writer.clear_logs(service_id);
+    }
+    let sink = ctx.writer.run_sink(service_id, run_id.get());
 
     match pty::start_service_with_pty_size(
         service,
         run_id,
+        sink,
         ctx.events_tx,
         ctx.shutdown,
         &terminate,
@@ -173,12 +180,6 @@ fn start_service_if_ready(
                 since: tokio::time::Instant::now(),
             });
             sync_model(ctx.writer, service, runtime);
-            // Model: clear on restart, and always reset the live-snapshot target so the new run's
-            // first frame appends rather than replacing the previous run's final frame.
-            ctx.writer.begin_run(service_id, run_id.get());
-            if clear_logs {
-                ctx.writer.clear_logs(service_id);
-            }
             #[cfg(test)]
             {
                 if clear_logs {
@@ -225,35 +226,15 @@ mod tests {
         config::{Dependency, DependencyCondition},
         model::SessionModelWriter,
         service::Service,
+        test_util::{service_config, spanned_string},
     };
     use std::collections::HashMap;
     use std::path::Path;
     use tokio::sync::mpsc;
     use yaml_spanned::Spanned;
 
-    fn spanned_string(value: &str) -> Spanned<String> {
-        Spanned {
-            span: yaml_spanned::spanned::Span::default(),
-            inner: value.to_string(),
-        }
-    }
-
     fn test_service(id: &str) -> color_eyre::Result<Service> {
-        let cfg = crate::config::Service {
-            name: spanned_string(id),
-            startup_mode: crate::service::StartupMode::Enabled,
-            command: (spanned_string("true"), Vec::new()),
-            working_dir: None,
-            env_file: Vec::new(),
-            environment: indexmap::IndexMap::new(),
-            depends_on: Vec::new(),
-            healthcheck: None,
-            ports: Vec::new(),
-            restart: None,
-            restart_policy: crate::service::RestartPolicy::Never,
-            color: None,
-            log_retention: crate::LogRetention::default(),
-        };
+        let cfg = service_config(id, ("true", &[]));
         Service::new(id, Path::new("."), cfg)
     }
 

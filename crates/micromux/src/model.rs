@@ -1,10 +1,11 @@
 //! The authoritative session model.
 //!
-//! The scheduler owns the lifecycle truth; this module materializes it as a queryable model that
-//! every frontend (the TUI, the control socket, the MCP server) reads from. There is exactly one
-//! source of truth: the scheduler *writes* it through a possession-scoped [`SessionModelWriter`],
-//! and adapters *read* it through a cloneable [`SessionModelReader`]. The lack of a write method on
-//! the reader is the security boundary — an adapter that only holds a reader can observe but never
+//! The scheduler owns lifecycle truth; this module materializes it as a queryable model that every
+//! frontend (the TUI, the control socket, the MCP server) reads from. There is exactly one source
+//! of truth: the scheduler writes lifecycle state through a possession-scoped
+//! [`SessionModelWriter`] and gives each live run a scoped [`RunSink`] for its data records, while
+//! adapters read through a cloneable [`SessionModelReader`]. The lack of a write method on the
+//! reader is the security boundary — an adapter that only holds a reader can observe but never
 //! mutate, and the only path by which it can affect state is the narrow
 //! [`crate::ServiceControl`] command port, which the scheduler validates before writing anything.
 //!
@@ -351,6 +352,8 @@ use self::runlog::{
 struct ServiceEntry {
     snapshot: ServiceSnapshot,
     started_at: Option<Instant>,
+    /// Only this run may update the visible logs and health history; older runs retain logs only.
+    latest_begun_run: u64,
     visible: MemoryLogBuffer,
     runs: VecDeque<RunLogEntry>,
     next_log_seq: u64,
@@ -372,6 +375,7 @@ impl ServiceEntry {
         spool_dir: Option<&Path>,
         disk: Option<DiskLogWriter>,
     ) -> Self {
+        let latest_begun_run = snapshot.run_generation;
         let log_retention = LogRetention {
             disk: DiskLogRetention {
                 retained_runs: log_retention.disk.retained_runs.max(1),
@@ -381,6 +385,7 @@ impl ServiceEntry {
         Self {
             snapshot,
             started_at: None,
+            latest_begun_run,
             visible: MemoryLogBuffer::new(log_retention.memory),
             runs: VecDeque::new(),
             next_log_seq: 1,
@@ -427,6 +432,7 @@ impl ServiceEntry {
     }
 
     fn begin_run(&mut self, run_generation: u64) {
+        self.latest_begun_run = run_generation;
         if let Some(run) = self.ensure_run(run_generation) {
             run.live_snapshot_id = None;
         }
@@ -446,6 +452,18 @@ impl ServiceEntry {
     }
 
     fn append_log(&mut self, run_generation: u64, update: LogUpdateKind, line: String) {
+        // A late record from a run the retention ring already evicted must not resurrect it:
+        // `ensure_run` would re-add the old generation *behind* newer runs and the ring would
+        // evict a newer run in its place. Late records are only kept while their run's entry
+        // still exists.
+        if run_generation != self.latest_begun_run
+            && !self
+                .runs
+                .iter()
+                .any(|run| run.run_generation == run_generation)
+        {
+            return;
+        }
         let mut next_seq = self.next_log_seq;
         let disk = self.disk.clone();
         let timestamp_unix_ms = unix_timestamp_ms();
@@ -501,9 +519,11 @@ impl ServiceEntry {
         };
         self.next_log_seq = next_seq;
 
-        match op {
-            DiskLogOp::Append => self.visible.append(line),
-            DiskLogOp::ReplaceLast => self.visible.replace_last(line),
+        if run_generation == self.latest_begun_run {
+            match op {
+                DiskLogOp::Append => self.visible.append(line),
+                DiskLogOp::ReplaceLast => self.visible.replace_last(line),
+            }
         }
     }
 
@@ -803,7 +823,118 @@ pub(crate) struct SessionModelWriter {
     inner: Arc<Inner>,
 }
 
+/// Write capability for one service run's logs and healthcheck records.
+///
+/// The scheduler mints this capability for the run's PTY reader and healthcheck tasks. It never
+/// reaches adapters, and its embedded run identity lets the model keep late records in the
+/// retained run without exposing them as current data.
+#[derive(Clone)]
+pub(crate) struct RunSink {
+    inner: Arc<Inner>,
+    service_id: ServiceID,
+    run_generation: u64,
+}
+
+impl RunSink {
+    pub(crate) fn append_log(&self, stream: OutputStream, update: LogUpdateKind, line: String) {
+        let line = match stream {
+            OutputStream::Stdout | OutputStream::Unknown => line,
+            OutputStream::Stderr => format!("[stderr] {line}"),
+        };
+        {
+            let mut guard = self.inner.services.write();
+            let Some(entry) = guard.get_mut(&self.service_id) else {
+                return;
+            };
+            entry.append_log(self.run_generation, update, line);
+        }
+        self.inner.publish(&self.service_id, ChangeKind::Logs);
+    }
+
+    pub(crate) fn start_health_attempt(&self, attempt: u64, command: String) {
+        {
+            let mut guard = self.inner.services.write();
+            let Some(entry) = guard.get_mut(&self.service_id) else {
+                return;
+            };
+            if entry.latest_begun_run != self.run_generation {
+                return;
+            }
+            while entry.health.len() >= HEALTH_HISTORY {
+                entry.health.pop_front();
+            }
+            entry.health.push_back(HealthAttempt {
+                run_generation: self.run_generation,
+                attempt,
+                command,
+                output: Vec::new(),
+                result: None,
+            });
+        }
+        self.inner.publish(&self.service_id, ChangeKind::Health);
+    }
+
+    pub(crate) fn append_health_line(&self, attempt: u64, stream: OutputStream, line: String) {
+        {
+            let mut guard = self.inner.services.write();
+            let Some(entry) = guard.get_mut(&self.service_id) else {
+                return;
+            };
+            if entry.latest_begun_run != self.run_generation {
+                return;
+            }
+            let Some(attempt_entry) = entry.health.iter_mut().find(|entry| {
+                entry.run_generation == self.run_generation && entry.attempt == attempt
+            }) else {
+                return;
+            };
+            while attempt_entry.output.len() >= HEALTH_OUTPUT_MAX_LINES {
+                attempt_entry.output.remove(0);
+            }
+            attempt_entry.output.push(HealthLine { stream, line });
+        }
+        self.inner.publish(&self.service_id, ChangeKind::Health);
+    }
+
+    pub(crate) fn finish_health_attempt(
+        &self,
+        attempt: u64,
+        success: bool,
+        exit_code: i32,
+        cancelled: bool,
+    ) {
+        {
+            let mut guard = self.inner.services.write();
+            let Some(entry) = guard.get_mut(&self.service_id) else {
+                return;
+            };
+            if entry.latest_begun_run != self.run_generation {
+                return;
+            }
+            let Some(attempt_entry) = entry.health.iter_mut().find(|entry| {
+                entry.run_generation == self.run_generation && entry.attempt == attempt
+            }) else {
+                return;
+            };
+            attempt_entry.result = Some(HealthResult {
+                success,
+                exit_code,
+                cancelled,
+            });
+        }
+        self.inner.publish(&self.service_id, ChangeKind::Health);
+    }
+}
+
 impl SessionModelWriter {
+    pub(crate) fn run_sink(&self, service_id: &ServiceID, run_generation: u64) -> RunSink {
+        RunSink {
+            inner: self.inner.clone(),
+            service_id: service_id.clone(),
+            run_generation,
+        }
+    }
+
     /// Publish a status snapshot for a service. `started_at` is `Some` while a run is live so the
     /// reader can refresh `uptime`.
     pub(crate) fn write_snapshot(&self, snapshot: ServiceSnapshot, started_at: Option<Instant>) {
@@ -822,6 +953,7 @@ impl SessionModelWriter {
     }
 
     /// Append a log line using the scheduler's logical line-update semantics.
+    #[cfg(test)]
     pub(crate) fn append_log(
         &self,
         id: &ServiceID,
@@ -830,18 +962,8 @@ impl SessionModelWriter {
         update: LogUpdateKind,
         line: String,
     ) {
-        let line = match stream {
-            OutputStream::Stdout | OutputStream::Unknown => line,
-            OutputStream::Stderr => format!("[stderr] {line}"),
-        };
-        {
-            let mut guard = self.inner.services.write();
-            let Some(entry) = guard.get_mut(id) else {
-                return;
-            };
-            entry.append_log(run_generation, update, line);
-        }
-        self.inner.publish(id, ChangeKind::Logs);
+        self.run_sink(id, run_generation)
+            .append_log(stream, update, line);
     }
 
     /// Hide older retained logs from the default visible log stream (e.g. on manual restart).
@@ -881,6 +1003,7 @@ impl SessionModelWriter {
     }
 
     /// Begin a new healthcheck attempt, evicting the oldest beyond the retained history.
+    #[cfg(test)]
     pub(crate) fn start_health_attempt(
         &self,
         id: &ServiceID,
@@ -888,26 +1011,12 @@ impl SessionModelWriter {
         attempt: u64,
         command: String,
     ) {
-        {
-            let mut guard = self.inner.services.write();
-            let Some(entry) = guard.get_mut(id) else {
-                return;
-            };
-            while entry.health.len() >= HEALTH_HISTORY {
-                entry.health.pop_front();
-            }
-            entry.health.push_back(HealthAttempt {
-                run_generation,
-                attempt,
-                command,
-                output: Vec::new(),
-                result: None,
-            });
-        }
-        self.inner.publish(id, ChangeKind::Health);
+        self.run_sink(id, run_generation)
+            .start_health_attempt(attempt, command);
     }
 
     /// Append output to an in-progress healthcheck attempt.
+    #[cfg(test)]
     pub(crate) fn append_health_line(
         &self,
         id: &ServiceID,
@@ -916,27 +1025,12 @@ impl SessionModelWriter {
         stream: OutputStream,
         line: String,
     ) {
-        {
-            let mut guard = self.inner.services.write();
-            let Some(entry) = guard.get_mut(id) else {
-                return;
-            };
-            let Some(attempt_entry) = entry
-                .health
-                .iter_mut()
-                .find(|a| a.run_generation == run_generation && a.attempt == attempt)
-            else {
-                return;
-            };
-            while attempt_entry.output.len() >= HEALTH_OUTPUT_MAX_LINES {
-                attempt_entry.output.remove(0);
-            }
-            attempt_entry.output.push(HealthLine { stream, line });
-        }
-        self.inner.publish(id, ChangeKind::Health);
+        self.run_sink(id, run_generation)
+            .append_health_line(attempt, stream, line);
     }
 
     /// Record the result of a finished healthcheck attempt.
+    #[cfg(test)]
     pub(crate) fn finish_health_attempt(
         &self,
         id: &ServiceID,
@@ -946,25 +1040,8 @@ impl SessionModelWriter {
         exit_code: i32,
         cancelled: bool,
     ) {
-        {
-            let mut guard = self.inner.services.write();
-            let Some(entry) = guard.get_mut(id) else {
-                return;
-            };
-            let Some(attempt_entry) = entry
-                .health
-                .iter_mut()
-                .find(|a| a.run_generation == run_generation && a.attempt == attempt)
-            else {
-                return;
-            };
-            attempt_entry.result = Some(HealthResult {
-                success,
-                exit_code,
-                cancelled,
-            });
-        }
-        self.inner.publish(id, ChangeKind::Health);
+        self.run_sink(id, run_generation)
+            .finish_health_attempt(attempt, success, exit_code, cancelled);
     }
 }
 
@@ -1020,24 +1097,9 @@ pub(crate) fn new(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_util::{initial_model_entry as entry, initial_snapshot as snapshot};
     use serde_json::json;
     use similar_asserts::assert_eq;
-
-    fn snapshot(id: &str) -> ServiceSnapshot {
-        ServiceSnapshot::initial(
-            id.to_string(),
-            id.to_string(),
-            Vec::new(),
-            false,
-            RestartPolicy::Never,
-            Vec::new(),
-            None,
-        )
-    }
-
-    fn entry(id: &str) -> (ServiceSnapshot, LogRetention) {
-        (snapshot(id), LogRetention::default())
-    }
 
     fn running_snapshot(id: &str) -> ServiceSnapshot {
         let mut snapshot = snapshot(id);
@@ -1152,6 +1214,7 @@ mod tests {
     fn append_assigns_monotonic_sequence_numbers() {
         let (reader, writer) = new([entry("svc")]);
         let id = "svc".to_string();
+        writer.begin_run(&id, 1);
         writer.append_log(
             &id,
             1,
@@ -1179,6 +1242,7 @@ mod tests {
     fn stderr_lines_are_prefixed_like_the_model() {
         let (reader, writer) = new([entry("svc")]);
         let id = "svc".to_string();
+        writer.begin_run(&id, 1);
         writer.append_log(
             &id,
             1,
@@ -1204,6 +1268,7 @@ mod tests {
         };
         let (reader, writer) = new([(snapshot("svc"), retention)]);
         let id = "svc".to_string();
+        writer.begin_run(&id, 1);
         for line in ["a", "b", "c"] {
             writer.append_log(
                 &id,
@@ -1237,6 +1302,7 @@ mod tests {
     fn live_snapshot_replaces_same_id_and_appends_new_id() {
         let (reader, writer) = new([entry("svc")]);
         let id = "svc".to_string();
+        writer.begin_run(&id, 1);
         writer.append_log(
             &id,
             1,
@@ -1269,6 +1335,7 @@ mod tests {
     fn logs_since_returns_incremental_lines_and_retention_marker() {
         let (reader, writer) = new([entry("svc")]);
         let id = "svc".to_string();
+        writer.begin_run(&id, 1);
         writer.append_log(
             &id,
             1,
@@ -1358,6 +1425,7 @@ mod tests {
     fn tail_limits_returned_lines() {
         let (reader, writer) = new([entry("svc")]);
         let id = "svc".to_string();
+        writer.begin_run(&id, 1);
         for i in 0..5 {
             writer.append_log(
                 &id,
@@ -1419,6 +1487,92 @@ mod tests {
             .map(|l| l.line)
             .collect();
         assert_eq!(run_one, vec!["run one".to_string()]);
+    }
+
+    #[test]
+    fn late_log_is_retained_with_its_run_but_not_visible() -> color_eyre::Result<()> {
+        let (reader, writer) =
+            new_with_retention([entry("svc")], Some(unique_spool_dir("late-run-log")), None);
+        let id = "svc".to_string();
+
+        writer.begin_run(&id, 1);
+        let first_run = writer.run_sink(&id, 1);
+        first_run.append_log(
+            OutputStream::Stdout,
+            LogUpdateKind::Append,
+            "before restart".to_string(),
+        );
+        writer.begin_run(&id, 2);
+        writer.append_log(
+            &id,
+            2,
+            OutputStream::Stdout,
+            LogUpdateKind::Append,
+            "current run".to_string(),
+        );
+
+        first_run.append_log(
+            OutputStream::Stdout,
+            LogUpdateKind::Append,
+            "late first run".to_string(),
+        );
+
+        let visible = reader
+            .logs(&id, None)
+            .into_iter()
+            .map(|line| line.line)
+            .collect::<Vec<_>>();
+        assert_eq!(visible, vec!["before restart", "current run"]);
+        let retained = reader
+            .run_log(&id, 1, None)
+            .ok_or_else(|| color_eyre::eyre::eyre!("missing retained first run"))?
+            .lines
+            .into_iter()
+            .map(|line| line.line)
+            .collect::<Vec<_>>();
+        assert_eq!(retained, vec!["before restart", "late first run"]);
+        Ok(())
+    }
+
+    #[test]
+    fn late_log_for_evicted_run_is_dropped_instead_of_resurrecting_it() {
+        let retention = LogRetention {
+            disk: DiskLogRetention { retained_runs: 2 },
+            ..LogRetention::default()
+        };
+        let (reader, writer) = new_with_retention(
+            [(snapshot("svc"), retention)],
+            Some(unique_spool_dir("evicted-late-log")),
+            None,
+        );
+        let id = "svc".to_string();
+
+        writer.begin_run(&id, 1);
+        let first_run = writer.run_sink(&id, 1);
+        for run in 1..=3 {
+            writer.begin_run(&id, run);
+            writer.append_log(
+                &id,
+                run,
+                OutputStream::Stdout,
+                LogUpdateKind::Append,
+                format!("run {run}"),
+            );
+        }
+
+        first_run.append_log(
+            OutputStream::Stdout,
+            LogUpdateKind::Append,
+            "late line from evicted run".to_string(),
+        );
+
+        let runs: Vec<u64> = reader
+            .log_runs(&id)
+            .into_iter()
+            .map(|run| run.run_generation)
+            .collect();
+        assert_eq!(runs, vec![2, 3]);
+        assert!(reader.run_log(&id, 1, None).is_none());
     }
 
     #[test]
@@ -1958,6 +2112,7 @@ mod tests {
         let (reader, writer) = new([entry("svc")]);
         let id = "svc".to_string();
         writer.write_snapshot(running_snapshot(&id), Some(Instant::now()));
+        writer.begin_run(&id, 1);
         for attempt in 1..=(HEALTH_HISTORY as u64 + 2) {
             writer.start_health_attempt(&id, 1, attempt, format!("probe {attempt}"));
             writer.finish_health_attempt(&id, 1, attempt, true, 0, false);
@@ -1996,6 +2151,7 @@ mod tests {
         let id = "svc".to_string();
 
         writer.write_snapshot(running_snapshot(&id), Some(Instant::now()));
+        writer.begin_run(&id, 1);
         writer.start_health_attempt(&id, 1, 1, "probe".to_string());
         writer.finish_health_attempt(&id, 1, 1, true, 0, false);
         assert!(reader.latest_health(&id).is_some());
@@ -2022,6 +2178,7 @@ mod tests {
         let id = "svc".to_string();
 
         writer.write_snapshot(running_snapshot(&id), Some(Instant::now()));
+        writer.begin_run(&id, 1);
         writer.start_health_attempt(&id, 1, 1, "probe stale".to_string());
         writer.finish_health_attempt(&id, 1, 1, true, 0, false);
         assert!(reader.latest_health(&id).is_some());
@@ -2035,13 +2192,14 @@ mod tests {
     }
 
     #[test]
-    fn latest_health_finds_current_attempt_even_if_history_contains_other_generations() {
+    fn stale_health_attempt_is_ignored_after_new_run_begins() {
         let (reader, writer) = new([entry("svc")]);
         let id = "svc".to_string();
 
         let mut current = running_snapshot(&id);
         current.run_generation = 2;
         writer.write_snapshot(current, Some(Instant::now()));
+        writer.begin_run(&id, 2);
         writer.start_health_attempt(&id, 2, 1, "probe current".to_string());
         writer.finish_health_attempt(&id, 2, 1, true, 0, false);
         writer.start_health_attempt(&id, 1, 2, "probe old".to_string());
@@ -2052,6 +2210,7 @@ mod tests {
         };
         assert_eq!(attempt.run_generation, 2);
         assert_eq!(attempt.command, "probe current");
+        assert_eq!(reader.healthchecks(&id).len(), 1);
     }
 
     #[test]
@@ -2062,6 +2221,7 @@ mod tests {
         let mut current = running_snapshot(&id);
         current.run_generation = 2;
         writer.write_snapshot(current, Some(Instant::now()));
+        writer.begin_run(&id, 2);
         writer.start_health_attempt(&id, 2, 1, "probe current".to_string());
         writer.start_health_attempt(&id, 1, 1, "probe stale".to_string());
 

@@ -889,24 +889,12 @@ impl SchedulerRuntime {
                 return false;
             };
             let current_run_id = runtime.current_run_id();
-            let model_only_for_last_run = current_run_id.is_none()
-                && runtime.last_run_id == Some(event.run_id())
-                && matches!(
-                    event,
-                    ProcessEvent::LogLine { .. }
-                        | ProcessEvent::HealthCheckStarted { .. }
-                        | ProcessEvent::HealthCheckLogLine { .. }
-                        | ProcessEvent::HealthCheckFinished { .. }
-                );
             let log_reader_finished = matches!(event, ProcessEvent::LogReaderFinished { .. })
                 && runtime
                     .draining_log_readers
                     .iter()
                     .any(|(run_id, _)| *run_id == event.run_id());
-            if current_run_id != Some(event.run_id())
-                && !model_only_for_last_run
-                && !log_reader_finished
-            {
+            if current_run_id != Some(event.run_id()) && !log_reader_finished {
                 tracing::debug!(
                     service_id,
                     event_run_id = ?event.run_id(),
@@ -920,17 +908,7 @@ impl SchedulerRuntime {
         #[cfg(test)]
         let test_event = event.to_test_event();
 
-        self.write_event_to_model(&service_id, event);
-
         match &event {
-            ProcessEvent::LogLine { .. }
-            | ProcessEvent::HealthCheckStarted { .. }
-            | ProcessEvent::HealthCheckLogLine { .. }
-            | ProcessEvent::HealthCheckFinished { .. } => {
-                #[cfg(test)]
-                self.test_events.forward(test_event);
-                false
-            }
             ProcessEvent::Healthy { .. } => {
                 if let Some(runtime) = self.services.get_mut(&service_id) {
                     runtime.mark_health(Health::Healthy);
@@ -977,72 +955,6 @@ impl SchedulerRuntime {
                 self.test_events.forward(test_event);
                 false
             }
-        }
-    }
-
-    fn write_event_to_model(&self, service_id: &ServiceID, event: &ProcessEvent) {
-        // Write the model from the scheduler's own task — lossless from the scheduler onward.
-        match event {
-            ProcessEvent::LogLine {
-                run_id,
-                stream,
-                update,
-                line,
-                ..
-            } => {
-                self.writer
-                    .append_log(service_id, run_id.get(), *stream, *update, line.clone());
-            }
-            ProcessEvent::HealthCheckStarted {
-                run_id,
-                attempt,
-                command,
-                ..
-            } => {
-                self.writer.start_health_attempt(
-                    service_id,
-                    run_id.get(),
-                    *attempt,
-                    command.clone(),
-                );
-            }
-            ProcessEvent::HealthCheckLogLine {
-                run_id,
-                attempt,
-                stream,
-                line,
-                ..
-            } => {
-                self.writer.append_health_line(
-                    service_id,
-                    run_id.get(),
-                    *attempt,
-                    *stream,
-                    line.clone(),
-                );
-            }
-            ProcessEvent::HealthCheckFinished {
-                run_id,
-                attempt,
-                success,
-                exit_code,
-                cancelled,
-                ..
-            } => {
-                self.writer.finish_health_attempt(
-                    service_id,
-                    run_id.get(),
-                    *attempt,
-                    *success,
-                    *exit_code,
-                    *cancelled,
-                );
-            }
-            ProcessEvent::Healthy { .. }
-            | ProcessEvent::Unhealthy { .. }
-            | ProcessEvent::Killed { .. }
-            | ProcessEvent::Exited { .. }
-            | ProcessEvent::LogReaderFinished { .. } => {}
         }
     }
 

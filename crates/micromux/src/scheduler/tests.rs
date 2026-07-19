@@ -1,11 +1,10 @@
 use super::*;
 use crate::config;
 use crate::service::Service;
+use crate::test_util::{service_config, spanned_string, unique_tmp_dir};
 use color_eyre::eyre;
-use indexmap::IndexMap;
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::path::Path;
 use tokio::time::{Duration, timeout};
 use yaml_spanned::Spanned;
 
@@ -39,22 +38,23 @@ async fn run_test_scheduler(
 struct Harness {
     reader: crate::model::SessionModelReader,
     control: ServiceControl,
+    commands: mpsc::Sender<Command>,
     shutdown: CancellationToken,
     handle: tokio::task::JoinHandle<eyre::Result<()>>,
 }
 
-fn spawn_harness(services: ServiceMap) -> Harness {
+fn spawn_harness(services: ServiceMap, reload_config: Option<ReloadConfig>) -> Harness {
     let (commands_tx, commands_rx) = mpsc::channel(64);
     let (events_tx, events_rx) = mpsc::channel(256);
     let (reader, writer) = crate::model::new(crate::initial_model_entries(&services));
-    let control = ServiceControl::new(commands_tx);
+    let control = ServiceControl::new(commands_tx.clone());
     let shutdown = CancellationToken::new();
     let handle = tokio::spawn({
         let shutdown = shutdown.clone();
         async move {
             scheduler(SchedulerInput {
                 services,
-                reload_config: None,
+                reload_config,
                 commands_rx,
                 events_rx,
                 events_tx,
@@ -68,39 +68,7 @@ fn spawn_harness(services: ServiceMap) -> Harness {
     Harness {
         reader,
         control,
-        shutdown,
-        handle,
-    }
-}
-
-fn spawn_harness_with_reload(services: ServiceMap, config_path: PathBuf) -> Harness {
-    let (commands_tx, commands_rx) = mpsc::channel(64);
-    let (events_tx, events_rx) = mpsc::channel(256);
-    let (reader, writer) = crate::model::new(crate::initial_model_entries(&services));
-    let control = ServiceControl::new(commands_tx);
-    let shutdown = CancellationToken::new();
-    let handle = tokio::spawn({
-        let shutdown = shutdown.clone();
-        async move {
-            scheduler(SchedulerInput {
-                services,
-                reload_config: Some(ReloadConfig {
-                    config_path,
-                    strict_override: None,
-                }),
-                commands_rx,
-                events_rx,
-                events_tx,
-                test_events_tx: None,
-                writer,
-                shutdown,
-            })
-            .await
-        }
-    });
-    Harness {
-        reader,
-        control,
+        commands: commands_tx,
         shutdown,
         handle,
     }
@@ -151,6 +119,27 @@ async fn wait_for_log(
         }
         if tokio::time::Instant::now() >= deadline {
             eyre::bail!("timed out waiting for `{needle}` in `{id}` logs");
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+async fn wait_for_finished_health_attempt(
+    reader: &crate::model::SessionModelReader,
+    id: &str,
+) -> eyre::Result<crate::model::HealthAttempt> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(attempt) = reader
+            .healthchecks(id)
+            .into_iter()
+            .rev()
+            .find(|attempt| attempt.result.is_some())
+        {
+            return Ok(attempt);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            eyre::bail!("timed out waiting for a finished healthcheck on `{id}`");
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
@@ -260,7 +249,7 @@ async fn initially_disabled_service_stays_stopped_until_enabled() -> eyre::Resul
         "svc".to_string(),
         Service::new("svc", Path::new("."), config)?,
     );
-    let harness = spawn_harness(services);
+    let harness = spawn_harness(services, None);
     let id = "svc".to_string();
 
     let snapshot = harness
@@ -302,7 +291,7 @@ async fn service_control_latches_generation_and_rejects_restart_when_disabled() 
             service_config("svc", ("sh", &["-c", "sleep 60"])),
         )?,
     );
-    let harness = spawn_harness(services);
+    let harness = spawn_harness(services, None);
     let id = "svc".to_string();
 
     let snapshot = wait_until(&harness.reader, "svc", |s| {
@@ -352,7 +341,7 @@ async fn commands_do_not_depend_on_event_subscribers() -> eyre::Result<()> {
             service_config("svc", ("sh", &["-c", "sleep 60"])),
         )?,
     );
-    let harness = spawn_harness(services);
+    let harness = spawn_harness(services, None);
     let id = "svc".to_string();
 
     wait_until(&harness.reader, "svc", |s| {
@@ -451,7 +440,13 @@ async fn restart_reloads_latest_service_config_before_spawning() -> eyre::Result
     let config_path = dir.path().join("micromux.yaml");
     fs::write(&config_path, reload_test_yaml("old-config"))?;
     let services = services_from_config_path(&config_path)?;
-    let harness = spawn_harness_with_reload(services, config_path.clone());
+    let harness = spawn_harness(
+        services,
+        Some(ReloadConfig {
+            config_path: config_path.clone(),
+            strict_override: None,
+        }),
+    );
     let id = "svc".to_string();
 
     wait_for_log(&harness.reader, "svc", "old-config").await?;
@@ -480,7 +475,13 @@ async fn restart_rejects_invalid_reloaded_config_without_killing_current_run() -
     let config_path = dir.path().join("micromux.yaml");
     fs::write(&config_path, reload_test_yaml("still-running"))?;
     let services = services_from_config_path(&config_path)?;
-    let harness = spawn_harness_with_reload(services, config_path.clone());
+    let harness = spawn_harness(
+        services,
+        Some(ReloadConfig {
+            config_path: config_path.clone(),
+            strict_override: None,
+        }),
+    );
     let id = "svc".to_string();
 
     wait_for_log(&harness.reader, "svc", "still-running").await?;
@@ -524,7 +525,13 @@ async fn automatic_restart_reloads_latest_service_config_before_spawning() -> ey
         auto_reload_test_yaml("echo old-auto; sleep 1; exit 1")?,
     )?;
     let services = services_from_config_path(&config_path)?;
-    let harness = spawn_harness_with_reload(services, config_path.clone());
+    let harness = spawn_harness(
+        services,
+        Some(ReloadConfig {
+            config_path: config_path.clone(),
+            strict_override: None,
+        }),
+    );
 
     wait_for_log(&harness.reader, "svc", "old-auto").await?;
     fs::write(
@@ -552,7 +559,13 @@ async fn reload_does_not_rewrite_snapshot_for_unrestarted_run() -> eyre::Result<
         reload_two_service_yaml("echo old-b; sleep 60", 3000)?,
     )?;
     let services = services_from_config_path(&config_path)?;
-    let harness = spawn_harness_with_reload(services, config_path.clone());
+    let harness = spawn_harness(
+        services,
+        Some(ReloadConfig {
+            config_path: config_path.clone(),
+            strict_override: None,
+        }),
+    );
     let a = "a".to_string();
     let b = "b".to_string();
 
@@ -609,46 +622,6 @@ async fn reload_does_not_rewrite_snapshot_for_unrestarted_run() -> eyre::Result<
     harness.shutdown.cancel();
     harness.handle.await??;
     Ok(())
-}
-
-fn spanned_string(value: &str) -> Spanned<String> {
-    Spanned {
-        span: yaml_spanned::spanned::Span::default(),
-        inner: value.to_string(),
-    }
-}
-
-fn service_config(name: &str, command: (&str, &[&str])) -> config::Service {
-    config::Service {
-        name: spanned_string(name),
-        startup_mode: StartupMode::Enabled,
-        command: (
-            spanned_string(command.0),
-            command
-                .1
-                .iter()
-                .map(|v| spanned_string(v))
-                .collect::<Vec<_>>(),
-        ),
-        working_dir: None,
-        env_file: vec![],
-        environment: IndexMap::new(),
-        depends_on: vec![],
-        healthcheck: None,
-        ports: vec![],
-        restart: None,
-        restart_policy: crate::service::RestartPolicy::Never,
-        color: None,
-        log_retention: crate::LogRetention::default(),
-    }
-}
-
-fn unique_tmp_dir(prefix: &str) -> std::path::PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    std::env::temp_dir().join(format!("micromux-{prefix}-{nanos}"))
 }
 
 async fn recv_event(mut rx: mpsc::Receiver<Event>) -> eyre::Result<(Event, mpsc::Receiver<Event>)> {
@@ -712,40 +685,13 @@ async fn healthcheck_inherits_environment() -> eyre::Result<()> {
 
     let mut services: ServiceMap = ServiceMap::new();
     services.insert("svc".to_string(), Service::new("svc", config_dir, cfg)?);
+    let harness = spawn_harness(services, None);
 
-    let shutdown = CancellationToken::new();
-    let (test_events_tx, mut test_events_rx) = mpsc::channel(128);
-    let (events_tx, events_rx) = mpsc::channel(128);
-    let (_commands_tx, commands_rx) = mpsc::channel(128);
+    let attempt = wait_for_finished_health_attempt(&harness.reader, "svc").await?;
+    assert_eq!(attempt.result.map(|result| result.success), Some(true));
 
-    let handle = tokio::spawn({
-        let shutdown = shutdown.clone();
-        async move {
-            run_test_scheduler(
-                &services,
-                commands_rx,
-                events_rx,
-                events_tx,
-                test_events_tx,
-                shutdown,
-            )
-            .await
-        }
-    });
-
-    let mut saw_hc_success = false;
-    for _ in 0..200 {
-        let (event, next_rx) = recv_event(test_events_rx).await?;
-        test_events_rx = next_rx;
-        if let Event::HealthCheckFinished { success: true, .. } = event {
-            saw_hc_success = true;
-            break;
-        }
-    }
-
-    shutdown.cancel();
-    handle.await??;
-    assert!(saw_hc_success);
+    harness.shutdown.cancel();
+    harness.handle.await??;
     Ok(())
 }
 
@@ -779,40 +725,13 @@ async fn healthcheck_inherits_working_dir() -> eyre::Result<()> {
 
     let mut services: ServiceMap = ServiceMap::new();
     services.insert("svc".to_string(), Service::new("svc", &dir, cfg)?);
+    let harness = spawn_harness(services, None);
 
-    let shutdown = CancellationToken::new();
-    let (test_events_tx, mut test_events_rx) = mpsc::channel(128);
-    let (events_tx, events_rx) = mpsc::channel(128);
-    let (_commands_tx, commands_rx) = mpsc::channel(128);
+    let attempt = wait_for_finished_health_attempt(&harness.reader, "svc").await?;
+    assert_eq!(attempt.result.map(|result| result.success), Some(true));
 
-    let handle = tokio::spawn({
-        let shutdown = shutdown.clone();
-        async move {
-            run_test_scheduler(
-                &services,
-                commands_rx,
-                events_rx,
-                events_tx,
-                test_events_tx,
-                shutdown,
-            )
-            .await
-        }
-    });
-
-    let mut saw_hc_success = false;
-    for _ in 0..200 {
-        let (event, next_rx) = recv_event(test_events_rx).await?;
-        test_events_rx = next_rx;
-        if let Event::HealthCheckFinished { success: true, .. } = event {
-            saw_hc_success = true;
-            break;
-        }
-    }
-
-    shutdown.cancel();
-    handle.await??;
-    assert!(saw_hc_success);
+    harness.shutdown.cancel();
+    harness.handle.await??;
     Ok(())
 }
 
@@ -842,56 +761,23 @@ async fn healthcheck_spawn_error_emits_log_line() -> eyre::Result<()> {
 
     let mut services: ServiceMap = ServiceMap::new();
     services.insert("svc".to_string(), Service::new("svc", config_dir, cfg)?);
+    let harness = spawn_harness(services, None);
 
-    let shutdown = CancellationToken::new();
-    let (test_events_tx, mut test_events_rx) = mpsc::channel(128);
-    let (events_tx, events_rx) = mpsc::channel(128);
-    let (_commands_tx, commands_rx) = mpsc::channel(128);
+    let attempt = wait_for_finished_health_attempt(&harness.reader, "svc").await?;
+    assert!(
+        attempt
+            .output
+            .iter()
+            .any(|line| { line.stream == OutputStream::Stderr && !line.line.is_empty() })
+    );
+    assert!(
+        attempt.result.is_some_and(|result| {
+            !result.success && result.exit_code == -1 && !result.cancelled
+        })
+    );
 
-    let handle = tokio::spawn({
-        let shutdown = shutdown.clone();
-        async move {
-            run_test_scheduler(
-                &services,
-                commands_rx,
-                events_rx,
-                events_tx,
-                test_events_tx,
-                shutdown,
-            )
-            .await
-        }
-    });
-
-    let mut saw_log_line = false;
-    let mut saw_finished = false;
-    for _ in 0..200 {
-        let (event, next_rx) = recv_event(test_events_rx).await?;
-        test_events_rx = next_rx;
-        match event {
-            Event::HealthCheckLogLine { stream, line, .. }
-                if matches!(stream, OutputStream::Stderr) && !line.is_empty() =>
-            {
-                saw_log_line = true;
-            }
-            Event::HealthCheckFinished {
-                success: false,
-                exit_code: -1,
-                ..
-            } => {
-                saw_finished = true;
-                if saw_log_line {
-                    break;
-                }
-            }
-            _ => {}
-        }
-    }
-
-    shutdown.cancel();
-    handle.await??;
-    assert!(saw_log_line);
-    assert!(saw_finished);
+    harness.shutdown.cancel();
+    harness.handle.await??;
     Ok(())
 }
 
@@ -1158,67 +1044,24 @@ async fn stale_log_from_previous_run_is_ignored() -> eyre::Result<()> {
 
     let mut services: ServiceMap = ServiceMap::new();
     services.insert("svc".to_string(), Service::new("svc", &dir, cfg)?);
+    let harness = spawn_harness(services, None);
 
-    let shutdown = CancellationToken::new();
-    let (test_events_tx, mut test_events_rx) = mpsc::channel(256);
-    let (events_tx, events_rx) = mpsc::channel(256);
-    let (_commands_tx, commands_rx) = mpsc::channel(256);
+    wait_until(&harness.reader, "svc", |snapshot| {
+        snapshot.run_generation >= 2 && snapshot.execution == Execution::Running
+    })
+    .await?;
+    wait_for_log(&harness.reader, "svc", "second-run").await?;
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    assert!(
+        !harness
+            .reader
+            .logs("svc", None)
+            .iter()
+            .any(|line| { line.line.contains("stale-from-first-run") })
+    );
 
-    let handle = tokio::spawn({
-        let shutdown = shutdown.clone();
-        async move {
-            run_test_scheduler(
-                &services,
-                commands_rx,
-                events_rx,
-                events_tx,
-                test_events_tx,
-                shutdown,
-            )
-            .await
-        }
-    });
-
-    let mut starts = 0;
-    let mut saw_second_run = false;
-    for _ in 0..100 {
-        let event = timeout(Duration::from_secs(5), test_events_rx.recv())
-            .await
-            .map_err(|_| eyre::eyre!("timeout waiting for event"))?
-            .ok_or_else(|| eyre::eyre!("event channel closed"))?;
-        match event {
-            Event::Started { .. } => {
-                starts += 1;
-            }
-            Event::LogLine { line, .. } if line.contains("second-run") => {
-                saw_second_run = true;
-            }
-            Event::LogLine { line, .. } if line.contains("stale-from-first-run") => {
-                eyre::bail!("stale first-run output reached the UI");
-            }
-            _ => {}
-        }
-
-        if starts >= 2 && saw_second_run {
-            break;
-        }
-    }
-    assert!(starts >= 2);
-    assert!(saw_second_run);
-
-    let deadline = tokio::time::Instant::now() + Duration::from_millis(1200);
-    while tokio::time::Instant::now() < deadline {
-        match timeout(Duration::from_millis(100), test_events_rx.recv()).await {
-            Ok(Some(Event::LogLine { line, .. })) if line.contains("stale-from-first-run") => {
-                eyre::bail!("stale first-run output reached the UI");
-            }
-            Ok(Some(_)) | Err(_) => {}
-            Ok(None) => break,
-        }
-    }
-
-    shutdown.cancel();
-    handle.await??;
+    harness.shutdown.cancel();
+    harness.handle.await??;
     Ok(())
 }
 
@@ -1235,7 +1078,7 @@ async fn pty_append_records_are_lossless_under_load() -> eyre::Result<()> {
     };
     let mut services: ServiceMap = ServiceMap::new();
     services.insert("svc".to_string(), Service::new("svc", config_dir, cfg)?);
-    let harness = spawn_harness(services);
+    let harness = spawn_harness(services, None);
 
     wait_until(&harness.reader, "svc", |snapshot| {
         snapshot.execution == Execution::Exited
@@ -1415,69 +1258,30 @@ async fn enable_after_disable_does_not_clear_logs() -> eyre::Result<()> {
             service_config("svc", ("sh", &["-c", "echo first-run; sleep 60"])),
         )?,
     );
+    let harness = spawn_harness(services, None);
 
-    let shutdown = CancellationToken::new();
-    let (test_events_tx, test_events_rx) = mpsc::channel(128);
-    let (events_tx, events_rx) = mpsc::channel(128);
-    let (commands_tx, commands_rx) = mpsc::channel(128);
+    wait_for_log(&harness.reader, "svc", "first-run").await?;
+    accepted(harness.control.disable(&"svc".to_string()).await)?;
+    wait_until(&harness.reader, "svc", |snapshot| {
+        snapshot.desired == Desired::Disabled && snapshot.execution == Execution::Exited
+    })
+    .await?;
 
-    let handle = tokio::spawn({
-        let shutdown = shutdown.clone();
-        async move {
-            run_test_scheduler(
-                &services,
-                commands_rx,
-                events_rx,
-                events_tx,
-                test_events_tx,
-                shutdown,
-            )
-            .await
-        }
-    });
+    accepted(harness.control.enable(&"svc".to_string()).await)?;
+    wait_until(&harness.reader, "svc", |snapshot| {
+        snapshot.run_generation == 2 && snapshot.execution == Execution::Running
+    })
+    .await?;
+    assert!(
+        harness
+            .reader
+            .logs("svc", None)
+            .iter()
+            .any(|line| { line.line.contains("first-run") })
+    );
 
-    let mut test_events_rx = test_events_rx;
-    let mut saw_log = false;
-    for _ in 0..20 {
-        let (event, next_rx) = recv_event(test_events_rx).await?;
-        test_events_rx = next_rx;
-        if matches!(event, Event::LogLine { line, .. } if line.contains("first-run")) {
-            saw_log = true;
-            break;
-        }
-    }
-    assert!(saw_log);
-
-    commands_tx
-        .send(Command::disable("svc".to_string()))
-        .await?;
-    loop {
-        let (event, next_rx) = recv_event(test_events_rx).await?;
-        test_events_rx = next_rx;
-        if matches!(event, Event::Exited(_, _)) {
-            break;
-        }
-    }
-
-    commands_tx.send(Command::enable("svc".to_string())).await?;
-
-    let mut restarted = false;
-    for _ in 0..20 {
-        let (event, next_rx) = recv_event(test_events_rx).await?;
-        test_events_rx = next_rx;
-        match event {
-            Event::ClearLogs(_) => eyre::bail!("enable unexpectedly cleared logs"),
-            Event::Started { .. } => {
-                restarted = true;
-                break;
-            }
-            _ => {}
-        }
-    }
-
-    assert!(restarted);
-    shutdown.cancel();
-    handle.await??;
+    harness.shutdown.cancel();
+    harness.handle.await??;
     Ok(())
 }
 
@@ -1739,52 +1543,13 @@ async fn emits_log_lines() -> eyre::Result<()> {
             service_config("svc", ("sh", &["-c", "echo hello && echo err >&2"])),
         )?,
     );
+    let harness = spawn_harness(services, None);
 
-    let shutdown = CancellationToken::new();
-    let (test_events_tx, test_events_rx) = mpsc::channel(64);
-    let (events_tx, events_rx) = mpsc::channel(64);
-    let (_commands_tx, commands_rx) = mpsc::channel(64);
+    wait_for_log(&harness.reader, "svc", "hello").await?;
+    wait_for_log(&harness.reader, "svc", "err").await?;
 
-    let handle = tokio::spawn({
-        let shutdown = shutdown.clone();
-        async move {
-            run_test_scheduler(
-                &services,
-                commands_rx,
-                events_rx,
-                events_tx,
-                test_events_tx,
-                shutdown,
-            )
-            .await
-        }
-    });
-
-    let (_event, mut test_events_rx) = recv_event(test_events_rx).await?;
-
-    let mut saw_hello = false;
-    let mut saw_err = false;
-
-    for _ in 0..50 {
-        let (event, next_rx) = recv_event(test_events_rx).await?;
-        test_events_rx = next_rx;
-        match event {
-            Event::LogLine { line, .. } if line.contains("hello") => {
-                saw_hello = true;
-            }
-            Event::LogLine { line, .. } if line.contains("err") => {
-                saw_err = true;
-            }
-            Event::Exited(_, _) if saw_hello && saw_err => break,
-            _ => {}
-        }
-    }
-
-    assert!(saw_hello);
-    assert!(saw_err);
-
-    shutdown.cancel();
-    handle.await??;
+    harness.shutdown.cancel();
+    harness.handle.await??;
     Ok(())
 }
 
@@ -1802,47 +1567,20 @@ async fn non_alt_screen_control_sequences_keep_raw_log_records() -> eyre::Result
             service_config("svc", ("sh", &["-c", &command])),
         )?,
     );
+    let harness = spawn_harness(services, None);
 
-    let shutdown = CancellationToken::new();
-    let (test_events_tx, test_events_rx) = mpsc::channel(64);
-    let (events_tx, events_rx) = mpsc::channel(64);
-    let (_commands_tx, commands_rx) = mpsc::channel(64);
+    wait_for_log(&harness.reader, "svc", "connecting to qdrant").await?;
+    let line = harness
+        .reader
+        .logs("svc", None)
+        .into_iter()
+        .find(|line| line.line.contains("connecting to qdrant"))
+        .ok_or_else(|| eyre::eyre!("missing structured log record"))?;
+    assert_eq!(line.line, json);
+    assert_eq!(line.line.find('\n'), None);
 
-    let handle = tokio::spawn({
-        let shutdown = shutdown.clone();
-        async move {
-            run_test_scheduler(
-                &services,
-                commands_rx,
-                events_rx,
-                events_tx,
-                test_events_tx,
-                shutdown,
-            )
-            .await
-        }
-    });
-
-    let (_event, mut test_events_rx) = recv_event(test_events_rx).await?;
-
-    let mut saw_json = false;
-    for _ in 0..50 {
-        let (event, next_rx) = recv_event(test_events_rx).await?;
-        test_events_rx = next_rx;
-        match event {
-            Event::LogLine { line, .. } if line.contains("connecting to qdrant") => {
-                assert_eq!(line, json);
-                assert_eq!(line.find('\n'), None);
-                saw_json = true;
-            }
-            Event::Exited(_, _) if saw_json => break,
-            _ => {}
-        }
-    }
-
-    assert!(saw_json);
-    shutdown.cancel();
-    handle.await??;
+    harness.shutdown.cancel();
+    harness.handle.await??;
     Ok(())
 }
 
@@ -1864,45 +1602,19 @@ async fn child_sees_tty() -> eyre::Result<()> {
             ),
         )?,
     );
+    let harness = spawn_harness(services, None);
 
-    let shutdown = CancellationToken::new();
-    let (test_events_tx, test_events_rx) = mpsc::channel(64);
-    let (events_tx, events_rx) = mpsc::channel(64);
-    let (_commands_tx, commands_rx) = mpsc::channel(64);
+    wait_for_log(&harness.reader, "svc", "tty").await?;
+    assert!(
+        harness
+            .reader
+            .logs("svc", None)
+            .iter()
+            .any(|line| { line.line == "tty" })
+    );
 
-    let handle = tokio::spawn({
-        let shutdown = shutdown.clone();
-        async move {
-            run_test_scheduler(
-                &services,
-                commands_rx,
-                events_rx,
-                events_tx,
-                test_events_tx,
-                shutdown,
-            )
-            .await
-        }
-    });
-
-    let (_event, mut test_events_rx) = recv_event(test_events_rx).await?;
-
-    let mut saw_tty = false;
-    for _ in 0..20 {
-        let (event, next_rx) = recv_event(test_events_rx).await?;
-        test_events_rx = next_rx;
-        match event {
-            Event::LogLine { line, .. } if line.contains("tty") => {
-                saw_tty = true;
-            }
-            Event::Exited(_, _) if saw_tty => break,
-            _ => {}
-        }
-    }
-
-    assert!(saw_tty);
-    shutdown.cancel();
-    handle.await??;
+    harness.shutdown.cancel();
+    harness.handle.await??;
     Ok(())
 }
 
@@ -1918,49 +1630,20 @@ async fn send_input_reaches_process() -> eyre::Result<()> {
             service_config("svc", ("sh", &["-c", "read line; echo got:$line"])),
         )?,
     );
+    let harness = spawn_harness(services, None);
 
-    let shutdown = CancellationToken::new();
-    let (test_events_tx, test_events_rx) = mpsc::channel(64);
-    let (events_tx, events_rx) = mpsc::channel(64);
-    let (commands_tx, commands_rx) = mpsc::channel(64);
-
-    let handle = tokio::spawn({
-        let shutdown = shutdown.clone();
-        async move {
-            run_test_scheduler(
-                &services,
-                commands_rx,
-                events_rx,
-                events_tx,
-                test_events_tx,
-                shutdown,
-            )
-            .await
-        }
-    });
-
-    let (_event, mut test_events_rx) = recv_event(test_events_rx).await?;
-
-    commands_tx
+    wait_until(&harness.reader, "svc", |snapshot| {
+        snapshot.execution == Execution::Running
+    })
+    .await?;
+    harness
+        .commands
         .send(Command::SendInput("svc".to_string(), b"hello\r".to_vec()))
         .await?;
+    wait_for_log(&harness.reader, "svc", "got:hello").await?;
 
-    let mut saw = false;
-    for _ in 0..30 {
-        let (event, next_rx) = recv_event(test_events_rx).await?;
-        test_events_rx = next_rx;
-        match event {
-            Event::LogLine { line, .. } if line.contains("got:hello") => {
-                saw = true;
-            }
-            Event::Exited(_, _) if saw => break,
-            _ => {}
-        }
-    }
-
-    assert!(saw);
-    shutdown.cancel();
-    handle.await??;
+    harness.shutdown.cancel();
+    harness.handle.await??;
     Ok(())
 }
 
@@ -2054,64 +1737,40 @@ async fn resize_all_changes_stty_size_for_new_service() -> eyre::Result<()> {
         }),
     }];
     services.insert("app".to_string(), Service::new("app", config_dir, app_cfg)?);
+    let harness = spawn_harness(services, None);
 
-    let shutdown = CancellationToken::new();
-    let (test_events_tx, test_events_rx) = mpsc::channel(256);
-    let (events_tx, events_rx) = mpsc::channel(256);
-    let (commands_tx, commands_rx) = mpsc::channel(256);
-
-    let handle = tokio::spawn({
-        let shutdown = shutdown.clone();
-        async move {
-            run_test_scheduler(
-                &services,
-                commands_rx,
-                events_rx,
-                events_tx,
-                test_events_tx,
-                shutdown,
-            )
-            .await
-        }
-    });
-
-    commands_tx
+    harness
+        .commands
         .send(Command::ResizeAll {
             cols: 100,
             rows: 40,
         })
         .await?;
+    wait_for_log(&harness.reader, "app", "40 100").await?;
+    harness
+        .commands
+        .send(Command::SendInput("app".to_string(), b"go\r".to_vec()))
+        .await?;
 
-    let (_event, mut test_events_rx) = recv_event(test_events_rx).await?;
-
-    let mut saw_first = false;
-    let mut saw_second = false;
-    for _ in 0..80 {
-        let (event, next_rx) = recv_event(test_events_rx).await?;
-        test_events_rx = next_rx;
-        match event {
-            Event::Started { service_id } if service_id == "app" => {}
-            Event::LogLine {
-                service_id, line, ..
-            } if service_id == "app" && line.trim() == "40 100" => {
-                if saw_first {
-                    saw_second = true;
-                    break;
-                }
-
-                saw_first = true;
-                commands_tx
-                    .send(Command::SendInput("app".to_string(), b"go\r".to_vec()))
-                    .await?;
-            }
-            _ => {}
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let count = harness
+            .reader
+            .logs("app", None)
+            .iter()
+            .filter(|line| line.line.trim() == "40 100")
+            .count();
+        if count >= 2 {
+            break;
         }
+        if tokio::time::Instant::now() >= deadline {
+            eyre::bail!("app did not report the resized PTY twice");
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
-    assert!(saw_first);
-    assert!(saw_second);
-    shutdown.cancel();
-    handle.await??;
+    harness.shutdown.cancel();
+    harness.handle.await??;
     Ok(())
 }
 
@@ -2129,53 +1788,18 @@ async fn working_dir_is_used_for_spawn() -> eyre::Result<()> {
 
     let mut services: ServiceMap = ServiceMap::new();
     services.insert("svc".to_string(), Service::new("svc", &config_dir, cfg)?);
-
-    let shutdown = CancellationToken::new();
-    let (test_events_tx, mut test_events_rx) = mpsc::channel(64);
-    let (events_tx, events_rx) = mpsc::channel(64);
-    let (_commands_tx, commands_rx) = mpsc::channel(64);
-
-    let handle = tokio::spawn({
-        let shutdown = shutdown.clone();
-        async move {
-            run_test_scheduler(
-                &services,
-                commands_rx,
-                events_rx,
-                events_tx,
-                test_events_tx,
-                shutdown,
-            )
-            .await
-        }
-    });
-
-    let mut saw_pwd = false;
+    let harness = spawn_harness(services, None);
     let expected = work_abs.canonicalize()?;
-
-    for _ in 0..50 {
-        let ev = timeout(Duration::from_secs(5), test_events_rx.recv())
-            .await
-            .map_err(|_| eyre::eyre!("timeout waiting for event"))?
-            .ok_or_else(|| eyre::eyre!("event channel closed"))?;
-        match ev {
-            Event::LogLine { line, .. } => {
-                if Path::new(&line) == expected {
-                    saw_pwd = true;
-                    break;
-                }
-            }
-            Event::Exited(_, _) if saw_pwd => break,
-            _ => {}
-        }
-    }
-
+    wait_for_log(&harness.reader, "svc", expected.to_string_lossy().as_ref()).await?;
     assert!(
-        saw_pwd,
-        "did not observe expected pwd output {}",
-        expected.display()
+        harness
+            .reader
+            .logs("svc", None)
+            .iter()
+            .any(|line| { Path::new(&line.line) == expected })
     );
-    shutdown.cancel();
-    handle.await??;
+
+    harness.shutdown.cancel();
+    harness.handle.await??;
     Ok(())
 }

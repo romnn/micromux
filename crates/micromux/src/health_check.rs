@@ -1,4 +1,7 @@
-use crate::scheduler::{OutputStream, ProcessEvent, RunId, ServiceID};
+use crate::{
+    model::RunSink,
+    scheduler::{OutputStream, ProcessEvent, RunId, ServiceID},
+};
 use itertools::Itertools;
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -41,6 +44,8 @@ const OUTPUT_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_mill
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use crate::model::SessionModelReader;
+    use crate::test_util::{initial_model_entry, spanned_string, unique_tmp_dir};
     use similar_asserts::assert_eq;
     use std::path::PathBuf;
     use yaml_spanned::Spanned;
@@ -49,13 +54,7 @@ mod tests {
 
     impl TempDir {
         fn new(prefix: &str) -> color_eyre::eyre::Result<Self> {
-            use std::time::{SystemTime, UNIX_EPOCH};
-
-            let nanos = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos();
-            let dir = std::env::temp_dir().join(format!("{prefix}-{nanos}"));
+            let dir = unique_tmp_dir(prefix);
             std::fs::create_dir_all(&dir)?;
             Ok(Self(dir))
         }
@@ -67,11 +66,11 @@ mod tests {
         }
     }
 
-    fn spanned_string(value: &str) -> Spanned<String> {
-        Spanned {
-            span: yaml_spanned::spanned::Span::default(),
-            inner: value.to_string(),
-        }
+    fn run_sink(id: &str, run_generation: u64) -> (SessionModelReader, RunSink) {
+        let (reader, writer) = crate::model::new([initial_model_entry(id)]);
+        let id = id.to_string();
+        writer.begin_run(&id, run_generation);
+        (reader, writer.run_sink(&id, run_generation))
     }
 
     #[cfg(unix)]
@@ -107,22 +106,19 @@ mod tests {
             }),
         };
 
-        let (events_tx, mut events_rx) = mpsc::channel(64);
+        let (reader, sink) = run_sink("svc", 1);
         let shutdown = CancellationToken::new();
         let terminate = CancellationToken::new();
         let env = std::collections::HashMap::new();
-        let service_id: ServiceID = "svc".to_string();
 
         let start = tokio::time::Instant::now();
         let res = super::run(
             &hc,
-            &service_id,
-            RunId::new(1),
             1,
             RunParams {
                 working_dir: Some(dir.0.as_path()),
                 environment: &env,
-                events_tx,
+                sink,
                 shutdown,
                 terminate,
             },
@@ -140,16 +136,13 @@ mod tests {
         let pid_str = std::fs::read_to_string(&pid_path)?;
         let pid: i32 = pid_str.trim().parse()?;
 
-        let mut saw_finished = false;
-        for _ in 0..50 {
-            if let Some(ev) = events_rx.recv().await
-                && let ProcessEvent::HealthCheckFinished { success: false, .. } = ev
-            {
-                saw_finished = true;
-                break;
-            }
-        }
-        assert!(saw_finished);
+        let history = reader.healthchecks("svc");
+        let result = history
+            .last()
+            .and_then(|attempt| attempt.result.as_ref())
+            .ok_or_else(|| color_eyre::eyre::eyre!("missing finished timeout attempt"))?;
+        assert!(!result.success);
+        assert!(!result.cancelled);
 
         match kill(Pid::from_raw(pid), None) {
             Err(Errno::ESRCH) => {}
@@ -178,23 +171,21 @@ mod tests {
             }),
         };
 
-        let (events_tx, mut events_rx) = mpsc::channel(64);
+        let (reader, sink) = run_sink("svc", 1);
+        let mut changes = reader.subscribe();
         let shutdown = CancellationToken::new();
         let terminate = CancellationToken::new();
         let run_handle = tokio::spawn({
             let terminate = terminate.clone();
             async move {
                 let env = std::collections::HashMap::new();
-                let service_id: ServiceID = "svc".to_string();
                 super::run(
                     &hc,
-                    &service_id,
-                    RunId::new(1),
                     1,
                     RunParams {
                         working_dir: None,
                         environment: &env,
-                        events_tx,
+                        sink,
                         shutdown,
                         terminate,
                     },
@@ -203,26 +194,23 @@ mod tests {
             }
         });
 
-        let mut saw_cancelled_finished = false;
-        for _ in 0..50 {
-            let Some(ev) = events_rx.recv().await else {
-                break;
-            };
-            match ev {
-                ProcessEvent::HealthCheckStarted { .. } => terminate.cancel(),
-                ProcessEvent::HealthCheckFinished {
-                    cancelled: true, ..
-                } => {
-                    saw_cancelled_finished = true;
-                    break;
-                }
-                _ => {}
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while reader.healthchecks("svc").is_empty() {
+                let _ = changes.recv().await;
             }
-        }
+        })
+        .await
+        .map_err(|_| color_eyre::eyre::eyre!("probe did not start"))?;
+        terminate.cancel();
 
         let outcome = run_handle.await?;
         assert!(matches!(outcome, Ok(Outcome::Cancelled)));
-        assert!(saw_cancelled_finished);
+        let history = reader.healthchecks("svc");
+        let result = history
+            .last()
+            .and_then(|attempt| attempt.result.as_ref())
+            .ok_or_else(|| color_eyre::eyre::eyre!("missing finished cancelled attempt"))?;
+        assert!(result.cancelled);
         Ok(())
     }
 
@@ -260,23 +248,20 @@ mod tests {
             }),
         };
 
-        let (events_tx, _events_rx) = mpsc::channel(64);
+        let (_reader, sink) = run_sink("svc", 1);
         let shutdown = CancellationToken::new();
         let terminate = CancellationToken::new();
         let env = std::collections::HashMap::new();
-        let service_id: ServiceID = "svc".to_string();
 
         let res = tokio::time::timeout(
             std::time::Duration::from_secs(2),
             super::run(
                 &hc,
-                &service_id,
-                RunId::new(1),
                 1,
                 RunParams {
                     working_dir: Some(dir.0.as_path()),
                     environment: &env,
-                    events_tx,
+                    sink,
                     shutdown,
                     terminate,
                 },
@@ -340,6 +325,7 @@ mod tests {
         let terminate = CancellationToken::new();
         let service_id: ServiceID = "svc".to_string();
         let run_id = RunId::new(1);
+        let (reader, sink) = run_sink(&service_id, run_id.get());
 
         let handle = tokio::spawn({
             let terminate = terminate.clone();
@@ -349,6 +335,7 @@ mod tests {
                     RunLoopParams {
                         service_id,
                         run_id,
+                        sink,
                         working_dir: None,
                         environment: std::collections::HashMap::new(),
                         events_tx,
@@ -360,28 +347,18 @@ mod tests {
             }
         });
 
-        let mut starts = 0;
         loop {
             let event = tokio::time::timeout(std::time::Duration::from_secs(2), events_rx.recv())
                 .await?
                 .ok_or_else(|| color_eyre::eyre::eyre!("healthcheck event channel closed"))?;
-            match event {
-                ProcessEvent::HealthCheckStarted { .. } => {
-                    starts += 1;
-                    if starts > 1 {
-                        color_eyre::eyre::bail!(
-                            "healthcheck needed more than one failure to become unhealthy"
-                        );
-                    }
-                }
-                ProcessEvent::Unhealthy { .. } => break,
-                _ => {}
+            if let ProcessEvent::Unhealthy { .. } = event {
+                break;
             }
         }
 
         terminate.cancel();
         handle.await?;
-        Ok(starts)
+        Ok(reader.healthchecks("svc").len())
     }
 
     #[tokio::test]
@@ -418,7 +395,7 @@ pub struct Error {
 struct RunParams<'a> {
     pub working_dir: Option<&'a std::path::Path>,
     pub environment: &'a std::collections::HashMap<String, String>,
-    pub events_tx: mpsc::Sender<ProcessEvent>,
+    pub sink: RunSink,
     pub shutdown: CancellationToken,
     pub terminate: CancellationToken,
 }
@@ -426,6 +403,7 @@ struct RunParams<'a> {
 pub(crate) struct RunLoopParams {
     pub service_id: ServiceID,
     pub run_id: RunId,
+    pub sink: RunSink,
     pub working_dir: Option<std::path::PathBuf>,
     pub environment: std::collections::HashMap<String, String>,
     pub events_tx: mpsc::Sender<ProcessEvent>,
@@ -548,13 +526,11 @@ pub async fn run_loop(health_check: crate::config::HealthCheck, params: RunLoopP
 
         let res = run(
             &health_check,
-            &params.service_id,
-            params.run_id,
             attempt_id,
             RunParams {
                 working_dir: params.working_dir.as_deref(),
                 environment: &params.environment,
-                events_tx: params.events_tx.clone(),
+                sink: params.sink.clone(),
                 shutdown: params.shutdown.clone(),
                 terminate: params.terminate.clone(),
             },
@@ -602,93 +578,26 @@ fn command_string(health_check: &crate::config::HealthCheck) -> String {
         .join(" ")
 }
 
-async fn emit_started(
-    events_tx: &mpsc::Sender<ProcessEvent>,
-    service_id: &ServiceID,
-    run_id: RunId,
-    attempt: u64,
-    command: String,
-) {
-    let _ = events_tx
-        .send(ProcessEvent::HealthCheckStarted {
-            service_id: service_id.clone(),
-            run_id,
-            attempt,
-            command,
-        })
-        .await;
-}
-
-async fn emit_finished(
-    events_tx: &mpsc::Sender<ProcessEvent>,
-    service_id: &ServiceID,
-    run_id: RunId,
-    attempt: u64,
-    success: bool,
-    exit_code: i32,
-    cancelled: bool,
-) {
-    let _ = events_tx
-        .send(ProcessEvent::HealthCheckFinished {
-            service_id: service_id.clone(),
-            run_id,
-            attempt,
-            success,
-            exit_code,
-            cancelled,
-        })
-        .await;
-}
-
-fn try_emit_spawn_failed(
-    events_tx: &mpsc::Sender<ProcessEvent>,
-    service_id: &ServiceID,
-    run_id: RunId,
-    attempt: u64,
-    source: &std::io::Error,
-) {
-    let _ = events_tx.try_send(ProcessEvent::HealthCheckLogLine {
-        service_id: service_id.clone(),
-        run_id,
-        attempt,
-        stream: OutputStream::Stderr,
-        line: source.to_string(),
-    });
-    let _ = events_tx.try_send(ProcessEvent::HealthCheckFinished {
-        service_id: service_id.clone(),
-        run_id,
-        attempt,
-        success: false,
-        exit_code: -1,
-        cancelled: false,
-    });
+fn emit_spawn_failed(sink: &RunSink, attempt: u64, source: &std::io::Error) {
+    sink.append_health_line(attempt, OutputStream::Stderr, source.to_string());
+    sink.finish_health_attempt(attempt, false, -1, false);
 }
 
 fn spawn_output_task(
     mut lines: tokio::io::Lines<BufReader<impl tokio::io::AsyncRead + Unpin + Send + 'static>>,
-    service_id: ServiceID,
-    run_id: RunId,
     attempt: u64,
     stream: OutputStream,
-    events_tx: mpsc::Sender<ProcessEvent>,
+    sink: RunSink,
 ) -> tokio::task::JoinHandle<()> {
     tokio::task::spawn(async move {
         loop {
             match lines.next_line().await {
                 Ok(Some(line)) => {
-                    let _ = events_tx
-                        .send(ProcessEvent::HealthCheckLogLine {
-                            service_id: service_id.clone(),
-                            run_id,
-                            attempt,
-                            stream,
-                            line,
-                        })
-                        .await;
+                    sink.append_health_line(attempt, stream, line);
                 }
                 Ok(None) => break,
                 Err(err) => {
-                    tracing::error!(service_id, ?err, "health check: failed to read line");
+                    tracing::error!(?err, "health check: failed to read line");
                 }
             }
         }
@@ -764,11 +673,9 @@ impl Drop for OutputReaders {
 }
 
 struct Running {
-    service_id: ServiceID,
-    run_id: RunId,
+    sink: RunSink,
     attempt: u64,
     command: String,
-    events_tx: mpsc::Sender<ProcessEvent>,
     output_readers: OutputReaders,
     wait_handle: tokio::task::JoinHandle<Result<std::process::ExitStatus, std::io::Error>>,
     kill_token: CancellationToken,
@@ -853,16 +760,9 @@ async fn finish_with_exit(running: &mut Running, success: bool, exit_code: i32) 
         running.output_readers.abort_and_join().await;
     }
 
-    emit_finished(
-        &running.events_tx,
-        &running.service_id,
-        running.run_id,
-        running.attempt,
-        success,
-        exit_code,
-        false,
-    )
-    .await;
+    running
+        .sink
+        .finish_health_attempt(running.attempt, success, exit_code, false);
 }
 
 #[cfg(unix)]
@@ -884,22 +784,13 @@ fn kill_reaped_probe_group(pid: i32) {
 )]
 async fn run(
     health_check: &crate::config::HealthCheck,
-    service_id: &ServiceID,
-    run_id: RunId,
     attempt: u64,
     params: RunParams<'_>,
 ) -> Result<Outcome, Error> {
     let (prog, args) = &health_check.test;
     let command = command_string(health_check);
 
-    emit_started(
-        &params.events_tx,
-        service_id,
-        run_id,
-        attempt,
-        command.clone(),
-    )
-    .await;
+    params.sink.start_health_attempt(attempt, command.clone());
 
     let mut cmd = Command::new(prog.as_ref());
     cmd.args(args.iter().map(std::convert::AsRef::as_ref))
@@ -915,7 +806,7 @@ async fn run(
     }
 
     let mut process = cmd.spawn().map_err(|source| {
-        try_emit_spawn_failed(&params.events_tx, service_id, run_id, attempt, &source);
+        emit_spawn_failed(&params.sink, attempt, &source);
         Error {
             command: command.clone(),
             source: ErrorReason::Spawn(source),
@@ -926,22 +817,18 @@ async fn run(
     if let Some(stderr) = process.stderr.take() {
         output_readers.set_stderr(spawn_output_task(
             BufReader::new(stderr).lines(),
-            service_id.clone(),
-            run_id,
             attempt,
             OutputStream::Stderr,
-            params.events_tx.clone(),
+            params.sink.clone(),
         ));
     }
 
     if let Some(stdout) = process.stdout.take() {
         output_readers.set_stdout(spawn_output_task(
             BufReader::new(stdout).lines(),
-            service_id.clone(),
-            run_id,
             attempt,
             OutputStream::Stdout,
-            params.events_tx.clone(),
+            params.sink.clone(),
         ));
     }
 
@@ -966,11 +853,9 @@ async fn run(
     .await;
 
     let mut running = Running {
-        service_id: service_id.clone(),
-        run_id,
+        sink: params.sink,
         attempt,
         command,
-        events_tx: params.events_tx.clone(),
         output_readers,
         wait_handle,
         kill_token,
@@ -983,30 +868,14 @@ async fn run(
             // The service is being stopped/restarted: this is a cancellation, not a probe
             // result. Tear down the probe but do NOT report it as healthy or unhealthy.
             cleanup_after_cancel(&mut running).await;
-            emit_finished(
-                &running.events_tx,
-                &running.service_id,
-                run_id,
-                attempt,
-                false,
-                -1,
-                true,
-            )
-            .await;
+            running.sink.finish_health_attempt(attempt, false, -1, true);
             Ok(Outcome::Cancelled)
         }
         Completion::Timeout => {
             cleanup_after_cancel(&mut running).await;
-            emit_finished(
-                &running.events_tx,
-                &running.service_id,
-                run_id,
-                attempt,
-                false,
-                -1,
-                false,
-            )
-            .await;
+            running
+                .sink
+                .finish_health_attempt(attempt, false, -1, false);
             let command = std::mem::take(&mut running.command);
             Err(Error {
                 command,

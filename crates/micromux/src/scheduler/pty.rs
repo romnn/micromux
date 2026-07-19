@@ -1,5 +1,5 @@
 use super::{LogUpdateKind, OutputStream, ProcessEvent, RunId, ServiceID};
-use crate::{health_check, service::Service};
+use crate::{health_check, model::RunSink, service::Service};
 use color_eyre::eyre;
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -713,6 +713,7 @@ impl Drop for ActiveLogReaderGuard {
 struct LogReaderArgs {
     service_id: ServiceID,
     run_id: RunId,
+    sink: RunSink,
     reader: PtyOutputReader,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     events_tx: mpsc::Sender<ProcessEvent>,
@@ -765,34 +766,6 @@ fn spawn_log_reader_thread(args: LogReaderArgs) {
             }
         }
 
-        fn send_log(
-            events_tx: &mpsc::Sender<ProcessEvent>,
-            service_id: &ServiceID,
-            run_id: RunId,
-            update: LogUpdateKind,
-            text: String,
-        ) {
-            let event = ProcessEvent::LogLine {
-                service_id: service_id.clone(),
-                run_id,
-                stream: OutputStream::Stdout,
-                update,
-                line: text,
-            };
-            match update {
-                // This function is only called from the dedicated PTY reader OS thread; block it
-                // for durable append records so scheduler backpressure reaches the child instead
-                // of silently dropping complete log lines.
-                LogUpdateKind::Append => {
-                    let _ = events_tx.blocking_send(event);
-                }
-                // Interactive alt-screen frames are snapshots, not a durable line stream.
-                LogUpdateKind::LiveSnapshot { .. } => {
-                    let _ = events_tx.try_send(event);
-                }
-            }
-        }
-
         fn send_log_reader_finished(
             events_tx: &mpsc::Sender<ProcessEvent>,
             service_id: &ServiceID,
@@ -807,18 +780,14 @@ fn spawn_log_reader_thread(args: LogReaderArgs) {
         fn emit_snapshot(
             term: &Term<PtyEventProxy>,
             rate: &mut RateLimit,
-            events_tx: &mpsc::Sender<ProcessEvent>,
-            service_id: &ServiceID,
-            run_id: RunId,
+            sink: &RunSink,
             force: bool,
         ) {
             match rate.snapshot_decision(force, Instant::now()) {
                 SnapshotDecision::Emit => {}
                 SnapshotDecision::Warn => {
-                    send_log(
-                        events_tx,
-                        service_id,
-                        run_id,
+                    sink.append_log(
+                        OutputStream::Stdout,
                         LogUpdateKind::Append,
                         "[micromux] interactive output rate-limited".to_string(),
                     );
@@ -895,10 +864,8 @@ fn spawn_log_reader_thread(args: LogReaderArgs) {
                 }
             }
 
-            send_log(
-                events_tx,
-                service_id,
-                run_id,
+            sink.append_log(
+                OutputStream::Stdout,
                 LogUpdateKind::LiveSnapshot {
                     id: rate.snapshot_id(),
                 },
@@ -907,12 +874,7 @@ fn spawn_log_reader_thread(args: LogReaderArgs) {
             rate.record_snapshot_sent();
         }
 
-        fn flush(
-            line: &mut Vec<u8>,
-            events_tx: &mpsc::Sender<ProcessEvent>,
-            service_id: &ServiceID,
-            run_id: RunId,
-        ) {
+        fn flush(line: &mut Vec<u8>, sink: &RunSink) {
             if line.is_empty() {
                 return;
             }
@@ -927,7 +889,7 @@ fn spawn_log_reader_thread(args: LogReaderArgs) {
             }
 
             let s = String::from_utf8_lossy(line).to_string();
-            send_log(events_tx, service_id, run_id, LogUpdateKind::Append, s);
+            sink.append_log(OutputStream::Stdout, LogUpdateKind::Append, s);
             line.clear();
         }
 
@@ -936,14 +898,9 @@ fn spawn_log_reader_thread(args: LogReaderArgs) {
         /// Unlike [`flush`] (used for partial lines at EOF / the 16 KiB overflow guard), this
         /// emits the record even when empty so intentional blank lines are not silently dropped.
         /// `line` never contains the terminating newline bytes themselves.
-        fn flush_record(
-            line: &mut Vec<u8>,
-            events_tx: &mpsc::Sender<ProcessEvent>,
-            service_id: &ServiceID,
-            run_id: RunId,
-        ) {
+        fn flush_record(line: &mut Vec<u8>, sink: &RunSink) {
             let s = String::from_utf8_lossy(line).to_string();
-            send_log(events_tx, service_id, run_id, LogUpdateKind::Append, s);
+            sink.append_log(OutputStream::Stdout, LogUpdateKind::Append, s);
             line.clear();
         }
 
@@ -951,21 +908,20 @@ fn spawn_log_reader_thread(args: LogReaderArgs) {
             snapshot_mode: bool,
             term: &Term<PtyEventProxy>,
             rate: &mut RateLimit,
-            events_tx: &mpsc::Sender<ProcessEvent>,
-            service_id: &ServiceID,
-            run_id: RunId,
+            sink: &RunSink,
             line: &mut Vec<u8>,
         ) {
             if snapshot_mode {
-                emit_snapshot(term, rate, events_tx, service_id, run_id, true);
+                emit_snapshot(term, rate, sink, true);
             } else {
-                flush(line, events_tx, service_id, run_id);
+                flush(line, sink);
             }
         }
 
         let LogReaderArgs {
             service_id,
             run_id,
+            sink,
             reader,
             writer,
             events_tx,
@@ -1024,44 +980,20 @@ fn spawn_log_reader_thread(args: LogReaderArgs) {
             let n = match read {
                 PtyRead::Bytes(n) => n,
                 PtyRead::Eof => {
-                    finish_stream(
-                        snapshot_mode,
-                        &term,
-                        &mut rate,
-                        &events_tx,
-                        &service_id,
-                        run_id,
-                        &mut line,
-                    );
+                    finish_stream(snapshot_mode, &term, &mut rate, &sink, &mut line);
                     send_log_reader_finished(&events_tx, &service_id, run_id);
                     break;
                 }
                 #[cfg(unix)]
                 PtyRead::Cancelled => {
-                    finish_stream(
-                        snapshot_mode,
-                        &term,
-                        &mut rate,
-                        &events_tx,
-                        &service_id,
-                        run_id,
-                        &mut line,
-                    );
+                    finish_stream(snapshot_mode, &term, &mut rate, &sink, &mut line);
                     send_log_reader_finished(&events_tx, &service_id, run_id);
                     break;
                 }
             };
 
             if n == 0 {
-                finish_stream(
-                    snapshot_mode,
-                    &term,
-                    &mut rate,
-                    &events_tx,
-                    &service_id,
-                    run_id,
-                    &mut line,
-                );
+                finish_stream(snapshot_mode, &term, &mut rate, &sink, &mut line);
                 send_log_reader_finished(&events_tx, &service_id, run_id);
                 break;
             }
@@ -1079,7 +1011,7 @@ fn spawn_log_reader_thread(args: LogReaderArgs) {
                 snapshot_mode = alt_screen;
                 dirty = alt_screen;
                 if alt_screen {
-                    flush_record(&mut line, &events_tx, &service_id, run_id);
+                    flush_record(&mut line, &sink);
                 } else {
                     line.clear();
                 }
@@ -1098,13 +1030,13 @@ fn spawn_log_reader_thread(args: LogReaderArgs) {
                     // still flushes — preserving intentional blank lines.
                     b'\r' => {
                         if !snapshot_mode {
-                            flush_record(&mut line, &events_tx, &service_id, run_id);
+                            flush_record(&mut line, &sink);
                         }
                         prev_was_cr = true;
                     }
                     b'\n' => {
                         if !snapshot_mode && !prev_was_cr {
-                            flush_record(&mut line, &events_tx, &service_id, run_id);
+                            flush_record(&mut line, &sink);
                         }
                         prev_was_cr = false;
                     }
@@ -1116,12 +1048,12 @@ fn spawn_log_reader_thread(args: LogReaderArgs) {
                         } else {
                             let boundary = filter.push(b, &mut line);
                             if boundary {
-                                flush(&mut line, &events_tx, &service_id, run_id);
+                                flush(&mut line, &sink);
                             }
                         }
 
                         if !snapshot_mode && line.len() >= 16 * 1024 {
-                            flush(&mut line, &events_tx, &service_id, run_id);
+                            flush(&mut line, &sink);
                         }
                     }
                 }
@@ -1132,7 +1064,7 @@ fn spawn_log_reader_thread(args: LogReaderArgs) {
                 let now = Instant::now();
                 let due = last_snapshot_at.is_none_or(|t| now.duration_since(t) >= interval);
                 if dirty && due {
-                    emit_snapshot(&term, &mut rate, &events_tx, &service_id, run_id, false);
+                    emit_snapshot(&term, &mut rate, &sink, false);
                     last_snapshot_at = Some(now);
                     dirty = false;
                 }
@@ -1346,6 +1278,7 @@ fn spawn_termination_task(args: TerminationTaskArgs) {
 pub(super) fn start_service_with_pty_size(
     service: &Service,
     run_id: RunId,
+    sink: RunSink,
     events_tx: &mpsc::Sender<ProcessEvent>,
     shutdown: &CancellationToken,
     terminate: &CancellationToken,
@@ -1420,6 +1353,7 @@ pub(super) fn start_service_with_pty_size(
     spawn_log_reader_thread(LogReaderArgs {
         service_id: service_id.clone(),
         run_id,
+        sink: sink.clone(),
         reader,
         writer: writer.clone(),
         events_tx: events_tx.clone(),
@@ -1459,6 +1393,7 @@ pub(super) fn start_service_with_pty_size(
                     health_check::RunLoopParams {
                         service_id,
                         run_id,
+                        sink,
                         working_dir,
                         environment,
                         events_tx,
