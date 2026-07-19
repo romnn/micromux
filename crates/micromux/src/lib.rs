@@ -29,6 +29,8 @@ mod model;
 mod scheduler;
 mod service;
 pub mod structured_log;
+#[cfg(test)]
+pub(crate) mod test_util;
 
 use color_eyre::eyre;
 use std::future::Future;

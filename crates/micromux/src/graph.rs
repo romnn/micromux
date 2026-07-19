@@ -52,34 +52,14 @@ mod tests {
     use super::*;
     use crate::config;
     use crate::service::Service;
+    use crate::test_util::spanned_string;
     use color_eyre::eyre;
-    use indexmap::IndexMap;
     use std::path::Path;
-    use yaml_spanned::Spanned;
-
-    fn spanned_string(value: &str) -> Spanned<String> {
-        Spanned {
-            span: yaml_spanned::spanned::Span::default(),
-            inner: value.to_string(),
-        }
-    }
 
     fn service_config(name: &str, depends_on: Vec<config::Dependency>) -> config::Service {
-        config::Service {
-            name: spanned_string(name),
-            startup_mode: crate::service::StartupMode::Enabled,
-            command: (spanned_string("echo"), vec![spanned_string("hi")]),
-            working_dir: None,
-            env_file: vec![],
-            environment: IndexMap::new(),
-            depends_on,
-            healthcheck: None,
-            ports: vec![],
-            restart: None,
-            restart_policy: crate::service::RestartPolicy::Never,
-            color: None,
-            log_retention: crate::LogRetention::default(),
-        }
+        let mut service = crate::test_util::service_config(name, ("echo", &["hi"]));
+        service.depends_on = depends_on;
+        service
     }
 
     #[test]

@@ -12,53 +12,12 @@ use crate::{
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config;
-    use indexmap::IndexMap;
+    use crate::{
+        config,
+        test_util::{service_config, spanned_string, unique_tmp_dir},
+    };
     use similar_asserts::assert_eq;
     use std::fs;
-
-    use std::time::{SystemTime, UNIX_EPOCH};
-    use yaml_spanned::Spanned;
-
-    fn spanned_string(value: &str) -> Spanned<String> {
-        Spanned {
-            span: yaml_spanned::spanned::Span::default(),
-            inner: value.to_string(),
-        }
-    }
-
-    fn unique_tmp_dir(prefix: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        std::env::temp_dir().join(format!("micromux-{prefix}-{nanos}"))
-    }
-
-    fn service_config(name: &str, command: (&str, &[&str])) -> config::Service {
-        config::Service {
-            name: spanned_string(name),
-            startup_mode: StartupMode::Enabled,
-            command: (
-                spanned_string(command.0),
-                command
-                    .1
-                    .iter()
-                    .map(|v| spanned_string(v))
-                    .collect::<Vec<_>>(),
-            ),
-            working_dir: None,
-            env_file: vec![],
-            environment: IndexMap::new(),
-            depends_on: vec![],
-            healthcheck: None,
-            ports: vec![],
-            restart: None,
-            restart_policy: crate::service::RestartPolicy::Never,
-            color: None,
-            log_retention: LogRetention::default(),
-        }
-    }
 
     #[test]
     fn argv_flattens_program_and_args_and_defaults_working_dir() -> eyre::Result<()> {
