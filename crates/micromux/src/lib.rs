@@ -45,8 +45,8 @@ pub use diagnostics::{Printer, ToDiagnostics};
 pub use health_check::Health;
 pub use model::{
     ChangeKind, Desired, DiskLogRetention, Execution, HealthAttempt, HealthLine, HealthResult,
-    LogLimit, LogLine, LogRetention, LogRun, LogRunSummary, MemoryLogRetention, ServiceSnapshot,
-    SessionChange, SessionModelReader, trim_to_last_bytes,
+    HealthcheckConfig, LogLimit, LogLine, LogRetention, LogRun, LogRunSummary, MemoryLogRetention,
+    RestartState, ServiceSnapshot, SessionChange, SessionModelReader, trim_to_last_bytes,
 };
 pub use scheduler::{
     Command, CommandRejection, OutputStream, SchedulerStopped, ServiceCommandAck,
@@ -92,7 +92,7 @@ pub(crate) fn initial_model_entries(services: &ServiceMap) -> Vec<(ServiceSnapsh
                 id.clone(),
                 service.name.as_ref().clone(),
                 service.advertised_ports.clone(),
-                service.health_check.is_some(),
+                service.health_check.as_ref().map(HealthcheckConfig::from),
                 service.restart_policy.clone(),
                 service.argv(),
                 service.working_dir_display(),

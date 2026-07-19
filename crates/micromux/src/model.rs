@@ -39,6 +39,10 @@ const DEFAULT_MEMORY_LOG_MAX_BYTES: usize = 64 * MIB;
 const HEALTH_HISTORY: usize = 8;
 /// Per-attempt healthcheck output retention.
 const HEALTH_OUTPUT_MAX_LINES: usize = 200;
+/// Default probe interval when none is configured (matches Docker Compose).
+const DEFAULT_HEALTHCHECK_INTERVAL: Duration = Duration::from_secs(30);
+/// Default probe timeout when none is configured (matches Docker Compose).
+const DEFAULT_HEALTHCHECK_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Capacity of the liveness-only change broadcast. A lagging subscriber loses only coalescible
 /// notifications (it re-queries the model for content), never log bytes.
@@ -85,6 +89,48 @@ struct DurationSchema {
     nanos: u32,
 }
 
+/// Effective healthcheck timing for a service run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct HealthcheckConfig {
+    /// Consecutive failed attempts required before the service becomes unhealthy.
+    pub retries: usize,
+    /// Delay between healthcheck attempts.
+    #[schemars(with = "DurationSchema")]
+    pub interval: Duration,
+    /// Maximum duration of one healthcheck attempt.
+    #[schemars(with = "DurationSchema")]
+    pub timeout: Duration,
+}
+
+impl From<&crate::config::HealthCheck> for HealthcheckConfig {
+    fn from(config: &crate::config::HealthCheck) -> Self {
+        Self {
+            retries: config.retries.as_deref().copied().unwrap_or(1).max(1),
+            interval: config
+                .interval
+                .as_deref()
+                .copied()
+                .unwrap_or(DEFAULT_HEALTHCHECK_INTERVAL),
+            timeout: config
+                .timeout
+                .as_deref()
+                .copied()
+                .unwrap_or(DEFAULT_HEALTHCHECK_TIMEOUT),
+        }
+    }
+}
+
+/// Active automatic-restart backoff for an exited service.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct RestartState {
+    /// Delay selected for the next automatic restart attempt.
+    #[schemars(with = "DurationSchema")]
+    pub backoff_delay: Duration,
+    /// Remaining automatic restarts for a bounded `on-failure` policy; `None` means unbounded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restarts_remaining: Option<usize>,
+}
+
 /// A point-in-time, serializable view of one service. This is the wire payload reused directly by
 /// the control protocol (no DTO mirror).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -106,12 +152,32 @@ pub struct ServiceSnapshot {
     /// service has never started.
     #[serde(default)]
     pub run_generation: u64,
+    /// Process ID of the direct child (the process-group leader). For wrapper commands such as
+    /// `cargo run`, this identifies the wrapper rather than the eventual server. `None` unless a
+    /// process is running, or when the pty backend did not report a pid.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    /// Wall-clock time when the current run started, in Unix milliseconds (the same unit as log
+    /// entry timestamps and `since` filters). This identifies the run in operator-facing output;
+    /// monotonic [`Self::uptime`] remains authoritative for elapsed time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at_unix_ms: Option<u64>,
     /// Ports declared by the service config. These are informational hints, not a liveness signal.
     #[serde(default)]
     pub advertised_ports: Vec<u16>,
     /// Whether this service has a healthcheck configured.
     #[serde(default)]
     pub healthcheck_configured: bool,
+    /// Effective healthcheck timing for the represented run, when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub healthcheck: Option<HealthcheckConfig>,
+    /// Whether the current command, working directory, ports, or effective healthcheck timing
+    /// differs from the configuration captured for this run.
+    #[serde(default)]
+    pub config_stale: bool,
+    /// Active automatic-restart backoff, if the scheduler is delaying the next attempt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restart_state: Option<RestartState>,
     /// Exit code of the most recently finished run, if any.
     #[serde(default)]
     pub last_exit_code: Option<i32>,
@@ -140,7 +206,7 @@ impl ServiceSnapshot {
         id: ServiceID,
         name: String,
         advertised_ports: Vec<u16>,
-        healthcheck_configured: bool,
+        healthcheck: Option<HealthcheckConfig>,
         restart_policy: RestartPolicy,
         command: Vec<String>,
         working_dir: Option<String>,
@@ -152,8 +218,13 @@ impl ServiceSnapshot {
             execution: Execution::Pending,
             health: None,
             run_generation: 0,
+            pid: None,
+            started_at_unix_ms: None,
             advertised_ports,
-            healthcheck_configured,
+            healthcheck_configured: healthcheck.is_some(),
+            healthcheck,
+            config_stale: false,
+            restart_state: None,
             last_exit_code: None,
             command,
             working_dir,
@@ -1134,21 +1205,32 @@ mod tests {
     }
 
     #[test]
-    fn service_snapshot_accepts_missing_additive_fields() {
+    fn service_snapshot_accepts_missing_additive_fields() -> serde_json::Result<()> {
         let snapshot = serde_json::from_value::<ServiceSnapshot>(json!({
             "id": "svc",
             "name": "svc",
             "desired": "Enabled",
             "execution": "Running"
-        }))
-        .unwrap();
+        }))?;
 
         assert_eq!(snapshot.run_generation, 0);
+        assert_eq!(snapshot.pid, None);
+        assert_eq!(snapshot.started_at_unix_ms, None);
         assert_eq!(snapshot.advertised_ports, Vec::<u16>::new());
         assert!(!snapshot.healthcheck_configured);
+        assert_eq!(snapshot.healthcheck, None);
+        assert!(!snapshot.config_stale);
+        assert_eq!(snapshot.restart_state, None);
         assert_eq!(snapshot.restart_policy, RestartPolicy::Never);
         assert_eq!(snapshot.command, Vec::<String>::new());
         assert_eq!(snapshot.health, None);
+
+        let encoded = serde_json::to_string(&snapshot)?;
+        let decoded = serde_json::from_str::<ServiceSnapshot>(&encoded)?;
+        assert_eq!(decoded.id, "svc");
+        assert_eq!(decoded.pid, None);
+        assert_eq!(decoded.started_at_unix_ms, None);
+        Ok(())
     }
 
     #[test]

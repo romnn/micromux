@@ -1,5 +1,5 @@
 use crate::{
-    model::RunSink,
+    model::{HealthcheckConfig, RunSink},
     scheduler::{OutputStream, ProcessEvent, RunId, ServiceID},
 };
 use itertools::Itertools;
@@ -34,10 +34,6 @@ pub enum Health {
     Unknown,
 }
 
-/// Default probe interval when none is configured (matches Docker Compose).
-const DEFAULT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
-/// Default probe timeout when none is configured (matches Docker Compose).
-const DEFAULT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// How long to wait for stdout/stderr readers to flush after the probe process exits.
 const OUTPUT_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
 
@@ -491,17 +487,14 @@ async fn record_probe_failure(
 }
 
 pub async fn run_loop(health_check: crate::config::HealthCheck, params: RunLoopParams) {
-    let max_retries = health_check.retries.as_deref().copied().unwrap_or(1).max(1);
+    let effective = HealthcheckConfig::from(&health_check);
+    let max_retries = effective.retries;
     let start_delay = health_check
         .start_delay
         .as_deref()
         .copied()
         .unwrap_or_default();
-    let interval = health_check
-        .interval
-        .as_deref()
-        .copied()
-        .unwrap_or(DEFAULT_INTERVAL);
+    let interval = effective.interval;
     tracing::info!(
         service_id = params.service_id,
         ?start_delay,
@@ -837,12 +830,7 @@ async fn run(
     let kill_token = CancellationToken::new();
     let mut wait_handle = spawn_wait_task(process, &kill_token);
     // Always bound the probe so a hung command cannot block the loop (and dependents) forever.
-    let timeout = Some(
-        health_check
-            .timeout
-            .as_ref()
-            .map_or(DEFAULT_TIMEOUT, |t| t.inner),
-    );
+    let timeout = Some(HealthcheckConfig::from(health_check).timeout);
 
     let completion = select_completion(
         timeout,

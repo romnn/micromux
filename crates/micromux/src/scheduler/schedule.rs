@@ -146,12 +146,7 @@ fn start_service_if_ready(
         log_reader.cancel();
     }
     runtime.mark_starting();
-    runtime.run_config = Some(RunConfig {
-        command: service.argv(),
-        working_dir: service.working_dir_display(),
-        advertised_ports: service.advertised_ports.clone(),
-        healthcheck_configured: service.health_check.is_some(),
-    });
+    runtime.run_config = Some(RunConfig::from(service));
     sync_model(ctx.writer, service, runtime);
 
     let run_id = runtime.allocate_run_id();
@@ -174,6 +169,7 @@ fn start_service_if_ready(
         Ok(started) => {
             runtime.mark_started(RunningService {
                 run_id,
+                pid: started.pid,
                 terminate,
                 log_reader: Some(started.log_reader),
                 pty: started.handles,

@@ -45,6 +45,9 @@ pub(super) struct PtyHandles {
 }
 
 pub(super) struct StartedPty {
+    /// Pid of the spawned child, when the pty backend reports one. A missing pid must never fail
+    /// the start — it only degrades the runtime-identity snapshot.
+    pub(super) pid: Option<u32>,
     pub(super) handles: PtyHandles,
     pub(super) log_reader: LogReaderHandle,
 }
@@ -1407,6 +1410,7 @@ pub(super) fn start_service_with_pty_size(
     }
 
     Ok(StartedPty {
+        pid,
         handles: PtyHandles {
             master,
             writer,

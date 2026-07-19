@@ -53,7 +53,7 @@ pub(crate) fn initial_snapshot(id: &str) -> ServiceSnapshot {
         id.to_string(),
         id.to_string(),
         Vec::new(),
-        false,
+        None,
         RestartPolicy::Never,
         Vec::new(),
         None,

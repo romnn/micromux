@@ -198,12 +198,71 @@ fn failed_start_advances_generation_and_records_exit() {
     assert!(matches!(runtime.state, State::Exited { exit_code: -1 }));
 }
 
+#[test]
+fn project_snapshot_reports_runtime_identity_and_config_drift() -> eyre::Result<()> {
+    let mut service = Service::new(
+        "svc",
+        Path::new("."),
+        service_config("svc", ("sh", &["-c", "sleep 60"])),
+    )?;
+    let policy = service.restart_policy.clone();
+    let mut runtime = ServiceRuntime::new(ServiceRuntimeInit::from(&service));
+    runtime.run_config = Some(RunConfig::from(&service));
+    start_dummy_run(&mut runtime)?;
+
+    let (running, _) = project_snapshot(&service, &runtime);
+    assert_eq!(running.pid, Some(42));
+    assert!(running.started_at_unix_ms.is_some());
+    assert!(!running.config_stale);
+
+    service = Service::new(
+        "svc",
+        Path::new("."),
+        service_config("svc", ("sh", &["-c", "sleep 60"])),
+    )?;
+    let (unchanged_reload, _) = project_snapshot(&service, &runtime);
+    assert!(!unchanged_reload.config_stale);
+
+    service.command = ("false".to_string(), Vec::new());
+    let (stale, _) = project_snapshot(&service, &runtime);
+    assert!(stale.config_stale);
+    assert_eq!(stale.command, vec!["sh", "-c", "sleep 60"]);
+
+    runtime.finish_current_run(&policy, 0);
+    let (exited, uptime_started_at) = project_snapshot(&service, &runtime);
+    assert_eq!(exited.pid, None);
+    assert_eq!(exited.started_at_unix_ms, None);
+    assert_eq!(uptime_started_at, None);
+    Ok(())
+}
+
+#[test]
+fn project_snapshot_reports_active_restart_backoff() -> eyre::Result<()> {
+    let mut config = service_config("svc", ("false", &[]));
+    config.restart_policy = crate::service::RestartPolicy::Always;
+    let service = Service::new("svc", Path::new("."), config)?;
+    let mut runtime = ServiceRuntime::new(ServiceRuntimeInit::from(&service));
+    runtime.run_config = Some(RunConfig::from(&service));
+    start_dummy_run(&mut runtime)?;
+    runtime.finish_current_run(&service.restart_policy, 1);
+
+    let (snapshot, _) = project_snapshot(&service, &runtime);
+
+    let restart = snapshot
+        .restart_state
+        .ok_or_else(|| eyre::eyre!("missing active restart state"))?;
+    assert_eq!(restart.backoff_delay, RESTART_BACKOFF_BASE);
+    assert_eq!(restart.restarts_remaining, None);
+    Ok(())
+}
+
 /// Start a fake run on `runtime` without spawning a process, for handle-bookkeeping tests.
 fn start_dummy_run(runtime: &mut ServiceRuntime) -> eyre::Result<RunId> {
     runtime.mark_starting();
     let run_id = runtime.allocate_run_id();
     runtime.mark_started(RunningService {
         run_id,
+        pid: Some(42),
         terminate: CancellationToken::new(),
         log_reader: Some(pty::LogReaderHandle::test_dummy()),
         pty: pty::PtyHandles::test_dummy()?,

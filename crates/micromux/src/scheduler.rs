@@ -2,7 +2,9 @@ use crate::{
     ReloadConfig, ServiceMap,
     graph::ServiceGraph,
     health_check::Health,
-    model::{Desired, Execution, ServiceSnapshot, SessionModelWriter},
+    model::{
+        Desired, Execution, HealthcheckConfig, RestartState, ServiceSnapshot, SessionModelWriter,
+    },
     service::{self, Service, StartupMode},
 };
 use codespan_reporting::diagnostic::Severity;
@@ -127,10 +129,25 @@ impl RestartTracker {
             *remaining = remaining.saturating_sub(1);
         }
     }
+
+    /// The currently active backoff as snapshot data, or `None` once the deadline has passed (the
+    /// retained `backoff_delay` then only seeds the *next* doubling and is not an active delay).
+    fn active_restart_state(&self, policy: &service::RestartPolicy) -> Option<RestartState> {
+        match (self.backoff_until, self.backoff_delay) {
+            (Some(deadline), Some(backoff_delay)) if deadline > tokio::time::Instant::now() => {
+                Some(RestartState {
+                    backoff_delay,
+                    restarts_remaining: self.remaining_failure_restarts(policy),
+                })
+            }
+            _ => None,
+        }
+    }
 }
 
 pub(super) struct RunningService {
     run_id: RunId,
+    pid: Option<u32>,
     terminate: CancellationToken,
     log_reader: Option<pty::LogReaderHandle>,
     pty: pty::PtyHandles,
@@ -168,12 +185,23 @@ impl Drop for RunningService {
 
 /// Presentation fields captured at spawn time, so config reloads cannot rewrite what an already
 /// running or exited run actually executed.
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub(super) struct RunConfig {
     command: Vec<String>,
     working_dir: Option<String>,
     advertised_ports: Vec<u16>,
-    healthcheck_configured: bool,
+    healthcheck: Option<HealthcheckConfig>,
+}
+
+impl From<&Service> for RunConfig {
+    fn from(service: &Service) -> Self {
+        Self {
+            command: service.argv(),
+            working_dir: service.working_dir_display(),
+            advertised_ports: service.advertised_ports.clone(),
+            healthcheck: service.health_check.as_ref().map(HealthcheckConfig::from),
+        }
+    }
 }
 
 pub(super) struct ServiceRuntime {
@@ -187,8 +215,11 @@ pub(super) struct ServiceRuntime {
     /// The id of the most recently started run, retained after `running` is cleared so an exited or
     /// disabled service can still report the generation that just ran (for `wait_for_healthy`).
     last_run_id: Option<RunId>,
-    /// When the current run started (wall clock), used to compute live uptime. `Some` iff running.
-    last_started_at: Option<std::time::Instant>,
+    /// Monotonic start instant used to compute live uptime. `Some` iff running.
+    uptime_started_at: Option<std::time::Instant>,
+    /// Wall-clock start time (Unix milliseconds) used only for operator-facing runtime identity.
+    /// `Some` iff running.
+    started_at_unix_ms: Option<u64>,
     /// Exit code of the most recently finished run.
     last_exit_code: Option<i32>,
     /// Fields that describe the most recent run rather than the current config.
@@ -231,7 +262,8 @@ impl ServiceRuntime {
             restart: RestartTracker::new(init.restart_policy),
             state,
             last_run_id: None,
-            last_started_at: None,
+            uptime_started_at: None,
+            started_at_unix_ms: None,
             last_exit_code: None,
             run_config: None,
             draining_log_readers: Vec::new(),
@@ -259,7 +291,8 @@ impl ServiceRuntime {
     /// Mark the service started: record the live run handle and the start instant. Called from the
     /// schedule path right after a successful spawn.
     fn mark_started(&mut self, running: RunningService) {
-        self.last_started_at = Some(std::time::Instant::now());
+        self.uptime_started_at = Some(std::time::Instant::now());
+        self.started_at_unix_ms = unix_now_ms();
         self.running = Some(running);
         self.state = State::Running { health: None };
     }
@@ -390,7 +423,8 @@ impl ServiceRuntime {
         if let Some(run_id) = finished_run_id {
             self.last_run_id = Some(run_id);
         }
-        self.last_started_at = None;
+        self.uptime_started_at = None;
+        self.started_at_unix_ms = None;
         self.last_exit_code = Some(exit_code);
         if self.desired == DesiredState::Disabled {
             self.state = State::Disabled;
@@ -440,7 +474,11 @@ pub(super) fn project_snapshot(
         (Execution::Running, State::Running { health }) => *health,
         _ => None,
     };
-    let run_config = runtime.run_config.as_ref();
+    let current_config = RunConfig::from(service);
+    let run_config = runtime.run_config.as_ref().unwrap_or(&current_config);
+    let restart_state = runtime
+        .restart
+        .active_restart_state(&service.restart_policy);
     let snapshot = ServiceSnapshot {
         id: service.id.clone(),
         name: service.name.as_ref().clone(),
@@ -451,24 +489,33 @@ pub(super) fn project_snapshot(
         execution,
         health,
         run_generation: runtime.run_generation(),
-        advertised_ports: run_config.map_or_else(
-            || service.advertised_ports.clone(),
-            |config| config.advertised_ports.clone(),
-        ),
-        healthcheck_configured: run_config.map_or_else(
-            || service.health_check.is_some(),
-            |config| config.healthcheck_configured,
-        ),
+        pid: runtime.running.as_ref().and_then(|running| running.pid),
+        started_at_unix_ms: runtime.started_at_unix_ms,
+        advertised_ports: run_config.advertised_ports.clone(),
+        healthcheck_configured: run_config.healthcheck.is_some(),
+        healthcheck: run_config.healthcheck.clone(),
+        config_stale: runtime
+            .run_config
+            .as_ref()
+            .is_some_and(|captured| captured != &current_config),
+        restart_state,
         last_exit_code: runtime.last_exit_code,
-        command: run_config.map_or_else(|| service.argv(), |config| config.command.clone()),
-        working_dir: run_config.map_or_else(
-            || service.working_dir_display(),
-            |config| config.working_dir.clone(),
-        ),
+        command: run_config.command.clone(),
+        working_dir: run_config.working_dir.clone(),
         uptime: None,
         restart_policy: service.restart_policy.clone(),
     };
-    (snapshot, runtime.last_started_at)
+    (snapshot, runtime.uptime_started_at)
+}
+
+/// Current wall-clock time in Unix milliseconds, matching the unix-ms convention of log-entry
+/// timestamps so a run's start can be correlated with log `since` filters. `None` if the clock
+/// reads before the epoch or overflows `u64` (never in practice).
+fn unix_now_ms() -> Option<u64> {
+    let elapsed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?;
+    u64::try_from(elapsed.as_millis()).ok()
 }
 
 /// The decisive desired/execution mapping. The notable row is *running + Disabled → Stopping*: a
