@@ -20,7 +20,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use micromux::{ChangeKind, Execution, Health, HealthAttempt, ServiceSnapshot};
+use micromux::{Desired, Execution, Health, HealthAttempt, ServiceSnapshot};
 use micromux_control::{
     Client, ControlEndpoint, ControlError, ErrorCode, Request, Response, SessionInfo, endpoint_for,
     runtime_dir_statuses, transport_supported, usable_runtime_dirs,
@@ -38,15 +38,16 @@ use rmcp::{
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::convert::WaitOutcome;
 use crate::select::ToolError;
 use crate::tools::health::{
-    bounded_attempt, diagnosis_hint, latest_health_for_snapshot, likely_cause_log_tail,
-    service_needs_diagnosis, timeout_hint,
+    ServiceDiagnosis, WaitConclusion, bounded_attempt, diagnose_service,
+    latest_health_for_snapshot, service_needs_diagnosis, service_snapshot, timeout_hint,
+    wait_for_health,
 };
 use crate::tools::logs::{
-    FollowGap, ServiceFollowGap, current_cursors, current_service_cursor, fetch_and_shape_tail,
-    follow_all_current_logs, follow_gap, next_follow_cursor, truncate_wait_matches,
+    FollowGap, ServiceFollowGap, compact_logs_since, current_cursors, current_service_cursor,
+    fetch_and_shape_tail, follow_all_current_logs, follow_gap, next_follow_cursor,
+    truncate_wait_matches,
 };
 use crate::tools::sessions::{
     CHILD_EXIT_GRACE, START_READY_TIMEOUT, already_running_any, reachable_session_for_start,
@@ -59,6 +60,8 @@ type ToolResult<T> = Result<Json<T>, ErrorData>;
 
 const DEFAULT_WAIT_TIMEOUT_SECS: u64 = 60;
 const MAX_WAIT_TIMEOUT_SECS: u64 = 600;
+const DEFAULT_RESTART_LOG_LIMIT: usize = 100;
+const MAX_RESTART_LOG_LIMIT: usize = 1000;
 /// Default number of logical log entries returned by `get_logs` when the caller does not pass
 /// `tail`.
 const DEFAULT_LOG_TAIL: usize = 200;
@@ -89,7 +92,9 @@ services. Actions are routed through \
 micromux, so they respect dependency gating and restart policy — prefer them over `kill`+rerun. \
 `restart_service`/`enable_service` return a `generation`; pass it to `wait_for_healthy` as \
 `after_generation` to wait for the *new* run. Use `wait_for_log` after an external action to block \
-until matching backend evidence appears. Use `diagnose` for a one-shot summary of exited or \
+until matching backend evidence appears. Use `restart_service_and_wait` for the common \
+cursor/restart/wait/log bundle, except for hot-reload services, which should use `log_cursors` and \
+`follow_all_logs` without restarting. Use `diagnose` for a one-shot summary of exited or \
 unhealthy services, including current live-run healthcheck output when applicable and \
 likely-cause log lines. Use \
 `start_session`/`stop_session` to bring a \
@@ -242,6 +247,21 @@ struct WaitArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+struct RestartAndWaitArgs {
+    /// The id of the target service.
+    service: String,
+    /// Optional session selector; omit for the current project.
+    #[serde(default)]
+    session: Option<String>,
+    /// Maximum seconds to wait (default 60, capped at 600).
+    #[serde(default)]
+    timeout_secs: Option<u64>,
+    /// Maximum compact log entries to return (default 100, capped at 1000).
+    #[serde(default)]
+    log_limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 struct DiagnoseArgs {
     /// Optional session selector; omit for the current project.
     #[serde(default)]
@@ -314,6 +334,20 @@ struct MutationResult {
     accepted: Vec<micromux::ServiceCommandAck>,
     service: String,
     generation: Option<u64>,
+}
+
+#[derive(Serialize, JsonSchema)]
+struct RestartAndWaitResult {
+    session_ref: SessionRef,
+    service: String,
+    previous_generation: u64,
+    run_generation: u64,
+    outcome: WaitResult,
+    snapshot: ServiceSnapshot,
+    logs: Vec<logproc::ProcessedEntry>,
+    logs_truncated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    diagnosis: Option<ServiceDiagnosis>,
 }
 
 #[derive(Serialize, JsonSchema)]
@@ -466,8 +500,10 @@ struct LogCursorsResult {
 
 #[derive(Serialize, JsonSchema)]
 struct HealthResult {
+    config_path: String,
     service: String,
-    health: Option<HealthAttempt>,
+    snapshot: ServiceSnapshot,
+    latest_healthcheck: Option<HealthAttempt>,
 }
 
 #[derive(Serialize, JsonSchema)]
@@ -478,16 +514,6 @@ struct DiagnoseResult {
     /// A copy-pasteable selector (`hash:<id>`) for the diagnosed session.
     session_selector: String,
     services: Vec<ServiceDiagnosis>,
-}
-
-#[derive(Serialize, JsonSchema)]
-struct ServiceDiagnosis {
-    service: String,
-    snapshot: ServiceSnapshot,
-    latest_healthcheck: Option<HealthAttempt>,
-    error_log_tail: Vec<logproc::ProcessedEntry>,
-    logs_truncated: bool,
-    hint: String,
 }
 
 #[derive(Serialize, JsonSchema)]
@@ -529,6 +555,24 @@ enum WaitStatus {
 }
 
 impl WaitResult {
+    fn from_conclusion(service: String, timeout: Duration, conclusion: &WaitConclusion) -> Self {
+        match conclusion {
+            WaitConclusion::Healthy(snapshot) => Self::healthy(service, snapshot.run_generation),
+            WaitConclusion::Exited(snapshot) => {
+                Self::exited(service, snapshot.last_exit_code, snapshot.run_generation)
+            }
+            WaitConclusion::Timeout {
+                snapshot,
+                latest_healthcheck,
+            } => Self::timeout(
+                service,
+                timeout.as_secs(),
+                snapshot,
+                latest_healthcheck.clone(),
+            ),
+        }
+    }
+
     fn healthy(service: String, generation: u64) -> Self {
         Self {
             status: WaitStatus::Healthy,
@@ -779,8 +823,9 @@ impl McpServer {
 
     #[tool(
         description = "List the services in a session with their desired/execution state, health, \
-        advertised ports, uptime, restart policy, last exit code, run generation, resolved command \
-        (argv), and working directory. The result carries a copy-pasteable session_selector."
+        advertised ports, pid, start time, config drift, uptime, restart state/policy, last exit \
+        code, run generation, resolved command (argv), and working directory. The result carries a \
+        copy-pasteable session_selector."
     )]
     async fn list_services(&self, args: Parameters<SessionArgs>) -> ToolResult<ServiceListResult> {
         let Parameters(args) = args;
@@ -1072,6 +1117,112 @@ impl McpServer {
             &args.service,
         )
         .await
+    }
+
+    #[tool(
+        description = "Convenience wrapper that captures log cursors, restarts one service, waits \
+        for the replacement run, and returns its snapshot plus compact new logs and failure \
+        diagnosis. The primitive tools remain the right choice for finer control. Do not use this \
+        for hot-reload services, which never restart; use log_cursors followed by follow_all_logs \
+        for those."
+    )]
+    async fn restart_service_and_wait(
+        &self,
+        args: Parameters<RestartAndWaitArgs>,
+    ) -> ToolResult<RestartAndWaitResult> {
+        let Parameters(args) = args;
+        let resolved = select::resolve(&self.cwd, args.session)
+            .await
+            .map_err(error_data)?;
+        let timeout = Duration::from_secs(
+            args.timeout_secs
+                .unwrap_or(DEFAULT_WAIT_TIMEOUT_SECS)
+                .min(MAX_WAIT_TIMEOUT_SECS),
+        );
+        let log_limit = args
+            .log_limit
+            .unwrap_or(DEFAULT_RESTART_LOG_LIMIT)
+            .clamp(1, MAX_RESTART_LOG_LIMIT);
+        let mut conn = SessionConn::connect(&resolved.endpoint)
+            .await
+            .map_err(error_data)?;
+
+        let before = service_result(
+            &args.service,
+            service_snapshot(&mut conn, &args.service).await,
+        )
+        .await?;
+        // Reject before capturing cursors, mirroring restart_service's remote rejection of
+        // disabled services (which still backstops the race where the service is disabled between
+        // this check and the restart request).
+        if before.desired == Desired::Disabled {
+            return Err(error_data(ToolError::InvalidState(format!(
+                "service `{}` is disabled and cannot be restarted; use enable_service to start it",
+                args.service
+            ))));
+        }
+        let cursors = current_cursors(&mut conn).await.map_err(error_data)?;
+        let response = conn
+            .request(Request::Restart {
+                service: args.service.clone(),
+            })
+            .await
+            .map_err(error_data)?;
+        let acks = service_result(&args.service, convert::accepted(response)).await?;
+        let previous_generation = acks
+            .iter()
+            .find(|ack| ack.service == args.service)
+            .map(|ack| ack.observed_generation)
+            .ok_or_else(|| {
+                error_data(ToolError::Unexpected(format!(
+                    "restart acknowledgement omitted service `{}`",
+                    args.service
+                )))
+            })?;
+
+        let conclusion = service_result(
+            &args.service,
+            wait_for_health(
+                &resolved.endpoint,
+                &mut conn,
+                &args.service,
+                Some(previous_generation),
+                timeout,
+            )
+            .await,
+        )
+        .await?;
+        let snapshot = conclusion.snapshot().clone();
+        let cursor = cursors.get(&args.service).copied().unwrap_or(0);
+        let (logs, logs_truncated) = service_result(
+            &args.service,
+            compact_logs_since(&mut conn, &args.service, cursor, log_limit).await,
+        )
+        .await?;
+        let diagnosis = if conclusion.needs_diagnosis() {
+            Some(
+                service_result(
+                    &args.service,
+                    diagnose_service(&mut conn, snapshot.clone(), DEFAULT_DIAGNOSE_TAIL).await,
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+        let outcome = WaitResult::from_conclusion(args.service.clone(), timeout, &conclusion);
+
+        Ok(Json(RestartAndWaitResult {
+            session_ref: SessionRef::from(&resolved.info),
+            service: args.service,
+            previous_generation,
+            run_generation: snapshot.run_generation,
+            outcome,
+            snapshot,
+            logs,
+            logs_truncated,
+            diagnosis,
+        }))
     }
 
     #[tool(
@@ -1483,32 +1634,38 @@ impl McpServer {
     }
 
     #[tool(
-        description = "Show the latest healthcheck attempt for a service's current live run (command, result, output)."
+        description = "Show a service's runtime snapshot and latest healthcheck attempt for its \
+        current live run (command, result, and bounded output), plus the session config path."
     )]
     async fn get_health(&self, args: Parameters<ServiceArgs>) -> ToolResult<HealthResult> {
         let Parameters(args) = args;
         let resolved = select::resolve(&self.cwd, args.session)
             .await
             .map_err(error_data)?;
-        let response = send_request(
-            &resolved.endpoint,
-            Request::GetHealth {
-                service: args.service.clone(),
-            },
+        let mut conn = SessionConn::connect(&resolved.endpoint)
+            .await
+            .map_err(error_data)?;
+        let snapshot = service_result(
+            &args.service,
+            service_snapshot(&mut conn, &args.service).await,
         )
-        .await
-        .map_err(error_data)?;
-        let attempt = service_result(&args.service, convert::health(response)).await?;
+        .await?;
+        let latest_healthcheck = latest_health_for_snapshot(&mut conn, &snapshot)
+            .await
+            .map(bounded_attempt);
         Ok(Json(HealthResult {
+            config_path: resolved.info.config_path,
             service: args.service,
-            health: attempt,
+            snapshot,
+            latest_healthcheck,
         }))
     }
 
     #[tool(
         description = "Summarize services that need attention in one call. Returns exited, \
         starting/pending/stopping, or unhealthy services with their full state snapshot, current \
-        live-run healthcheck output when applicable, and a compact tail of likely-cause log lines."
+        live-run healthcheck output when applicable, factual supervisor-state signals, and a \
+        compact tail of likely-cause log lines."
     )]
     async fn diagnose(&self, args: Parameters<DiagnoseArgs>) -> ToolResult<DiagnoseResult> {
         let Parameters(args) = args;
@@ -1529,22 +1686,11 @@ impl McpServer {
         let services = convert::services(response).map_err(error_data)?;
         let mut diagnoses = Vec::new();
         for snapshot in services.into_iter().filter(service_needs_diagnosis) {
-            let latest_healthcheck = latest_health_for_snapshot(&mut conn, &snapshot)
-                .await
-                .map(bounded_attempt);
-            let (error_log_tail, logs_truncated) =
-                likely_cause_log_tail(&mut conn, &snapshot, tail)
+            diagnoses.push(
+                diagnose_service(&mut conn, snapshot, tail)
                     .await
-                    .map_err(error_data)?;
-            let hint = diagnosis_hint(&snapshot, latest_healthcheck.as_ref(), &error_log_tail);
-            diagnoses.push(ServiceDiagnosis {
-                service: snapshot.id.clone(),
-                snapshot,
-                latest_healthcheck,
-                error_log_tail,
-                logs_truncated,
-                hint,
-            });
+                    .map_err(error_data)?,
+            );
         }
         let session_selector = session_selector(&resolved.info);
         Ok(Json(DiagnoseResult {
@@ -1569,103 +1715,28 @@ impl McpServer {
                 .unwrap_or(DEFAULT_WAIT_TIMEOUT_SECS)
                 .min(MAX_WAIT_TIMEOUT_SECS),
         );
-        let deadline = tokio::time::Instant::now() + timeout;
         let mut conn = SessionConn::connect(&resolved.endpoint)
             .await
             .map_err(error_data)?;
-        // Best-effort wakeup; `None` (subscribe failed or stream ended) degrades to pure polling.
-        let mut subscription = Client::subscribe(&resolved.endpoint).await.ok();
-
-        loop {
-            let response = conn
-                .request(Request::ListServices)
-                .await
-                .map_err(error_data)?;
-            let services = convert::services(response).map_err(error_data)?;
-            let Some(snapshot) = services
-                .into_iter()
-                .find(|snapshot| snapshot.id == args.service)
-            else {
-                return Err(error_data(
-                    enrich_unknown_service(
-                        &args.service,
-                        ToolError::Remote {
-                            code: ErrorCode::UnknownService,
-                            message: format!("unknown service `{}`", args.service),
-                        },
-                    )
-                    .await,
-                ));
-            };
-
-            match convert::evaluate(&snapshot, args.after_generation) {
-                WaitOutcome::Healthy => {
-                    return Ok(Json(WaitResult::healthy(
-                        args.service,
-                        snapshot.run_generation,
-                    )));
-                }
-                WaitOutcome::Exited(exit_code) => {
-                    return Ok(Json(WaitResult::exited(
-                        args.service,
-                        exit_code,
-                        snapshot.run_generation,
-                    )));
-                }
-                WaitOutcome::InvalidState => {
-                    return Err(error_data(ToolError::InvalidState(format!(
-                        "service `{}` is disabled and will not become healthy",
-                        args.service
-                    ))));
-                }
-                WaitOutcome::Pending => {}
+        let conclusion = match wait_for_health(
+            &resolved.endpoint,
+            &mut conn,
+            &args.service,
+            args.after_generation,
+            timeout,
+        )
+        .await
+        {
+            Ok(conclusion) => conclusion,
+            Err(err) => {
+                return Err(error_data(enrich_unknown_service(&args.service, err).await));
             }
-
-            let now = tokio::time::Instant::now();
-            if now >= deadline {
-                // Surface the facts we have rather than guessing "still building": the execution
-                // sub-state and the latest healthcheck attempt distinguish "process up, probe
-                // failing" from "still starting" without a heuristic.
-                let latest = latest_health_for_snapshot(&mut conn, &snapshot)
-                    .await
-                    .map(bounded_attempt);
-                return Ok(Json(WaitResult::timeout(
-                    args.service,
-                    timeout.as_secs(),
-                    &snapshot,
-                    latest,
-                )));
-            }
-            let wait = deadline.saturating_duration_since(now).min(WAIT_POLL_FLOOR);
-
-            // Wake on a relevant change (this service; ignore log appends, which don't affect
-            // health), but never wait longer than the poll floor before re-polling. Drop the
-            // subscription if its stream ends — polling still converges.
-            let drop_subscription = if let Some(stream) = subscription.as_mut() {
-                let relevant = tokio::time::timeout(wait, async {
-                    loop {
-                        match stream.recv().await {
-                            Ok(Some(change))
-                                if change.service_id == args.service
-                                    && change.kind != ChangeKind::Logs =>
-                            {
-                                return true;
-                            }
-                            Ok(Some(_)) => {}
-                            Ok(None) | Err(_) => return false,
-                        }
-                    }
-                })
-                .await;
-                matches!(relevant, Ok(false))
-            } else {
-                tokio::time::sleep(wait).await;
-                false
-            };
-            if drop_subscription {
-                subscription = None;
-            }
-        }
+        };
+        Ok(Json(WaitResult::from_conclusion(
+            args.service,
+            timeout,
+            &conclusion,
+        )))
     }
 }
 
@@ -1833,10 +1904,38 @@ mod tests {
     use micromux_control::{PROTOCOL_VERSION, ServiceBrief, SessionInfo};
     use similar_asserts::assert_eq;
     use std::collections::BTreeMap;
+    use std::time::Duration;
 
     #[test]
-    fn server_builds_typed_tool_schemas() {
-        let _ = McpServer::new();
+    fn server_builds_typed_tool_schemas() -> color_eyre::Result<()> {
+        let server = McpServer::new();
+        let tools = server.tool_router.list_all();
+        let restart = tools
+            .iter()
+            .find(|tool| tool.name == "restart_service_and_wait")
+            .ok_or_else(|| color_eyre::eyre::eyre!("missing restart_service_and_wait tool"))?;
+        assert!(
+            restart
+                .description
+                .as_deref()
+                .is_some_and(|description| description.contains("hot-reload"))
+        );
+        let input_properties = restart
+            .input_schema
+            .get("properties")
+            .and_then(serde_json::Value::as_object)
+            .ok_or_else(|| color_eyre::eyre::eyre!("missing input properties"))?;
+        assert!(input_properties.contains_key("service"));
+        assert!(input_properties.contains_key("timeout_secs"));
+        assert!(input_properties.contains_key("log_limit"));
+
+        let output_schema =
+            serde_json::to_string(&schemars::schema_for!(super::RestartAndWaitResult))?;
+        assert!(output_schema.contains("previous_generation"));
+        assert!(output_schema.contains("run_generation"));
+        assert!(output_schema.contains("snapshot"));
+        assert!(output_schema.contains("diagnosis"));
+        Ok(())
     }
 
     fn session_info(id: &str, services: &[&str]) -> SessionInfo {
@@ -1934,7 +2033,7 @@ mod tests {
             "svc".to_string(),
             "svc".to_string(),
             Vec::new(),
-            false,
+            None,
             micromux::RestartPolicy::Never,
             Vec::new(),
             None,
@@ -1967,7 +2066,11 @@ mod tests {
             "svc".to_string(),
             "svc".to_string(),
             Vec::new(),
-            true,
+            Some(micromux::HealthcheckConfig {
+                retries: 1,
+                interval: Duration::from_secs(1),
+                timeout: Duration::from_secs(1),
+            }),
             micromux::RestartPolicy::Never,
             Vec::new(),
             None,

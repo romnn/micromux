@@ -1,8 +1,67 @@
-use micromux::{Execution, Health, HealthAttempt, ServiceSnapshot};
-use micromux_control::{ErrorCode, Request};
+use std::io;
+use std::net::{Ipv4Addr, SocketAddrV4};
+use std::time::Duration;
+
+use micromux::{ChangeKind, Execution, Health, HealthAttempt, ServiceSnapshot};
+use micromux_control::{Client, ControlEndpoint, ErrorCode, Request};
+use schemars::JsonSchema;
+use serde::Serialize;
 
 use crate::select::ToolError;
-use crate::{DIAGNOSE_LOG_SCAN, SessionConn, convert, logproc};
+use crate::{DIAGNOSE_LOG_SCAN, SessionConn, WAIT_POLL_FLOOR, convert, logproc};
+
+const PORT_PROBE_BUDGET: Duration = Duration::from_millis(50);
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+pub(crate) struct Signal {
+    pub(crate) kind: SignalKind,
+    pub(crate) detail: String,
+    pub(crate) next_probe: &'static str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[non_exhaustive]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SignalKind {
+    ExitSignal,
+    CrashLoop,
+    HealthcheckTimeout,
+    PortUnavailable,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub(crate) struct ServiceDiagnosis {
+    pub(crate) service: String,
+    pub(crate) snapshot: ServiceSnapshot,
+    pub(crate) latest_healthcheck: Option<HealthAttempt>,
+    pub(crate) signals: Vec<Signal>,
+    pub(crate) error_log_tail: Vec<logproc::ProcessedEntry>,
+    pub(crate) logs_truncated: bool,
+    pub(crate) hint: String,
+}
+
+pub(crate) enum WaitConclusion {
+    Healthy(ServiceSnapshot),
+    Exited(ServiceSnapshot),
+    Timeout {
+        snapshot: ServiceSnapshot,
+        latest_healthcheck: Option<HealthAttempt>,
+    },
+}
+
+impl WaitConclusion {
+    pub(crate) fn snapshot(&self) -> &ServiceSnapshot {
+        match self {
+            Self::Healthy(snapshot) | Self::Exited(snapshot) | Self::Timeout { snapshot, .. } => {
+                snapshot
+            }
+        }
+    }
+
+    pub(crate) fn needs_diagnosis(&self) -> bool {
+        matches!(self, Self::Exited(_) | Self::Timeout { .. })
+    }
+}
 
 pub(crate) fn health_attempt_matches_snapshot(
     snapshot: &ServiceSnapshot,
@@ -73,6 +132,260 @@ pub(crate) fn diagnosis_hint(
         Execution::Unknown => "service reported an unknown execution state".to_string(),
         Execution::Running => {
             "service state needs attention; inspect snapshot and logs".to_string()
+        }
+    }
+}
+
+fn exit_signal(snapshot: &ServiceSnapshot) -> Option<Signal> {
+    if snapshot.execution != Execution::Exited {
+        return None;
+    }
+    let exit_code = snapshot.last_exit_code?;
+    let meaning = match exit_code {
+        137 => " (SIGKILL; often OOM)",
+        143 => " (SIGTERM)",
+        139 => " (SIGSEGV)",
+        127 => " (command not found)",
+        126 => " (command found but not executable)",
+        0 => " (clean exit)",
+        _ => "",
+    };
+    Some(Signal {
+        kind: SignalKind::ExitSignal,
+        detail: format!("last run exited with status {exit_code}{meaning}"),
+        next_probe: "inspect error_log_tail and the full retained run with get_logs",
+    })
+}
+
+fn crash_loop_signal(snapshot: &ServiceSnapshot) -> Option<Signal> {
+    let restart = snapshot.restart_state.as_ref()?;
+    let remaining = restart.restarts_remaining.map_or_else(
+        || "unbounded".to_string(),
+        |remaining| remaining.to_string(),
+    );
+    Some(Signal {
+        kind: SignalKind::CrashLoop,
+        detail: format!(
+            "automatic restart backoff is active for {:?}; remaining restart budget: {remaining}",
+            restart.backoff_delay
+        ),
+        next_probe: "inspect the exit signal and retained logs before the next restart attempt",
+    })
+}
+
+fn healthcheck_signal(
+    snapshot: &ServiceSnapshot,
+    latest_healthcheck: Option<&HealthAttempt>,
+) -> Option<Signal> {
+    if !snapshot.healthcheck_configured
+        || snapshot.execution != Execution::Running
+        || snapshot.health == Some(Health::Healthy)
+    {
+        return None;
+    }
+
+    let timing = snapshot.healthcheck.as_ref().map_or_else(
+        || "timing unavailable from this session snapshot".to_string(),
+        |config| {
+            format!(
+                "retries: {}, interval: {:?}, timeout: {:?}",
+                config.retries, config.interval, config.timeout
+            )
+        },
+    );
+    let latest = match latest_healthcheck.and_then(|attempt| attempt.result) {
+        Some(result) if result.success => {
+            format!(
+                "latest completed attempt succeeded with exit status {}",
+                result.exit_code
+            )
+        }
+        Some(result) => {
+            format!(
+                "latest completed attempt failed with exit status {}",
+                result.exit_code
+            )
+        }
+        None => "no healthcheck attempt has completed yet".to_string(),
+    };
+    Some(Signal {
+        kind: SignalKind::HealthcheckTimeout,
+        detail: format!("healthcheck has not become healthy ({timing}); {latest}"),
+        next_probe: "inspect latest_healthcheck output and wait for another state change",
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PortProbe {
+    Available,
+    Held,
+    Unknown,
+}
+
+fn classify_bind_result(result: io::Result<tokio::net::TcpListener>) -> PortProbe {
+    match result {
+        Ok(listener) => {
+            drop(listener);
+            PortProbe::Available
+        }
+        Err(error) if error.kind() == io::ErrorKind::AddrInUse => PortProbe::Held,
+        Err(_) => PortProbe::Unknown,
+    }
+}
+
+async fn probe_port(port: u16) -> PortProbe {
+    let address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, port);
+    match tokio::time::timeout(PORT_PROBE_BUDGET, tokio::net::TcpListener::bind(address)).await {
+        Ok(result) => classify_bind_result(result),
+        Err(_) => PortProbe::Unknown,
+    }
+}
+
+async fn port_signals(snapshot: &ServiceSnapshot) -> Vec<Signal> {
+    // Probe only when micromux holds no live process for this service: a Running service has
+    // plausibly bound its own port, a Stopping one is still draining and may hold it too, and
+    // Unknown (a newer peer's state) gives no basis to attribute the holder. A held port while
+    // Pending/Starting/Exited is the useful fact — a foreign process or an orphaned child of a
+    // previous run will make the next bind fail.
+    if !matches!(
+        snapshot.execution,
+        Execution::Pending | Execution::Starting | Execution::Exited
+    ) {
+        return Vec::new();
+    }
+    let mut signals = Vec::new();
+    for port in &snapshot.advertised_ports {
+        if probe_port(*port).await == PortProbe::Held {
+            signals.push(Signal {
+                kind: SignalKind::PortUnavailable,
+                detail: format!(
+                    "advertised port {port} is already held on 127.0.0.1 while the service is {:?}",
+                    snapshot.execution
+                ),
+                next_probe: "identify the process listening on the advertised port",
+            });
+        }
+    }
+    signals
+}
+
+pub(crate) async fn supervisor_signals(
+    snapshot: &ServiceSnapshot,
+    latest_healthcheck: Option<&HealthAttempt>,
+) -> Vec<Signal> {
+    let mut signals = [
+        exit_signal(snapshot),
+        crash_loop_signal(snapshot),
+        healthcheck_signal(snapshot, latest_healthcheck),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    signals.extend(port_signals(snapshot).await);
+    signals
+}
+
+pub(crate) async fn diagnose_service(
+    conn: &mut SessionConn,
+    snapshot: ServiceSnapshot,
+    tail: usize,
+) -> Result<ServiceDiagnosis, ToolError> {
+    let latest_healthcheck = latest_health_for_snapshot(conn, &snapshot)
+        .await
+        .map(bounded_attempt);
+    let signals = supervisor_signals(&snapshot, latest_healthcheck.as_ref()).await;
+    let (error_log_tail, logs_truncated) = likely_cause_log_tail(conn, &snapshot, tail).await?;
+    let hint = diagnosis_hint(&snapshot, latest_healthcheck.as_ref(), &error_log_tail);
+    Ok(ServiceDiagnosis {
+        service: snapshot.id.clone(),
+        snapshot,
+        latest_healthcheck,
+        signals,
+        error_log_tail,
+        logs_truncated,
+        hint,
+    })
+}
+
+pub(crate) async fn service_snapshot(
+    conn: &mut SessionConn,
+    service: &str,
+) -> Result<ServiceSnapshot, ToolError> {
+    let response = conn.request(Request::ListServices).await?;
+    let services = convert::services(response)?;
+    services
+        .into_iter()
+        .find(|snapshot| snapshot.id == service)
+        .ok_or_else(|| ToolError::Remote {
+            code: ErrorCode::UnknownService,
+            message: format!("unknown service `{service}`"),
+        })
+}
+
+pub(crate) async fn wait_for_health(
+    endpoint: &ControlEndpoint,
+    conn: &mut SessionConn,
+    service: &str,
+    after_generation: Option<u64>,
+    timeout: Duration,
+) -> Result<WaitConclusion, ToolError> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    // Best-effort wakeup; `None` (subscribe failed or stream ended) degrades to pure polling.
+    let mut subscription = Client::subscribe(endpoint).await.ok();
+
+    loop {
+        let snapshot = service_snapshot(conn, service).await?;
+        match convert::evaluate(&snapshot, after_generation) {
+            convert::WaitOutcome::Healthy => return Ok(WaitConclusion::Healthy(snapshot)),
+            convert::WaitOutcome::Exited(_) => return Ok(WaitConclusion::Exited(snapshot)),
+            convert::WaitOutcome::InvalidState => {
+                return Err(ToolError::InvalidState(format!(
+                    "service `{service}` is disabled and will not become healthy"
+                )));
+            }
+            convert::WaitOutcome::Pending => {}
+        }
+
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            // Surface the facts we have rather than guessing "still building": the execution
+            // sub-state and the latest healthcheck attempt distinguish "process up, probe
+            // failing" from "still starting" without a heuristic.
+            let latest_healthcheck = latest_health_for_snapshot(conn, &snapshot)
+                .await
+                .map(bounded_attempt);
+            return Ok(WaitConclusion::Timeout {
+                snapshot,
+                latest_healthcheck,
+            });
+        }
+        let wait = deadline.saturating_duration_since(now).min(WAIT_POLL_FLOOR);
+
+        // Wake on a relevant change (this service; ignore log appends, which don't affect
+        // health), but never wait longer than the poll floor before re-polling. Drop the
+        // subscription if its stream ends — polling still converges.
+        let drop_subscription = if let Some(stream) = subscription.as_mut() {
+            let relevant = tokio::time::timeout(wait, async {
+                loop {
+                    match stream.recv().await {
+                        Ok(Some(change))
+                            if change.service_id == service && change.kind != ChangeKind::Logs =>
+                        {
+                            return true;
+                        }
+                        Ok(Some(_)) => {}
+                        Ok(None) | Err(_) => return false,
+                    }
+                }
+            })
+            .await;
+            matches!(relevant, Ok(false))
+        } else {
+            tokio::time::sleep(wait).await;
+            false
+        };
+        if drop_subscription {
+            subscription = None;
         }
     }
 }
@@ -183,4 +496,140 @@ async fn fetch_log_tail(
         })
         .await?;
     convert::logs(response)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use micromux::{HealthResult, HealthcheckConfig, RestartPolicy, RestartState};
+    use similar_asserts::assert_eq;
+
+    fn snapshot(execution: Execution) -> ServiceSnapshot {
+        let mut snapshot = ServiceSnapshot::initial(
+            "svc".to_string(),
+            "svc".to_string(),
+            Vec::new(),
+            None,
+            RestartPolicy::Never,
+            Vec::new(),
+            None,
+        );
+        snapshot.execution = execution;
+        snapshot.run_generation = 1;
+        snapshot
+    }
+
+    #[test]
+    fn exit_signal_interprets_only_portable_exit_conventions() {
+        let cases = [
+            (137, "SIGKILL; often OOM"),
+            (143, "SIGTERM"),
+            (139, "SIGSEGV"),
+            (127, "command not found"),
+            (126, "command found but not executable"),
+            (0, "clean exit"),
+        ];
+        for (exit_code, expected) in cases {
+            let mut snapshot = snapshot(Execution::Exited);
+            snapshot.last_exit_code = Some(exit_code);
+
+            let signal = exit_signal(&snapshot);
+
+            assert_eq!(
+                signal.as_ref().map(|signal| signal.kind),
+                Some(SignalKind::ExitSignal)
+            );
+            assert!(
+                signal
+                    .as_ref()
+                    .is_some_and(|signal| signal.detail.contains(expected)),
+                "missing `{expected}` for exit code {exit_code}"
+            );
+        }
+    }
+
+    #[test]
+    fn crash_loop_signal_reports_backoff_and_remaining_budget() {
+        let mut snapshot = snapshot(Execution::Exited);
+        snapshot.restart_state = Some(RestartState {
+            backoff_delay: Duration::from_millis(500),
+            restarts_remaining: Some(2),
+        });
+
+        let signal = crash_loop_signal(&snapshot);
+
+        assert_eq!(
+            signal.as_ref().map(|signal| signal.kind),
+            Some(SignalKind::CrashLoop)
+        );
+        assert!(signal.as_ref().is_some_and(|signal| {
+            signal.detail.contains("500ms") && signal.detail.contains('2')
+        }));
+    }
+
+    #[test]
+    fn healthcheck_signal_distinguishes_waiting_from_completed_failure() {
+        let mut snapshot = snapshot(Execution::Running);
+        snapshot.healthcheck_configured = true;
+        snapshot.healthcheck = Some(HealthcheckConfig {
+            retries: 3,
+            interval: Duration::from_secs(2),
+            timeout: Duration::from_secs(1),
+        });
+
+        let waiting = healthcheck_signal(&snapshot, None);
+        assert!(waiting.as_ref().is_some_and(|signal| {
+            signal.kind == SignalKind::HealthcheckTimeout
+                && signal
+                    .detail
+                    .contains("no healthcheck attempt has completed yet")
+                && signal.detail.contains("retries: 3")
+        }));
+
+        let attempt = HealthAttempt {
+            run_generation: 1,
+            attempt: 1,
+            command: "probe".to_string(),
+            output: Vec::new(),
+            result: Some(HealthResult {
+                success: false,
+                exit_code: 7,
+                cancelled: false,
+            }),
+        };
+        let failing = healthcheck_signal(&snapshot, Some(&attempt));
+        assert!(failing.as_ref().is_some_and(|signal| {
+            signal.detail.contains("failed with exit status 7")
+                && signal.detail.contains("interval: 2s")
+                && signal.detail.contains("timeout: 1s")
+        }));
+    }
+
+    #[tokio::test]
+    async fn held_advertised_port_emits_unavailable_signal() -> color_eyre::Result<()> {
+        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+        let port = listener.local_addr()?.port();
+        let mut snapshot = snapshot(Execution::Exited);
+        snapshot.advertised_ports = vec![port];
+
+        let signals = port_signals(&snapshot).await;
+
+        assert_eq!(signals.len(), 1);
+        assert_eq!(
+            signals.first().map(|signal| signal.kind),
+            Some(SignalKind::PortUnavailable)
+        );
+
+        // A draining service plausibly holds its own port — probing would blame the service for
+        // its own bind, so live-process states must not emit the signal.
+        snapshot.execution = Execution::Stopping;
+        assert_eq!(port_signals(&snapshot).await, Vec::new());
+        Ok(())
+    }
+
+    #[test]
+    fn non_address_in_use_probe_errors_do_not_emit_signals() {
+        let error = io::Error::new(io::ErrorKind::PermissionDenied, "denied");
+        assert_eq!(classify_bind_result(Err(error)), PortProbe::Unknown);
+    }
 }

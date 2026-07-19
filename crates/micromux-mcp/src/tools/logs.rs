@@ -244,6 +244,34 @@ pub(crate) async fn current_cursors(
     Ok(cursors)
 }
 
+pub(crate) async fn compact_logs_since(
+    conn: &mut SessionConn,
+    service: &str,
+    after: u64,
+    limit: usize,
+) -> Result<(Vec<logproc::ProcessedEntry>, bool), ToolError> {
+    let response = conn
+        .request(Request::FollowLogs {
+            service: service.to_string(),
+            run_generation: None,
+            after: Some(after),
+        })
+        .await?;
+    let logs = convert::logs(response)?;
+    let mut entries = logproc::shape(
+        &logs.lines,
+        &logproc::Shape {
+            format: logproc::LogFormat::Compact,
+            ..logproc::Shape::default()
+        },
+    );
+    let mut truncated = logs.truncated;
+    if entries.len() > limit {
+        truncated |= logproc::truncate_preserving_record_boundaries(&mut entries, limit);
+    }
+    Ok((entries, truncated))
+}
+
 pub(crate) async fn follow_all_current_logs(
     conn: &mut SessionConn,
     after: &BTreeMap<String, u64>,

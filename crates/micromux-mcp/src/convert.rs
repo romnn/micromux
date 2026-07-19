@@ -173,7 +173,7 @@ mod tests {
             "svc".to_string(),
             "svc".to_string(),
             Vec::new(),
-            false,
+            None,
             RestartPolicy::Never,
             Vec::new(),
             None,
