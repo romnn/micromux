@@ -39,6 +39,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::select::ToolError;
+use crate::tools::events::{ServiceEventPage, SessionServiceEvent, merge_service_events};
 use crate::tools::health::{
     ServiceDiagnosis, SnapshotWait, WaitConclusion, bounded_attempt, diagnose_service,
     latest_health_for_snapshot, retired_service_message, service_needs_diagnosis, service_snapshot,
@@ -68,6 +69,8 @@ const DEFAULT_LOG_TAIL: usize = 200;
 /// Upper bound on entries fetched from the session per call; also the window scanned when a filter is
 /// active, so `grep`/`min_level` can match against more than the returned count.
 const MAX_LOG_TAIL: usize = 2000;
+const DEFAULT_EVENT_TAIL: usize = 50;
+const MAX_EVENT_TAIL: usize = micromux::EVENT_HISTORY;
 const DEFAULT_DIAGNOSE_TAIL: usize = 5;
 const MAX_DIAGNOSE_TAIL: usize = 20;
 const DIAGNOSE_LOG_SCAN: usize = 500;
@@ -139,7 +142,7 @@ struct ServiceArgs {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct ServiceEventsArgs {
-    /// The id of the target service.
+    /// The id of the target service, or `*` to merge events from every service.
     service: String,
     /// Optional session selector; omit for the current project.
     #[serde(default)]
@@ -147,6 +150,9 @@ struct ServiceEventsArgs {
     /// Return events with a sequence strictly greater than this cursor.
     #[serde(default)]
     after_seq: Option<u64>,
+    /// Per-service cursors for `service="*"`; missing services start before their first event.
+    #[serde(default)]
+    after: Option<BTreeMap<String, u64>>,
     /// Maximum events to return (default 50, capped at 256).
     #[serde(default)]
     tail: Option<usize>,
@@ -684,7 +690,7 @@ struct HealthResult {
 }
 
 #[derive(Serialize, JsonSchema)]
-struct ServiceEventsResult {
+struct SingleServiceEventsResult {
     #[serde(flatten)]
     session_ref: SessionRef,
     service: String,
@@ -694,6 +700,26 @@ struct ServiceEventsResult {
     next_seq: Option<u64>,
     /// Whether older events were dropped by the tail bound or ring eviction.
     truncated: bool,
+}
+
+#[derive(Serialize, JsonSchema)]
+struct SessionServiceEventsResult {
+    #[serde(flatten)]
+    session_ref: SessionRef,
+    service: String,
+    /// Lifecycle timeline events from every service, oldest first.
+    events: Vec<SessionServiceEvent>,
+    /// Per-service cursors; pass this map as `after` to follow incrementally.
+    next: BTreeMap<String, u64>,
+    /// Whether older events were dropped by the shared tail bound or ring eviction.
+    truncated: bool,
+}
+
+#[derive(Serialize, JsonSchema)]
+#[serde(untagged)]
+enum ServiceEventsResult {
+    Single(SingleServiceEventsResult),
+    Session(SessionServiceEventsResult),
 }
 
 #[derive(Serialize, JsonSchema)]
@@ -2233,8 +2259,9 @@ impl McpServer {
     }
 
     #[tool(
-        description = "Return a service's retained scheduler lifecycle timeline. Use after_seq for \
-        incremental polling; events include dependency gating, spawn/exit, health transitions, \
+        description = "Return retained scheduler lifecycle events. Use after_seq for one service, \
+        or pass service=\"*\" with the previous per-service `next` map as `after` to merge every \
+        service's timeline. Events include dependency gating, spawn/exit, health transitions, \
         restart backoff, config reloads, and dynamic-service lifecycle changes."
     )]
     async fn get_service_events(
@@ -2245,6 +2272,66 @@ impl McpServer {
         let resolved = select::resolve(&self.cwd, args.session)
             .await
             .map_err(error_data)?;
+        if args.service == "*" {
+            if args.after_seq.is_some() {
+                return Err(ErrorData::invalid_params(
+                    "after_seq is service-scoped; use the per-service after map with service=\"*\"",
+                    None,
+                ));
+            }
+            let limit = args
+                .tail
+                .unwrap_or(DEFAULT_EVENT_TAIL)
+                .clamp(1, MAX_EVENT_TAIL);
+            let tail_mode = args.after.is_none();
+            let mut conn = SessionConn::connect(&resolved.endpoint)
+                .await
+                .map_err(error_data)?;
+            let response = conn
+                .request(Request::ListServices)
+                .await
+                .map_err(error_data)?;
+            let services = convert::services(response).map_err(error_data)?;
+            let mut pages = Vec::with_capacity(services.len());
+            for service in services {
+                let after_seq = args
+                    .after
+                    .as_ref()
+                    .map(|cursors| cursors.get(&service.id).copied().unwrap_or(0));
+                let response = conn
+                    .request(Request::GetEvents {
+                        service: service.id.clone(),
+                        after: after_seq,
+                        tail: Some(limit),
+                    })
+                    .await
+                    .map_err(error_data)?;
+                let (events, truncated) =
+                    service_result(&service.id, convert::events(response)).await?;
+                pages.push(ServiceEventPage {
+                    service: service.id,
+                    after_seq,
+                    events,
+                    truncated,
+                });
+            }
+            let merged = merge_service_events(pages, limit, tail_mode);
+            return Ok(Json(ServiceEventsResult::Session(
+                SessionServiceEventsResult {
+                    session_ref: SessionRef::from(&resolved.info),
+                    service: args.service,
+                    events: merged.events,
+                    next: merged.next,
+                    truncated: merged.truncated,
+                },
+            )));
+        }
+        if args.after.is_some() {
+            return Err(ErrorData::invalid_params(
+                "after is only valid with service=\"*\"; use after_seq for one service",
+                None,
+            ));
+        }
         let response = send_request(
             &resolved.endpoint,
             Request::GetEvents {
@@ -2257,13 +2344,15 @@ impl McpServer {
         .map_err(error_data)?;
         let (events, truncated) = service_result(&args.service, convert::events(response)).await?;
         let next_seq = events.last().map(|event| event.seq).or(args.after_seq);
-        Ok(Json(ServiceEventsResult {
-            session_ref: SessionRef::from(&resolved.info),
-            service: args.service,
-            events,
-            next_seq,
-            truncated,
-        }))
+        Ok(Json(ServiceEventsResult::Single(
+            SingleServiceEventsResult {
+                session_ref: SessionRef::from(&resolved.info),
+                service: args.service,
+                events,
+                next_seq,
+                truncated,
+            },
+        )))
     }
 
     #[tool(
@@ -2750,8 +2839,9 @@ mod tests {
     use super::{
         DynamicServiceArgs, EnsureAction, EnsureActionKind, EnsureReadyArgs, LogFilterArgs,
         LogsArgs, ReconcileConfigArgs, RenewDynamicServiceArgs, ReplaceDynamicServiceArgs,
-        ServiceArgs, ServiceEventsArgs, SessionArgs, StartDynamicAndWaitArgs, WaitForExitArgs,
-        WaitForExitStatus, WaitStatus,
+        ServiceArgs, ServiceEventsArgs, ServiceEventsResult, SessionArgs,
+        SessionServiceEventsResult, StartDynamicAndWaitArgs, WaitForExitArgs, WaitForExitStatus,
+        WaitStatus,
     };
 
     #[cfg(unix)]
@@ -2938,10 +3028,14 @@ services:
                 service: "debug".to_string(),
                 session: Some(selector.to_string()),
                 after_seq: None,
+                after: None,
                 tail: Some(20),
             }))
             .await
             .map_err(|err| color_eyre::eyre::eyre!(err.message))?;
+        let ServiceEventsResult::Single(events) = events else {
+            color_eyre::eyre::bail!("single-service event request returned a session-wide page");
+        };
         assert!(
             events
                 .events
@@ -2956,6 +3050,197 @@ services:
         );
         assert!(events.next_seq.is_some());
         assert!(!events.truncated);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    async fn start_event_test_services(
+        server: &McpServer,
+        selector: &str,
+    ) -> color_eyre::eyre::Result<()> {
+        for service in ["first", "second"] {
+            let idempotency_key = format!("create-{service}");
+            server
+                .start_dynamic_service(Parameters(DynamicServiceArgs {
+                    session: Some(selector.to_string()),
+                    params: dynamic_params_for(
+                        service,
+                        &["sh", "-c", "sleep 60"],
+                        Some(&idempotency_key),
+                    ),
+                }))
+                .await
+                .map_err(|err| color_eyre::eyre::eyre!(err.message))?;
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    async fn renew_event_test_services(
+        server: &McpServer,
+        selector: &str,
+        services: &[&str],
+        lease_secs: u64,
+    ) -> color_eyre::eyre::Result<()> {
+        for service in services {
+            server
+                .renew_dynamic_service(Parameters(RenewDynamicServiceArgs {
+                    service: (*service).to_string(),
+                    expected_revision: 1,
+                    expires_after: Some(Lease::After(Duration::from_secs(lease_secs))),
+                    session: Some(selector.to_string()),
+                }))
+                .await
+                .map_err(|err| color_eyre::eyre::eyre!(err.message))?;
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    async fn wildcard_event_page(
+        server: &McpServer,
+        selector: &str,
+        after: Option<BTreeMap<String, u64>>,
+    ) -> color_eyre::eyre::Result<SessionServiceEventsResult> {
+        let Json(page) = server
+            .get_service_events(Parameters(ServiceEventsArgs {
+                service: "*".to_string(),
+                session: Some(selector.to_string()),
+                after_seq: None,
+                after,
+                tail: Some(micromux::EVENT_HISTORY),
+            }))
+            .await
+            .map_err(|err| color_eyre::eyre::eyre!(err.message))?;
+        let ServiceEventsResult::Session(page) = page else {
+            color_eyre::eyre::bail!("wildcard event request returned a single-service page");
+        };
+        Ok(page)
+    }
+
+    #[cfg(unix)]
+    fn assert_initial_event_page(
+        page: &SessionServiceEventsResult,
+    ) -> color_eyre::eyre::Result<()> {
+        assert!(!page.truncated);
+        assert!(page.events.windows(2).all(|events| {
+            let left = &events[0];
+            let right = &events[1];
+            (left.event.at_unix_ms, left.service.as_str(), left.event.seq)
+                <= (
+                    right.event.at_unix_ms,
+                    right.service.as_str(),
+                    right.event.seq,
+                )
+        }));
+        let lifecycle = page
+            .events
+            .iter()
+            .filter(|event| {
+                ["first", "second"].contains(&event.service.as_str())
+                    && matches!(
+                        event.event.kind,
+                        micromux::ServiceEventKind::Created
+                            | micromux::ServiceEventKind::LeaseRenewed
+                    )
+            })
+            .map(|event| (event.service.as_str(), event.event.kind))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            lifecycle,
+            vec![
+                ("first", micromux::ServiceEventKind::Created),
+                ("second", micromux::ServiceEventKind::Created),
+                ("first", micromux::ServiceEventKind::LeaseRenewed),
+                ("second", micromux::ServiceEventKind::LeaseRenewed),
+            ]
+        );
+        for service in ["first", "second"] {
+            let returned_cursor = page
+                .events
+                .iter()
+                .filter(|event| event.service == service)
+                .map(|event| event.event.seq)
+                .max();
+            assert_eq!(page.next.get(service).copied(), returned_cursor);
+        }
+        let encoded = serde_json::to_value(&page.events)?;
+        assert!(
+            encoded
+                .as_array()
+                .is_some_and(
+                    |events| events.iter().all(|event| event.get("service").is_some()
+                        && event.get("seq").is_some()
+                        && event.get("event").is_none())
+                )
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn assert_incremental_event_page(
+        page: &SessionServiceEventsResult,
+        previous: &BTreeMap<String, u64>,
+    ) {
+        assert!(
+            page.events.iter().all(|event| {
+                event.event.seq > previous.get(&event.service).copied().unwrap_or(0)
+            })
+        );
+        let renewed = page
+            .events
+            .iter()
+            .filter(|event| {
+                event.event.kind == micromux::ServiceEventKind::LeaseRenewed
+                    && ["first", "second"].contains(&event.service.as_str())
+            })
+            .map(|event| event.service.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(renewed, vec!["second", "first"]);
+        for event in &page.events {
+            assert!(
+                page.next
+                    .get(&event.service)
+                    .is_some_and(|cursor| *cursor >= event.event.seq)
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn session_events_merge_and_page_with_per_service_cursors() -> color_eyre::eyre::Result<()>
+    {
+        let project = tempfile::tempdir()?;
+        let (session, selector) = boot_dynamic_mcp_session(project.path())?;
+        let mut server = McpServer::new();
+        server.cwd = project.path().to_path_buf();
+
+        start_event_test_services(&server, &selector).await?;
+        renew_event_test_services(&server, &selector, &["first", "second"], 45).await?;
+        let first_page = wildcard_event_page(&server, &selector, None).await?;
+        assert_initial_event_page(&first_page)?;
+
+        let previous = first_page.next;
+        renew_event_test_services(&server, &selector, &["second", "first"], 50).await?;
+        let next_page = wildcard_event_page(&server, &selector, Some(previous.clone())).await?;
+        assert_incremental_event_page(&next_page, &previous);
+
+        let invalid = server
+            .get_service_events(Parameters(ServiceEventsArgs {
+                service: "*".to_string(),
+                session: Some(selector),
+                after_seq: Some(1),
+                after: None,
+                tail: None,
+            }))
+            .await
+            .err()
+            .ok_or_else(|| color_eyre::eyre::eyre!("wildcard scalar cursor was accepted"))?;
+        assert!(invalid.message.contains("after_seq is service-scoped"));
+
+        session.finish().await?;
         Ok(())
     }
 
