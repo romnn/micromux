@@ -401,6 +401,7 @@ mod tests {
             config_path: "/project/micromux.yaml".to_string(),
             services: Vec::new(),
             micromux_version: env!("CARGO_PKG_VERSION").to_string(),
+            capabilities: None,
         }
     }
 

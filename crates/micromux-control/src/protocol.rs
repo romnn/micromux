@@ -1,13 +1,14 @@
 //! The control wire protocol: newline-delimited JSON request/response envelopes.
 //!
 //! Domain payloads (`ServiceSnapshot`, `HealthAttempt`, `LogLine`, `SessionChange`,
-//! `ServiceCommandAck`) are the stable core types reused directly — no DTO mirror. The session and
-//! the proxy accept peers that speak the same major protocol version, so additive payload changes
-//! do not orphan already-running sessions.
+//! `ServiceCommandAck`, `DynamicServiceAck`, `ServiceEvent`, and `DynamicServiceParams`) are the
+//! stable core types reused directly — no DTO mirror. The session and the proxy accept peers that
+//! speak the same major protocol version, so additive payload changes do not orphan
+//! already-running sessions.
 
 use micromux::{
-    HealthAttempt, LogLine, LogRunSummary, ServiceCommandAck, ServiceID, ServiceSnapshot,
-    SessionChange,
+    DynamicServiceAck, DynamicServiceParams, HealthAttempt, LogLine, LogRunSummary,
+    ServiceCommandAck, ServiceEvent, ServiceID, ServiceSnapshot, SessionChange,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -16,7 +17,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// Bump the minor for additive changes (new optional/defaulted fields, new tools that reuse
 /// existing requests), and bump the major for incompatible request/response semantics.
-pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(3, 2);
+pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(3, 3);
 
 /// A typed control protocol version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -96,6 +97,15 @@ pub enum Request {
         /// Target service.
         service: ServiceID,
     },
+    /// Return retained scheduler lifecycle events for a service.
+    GetEvents {
+        /// Target service.
+        service: ServiceID,
+        /// Return events with a sequence strictly greater than this cursor.
+        after: Option<u64>,
+        /// Bound the result; when `after` is absent this selects the newest events.
+        tail: Option<usize>,
+    },
     /// Restart a single service.
     Restart {
         /// Target service.
@@ -111,6 +121,25 @@ pub enum Request {
     /// Disable a single service.
     Disable {
         /// Target service.
+        service: ServiceID,
+    },
+    /// Create and start a dynamic service.
+    StartDynamicService {
+        /// Definition, clone source, and lease request.
+        params: DynamicServiceParams,
+    },
+    /// Replace or revive a dynamic service.
+    ReplaceDynamicService {
+        /// Existing dynamic service id.
+        service: ServiceID,
+        /// Required current revision.
+        expected_revision: u64,
+        /// Replacement definition, clone source, and lease request.
+        params: DynamicServiceParams,
+    },
+    /// Retire a dynamic service.
+    StopDynamicService {
+        /// Dynamic service id.
         service: ServiceID,
     },
     /// Stop the whole session: stop every service and exit the session process (graceful, like the
@@ -157,6 +186,30 @@ pub struct SessionInfo {
     /// The micromux version of the session binary.
     #[serde(default)]
     pub micromux_version: String,
+    /// Optional capabilities advertised by newer sessions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<SessionCapabilities>,
+}
+
+/// Optional session features and their current limits.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct SessionCapabilities {
+    /// Dynamic-service limits, or `None` when runtime creation is not permitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dynamic_services: Option<DynamicServicesCaps>,
+}
+
+/// Dynamic-service limits and current usage advertised by a session.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct DynamicServicesCaps {
+    /// Maximum non-retired dynamic services.
+    pub max_services: usize,
+    /// Current non-retired dynamic-service count.
+    pub live_services: usize,
+    /// Maximum and default lease duration in seconds.
+    pub max_lifetime_secs: u64,
+    /// Canonical working-directory roots accepted by the session.
+    pub allowed_working_roots: Vec<String>,
 }
 
 impl SessionInfo {
@@ -186,6 +239,14 @@ pub enum ErrorCode {
     InvalidState,
     /// The latest config could not be reloaded before a restart/enable command.
     ConfigReload,
+    /// The target session's policy denied the operation.
+    PolicyDenied,
+    /// A target-session resource limit was reached.
+    LimitExceeded,
+    /// An optimistic-concurrency revision was stale.
+    RevisionMismatch,
+    /// A dynamic service definition was invalid.
+    InvalidSpec,
     /// The scheduler stopped before acknowledging a command.
     SchedulerStopped,
     /// The control plane is not supported on this platform.
@@ -223,12 +284,21 @@ pub enum Response {
     },
     /// Reply to [`Request::GetHealth`].
     Health(Option<HealthAttempt>),
+    /// Reply to [`Request::GetEvents`].
+    Events {
+        /// Retained lifecycle events in ascending sequence order.
+        events: Vec<ServiceEvent>,
+        /// Whether matching events were omitted by the response bound.
+        truncated: bool,
+    },
     /// A mutation was *accepted* (validated + queued), not necessarily completed. Carries each
     /// affected service's latched generation.
     Accepted {
         /// Per-service acknowledgements.
         services: Vec<ServiceCommandAck>,
     },
+    /// Reply to a dynamic-service mutation.
+    DynamicService(DynamicServiceAck),
     /// A streamed change notification (only after [`Request::Subscribe`]).
     Change(SessionChange),
     /// Acknowledgement of [`Request::Shutdown`], written just before the session begins exiting.
@@ -270,6 +340,7 @@ mod tests {
             config_path: "/project/micromux.yaml".to_string(),
             services: Vec::new(),
             micromux_version: env!("CARGO_PKG_VERSION").to_string(),
+            capabilities: None,
         }
     }
 
@@ -287,7 +358,7 @@ mod tests {
     fn protocol_version_uses_major_minor_shape_and_accepts_same_major() {
         assert_eq!(
             serde_json::to_value(PROTOCOL_VERSION).unwrap(),
-            json!({ "major": 3, "minor": 2 })
+            json!({ "major": 3, "minor": 3 })
         );
         assert_eq!(
             serde_json::from_value::<ProtocolVersion>(json!({ "major": 1, "minor": 0 })).unwrap(),
@@ -335,10 +406,51 @@ mod tests {
         }))
         .unwrap();
 
-        assert_eq!(info.protocol_version, PROTOCOL_VERSION);
+        assert_eq!(info.protocol_version, ProtocolVersion::new(3, 2));
         assert_eq!(info.name, "");
         assert!(info.services.is_empty());
         assert_eq!(info.micromux_version, "");
+        assert!(info.capabilities.is_none());
+    }
+
+    #[test]
+    fn dynamic_service_ack_round_trips_and_accepts_missing_additive_fields() {
+        let ack = DynamicServiceAck {
+            service: "debug".to_string(),
+            revision: 2,
+            observed_generation: 1,
+            expires_at_unix_ms: 1234,
+            command: vec!["true".to_string()],
+            working_dir: None,
+            ports: vec![3201],
+            env_keys: vec!["RUST_LOG".to_string()],
+            restart: micromux::RestartPolicy::Never,
+            healthcheck_configured: false,
+            already_retired: false,
+            idempotent_replay: true,
+        };
+        let encoded = serde_json::to_value(Response::DynamicService(ack.clone())).unwrap();
+        let decoded = serde_json::from_value::<Response>(encoded).unwrap();
+        let Response::DynamicService(decoded) = decoded else {
+            panic!("expected a dynamic-service response");
+        };
+        assert_eq!(decoded.service, ack.service);
+        assert_eq!(decoded.revision, ack.revision);
+        assert!(decoded.idempotent_replay);
+
+        // The defaulted fields are additive: a minimal older payload still deserializes.
+        let minimal = serde_json::from_value::<DynamicServiceAck>(json!({
+            "service": "debug",
+            "revision": 1,
+            "observed_generation": 0,
+            "expires_at_unix_ms": 1,
+            "command": ["true"],
+            "restart": "Never",
+            "healthcheck_configured": false
+        }))
+        .unwrap();
+        assert!(minimal.ports.is_empty());
+        assert!(!minimal.already_retired);
     }
 
     #[test]
@@ -357,5 +469,51 @@ mod tests {
             }
             other => panic!("unexpected response: {other:?}"),
         }
+    }
+
+    #[test]
+    fn dynamic_request_round_trips_flat_spec_and_humantime_lease() -> serde_json::Result<()> {
+        let value = json!({
+            "StartDynamicService": {
+                "params": {
+                    "service": "debug",
+                    "command": ["CMD-SHELL", "echo ready"],
+                    "environment": {"MODE": "debug"},
+                    "healthcheck": null,
+                    "expires_after": "90s",
+                    "idempotency_key": "request-1"
+                }
+            }
+        });
+        let request = serde_json::from_value::<Request>(value.clone())?;
+        let Request::StartDynamicService { params } = &request else {
+            return Err(serde_json::Error::io(std::io::Error::other(
+                "unexpected request variant",
+            )));
+        };
+        assert_eq!(
+            params.expires_after,
+            Some(std::time::Duration::from_secs(90))
+        );
+        assert_eq!(params.spec.healthcheck, micromux::SpecField::Clear);
+        let encoded = serde_json::to_value(&request)?;
+        assert_eq!(
+            encoded.pointer("/StartDynamicService/params/expires_after"),
+            Some(&json!("1m 30s"))
+        );
+        assert_eq!(
+            encoded.pointer("/StartDynamicService/params/extra_args"),
+            Some(&json!([]))
+        );
+        let Request::StartDynamicService { params } = serde_json::from_value(encoded)? else {
+            return Err(serde_json::Error::io(std::io::Error::other(
+                "unexpected round-trip request variant",
+            )));
+        };
+        assert_eq!(
+            params.expires_after,
+            Some(std::time::Duration::from_secs(90))
+        );
+        Ok(())
     }
 }

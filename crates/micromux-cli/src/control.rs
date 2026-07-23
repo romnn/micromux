@@ -67,6 +67,7 @@ pub fn spawn(
         handles.reader.clone(),
         handles.service_control(),
         identity,
+        handles.dynamic_services.clone(),
     ));
     tracing::info!(endpoint = ?endpoint, "control plane listening");
 

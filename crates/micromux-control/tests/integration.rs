@@ -29,16 +29,22 @@ struct Session {
 fn build_session(dir: &Path, command: &str) -> eyre::Result<Session> {
     let yaml =
         format!("version: 1\nservices:\n  svc:\n    command: [\"sh\", \"-c\", \"{command}\"]\n");
+    build_session_yaml(dir, &yaml)
+}
+
+fn build_session_yaml(dir: &Path, yaml: &str) -> eyre::Result<Session> {
     let mut diagnostics = vec![];
-    let config = micromux::from_str(&yaml, Path::new("."), 0usize, None, &mut diagnostics)
+    let mut config = micromux::from_str(yaml, dir, 0usize, None, &mut diagnostics)
         .map_err(|err| eyre::eyre!("parse config: {err}"))?;
+    let config_path = dir.join("micromux.yaml");
+    std::fs::write(&config_path, yaml)?;
+    config.config_path = Some(config_path.clone());
     let mux = Arc::new(micromux::Micromux::new(&config)?);
 
     let shutdown = CancellationToken::new();
     let (runner, handles) = mux.clone().start(shutdown.clone());
     let runner = tokio::spawn(runner);
 
-    let config_path = dir.join("micromux.yaml");
     let endpoint = micromux_control::endpoint_for(dir, &config_path);
     let guard = bind(&endpoint)?.ok_or_else(|| eyre::eyre!("failed to acquire endpoint lock"))?;
     let identity = SessionIdentity::new("test".to_string(), dir, &config_path);
@@ -46,6 +52,7 @@ fn build_session(dir: &Path, command: &str) -> eyre::Result<Session> {
         handles.reader.clone(),
         handles.service_control(),
         identity,
+        handles.dynamic_services.clone(),
     ));
     tokio::spawn({
         let shutdown = shutdown.clone();
@@ -57,6 +64,36 @@ fn build_session(dir: &Path, command: &str) -> eyre::Result<Session> {
         shutdown,
         _runner: runner,
     })
+}
+
+fn dynamic_params(id: &str, command: &[&str]) -> micromux::DynamicServiceParams {
+    let spec = micromux::PartialServiceSpec {
+        command: Some(command.iter().map(|part| (*part).to_string()).collect()),
+        environment: Some(
+            [("PRIVATE_VALUE".to_string(), "secret".to_string())]
+                .into_iter()
+                .collect(),
+        ),
+        ..micromux::PartialServiceSpec::default()
+    };
+    micromux::DynamicServiceParams {
+        service: id.to_string(),
+        spec,
+        from_service: None,
+        extra_args: Vec::new(),
+        expires_after: Some(Duration::from_secs(30)),
+        owner: Some("integration-test".to_string()),
+        idempotency_key: None,
+    }
+}
+
+async fn dynamic_caps(client: &mut Client) -> eyre::Result<micromux_control::DynamicServicesCaps> {
+    client
+        .describe()
+        .await?
+        .capabilities
+        .and_then(|capabilities| capabilities.dynamic_services)
+        .ok_or_else(|| eyre::eyre!("dynamic capability missing"))
 }
 
 async fn request_until<F>(
@@ -178,6 +215,189 @@ async fn describe_list_logs_and_restart_over_the_socket() -> eyre::Result<()> {
             ..
         }
     ));
+
+    session.shutdown.cancel();
+    Ok(())
+}
+
+#[tokio::test]
+async fn dynamic_service_lifecycle_and_capabilities_cross_the_socket() -> eyre::Result<()> {
+    let dir = unique_dir("dynamic")?;
+    let session = build_session_yaml(
+        dir.path(),
+        r#"version: 1
+control:
+  dynamic_services:
+    enabled: true
+    allowed_working_roots: [.]
+    max_services: 2
+    max_lifetime: 1h
+services:
+  svc:
+    command: ["sh", "-c", "sleep 60"]
+    environment:
+      CLONED_SECRET: hidden
+"#,
+    )?;
+    let mut client = Client::connect(&session.endpoint).await?;
+    let before_caps = dynamic_caps(&mut client).await?;
+    assert_eq!(before_caps.max_services, 2);
+    assert_eq!(before_caps.live_services, 0);
+
+    let mut params = dynamic_params("debug", &["sh", "-c", "echo debug; sleep 60"]);
+    params.from_service = Some("svc".to_string());
+    params.extra_args.push("clone-arg".to_string());
+    let created = client
+        .request(Request::StartDynamicService { params })
+        .await?;
+    let Response::DynamicService(created) = created else {
+        eyre::bail!("expected dynamic-service receipt, got {created:?}");
+    };
+    assert_eq!(created.revision, 1);
+    assert_eq!(created.env_keys, vec!["CLONED_SECRET", "PRIVATE_VALUE"]);
+    assert_eq!(
+        created.command.last().map(String::as_str),
+        Some("clone-arg")
+    );
+    assert!(!serde_json::to_string(&created)?.contains("secret"));
+
+    request_until(&session.endpoint, Request::ListServices, |response| {
+        matches!(response, Response::Services(services)
+        if services.iter().any(|service| {
+            service.id == "debug"
+                && service.origin == micromux::OriginKind::Dynamic
+                && service.execution == micromux::Execution::Running
+        }))
+    })
+    .await?;
+    assert_eq!(dynamic_caps(&mut client).await?.live_services, 1);
+
+    let stale = client
+        .request(Request::ReplaceDynamicService {
+            service: "debug".to_string(),
+            expected_revision: 0,
+            params: dynamic_params("debug", &["true"]),
+        })
+        .await?;
+    assert!(matches!(
+        stale,
+        Response::Error {
+            code: micromux_control::ErrorCode::RevisionMismatch,
+            ..
+        }
+    ));
+
+    let replaced = client
+        .request(Request::ReplaceDynamicService {
+            service: "debug".to_string(),
+            expected_revision: 1,
+            params: dynamic_params("debug", &["sh", "-c", "echo replaced; sleep 60"]),
+        })
+        .await?;
+    let Response::DynamicService(replaced) = replaced else {
+        eyre::bail!("expected dynamic-service receipt, got {replaced:?}");
+    };
+    assert_eq!(replaced.revision, 2);
+    assert!(!replaced.idempotent_replay);
+
+    let stopped = client
+        .request(Request::StopDynamicService {
+            service: "debug".to_string(),
+        })
+        .await?;
+    assert!(matches!(stopped, Response::DynamicService(receipt) if !receipt.already_retired));
+    request_until(&session.endpoint, Request::ListServices, |response| {
+        matches!(response, Response::Services(services)
+        if services.iter().any(|service| {
+            service.id == "debug"
+                && service.dynamic.as_ref().is_some_and(|dynamic| {
+                    dynamic.retired == Some(micromux::RetiredReason::Stopped)
+                })
+        }))
+    })
+    .await?;
+    assert_eq!(dynamic_caps(&mut client).await?.live_services, 0);
+
+    session.shutdown.cancel();
+    Ok(())
+}
+
+#[tokio::test]
+async fn service_events_page_and_bound_over_the_socket() -> eyre::Result<()> {
+    let dir = unique_dir("events")?;
+    let session = build_session_yaml(
+        dir.path(),
+        r#"version: 1
+control:
+  dynamic_services:
+    enabled: true
+services:
+  svc:
+    command: ["sh", "-c", "sleep 60"]
+"#,
+    )?;
+    let mut client = Client::connect(&session.endpoint).await?;
+    let created = client
+        .request(Request::StartDynamicService {
+            params: dynamic_params("debug", &["sh", "-c", "sleep 60"]),
+        })
+        .await?;
+    eyre::ensure!(
+        matches!(created, Response::DynamicService(_)),
+        "expected dynamic-service receipt, got {created:?}"
+    );
+
+    // Created lands with the insert; Spawned once the scheduler starts the run.
+    let full = request_until(
+        &session.endpoint,
+        Request::GetEvents {
+            service: "debug".to_string(),
+            after: None,
+            tail: Some(micromux::EVENT_HISTORY + 1),
+        },
+        |response| matches!(response, Response::Events { events, .. } if events.len() >= 2),
+    )
+    .await?;
+    let Response::Events {
+        events,
+        truncated: false,
+    } = full
+    else {
+        eyre::bail!("expected an untruncated event list, got {full:?}");
+    };
+    assert!(
+        events
+            .iter()
+            .any(|event| event.kind == micromux::ServiceEventKind::Created)
+    );
+    let first_seq = events
+        .first()
+        .map(|event| event.seq)
+        .ok_or_else(|| eyre::eyre!("event list was empty"))?;
+
+    // An explicit tail below the event count is clamped and reported as truncated.
+    let bounded = client
+        .request(Request::GetEvents {
+            service: "debug".to_string(),
+            after: None,
+            tail: Some(1),
+        })
+        .await?;
+    assert!(matches!(bounded, Response::Events { events, truncated: true } if events.len() == 1));
+
+    // The `after` cursor pages strictly past the given seq.
+    let paged = client
+        .request(Request::GetEvents {
+            service: "debug".to_string(),
+            after: Some(first_seq),
+            tail: None,
+        })
+        .await?;
+    let Response::Events { events: later, .. } = paged else {
+        eyre::bail!("expected an event list, got {paged:?}");
+    };
+    assert!(!later.is_empty());
+    assert!(later.iter().all(|event| event.seq > first_seq));
 
     session.shutdown.cancel();
     Ok(())

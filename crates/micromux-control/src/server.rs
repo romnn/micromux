@@ -123,6 +123,7 @@ pub struct ControlServer {
     reader: SessionModelReader,
     control: ServiceControl,
     identity: SessionIdentity,
+    dynamic_policy: micromux::DynamicServicesPolicy,
 }
 
 impl ControlServer {
@@ -132,11 +133,13 @@ impl ControlServer {
         reader: SessionModelReader,
         control: ServiceControl,
         identity: SessionIdentity,
+        dynamic_policy: micromux::DynamicServicesPolicy,
     ) -> Self {
         Self {
             reader,
             control,
             identity,
+            dynamic_policy,
         }
     }
 

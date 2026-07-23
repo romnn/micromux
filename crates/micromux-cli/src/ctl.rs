@@ -44,23 +44,39 @@ fn request_for(action: &CtlAction) -> Request {
     }
 }
 
+fn service_origin_label(service: &micromux::ServiceSnapshot) -> String {
+    match (&service.origin, &service.dynamic) {
+        (micromux::OriginKind::Configured, _) => "configured".to_string(),
+        (micromux::OriginKind::Dynamic, Some(dynamic)) => format!(
+            "dynamic(revision={}, retired={:?})",
+            dynamic.revision, dynamic.retired
+        ),
+        (micromux::OriginKind::Dynamic, None) => "dynamic".to_string(),
+        (micromux::OriginKind::Unknown, _) => "unknown".to_string(),
+    }
+}
+
+fn print_services(services: &[micromux::ServiceSnapshot]) {
+    for service in services {
+        let health = service
+            .health
+            .map_or_else(|| "-".to_string(), |health| health.to_string());
+        println!(
+            "{:<20} id={} origin={} desired={:?} execution={:?} health={} generation={}",
+            service.name,
+            service.id,
+            service_origin_label(service),
+            service.desired,
+            service.execution,
+            health,
+            service.run_generation
+        );
+    }
+}
+
 fn print_response(response: &Response) -> eyre::Result<()> {
     match response {
-        Response::Services(services) => {
-            for service in services {
-                let health = service
-                    .health
-                    .map_or_else(|| "-".to_string(), |health| health.to_string());
-                println!(
-                    "{:<20} desired={:?} execution={:?} health={} generation={}",
-                    service.name,
-                    service.desired,
-                    service.execution,
-                    health,
-                    service.run_generation
-                );
-            }
-        }
+        Response::Services(services) => print_services(services),
         Response::Logs { lines, truncated } => {
             for line in lines {
                 println!("{}", line.line);
@@ -92,6 +108,14 @@ fn print_response(response: &Response) -> eyre::Result<()> {
             }
         }
         Response::Health(None) => println!("no healthcheck attempts recorded"),
+        Response::Events { events, truncated } => {
+            for event in events {
+                println!("{} {:?}: {}", event.seq, event.kind, event.detail);
+            }
+            if *truncated {
+                eprintln!("event response truncated by server limits");
+            }
+        }
         Response::Description(info) => {
             println!("{} (pid {})", info.name, info.pid);
             println!("  config:  {}", info.config_path);
@@ -112,6 +136,12 @@ fn print_response(response: &Response) -> eyre::Result<()> {
                     ack.service, ack.observed_generation
                 );
             }
+        }
+        Response::DynamicService(receipt) => {
+            println!(
+                "accepted {} (revision {}, generation {})",
+                receipt.service, receipt.revision, receipt.observed_generation
+            );
         }
         Response::Error { code, message } => {
             eyre::bail!("{code:?}: {message}");

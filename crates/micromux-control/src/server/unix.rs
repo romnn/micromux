@@ -20,6 +20,10 @@ use crate::{
 const DEFAULT_LOG_TAIL: usize = 200;
 /// Hard cap on `tail`, independent of the request frame.
 const MAX_LOG_TAIL: usize = 2000;
+/// Default number of recent timeline events returned when a client does not specify `tail`.
+const DEFAULT_EVENT_TAIL: usize = 50;
+/// Hard cap on the event `tail`; the model retains at most this many events per service.
+const MAX_EVENT_TAIL: usize = micromux::EVENT_HISTORY;
 /// Response byte budget for log/health payloads; oldest content beyond it is dropped so a chatty
 /// service can't blow the frame.
 const RESPONSE_MAX_BYTES: usize = 512 * 1024;
@@ -231,8 +235,18 @@ where
                         }
                     }
                     Err(RecvError::Lagged(_)) => {
+                        // A roster entry evicted *during* the lag is not enumerated here; its
+                        // disappearance still reaches consumers because the surviving services'
+                        // synthesized `Roster` changes trigger a full resync, and configured
+                        // services always exist.
                         for snapshot in server.reader.services() {
-                            for kind in [ChangeKind::Status, ChangeKind::Logs, ChangeKind::Health] {
+                            for kind in [
+                                ChangeKind::Status,
+                                ChangeKind::Logs,
+                                ChangeKind::Health,
+                                ChangeKind::Roster,
+                                ChangeKind::Events,
+                            ] {
                                 let Ok(line) = serde_json::to_string(&Response::Change(SessionChange {
                                     service_id: snapshot.id.clone(),
                                     kind,
@@ -306,10 +320,31 @@ async fn dispatch(server: &ControlServer, request: Request) -> Response {
             bound_health_attempt(&mut attempt);
             Response::Health(attempt)
         }
+        Request::GetEvents {
+            service,
+            after,
+            tail,
+        } => get_events(&server.reader, &service, after, tail),
         Request::Restart { service } => acknowledge(server.control.restart(&service).await),
         Request::RestartAll => acknowledge(server.control.restart_all().await),
         Request::Enable { service } => acknowledge(server.control.enable(&service).await),
         Request::Disable { service } => acknowledge(server.control.disable(&service).await),
+        Request::StartDynamicService { params } => {
+            acknowledge_dynamic(server.control.start_dynamic(params).await)
+        }
+        Request::ReplaceDynamicService {
+            service,
+            expected_revision,
+            params,
+        } => acknowledge_dynamic(
+            server
+                .control
+                .replace_dynamic(&service, expected_revision, params)
+                .await,
+        ),
+        Request::StopDynamicService { service } => {
+            acknowledge_dynamic(server.control.stop_dynamic(&service).await)
+        }
         // Subscribe is intercepted before dispatch; reaching here is a protocol misuse.
         Request::Subscribe => Response::error(
             ErrorCode::BadRequest,
@@ -320,6 +355,21 @@ async fn dispatch(server: &ControlServer, request: Request) -> Response {
             Response::error(ErrorCode::BadRequest, "shutdown is handled before dispatch")
         }
     }
+}
+
+fn get_events(
+    reader: &SessionModelReader,
+    service: &str,
+    after: Option<u64>,
+    tail: Option<usize>,
+) -> Response {
+    if reader.service(service).is_none() {
+        return unknown_service(service);
+    }
+    let requested_tail = tail.unwrap_or(DEFAULT_EVENT_TAIL);
+    let (events, truncated) =
+        reader.events(service, after, Some(requested_tail.min(MAX_EVENT_TAIL)));
+    Response::Events { events, truncated }
 }
 
 fn get_logs(
@@ -416,15 +466,37 @@ fn bound_follow_response_lines_page(
 }
 
 fn describe(server: &ControlServer) -> SessionInfo {
-    let services = server
-        .reader
-        .services()
-        .into_iter()
+    let snapshots = server.reader.services();
+    let services = snapshots
+        .iter()
         .map(|snapshot| ServiceBrief {
-            id: snapshot.id,
-            name: snapshot.name,
+            id: snapshot.id.clone(),
+            name: snapshot.name.clone(),
         })
         .collect();
+    let dynamic_services = server.dynamic_policy.enabled.then(|| {
+        let live_services = snapshots
+            .iter()
+            .filter(|snapshot| {
+                snapshot.origin == micromux::OriginKind::Dynamic
+                    && snapshot
+                        .dynamic
+                        .as_ref()
+                        .is_some_and(|dynamic| dynamic.retired.is_none())
+            })
+            .count();
+        crate::DynamicServicesCaps {
+            max_services: server.dynamic_policy.max_services,
+            live_services,
+            max_lifetime_secs: server.dynamic_policy.max_lifetime.as_secs(),
+            allowed_working_roots: server
+                .dynamic_policy
+                .allowed_working_roots
+                .iter()
+                .map(|root| root.display().to_string())
+                .collect(),
+        }
+    });
     SessionInfo {
         protocol_version: PROTOCOL_VERSION,
         id: server.identity.id.clone(),
@@ -435,6 +507,7 @@ fn describe(server: &ControlServer) -> SessionInfo {
         config_path: server.identity.config_path.clone(),
         services,
         micromux_version: server.identity.micromux_version.clone(),
+        capabilities: Some(crate::SessionCapabilities { dynamic_services }),
     }
 }
 
@@ -526,19 +599,50 @@ fn bound_health_attempt(attempt: &mut Option<micromux::HealthAttempt>) {
     }
 }
 
-fn acknowledge(result: Result<ServiceCommandResult, SchedulerStopped>) -> Response {
-    match result {
-        Ok(Ok(services)) => Response::Accepted { services },
-        Ok(Err(CommandRejection::UnknownService)) => {
+/// Map a scheduler rejection to its wire error. Shared by every mutation acknowledgement so a
+/// new [`CommandRejection`] variant only needs handling once.
+fn rejection_response(rejection: CommandRejection) -> Response {
+    match rejection {
+        CommandRejection::UnknownService => {
             Response::error(ErrorCode::UnknownService, "unknown service")
         }
-        Ok(Err(CommandRejection::InvalidState)) => Response::error(
+        CommandRejection::InvalidState => Response::error(
             ErrorCode::InvalidState,
             "the command is not valid in the service's current state",
         ),
-        Ok(Err(CommandRejection::ConfigReload(message))) => {
+        CommandRejection::ConfigReload(message) => {
             Response::error(ErrorCode::ConfigReload, message)
         }
+        CommandRejection::PolicyDenied(message) => {
+            Response::error(ErrorCode::PolicyDenied, message)
+        }
+        CommandRejection::LimitExceeded(message) => {
+            Response::error(ErrorCode::LimitExceeded, message)
+        }
+        CommandRejection::RevisionMismatch { expected, actual } => Response::error(
+            ErrorCode::RevisionMismatch,
+            format!("expected revision {expected}, actual revision {actual}"),
+        ),
+        CommandRejection::InvalidSpec(message) => Response::error(ErrorCode::InvalidSpec, message),
+    }
+}
+
+fn acknowledge(result: Result<ServiceCommandResult, SchedulerStopped>) -> Response {
+    match result {
+        Ok(Ok(services)) => Response::Accepted { services },
+        Ok(Err(rejection)) => rejection_response(rejection),
+        Err(SchedulerStopped) => {
+            Response::error(ErrorCode::SchedulerStopped, "the scheduler has stopped")
+        }
+    }
+}
+
+fn acknowledge_dynamic(
+    result: Result<micromux::DynamicServiceResult, SchedulerStopped>,
+) -> Response {
+    match result {
+        Ok(Ok(ack)) => Response::DynamicService(ack),
+        Ok(Err(rejection)) => rejection_response(rejection),
         Err(SchedulerStopped) => {
             Response::error(ErrorCode::SchedulerStopped, "the scheduler has stopped")
         }

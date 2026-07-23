@@ -164,7 +164,7 @@ async fn run() -> eyre::Result<()> {
     let (runner, handles) = mux.clone().start(shutdown.clone());
 
     // Default-on control plane, opt out via `--no-control` or `control: { enabled: false }`.
-    if !options.no_control && config.config.control_enabled {
+    if !options.no_control && config.config.control.enabled {
         let working_dir = std::env::current_dir()?;
         match control::resolve_config_path(options.config_path.as_deref(), &working_dir).await {
             Ok(config_path) => {
