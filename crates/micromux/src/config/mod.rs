@@ -157,8 +157,8 @@ pub struct DynamicServicesPolicy {
     pub allowed_working_roots: Vec<PathBuf>,
     /// Maximum number of non-retired dynamic services.
     pub max_services: usize,
-    /// Maximum and default lease duration.
-    pub max_lifetime: Duration,
+    /// Maximum and default lease duration, or `None` to permit session-lifetime leases.
+    pub max_lifetime: Option<Duration>,
 }
 
 impl Default for DynamicServicesPolicy {
@@ -167,7 +167,7 @@ impl Default for DynamicServicesPolicy {
             enabled: false,
             allowed_working_roots: vec![PathBuf::from(".")],
             max_services: 4,
-            max_lifetime: Duration::from_hours(12),
+            max_lifetime: Some(Duration::from_hours(12)),
         }
     }
 }

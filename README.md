@@ -191,9 +191,10 @@ control:
     max_lifetime: 12h
 ```
 
-Every dynamic service has a TTL and stops with the session. This policy limits accidental blast
-radius for a same-user local control tool; it is not a security sandbox, because commands still run
-as the session user. Environment values can be sent inward or cloned server-side with
+Dynamic services are bounded to the configured lifetime by default and always stop with the session.
+Set `max_lifetime: none` to explicitly permit session-lifetime leases. This policy limits accidental
+blast radius for a same-user local control tool; it is not a security sandbox, because commands
+still run as the session user. Environment values can be sent inward or cloned server-side with
 `from_service`; snapshots omit the environment entirely, and receipts return only key names.
 
 Build a lean TUI-only binary with the MCP server compiled out via `cargo install --no-default-features micromux-cli`.

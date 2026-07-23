@@ -488,7 +488,10 @@ fn describe(server: &ControlServer) -> SessionInfo {
         crate::DynamicServicesCaps {
             max_services: server.dynamic_policy.max_services,
             live_services,
-            max_lifetime_secs: server.dynamic_policy.max_lifetime.as_secs(),
+            max_lifetime_secs: server
+                .dynamic_policy
+                .max_lifetime
+                .map(|value| value.as_secs()),
             allowed_working_roots: server
                 .dynamic_policy
                 .allowed_working_roots

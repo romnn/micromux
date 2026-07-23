@@ -1,5 +1,5 @@
 use crate::{
-    DynamicOrigin, DynamicServiceParams, DynamicServicesPolicy, ReloadConfig, ServiceMap,
+    DynamicOrigin, DynamicServiceParams, DynamicServicesPolicy, Lease, ReloadConfig, ServiceMap,
     ServiceOrigin, ServiceSpec,
     graph::ServiceGraph,
     health_check::Health,
@@ -909,10 +909,12 @@ impl SchedulerRuntime {
         });
     }
 
-    fn effective_lifetime(&self, requested: Option<Duration>) -> Duration {
-        requested
-            .unwrap_or(self.dynamic_policy.max_lifetime)
-            .min(self.dynamic_policy.max_lifetime)
+    fn effective_lifetime(&self, requested: Option<Lease>) -> Option<Duration> {
+        match (requested, self.dynamic_policy.max_lifetime) {
+            (None | Some(Lease::Unbounded), maximum) => maximum,
+            (Some(Lease::After(requested)), Some(maximum)) => Some(requested.min(maximum)),
+            (Some(Lease::After(requested)), None) => Some(requested),
+        }
     }
 
     fn expiry_deadline(lifetime: Duration) -> Result<tokio::time::Instant, CommandRejection> {
@@ -925,11 +927,30 @@ impl SchedulerRuntime {
             })
     }
 
+    fn lease_deadlines(
+        lifetime: Option<Duration>,
+    ) -> Result<(Option<tokio::time::Instant>, Option<u64>), CommandRejection> {
+        let expires_at = lifetime.map(Self::expiry_deadline).transpose()?;
+        let now = unix_now_ms().unwrap_or_default();
+        let expires_at_unix_ms = lifetime.map(|lifetime| {
+            let lifetime_ms = u64::try_from(lifetime.as_millis()).unwrap_or(u64::MAX);
+            now.saturating_add(lifetime_ms)
+        });
+        Ok((expires_at, expires_at_unix_ms))
+    }
+
+    fn lease_detail(expires_at_unix_ms: Option<u64>) -> String {
+        expires_at_unix_ms.map_or_else(
+            || "lease is unbounded".to_string(),
+            |expires_at| format!("lease expires at {expires_at}"),
+        )
+    }
+
     fn materialize_spec(
         &self,
         services: &ServiceMap,
         params: &DynamicServiceParams,
-    ) -> Result<(ServiceSpec, Duration), CommandRejection> {
+    ) -> Result<(ServiceSpec, Option<Duration>), CommandRejection> {
         let base = if let Some(from_service) = &params.from_service {
             services
                 .get(from_service)
@@ -1075,10 +1096,8 @@ impl SchedulerRuntime {
         self.require_dynamic_slot(services)?;
 
         let (spec, lifetime) = self.materialize_spec(services, &params)?;
-        let expires_at = Self::expiry_deadline(lifetime)?;
+        let (expires_at, expires_at_unix_ms) = Self::lease_deadlines(lifetime)?;
         let now = unix_now_ms().unwrap_or_default();
-        let lifetime_ms = u64::try_from(lifetime.as_millis()).unwrap_or(u64::MAX);
-        let expires_at_unix_ms = now.saturating_add(lifetime_ms);
         let origin = DynamicOrigin {
             created_at_unix_ms: now,
             expires_at_unix_ms,
@@ -1094,7 +1113,7 @@ impl SchedulerRuntime {
         self.validate_candidate(services, &service)?;
 
         let mut runtime = ServiceRuntime::new(ServiceRuntimeInit::from(&service));
-        runtime.expires_at = Some(expires_at);
+        runtime.expires_at = expires_at;
         runtime.request_enable();
         let (snapshot, _) = project_snapshot(&service, &runtime);
         services.insert(params.service.clone(), service.clone());
@@ -1104,7 +1123,8 @@ impl SchedulerRuntime {
             &params.service,
             ServiceEventKind::Created,
             format!(
-                "dynamic service created with revision 1; lease expires at {expires_at_unix_ms}"
+                "dynamic service created with revision 1; {}",
+                Self::lease_detail(expires_at_unix_ms)
             ),
         );
 
@@ -1169,10 +1189,7 @@ impl SchedulerRuntime {
             ))
         })?;
         let (spec, lifetime) = self.materialize_spec(services, &params)?;
-        let expires_at = Self::expiry_deadline(lifetime)?;
-        let now = unix_now_ms().unwrap_or_default();
-        let lifetime_ms = u64::try_from(lifetime.as_millis()).unwrap_or(u64::MAX);
-        let expires_at_unix_ms = now.saturating_add(lifetime_ms);
+        let (expires_at, expires_at_unix_ms) = Self::lease_deadlines(lifetime)?;
         let origin = DynamicOrigin {
             created_at_unix_ms,
             expires_at_unix_ms,
@@ -1191,7 +1208,7 @@ impl SchedulerRuntime {
         let observed_generation = runtime.run_generation();
         runtime.retired = None;
         runtime.retired_at_unix_ms = None;
-        runtime.expires_at = Some(expires_at);
+        runtime.expires_at = expires_at;
         runtime.reconfigure(&spec.restart);
         runtime.request_restart();
         let service = services
@@ -1204,7 +1221,8 @@ impl SchedulerRuntime {
             service_id,
             ServiceEventKind::Replaced,
             format!(
-                "dynamic service replaced with revision {revision}; lease expires at {expires_at_unix_ms}"
+                "dynamic service replaced with revision {revision}; {}",
+                Self::lease_detail(expires_at_unix_ms)
             ),
         );
 

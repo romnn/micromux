@@ -94,7 +94,7 @@ pub enum OriginKind {
 pub enum RetiredReason {
     /// Explicitly stopped through the control plane.
     Stopped,
-    /// Its mandatory lease expired.
+    /// Its lease expired.
     Expired,
     /// A newer peer sent a retirement reason this binary does not know yet.
     #[serde(other)]
@@ -106,8 +106,9 @@ pub enum RetiredReason {
 pub struct DynamicServiceInfo {
     /// Creation time in Unix milliseconds.
     pub created_at_unix_ms: u64,
-    /// Lease expiry time in Unix milliseconds.
-    pub expires_at_unix_ms: u64,
+    /// Lease expiry time in Unix milliseconds, or `None` for a session-lifetime lease.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at_unix_ms: Option<u64>,
     /// Optional caller-supplied ownership label.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner: Option<String>,

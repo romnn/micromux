@@ -174,13 +174,54 @@ pub enum ServiceOrigin {
 pub struct DynamicOrigin {
     /// Creation time in Unix milliseconds.
     pub created_at_unix_ms: u64,
-    /// Lease expiry time in Unix milliseconds.
-    pub expires_at_unix_ms: u64,
+    /// Lease expiry time in Unix milliseconds, or `None` for a session-lifetime lease.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at_unix_ms: Option<u64>,
     /// Optional caller-supplied ownership label.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner: Option<String>,
     /// Optimistic-concurrency revision, starting at one.
     pub revision: u64,
+}
+
+/// A dynamic-service lease, either bounded by a duration or valid for the session lifetime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, JsonSchema)]
+#[schemars(with = "String")]
+pub enum Lease {
+    /// A bounded lease duration.
+    After(Duration),
+    /// A lease with no expiry before the session stops.
+    Unbounded,
+}
+
+impl Serialize for Lease {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            Self::After(duration) => {
+                serializer.serialize_str(&humantime::format_duration(*duration).to_string())
+            }
+            Self::Unbounded => serializer.serialize_str("none"),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Lease {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        if raw == "none" {
+            Ok(Self::Unbounded)
+        } else {
+            humantime::parse_duration(&raw)
+                .map(Self::After)
+                .map_err(serde::de::Error::custom)
+        }
+    }
 }
 
 /// An optional mutation field that can also explicitly clear its current value.
@@ -306,14 +347,9 @@ pub struct DynamicServiceParams {
     /// Arguments appended after materializing and normalizing the command.
     #[serde(default)]
     pub extra_args: Vec<String>,
-    /// Requested lease duration. The session policy may clamp it.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        with = "duration::option"
-    )]
-    #[schemars(with = "Option<String>")]
-    pub expires_after: Option<Duration>,
+    /// Requested lease. The session policy may clamp an unbounded or long lease.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_after: Option<Lease>,
     /// Optional caller-supplied ownership label.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner: Option<String>,

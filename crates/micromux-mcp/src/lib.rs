@@ -2395,7 +2395,7 @@ mod tests {
     };
 
     #[cfg(unix)]
-    use micromux::{DynamicServiceParams, PartialServiceSpec};
+    use micromux::{DynamicServiceParams, Lease, PartialServiceSpec};
 
     #[cfg(unix)]
     use rmcp::handler::server::wrapper::{Json, Parameters};
@@ -2511,7 +2511,7 @@ services:
             },
             from_service: None,
             extra_args: Vec::new(),
-            expires_after: Some(Duration::from_secs(30)),
+            expires_after: Some(Lease::After(Duration::from_secs(30))),
             owner: Some("mcp-integration-test".to_string()),
             idempotency_key: idempotency_key.map(str::to_string),
         }
@@ -2922,7 +2922,7 @@ services:
                 service: "debug".to_string(),
                 revision: 2,
                 observed_generation: 1,
-                expires_at_unix_ms: 1234,
+                expires_at_unix_ms: Some(1234),
                 command: vec!["true".to_string()],
                 working_dir: Some("/w".to_string()),
                 ports: Vec::new(),

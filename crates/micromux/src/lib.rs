@@ -63,8 +63,8 @@ pub use scheduler::{
 };
 pub use service::RestartPolicy;
 pub use spec::{
-    DependencySpec, DynamicOrigin, DynamicServiceParams, HealthcheckSpec, PartialServiceSpec,
-    ServiceOrigin, ServiceSpec, SpecError, SpecField,
+    DependencySpec, DynamicOrigin, DynamicServiceParams, HealthcheckSpec, Lease,
+    PartialServiceSpec, ServiceOrigin, ServiceSpec, SpecError, SpecField,
 };
 pub use structured_log::{
     FIELDS_KEY, MESSAGE_KEYS, StructuredLogLevel, find_fields_object, find_key,

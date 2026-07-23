@@ -114,7 +114,7 @@ fn enabled_dynamic_policy(root: &Path) -> eyre::Result<DynamicServicesPolicy> {
         enabled: true,
         allowed_working_roots: vec![root.canonicalize()?],
         max_services: 4,
-        max_lifetime: Duration::from_mins(1),
+        max_lifetime: Some(Duration::from_mins(1)),
     })
 }
 
@@ -625,17 +625,21 @@ async fn dynamic_policy_limit_ttl_and_dependency_gating() -> eyre::Result<()> {
     );
     let mut policy = enabled_dynamic_policy(dir.path())?;
     policy.max_services = 1;
-    policy.max_lifetime = Duration::from_millis(250);
+    policy.max_lifetime = Some(Duration::from_millis(250));
     let harness = spawn_harness_with_policy(services, None, dir.path().to_path_buf(), policy);
     let mut params = dynamic_params("worker", &["sh", "-c", "sleep 60"]);
-    params.expires_after = Some(Duration::from_secs(30));
+    params.expires_after = Some(Lease::Unbounded);
     params.spec.depends_on = Some(vec![crate::DependencySpec {
         service: "dep".to_string(),
         condition: config::DependencyCondition::Started,
     }]);
     let created = dynamic_accepted(harness.control.start_dynamic(params).await)?;
     let now = unix_now_ms().unwrap_or_default();
-    assert!(created.expires_at_unix_ms.saturating_sub(now) <= 250);
+    assert!(
+        created
+            .expires_at_unix_ms
+            .is_some_and(|expires_at| expires_at.saturating_sub(now) <= 250)
+    );
     let blocked = wait_until(&harness.reader, "worker", |snapshot| {
         snapshot.execution == Execution::Pending
     })
@@ -708,7 +712,7 @@ async fn dynamic_policy_limit_ttl_and_dependency_gating() -> eyre::Result<()> {
 async fn dynamic_lifetime_overflow_is_rejected_without_mutating_the_roster() -> eyre::Result<()> {
     let dir = tempfile::tempdir()?;
     let mut policy = enabled_dynamic_policy(dir.path())?;
-    policy.max_lifetime = Duration::MAX;
+    policy.max_lifetime = Some(Duration::MAX);
     let harness =
         spawn_harness_with_policy(ServiceMap::new(), None, dir.path().to_path_buf(), policy);
 
@@ -722,6 +726,34 @@ async fn dynamic_lifetime_overflow_is_rejected_without_mutating_the_roster() -> 
         matches!(result, Err(CommandRejection::InvalidSpec(message)) if message.contains("monotonic clock"))
     );
     assert!(harness.reader.service("too-long").is_none());
+
+    harness.shutdown.cancel();
+    harness.handle.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn unbounded_dynamic_lease_has_no_expiry_and_does_not_retire() -> eyre::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut policy = enabled_dynamic_policy(dir.path())?;
+    policy.max_lifetime = None;
+    let harness =
+        spawn_harness_with_policy(ServiceMap::new(), None, dir.path().to_path_buf(), policy);
+    let mut params = dynamic_params("unbounded", &["sh", "-c", "sleep 60"]);
+    params.expires_after = Some(Lease::Unbounded);
+
+    let receipt = dynamic_accepted(harness.control.start_dynamic(params).await)?;
+    assert_eq!(receipt.expires_at_unix_ms, None);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let snapshot = harness
+        .reader
+        .service("unbounded")
+        .ok_or_else(|| eyre::eyre!("unbounded service is missing"))?;
+    let dynamic = snapshot
+        .dynamic
+        .ok_or_else(|| eyre::eyre!("unbounded service has no dynamic metadata"))?;
+    assert_eq!(dynamic.expires_at_unix_ms, None);
+    assert_eq!(dynamic.retired, None);
 
     harness.shutdown.cancel();
     harness.handle.await??;

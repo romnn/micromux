@@ -206,8 +206,9 @@ pub struct DynamicServicesCaps {
     pub max_services: usize,
     /// Current non-retired dynamic-service count.
     pub live_services: usize,
-    /// Maximum and default lease duration in seconds.
-    pub max_lifetime_secs: u64,
+    /// Maximum and default lease duration in seconds, or `None` for session-lifetime leases.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_lifetime_secs: Option<u64>,
     /// Canonical working-directory roots accepted by the session.
     pub allowed_working_roots: Vec<String>,
 }
@@ -419,7 +420,7 @@ mod tests {
             service: "debug".to_string(),
             revision: 2,
             observed_generation: 1,
-            expires_at_unix_ms: 1234,
+            expires_at_unix_ms: Some(1234),
             command: vec!["true".to_string()],
             working_dir: None,
             ports: vec![3201],
@@ -443,12 +444,12 @@ mod tests {
             "service": "debug",
             "revision": 1,
             "observed_generation": 0,
-            "expires_at_unix_ms": 1,
             "command": ["true"],
             "restart": "Never",
             "healthcheck_configured": false
         }))
         .unwrap();
+        assert_eq!(minimal.expires_at_unix_ms, None);
         assert!(minimal.ports.is_empty());
         assert!(!minimal.already_retired);
     }
@@ -493,7 +494,7 @@ mod tests {
         };
         assert_eq!(
             params.expires_after,
-            Some(std::time::Duration::from_secs(90))
+            Some(micromux::Lease::After(std::time::Duration::from_secs(90)))
         );
         assert_eq!(params.spec.healthcheck, micromux::SpecField::Clear);
         let encoded = serde_json::to_value(&request)?;
@@ -512,8 +513,44 @@ mod tests {
         };
         assert_eq!(
             params.expires_after,
-            Some(std::time::Duration::from_secs(90))
+            Some(micromux::Lease::After(std::time::Duration::from_secs(90)))
         );
+        Ok(())
+    }
+
+    #[test]
+    fn dynamic_request_round_trips_an_unbounded_or_omitted_lease() -> serde_json::Result<()> {
+        let unbounded = json!({
+            "StartDynamicService": {
+                "params": {
+                    "service": "debug",
+                    "command": ["true"],
+                    "expires_after": "none"
+                }
+            }
+        });
+        let request = serde_json::from_value::<Request>(unbounded)?;
+        let Request::StartDynamicService { params } = request else {
+            return Err(serde_json::Error::io(std::io::Error::other(
+                "unexpected request variant",
+            )));
+        };
+        assert_eq!(params.expires_after, Some(micromux::Lease::Unbounded));
+
+        let omitted = json!({
+            "StartDynamicService": {
+                "params": {
+                    "service": "debug",
+                    "command": ["true"]
+                }
+            }
+        });
+        let Request::StartDynamicService { params } = serde_json::from_value(omitted)? else {
+            return Err(serde_json::Error::io(std::io::Error::other(
+                "unexpected request variant",
+            )));
+        };
+        assert_eq!(params.expires_after, None);
         Ok(())
     }
 }

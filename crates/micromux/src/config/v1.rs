@@ -457,12 +457,10 @@ fn parse_dynamic_services<F: Copy>(
         .map(|value| parse_positive_usize(value, "control.dynamic_services.max_services"))
         .transpose()?
         .unwrap_or(defaults.max_services);
-    let max_lifetime = dynamic_mapping
-        .map(|mapping| parse_duration(mapping.get("max_lifetime")))
-        .transpose()?
-        .flatten()
-        .map(Spanned::into_inner)
-        .unwrap_or(defaults.max_lifetime);
+    let max_lifetime = parse_lease(
+        dynamic_mapping.and_then(|mapping| mapping.get("max_lifetime")),
+        defaults.max_lifetime,
+    )?;
     // Roots are canonicalized eagerly so policy checks compare canonical paths; with the
     // feature disabled the roots are never consulted, so a stale path must not fail the load.
     let allowed_working_roots = parse_dynamic_roots(
@@ -492,6 +490,19 @@ fn parse_dynamic_services<F: Copy>(
         max_services,
         max_lifetime,
     })
+}
+
+fn parse_lease(
+    value: Option<&yaml_spanned::Spanned<Value>>,
+    default: Option<std::time::Duration>,
+) -> Result<Option<std::time::Duration>, ConfigError> {
+    let Some(value) = value else {
+        return Ok(default);
+    };
+    if value.as_str() == Some("none") {
+        return Ok(None);
+    }
+    parse_duration(Some(value)).map(|duration| duration.map(Spanned::into_inner))
 }
 
 fn parse_dynamic_roots(
@@ -1621,7 +1632,10 @@ mod tests {
 
         assert!(policy.enabled);
         assert_eq!(policy.max_services, 7);
-        assert_eq!(policy.max_lifetime, std::time::Duration::from_mins(90));
+        assert_eq!(
+            policy.max_lifetime,
+            Some(std::time::Duration::from_mins(90))
+        );
         assert_eq!(
             policy.allowed_working_roots,
             vec![dir.path().join("sandbox").canonicalize()?]
@@ -1643,6 +1657,10 @@ mod tests {
         assert!(!defaults.config.control.dynamic_services.enabled);
         assert_eq!(defaults.config.control.dynamic_services.max_services, 4);
         assert_eq!(
+            defaults.config.control.dynamic_services.max_lifetime,
+            Some(std::time::Duration::from_hours(12))
+        );
+        assert_eq!(
             defaults
                 .config
                 .control
@@ -1650,6 +1668,25 @@ mod tests {
                 .allowed_working_roots,
             vec![dir.path().canonicalize()?]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn dynamic_services_policy_accepts_an_unbounded_max_lifetime() -> eyre::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let yaml = indoc! {r#"
+            version: 1
+            control:
+              dynamic_services:
+                max_lifetime: none
+            services:
+              app:
+                command: ["true"]
+        "#};
+        let mut diagnostics: Vec<Diagnostic<usize>> = Vec::new();
+        let parsed = config::from_str(yaml, dir.path(), 0, None, &mut diagnostics)?;
+
+        assert_eq!(parsed.config.control.dynamic_services.max_lifetime, None);
         Ok(())
     }
 }

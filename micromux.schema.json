@@ -87,9 +87,16 @@
               "description": "Maximum live (non-retired) dynamic services."
             },
             "max_lifetime": {
-              "$ref": "#/definitions/duration",
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/duration"
+                },
+                {
+                  "const": "none"
+                }
+              ],
               "default": "12h",
-              "description": "Maximum and default lifetime for every dynamic service."
+              "description": "Maximum and default dynamic-service lifetime. Set to 'none' to permit session-lifetime leases."
             }
           }
         }

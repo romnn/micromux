@@ -34,8 +34,9 @@ pub struct DynamicServiceAck {
     pub revision: u64,
     /// Run generation observed before the mutation.
     pub observed_generation: u64,
-    /// Effective lease expiry in Unix milliseconds.
-    pub expires_at_unix_ms: u64,
+    /// Effective lease expiry in Unix milliseconds, or `None` for a session-lifetime lease.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at_unix_ms: Option<u64>,
     /// Effective command argv.
     pub command: Vec<String>,
     /// Effective working directory.
@@ -64,7 +65,7 @@ impl DynamicServiceAck {
         service: ServiceID,
         revision: u64,
         observed_generation: u64,
-        expires_at_unix_ms: u64,
+        expires_at_unix_ms: Option<u64>,
         spec: &ServiceSpec,
         already_retired: bool,
         idempotent_replay: bool,

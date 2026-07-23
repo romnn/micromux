@@ -81,7 +81,7 @@ fn dynamic_params(id: &str, command: &[&str]) -> micromux::DynamicServiceParams 
         spec,
         from_service: None,
         extra_args: Vec::new(),
-        expires_after: Some(Duration::from_secs(30)),
+        expires_after: Some(micromux::Lease::After(Duration::from_secs(30))),
         owner: Some("integration-test".to_string()),
         idempotency_key: None,
     }
