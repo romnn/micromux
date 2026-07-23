@@ -114,6 +114,28 @@ mod tests {
     }
 
     #[test]
+    fn detail_command_is_capped_so_bounded_facts_survive_pathological_commands() {
+        let mut snapshot = micromux::ServiceSnapshot::initial(
+            "svc".to_string(),
+            "svc".to_string(),
+            Vec::new(),
+            None,
+            micromux::RestartPolicy::Never,
+            vec!["sh".to_string(), "-c".to_string(), "x".repeat(500)],
+            None,
+        );
+        snapshot.run_generation = 1;
+
+        let line = service_detail_line(&snapshot, 1_000)
+            .map(|line| line.to_string())
+            .unwrap_or_default();
+
+        assert!(line.contains('…'));
+        assert!(line.ends_with(" gen 1 "));
+        assert!(line.chars().count() < 100);
+    }
+
+    #[test]
     fn lease_phrase_covers_every_magnitude_and_the_unbounded_lease() {
         assert_eq!(lease_phrase(None, 1_000), "no expiry");
         assert_eq!(lease_phrase(Some(500), 1_000), "expired");
@@ -497,6 +519,20 @@ fn shell_join(argv: &[String]) -> String {
         .join(" ")
 }
 
+/// Longest command rendered in the detail line. An unbounded command would push the bounded
+/// facts (generation, revision, lease) off the border; the full command stays available through
+/// `ctl ls` and the MCP snapshot.
+const DETAIL_COMMAND_MAX_CHARS: usize = 80;
+
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let mut truncated: String = text.chars().take(max_chars.saturating_sub(1)).collect();
+    truncated.push('…');
+    truncated
+}
+
 /// Wall clock in the unit lease expiries are expressed in.
 fn now_unix_ms() -> u64 {
     std::time::SystemTime::now()
@@ -537,6 +573,7 @@ fn service_detail_line(
     let mut spans: Vec<Span<'static>> = Vec::new();
     let command = shell_join(&snapshot.command);
     if !command.is_empty() {
+        let command = truncate_chars(&command, DETAIL_COMMAND_MAX_CHARS);
         spans.push(format!(" $ {command} ").fg(tailwind::GRAY.c400));
     }
     spans.push(format!(" gen {} ", snapshot.run_generation).fg(tailwind::GRAY.c400));
