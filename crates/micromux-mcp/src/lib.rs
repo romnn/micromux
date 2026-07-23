@@ -81,30 +81,28 @@ const DIAGNOSE_LOG_SCAN: usize = 500;
 const WAIT_POLL_FLOOR: Duration = Duration::from_secs(1);
 const WAIT_LOG_POLL: Duration = Duration::from_millis(250);
 
-const INSTRUCTIONS: &str = "Discover and control running micromux sessions. \
-List services, inspect current and previous run logs, restart/enable/disable services, check \
-health, and wait for a service to become healthy. When no `session` is given, the tools target the \
-micromux running in the current project directory. Use `find_service` to locate a service by id or \
-name across every running session (with each match's copy-pasteable `session_selector`, config \
-path, working dir, and status) instead of the list_sessions -> pick a hash -> list_services dance; \
-service-scoped tools also point at sibling sessions when a service is unknown in the selected one. \
-Use `list_log_runs` to find retained previous \
-runs, and `follow_logs` with `next_seq` for one-service tailing. Use `log_cursors` before an \
-action and then `follow_all_logs` with its per-service `next` map to inspect what changed across \
-services. Actions are routed through \
-micromux, so they respect dependency gating and restart policy — prefer them over `kill`+rerun. \
-`restart_service`/`enable_service` return a `generation`; pass it to `wait_for_healthy` as \
-`after_generation` to wait for the *new* run. Use `wait_for_log` after an external action to block \
-until matching backend evidence appears. Use `restart_service_and_wait` for the common \
-cursor/restart/wait/log bundle, except for hot-reload services, which should use `log_cursors` and \
-`follow_all_logs` without restarting. Use `diagnose` for a one-shot summary of exited or \
-unhealthy services, including current live-run healthcheck output when applicable and \
-likely-cause log lines. Use \
-`start_session`/`stop_session` to bring a \
-project's services up or stop a session and free its ports (e.g. when switching git worktrees that \
-bind the same ports). `get_logs`/`follow_logs`/`follow_all_logs` strip ANSI by default and accept \
-a `grep` regex, `grep_context`, `since`, `trace_id`, `format=\"compact\"`, and, for services that \
-emit JSON logs, a `min_level` filter.";
+const INSTRUCTIONS: &str = "Discover and control running micromux sessions. When no `session` is \
+given, tools target the current project's session. Use `find_service` to locate a service across \
+sessions; service-scoped errors also point at matching sibling sessions. Validate a candidate file \
+with `validate_config`; for an active session's on-disk edits, call `reconcile_config` with \
+`dry_run=true` before applying it. Reconciliation adds, retires, and updates configured services but \
+does not restart changed processes. Before creating a runtime service, use `list_sessions` and check \
+`capabilities.dynamic_services`. Supply an `idempotency_key` so creation retries are safe. Leases \
+are bounded by session policy unless it explicitly permits `expires_after=\"none\"`; use \
+`renew_dynamic_service` to extend a live lease without restarting. For servers, use \
+`start_dynamic_service_and_wait` for the create/wait/log/events/diagnosis bundle, or compose \
+`start_dynamic_service`, `wait_for_healthy(after_generation=observed_generation)`, and \
+`follow_logs`. Use `wait_for_exit` for one-shot jobs instead of waiting for health. \
+`ensure_service_ready` can start a missing session, enable a disabled configured service, and wait \
+for readiness in one call. Use `get_service_events` for startup forensics; pass `service=\"*\"` \
+with its per-service cursor map to follow ordering across the session. `restart_service` and \
+`enable_service` return a generation for `wait_for_healthy`; `restart_service_and_wait` bundles the \
+usual cursor/restart/wait/log flow. Use `wait_for_log` after external actions, `diagnose` for a \
+one-shot failure summary, `list_log_runs` for retained runs, and `log_cursors` plus \
+`follow_all_logs` around hot reloads. Log tools strip ANSI by default and support regex, context, \
+time, trace-id, compact JSON, and minimum-level filters. Actions go through micromux and retain its \
+dependency and restart semantics. Use `start_session` and `stop_session` to manage a project's \
+headless session.";
 
 /// The MCP server handler. Cheap to clone; holds no supervision state.
 #[derive(Clone)]
@@ -1802,10 +1800,12 @@ impl McpServer {
     #[tool(
         description = "Create and start a runtime service in the target session. Requires \
         control.dynamic_services.enabled in that session's micromux.yaml. Dynamic services stop \
-        with the session and always have a TTL. from_service clones any existing service \
-        (configured or dynamic) server-side, including environment values that are never \
-        displayed; extra_args append to the resolved argv (for a CMD-SHELL command they become \
-        shell positional parameters, not appended script text). Pass idempotency_key when \
+        with the session; leases are bounded unless policy explicitly permits expires_after=\"none\". \
+        from_service clones any existing service (configured or dynamic) server-side, including \
+        environment values that are never displayed. When replacing, pass from_service equal to \
+        service to start from its current spec and override only provided fields. Put stable flags \
+        in command: extra_args re-append on every self-referential replace (and for CMD-SHELL they \
+        are shell positional parameters, not appended script text). Pass idempotency_key when \
         retrying. Then call wait_for_healthy with after_generation=observed_generation."
     )]
     async fn start_dynamic_service(
@@ -1914,10 +1914,12 @@ impl McpServer {
     #[tool(
         description = "Replace or revive a runtime service using optimistic concurrency. Requires \
         control.dynamic_services.enabled in the target session's micromux.yaml. Dynamic services \
-        stop with the session and always have a fresh TTL after replacement. from_service clones \
-        any existing service (configured or dynamic) server-side, including environment values \
-        that are never displayed. Pass idempotency_key when retrying, then compose with \
-        wait_for_healthy(after_generation=observed_generation)."
+        stop with the session and receive a fresh bounded or explicitly unbounded lease after \
+        replacement. from_service clones any existing service server-side, including environment \
+        values that are never displayed. Pass from_service equal to service to start from its \
+        current spec and override only provided fields. Put stable flags in command: extra_args \
+        re-append on every self-referential replace. Pass idempotency_key when retrying, then \
+        compose with wait_for_healthy(after_generation=observed_generation)."
     )]
     async fn replace_dynamic_service(
         &self,
@@ -3293,6 +3295,31 @@ services:
             assert!(
                 tools.iter().any(|tool| tool.name == name),
                 "missing {name} tool"
+            );
+        }
+        for name in ["start_dynamic_service", "replace_dynamic_service"] {
+            let description = tools
+                .iter()
+                .find(|tool| tool.name == name)
+                .and_then(|tool| tool.description.as_deref())
+                .ok_or_else(|| color_eyre::eyre::eyre!("missing {name} description"))?;
+            assert!(description.contains("from_service equal to service"));
+            assert!(description.contains("extra_args re-append"));
+        }
+        for surface in [
+            "capabilities.dynamic_services",
+            "start_dynamic_service_and_wait",
+            "idempotency_key",
+            "renew_dynamic_service",
+            "reconcile_config",
+            "validate_config",
+            "get_service_events",
+            "ensure_service_ready",
+            "wait_for_exit",
+        ] {
+            assert!(
+                super::INSTRUCTIONS.contains(surface),
+                "missing {surface} guidance"
             );
         }
         Ok(())

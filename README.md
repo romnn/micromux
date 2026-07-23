@@ -192,10 +192,18 @@ control:
 ```
 
 Dynamic services are bounded to the configured lifetime by default and always stop with the session.
-Set `max_lifetime: none` to explicitly permit session-lifetime leases. This policy limits accidental
-blast radius for a same-user local control tool; it is not a security sandbox, because commands
-still run as the session user. Environment values can be sent inward or cloned server-side with
-`from_service`; snapshots omit the environment entirely, and receipts return only key names.
+Set `max_lifetime: none` to explicitly opt in to session-lifetime leases; callers can then request
+`expires_after: none`. `renew_dynamic_service` extends or removes a live service's deadline without
+restarting it. This policy limits accidental blast radius for a same-user local control tool; it is
+not a security sandbox, because commands still run as the session user. Environment values can be
+sent inward or cloned server-side with `from_service`; snapshots omit the environment entirely, and
+receipts return only key names.
+
+Use `validate_config` to check a candidate config without a running session. For edits to the active
+session's on-disk config, run `reconcile_config` as a dry run first, then apply it; additions and
+removals take effect immediately, while changed definitions are used on the next restart. Terminal
+attachment is deliberately not part of this control surface yet; its design is tracked in the
+[attach plan](plan/attach.md).
 
 Build a lean TUI-only binary with the MCP server compiled out via `cargo install --no-default-features micromux-cli`.
 

@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use tokio::time::{Duration, timeout};
 use yaml_spanned::Spanned;
 
+use crate::RestartPolicy;
 use crate::model::{Desired, Execution};
 use similar_asserts::assert_eq;
 
@@ -612,6 +613,52 @@ async fn dynamic_service_create_replace_stop_and_idempotency() -> eyre::Result<(
     wait_for_log(&harness.reader, "debug", "replaced").await?;
 
     assert_dynamic_retirement(&harness).await?;
+
+    harness.shutdown.cancel();
+    harness.handle.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn self_referential_dynamic_replace_overlays_and_reappends_extra_args() -> eyre::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let harness = spawn_harness_with_policy(
+        ServiceMap::new(),
+        None,
+        dir.path().to_path_buf(),
+        enabled_dynamic_policy(dir.path())?,
+    );
+    let id = "debug".to_string();
+    let created = dynamic_accepted(
+        harness
+            .control
+            .start_dynamic(dynamic_params(&id, &["sh", "-c", "sleep 60"]))
+            .await,
+    )?;
+    assert_eq!(created.command, vec!["sh", "-c", "sleep 60"]);
+
+    let mut replacement = dynamic_params(&id, &["unused"]);
+    replacement.spec.command = None;
+    replacement.spec.restart = Some(RestartPolicy::Always);
+    replacement.from_service = Some(id.clone());
+    replacement.extra_args = vec!["--trace".to_string()];
+    let replaced = dynamic_accepted(
+        harness
+            .control
+            .replace_dynamic(&id, 1, replacement.clone())
+            .await,
+    )?;
+    assert_eq!(replaced.revision, 2);
+    assert_eq!(replaced.restart, RestartPolicy::Always);
+    assert_eq!(replaced.command, vec!["sh", "-c", "sleep 60", "--trace"]);
+
+    let repeated = dynamic_accepted(harness.control.replace_dynamic(&id, 2, replacement).await)?;
+    assert_eq!(repeated.revision, 3);
+    assert_eq!(repeated.restart, RestartPolicy::Always);
+    assert_eq!(
+        repeated.command,
+        vec!["sh", "-c", "sleep 60", "--trace", "--trace"]
+    );
 
     harness.shutdown.cancel();
     harness.handle.await??;
