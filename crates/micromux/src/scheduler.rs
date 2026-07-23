@@ -551,6 +551,20 @@ pub(super) fn project_snapshot(
     (snapshot, runtime.uptime_started_at)
 }
 
+/// The lease a dynamic service actually gets, from the request and the session cap. Pure so the
+/// clamp table is unit-testable: omitted or `"none"` fall to the policy default (the cap itself,
+/// or unbounded when the policy is uncapped); a bounded request is clamped to the cap.
+fn effective_lifetime(
+    max_lifetime: Option<Duration>,
+    requested: Option<Lease>,
+) -> Option<Duration> {
+    match (requested, max_lifetime) {
+        (None | Some(Lease::Unbounded), maximum) => maximum,
+        (Some(Lease::After(requested)), Some(maximum)) => Some(requested.min(maximum)),
+        (Some(Lease::After(requested)), None) => Some(requested),
+    }
+}
+
 /// Current wall-clock time in Unix milliseconds, matching the unix-ms convention of log-entry
 /// timestamps so a run's start can be correlated with log `since` filters. `None` if the clock
 /// reads before the epoch or overflows `u64` (never in practice).
@@ -846,6 +860,20 @@ impl SchedulerRuntime {
         }
     }
 
+    /// Actionable guidance for a command that hit a retired service, matched to how it retired:
+    /// a reconcile-removed configured service revives through the config file, everything else
+    /// through `replace_dynamic_service`.
+    fn retired_guidance(reason: RetiredReason) -> &'static str {
+        match reason {
+            RetiredReason::Removed => {
+                "the service was removed from micromux.yaml; re-add it and run reconcile_config to revive it"
+            }
+            RetiredReason::Stopped | RetiredReason::Expired | RetiredReason::Unknown => {
+                "the dynamic service is retired; use replace_dynamic_service to revive it"
+            }
+        }
+    }
+
     fn validate_service_id(id: &str) -> Result<(), CommandRejection> {
         if (1..=64).contains(&id.len())
             && id
@@ -924,11 +952,7 @@ impl SchedulerRuntime {
     }
 
     fn effective_lifetime(&self, requested: Option<Lease>) -> Option<Duration> {
-        match (requested, self.dynamic_policy.max_lifetime) {
-            (None | Some(Lease::Unbounded), maximum) => maximum,
-            (Some(Lease::After(requested)), Some(maximum)) => Some(requested.min(maximum)),
-            (Some(Lease::After(requested)), None) => Some(requested),
-        }
+        effective_lifetime(self.dynamic_policy.max_lifetime, requested)
     }
 
     fn expiry_deadline(lifetime: Duration) -> Result<tokio::time::Instant, CommandRejection> {
@@ -1031,10 +1055,12 @@ impl SchedulerRuntime {
                     candidate.id, dependency.service
                 )));
             };
-            if runtime.retired.is_some() {
+            if let Some(reason) = runtime.retired {
                 return Err(CommandRejection::InvalidSpec(format!(
-                    "service `{}` depends on retired dynamic service `{}`; replace_dynamic_service must revive it first",
-                    candidate.id, dependency.service
+                    "service `{}` depends on retired service `{}`; {}",
+                    candidate.id,
+                    dependency.service,
+                    Self::retired_guidance(reason)
                 )));
             }
         }
@@ -1329,20 +1355,17 @@ impl SchedulerRuntime {
         let revision = origin.revision;
         let spec = service.spec.clone();
 
-        let runtime = self
-            .services
+        // Re-borrowing mutably what the checks above already validated; the scheduler is
+        // single-threaded, so neither entry can have changed in between.
+        if let Some(runtime) = self.services.get_mut(service_id) {
+            runtime.expires_at = expires_at;
+        }
+        if let Some(ServiceOrigin::Dynamic(origin)) = services
             .get_mut(service_id)
-            .ok_or(CommandRejection::UnknownService)?;
-        let service = services
-            .get_mut(service_id)
-            .ok_or(CommandRejection::UnknownService)?;
-        let ServiceOrigin::Dynamic(origin) = &mut service.origin else {
-            return Err(CommandRejection::InvalidState(
-                "the service is configured, not dynamic".to_string(),
-            ));
-        };
-        runtime.expires_at = expires_at;
-        origin.expires_at_unix_ms = expires_at_unix_ms;
+            .map(|service| &mut service.origin)
+        {
+            origin.expires_at_unix_ms = expires_at_unix_ms;
+        }
         self.sync(services, service_id);
         self.append_event(
             service_id,
@@ -1538,6 +1561,9 @@ impl SchedulerRuntime {
             if current.log_retention != updated_service.log_retention {
                 changed.push("log retention");
             }
+            if current.enable_color != updated_service.enable_color {
+                changed.push("color");
+            }
             if !changed.is_empty() {
                 actions.push(ReconcileAction {
                     service: service_id.clone(),
@@ -1680,7 +1706,11 @@ impl SchedulerRuntime {
                     self.append_event(
                         service_id,
                         ServiceEventKind::Created,
-                        "configured service added by config reconciliation",
+                        if reviving {
+                            "configured service revived by config reconciliation"
+                        } else {
+                            "configured service added by config reconciliation"
+                        },
                     );
                 }
                 ReconcileActionKind::Changed => {
@@ -1733,8 +1763,10 @@ impl SchedulerRuntime {
         let config_path = reload.config_path.display().to_string();
         let updated = load_services_from_disk(reload).map_err(CommandRejection::ConfigReload)?;
         let actions = self.reconcile_actions(services, &updated);
+        // Validate on dry runs too: a preview that reports actions the apply would then
+        // reject (dynamic-id collision, orphaned dependents, graph failure) is not a preview.
+        self.validate_reconcile_candidate(services, &updated, &actions)?;
         if !dry_run {
-            self.validate_reconcile_candidate(services, &updated, &actions)?;
             self.apply_reconcile(services, &updated, &actions);
         }
         Ok(ReconcileReceipt {
@@ -1803,14 +1835,26 @@ impl SchedulerRuntime {
     }
 
     fn reply(ack: Option<CommandAck>, result: ServiceCommandResult) {
-        if let Some(ack) = ack {
-            ack.send(result);
+        match ack {
+            Some(ack) => ack.send(result),
+            // Fire-and-forget senders (the TUI) have nowhere to surface a rejection; leave a
+            // trace so an inert keypress is diagnosable.
+            None => {
+                if let Err(rejection) = result {
+                    tracing::debug!(?rejection, "fire-and-forget command rejected");
+                }
+            }
         }
     }
 
     fn reply_dynamic(ack: Option<control::DynamicCommandAck>, result: DynamicServiceResult) {
-        if let Some(ack) = ack {
-            ack.send(result);
+        match ack {
+            Some(ack) => ack.send(result),
+            None => {
+                if let Err(rejection) = result {
+                    tracing::debug!(?rejection, "fire-and-forget dynamic command rejected");
+                }
+            }
         }
     }
 
@@ -1828,10 +1872,9 @@ impl SchedulerRuntime {
             .services
             .get(service_id)
             .ok_or(CommandRejection::UnknownService)?;
-        if runtime.retired.is_some() {
+        if let Some(reason) = runtime.retired {
             return Err(CommandRejection::InvalidState(
-                "the service is retired; use replace_dynamic_service to revive a dynamic service"
-                    .to_string(),
+                Self::retired_guidance(reason).to_string(),
             ));
         }
         if runtime.desired == DesiredState::Disabled {
@@ -1868,14 +1911,13 @@ impl SchedulerRuntime {
         if !self.services.contains_key(service_id) {
             return Err(CommandRejection::UnknownService);
         }
-        if self
+        if let Some(reason) = self
             .services
             .get(service_id)
-            .is_some_and(|runtime| runtime.retired.is_some())
+            .and_then(|runtime| runtime.retired)
         {
             return Err(CommandRejection::InvalidState(
-                "the service is retired; use replace_dynamic_service to revive a dynamic service"
-                    .to_string(),
+                Self::retired_guidance(reason).to_string(),
             ));
         }
         self.reload_services(services)?;

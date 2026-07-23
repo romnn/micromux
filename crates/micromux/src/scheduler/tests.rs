@@ -209,9 +209,12 @@ async fn assert_dynamic_retirement(harness: &Harness) -> eyre::Result<()> {
         .start_dynamic(blocked)
         .await
         .map_err(|_| eyre::eyre!("scheduler stopped"))?;
-    assert!(
-        matches!(blocked, Err(CommandRejection::InvalidSpec(message)) if message.contains("retired dynamic service"))
-    );
+    assert!(matches!(
+        blocked,
+        Err(CommandRejection::InvalidSpec(message))
+            if message.contains("depends on retired service")
+                && message.contains("replace_dynamic_service")
+    ));
     let restart = harness
         .control
         .restart(&"debug".to_string())
@@ -319,6 +322,32 @@ async fn wait_for_finished_health_attempt(
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+}
+
+#[test]
+fn effective_lifetime_clamps_requests_to_the_policy_cap() {
+    let cap = Duration::from_mins(1);
+    // Omitted or "none" fall to the policy default (the cap, or unbounded when uncapped).
+    assert_eq!(effective_lifetime(Some(cap), None), Some(cap));
+    assert_eq!(
+        effective_lifetime(Some(cap), Some(Lease::Unbounded)),
+        Some(cap)
+    );
+    assert_eq!(effective_lifetime(None, None), None);
+    assert_eq!(effective_lifetime(None, Some(Lease::Unbounded)), None);
+    // Bounded requests: clamped to the cap, honored under it, honored verbatim when uncapped.
+    assert_eq!(
+        effective_lifetime(Some(cap), Some(Lease::After(Duration::from_hours(1)))),
+        Some(cap)
+    );
+    assert_eq!(
+        effective_lifetime(Some(cap), Some(Lease::After(Duration::from_secs(30)))),
+        Some(Duration::from_secs(30))
+    );
+    assert_eq!(
+        effective_lifetime(None, Some(Lease::After(Duration::from_secs(30)))),
+        Some(Duration::from_secs(30))
+    );
 }
 
 #[test]

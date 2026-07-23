@@ -865,6 +865,13 @@ mod tests {
             ui:
               width: 120
               pretty_json_logs: false
+            control:
+              enabled: true
+              dynamic_services:
+                enabled: true
+                allowed_working_roots: ["."]
+                max_services: 4
+                max_lifetime: none
             logs:
               retained_runs: 4
               memory:

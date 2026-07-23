@@ -219,7 +219,11 @@ impl<'de> Deserialize<'de> for Lease {
         } else {
             humantime::parse_duration(&raw)
                 .map(Self::After)
-                .map_err(serde::de::Error::custom)
+                .map_err(|err| {
+                    serde::de::Error::custom(format!(
+                        "expected a duration like \"30m\" or the literal \"none\": {err}"
+                    ))
+                })
         }
     }
 }
