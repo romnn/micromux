@@ -42,9 +42,10 @@ pub use protocol::{
     ServiceBrief, SessionCapabilities, SessionInfo,
 };
 pub use select::{
-    ProbeReport, ResolvedSession, RuntimeDirDetail, SelectError, SessionSelector,
-    SocketProbeDetail, SocketProbeStatus, config_for_target, probe_detail, resolve_selector,
-    resolve_selector_in_runtime_dirs, session_config_path_is_under, session_matches_config_path,
+    AmbiguousSelection, ProbeReport, ResolvedSession, RuntimeDirDetail, SelectError,
+    SessionSelector, SocketProbeDetail, SocketProbeStatus, config_for_target, probe_detail,
+    resolve_selector, resolve_selector_in_runtime_dirs, session_config_path_is_under,
+    session_matches_config_path,
 };
 pub use server::{ControlServer, EndpointGuard, SessionIdentity, bind, endpoint_owner_lock_held};
 

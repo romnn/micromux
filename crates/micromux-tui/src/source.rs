@@ -7,6 +7,12 @@ use tokio::sync::{broadcast, mpsc};
 
 use crate::RemoteSource;
 
+pub(crate) struct AttachmentStatus {
+    pub session: micromux_control::SessionInfo,
+    pub connected: bool,
+    pub notice: Option<String>,
+}
+
 /// Where the TUI's session data comes from.
 ///
 /// The set is closed because the TUI supports only an in-process session model and the remote
@@ -116,6 +122,17 @@ impl SessionSource {
     pub(crate) fn cancel(&self) {
         if let Self::Remote(source) = self {
             source.cancel();
+        }
+    }
+
+    pub(crate) fn attachment_status(&self) -> Option<AttachmentStatus> {
+        match self {
+            Self::Local(_) => None,
+            Self::Remote(source) => Some(AttachmentStatus {
+                session: source.session(),
+                connected: source.connected(),
+                notice: source.notice(),
+            }),
         }
     }
 }

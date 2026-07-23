@@ -10,9 +10,12 @@ use color_eyre::eyre;
 use micromux::CancellationToken;
 use micromux_control::{ControlEndpoint, ControlServer, SessionIdentity, bind};
 use micromux_tui::RemoteSource;
+use similar_asserts::assert_eq;
 
 struct Session {
     endpoint: ControlEndpoint,
+    config_path: std::path::PathBuf,
+    reader: micromux::SessionModelReader,
     shutdown: CancellationToken,
     _runner: tokio::task::JoinHandle<eyre::Result<()>>,
 }
@@ -38,6 +41,7 @@ services:
     let guard = bind(&endpoint)?.ok_or_else(|| eyre::eyre!("failed to bind endpoint"))?;
     let identity = SessionIdentity::new("attach-test".to_string(), dir, &config_path);
     let service_control = handles.service_control();
+    let reader = handles.reader.clone();
     let server = Arc::new(ControlServer::new(
         handles.reader,
         service_control,
@@ -51,9 +55,26 @@ services:
 
     Ok(Session {
         endpoint,
+        config_path,
+        reader,
         shutdown,
         _runner: runner,
     })
+}
+
+async fn wait_for_running(source: &RemoteSource) -> eyre::Result<u64> {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if let Some(snapshot) = source.service("svc")
+            && snapshot.execution == micromux::Execution::Running
+        {
+            return Ok(snapshot.run_generation);
+        }
+        if Instant::now() >= deadline {
+            eyre::bail!("remote source did not observe a running service");
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 #[tokio::test]
@@ -80,10 +101,7 @@ async fn remote_source_observes_logs_and_restart_generation() -> eyre::Result<()
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
-    let initial_generation = source
-        .service("svc")
-        .ok_or_else(|| eyre::eyre!("remote source omitted svc"))?
-        .run_generation;
+    let initial_generation = wait_for_running(&source).await?;
     source.restart("svc".to_string());
 
     let deadline = Instant::now() + Duration::from_secs(3);
@@ -101,6 +119,43 @@ async fn remote_source_observes_logs_and_restart_generation() -> eyre::Result<()
     }
 
     source.cancel();
+    session.shutdown.cancel();
+    Ok(())
+}
+
+#[tokio::test]
+async fn detach_after_resolution_leaves_the_session_running() -> eyre::Result<()> {
+    let dir = tempfile::Builder::new()
+        .prefix("micromux-tui-detach-")
+        .tempdir()?;
+    let session = build_session(dir.path())?;
+    let runtime_dirs = vec![dir.path().to_path_buf()];
+    let dir_statuses = vec![micromux_control::RuntimeDirStatus {
+        path: dir.path().to_path_buf(),
+        usable: true,
+        error: None,
+    }];
+    let resolved = micromux_control::resolve_selector_in_runtime_dirs(
+        &runtime_dirs,
+        &dir_statuses,
+        dir.path(),
+        None,
+        Some(&session.config_path),
+    )
+    .await?;
+    let source = RemoteSource::connect(resolved.endpoint).await?;
+    wait_for_running(&source).await?;
+
+    source.cancel();
+    drop(source);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    assert!(session.reader.service("svc").is_some_and(|snapshot| {
+        snapshot.execution == micromux::Execution::Running && snapshot.run_generation > 0
+    }));
+    let mut client = micromux_control::Client::connect(&session.endpoint).await?;
+    assert_eq!(client.describe().await?.name, "attach-test");
+
     session.shutdown.cancel();
     Ok(())
 }

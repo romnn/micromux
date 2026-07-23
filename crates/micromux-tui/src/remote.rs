@@ -252,7 +252,11 @@ async fn run_remote(
                 () = tokio::time::sleep(delay) => {}
             }
 
-            match establish(&endpoint, &store, &changes).await {
+            let established = tokio::select! {
+                () = shutdown.cancelled() => return,
+                established = establish(&endpoint, &store, &changes) => established,
+            };
+            match established {
                 Ok((new_request, new_subscription)) => {
                     request = new_request;
                     subscription = new_subscription;

@@ -82,6 +82,12 @@ pub struct Options {
 /// A micromux subcommand. With no subcommand, micromux runs the TUI for the current project.
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Attach the TUI to an already-running micromux session.
+    Attach {
+        /// Session selector: `name:`, `pid:`, `hash:`, or a bare session name.
+        #[arg(long)]
+        session: Option<String>,
+    },
     /// Control a running micromux session over its local endpoint (dogfoods the control protocol).
     Ctl {
         /// The action to perform.
@@ -94,6 +100,40 @@ pub enum Command {
     /// Run the supervisor headless (no TUI), serving the control plane until stopped. Intended for
     /// agent-managed sessions — see the MCP `start_session`/`stop_session` tools.
     Serve,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Command, Options};
+    use clap::Parser;
+    use similar_asserts::assert_eq;
+
+    #[test]
+    fn attach_accepts_optional_selector_and_global_config_override() -> Result<(), clap::Error> {
+        let current = Options::try_parse_from(["micromux", "attach"]);
+        assert!(matches!(
+            current.map(|options| options.command),
+            Ok(Some(Command::Attach { session: None }))
+        ));
+
+        let options = Options::try_parse_from([
+            "micromux",
+            "attach",
+            "--session",
+            "name:api",
+            "--config",
+            "other.yaml",
+        ])?;
+        assert_eq!(
+            options.config_path.as_deref(),
+            Some(std::path::Path::new("other.yaml"))
+        );
+        assert!(matches!(
+            options.command,
+            Some(Command::Attach { session: Some(session) }) if session == "name:api"
+        ));
+        Ok(())
+    }
 }
 
 /// An action for the `micromux ctl` client.

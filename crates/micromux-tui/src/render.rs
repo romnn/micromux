@@ -448,10 +448,12 @@ impl Widget for &mut App {
             [main_right_area, Rect::default()]
         };
 
-        let header = format!("micromux v{}", env!("CARGO_PKG_VERSION"))
-            .bold()
-            .fg(App::HEADER_COLOR)
-            .into_centered_line();
+        let header = self.attachment_header().unwrap_or_else(|| {
+            format!("micromux v{}", env!("CARGO_PKG_VERSION"))
+                .bold()
+                .fg(App::HEADER_COLOR)
+                .into_centered_line()
+        });
         Paragraph::new(header).render(header_area, buf);
         self.render_services(services_area, buf);
         self.render_logs(logs_area, buf);
@@ -465,6 +467,23 @@ impl Widget for &mut App {
 impl App {
     const HEADER_COLOR: Color = tailwind::YELLOW.c500;
     const HIGHLIGHT_COLOR: Color = tailwind::GRAY.c900;
+
+    fn attachment_header(&self) -> Option<Line<'static>> {
+        let status = self.source.attachment_status()?;
+        let mut spans = if status.connected {
+            vec!["attached: ".fg(tailwind::GREEN.c400).bold()]
+        } else {
+            vec!["reconnecting… ".fg(tailwind::RED.c400).bold()]
+        };
+        spans.extend([
+            status.session.name.bold(),
+            format!(" ({}) — q detaches", status.session.config_path).into(),
+        ]);
+        if let Some(notice) = status.notice {
+            spans.extend([" — ".into(), notice.fg(tailwind::RED.c400)]);
+        }
+        Some(Line::from(spans).centered())
+    }
 
     fn render_services(&self, area: Rect, buf: &mut Buffer) {
         let items: Vec<ListItem> = self
@@ -747,19 +766,25 @@ impl App {
             "OFF"
         };
         let wrap = if self.log_view.wrap { "ON" } else { "OFF" };
-        let attach = if self.pty_input_mode { "ON" } else { "OFF" };
+        let pty_input = if self.pty_input_mode { "ON" } else { "OFF" };
         let focus = match self.focus {
             crate::Focus::Services => "SERVICES",
             crate::Focus::Logs => "LOGS",
             crate::Focus::Healthcheck => "HEALTH",
         };
 
-        let footer_text = [
+        let mut footer_text = vec![
             Keys::new("↑/↓", "Navigate"),
             Keys::new("←/→", "Resize"),
             Keys::new("Tab", format!("Focus:{focus}")),
-            Keys::new("a", format!("Attach:{attach}")),
-            Keys::new("Alt+Esc", "Detach"),
+        ];
+        if self.input.is_some() {
+            footer_text.extend([
+                Keys::new("a", format!("PTY Input:{pty_input}")),
+                Keys::new("Alt+Esc", "Exit input"),
+            ]);
+        }
+        footer_text.extend([
             Keys::new("H", "Health"),
             Keys::new("w", format!("Wrap:{wrap}")),
             Keys::new("t", format!("Tail:{tail}")),
@@ -767,8 +792,15 @@ impl App {
             Keys::new("R", "Restart All"),
             Keys::new("d", "Disable/Enable"),
             Keys::new("s", "Stop dynamic"),
-            Keys::new("q", "Quit"),
-        ];
+            Keys::new(
+                "q",
+                if self.source.attachment_status().is_some() {
+                    "Detach"
+                } else {
+                    "Quit"
+                },
+            ),
+        ]);
 
         let widget = Paragraph::new(
             Line::from(

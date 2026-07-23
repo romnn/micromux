@@ -644,6 +644,7 @@ mod tests {
     use codespan_reporting::diagnostic::Diagnostic;
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
     use indoc::indoc;
+    use ratatui::widgets::Widget as _;
     use similar_asserts::assert_eq;
     use std::path::Path;
     use tokio::sync::mpsc;
@@ -839,6 +840,16 @@ mod tests {
             commands_rx.try_recv(),
             Err(mpsc::error::TryRecvError::Empty)
         ));
+        let area = ratatui::layout::Rect::new(0, 0, 160, 24);
+        let mut buffer = ratatui::buffer::Buffer::empty(area);
+        (&mut app).render(area, &mut buffer);
+        let rendered = buffer
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(!rendered.contains("PTY Input"));
+        assert!(!rendered.contains("Exit input"));
         Ok(())
     }
 

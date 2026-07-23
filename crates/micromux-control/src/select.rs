@@ -111,6 +111,15 @@ pub struct ResolvedSession {
     pub info: SessionInfo,
 }
 
+/// Details for a selector that matched more than one live session.
+#[derive(Debug)]
+pub struct AmbiguousSelection {
+    /// Human-readable explanation and disambiguation hint.
+    pub message: String,
+    /// The live candidates, used by interactive clients to print concrete selectors.
+    pub candidates: Vec<SessionInfo>,
+}
+
 /// Failures produced while selecting a live session.
 #[derive(Debug, thiserror::Error)]
 pub enum SelectError {
@@ -118,8 +127,8 @@ pub enum SelectError {
     #[error("no session: {}", .0.summary)]
     NoSession(Box<ProbeReport>),
     /// More than one live session matched.
-    #[error("ambiguous selector: {0}")]
-    Ambiguous(String),
+    #[error("ambiguous selector: {}", .0.message)]
+    Ambiguous(Box<AmbiguousSelection>),
     /// A possibly matching endpoint existed but was unusable.
     #[error("session busy: {0}")]
     Busy(String),
@@ -326,10 +335,13 @@ fn resolve_unique_current_scan_matches(
     describe: &str,
 ) -> Result<Option<ResolvedSession>, SelectError> {
     if matches.len() > 1 {
-        return Err(SelectError::Ambiguous(format!(
-            "{describe} matched {} live sessions; use pid: or name: to disambiguate",
-            matches.len()
-        )));
+        return Err(ambiguous_selection(
+            format!(
+                "{describe} matched {} live sessions; use pid: or name: to disambiguate",
+                matches.len()
+            ),
+            &matches,
+        ));
     }
     Ok(matches.into_iter().next())
 }
@@ -445,10 +457,13 @@ fn classify_probe_matches(
     report: impl FnOnce(Vec<SocketProbeDetail>) -> ProbeReport,
 ) -> Result<ResolvedSession, SelectError> {
     if matches.len() > 1 {
-        return Err(SelectError::Ambiguous(format!(
-            "{describe} matched {} live sessions; {disambiguate_hint}",
-            matches.len()
-        )));
+        return Err(ambiguous_selection(
+            format!(
+                "{describe} matched {} live sessions; {disambiguate_hint}",
+                matches.len()
+            ),
+            &matches,
+        ));
     }
     if let Some(resolved) = matches.into_iter().next() {
         return Ok(resolved);
@@ -464,6 +479,16 @@ fn classify_probe_matches(
     Err(SelectError::NoSession(Box::new(report(
         probes.into_iter().map(probe_detail).collect(),
     ))))
+}
+
+fn ambiguous_selection(message: String, matches: &[ResolvedSession]) -> SelectError {
+    SelectError::Ambiguous(Box::new(AmbiguousSelection {
+        message,
+        candidates: matches
+            .iter()
+            .map(|resolved| resolved.info.clone())
+            .collect(),
+    }))
 }
 
 /// Convert an endpoint probe into its transport-level diagnostic representation.

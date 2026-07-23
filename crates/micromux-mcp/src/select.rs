@@ -165,7 +165,7 @@ fn map_select_error(cwd: &Path, error: SelectError) -> ToolError {
         SelectError::NoSession(report) => {
             ToolError::NoSession(Box::new(diagnostics_from_report(cwd, *report)))
         }
-        SelectError::Ambiguous(message) => ToolError::Ambiguous(message),
+        SelectError::Ambiguous(ambiguous) => ToolError::Ambiguous(ambiguous.message),
         SelectError::Busy(message) => ToolError::Busy(message),
         SelectError::Unsupported => ToolError::Unsupported,
         SelectError::Control(error) => ToolError::from(error),

@@ -5,6 +5,7 @@
 //! - Emitting diagnostics.
 //! - Starting the TUI and scheduler.
 
+mod attach;
 mod control;
 mod ctl;
 mod logging;
@@ -135,6 +136,9 @@ async fn run() -> eyre::Result<()> {
     let mut options = options::Options::parse();
 
     match options.command.take() {
+        Some(options::Command::Attach { session }) => {
+            return attach::run(&options, session.as_deref()).await;
+        }
         Some(options::Command::Ctl { action }) => {
             return ctl::run(action, options.config_path.as_deref()).await;
         }
