@@ -1,6 +1,7 @@
 //! Scheduler command and lifecycle types.
 
-use super::control::CommandAck;
+use super::control::{CommandAck, DynamicCommandAck};
+use crate::DynamicServiceParams;
 use crate::health_check::Health;
 
 /// Unique identifier for a service.
@@ -207,6 +208,31 @@ pub enum Command {
         service: ServiceID,
         /// Optional reply channel for acknowledged commands.
         ack: Option<CommandAck>,
+    },
+    /// Create a dynamic service.
+    StartDynamic {
+        /// Definition and lease request.
+        params: DynamicServiceParams,
+        /// Required reply channel.
+        ack: DynamicCommandAck,
+    },
+    /// Replace or revive a dynamic service.
+    ReplaceDynamic {
+        /// Existing dynamic service id.
+        service: ServiceID,
+        /// Required current revision.
+        expected_revision: u64,
+        /// Replacement definition and lease request.
+        params: DynamicServiceParams,
+        /// Required reply channel.
+        ack: DynamicCommandAck,
+    },
+    /// Retire a dynamic service.
+    StopDynamic {
+        /// Dynamic service id.
+        service: ServiceID,
+        /// Required reply channel.
+        ack: DynamicCommandAck,
     },
     /// Send a raw input payload to a service.
     SendInput(ServiceID, Vec<u8>),

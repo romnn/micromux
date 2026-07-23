@@ -8,6 +8,7 @@
 //! `mpsc::Sender<Command>` instead.
 
 use super::types::{Command, ServiceID};
+use crate::{DynamicServiceParams, RestartPolicy, ServiceSpec};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
@@ -23,6 +24,70 @@ pub struct ServiceCommandAck {
     pub observed_generation: u64,
 }
 
+/// Scheduler acknowledgement for a dynamic-service mutation. Reused directly as the
+/// control-protocol wire payload, like [`ServiceCommandAck`].
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct DynamicServiceAck {
+    /// Affected service.
+    pub service: ServiceID,
+    /// Current optimistic-concurrency revision.
+    pub revision: u64,
+    /// Run generation observed before the mutation.
+    pub observed_generation: u64,
+    /// Effective lease expiry in Unix milliseconds.
+    pub expires_at_unix_ms: u64,
+    /// Effective command argv.
+    pub command: Vec<String>,
+    /// Effective working directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_dir: Option<String>,
+    /// Informational ports.
+    #[serde(default)]
+    pub ports: Vec<u16>,
+    /// Environment key names. Values never leave the scheduler boundary.
+    #[serde(default)]
+    pub env_keys: Vec<String>,
+    /// Effective restart policy.
+    pub restart: RestartPolicy,
+    /// Whether an effective healthcheck is configured.
+    pub healthcheck_configured: bool,
+    /// Whether a stop found the service already retired.
+    #[serde(default)]
+    pub already_retired: bool,
+    /// Whether the acknowledgement was replayed from the idempotency window.
+    #[serde(default)]
+    pub idempotent_replay: bool,
+}
+
+impl DynamicServiceAck {
+    pub(crate) fn new(
+        service: ServiceID,
+        revision: u64,
+        observed_generation: u64,
+        expires_at_unix_ms: u64,
+        spec: &ServiceSpec,
+        already_retired: bool,
+        idempotent_replay: bool,
+    ) -> Self {
+        let mut env_keys = spec.environment.keys().cloned().collect::<Vec<_>>();
+        env_keys.sort_unstable();
+        Self {
+            service,
+            revision,
+            observed_generation,
+            expires_at_unix_ms,
+            command: spec.command.clone(),
+            working_dir: spec.working_dir_display(),
+            ports: spec.ports.clone(),
+            env_keys,
+            restart: spec.restart.clone(),
+            healthcheck_configured: spec.healthcheck.is_some(),
+            already_retired,
+            idempotent_replay,
+        }
+    }
+}
+
 /// A typed rejection produced by the scheduler when it declines a command.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum CommandRejection {
@@ -35,10 +100,30 @@ pub enum CommandRejection {
     /// The latest config could not be loaded safely before restarting.
     #[error("config reload failed: {0}")]
     ConfigReload(String),
+    /// The session policy does not permit the requested operation.
+    #[error("policy denied: {0}")]
+    PolicyDenied(String),
+    /// A configured resource limit would be exceeded.
+    #[error("limit exceeded: {0}")]
+    LimitExceeded(String),
+    /// The caller's optimistic-concurrency revision is stale.
+    #[error("revision mismatch: expected {expected}, actual {actual}")]
+    RevisionMismatch {
+        /// Revision supplied by the caller.
+        expected: u64,
+        /// Current revision in the scheduler.
+        actual: u64,
+    },
+    /// The supplied service definition is invalid.
+    #[error("invalid service spec: {0}")]
+    InvalidSpec(String),
 }
 
 /// The inner result of a service-control command: either the per-service acks, or a typed rejection.
 pub type ServiceCommandResult = Result<Vec<ServiceCommandAck>, CommandRejection>;
+
+/// Result of one dynamic-service mutation.
+pub type DynamicServiceResult = Result<DynamicServiceAck, CommandRejection>;
 
 /// The scheduler dropped the reply channel (it is shutting down) before acknowledging a command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -53,6 +138,12 @@ pub struct CommandAck {
     tx: oneshot::Sender<ServiceCommandResult>,
 }
 
+/// Reply half for a dynamic-service command.
+#[derive(Debug)]
+pub struct DynamicCommandAck {
+    tx: oneshot::Sender<DynamicServiceResult>,
+}
+
 impl CommandAck {
     pub(crate) fn new() -> (Self, oneshot::Receiver<ServiceCommandResult>) {
         let (tx, rx) = oneshot::channel();
@@ -61,6 +152,17 @@ impl CommandAck {
 
     /// Satisfy the command. A dropped receiver (caller gone) is not an error here.
     pub(crate) fn send(self, result: ServiceCommandResult) {
+        let _ = self.tx.send(result);
+    }
+}
+
+impl DynamicCommandAck {
+    pub(crate) fn new() -> (Self, oneshot::Receiver<DynamicServiceResult>) {
+        let (tx, rx) = oneshot::channel();
+        (Self { tx }, rx)
+    }
+
+    pub(crate) fn send(self, result: DynamicServiceResult) {
         let _ = self.tx.send(result);
     }
 }
@@ -140,5 +242,66 @@ impl ServiceControl {
             ack: Some(ack),
         })
         .await
+    }
+
+    /// Create and start a dynamic service.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SchedulerStopped`] if the scheduler is no longer accepting commands.
+    pub async fn start_dynamic(
+        &self,
+        params: DynamicServiceParams,
+    ) -> Result<DynamicServiceResult, SchedulerStopped> {
+        let (ack, rx) = DynamicCommandAck::new();
+        self.tx
+            .send(Command::StartDynamic { params, ack })
+            .await
+            .map_err(|_| SchedulerStopped)?;
+        rx.await.map_err(|_| SchedulerStopped)
+    }
+
+    /// Replace or revive a dynamic service at an expected revision.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SchedulerStopped`] if the scheduler is no longer accepting commands.
+    pub async fn replace_dynamic(
+        &self,
+        service: &ServiceID,
+        expected_revision: u64,
+        params: DynamicServiceParams,
+    ) -> Result<DynamicServiceResult, SchedulerStopped> {
+        let (ack, rx) = DynamicCommandAck::new();
+        self.tx
+            .send(Command::ReplaceDynamic {
+                service: service.clone(),
+                expected_revision,
+                params,
+                ack,
+            })
+            .await
+            .map_err(|_| SchedulerStopped)?;
+        rx.await.map_err(|_| SchedulerStopped)
+    }
+
+    /// Retire a dynamic service without removing its post-mortem state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SchedulerStopped`] if the scheduler is no longer accepting commands.
+    pub async fn stop_dynamic(
+        &self,
+        service: &ServiceID,
+    ) -> Result<DynamicServiceResult, SchedulerStopped> {
+        let (ack, rx) = DynamicCommandAck::new();
+        self.tx
+            .send(Command::StopDynamic {
+                service: service.clone(),
+                ack,
+            })
+            .await
+            .map_err(|_| SchedulerStopped)?;
+        rx.await.map_err(|_| SchedulerStopped)
     }
 }

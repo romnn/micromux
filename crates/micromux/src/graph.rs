@@ -18,8 +18,8 @@ impl ServiceGraph {
         // Add node for each service and edges for its dependencies
         for (name, service) in services {
             let name = name.as_ref();
-            for dep in &service.depends_on {
-                let dep_name = dep.name.as_ref().as_str();
+            for dep in &service.spec.depends_on {
+                let dep_name = dep.service.as_str();
 
                 // Validate that the dependency actually exists
                 if !graph.contains_node(dep_name) {

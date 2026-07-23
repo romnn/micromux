@@ -1,6 +1,6 @@
 use super::{
-    Config, ConfigError, HealthCheckDefaults, Service, UiConfig, parse, parse_duration,
-    parse_optional,
+    Config, ConfigError, ControlConfig, DynamicServicesPolicy, HealthCheckDefaults, Service,
+    UiConfig, parse, parse_duration, parse_optional,
 };
 use crate::diagnostics::DiagnosticExt;
 use crate::{
@@ -11,6 +11,7 @@ use crate::{
 use codespan_reporting::diagnostic::{Diagnostic, Label};
 use indexmap::IndexMap;
 use itertools::Itertools;
+use std::path::Path;
 use yaml_spanned::{Mapping, Sequence, Spanned, Value, value::Kind};
 
 /// Known top-level keys for a service definition (including accepted aliases). Used to warn
@@ -370,30 +371,178 @@ pub fn parse_ui_config<F: Copy>(
     })
 }
 
-/// Parse the optional top-level `control: { enabled: <bool> }` section. Defaults to enabled.
-pub fn parse_control_enabled<F: Copy>(
+/// Parse the optional top-level control policy.
+pub fn parse_control<F: Copy>(
     value: &yaml_spanned::Spanned<Value>,
+    config_dir: &Path,
     file_id: F,
     strict: bool,
     diagnostics: &mut Vec<Diagnostic<F>>,
-) -> Result<bool, ConfigError> {
-    let Some(value) = value.get("control") else {
-        return Ok(true);
-    };
-    let (_span, mapping) = expect_mapping(value, "control config must be a mapping".into())?;
-    warn_unknown_keys(
-        mapping,
-        &["enabled"],
-        "control",
+) -> Result<ControlConfig, ConfigError> {
+    let control = value.get("control");
+    let mapping = control
+        .map(|control| expect_mapping(control, "control config must be a mapping".into()))
+        .transpose()?
+        .map(|(_, mapping)| mapping);
+    if let Some(mapping) = mapping {
+        warn_unknown_keys(
+            mapping,
+            &["enabled", "dynamic_services"],
+            "control",
+            file_id,
+            strict,
+            diagnostics,
+        );
+    }
+    let enabled = mapping
+        .map(|mapping| parse_optional::<bool>(mapping.get("enabled")))
+        .transpose()?
+        .flatten()
+        .map(Spanned::into_inner)
+        .unwrap_or(true);
+    let dynamic = mapping.and_then(|mapping| mapping.get("dynamic_services"));
+    let dynamic_services = parse_dynamic_services(
+        dynamic,
+        value.span(),
+        config_dir,
         file_id,
         strict,
         diagnostics,
-    );
-    let enabled = parse_optional::<bool>(mapping.get("enabled"))?;
-    Ok(match enabled {
-        Some(spanned) => spanned.into_inner(),
-        None => true,
+    )?;
+
+    Ok(ControlConfig {
+        enabled,
+        dynamic_services,
     })
+}
+
+fn parse_dynamic_services<F: Copy>(
+    dynamic: Option<&yaml_spanned::Spanned<Value>>,
+    default_span: &yaml_spanned::spanned::Span,
+    config_dir: &Path,
+    file_id: F,
+    strict: bool,
+    diagnostics: &mut Vec<Diagnostic<F>>,
+) -> Result<DynamicServicesPolicy, ConfigError> {
+    let dynamic_mapping = dynamic
+        .map(|dynamic| expect_mapping(dynamic, "control.dynamic_services must be a mapping".into()))
+        .transpose()?
+        .map(|(_, mapping)| mapping);
+    if let Some(dynamic_mapping) = dynamic_mapping {
+        warn_unknown_keys(
+            dynamic_mapping,
+            &[
+                "enabled",
+                "allowed_working_roots",
+                "max_services",
+                "max_lifetime",
+            ],
+            "control.dynamic_services",
+            file_id,
+            strict,
+            diagnostics,
+        );
+    }
+    // Fall back to `DynamicServicesPolicy::default()` per field so the parser and the
+    // programmatic default cannot drift apart.
+    let defaults = DynamicServicesPolicy::default();
+    let dynamic_enabled = dynamic_mapping
+        .map(|mapping| parse_optional::<bool>(mapping.get("enabled")))
+        .transpose()?
+        .flatten()
+        .map(Spanned::into_inner)
+        .unwrap_or(defaults.enabled);
+    let max_services = dynamic_mapping
+        .and_then(|mapping| mapping.get("max_services"))
+        .map(|value| parse_positive_usize(value, "control.dynamic_services.max_services"))
+        .transpose()?
+        .unwrap_or(defaults.max_services);
+    let max_lifetime = dynamic_mapping
+        .map(|mapping| parse_duration(mapping.get("max_lifetime")))
+        .transpose()?
+        .flatten()
+        .map(Spanned::into_inner)
+        .unwrap_or(defaults.max_lifetime);
+    // Roots are canonicalized eagerly so policy checks compare canonical paths; with the
+    // feature disabled the roots are never consulted, so a stale path must not fail the load.
+    let allowed_working_roots = parse_dynamic_roots(
+        dynamic,
+        dynamic_mapping,
+        default_span,
+        config_dir,
+        dynamic_enabled,
+    )?;
+    if dynamic_enabled && allowed_working_roots.is_empty() {
+        let span = dynamic.map(|value| value.span).unwrap_or(*default_span);
+        diagnostics.push(
+            Diagnostic::warning_or_error(strict)
+                .with_message(
+                    "control.dynamic_services.allowed_working_roots is empty; every dynamic \
+                     service will be denied",
+                )
+                .with_labels(vec![
+                    Label::primary(file_id, span).with_message("empty allowed_working_roots"),
+                ]),
+        );
+    }
+
+    Ok(DynamicServicesPolicy {
+        enabled: dynamic_enabled,
+        allowed_working_roots,
+        max_services,
+        max_lifetime,
+    })
+}
+
+fn parse_dynamic_roots(
+    dynamic: Option<&yaml_spanned::Spanned<Value>>,
+    dynamic_mapping: Option<&Mapping>,
+    default_span: &yaml_spanned::spanned::Span,
+    config_dir: &Path,
+    enabled: bool,
+) -> Result<Vec<std::path::PathBuf>, ConfigError> {
+    let root_values = dynamic_mapping
+        .and_then(|mapping| mapping.get("allowed_working_roots"))
+        .map(|value| {
+            expect_sequence(
+                value,
+                "control.dynamic_services.allowed_working_roots must be a sequence".into(),
+            )
+        })
+        .transpose()?;
+    let roots = match root_values {
+        Some(values) => values
+            .iter()
+            .map(|value| Ok((parse::<String>(value)?.into_inner(), value.span)))
+            .collect::<Result<Vec<_>, ConfigError>>()?,
+        None => vec![(
+            ".".to_string(),
+            dynamic.map_or(*default_span, |value| value.span),
+        )],
+    };
+    roots
+        .into_iter()
+        .map(|(root, span)| {
+            let path = crate::env::resolve_path(config_dir, &root).map_err(|err| {
+                ConfigError::InvalidValue {
+                    message: format!("failed to resolve allowed working root `{root}`: {err}"),
+                    span: span.into(),
+                }
+            })?;
+            // With dynamic services disabled the roots are never consulted, so a root that no
+            // longer exists on disk must not fail an otherwise valid config.
+            if !enabled {
+                return Ok(path);
+            }
+            std::fs::canonicalize(&path).map_err(|err| ConfigError::InvalidValue {
+                message: format!(
+                    "failed to canonicalize allowed working root `{}`: {err}",
+                    path.display()
+                ),
+                span: span.into(),
+            })
+        })
+        .collect()
 }
 
 fn parse_positive_usize(
@@ -534,118 +683,71 @@ fn invalid_empty_command(raw_command: &str, span: yaml_spanned::spanned::Span) -
     }
 }
 
-fn normalize_cmd_exec(
-    command: &[Spanned<String>],
-    raw_command: &str,
-    span: yaml_spanned::spanned::Span,
-) -> Result<(Spanned<String>, Vec<Spanned<String>>), ConfigError> {
-    // Exec form: ["CMD", prog, arg1, arg2...]
-    let Some(prog) = command.get(1).cloned() else {
-        // CMD form needs at least one program
-        return Err(invalid_empty_command(raw_command, span));
-    };
-    let args = command
-        .get(2..)
-        .map(<[yaml_spanned::Spanned<std::string::String>]>::to_vec)
-        .unwrap_or_default();
-    Ok((prog, args))
-}
-
-fn normalize_cmd_shell(
-    command: &[Spanned<String>],
-    raw_command: &str,
-    span: yaml_spanned::spanned::Span,
-) -> Result<(Spanned<String>, Vec<Spanned<String>>), ConfigError> {
-    // Shell form: ["CMD-SHELL", cmd...]
-    // Join everything after index 0 into one string.
-    let Some(rest) = command.get(1..) else {
-        return Err(invalid_empty_command(raw_command, span));
-    };
-
-    let command_string = rest.iter().map(std::convert::AsRef::as_ref).join(" ");
-    let Some(span_start) = rest.first().map(|v| v.span.start) else {
-        return Err(invalid_empty_command(raw_command, span));
-    };
-    let Some(span_end) = rest.last().map(|v| v.span.end) else {
-        return Err(invalid_empty_command(raw_command, span));
-    };
-
-    let cmd_shell_span = command.first().map_or(span, |v| v.span);
-
-    #[cfg(unix)]
-    let (prog, args) = (
-        Spanned {
-            span: cmd_shell_span,
-            inner: "sh".to_string(),
-        },
-        vec![
-            Spanned {
-                span: cmd_shell_span,
-                inner: "-c".to_string(),
-            },
-            Spanned {
-                span: yaml_spanned::spanned::Span {
-                    start: span_start,
-                    end: span_end,
-                },
-                inner: command_string,
-            },
-        ],
-    );
-    #[cfg(windows)]
-    let (prog, args) = (
-        Spanned {
-            span: cmd_shell_span,
-            inner: "cmd.exe".to_string(),
-        },
-        vec![
-            Spanned {
-                span: cmd_shell_span,
-                inner: "/S".to_string(),
-            },
-            Spanned {
-                span: cmd_shell_span,
-                inner: "/C".to_string(),
-            },
-            Spanned {
-                span: yaml_spanned::spanned::Span {
-                    start: span_start,
-                    end: span_end,
-                },
-                inner: command_string,
-            },
-        ],
-    );
-
-    Ok((prog, args))
-}
-
 pub fn normalize_command(
     command: &[Spanned<String>],
     raw_command: &str,
     span: yaml_spanned::spanned::Span,
 ) -> Result<(Spanned<String>, Vec<Spanned<String>>), ConfigError> {
-    if command.is_empty() {
-        return Err(invalid_empty_command(raw_command, span));
-    }
-
     let Some(first) = command.first() else {
         return Err(invalid_empty_command(raw_command, span));
     };
 
-    let (prog, args) = match first.as_str() {
-        "CMD" => normalize_cmd_exec(command, raw_command, span)?,
-        "CMD-SHELL" => normalize_cmd_shell(command, raw_command, span)?,
-        _ => (
+    match first.as_str() {
+        "CMD" => {
+            let Some(program) = command.get(1).cloned() else {
+                return Err(invalid_empty_command(raw_command, span));
+            };
+            Ok((
+                program,
+                command.get(2..).map(<[_]>::to_vec).unwrap_or_default(),
+            ))
+        }
+        "CMD-SHELL" => {
+            let Some(rest) = command.get(1..).filter(|rest| !rest.is_empty()) else {
+                return Err(invalid_empty_command(raw_command, span));
+            };
+            // Only the CMD-SHELL arm needs the span-free lowering; the other arms pass the
+            // spanned parts through untouched.
+            let plain = command
+                .iter()
+                .map(|part| part.as_ref().clone())
+                .collect::<Vec<_>>();
+            let normalized = crate::spec::normalize_command(&plain)
+                .map_err(|_| invalid_empty_command(raw_command, span))?;
+            let command_span = yaml_spanned::spanned::Span {
+                start: rest.first().map_or(span.start, |part| part.span.start),
+                end: rest.last().map_or(span.end, |part| part.span.end),
+            };
+            let prefix_span = first.span;
+            let Some(program) = normalized.first() else {
+                return Err(invalid_empty_command(raw_command, span));
+            };
+            let args = normalized
+                .iter()
+                .enumerate()
+                .skip(1)
+                .map(|(index, part)| Spanned {
+                    span: if index + 1 == normalized.len() {
+                        command_span
+                    } else {
+                        prefix_span
+                    },
+                    inner: part.clone(),
+                })
+                .collect();
+            Ok((
+                Spanned {
+                    span: prefix_span,
+                    inner: program.clone(),
+                },
+                args,
+            ))
+        }
+        _ => Ok((
             first.clone(),
-            command
-                .get(1..)
-                .map(<[yaml_spanned::Spanned<std::string::String>]>::to_vec)
-                .unwrap_or_default(),
-        ),
-    };
-
-    Ok((prog, args))
+            command.get(1..).map(<[_]>::to_vec).unwrap_or_default(),
+        )),
+    }
 }
 
 pub fn parse_command(
@@ -942,6 +1044,7 @@ fn parse_services<F: Copy>(
 
 pub fn parse_config<F: Copy + PartialEq>(
     value: &yaml_spanned::Spanned<Value>,
+    config_dir: &Path,
     file_id: F,
     strict_override: Option<bool>,
     diagnostics: &mut Vec<Diagnostic<F>>,
@@ -950,7 +1053,7 @@ pub fn parse_config<F: Copy + PartialEq>(
     let strict = strict_override.or(strict_config).unwrap_or(false);
     let name = parse_optional::<String>(value.get("name"))?.map(Spanned::into_inner);
     let ui_config = parse_ui_config(value, file_id, strict, diagnostics)?;
-    let control_enabled = parse_control_enabled(value, file_id, strict, diagnostics)?;
+    let control = parse_control(value, config_dir, file_id, strict, diagnostics)?;
     let restart_policy = value
         .get("restart")
         .map(parse_restart_value)
@@ -978,7 +1081,7 @@ pub fn parse_config<F: Copy + PartialEq>(
     Ok(Config {
         name,
         ui_config,
-        control_enabled,
+        control,
         log_retention,
         restart_policy,
         healthcheck_defaults,
@@ -1373,7 +1476,7 @@ mod tests {
         let parsed = config::from_str(yaml, Path::new("."), 0, None, &mut diagnostics)?;
         assert_eq!(parsed.config.name.as_deref(), Some("my-project"));
         assert!(!parsed.config.ui_config.pretty_json_logs);
-        assert!(!parsed.config.control_enabled);
+        assert!(!parsed.config.control.enabled);
         assert_eq!(parsed.config.log_retention.disk.retained_runs, 5);
         assert_eq!(
             parsed.config.log_retention.memory.max_lines,
@@ -1404,7 +1507,7 @@ mod tests {
         let parsed = config::from_str(yaml, Path::new("."), 0, None, &mut diagnostics)?;
         assert_eq!(parsed.config.name, None);
         assert!(parsed.config.ui_config.pretty_json_logs);
-        assert!(parsed.config.control_enabled);
+        assert!(parsed.config.control.enabled);
         assert_eq!(parsed.config.log_retention, LogRetention::default());
         assert_eq!(
             parsed.config.restart_policy,
@@ -1492,6 +1595,61 @@ mod tests {
                 Some("echo a b")
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn dynamic_services_policy_parses_defaults_and_canonical_roots() -> eyre::Result<()> {
+        let dir = tempfile::tempdir()?;
+        std::fs::create_dir(dir.path().join("sandbox"))?;
+        let yaml = indoc! {r#"
+            version: 1
+            control:
+              dynamic_services:
+                enabled: true
+                allowed_working_roots: [sandbox]
+                max_services: 7
+                max_lifetime: 90m
+                future_limit: true
+            services:
+              app:
+                command: ["true"]
+        "#};
+        let mut diagnostics: Vec<Diagnostic<usize>> = Vec::new();
+        let parsed = config::from_str(yaml, dir.path(), 0, None, &mut diagnostics)?;
+        let policy = parsed.config.control.dynamic_services;
+
+        assert!(policy.enabled);
+        assert_eq!(policy.max_services, 7);
+        assert_eq!(policy.max_lifetime, std::time::Duration::from_mins(90));
+        assert_eq!(
+            policy.allowed_working_roots,
+            vec![dir.path().join("sandbox").canonicalize()?]
+        );
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("unknown control.dynamic_services field `future_limit`")
+        }));
+
+        let mut diagnostics = Vec::new();
+        let defaults = config::from_str(
+            "version: 1\nservices:\n  app:\n    command: [true]\n",
+            dir.path(),
+            0,
+            None,
+            &mut diagnostics,
+        )?;
+        assert!(!defaults.config.control.dynamic_services.enabled);
+        assert_eq!(defaults.config.control.dynamic_services.max_services, 4);
+        assert_eq!(
+            defaults
+                .config
+                .control
+                .dynamic_services
+                .allowed_working_roots,
+            vec![dir.path().canonicalize()?]
+        );
         Ok(())
     }
 }

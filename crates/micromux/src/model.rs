@@ -39,11 +39,8 @@ const DEFAULT_MEMORY_LOG_MAX_BYTES: usize = 64 * MIB;
 const HEALTH_HISTORY: usize = 8;
 /// Per-attempt healthcheck output retention.
 const HEALTH_OUTPUT_MAX_LINES: usize = 200;
-/// Default probe interval when none is configured (matches Docker Compose).
-const DEFAULT_HEALTHCHECK_INTERVAL: Duration = Duration::from_secs(30);
-/// Default probe timeout when none is configured (matches Docker Compose).
-const DEFAULT_HEALTHCHECK_TIMEOUT: Duration = Duration::from_secs(30);
-
+/// Maximum retained lifecycle events per service.
+pub const EVENT_HISTORY: usize = 256;
 /// Capacity of the liveness-only change broadcast. A lagging subscriber loses only coalescible
 /// notifications (it re-queries the model for content), never log bytes.
 const CHANGE_CHANNEL_CAPACITY: usize = 1024;
@@ -79,6 +76,51 @@ pub enum Execution {
     Unknown,
 }
 
+/// Origin category exposed on service snapshots.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub enum OriginKind {
+    /// Loaded from the session configuration.
+    #[default]
+    Configured,
+    /// Created through the control plane.
+    Dynamic,
+    /// A newer peer sent an origin this binary does not know yet.
+    #[serde(other)]
+    Unknown,
+}
+
+/// Why a dynamic service reached its terminal state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub enum RetiredReason {
+    /// Explicitly stopped through the control plane.
+    Stopped,
+    /// Its mandatory lease expired.
+    Expired,
+    /// A newer peer sent a retirement reason this binary does not know yet.
+    #[serde(other)]
+    Unknown,
+}
+
+/// Public provenance and lifecycle metadata for a dynamic service.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct DynamicServiceInfo {
+    /// Creation time in Unix milliseconds.
+    pub created_at_unix_ms: u64,
+    /// Lease expiry time in Unix milliseconds.
+    pub expires_at_unix_ms: u64,
+    /// Optional caller-supplied ownership label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+    /// Optimistic-concurrency revision.
+    pub revision: u64,
+    /// Terminal reason, present after retirement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retired: Option<RetiredReason>,
+    /// Retirement time in Unix milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retired_at_unix_ms: Option<u64>,
+}
+
 #[derive(JsonSchema)]
 #[expect(
     dead_code,
@@ -102,20 +144,12 @@ pub struct HealthcheckConfig {
     pub timeout: Duration,
 }
 
-impl From<&crate::config::HealthCheck> for HealthcheckConfig {
-    fn from(config: &crate::config::HealthCheck) -> Self {
+impl From<&crate::spec::HealthcheckSpec> for HealthcheckConfig {
+    fn from(config: &crate::spec::HealthcheckSpec) -> Self {
         Self {
-            retries: config.retries.as_deref().copied().unwrap_or(1).max(1),
-            interval: config
-                .interval
-                .as_deref()
-                .copied()
-                .unwrap_or(DEFAULT_HEALTHCHECK_INTERVAL),
-            timeout: config
-                .timeout
-                .as_deref()
-                .copied()
-                .unwrap_or(DEFAULT_HEALTHCHECK_TIMEOUT),
+            retries: config.retries,
+            interval: config.interval,
+            timeout: config.timeout,
         }
     }
 }
@@ -139,6 +173,12 @@ pub struct ServiceSnapshot {
     pub id: ServiceID,
     /// Human-readable service name.
     pub name: String,
+    /// Whether this service was configured or created at runtime.
+    #[serde(default)]
+    pub origin: OriginKind,
+    /// Dynamic lifecycle metadata, present only for dynamic services.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dynamic: Option<DynamicServiceInfo>,
     /// Requested state (`Disabled` is a desire, not an execution).
     pub desired: Desired,
     /// Observed lifecycle phase.
@@ -214,6 +254,8 @@ impl ServiceSnapshot {
         Self {
             id,
             name,
+            origin: OriginKind::Configured,
+            dynamic: None,
             desired: Desired::Enabled,
             execution: Execution::Pending,
             health: None,
@@ -382,6 +424,71 @@ pub struct HealthAttempt {
     pub result: Option<HealthResult>,
 }
 
+/// One scheduler lifecycle fact retained for service diagnosis.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ServiceEvent {
+    /// Per-service monotonic sequence number.
+    pub seq: u64,
+    /// Event time in Unix milliseconds.
+    pub at_unix_ms: u64,
+    /// Run generation associated with the transition.
+    pub run_generation: u64,
+    /// Lifecycle transition category.
+    pub kind: ServiceEventKind,
+    /// One human-readable line describing the transition.
+    pub detail: String,
+    /// Exit code associated with an exit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    /// Process id associated with a spawn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    /// Backoff delay in milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delay_ms: Option<u64>,
+    /// Dependencies preventing a start.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_on: Option<Vec<ServiceID>>,
+}
+
+/// Scheduler lifecycle transition category.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub enum ServiceEventKind {
+    /// A restart was requested.
+    RestartRequested,
+    /// An enable was requested.
+    EnableRequested,
+    /// A disable was requested.
+    DisableRequested,
+    /// Configured service definitions were reloaded.
+    ConfigReloaded,
+    /// A process could not be spawned.
+    SpawnFailed,
+    /// A process was spawned.
+    Spawned,
+    /// A running service became healthy.
+    Healthy,
+    /// A running service became unhealthy.
+    Unhealthy,
+    /// A process exited.
+    Exited,
+    /// An automatic-restart backoff was armed.
+    BackoffScheduled,
+    /// Dependencies are preventing a start.
+    DependencyBlocked,
+    /// Previously blocking dependencies became ready.
+    DependencyReady,
+    /// A dynamic service was created.
+    Created,
+    /// A dynamic service was replaced or revived.
+    Replaced,
+    /// A dynamic service was explicitly stopped or expired.
+    Retired,
+    /// A newer peer sent an event kind this binary does not know yet.
+    #[serde(other)]
+    Unknown,
+}
+
 /// What kind of change a [`SessionChange`] notification coalesces. The broadcast is liveness-only:
 /// subscribers receive the kind and re-query the model for content.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -392,6 +499,10 @@ pub enum ChangeKind {
     Logs,
     /// Healthcheck history changed.
     Health,
+    /// The service roster changed.
+    Roster,
+    /// Lifecycle timeline history changed.
+    Events,
     /// A newer peer sent a change kind this binary does not know yet.
     #[serde(other)]
     Unknown,
@@ -432,6 +543,8 @@ struct ServiceEntry {
     spool_dir: Option<PathBuf>,
     disk: Option<DiskLogWriter>,
     health: VecDeque<HealthAttempt>,
+    events: VecDeque<ServiceEvent>,
+    next_event_seq: u64,
 }
 
 struct RunLogSource {
@@ -464,6 +577,8 @@ impl ServiceEntry {
             spool_dir: spool_dir.map(Path::to_path_buf),
             disk,
             health: VecDeque::new(),
+            events: VecDeque::new(),
+            next_event_seq: 1,
         }
     }
 
@@ -697,6 +812,12 @@ impl ServiceEntry {
             }
         }
     }
+
+    fn remove_retained_run_files(&mut self) {
+        for run in &mut self.runs {
+            run.enqueue_remove(self.disk.as_ref());
+        }
+    }
 }
 
 struct Inner {
@@ -705,6 +826,7 @@ struct Inner {
     spool_dir: Option<PathBuf>,
     _spool_lock: Option<File>,
     disk: Option<DiskLogWorker>,
+    disk_writer: Option<DiskLogWriter>,
 }
 
 impl Inner {
@@ -726,6 +848,7 @@ impl Inner {
 impl Drop for Inner {
     fn drop(&mut self) {
         self.services.get_mut().clear();
+        self.disk_writer.take();
         let disk_stopped = if let Some(disk) = self.disk.as_mut() {
             disk.shutdown()
         } else {
@@ -877,6 +1000,40 @@ impl SessionModelReader {
         guard.get(id).and_then(ServiceEntry::latest_current_health)
     }
 
+    /// Retained lifecycle events, either forward from `after` or as the newest chronological tail.
+    ///
+    /// The returned boolean is true when retention or `tail` omitted matching events.
+    #[must_use]
+    pub fn events(
+        &self,
+        id: &str,
+        after: Option<u64>,
+        tail: Option<usize>,
+    ) -> (Vec<ServiceEvent>, bool) {
+        let guard = self.inner.services.read();
+        let Some(entry) = guard.get(id) else {
+            return (Vec::new(), false);
+        };
+        let limit = tail.unwrap_or(EVENT_HISTORY).min(EVENT_HISTORY);
+        let retention_truncated = entry
+            .events
+            .front()
+            .is_some_and(|first| first.seq > after.unwrap_or(0).saturating_add(1));
+        let matching = entry
+            .events
+            .iter()
+            .filter(|event| after.is_none_or(|after| event.seq > after))
+            .cloned()
+            .collect::<Vec<_>>();
+        let truncated = retention_truncated || matching.len() > limit;
+        if after.is_some() {
+            (matching.into_iter().take(limit).collect(), truncated)
+        } else {
+            let skip = matching.len().saturating_sub(limit);
+            (matching.into_iter().skip(skip).collect(), truncated)
+        }
+    }
+
     /// Subscribe to liveness-only change notifications. Re-query the model for content on each.
     #[must_use]
     pub fn subscribe(&self) -> broadcast::Receiver<SessionChange> {
@@ -998,6 +1155,62 @@ impl RunSink {
 }
 
 impl SessionModelWriter {
+    /// Add a service to the end of the roster.
+    pub(crate) fn insert_service(&self, snapshot: ServiceSnapshot, retention: LogRetention) {
+        let service_id = snapshot.id.clone();
+        {
+            let mut guard = self.inner.services.write();
+            if guard.contains_key(&service_id) {
+                tracing::warn!(service_id, "ignoring duplicate service insertion");
+                return;
+            }
+            guard.insert(
+                service_id.clone(),
+                ServiceEntry::new(
+                    snapshot,
+                    retention,
+                    self.inner.spool_dir.as_deref(),
+                    self.inner.disk_writer.clone(),
+                ),
+            );
+        }
+        self.inner.publish(&service_id, ChangeKind::Roster);
+    }
+
+    /// Remove a fully drained service from the roster.
+    pub(crate) fn remove_service(&self, id: &ServiceID) {
+        let removed = self
+            .inner
+            .services
+            .write()
+            .shift_remove(id)
+            .map(|mut entry| entry.remove_retained_run_files())
+            .is_some();
+        if removed {
+            self.inner.publish(id, ChangeKind::Roster);
+        } else {
+            tracing::warn!(service_id = id, "ignoring removal of unknown service");
+        }
+    }
+
+    /// Append one lifecycle event, assigning its per-service sequence number.
+    pub(crate) fn append_event(&self, id: &ServiceID, mut event: ServiceEvent) {
+        {
+            let mut guard = self.inner.services.write();
+            let Some(entry) = guard.get_mut(id) else {
+                tracing::warn!(service_id = id, "ignoring event for unknown service");
+                return;
+            };
+            event.seq = entry.next_event_seq;
+            entry.next_event_seq = entry.next_event_seq.saturating_add(1);
+            while entry.events.len() >= EVENT_HISTORY {
+                entry.events.pop_front();
+            }
+            entry.events.push_back(event);
+        }
+        self.inner.publish(id, ChangeKind::Events);
+    }
+
     pub(crate) fn run_sink(&self, service_id: &ServiceID, run_generation: u64) -> RunSink {
         RunSink {
             inner: self.inner.clone(),
@@ -1148,6 +1361,7 @@ pub(crate) fn new_with_retention(
         spool_dir,
         _spool_lock: spool_lock,
         disk,
+        disk_writer,
     });
     (
         SessionModelReader {
@@ -1202,6 +1416,18 @@ mod tests {
             serde_json::from_str::<OutputStream>("\"Combined\"").unwrap(),
             OutputStream::Unknown
         );
+        assert_eq!(
+            serde_json::from_str::<OriginKind>("\"Templated\"").unwrap(),
+            OriginKind::Unknown
+        );
+        assert_eq!(
+            serde_json::from_str::<RetiredReason>("\"Preempted\"").unwrap(),
+            RetiredReason::Unknown
+        );
+        assert_eq!(
+            serde_json::from_str::<ServiceEventKind>("\"Migrated\"").unwrap(),
+            ServiceEventKind::Unknown
+        );
     }
 
     #[test]
@@ -1224,6 +1450,8 @@ mod tests {
         assert_eq!(snapshot.restart_policy, RestartPolicy::Never);
         assert_eq!(snapshot.command, Vec::<String>::new());
         assert_eq!(snapshot.health, None);
+        assert_eq!(snapshot.origin, OriginKind::Configured);
+        assert!(snapshot.dynamic.is_none());
 
         let encoded = serde_json::to_string(&snapshot)?;
         let decoded = serde_json::from_str::<ServiceSnapshot>(&encoded)?;
@@ -2187,6 +2415,105 @@ mod tests {
             Some(Execution::Running)
         );
         assert!(services.first().and_then(|s| s.uptime).is_some());
+    }
+
+    #[tokio::test]
+    async fn roster_insert_and_remove_publish_changes_in_order() {
+        let (reader, writer) = new([entry("configured")]);
+        let mut changes = reader.subscribe();
+        writer.insert_service(snapshot("dynamic"), LogRetention::default());
+
+        let inserted = changes.recv().await.expect("insert change");
+        assert_eq!(inserted.service_id, "dynamic");
+        assert_eq!(inserted.kind, ChangeKind::Roster);
+        assert_eq!(
+            reader
+                .services()
+                .into_iter()
+                .map(|snapshot| snapshot.id)
+                .collect::<Vec<_>>(),
+            vec!["configured", "dynamic"]
+        );
+
+        writer.remove_service(&"dynamic".to_string());
+        let removed = changes.recv().await.expect("remove change");
+        assert_eq!(removed.service_id, "dynamic");
+        assert_eq!(removed.kind, ChangeKind::Roster);
+        assert!(reader.service("dynamic").is_none());
+    }
+
+    #[test]
+    fn roster_removal_deletes_retained_run_files() -> color_eyre::Result<()> {
+        let spool = unique_spool_dir("removed-service");
+        let (reader, writer) = new_with_retention([entry("dynamic")], Some(spool.clone()), None);
+        let id = "dynamic".to_string();
+        writer.begin_run(&id, 1);
+        writer.append_log(
+            &id,
+            1,
+            OutputStream::Stdout,
+            LogUpdateKind::Append,
+            "retained".to_string(),
+        );
+        let path = reader
+            .log_runs(&id)
+            .into_iter()
+            .find_map(|run| run.path)
+            .map(PathBuf::from)
+            .ok_or_else(|| color_eyre::eyre::eyre!("missing retained run path"))?;
+        let _ = reader.run_log(&id, 1, None);
+        assert!(path.exists());
+
+        writer.remove_service(&id);
+        writer.inner.flush_disk();
+
+        assert!(!path.exists());
+        drop(reader);
+        drop(writer);
+        assert!(!spool.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn service_event_history_is_bounded_and_pages_by_cursor_or_tail() {
+        let (reader, writer) = new([entry("svc")]);
+        let id = "svc".to_string();
+        for generation in 1..=EVENT_HISTORY as u64 + 5 {
+            writer.append_event(
+                &id,
+                ServiceEvent {
+                    seq: 0,
+                    at_unix_ms: generation,
+                    run_generation: generation,
+                    kind: ServiceEventKind::Spawned,
+                    detail: format!("generation {generation}"),
+                    exit_code: None,
+                    pid: None,
+                    delay_ms: None,
+                    blocked_on: None,
+                },
+            );
+        }
+
+        let (history, truncated) = reader.events(&id, None, None);
+        assert_eq!(history.len(), EVENT_HISTORY);
+        assert!(truncated);
+        assert_eq!(history.first().map(|event| event.seq), Some(6));
+        assert_eq!(history.last().map(|event| event.seq), Some(261));
+
+        let (tail, truncated) = reader.events(&id, None, Some(3));
+        assert_eq!(
+            tail.iter().map(|event| event.seq).collect::<Vec<_>>(),
+            vec![259, 260, 261]
+        );
+        assert!(truncated);
+
+        let (page, truncated) = reader.events(&id, Some(257), Some(2));
+        assert_eq!(
+            page.iter().map(|event| event.seq).collect::<Vec<_>>(),
+            vec![258, 259]
+        );
+        assert!(truncated);
     }
 
     #[test]

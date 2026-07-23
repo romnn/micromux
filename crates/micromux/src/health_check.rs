@@ -1,5 +1,5 @@
 use crate::{
-    model::{HealthcheckConfig, RunSink},
+    model::RunSink,
     scheduler::{OutputStream, ProcessEvent, RunId, ServiceID},
 };
 use itertools::Itertools;
@@ -79,7 +79,7 @@ mod tests {
         let dir = TempDir::new("micromux-hc-timeout")?;
         let pid_path = dir.0.join("pid");
 
-        let hc = crate::config::HealthCheck {
+        let hc: crate::HealthcheckSpec = crate::config::HealthCheck {
             test: (
                 spanned_string("sh"),
                 vec![
@@ -100,7 +100,8 @@ mod tests {
                 span: yaml_spanned::spanned::Span::default(),
                 inner: 1,
             }),
-        };
+        }
+        .into();
 
         let (reader, sink) = run_sink("svc", 1);
         let shutdown = CancellationToken::new();
@@ -150,7 +151,7 @@ mod tests {
 
     #[tokio::test]
     async fn terminated_probe_emits_cancelled_finished() -> color_eyre::eyre::Result<()> {
-        let hc = crate::config::HealthCheck {
+        let hc: crate::HealthcheckSpec = crate::config::HealthCheck {
             test: (
                 spanned_string("sh"),
                 vec![spanned_string("-c"), spanned_string("sleep 5")],
@@ -165,7 +166,8 @@ mod tests {
                 span: yaml_spanned::spanned::Span::default(),
                 inner: 1,
             }),
-        };
+        }
+        .into();
 
         let (reader, sink) = run_sink("svc", 1);
         let mut changes = reader.subscribe();
@@ -221,7 +223,7 @@ mod tests {
         let dir = TempDir::new("micromux-hc-bg-stdout")?;
         let pid_path = dir.0.join("pid");
 
-        let hc = crate::config::HealthCheck {
+        let hc: crate::HealthcheckSpec = crate::config::HealthCheck {
             test: (
                 spanned_string("sh"),
                 vec![
@@ -242,7 +244,8 @@ mod tests {
                 span: yaml_spanned::spanned::Span::default(),
                 inner: 1,
             }),
-        };
+        }
+        .into();
 
         let (_reader, sink) = run_sink("svc", 1);
         let shutdown = CancellationToken::new();
@@ -296,7 +299,7 @@ mod tests {
     }
 
     async fn started_attempts_before_unhealthy(retries: usize) -> color_eyre::eyre::Result<usize> {
-        let hc = crate::config::HealthCheck {
+        let hc: crate::HealthcheckSpec = crate::config::HealthCheck {
             test: (
                 spanned_string("sh"),
                 vec![spanned_string("-c"), spanned_string("exit 1")],
@@ -314,7 +317,8 @@ mod tests {
                 span: yaml_spanned::spanned::Span::default(),
                 inner: retries,
             }),
-        };
+        }
+        .into();
 
         let (events_tx, mut events_rx) = mpsc::channel(64);
         let shutdown = CancellationToken::new();
@@ -486,15 +490,10 @@ async fn record_probe_failure(
     }
 }
 
-pub async fn run_loop(health_check: crate::config::HealthCheck, params: RunLoopParams) {
-    let effective = HealthcheckConfig::from(&health_check);
-    let max_retries = effective.retries;
-    let start_delay = health_check
-        .start_delay
-        .as_deref()
-        .copied()
-        .unwrap_or_default();
-    let interval = effective.interval;
+pub async fn run_loop(health_check: crate::HealthcheckSpec, params: RunLoopParams) {
+    let max_retries = health_check.retries;
+    let start_delay = health_check.start_delay.unwrap_or_default();
+    let interval = health_check.interval;
     tracing::info!(
         service_id = params.service_id,
         ?start_delay,
@@ -562,13 +561,8 @@ pub async fn run_loop(health_check: crate::config::HealthCheck, params: RunLoopP
     }
 }
 
-fn command_string(health_check: &crate::config::HealthCheck) -> String {
-    let (prog, args) = &health_check.test;
-    [prog]
-        .into_iter()
-        .chain(args.iter())
-        .map(|value| value.as_str())
-        .join(" ")
+fn command_string(health_check: &crate::HealthcheckSpec) -> String {
+    health_check.test.iter().join(" ")
 }
 
 fn emit_spawn_failed(sink: &RunSink, attempt: u64, source: &std::io::Error) {
@@ -776,17 +770,28 @@ fn kill_reaped_probe_group(pid: i32) {
     reason = "the probe lifecycle keeps spawn, timeout, output drain, and cleanup ordering together"
 )]
 async fn run(
-    health_check: &crate::config::HealthCheck,
+    health_check: &crate::HealthcheckSpec,
     attempt: u64,
     params: RunParams<'_>,
 ) -> Result<Outcome, Error> {
-    let (prog, args) = &health_check.test;
     let command = command_string(health_check);
+
+    let Some((prog, args)) = health_check.test.split_first() else {
+        let source = std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "healthcheck command is empty",
+        );
+        emit_spawn_failed(&params.sink, attempt, &source);
+        return Err(Error {
+            command,
+            source: ErrorReason::Spawn(source),
+        });
+    };
 
     params.sink.start_health_attempt(attempt, command.clone());
 
-    let mut cmd = Command::new(prog.as_ref());
-    cmd.args(args.iter().map(std::convert::AsRef::as_ref))
+    let mut cmd = Command::new(prog);
+    cmd.args(args)
         .envs(params.environment.iter())
         .stderr(Stdio::piped())
         .stdout(Stdio::piped());
@@ -830,7 +835,7 @@ async fn run(
     let kill_token = CancellationToken::new();
     let mut wait_handle = spawn_wait_task(process, &kill_token);
     // Always bound the probe so a hung command cannot block the loop (and dependents) forever.
-    let timeout = Some(HealthcheckConfig::from(health_check).timeout);
+    let timeout = Some(health_check.timeout);
 
     let completion = select_completion(
         timeout,

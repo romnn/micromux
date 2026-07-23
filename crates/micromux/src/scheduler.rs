@@ -1,15 +1,20 @@
 use crate::{
-    ReloadConfig, ServiceMap,
+    DynamicOrigin, DynamicServiceParams, DynamicServicesPolicy, ReloadConfig, ServiceMap,
+    ServiceOrigin, ServiceSpec,
     graph::ServiceGraph,
     health_check::Health,
     model::{
-        Desired, Execution, HealthcheckConfig, RestartState, ServiceSnapshot, SessionModelWriter,
+        Desired, DynamicServiceInfo, Execution, HealthcheckConfig, LogRetention, OriginKind,
+        RestartState, RetiredReason, ServiceEvent, ServiceEventKind, ServiceSnapshot,
+        SessionModelWriter,
     },
     service::{self, Service, StartupMode},
 };
 use codespan_reporting::diagnostic::Severity;
 use color_eyre::eyre;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::hash::{Hash, Hasher};
+use std::path::PathBuf;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -20,6 +25,8 @@ const RESTART_BACKOFF_BASE: Duration = Duration::from_millis(250);
 const RESTART_BACKOFF_MAX: Duration = Duration::from_secs(10);
 /// Minimum uptime after which a service is considered stable and its backoff is reset.
 const RESTART_BACKOFF_RESET: Duration = RESTART_BACKOFF_MAX;
+const MAX_RETIRED_DYNAMIC: usize = 8;
+const IDEMPOTENCY_WINDOW: usize = 64;
 
 #[path = "scheduler/types.rs"]
 mod types;
@@ -32,7 +39,8 @@ pub(crate) use types::{LogUpdateKind, ProcessEvent, RunId, State};
 mod control;
 pub(crate) use control::CommandAck;
 pub use control::{
-    CommandRejection, SchedulerStopped, ServiceCommandAck, ServiceCommandResult, ServiceControl,
+    CommandRejection, DynamicServiceAck, DynamicServiceResult, SchedulerStopped, ServiceCommandAck,
+    ServiceCommandResult, ServiceControl,
 };
 
 #[path = "scheduler/pty.rs"]
@@ -198,8 +206,12 @@ impl From<&Service> for RunConfig {
         Self {
             command: service.argv(),
             working_dir: service.working_dir_display(),
-            advertised_ports: service.advertised_ports.clone(),
-            healthcheck: service.health_check.as_ref().map(HealthcheckConfig::from),
+            advertised_ports: service.spec.ports.clone(),
+            healthcheck: service
+                .spec
+                .healthcheck
+                .as_ref()
+                .map(HealthcheckConfig::from),
         }
     }
 }
@@ -225,6 +237,10 @@ pub(super) struct ServiceRuntime {
     /// Fields that describe the most recent run rather than the current config.
     run_config: Option<RunConfig>,
     draining_log_readers: Vec<(RunId, pty::LogReaderHandle)>,
+    retired: Option<RetiredReason>,
+    retired_at_unix_ms: Option<u64>,
+    expires_at: Option<tokio::time::Instant>,
+    last_blocked_on: Vec<ServiceID>,
 }
 
 #[derive(Clone, Copy)]
@@ -236,7 +252,7 @@ struct ServiceRuntimeInit<'a> {
 impl<'a> From<&'a Service> for ServiceRuntimeInit<'a> {
     fn from(service: &'a Service) -> Self {
         Self {
-            restart_policy: &service.restart_policy,
+            restart_policy: &service.spec.restart,
             startup_mode: service.startup_mode,
         }
     }
@@ -267,6 +283,10 @@ impl ServiceRuntime {
             last_exit_code: None,
             run_config: None,
             draining_log_readers: Vec::new(),
+            retired: None,
+            retired_at_unix_ms: None,
+            expires_at: None,
+            last_blocked_on: Vec::new(),
         }
     }
 
@@ -303,11 +323,20 @@ impl ServiceRuntime {
     }
 
     /// Update the cached health from a resolved probe, but only while a process is live.
-    fn mark_health(&mut self, health: Health) {
+    ///
+    /// Returns whether the state actually changed, so callers can distinguish a real health
+    /// transition from a probe result that landed after the run was cancelled (e.g. `Killed`).
+    fn mark_health(&mut self, health: Health) -> bool {
+        if matches!(self.state, State::Running { health: Some(current) } if current == health) {
+            return false;
+        }
         if matches!(self.state, State::Running { .. } | State::Starting) {
             self.state = State::Running {
                 health: Some(health),
             };
+            true
+        } else {
+            false
         }
     }
 
@@ -476,12 +505,25 @@ pub(super) fn project_snapshot(
     };
     let current_config = RunConfig::from(service);
     let run_config = runtime.run_config.as_ref().unwrap_or(&current_config);
-    let restart_state = runtime
-        .restart
-        .active_restart_state(&service.restart_policy);
+    let restart_state = runtime.restart.active_restart_state(&service.spec.restart);
     let snapshot = ServiceSnapshot {
         id: service.id.clone(),
-        name: service.name.as_ref().clone(),
+        name: service.display_name().to_string(),
+        origin: match service.origin {
+            ServiceOrigin::Configured => OriginKind::Configured,
+            ServiceOrigin::Dynamic(_) => OriginKind::Dynamic,
+        },
+        dynamic: match &service.origin {
+            ServiceOrigin::Configured => None,
+            ServiceOrigin::Dynamic(origin) => Some(DynamicServiceInfo {
+                created_at_unix_ms: origin.created_at_unix_ms,
+                expires_at_unix_ms: origin.expires_at_unix_ms,
+                owner: origin.owner.clone(),
+                revision: origin.revision,
+                retired: runtime.retired,
+                retired_at_unix_ms: runtime.retired_at_unix_ms,
+            }),
+        },
         desired: match runtime.desired {
             DesiredState::Enabled => Desired::Enabled,
             DesiredState::Disabled => Desired::Disabled,
@@ -503,7 +545,7 @@ pub(super) fn project_snapshot(
         command: run_config.command.clone(),
         working_dir: run_config.working_dir.clone(),
         uptime: None,
-        restart_policy: service.restart_policy.clone(),
+        restart_policy: service.spec.restart.clone(),
     };
     (snapshot, runtime.uptime_started_at)
 }
@@ -516,6 +558,24 @@ fn unix_now_ms() -> Option<u64> {
         .duration_since(std::time::UNIX_EPOCH)
         .ok()?;
     u64::try_from(elapsed.as_millis()).ok()
+}
+
+fn service_event(
+    run_generation: u64,
+    kind: ServiceEventKind,
+    detail: impl Into<String>,
+) -> ServiceEvent {
+    ServiceEvent {
+        seq: 0,
+        at_unix_ms: unix_now_ms().unwrap_or_default(),
+        run_generation,
+        kind,
+        detail: detail.into(),
+        exit_code: None,
+        pid: None,
+        delay_ms: None,
+        blocked_on: None,
+    }
 }
 
 /// The decisive desired/execution mapping. The notable row is *running + Disabled → Stopping*: a
@@ -584,14 +644,31 @@ fn load_services_from_disk(reload: &ReloadConfig) -> Result<ServiceMap, String> 
 }
 
 fn validate_reloaded_services(current: &ServiceMap, updated: &ServiceMap) -> Result<(), String> {
+    if let Some(id) = updated.keys().find(|id| {
+        current
+            .get(*id)
+            .is_some_and(|service| matches!(service.origin, ServiceOrigin::Dynamic(_)))
+    }) {
+        return Err(format!(
+            "`{id}` exists as a dynamic service in this session; rename it or restart the session to discard dynamic entries"
+        ));
+    }
+    let configured = current
+        .iter()
+        .filter_map(|(id, service)| {
+            matches!(service.origin, ServiceOrigin::Configured).then_some(id)
+        })
+        .collect::<std::collections::HashSet<_>>();
     let missing = current
-        .keys()
+        .iter()
+        .filter(|(_, service)| matches!(service.origin, ServiceOrigin::Configured))
+        .map(|(id, _)| id)
         .filter(|service_id| !updated.contains_key(*service_id))
-        .cloned()
+        .map(|id| (*id).clone())
         .collect::<Vec<_>>();
     let added = updated
         .keys()
-        .filter(|service_id| !current.contains_key(*service_id))
+        .filter(|service_id| !configured.contains(*service_id))
         .cloned()
         .collect::<Vec<_>>();
 
@@ -643,17 +720,35 @@ struct SchedulerRuntime {
     test_events: TestEventSink,
     writer: SessionModelWriter,
     shutdown: CancellationToken,
+    config_dir: PathBuf,
+    dynamic_policy: DynamicServicesPolicy,
+    default_log_retention: LogRetention,
+    idempotency: VecDeque<IdempotencyRecord>,
+}
+
+struct SchedulerResources {
+    reload_config: Option<ReloadConfig>,
+    events_tx: mpsc::Sender<ProcessEvent>,
+    #[cfg(test)]
+    test_events: TestEventSink,
+    writer: SessionModelWriter,
+    shutdown: CancellationToken,
+    config_dir: PathBuf,
+    dynamic_policy: DynamicServicesPolicy,
+    default_log_retention: LogRetention,
+}
+
+#[derive(Clone)]
+struct IdempotencyRecord {
+    key: String,
+    digest: u64,
+    service: ServiceID,
+    revision: u64,
+    ack: DynamicServiceAck,
 }
 
 impl SchedulerRuntime {
-    fn new(
-        services: &ServiceMap,
-        reload_config: Option<ReloadConfig>,
-        events_tx: mpsc::Sender<ProcessEvent>,
-        #[cfg(test)] test_events: TestEventSink,
-        writer: SessionModelWriter,
-        shutdown: CancellationToken,
-    ) -> Self {
+    fn new(services: &ServiceMap, resources: SchedulerResources) -> Self {
         let services = services
             .iter()
             .map(|(service_id, service)| {
@@ -663,6 +758,17 @@ impl SchedulerRuntime {
                 )
             })
             .collect();
+        let SchedulerResources {
+            reload_config,
+            events_tx,
+            #[cfg(test)]
+            test_events,
+            writer,
+            shutdown,
+            config_dir,
+            dynamic_policy,
+            default_log_retention,
+        } = resources;
 
         Self {
             services,
@@ -678,6 +784,10 @@ impl SchedulerRuntime {
             test_events,
             writer,
             shutdown,
+            config_dir,
+            dynamic_policy,
+            default_log_retention,
+            idempotency: VecDeque::new(),
         }
     }
 
@@ -697,6 +807,540 @@ impl SchedulerRuntime {
         }
     }
 
+    fn append_event(
+        &self,
+        service_id: &ServiceID,
+        kind: ServiceEventKind,
+        detail: impl Into<String>,
+    ) {
+        let generation = self
+            .services
+            .get(service_id)
+            .map_or(0, ServiceRuntime::run_generation);
+        self.writer
+            .append_event(service_id, service_event(generation, kind, detail));
+    }
+
+    fn require_dynamic_enabled(&self) -> Result<(), CommandRejection> {
+        if self.dynamic_policy.enabled {
+            Ok(())
+        } else {
+            Err(CommandRejection::PolicyDenied(
+                "set control.dynamic_services.enabled: true in micromux.yaml and restart the session"
+                    .to_string(),
+            ))
+        }
+    }
+
+    fn validate_service_id(id: &str) -> Result<(), CommandRejection> {
+        if (1..=64).contains(&id.len())
+            && id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        {
+            Ok(())
+        } else {
+            Err(CommandRejection::InvalidSpec(format!(
+                "service id `{id}` must match [A-Za-z0-9._-]{{1,64}}"
+            )))
+        }
+    }
+
+    fn request_digest(
+        operation: &str,
+        expected_revision: Option<u64>,
+        params: &DynamicServiceParams,
+    ) -> Result<u64, CommandRejection> {
+        let bytes = serde_json::to_vec(&(operation, expected_revision, params)).map_err(|err| {
+            CommandRejection::InvalidSpec(format!("failed to encode request: {err}"))
+        })?;
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        bytes.hash(&mut hasher);
+        Ok(hasher.finish())
+    }
+
+    fn replay_idempotent(
+        &self,
+        key: Option<&str>,
+        digest: u64,
+        services: &ServiceMap,
+    ) -> Result<Option<DynamicServiceAck>, CommandRejection> {
+        let Some(key) = key else {
+            return Ok(None);
+        };
+        let Some(record) = self.idempotency.iter().find(|record| record.key == key) else {
+            return Ok(None);
+        };
+        if record.digest != digest {
+            return Err(CommandRejection::PolicyDenied(
+                "idempotency key reused with a different request".to_string(),
+            ));
+        }
+        let revision_matches =
+            services
+                .get(&record.service)
+                .and_then(|service| match &service.origin {
+                    ServiceOrigin::Configured => None,
+                    ServiceOrigin::Dynamic(origin) => Some(origin.revision),
+                })
+                == Some(record.revision);
+        if !revision_matches {
+            return Ok(None);
+        }
+        let mut ack = record.ack.clone();
+        ack.idempotent_replay = true;
+        Ok(Some(ack))
+    }
+
+    fn remember_idempotent(&mut self, key: Option<String>, digest: u64, ack: &DynamicServiceAck) {
+        let Some(key) = key else {
+            return;
+        };
+        self.idempotency.retain(|record| record.key != key);
+        while self.idempotency.len() >= IDEMPOTENCY_WINDOW {
+            self.idempotency.pop_front();
+        }
+        self.idempotency.push_back(IdempotencyRecord {
+            key,
+            digest,
+            service: ack.service.clone(),
+            revision: ack.revision,
+            ack: ack.clone(),
+        });
+    }
+
+    fn effective_lifetime(&self, requested: Option<Duration>) -> Duration {
+        requested
+            .unwrap_or(self.dynamic_policy.max_lifetime)
+            .min(self.dynamic_policy.max_lifetime)
+    }
+
+    fn expiry_deadline(lifetime: Duration) -> Result<tokio::time::Instant, CommandRejection> {
+        tokio::time::Instant::now()
+            .checked_add(lifetime)
+            .ok_or_else(|| {
+                CommandRejection::InvalidSpec(
+                    "effective expires_after is too large for the monotonic clock".to_string(),
+                )
+            })
+    }
+
+    fn materialize_spec(
+        &self,
+        services: &ServiceMap,
+        params: &DynamicServiceParams,
+    ) -> Result<(ServiceSpec, Duration), CommandRejection> {
+        let base = if let Some(from_service) = &params.from_service {
+            services
+                .get(from_service)
+                .map(|service| service.spec.clone())
+                .ok_or_else(|| {
+                    CommandRejection::InvalidSpec(format!(
+                        "from_service `{from_service}` does not exist"
+                    ))
+                })?
+        } else {
+            ServiceSpec::default()
+        };
+        let mut spec = params.spec.clone().apply_to(base);
+        spec.normalize()
+            .map_err(|err| CommandRejection::InvalidSpec(err.to_string()))?;
+        spec.command.extend(params.extra_args.clone());
+
+        let working_dir = spec
+            .working_dir
+            .clone()
+            .unwrap_or_else(|| self.config_dir.clone());
+        let working_dir = if working_dir.is_absolute() {
+            working_dir
+        } else {
+            self.config_dir.join(working_dir)
+        };
+        let working_dir = std::fs::canonicalize(&working_dir).map_err(|err| {
+            CommandRejection::InvalidSpec(format!(
+                "working directory `{}` cannot be resolved: {err}",
+                working_dir.display()
+            ))
+        })?;
+        if !self
+            .dynamic_policy
+            .allowed_working_roots
+            .iter()
+            .filter_map(|root| std::fs::canonicalize(root).ok())
+            .any(|root| working_dir.starts_with(root))
+        {
+            return Err(CommandRejection::PolicyDenied(format!(
+                "working directory `{}` is outside control.dynamic_services.allowed_working_roots",
+                working_dir.display()
+            )));
+        }
+        spec.working_dir = Some(working_dir);
+        Ok((spec, self.effective_lifetime(params.expires_after)))
+    }
+
+    fn validate_candidate(
+        &self,
+        services: &ServiceMap,
+        candidate: &Service,
+    ) -> Result<(), CommandRejection> {
+        for dependency in &candidate.spec.depends_on {
+            if dependency.service == candidate.id {
+                return Err(CommandRejection::InvalidSpec(format!(
+                    "service `{}` cannot depend on itself",
+                    candidate.id
+                )));
+            }
+            let Some(runtime) = self.services.get(&dependency.service) else {
+                return Err(CommandRejection::InvalidSpec(format!(
+                    "service `{}` depends on unknown `{}`",
+                    candidate.id, dependency.service
+                )));
+            };
+            if runtime.retired.is_some() {
+                return Err(CommandRejection::InvalidSpec(format!(
+                    "service `{}` depends on retired dynamic service `{}`; replace_dynamic_service must revive it first",
+                    candidate.id, dependency.service
+                )));
+            }
+        }
+        let mut union = services.clone();
+        union.insert(candidate.id.clone(), candidate.clone());
+        ServiceGraph::new(&union).map_err(|err| CommandRejection::InvalidSpec(err.to_string()))?;
+        Ok(())
+    }
+
+    fn dynamic_origin(service: &Service) -> Result<&DynamicOrigin, CommandRejection> {
+        match &service.origin {
+            ServiceOrigin::Dynamic(origin) => Ok(origin),
+            ServiceOrigin::Configured => Err(CommandRejection::InvalidState),
+        }
+    }
+
+    fn live_dynamic_count(&self, services: &ServiceMap) -> usize {
+        services
+            .iter()
+            .filter(|(id, service)| {
+                matches!(service.origin, ServiceOrigin::Dynamic(_))
+                    && self
+                        .services
+                        .get(*id)
+                        .is_some_and(|runtime| runtime.retired.is_none())
+            })
+            .count()
+    }
+
+    fn require_dynamic_slot(&self, services: &ServiceMap) -> Result<(), CommandRejection> {
+        let live = self.live_dynamic_count(services);
+        if live < self.dynamic_policy.max_services {
+            Ok(())
+        } else {
+            Err(CommandRejection::LimitExceeded(format!(
+                "control.dynamic_services.max_services is {}; {live} dynamic services are live",
+                self.dynamic_policy.max_services
+            )))
+        }
+    }
+
+    fn start_dynamic(
+        &mut self,
+        services: &mut ServiceMap,
+        params: DynamicServiceParams,
+    ) -> Result<DynamicServiceAck, CommandRejection> {
+        self.require_dynamic_enabled()?;
+        Self::validate_service_id(&params.service)?;
+        let digest = Self::request_digest("start", None, &params)?;
+        if let Some(ack) =
+            self.replay_idempotent(params.idempotency_key.as_deref(), digest, services)?
+        {
+            return Ok(ack);
+        }
+        if services.contains_key(&params.service) {
+            let retired_dynamic = services
+                .get(&params.service)
+                .is_some_and(|service| matches!(service.origin, ServiceOrigin::Dynamic(_)))
+                && self
+                    .services
+                    .get(&params.service)
+                    .is_some_and(|runtime| runtime.retired.is_some());
+            let guidance = if retired_dynamic {
+                "; use replace_dynamic_service to revive the retired entry"
+            } else {
+                ""
+            };
+            return Err(CommandRejection::InvalidSpec(format!(
+                "service `{}` already exists{guidance}",
+                params.service,
+            )));
+        }
+        self.require_dynamic_slot(services)?;
+
+        let (spec, lifetime) = self.materialize_spec(services, &params)?;
+        let expires_at = Self::expiry_deadline(lifetime)?;
+        let now = unix_now_ms().unwrap_or_default();
+        let lifetime_ms = u64::try_from(lifetime.as_millis()).unwrap_or(u64::MAX);
+        let expires_at_unix_ms = now.saturating_add(lifetime_ms);
+        let origin = DynamicOrigin {
+            created_at_unix_ms: now,
+            expires_at_unix_ms,
+            owner: params.owner.clone(),
+            revision: 1,
+        };
+        let service = Service::dynamic(
+            params.service.clone(),
+            spec.clone(),
+            ServiceOrigin::Dynamic(origin),
+            self.default_log_retention,
+        );
+        self.validate_candidate(services, &service)?;
+
+        let mut runtime = ServiceRuntime::new(ServiceRuntimeInit::from(&service));
+        runtime.expires_at = Some(expires_at);
+        runtime.request_enable();
+        let (snapshot, _) = project_snapshot(&service, &runtime);
+        services.insert(params.service.clone(), service.clone());
+        self.services.insert(params.service.clone(), runtime);
+        self.writer.insert_service(snapshot, service.log_retention);
+        self.append_event(
+            &params.service,
+            ServiceEventKind::Created,
+            format!(
+                "dynamic service created with revision 1; lease expires at {expires_at_unix_ms}"
+            ),
+        );
+
+        let ack = DynamicServiceAck::new(
+            params.service,
+            1,
+            0,
+            expires_at_unix_ms,
+            &spec,
+            false,
+            false,
+        );
+        self.remember_idempotent(params.idempotency_key, digest, &ack);
+        Ok(ack)
+    }
+
+    fn replace_dynamic(
+        &mut self,
+        services: &mut ServiceMap,
+        service_id: &ServiceID,
+        expected_revision: u64,
+        params: DynamicServiceParams,
+    ) -> Result<DynamicServiceAck, CommandRejection> {
+        self.require_dynamic_enabled()?;
+        if params.service != *service_id {
+            return Err(CommandRejection::InvalidSpec(format!(
+                "params.service `{}` does not match target `{service_id}`",
+                params.service
+            )));
+        }
+        let digest = Self::request_digest("replace", Some(expected_revision), &params)?;
+        if let Some(ack) =
+            self.replay_idempotent(params.idempotency_key.as_deref(), digest, services)?
+        {
+            return Ok(ack);
+        }
+        let current = services
+            .get(service_id)
+            .ok_or(CommandRejection::UnknownService)?;
+        let current_origin = Self::dynamic_origin(current)?;
+        if current_origin.revision != expected_revision {
+            return Err(CommandRejection::RevisionMismatch {
+                expected: expected_revision,
+                actual: current_origin.revision,
+            });
+        }
+        let reviving = self
+            .services
+            .get(service_id)
+            .is_some_and(|runtime| runtime.retired.is_some());
+        if reviving {
+            self.require_dynamic_slot(services)?;
+        }
+        let created_at_unix_ms = current_origin.created_at_unix_ms;
+        let owner = params
+            .owner
+            .clone()
+            .or_else(|| current_origin.owner.clone());
+        let revision = current_origin.revision.checked_add(1).ok_or_else(|| {
+            CommandRejection::InvalidSpec(format!(
+                "service `{service_id}` has exhausted its revision counter"
+            ))
+        })?;
+        let (spec, lifetime) = self.materialize_spec(services, &params)?;
+        let expires_at = Self::expiry_deadline(lifetime)?;
+        let now = unix_now_ms().unwrap_or_default();
+        let lifetime_ms = u64::try_from(lifetime.as_millis()).unwrap_or(u64::MAX);
+        let expires_at_unix_ms = now.saturating_add(lifetime_ms);
+        let origin = DynamicOrigin {
+            created_at_unix_ms,
+            expires_at_unix_ms,
+            owner,
+            revision,
+        };
+        let mut candidate = current.clone();
+        candidate.spec = spec.clone();
+        candidate.origin = ServiceOrigin::Dynamic(origin.clone());
+        self.validate_candidate(services, &candidate)?;
+
+        let runtime = self
+            .services
+            .get_mut(service_id)
+            .ok_or(CommandRejection::UnknownService)?;
+        let observed_generation = runtime.run_generation();
+        runtime.retired = None;
+        runtime.retired_at_unix_ms = None;
+        runtime.expires_at = Some(expires_at);
+        runtime.reconfigure(&spec.restart);
+        runtime.request_restart();
+        let service = services
+            .get_mut(service_id)
+            .ok_or(CommandRejection::UnknownService)?;
+        service.spec = spec.clone();
+        service.origin = ServiceOrigin::Dynamic(origin);
+        self.sync(services, service_id);
+        self.append_event(
+            service_id,
+            ServiceEventKind::Replaced,
+            format!(
+                "dynamic service replaced with revision {revision}; lease expires at {expires_at_unix_ms}"
+            ),
+        );
+
+        let ack = DynamicServiceAck::new(
+            service_id.clone(),
+            revision,
+            observed_generation,
+            expires_at_unix_ms,
+            &spec,
+            false,
+            false,
+        );
+        self.remember_idempotent(params.idempotency_key, digest, &ack);
+        Ok(ack)
+    }
+
+    fn stop_dynamic(
+        &mut self,
+        services: &ServiceMap,
+        service_id: &ServiceID,
+    ) -> Result<DynamicServiceAck, CommandRejection> {
+        self.require_dynamic_enabled()?;
+        let service = services
+            .get(service_id)
+            .ok_or(CommandRejection::UnknownService)?;
+        let origin = Self::dynamic_origin(service)?;
+        let runtime = self
+            .services
+            .get_mut(service_id)
+            .ok_or(CommandRejection::UnknownService)?;
+        let observed_generation = runtime.run_generation();
+        let already_retired = runtime.retired.is_some();
+        if !already_retired {
+            runtime.disable();
+            runtime.retired = Some(RetiredReason::Stopped);
+            runtime.retired_at_unix_ms = unix_now_ms();
+            runtime.expires_at = None;
+            self.sync(services, service_id);
+            self.append_event(
+                service_id,
+                ServiceEventKind::Retired,
+                "dynamic service retired because stop was requested",
+            );
+        }
+        Ok(DynamicServiceAck::new(
+            service_id.clone(),
+            origin.revision,
+            observed_generation,
+            origin.expires_at_unix_ms,
+            &service.spec,
+            already_retired,
+            false,
+        ))
+    }
+
+    fn expire_due(&mut self, services: &ServiceMap) -> bool {
+        let now = tokio::time::Instant::now();
+        let due = self
+            .services
+            .iter()
+            .filter(|(_, runtime)| {
+                runtime.retired.is_none()
+                    && runtime.expires_at.is_some_and(|deadline| deadline <= now)
+            })
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        for service_id in &due {
+            if let Some(runtime) = self.services.get_mut(service_id) {
+                runtime.disable();
+                runtime.retired = Some(RetiredReason::Expired);
+                runtime.retired_at_unix_ms = unix_now_ms();
+                runtime.expires_at = None;
+            }
+            self.sync(services, service_id);
+            self.append_event(
+                service_id,
+                ServiceEventKind::Retired,
+                "dynamic service retired because its lease expired",
+            );
+        }
+        !due.is_empty()
+    }
+
+    fn next_expiry(&self) -> Option<tokio::time::Instant> {
+        self.services
+            .values()
+            .filter(|runtime| runtime.retired.is_none())
+            .filter_map(|runtime| runtime.expires_at)
+            .min()
+    }
+
+    fn evict_retired(&mut self, services: &mut ServiceMap) {
+        loop {
+            let retired_count = self
+                .services
+                .values()
+                .filter(|runtime| runtime.retired.is_some())
+                .count();
+            if retired_count <= MAX_RETIRED_DYNAMIC {
+                return;
+            }
+            let depended_on = services
+                .iter()
+                .filter(|(id, _)| {
+                    self.services
+                        .get(*id)
+                        .is_some_and(|runtime| runtime.retired.is_none())
+                })
+                .flat_map(|(_, service)| {
+                    service
+                        .spec
+                        .depends_on
+                        .iter()
+                        .map(|dependency| dependency.service.clone())
+                })
+                .collect::<std::collections::HashSet<_>>();
+            let candidate = services
+                .keys()
+                .filter_map(|id| {
+                    let runtime = self.services.get(id)?;
+                    (runtime.retired.is_some()
+                        && runtime.running.is_none()
+                        && runtime.draining_log_readers.is_empty()
+                        && !depended_on.contains(id))
+                    .then_some((runtime.retired_at_unix_ms.unwrap_or_default(), id.clone()))
+                })
+                .min();
+            let Some((_, id)) = candidate else {
+                return;
+            };
+            self.services.remove(&id);
+            services.shift_remove(&id);
+            self.writer.remove_service(&id);
+        }
+    }
+
     fn reload_services(&mut self, services: &mut ServiceMap) -> Result<(), CommandRejection> {
         let Some(reload) = &self.reload_config else {
             return Ok(());
@@ -704,15 +1348,45 @@ impl SchedulerRuntime {
         let updated = load_services_from_disk(reload).map_err(CommandRejection::ConfigReload)?;
         validate_reloaded_services(services, &updated).map_err(CommandRejection::ConfigReload)?;
 
+        let mut merged = updated;
+        for (service_id, service) in services
+            .iter()
+            .filter(|(_, service)| matches!(service.origin, ServiceOrigin::Dynamic(_)))
+        {
+            merged.insert(service_id.clone(), service.clone());
+        }
+        ServiceGraph::new(&merged)
+            .map_err(|err| CommandRejection::ConfigReload(err.to_string()))?;
+
+        let changed = services
+            .iter()
+            .filter(|(_, service)| matches!(service.origin, ServiceOrigin::Configured))
+            .filter_map(|(service_id, service)| {
+                merged
+                    .get(service_id)
+                    .filter(|updated| updated.spec != service.spec)
+                    .map(|_| service_id.clone())
+            })
+            .collect::<Vec<_>>();
+
         for (service_id, runtime) in &mut self.services {
-            if let Some(service) = updated.get(service_id) {
-                runtime.reconfigure(&service.restart_policy);
+            if let Some(service) = merged
+                .get(service_id)
+                .filter(|service| matches!(service.origin, ServiceOrigin::Configured))
+            {
+                runtime.reconfigure(&service.spec.restart);
                 self.writer
                     .reconfigure_log_retention(service_id, service.log_retention);
             }
         }
-        *services = updated;
+        *services = merged;
         self.sync_all(services);
+        if !changed.is_empty() {
+            let detail = format!("reloaded changed service specs: {}", changed.join(", "));
+            for service_id in &changed {
+                self.append_event(service_id, ServiceEventKind::ConfigReloaded, detail.clone());
+            }
+        }
         Ok(())
     }
 
@@ -737,7 +1411,7 @@ impl SchedulerRuntime {
             }
             match runtime.state {
                 State::Exited { exit_code } => {
-                    runtime.will_auto_restart(&service.restart_policy, exit_code)
+                    runtime.will_auto_restart(&service.spec.restart, exit_code)
                 }
                 State::Pending
                 | State::Starting
@@ -790,11 +1464,9 @@ impl SchedulerRuntime {
         if !self.services.contains_key(service_id) {
             return Err(CommandRejection::UnknownService);
         }
-        if self
-            .services
-            .get(service_id)
-            .is_some_and(|runtime| runtime.desired == DesiredState::Disabled)
-        {
+        if self.services.get(service_id).is_some_and(|runtime| {
+            runtime.desired == DesiredState::Disabled || runtime.retired.is_some()
+        }) {
             return Err(CommandRejection::InvalidState);
         }
         self.reload_services(services)?;
@@ -807,6 +1479,11 @@ impl SchedulerRuntime {
         // after the old process has drained its output.
         runtime.request_restart();
         self.sync(services, service_id);
+        self.append_event(
+            service_id,
+            ServiceEventKind::RestartRequested,
+            "service restart requested",
+        );
         Ok(vec![ServiceCommandAck {
             service: service_id.clone(),
             observed_generation,
@@ -821,6 +1498,13 @@ impl SchedulerRuntime {
         if !self.services.contains_key(service_id) {
             return Err(CommandRejection::UnknownService);
         }
+        if self
+            .services
+            .get(service_id)
+            .is_some_and(|runtime| runtime.retired.is_some())
+        {
+            return Err(CommandRejection::InvalidState);
+        }
         self.reload_services(services)?;
         let runtime = self
             .services
@@ -829,6 +1513,11 @@ impl SchedulerRuntime {
         let observed_generation = runtime.run_generation();
         runtime.request_enable();
         self.sync(services, service_id);
+        self.append_event(
+            service_id,
+            ServiceEventKind::EnableRequested,
+            "service enable requested",
+        );
         Ok(vec![ServiceCommandAck {
             service: service_id.clone(),
             observed_generation,
@@ -846,6 +1535,11 @@ impl SchedulerRuntime {
         let observed_generation = runtime.run_generation();
         runtime.disable();
         self.sync(services, service_id);
+        self.append_event(
+            service_id,
+            ServiceEventKind::DisableRequested,
+            "service disable requested",
+        );
         Ok(vec![ServiceCommandAck {
             service: service_id.clone(),
             observed_generation,
@@ -859,7 +1553,9 @@ impl SchedulerRuntime {
             let restart = self
                 .services
                 .get_mut(service_id)
-                .filter(|runtime| runtime.desired == DesiredState::Enabled)
+                .filter(|runtime| {
+                    runtime.desired == DesiredState::Enabled && runtime.retired.is_none()
+                })
                 .map(|runtime| {
                     let observed_generation = runtime.run_generation();
                     runtime.request_restart();
@@ -867,6 +1563,11 @@ impl SchedulerRuntime {
                 });
             if let Some(observed_generation) = restart {
                 self.sync(services, service_id);
+                self.append_event(
+                    service_id,
+                    ServiceEventKind::RestartRequested,
+                    "service restart requested by restart_all",
+                );
                 acks.push(ServiceCommandAck {
                     service: service_id.clone(),
                     observed_generation,
@@ -902,6 +1603,26 @@ impl SchedulerRuntime {
                 Self::reply(ack, result);
                 true
             }
+            Command::StartDynamic { params, ack } => {
+                let result = self.start_dynamic(services, params);
+                ack.send(result);
+                true
+            }
+            Command::ReplaceDynamic {
+                service,
+                expected_revision,
+                params,
+                ack,
+            } => {
+                let result = self.replace_dynamic(services, &service, expected_revision, params);
+                ack.send(result);
+                true
+            }
+            Command::StopDynamic { service, ack } => {
+                let result = self.stop_dynamic(services, &service);
+                ack.send(result);
+                true
+            }
             Command::SendInput(service_id, data) => {
                 if let Some(runtime) = self.services.get(&service_id)
                     && let Some(running) = &runtime.running
@@ -927,79 +1648,124 @@ impl SchedulerRuntime {
         }
     }
 
+    fn handle_health_event(
+        &mut self,
+        services: &ServiceMap,
+        event: &ProcessEvent,
+        health: Health,
+        kind: ServiceEventKind,
+        detail: &'static str,
+    ) -> bool {
+        let service_id = event.service_id();
+        let changed = self
+            .services
+            .get_mut(service_id)
+            .is_some_and(|runtime| runtime.mark_health(health));
+        self.sync(services, service_id);
+        if changed {
+            self.append_event(service_id, kind, detail);
+        }
+        #[cfg(test)]
+        self.test_events.forward(event.to_test_event());
+        true
+    }
+
+    fn handle_exit_event(
+        &mut self,
+        services: &ServiceMap,
+        event: &ProcessEvent,
+        exit_code: i32,
+    ) -> bool {
+        let service_id = event.service_id();
+        if let Some(service) = services.get(service_id)
+            && let Some(runtime) = self.services.get_mut(service_id)
+        {
+            runtime.finish_current_run(&service.spec.restart, exit_code);
+        }
+        self.sync(services, service_id);
+        let generation = event.run_id().get();
+        let mut exited = service_event(
+            generation,
+            ServiceEventKind::Exited,
+            format!("service process exited with code {exit_code}"),
+        );
+        exited.exit_code = Some(exit_code);
+        self.writer.append_event(service_id, exited);
+        if let Some(delay) = self.services.get(service_id).and_then(|runtime| {
+            runtime
+                .restart
+                .backoff_until
+                .and(runtime.restart.backoff_delay)
+        }) {
+            let mut backoff = service_event(
+                generation,
+                ServiceEventKind::BackoffScheduled,
+                format!("automatic restart scheduled after {} ms", delay.as_millis()),
+            );
+            backoff.delay_ms = u64::try_from(delay.as_millis()).ok();
+            self.writer.append_event(service_id, backoff);
+        }
+        #[cfg(test)]
+        self.test_events.forward(event.to_test_event());
+        true
+    }
+
     fn handle_event(&mut self, services: &ServiceMap, event: &ProcessEvent) -> bool {
         tracing::debug!(?event, "received process event");
 
         let service_id = event.service_id().clone();
-        {
-            let Some(runtime) = self.services.get(&service_id) else {
-                return false;
-            };
-            let current_run_id = runtime.current_run_id();
-            let log_reader_finished = matches!(event, ProcessEvent::LogReaderFinished { .. })
-                && runtime
-                    .draining_log_readers
-                    .iter()
-                    .any(|(run_id, _)| *run_id == event.run_id());
-            if current_run_id != Some(event.run_id()) && !log_reader_finished {
-                tracing::debug!(
-                    service_id,
-                    event_run_id = ?event.run_id(),
-                    current_run_id = ?current_run_id,
-                    "ignoring stale process event"
-                );
-                return false;
-            }
+        let Some(runtime) = self.services.get(&service_id) else {
+            return false;
+        };
+        let current_run_id = runtime.current_run_id();
+        let log_reader_finished = matches!(event, ProcessEvent::LogReaderFinished { .. })
+            && runtime
+                .draining_log_readers
+                .iter()
+                .any(|(run_id, _)| *run_id == event.run_id());
+        if current_run_id != Some(event.run_id()) && !log_reader_finished {
+            tracing::debug!(
+                service_id,
+                event_run_id = ?event.run_id(),
+                current_run_id = ?current_run_id,
+                "ignoring stale process event"
+            );
+            return false;
         }
 
-        #[cfg(test)]
-        let test_event = event.to_test_event();
-
-        match &event {
-            ProcessEvent::Healthy { .. } => {
-                if let Some(runtime) = self.services.get_mut(&service_id) {
-                    runtime.mark_health(Health::Healthy);
-                }
-                self.sync(services, &service_id);
-                #[cfg(test)]
-                self.test_events.forward(test_event);
-                true
-            }
-            ProcessEvent::Unhealthy { .. } => {
-                if let Some(runtime) = self.services.get_mut(&service_id) {
-                    runtime.mark_health(Health::Unhealthy);
-                }
-                self.sync(services, &service_id);
-                #[cfg(test)]
-                self.test_events.forward(test_event);
-                true
-            }
+        match event {
+            ProcessEvent::Healthy { .. } => self.handle_health_event(
+                services,
+                event,
+                Health::Healthy,
+                ServiceEventKind::Healthy,
+                "service became healthy",
+            ),
+            ProcessEvent::Unhealthy { .. } => self.handle_health_event(
+                services,
+                event,
+                Health::Unhealthy,
+                ServiceEventKind::Unhealthy,
+                "service became unhealthy",
+            ),
             ProcessEvent::Killed { .. } => {
                 if let Some(runtime) = self.services.get_mut(&service_id) {
                     runtime.mark_killed();
                 }
                 self.sync(services, &service_id);
                 #[cfg(test)]
-                self.test_events.forward(test_event);
+                self.test_events.forward(event.to_test_event());
                 true
             }
             ProcessEvent::Exited { exit_code, .. } => {
-                if let Some(service) = services.get(&service_id)
-                    && let Some(runtime) = self.services.get_mut(&service_id)
-                {
-                    runtime.finish_current_run(&service.restart_policy, *exit_code);
-                }
-                self.sync(services, &service_id);
-                #[cfg(test)]
-                self.test_events.forward(test_event);
-                true
+                self.handle_exit_event(services, event, *exit_code)
             }
             ProcessEvent::LogReaderFinished { run_id, .. } => {
                 if let Some(runtime) = self.services.get_mut(&service_id) {
                     runtime.finish_log_reader(*run_id);
                 }
                 #[cfg(test)]
-                self.test_events.forward(test_event);
+                self.test_events.forward(event.to_test_event());
                 false
             }
         }
@@ -1077,6 +1843,9 @@ pub(crate) struct SchedulerInput {
     pub(crate) test_events_tx: Option<mpsc::Sender<Event>>,
     pub(crate) writer: SessionModelWriter,
     pub(crate) shutdown: CancellationToken,
+    pub(crate) config_dir: PathBuf,
+    pub(crate) dynamic_policy: DynamicServicesPolicy,
+    pub(crate) default_log_retention: LogRetention,
 }
 
 pub(crate) async fn scheduler(input: SchedulerInput) -> eyre::Result<()> {
@@ -1090,6 +1859,9 @@ pub(crate) async fn scheduler(input: SchedulerInput) -> eyre::Result<()> {
         test_events_tx,
         writer,
         shutdown,
+        config_dir,
+        dynamic_policy,
+        default_log_retention,
     } = input;
     ServiceGraph::new(&services)?;
     #[cfg(test)]
@@ -1102,12 +1874,17 @@ pub(crate) async fn scheduler(input: SchedulerInput) -> eyre::Result<()> {
     };
     let mut rt = SchedulerRuntime::new(
         &services,
-        reload_config,
-        events_tx,
-        #[cfg(test)]
-        test_events,
-        writer,
-        shutdown.clone(),
+        SchedulerResources {
+            reload_config,
+            events_tx,
+            #[cfg(test)]
+            test_events,
+            writer,
+            shutdown: shutdown.clone(),
+            config_dir,
+            dynamic_policy,
+            default_log_retention,
+        },
     );
 
     // Initial scheduling pass
@@ -1121,6 +1898,7 @@ pub(crate) async fn scheduler(input: SchedulerInput) -> eyre::Result<()> {
         // Wake the loop when the nearest pending restart backoff expires; without this a
         // backed-off service would never restart unless some unrelated event happened to arrive.
         let next_backoff = rt.next_backoff();
+        let next_expiry = rt.next_expiry();
         let needs_schedule = tokio::select! {
             () = shutdown.cancelled() => {
                 tracing::debug!("exiting scheduler");
@@ -1144,8 +1922,18 @@ pub(crate) async fn scheduler(input: SchedulerInput) -> eyre::Result<()> {
                     None => std::future::pending::<()>().await,
                 }
             } => true,
+            () = async {
+                match next_expiry {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => rt.expire_due(&services),
         };
 
+        // Retirement can become evictable only after later process/log-reader events arrive, so
+        // enforce the bounded tombstone roster after every scheduler wake rather than only on
+        // insertion.
+        rt.evict_retired(&mut services);
         if needs_schedule {
             rt.schedule_pass(&mut services);
         }

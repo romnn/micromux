@@ -97,6 +97,23 @@ pub type FileId = usize;
 /// A half-open character span.
 pub type Span = std::ops::Range<usize>;
 
+/// Render diagnostics into an ANSI-free string.
+///
+/// # Errors
+///
+/// Returns an error if a diagnostic refers to an invalid file or source span.
+pub fn render_to_string(
+    files: &files::SimpleFiles<String, String>,
+    diagnostics: &[Diagnostic<usize>],
+) -> Result<String, files::Error> {
+    let mut rendered = String::new();
+    let config = term::Config::default();
+    for diagnostic in diagnostics {
+        term::emit_to_string(&mut rendered, &config, files, diagnostic)?;
+    }
+    Ok(rendered)
+}
+
 /// Convert an error type into codespan diagnostics.
 pub trait ToDiagnostics {
     /// Convert this error value into diagnostics.

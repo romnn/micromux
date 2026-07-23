@@ -139,6 +139,39 @@ pub struct UiConfig {
     pub pretty_json_logs: bool,
 }
 
+/// Agent-control configuration latched for the lifetime of a session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlConfig {
+    /// Whether the local control endpoint is enabled.
+    pub enabled: bool,
+    /// Policy for runtime-created services.
+    pub dynamic_services: DynamicServicesPolicy,
+}
+
+/// Limits applied atomically by the scheduler to runtime-created services.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DynamicServicesPolicy {
+    /// Whether runtime creation and replacement are permitted.
+    pub enabled: bool,
+    /// Canonical working-directory roots dynamic services may use.
+    pub allowed_working_roots: Vec<PathBuf>,
+    /// Maximum number of non-retired dynamic services.
+    pub max_services: usize,
+    /// Maximum and default lease duration.
+    pub max_lifetime: Duration,
+}
+
+impl Default for DynamicServicesPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            allowed_working_roots: vec![PathBuf::from(".")],
+            max_services: 4,
+            max_lifetime: Duration::from_hours(12),
+        }
+    }
+}
+
 impl Default for UiConfig {
     fn default() -> Self {
         Self {
@@ -162,9 +195,8 @@ pub struct Config {
     pub name: Option<String>,
     /// Configuration for the UI.
     pub ui_config: UiConfig,
-    /// Whether the agent control plane is enabled (default `true`; opt out with
-    /// `control: { enabled: false }`).
-    pub control_enabled: bool,
+    /// Agent-control and dynamic-service policy.
+    pub control: ControlConfig,
     /// Retention limits for service logs exposed to the TUI/control plane/MCP.
     pub log_retention: LogRetention,
     /// Default restart policy inherited by services that do not set `restart`.
@@ -190,8 +222,10 @@ pub struct ConfigFile<F> {
     pub config: Config,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 /// Condition that must be satisfied before a dependent service is considered ready.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema,
+)]
 pub enum DependencyCondition {
     /// Dependency must have started.
     #[default]
@@ -591,7 +625,7 @@ pub fn from_str<F: Copy + PartialEq>(
     let version = parse_version(&value, file_id, effective_strict, diagnostics)?;
     let config = match version {
         Version::Latest | Version::V1 => {
-            v1::parse_config(&value, file_id, strict_override, diagnostics)?
+            v1::parse_config(&value, config_dir, file_id, strict_override, diagnostics)?
         }
     };
 

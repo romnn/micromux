@@ -95,6 +95,7 @@ impl alacritty_terminal::grid::Dimensions for TermSize {
 
 fn env_vars_for_service(service: &Service) -> HashMap<String, String> {
     let mut env_vars: HashMap<String, String> = service
+        .spec
         .environment
         .iter()
         .map(|(k, v)| (k.clone(), v.clone()))
@@ -1290,7 +1291,9 @@ pub(super) fn start_service_with_pty_size(
     use portable_pty::{CommandBuilder, PtySize};
 
     let service_id = service.id.clone();
-    let (prog, args) = &service.command;
+    let Some((prog, args)) = service.spec.command.split_first() else {
+        return Err(eyre::eyre!("service command is empty"));
+    };
 
     let env_vars = env_vars_for_service(service);
     let env_vars = {
@@ -1318,7 +1321,7 @@ pub(super) fn start_service_with_pty_size(
 
     let mut cmd = CommandBuilder::new(prog);
     cmd.args(args);
-    if let Some(dir) = &service.working_dir {
+    if let Some(dir) = &service.spec.working_dir {
         cmd.cwd(dir);
     }
     for (k, v) in &env_vars {
@@ -1378,11 +1381,12 @@ pub(super) fn start_service_with_pty_size(
     });
     child_guard.disarm();
 
-    if let Some(health_check) = service.health_check.clone() {
+    if let Some(health_check) = service.spec.healthcheck.clone() {
         tokio::spawn({
             let service_id = service_id.clone();
-            let working_dir = service.working_dir.clone();
+            let working_dir = service.spec.working_dir.clone();
             let environment: std::collections::HashMap<String, String> = service
+                .spec
                 .environment
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone()))

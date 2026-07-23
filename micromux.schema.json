@@ -56,7 +56,42 @@
       "properties": {
         "enabled": {
           "type": "boolean",
-          "description": "Enable the local control endpoint (default true)."
+          "default": true,
+          "description": "Enable the local control endpoint. Changes require a session restart."
+        },
+        "dynamic_services": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Runtime-created service policy. This is blast-radius hygiene for same-user commands, not a security sandbox. Changes require a session restart.",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "default": false,
+              "description": "Permit runtime-created services through the local control plane."
+            },
+            "allowed_working_roots": {
+              "type": "array",
+              "default": [
+                "."
+              ],
+              "items": {
+                "type": "string",
+                "minLength": 1
+              },
+              "description": "Working-directory roots, resolved and canonicalized relative to the config directory."
+            },
+            "max_services": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 4,
+              "description": "Maximum live (non-retired) dynamic services."
+            },
+            "max_lifetime": {
+              "$ref": "#/definitions/duration",
+              "default": "12h",
+              "description": "Maximum and default lifetime for every dynamic service."
+            }
+          }
         }
       }
     },
