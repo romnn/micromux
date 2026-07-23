@@ -5,7 +5,7 @@
 # `micromux serve` session for examples/demo, plus `micromux --help` — converted from ANSI to HTML
 # with `terminal-to-html` (https://github.com/buildkite/terminal-to-html), which mise provides via
 # its go backend. This is the line-oriented counterpart to crates/micromux-screenshot, which
-# captures the full truecolor TUI as PNGs with `freeze` (terminal-to-html cannot render 24-bit
+# captures the full truecolor TUI as PNG's with `freeze` (terminal-to-html cannot render 24-bit
 # color, so the TUI stays a screenshot while the 16-color CLI output becomes crisp inline HTML).
 #
 # The snippets are committed, so the Hugo site builds without micromux or terminal-to-html; run this
