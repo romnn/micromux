@@ -539,7 +539,7 @@ impl App {
                 .current_service()
                 .and_then(|service| service.cached_lines.back())
                 .map_or(0, |(seq, _)| seq.saturating_sub(1));
-            let (first_retained, new_lines) = self.reader.logs_since(&current_id, after);
+            let (first_retained, new_lines) = self.source.logs_since(&current_id, after);
             if let Some(service) = self.state.current_service_mut() {
                 match first_retained {
                     None => service.cached_lines.clear(),
@@ -642,7 +642,7 @@ impl App {
                 )
             });
         if dirty {
-            let attempts = self.reader.healthchecks(&current_id);
+            let attempts = self.source.healthchecks(&current_id);
             let out = build_healthcheck_text(configured, &attempts);
             if let Some(service) = self.state.current_service_mut() {
                 service.healthcheck_cached_text = out;
@@ -747,7 +747,7 @@ impl App {
             "OFF"
         };
         let wrap = if self.log_view.wrap { "ON" } else { "OFF" };
-        let attach = if self.attach_mode { "ON" } else { "OFF" };
+        let attach = if self.pty_input_mode { "ON" } else { "OFF" };
         let focus = match self.focus {
             crate::Focus::Services => "SERVICES",
             crate::Focus::Logs => "LOGS",

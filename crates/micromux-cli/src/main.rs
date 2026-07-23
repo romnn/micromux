@@ -183,9 +183,13 @@ async fn run() -> eyre::Result<()> {
         }
     }
 
+    let input = handles.commands.clone();
     let tui = micromux_tui::App::new(
-        handles.reader.clone(),
-        handles.commands.clone(),
+        micromux_tui::SessionSource::Local(micromux_tui::LocalSource::new(
+            handles.reader.clone(),
+            handles.commands.clone(),
+        )),
+        Some(input),
         shutdown.clone(),
         config.config.ui_config.pretty_json_logs && !options.no_pretty_json_logs,
     );

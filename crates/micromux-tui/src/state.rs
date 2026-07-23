@@ -1,5 +1,5 @@
 /// View state for one service. Domain state (execution, health, logs, healthchecks) lives in the
-/// core's `SessionModelReader`; this is the per-service render cache the TUI keeps.
+/// [`crate::SessionSource`]; this is the per-service render cache the TUI keeps.
 #[derive(Debug)]
 pub struct Service {
     pub snapshot: micromux::ServiceSnapshot,
