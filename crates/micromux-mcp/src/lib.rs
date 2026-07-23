@@ -813,6 +813,8 @@ struct WaitForExitResult {
     run_generation: u64,
     snapshot: ServiceSnapshot,
     logs: Vec<logproc::ProcessedEntry>,
+    /// Whether the log tail was cut by the limit; fetch the rest with `follow_logs`.
+    logs_truncated: bool,
     waited_secs: u64,
 }
 
@@ -1004,6 +1006,23 @@ async fn enrich_unknown_service(service: &str, mut err: ToolError) -> ToolError 
 
 /// Map a single-service control result into a tool result, enriching an `UnknownService` error with
 /// the sibling sessions that do have the service so the agent can retarget in one hop.
+/// Recent lifecycle events for one service, bounded by the model's retention.
+async fn service_events_tail(
+    conn: &mut SessionConn,
+    service: &str,
+) -> Result<Vec<micromux::ServiceEvent>, ErrorData> {
+    let response = conn
+        .request(Request::GetEvents {
+            service: service.to_string(),
+            after: None,
+            tail: Some(micromux::EVENT_HISTORY),
+        })
+        .await
+        .map_err(error_data)?;
+    let (events, _) = service_result(service, convert::events(response)).await?;
+    Ok(events)
+}
+
 async fn service_result<T>(service: &str, result: Result<T, ToolError>) -> Result<T, ErrorData> {
     match result {
         Ok(value) => Ok(value),
@@ -1713,16 +1732,8 @@ impl McpServer {
         } else {
             None
         };
-        let events_response = conn
-            .request(Request::GetEvents {
-                service: args.service.clone(),
-                after: None,
-                tail: Some(micromux::EVENT_HISTORY),
-            })
-            .await
-            .map_err(error_data)?;
-        let (events, _) = service_result(&args.service, convert::events(events_response)).await?;
-        let events = events
+        let events = service_events_tail(&mut conn, &args.service)
+            .await?
             .into_iter()
             .filter(|event| event.run_generation >= previous_generation)
             .collect();
@@ -1888,15 +1899,14 @@ impl McpServer {
         } else {
             None
         };
-        let events_response = conn
-            .request(Request::GetEvents {
-                service: service.clone(),
-                after: None,
-                tail: Some(micromux::EVENT_HISTORY),
-            })
-            .await
-            .map_err(error_data)?;
-        let (events, _) = service_result(&service, convert::events(events_response)).await?;
+        // Events only accompany a failed wait, mirroring the diagnosis block: on a healthy path
+        // — including an idempotent replay of a long-lived service — the full retained history
+        // would be noise, not evidence.
+        let events = if conclusion.needs_diagnosis() {
+            service_events_tail(&mut conn, &service).await?
+        } else {
+            Vec::new()
+        };
         let outcome = WaitResult::from_conclusion(service, timeout, &conclusion);
 
         Ok(Json(StartDynamicAndWaitResult {
@@ -1965,8 +1975,8 @@ impl McpServer {
     #[tool(
         description = "Retire a runtime service while preserving its bounded logs and snapshot for \
         post-mortem inspection. Requires control.dynamic_services.enabled in the target session's \
-        micromux.yaml. Stop is idempotent; the service also stops with the session and always \
-        carries a TTL."
+        micromux.yaml. Stop is idempotent; the service also stops with the session, and its lease \
+        (unless the policy permitted expires_after=\"none\") would retire it on expiry anyway."
     )]
     async fn stop_dynamic_service(
         &self,
@@ -2308,8 +2318,16 @@ impl McpServer {
                     })
                     .await
                     .map_err(error_data)?;
-                let (events, truncated) =
-                    service_result(&service.id, convert::events(response)).await?;
+                // A service evicted between ListServices and its GetEvents must not fail the
+                // whole session-wide merge; skip it and let the survivors report.
+                let (events, truncated) = match convert::events(response) {
+                    Ok(page) => page,
+                    Err(ToolError::Remote {
+                        code: ErrorCode::UnknownService,
+                        ..
+                    }) => continue,
+                    Err(err) => return Err(error_data(err)),
+                };
                 pages.push(ServiceEventPage {
                     service: service.id,
                     after_seq,
@@ -2500,7 +2518,7 @@ impl McpServer {
             }
             SnapshotWait::Timeout(snapshot) => (WaitForExitStatus::Timeout, None, snapshot),
         };
-        let (logs, _) = service_result(
+        let (logs, logs_truncated) = service_result(
             &args.service,
             compact_logs_since(&mut conn, &args.service, cursor, log_limit).await,
         )
@@ -2513,6 +2531,7 @@ impl McpServer {
             exit_code,
             run_generation: snapshot.run_generation,
             snapshot,
+            logs_truncated,
             logs,
             waited_secs: started.elapsed().as_secs(),
         }))
@@ -2821,8 +2840,9 @@ pub async fn serve_stdio() -> Result<(), Box<dyn std::error::Error + Send + Sync
 mod tests {
     use super::{
         DynamicMutationResult, ExitVerdict, McpServer, MutationResult, RestartAndWaitResult,
-        SessionMutationResult, SessionRef, StopSessionResult, WaitResult, classify_exit,
-        parse_since_text, session_has_service, session_resolves_service_id, session_selector,
+        SessionMutationResult, SessionRef, StartDynamicAndWaitResult, StopSessionResult,
+        WaitForExitResult, WaitForExitStatus, WaitResult, classify_exit, parse_since_text,
+        session_has_service, session_resolves_service_id, session_selector,
     };
     use crate::tools::health::health_attempt_matches_snapshot;
     use crate::tools::logs::{
@@ -2842,8 +2862,7 @@ mod tests {
         DynamicServiceArgs, EnsureAction, EnsureActionKind, EnsureReadyArgs, LogFilterArgs,
         LogsArgs, ReconcileConfigArgs, RenewDynamicServiceArgs, ReplaceDynamicServiceArgs,
         ServiceArgs, ServiceEventsArgs, ServiceEventsResult, SessionArgs,
-        SessionServiceEventsResult, StartDynamicAndWaitArgs, WaitForExitArgs, WaitForExitStatus,
-        WaitStatus,
+        SessionServiceEventsResult, StartDynamicAndWaitArgs, WaitForExitArgs, WaitStatus,
     };
 
     #[cfg(unix)]
@@ -3961,6 +3980,107 @@ services:
                 "service",
                 "session",
                 "snapshot",
+            ],
+        )?;
+
+        Ok(())
+    }
+
+    // The double-flattened bundles are exactly what these key-set pins protect: a colliding
+    // field name in SessionRef, the ack, or the body would silently shadow on the wire.
+    #[test]
+    fn wait_bundles_have_exact_flat_key_sets() -> color_eyre::Result<()> {
+        let start_bundle = StartDynamicAndWaitResult {
+            session_ref: test_session_ref(),
+            receipt: micromux_control::DynamicServiceAck {
+                service: "debug".to_string(),
+                revision: 1,
+                observed_generation: 0,
+                // None must be absent from the JSON, not null: the unbounded-lease shape.
+                expires_at_unix_ms: None,
+                command: vec!["true".to_string()],
+                working_dir: None,
+                ports: Vec::new(),
+                env_keys: Vec::new(),
+                restart: micromux::RestartPolicy::Never,
+                healthcheck_configured: false,
+                already_retired: false,
+                idempotent_replay: false,
+            },
+            outcome: WaitResult::healthy("debug".to_string(), 1),
+            snapshot: ServiceSnapshot::initial(
+                "debug".to_string(),
+                "debug".to_string(),
+                Vec::new(),
+                None,
+                micromux::RestartPolicy::Never,
+                Vec::new(),
+                None,
+            ),
+            logs: Vec::new(),
+            logs_truncated: false,
+            events: Vec::new(),
+            diagnosis: None,
+        };
+        assert_json_keys(
+            &start_bundle,
+            &[
+                "already_retired",
+                "command",
+                "config_path",
+                "env_keys",
+                "events",
+                "healthcheck_configured",
+                "id",
+                "idempotent_replay",
+                "logs",
+                "logs_truncated",
+                "observed_generation",
+                "outcome",
+                "pid",
+                "ports",
+                "restart",
+                "revision",
+                "service",
+                "session",
+                "snapshot",
+            ],
+        )?;
+
+        let exit = WaitForExitResult {
+            session_ref: test_session_ref(),
+            service: "job".to_string(),
+            status: WaitForExitStatus::Exited,
+            exit_code: Some(3),
+            run_generation: 1,
+            snapshot: ServiceSnapshot::initial(
+                "job".to_string(),
+                "job".to_string(),
+                Vec::new(),
+                None,
+                micromux::RestartPolicy::Never,
+                Vec::new(),
+                None,
+            ),
+            logs: Vec::new(),
+            logs_truncated: false,
+            waited_secs: 1,
+        };
+        assert_json_keys(
+            &exit,
+            &[
+                "config_path",
+                "exit_code",
+                "id",
+                "logs",
+                "logs_truncated",
+                "pid",
+                "run_generation",
+                "service",
+                "session",
+                "snapshot",
+                "status",
+                "waited_secs",
             ],
         )?;
         Ok(())

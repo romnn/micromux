@@ -38,7 +38,6 @@ pub(crate) fn merge_service_events(
                 page.service.clone(),
                 page.after_seq,
                 page.events.last().map(|event| event.seq),
-                !page.events.is_empty(),
             )
         })
         .collect::<Vec<_>>();
@@ -92,13 +91,9 @@ pub(crate) fn merge_service_events(
 
     let returned = returned_cursors(&events);
     let mut next = BTreeMap::new();
-    for (service, after_seq, raw_next_seq, had_events) in page_cursors {
+    for (service, after_seq, raw_next_seq) in page_cursors {
         let cursor = if merge_truncated && !tail_mode {
-            returned
-                .get(&service)
-                .copied()
-                .or_else(|| (!had_events).then_some(raw_next_seq).flatten())
-                .or(after_seq)
+            returned.get(&service).copied().or(after_seq)
         } else {
             raw_next_seq.or(after_seq).or(tail_mode.then_some(0))
         };
@@ -182,6 +177,14 @@ mod tests {
 
     #[test]
     fn shared_bound_advances_only_returned_incremental_events_but_all_tail_cursors() {
+        let first_only = merge_service_events(interleaved_pages(), 1, false);
+        assert_eq!(first_only.events.len(), 1);
+        assert_eq!(first_only.events[0].service, "alpha");
+        assert_eq!(first_only.events[0].event.seq, 1);
+        assert_eq!(first_only.next.get("alpha"), Some(&1));
+        assert_eq!(first_only.next.get("beta"), Some(&0));
+        assert!(first_only.truncated);
+
         let page = merge_service_events(interleaved_pages(), 2, false);
         let incremental = page
             .events
