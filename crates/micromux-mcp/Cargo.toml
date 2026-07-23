@@ -28,7 +28,7 @@ micromux = { path = "../micromux/" }
 micromux-control = { path = "../micromux-control/" }
 directories.workspace = true
 
-rmcp = { version = "1", features = ["server", "transport-io", "macros"] }
+rmcp = { version = "2.2.0", features = ["server", "transport-io", "macros"] }
 schemars.workspace = true
 
 serde.workspace = true
