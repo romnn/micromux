@@ -92,6 +92,19 @@ pub fn health(response: Response) -> Result<Option<HealthAttempt>, ToolError> {
     }
 }
 
+/// Extract the retained healthcheck attempt history.
+///
+/// # Errors
+///
+/// Returns a [`ToolError`] if the session replied with an error or an unexpected response.
+pub fn health_history(response: Response) -> Result<Vec<HealthAttempt>, ToolError> {
+    match response {
+        Response::HealthHistory { attempts } => Ok(attempts),
+        Response::Error { code, message } => Err(remote_error(code, message)),
+        other => Err(ToolError::Unexpected(format!("{other:?}"))),
+    }
+}
+
 /// Extract a page of lifecycle events and its truncation marker.
 ///
 /// # Errors

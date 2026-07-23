@@ -189,6 +189,9 @@ pub enum CtlAction {
     Health {
         /// The service to inspect.
         service: String,
+        /// Show the retained attempt history (oldest first) instead of only the latest attempt.
+        #[arg(long)]
+        history: bool,
     },
     /// Show the session identity.
     Describe,

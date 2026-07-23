@@ -42,8 +42,8 @@ use crate::select::ToolError;
 use crate::tools::events::{ServiceEventPage, SessionServiceEvent, merge_service_events};
 use crate::tools::health::{
     ServiceDiagnosis, SnapshotWait, WaitConclusion, bounded_attempt, diagnose_service,
-    latest_health_for_snapshot, retired_service_message, service_needs_diagnosis, service_snapshot,
-    timeout_hint, wait_for_health, wait_for_snapshot,
+    health_history, latest_health_for_snapshot, retired_service_message, service_needs_diagnosis,
+    service_snapshot, timeout_hint, wait_for_health, wait_for_snapshot,
 };
 use crate::tools::logs::{
     FollowGap, ServiceFollowGap, compact_logs_since, current_cursors, current_service_cursor,
@@ -98,7 +98,8 @@ for readiness in one call. Use `get_service_events` for startup forensics; pass 
 with its per-service cursor map to follow ordering across the session. `restart_service` and \
 `enable_service` return a generation for `wait_for_healthy`; `restart_service_and_wait` bundles the \
 usual cursor/restart/wait/log flow. Use `wait_for_log` after external actions, `diagnose` for a \
-one-shot failure summary, `list_log_runs` for retained runs, and `log_cursors` plus \
+one-shot failure summary, `get_health_history` when a flapping probe needs more than the latest \
+attempt, `list_log_runs` for retained runs, and `log_cursors` plus \
 `follow_all_logs` around hot reloads. Log tools strip ANSI by default and support regex, context, \
 time, trace-id, compact JSON, and minimum-level filters. Actions go through micromux and retain its \
 dependency and restart semantics. Use `start_session` to create a project's headless session; a \
@@ -685,6 +686,15 @@ struct HealthResult {
     service: String,
     snapshot: ServiceSnapshot,
     latest_healthcheck: Option<HealthAttempt>,
+}
+
+#[derive(Serialize, JsonSchema)]
+struct HealthHistoryResult {
+    config_path: String,
+    service: String,
+    snapshot: ServiceSnapshot,
+    /// Retained probe attempts for the current or latest run, oldest first.
+    attempts: Vec<HealthAttempt>,
 }
 
 #[derive(Serialize, JsonSchema)]
@@ -2271,6 +2281,46 @@ impl McpServer {
     }
 
     #[tool(
+        description = "Show a service's retained healthcheck attempt history for its current or \
+        latest run, oldest first, with per-attempt bounded output. Use when the latest attempt \
+        from get_health is not enough — e.g. to see whether a flapping probe fails the same way \
+        every time."
+    )]
+    async fn get_health_history(
+        &self,
+        args: Parameters<ServiceArgs>,
+    ) -> ToolResult<HealthHistoryResult> {
+        let Parameters(args) = args;
+        let resolved = select::resolve(&self.cwd, args.session)
+            .await
+            .map_err(error_data)?;
+        let mut conn = SessionConn::connect(&resolved.endpoint)
+            .await
+            .map_err(error_data)?;
+        // The snapshot fetch first: it enriches an unknown-service error with sibling-session
+        // pointers and gives the caller run context for the attempts.
+        let snapshot = service_result(
+            &args.service,
+            service_snapshot(&mut conn, &args.service).await,
+        )
+        .await?;
+        let attempts = service_result(
+            &args.service,
+            health_history(&mut conn, &args.service).await,
+        )
+        .await?
+        .into_iter()
+        .map(bounded_attempt)
+        .collect();
+        Ok(Json(HealthHistoryResult {
+            config_path: resolved.info.config_path,
+            service: args.service,
+            snapshot,
+            attempts,
+        }))
+    }
+
+    #[tool(
         description = "Return retained scheduler lifecycle events. Use after_seq for one service, \
         or pass service=\"*\" with the previous per-service `next` map as `after` to merge every \
         service's timeline. Events include dependency gating, spawn/exit, health transitions, \
@@ -2920,6 +2970,15 @@ services:
     command: ["sh", "-c", "sleep 60"]
     disabled: true
 "#;
+        boot_mcp_session_with_yaml(project_dir, "mcp-dynamic-test", yaml)
+    }
+
+    #[cfg(unix)]
+    fn boot_mcp_session_with_yaml(
+        project_dir: &std::path::Path,
+        name: &str,
+        yaml: &str,
+    ) -> color_eyre::eyre::Result<(RunningMcpSession, String)> {
         let config_path = project_dir.join("micromux.yaml");
         std::fs::write(&config_path, yaml)?;
         let config_path = std::fs::canonicalize(config_path)?;
@@ -2941,11 +3000,8 @@ services:
         let endpoint = micromux_control::endpoint_for(runtime_dir, &config_path);
         let guard = micromux_control::bind(&endpoint)?
             .ok_or_else(|| color_eyre::eyre::eyre!("control endpoint is already owned"))?;
-        let identity = micromux_control::SessionIdentity::new(
-            "mcp-dynamic-test".to_string(),
-            project_dir,
-            &config_path,
-        );
+        let identity =
+            micromux_control::SessionIdentity::new(name.to_string(), project_dir, &config_path);
         let selector = format!("hash:{}", identity.id);
         let server = Arc::new(micromux_control::ControlServer::new(
             handles.reader.clone(),
@@ -3310,6 +3366,7 @@ services:
             "reconcile_config",
             "ensure_service_ready",
             "wait_for_exit",
+            "get_health_history",
         ] {
             assert!(
                 tools.iter().any(|tool| tool.name == name),
@@ -3335,6 +3392,7 @@ services:
             "get_service_events",
             "ensure_service_ready",
             "wait_for_exit",
+            "get_health_history",
             "micromux attach",
         ] {
             assert!(
@@ -3343,6 +3401,66 @@ services:
             );
         }
         Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn get_health_history_returns_attempts_oldest_first() -> color_eyre::eyre::Result<()> {
+        let project = tempfile::tempdir()?;
+        let yaml = r#"version: 1
+services:
+  svc:
+    command: ["sh", "-c", "sleep 60"]
+    healthcheck:
+      test: ["CMD-SHELL", "echo probe-output; exit 1"]
+      start_delay: "10ms"
+      interval: "50ms"
+      timeout: "1s"
+      retries: 50
+"#;
+        let (session, selector) =
+            boot_mcp_session_with_yaml(project.path(), "mcp-health-history-test", yaml)?;
+        let mut server = McpServer::new();
+        server.cwd = project.path().to_path_buf();
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let result = loop {
+            let Json(result) = server
+                .get_health_history(Parameters(ServiceArgs {
+                    service: "svc".to_string(),
+                    session: Some(selector.clone()),
+                }))
+                .await
+                .map_err(|err| color_eyre::eyre::eyre!("get_health_history: {err:?}"))?;
+            if result.attempts.len() >= 2 {
+                break result;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                color_eyre::eyre::bail!("healthcheck history did not accumulate two attempts");
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        };
+
+        assert_eq!(result.service, "svc");
+        assert_eq!(result.snapshot.id, "svc");
+        assert!(
+            result
+                .attempts
+                .windows(2)
+                .all(|pair| pair[0].attempt < pair[1].attempt)
+        );
+        let completed = result
+            .attempts
+            .iter()
+            .find(|attempt| attempt.result.is_some())
+            .ok_or_else(|| color_eyre::eyre::eyre!("no completed attempt in history"))?;
+        assert!(
+            completed
+                .output
+                .iter()
+                .any(|line| line.line.contains("probe-output"))
+        );
+        session.finish().await
     }
 
     #[cfg(unix)]

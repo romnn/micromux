@@ -40,7 +40,16 @@ fn request_for(action: &CtlAction) -> Request {
             service: service.clone(),
         },
         CtlAction::Reconcile { dry_run } => Request::ReconcileConfig { dry_run: *dry_run },
-        CtlAction::Health { service } => Request::GetHealth {
+        CtlAction::Health {
+            service,
+            history: false,
+        } => Request::GetHealth {
+            service: service.clone(),
+        },
+        CtlAction::Health {
+            service,
+            history: true,
+        } => Request::GetHealthHistory {
             service: service.clone(),
         },
         CtlAction::Describe => Request::Describe,
@@ -422,6 +431,24 @@ mod tests {
         assert!(matches!(
             request_for(&CtlAction::Reconcile { dry_run: false }),
             Request::ReconcileConfig { dry_run: false }
+        ));
+    }
+
+    #[test]
+    fn health_maps_to_latest_or_history_by_flag() {
+        assert!(matches!(
+            request_for(&CtlAction::Health {
+                service: "api".to_string(),
+                history: false,
+            }),
+            Request::GetHealth { service } if service == "api"
+        ));
+        assert!(matches!(
+            request_for(&CtlAction::Health {
+                service: "api".to_string(),
+                history: true,
+            }),
+            Request::GetHealthHistory { service } if service == "api"
         ));
     }
 

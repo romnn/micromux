@@ -583,6 +583,23 @@ async fn latest_health(conn: &mut SessionConn, service: &str) -> Option<HealthAt
     convert::health(response).ok().flatten()
 }
 
+/// Fetch the retained healthcheck attempt history (oldest first) for a service.
+///
+/// # Errors
+///
+/// Returns a [`ToolError`] when the request fails or the service is unknown.
+pub(crate) async fn health_history(
+    conn: &mut SessionConn,
+    service: &str,
+) -> Result<Vec<HealthAttempt>, ToolError> {
+    let response = conn
+        .request(Request::GetHealthHistory {
+            service: service.to_string(),
+        })
+        .await?;
+    convert::health_history(response)
+}
+
 pub(crate) async fn latest_health_for_snapshot(
     conn: &mut SessionConn,
     snapshot: &ServiceSnapshot,
