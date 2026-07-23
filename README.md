@@ -123,7 +123,7 @@ command = "micromux"
 args = ["mcp"]
 ```
 
-Launched in a project directory, the tools target that project's session automatically. Target another with a `session` argument (`name:<n>`, `pid:<n>`, or `hash:<h>`) or the `MICROMUX_SESSION` env var. Tools: `list_sessions`, `list_services`, `find_service`, `diagnose`, `list_log_runs`, `get_log_file_path`, `get_logs`, `follow_logs`, `log_cursors`, `follow_all_logs`, `wait_for_log`, `restart_service`, `restart_all`, `enable_service`, `disable_service`, `get_health`, `wait_for_healthy`, `start_session`, `stop_session`. `restart_service`/`enable_service` return a run **generation**; pass it to `wait_for_healthy(after_generation=…)` to wait for the *new* run, not the old one. Manual restarts, enable, and due automatic restarts reload the latest `micromux.yaml` service definitions before spawning, so command flags, environment, ports, restart policy, healthcheck, and log-retention edits take effect without stopping the whole session.
+Launched in a project directory, the tools target that project's session automatically. Target another with a `session` argument (`name:<n>`, `pid:<n>`, or `hash:<h>`) or the `MICROMUX_SESSION` env var. Tools include session and service discovery, config validation, lifecycle-event and log inspection, health diagnosis/waits, ordinary mutations, `ensure_service_ready`, session start/stop, and the `start_dynamic_service`/`replace_dynamic_service`/`stop_dynamic_service` runtime-service lifecycle. `restart_service`/`enable_service` return a run **generation**; pass it to `wait_for_healthy(after_generation=…)` to wait for the *new* run, not the old one. Manual restarts, enable, and due automatic restarts reload the latest `micromux.yaml` service definitions before spawning, so command flags, environment, ports, restart policy, healthcheck, and log-retention edits take effect without stopping the whole session.
 
 `start_session` spawns a detached, headless `micromux serve` for a project, and `stop_session` stops a session and frees its ports — handy when switching between git worktrees that bind the same ports. `list_sessions` always includes discovery diagnostics, including sockets that exist but cannot answer because they are busy or speak another protocol version. `list_services` includes each service's resolved command (argv) and working directory, and its result carries a copy-pasteable `session_selector` (`hash:<id>`). `find_service` locates a service by id or name across every running session — returning each match's `session_selector`, config path, working dir, and current status — so you can retarget without the list_sessions → pick a hash → list_services dance; service-scoped tools also point at the sibling sessions that have the service when it is unknown in the selected one. `get_logs`/`follow_logs`/`follow_all_logs` strip ANSI color by default (`raw=true` keeps it), return logical log entries instead of wrapped terminal rows, trim terminal padding, and accept `grep`, `grep_context`, `since`/`since_unix_ms`, and `trace_id` filters; for services that emit JSON logs, `min_level` (`trace`…`fatal`) filters by structured level and each entry carries its detected `level`, micromux ingestion timestamp, parsed JSON source timestamp, `message`, and typed JSON `fields`. Use `format: "compact"` to return token-efficient lines like timestamp + level + message + key/value fields instead of the raw JSON string. Call `log_cursors` before an action, then pass its cursor map to `follow_all_logs(after=…)` or `wait_for_log(service="*", after=…)` to inspect the resulting logs across services with a timestamp-guided merge that preserves each service's cursor order. Cursor `0` means "before the first entry" for a service with no logs yet. `diagnose` returns a one-shot summary of exited or unhealthy services with their state, current live-run healthcheck output when applicable, and compact likely-cause log lines. On a `wait_for_healthy` timeout the response includes the execution sub-state and current live-run healthcheck output when applicable, so "still starting" is distinguishable from "process up, probe failing".
 
@@ -178,6 +178,23 @@ micromux ctl logs api --tail 50
 micromux ctl logs api --run-generation 2 --tail 200
 micromux ctl restart api
 ```
+
+Runtime-created services are disabled by default. Enable and bound them in the target session's
+config; policy changes are latched when the session starts and require a restart:
+
+```yaml
+control:
+  dynamic_services:
+    enabled: true
+    allowed_working_roots: ["."]
+    max_services: 4
+    max_lifetime: 12h
+```
+
+Every dynamic service has a TTL and stops with the session. This policy limits accidental blast
+radius for a same-user local control tool; it is not a security sandbox, because commands still run
+as the session user. Environment values can be sent inward or cloned server-side with
+`from_service`; snapshots omit the environment entirely, and receipts return only key names.
 
 Build a lean TUI-only binary with the MCP server compiled out via `cargo install --no-default-features micromux-cli`.
 
