@@ -640,36 +640,33 @@ fn rejection_response(rejection: CommandRejection) -> Response {
     }
 }
 
-fn acknowledge(result: Result<ServiceCommandResult, SchedulerStopped>) -> Response {
+/// Shared acknowledgement plumbing: only the success payload differs between the mutation
+/// families, so rejections and a stopped scheduler are mapped exactly once.
+fn acknowledge_with<T>(
+    result: Result<Result<T, CommandRejection>, SchedulerStopped>,
+    ok: impl FnOnce(T) -> Response,
+) -> Response {
     match result {
-        Ok(Ok(services)) => Response::Accepted { services },
+        Ok(Ok(value)) => ok(value),
         Ok(Err(rejection)) => rejection_response(rejection),
         Err(SchedulerStopped) => {
             Response::error(ErrorCode::SchedulerStopped, "the scheduler has stopped")
         }
     }
+}
+
+fn acknowledge(result: Result<ServiceCommandResult, SchedulerStopped>) -> Response {
+    acknowledge_with(result, |services| Response::Accepted { services })
 }
 
 fn acknowledge_dynamic(
     result: Result<micromux::DynamicServiceResult, SchedulerStopped>,
 ) -> Response {
-    match result {
-        Ok(Ok(ack)) => Response::DynamicService(ack),
-        Ok(Err(rejection)) => rejection_response(rejection),
-        Err(SchedulerStopped) => {
-            Response::error(ErrorCode::SchedulerStopped, "the scheduler has stopped")
-        }
-    }
+    acknowledge_with(result, Response::DynamicService)
 }
 
 fn acknowledge_reconcile(result: Result<micromux::ReconcileResult, SchedulerStopped>) -> Response {
-    match result {
-        Ok(Ok(receipt)) => Response::Reconcile(receipt),
-        Ok(Err(rejection)) => rejection_response(rejection),
-        Err(SchedulerStopped) => {
-            Response::error(ErrorCode::SchedulerStopped, "the scheduler has stopped")
-        }
-    }
+    acknowledge_with(result, Response::Reconcile)
 }
 
 #[cfg(test)]

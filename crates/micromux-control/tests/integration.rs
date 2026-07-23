@@ -96,22 +96,6 @@ async fn dynamic_caps(client: &mut Client) -> eyre::Result<micromux_control::Dyn
         .ok_or_else(|| eyre::eyre!("dynamic capability missing"))
 }
 
-async fn renew_dynamic_over_socket(client: &mut Client) -> eyre::Result<()> {
-    let renewed = client
-        .request(Request::RenewDynamicService {
-            service: "debug".to_string(),
-            expected_revision: 1,
-            expires_after: Some(micromux::Lease::After(Duration::from_mins(30))),
-        })
-        .await?;
-    let Response::DynamicService(renewed) = renewed else {
-        eyre::bail!("expected dynamic-service receipt, got {renewed:?}");
-    };
-    assert_eq!(renewed.revision, 1);
-    assert!(renewed.expires_at_unix_ms.is_some());
-    Ok(())
-}
-
 async fn request_until<F>(
     endpoint: &ControlEndpoint,
     request: Request,
@@ -341,23 +325,6 @@ services:
     .await?;
     assert_eq!(dynamic_caps(&mut client).await?.live_services, 1);
 
-    renew_dynamic_over_socket(&mut client).await?;
-
-    let stale = client
-        .request(Request::ReplaceDynamicService {
-            service: "debug".to_string(),
-            expected_revision: 0,
-            params: dynamic_params("debug", &["true"]),
-        })
-        .await?;
-    assert!(matches!(
-        stale,
-        Response::Error {
-            code: micromux_control::ErrorCode::RevisionMismatch,
-            ..
-        }
-    ));
-
     let replaced = client
         .request(Request::ReplaceDynamicService {
             service: "debug".to_string(),
@@ -377,6 +344,13 @@ services:
         })
         .await?;
     assert!(matches!(stopped, Response::DynamicService(receipt) if !receipt.already_retired));
+    // Stop is idempotent on the wire: a second request acknowledges instead of erroring.
+    let stopped_again = client
+        .request(Request::StopDynamicService {
+            service: "debug".to_string(),
+        })
+        .await?;
+    assert!(matches!(stopped_again, Response::DynamicService(receipt) if receipt.already_retired));
     request_until(&session.endpoint, Request::ListServices, |response| {
         matches!(response, Response::Services(services)
         if services.iter().any(|service| {
@@ -386,6 +360,65 @@ services:
     })
     .await?;
     assert_eq!(dynamic_caps(&mut client).await?.live_services, 0);
+
+    session.shutdown.cancel();
+    Ok(())
+}
+
+#[tokio::test]
+async fn renew_preserves_revision_and_guards_stale_replacements_over_the_socket() -> eyre::Result<()>
+{
+    let dir = unique_dir("renew")?;
+    let session = build_session_yaml(
+        dir.path(),
+        r#"version: 1
+control:
+  dynamic_services:
+    enabled: true
+services:
+  svc:
+    command: ["sh", "-c", "sleep 60"]
+"#,
+    )?;
+    let mut client = Client::connect(&session.endpoint).await?;
+    let created = client
+        .request(Request::StartDynamicService {
+            params: dynamic_params("debug", &["sh", "-c", "sleep 60"]),
+        })
+        .await?;
+    eyre::ensure!(
+        matches!(created, Response::DynamicService(_)),
+        "expected dynamic-service receipt, got {created:?}"
+    );
+
+    // Renew must not bump the revision — a later replace still targets revision 1.
+    let renewed = client
+        .request(Request::RenewDynamicService {
+            service: "debug".to_string(),
+            expected_revision: 1,
+            expires_after: Some(micromux::Lease::After(Duration::from_mins(30))),
+        })
+        .await?;
+    let Response::DynamicService(renewed) = renewed else {
+        eyre::bail!("expected dynamic-service receipt, got {renewed:?}");
+    };
+    assert_eq!(renewed.revision, 1);
+    assert!(renewed.expires_at_unix_ms.is_some());
+
+    let stale = client
+        .request(Request::ReplaceDynamicService {
+            service: "debug".to_string(),
+            expected_revision: 0,
+            params: dynamic_params("debug", &["true"]),
+        })
+        .await?;
+    assert!(matches!(
+        stale,
+        Response::Error {
+            code: micromux_control::ErrorCode::RevisionMismatch,
+            ..
+        }
+    ));
 
     session.shutdown.cancel();
     Ok(())

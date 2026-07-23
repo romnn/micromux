@@ -51,12 +51,23 @@ fn request_for(action: &CtlAction) -> Request {
 fn service_origin_label(service: &micromux::ServiceSnapshot) -> String {
     match (&service.origin, &service.dynamic) {
         (micromux::OriginKind::Configured, _) => "configured".to_string(),
-        (micromux::OriginKind::Dynamic, Some(dynamic)) => format!(
-            "dynamic(revision={}, retired={:?})",
-            dynamic.revision, service.retired
-        ),
+        (micromux::OriginKind::Dynamic, Some(dynamic)) => {
+            format!("dynamic(revision={})", dynamic.revision)
+        }
         (micromux::OriginKind::Dynamic, None) => "dynamic".to_string(),
         (micromux::OriginKind::Unknown, _) => "unknown".to_string(),
+    }
+}
+
+/// Retirement suffix for a service row. Origin-independent: a reconcile-removed configured
+/// service must be as visible as a stopped dynamic one.
+fn service_retired_label(service: &micromux::ServiceSnapshot) -> String {
+    match service.retired {
+        Some(micromux::RetiredReason::Stopped) => " retired=stopped".to_string(),
+        Some(micromux::RetiredReason::Expired) => " retired=expired".to_string(),
+        Some(micromux::RetiredReason::Removed) => " retired=removed".to_string(),
+        Some(micromux::RetiredReason::Unknown) => " retired=unknown".to_string(),
+        None => String::new(),
     }
 }
 
@@ -66,14 +77,15 @@ fn print_services(services: &[micromux::ServiceSnapshot]) {
             .health
             .map_or_else(|| "-".to_string(), |health| health.to_string());
         println!(
-            "{:<20} id={} origin={} desired={:?} execution={:?} health={} generation={}",
+            "{:<20} id={} origin={} desired={:?} execution={:?} health={} generation={}{}",
             service.name,
             service.id,
             service_origin_label(service),
             service.desired,
             service.execution,
             health,
-            service.run_generation
+            service.run_generation,
+            service_retired_label(service)
         );
     }
 }
@@ -384,10 +396,52 @@ pub async fn run(action: CtlAction, config_path: Option<&Path>) -> eyre::Result<
 
 #[cfg(test)]
 mod tests {
-    use super::{dynamic_receipt_line, request_for};
+    use super::{dynamic_receipt_line, request_for, service_origin_label, service_retired_label};
     use crate::options::CtlAction;
     use micromux_control::{DynamicServiceAck, Request};
     use similar_asserts::assert_eq;
+
+    #[test]
+    fn reconcile_maps_to_the_control_request_with_dry_run() {
+        assert!(matches!(
+            request_for(&CtlAction::Reconcile { dry_run: true }),
+            Request::ReconcileConfig { dry_run: true }
+        ));
+        assert!(matches!(
+            request_for(&CtlAction::Reconcile { dry_run: false }),
+            Request::ReconcileConfig { dry_run: false }
+        ));
+    }
+
+    #[test]
+    fn retirement_is_visible_for_every_origin_without_debug_formatting() {
+        let mut snapshot = micromux::ServiceSnapshot::initial(
+            "removed".to_string(),
+            "removed".to_string(),
+            Vec::new(),
+            None,
+            micromux::RestartPolicy::Never,
+            vec!["true".to_string()],
+            None,
+        );
+        assert_eq!(service_retired_label(&snapshot), "");
+
+        // A reconcile-removed configured service must be as visible as a stopped dynamic one.
+        snapshot.retired = Some(micromux::RetiredReason::Removed);
+        assert_eq!(service_origin_label(&snapshot), "configured");
+        assert_eq!(service_retired_label(&snapshot), " retired=removed");
+
+        snapshot.origin = micromux::OriginKind::Dynamic;
+        snapshot.dynamic = Some(micromux::DynamicServiceInfo {
+            created_at_unix_ms: 0,
+            expires_at_unix_ms: None,
+            owner: None,
+            revision: 2,
+        });
+        snapshot.retired = Some(micromux::RetiredReason::Stopped);
+        assert_eq!(service_origin_label(&snapshot), "dynamic(revision=2)");
+        assert_eq!(service_retired_label(&snapshot), " retired=stopped");
+    }
 
     #[test]
     fn stop_dynamic_maps_to_the_control_request_and_prints_retirement_state() {

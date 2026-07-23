@@ -155,7 +155,8 @@ pub enum Request {
     ///
     /// The config file is the authority, so this operation has no dynamic-service capability gate.
     ReconcileConfig {
-        /// Compute the semantic diff without mutating the session.
+        /// Compute the semantic diff without mutating the session. Deliberately a required
+        /// field: omission must never silently mean "apply".
         dry_run: bool,
     },
     /// Stop the whole session: stop every service and exit the session process (graceful, like the
