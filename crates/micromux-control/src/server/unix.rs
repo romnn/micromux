@@ -342,6 +342,16 @@ async fn dispatch(server: &ControlServer, request: Request) -> Response {
                 .replace_dynamic(&service, expected_revision, params)
                 .await,
         ),
+        Request::RenewDynamicService {
+            service,
+            expected_revision,
+            expires_after,
+        } => acknowledge_dynamic(
+            server
+                .control
+                .renew_dynamic(&service, expected_revision, expires_after)
+                .await,
+        ),
         Request::StopDynamicService { service } => {
             acknowledge_dynamic(server.control.stop_dynamic(&service).await)
         }
@@ -609,10 +619,9 @@ fn rejection_response(rejection: CommandRejection) -> Response {
         CommandRejection::UnknownService => {
             Response::error(ErrorCode::UnknownService, "unknown service")
         }
-        CommandRejection::InvalidState => Response::error(
-            ErrorCode::InvalidState,
-            "the command is not valid in the service's current state",
-        ),
+        CommandRejection::InvalidState(message) => {
+            Response::error(ErrorCode::InvalidState, message)
+        }
         CommandRejection::ConfigReload(message) => {
             Response::error(ErrorCode::ConfigReload, message)
         }

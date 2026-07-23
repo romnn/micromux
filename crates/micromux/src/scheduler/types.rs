@@ -1,8 +1,8 @@
 //! Scheduler command and lifecycle types.
 
 use super::control::{CommandAck, DynamicCommandAck};
-use crate::DynamicServiceParams;
 use crate::health_check::Health;
+use crate::{DynamicServiceParams, Lease};
 
 /// Unique identifier for a service.
 pub type ServiceID = String;
@@ -224,6 +224,17 @@ pub enum Command {
         expected_revision: u64,
         /// Replacement definition and lease request.
         params: DynamicServiceParams,
+        /// Required reply channel.
+        ack: DynamicCommandAck,
+    },
+    /// Renew a live dynamic service's lease without restarting it.
+    RenewDynamic {
+        /// Existing dynamic service id.
+        service: ServiceID,
+        /// Required current revision.
+        expected_revision: u64,
+        /// Requested replacement lease.
+        expires_after: Option<Lease>,
         /// Required reply channel.
         ack: DynamicCommandAck,
     },

@@ -165,6 +165,20 @@ struct ReplaceDynamicServiceArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+struct RenewDynamicServiceArgs {
+    /// Dynamic service id.
+    service: String,
+    /// Revision currently observed by the caller.
+    expected_revision: u64,
+    /// Replacement lease; omit to renew with the session policy default.
+    #[serde(default)]
+    expires_after: Option<micromux::Lease>,
+    /// Optional session selector; omit for the current project.
+    #[serde(default)]
+    session: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 struct FindServiceArgs {
     /// The service id or human name to locate across every running session.
     service: String,
@@ -1658,6 +1672,28 @@ impl McpServer {
     }
 
     #[tool(
+        description = "Renew a live runtime service's lease without restarting it or changing its \
+        revision. Requires control.dynamic_services.enabled in the target session's \
+        micromux.yaml. Omit expires_after to apply the policy default; request 'none' for a \
+        session-lifetime lease where policy permits it. A receipt replayed from an earlier \
+        idempotent create may show a stale expiry after renewal; the service snapshot is the \
+        expiry authority."
+    )]
+    async fn renew_dynamic_service(
+        &self,
+        args: Parameters<RenewDynamicServiceArgs>,
+    ) -> ToolResult<DynamicMutationResult> {
+        let Parameters(args) = args;
+        let request = Request::RenewDynamicService {
+            service: args.service.clone(),
+            expected_revision: args.expected_revision,
+            expires_after: args.expires_after,
+        };
+        self.dynamic_mutation(args.session, &args.service, request)
+            .await
+    }
+
+    #[tool(
         description = "Retire a runtime service while preserving its bounded logs and snapshot for \
         post-mortem inspection. Requires control.dynamic_services.enabled in the target session's \
         micromux.yaml. Stop is idempotent; the service also stops with the session and always \
@@ -2390,8 +2426,8 @@ mod tests {
     #[cfg(unix)]
     use super::{
         DynamicServiceArgs, EnsureAction, EnsureActionKind, EnsureReadyArgs, LogFilterArgs,
-        LogsArgs, ReplaceDynamicServiceArgs, ServiceArgs, ServiceEventsArgs, SessionArgs,
-        WaitStatus,
+        LogsArgs, RenewDynamicServiceArgs, ReplaceDynamicServiceArgs, ServiceArgs,
+        ServiceEventsArgs, SessionArgs, WaitStatus,
     };
 
     #[cfg(unix)]
@@ -2548,6 +2584,48 @@ services:
             .any(|entry| entry.line.contains("dynamic-mcp-log")))
     }
 
+    #[cfg(unix)]
+    async fn assert_dynamic_renewal_and_events(
+        server: &McpServer,
+        selector: &str,
+    ) -> color_eyre::eyre::Result<()> {
+        let Json(renewed) = server
+            .renew_dynamic_service(Parameters(RenewDynamicServiceArgs {
+                service: "debug".to_string(),
+                expected_revision: 1,
+                expires_after: Some(Lease::After(Duration::from_secs(45))),
+                session: Some(selector.to_string()),
+            }))
+            .await
+            .map_err(|err| color_eyre::eyre::eyre!(err.message))?;
+        assert_eq!(renewed.receipt.revision, 1);
+
+        let Json(events) = server
+            .get_service_events(Parameters(ServiceEventsArgs {
+                service: "debug".to_string(),
+                session: Some(selector.to_string()),
+                after_seq: None,
+                tail: Some(20),
+            }))
+            .await
+            .map_err(|err| color_eyre::eyre::eyre!(err.message))?;
+        assert!(
+            events
+                .events
+                .iter()
+                .any(|event| event.kind == micromux::ServiceEventKind::Created)
+        );
+        assert!(
+            events
+                .events
+                .iter()
+                .any(|event| event.kind == micromux::ServiceEventKind::LeaseRenewed)
+        );
+        assert!(events.next_seq.is_some());
+        assert!(!events.truncated);
+        Ok(())
+    }
+
     #[test]
     fn server_builds_typed_tool_schemas() -> color_eyre::Result<()> {
         let server = McpServer::new();
@@ -2585,6 +2663,7 @@ services:
         for name in [
             "start_dynamic_service",
             "replace_dynamic_service",
+            "renew_dynamic_service",
             "stop_dynamic_service",
             "get_service_events",
             "validate_config",
@@ -2702,23 +2781,7 @@ services:
         assert_eq!(dynamic.origin, micromux::OriginKind::Dynamic);
         assert_eq!(dynamic.dynamic.as_ref().map(|info| info.revision), Some(1));
 
-        let Json(events) = server
-            .get_service_events(Parameters(ServiceEventsArgs {
-                service: "debug".to_string(),
-                session: Some(selector.clone()),
-                after_seq: None,
-                tail: Some(20),
-            }))
-            .await
-            .map_err(|err| color_eyre::eyre::eyre!(err.message))?;
-        assert!(
-            events
-                .events
-                .iter()
-                .any(|event| event.kind == micromux::ServiceEventKind::Created)
-        );
-        assert!(events.next_seq.is_some());
-        assert!(!events.truncated);
+        assert_dynamic_renewal_and_events(&server, &selector).await?;
 
         let stale = server
             .replace_dynamic_service(Parameters(ReplaceDynamicServiceArgs {

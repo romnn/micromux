@@ -1033,7 +1033,9 @@ impl SchedulerRuntime {
     fn dynamic_origin(service: &Service) -> Result<&DynamicOrigin, CommandRejection> {
         match &service.origin {
             ServiceOrigin::Dynamic(origin) => Ok(origin),
-            ServiceOrigin::Configured => Err(CommandRejection::InvalidState),
+            ServiceOrigin::Configured => Err(CommandRejection::InvalidState(
+                "the service is configured, not dynamic".to_string(),
+            )),
         }
     }
 
@@ -1278,6 +1280,76 @@ impl SchedulerRuntime {
         ))
     }
 
+    fn renew_dynamic(
+        &mut self,
+        services: &mut ServiceMap,
+        service_id: &ServiceID,
+        expected_revision: u64,
+        expires_after: Option<Lease>,
+    ) -> Result<DynamicServiceAck, CommandRejection> {
+        self.require_dynamic_enabled()?;
+        let service = services
+            .get(service_id)
+            .ok_or(CommandRejection::UnknownService)?;
+        let origin = Self::dynamic_origin(service)?;
+        if origin.revision != expected_revision {
+            return Err(CommandRejection::RevisionMismatch {
+                expected: expected_revision,
+                actual: origin.revision,
+            });
+        }
+        let runtime = self
+            .services
+            .get(service_id)
+            .ok_or(CommandRejection::UnknownService)?;
+        if runtime.retired.is_some() {
+            return Err(CommandRejection::InvalidState(
+                "the dynamic service is retired; use replace_dynamic_service to revive it"
+                    .to_string(),
+            ));
+        }
+
+        let lifetime = self.effective_lifetime(expires_after);
+        let (expires_at, expires_at_unix_ms) = Self::lease_deadlines(lifetime)?;
+        let observed_generation = runtime.run_generation();
+        let revision = origin.revision;
+        let spec = service.spec.clone();
+
+        let runtime = self
+            .services
+            .get_mut(service_id)
+            .ok_or(CommandRejection::UnknownService)?;
+        let service = services
+            .get_mut(service_id)
+            .ok_or(CommandRejection::UnknownService)?;
+        let ServiceOrigin::Dynamic(origin) = &mut service.origin else {
+            return Err(CommandRejection::InvalidState(
+                "the service is configured, not dynamic".to_string(),
+            ));
+        };
+        runtime.expires_at = expires_at;
+        origin.expires_at_unix_ms = expires_at_unix_ms;
+        self.sync(services, service_id);
+        self.append_event(
+            service_id,
+            ServiceEventKind::LeaseRenewed,
+            format!(
+                "dynamic service lease renewed; {}",
+                Self::lease_detail(expires_at_unix_ms)
+            ),
+        );
+
+        Ok(DynamicServiceAck::new(
+            service_id.clone(),
+            revision,
+            observed_generation,
+            expires_at_unix_ms,
+            &spec,
+            false,
+            false,
+        ))
+    }
+
     fn expire_due(&mut self, services: &ServiceMap) -> bool {
         let now = tokio::time::Instant::now();
         let due = self
@@ -1482,10 +1554,20 @@ impl SchedulerRuntime {
         if !self.services.contains_key(service_id) {
             return Err(CommandRejection::UnknownService);
         }
-        if self.services.get(service_id).is_some_and(|runtime| {
-            runtime.desired == DesiredState::Disabled || runtime.retired.is_some()
-        }) {
-            return Err(CommandRejection::InvalidState);
+        let runtime = self
+            .services
+            .get(service_id)
+            .ok_or(CommandRejection::UnknownService)?;
+        if runtime.retired.is_some() {
+            return Err(CommandRejection::InvalidState(
+                "the service is retired; use replace_dynamic_service to revive a dynamic service"
+                    .to_string(),
+            ));
+        }
+        if runtime.desired == DesiredState::Disabled {
+            return Err(CommandRejection::InvalidState(
+                "the service is disabled; enable it before restarting".to_string(),
+            ));
         }
         self.reload_services(services)?;
         let runtime = self
@@ -1521,7 +1603,10 @@ impl SchedulerRuntime {
             .get(service_id)
             .is_some_and(|runtime| runtime.retired.is_some())
         {
-            return Err(CommandRejection::InvalidState);
+            return Err(CommandRejection::InvalidState(
+                "the service is retired; use replace_dynamic_service to revive a dynamic service"
+                    .to_string(),
+            ));
         }
         self.reload_services(services)?;
         let runtime = self
@@ -1633,6 +1718,17 @@ impl SchedulerRuntime {
                 ack,
             } => {
                 let result = self.replace_dynamic(services, &service, expected_revision, params);
+                ack.send(result);
+                true
+            }
+            Command::RenewDynamic {
+                service,
+                expected_revision,
+                expires_after,
+                ack,
+            } => {
+                let result =
+                    self.renew_dynamic(services, &service, expected_revision, expires_after);
                 ack.send(result);
                 true
             }

@@ -211,7 +211,7 @@ async fn assert_dynamic_retirement(harness: &Harness) -> eyre::Result<()> {
         .restart(&"debug".to_string())
         .await
         .map_err(|_| eyre::eyre!("scheduler stopped"))?;
-    assert!(matches!(restart, Err(CommandRejection::InvalidState)));
+    assert!(matches!(restart, Err(CommandRejection::InvalidState(_))));
 
     let events = harness.reader.events("debug", None, None).0;
     for kind in [
@@ -494,7 +494,7 @@ async fn initially_disabled_service_stays_stopped_until_enabled() -> eyre::Resul
         .restart(&id)
         .await
         .map_err(|_| eyre::eyre!("scheduler stopped"))?;
-    assert!(matches!(rejected, Err(CommandRejection::InvalidState)));
+    assert!(matches!(rejected, Err(CommandRejection::InvalidState(_))));
 
     accepted(harness.control.enable(&id).await)?;
     let snapshot = wait_until(&harness.reader, "svc", |snapshot| {
@@ -545,7 +545,7 @@ async fn service_control_latches_generation_and_rejects_restart_when_disabled() 
         .restart(&id)
         .await
         .map_err(|_| eyre::eyre!("scheduler stopped"))?;
-    assert!(matches!(rejected, Err(CommandRejection::InvalidState)));
+    assert!(matches!(rejected, Err(CommandRejection::InvalidState(_))));
 
     // Enable is the operation that starts a disabled service.
     accepted(harness.control.enable(&id).await)?;
@@ -754,6 +754,125 @@ async fn unbounded_dynamic_lease_has_no_expiry_and_does_not_retire() -> eyre::Re
         .ok_or_else(|| eyre::eyre!("unbounded service has no dynamic metadata"))?;
     assert_eq!(dynamic.expires_at_unix_ms, None);
     assert_eq!(dynamic.retired, None);
+
+    harness.shutdown.cancel();
+    harness.handle.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn renewing_dynamic_lease_preserves_the_running_process_and_revision() -> eyre::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let harness = spawn_harness_with_policy(
+        ServiceMap::new(),
+        None,
+        dir.path().to_path_buf(),
+        enabled_dynamic_policy(dir.path())?,
+    );
+    let mut params = dynamic_params("renewable", &["sh", "-c", "sleep 60"]);
+    params.expires_after = Some(Lease::After(Duration::from_secs(10)));
+    dynamic_accepted(harness.control.start_dynamic(params).await)?;
+    let before = wait_until(&harness.reader, "renewable", |snapshot| {
+        snapshot.execution == Execution::Running
+    })
+    .await?;
+    let before_expiry = before
+        .dynamic
+        .as_ref()
+        .and_then(|dynamic| dynamic.expires_at_unix_ms)
+        .ok_or_else(|| eyre::eyre!("bounded lease has no expiry"))?;
+
+    let stale = harness
+        .control
+        .renew_dynamic(&"renewable".to_string(), 0, None)
+        .await
+        .map_err(|_| eyre::eyre!("scheduler stopped"))?;
+    assert!(matches!(
+        stale,
+        Err(CommandRejection::RevisionMismatch {
+            expected: 0,
+            actual: 1
+        })
+    ));
+
+    let receipt = dynamic_accepted(
+        harness
+            .control
+            .renew_dynamic(&"renewable".to_string(), 1, None)
+            .await,
+    )?;
+    let after = harness
+        .reader
+        .service("renewable")
+        .ok_or_else(|| eyre::eyre!("renewable service is missing"))?;
+    let after_dynamic = after
+        .dynamic
+        .as_ref()
+        .ok_or_else(|| eyre::eyre!("renewable service has no dynamic metadata"))?;
+    assert_eq!(receipt.revision, 1);
+    assert_eq!(receipt.observed_generation, before.run_generation);
+    assert_eq!(after.run_generation, before.run_generation);
+    assert_eq!(after.pid, before.pid);
+    assert_eq!(after_dynamic.revision, 1);
+    assert!(
+        after_dynamic
+            .expires_at_unix_ms
+            .is_some_and(|expiry| expiry > before_expiry)
+    );
+    assert!(
+        harness
+            .reader
+            .events("renewable", None, None)
+            .0
+            .iter()
+            .any(|event| event.kind == ServiceEventKind::LeaseRenewed)
+    );
+
+    dynamic_accepted(harness.control.stop_dynamic(&"renewable".to_string()).await)?;
+    let retired = harness
+        .control
+        .renew_dynamic(&"renewable".to_string(), 1, None)
+        .await
+        .map_err(|_| eyre::eyre!("scheduler stopped"))?;
+    assert!(
+        matches!(retired, Err(CommandRejection::InvalidState(message)) if message.contains("replace_dynamic_service"))
+    );
+
+    harness.shutdown.cancel();
+    harness.handle.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn renewing_to_unbounded_clears_the_expiry_deadline() -> eyre::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut policy = enabled_dynamic_policy(dir.path())?;
+    policy.max_lifetime = None;
+    let harness =
+        spawn_harness_with_policy(ServiceMap::new(), None, dir.path().to_path_buf(), policy);
+    let mut params = dynamic_params("renewable", &["sh", "-c", "sleep 60"]);
+    params.expires_after = Some(Lease::After(Duration::from_secs(10)));
+    dynamic_accepted(harness.control.start_dynamic(params).await)?;
+    let before = harness
+        .reader
+        .service("renewable")
+        .and_then(|snapshot| snapshot.dynamic)
+        .and_then(|dynamic| dynamic.expires_at_unix_ms);
+    assert!(before.is_some());
+
+    let receipt = dynamic_accepted(
+        harness
+            .control
+            .renew_dynamic(&"renewable".to_string(), 1, Some(Lease::Unbounded))
+            .await,
+    )?;
+    assert_eq!(receipt.expires_at_unix_ms, None);
+    let after = harness
+        .reader
+        .service("renewable")
+        .and_then(|snapshot| snapshot.dynamic)
+        .and_then(|dynamic| dynamic.expires_at_unix_ms);
+    assert_eq!(after, None);
 
     harness.shutdown.cancel();
     harness.handle.await??;

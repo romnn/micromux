@@ -8,7 +8,7 @@
 //! `mpsc::Sender<Command>` instead.
 
 use super::types::{Command, ServiceID};
-use crate::{DynamicServiceParams, RestartPolicy, ServiceSpec};
+use crate::{DynamicServiceParams, Lease, RestartPolicy, ServiceSpec};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
@@ -95,9 +95,9 @@ pub enum CommandRejection {
     /// No service with the given id exists.
     #[error("unknown service")]
     UnknownService,
-    /// The command is not valid in the service's current state (e.g. restart on a disabled service).
-    #[error("command is invalid in the service's current state")]
-    InvalidState,
+    /// The command is not valid in the service's current state.
+    #[error("command is invalid in the service's current state: {0}")]
+    InvalidState(String),
     /// The latest config could not be loaded safely before restarting.
     #[error("config reload failed: {0}")]
     ConfigReload(String),
@@ -279,6 +279,30 @@ impl ServiceControl {
                 service: service.clone(),
                 expected_revision,
                 params,
+                ack,
+            })
+            .await
+            .map_err(|_| SchedulerStopped)?;
+        rx.await.map_err(|_| SchedulerStopped)
+    }
+
+    /// Renew a live dynamic service's lease without restarting it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SchedulerStopped`] if the scheduler is no longer accepting commands.
+    pub async fn renew_dynamic(
+        &self,
+        service: &ServiceID,
+        expected_revision: u64,
+        expires_after: Option<Lease>,
+    ) -> Result<DynamicServiceResult, SchedulerStopped> {
+        let (ack, rx) = DynamicCommandAck::new();
+        self.tx
+            .send(Command::RenewDynamic {
+                service: service.clone(),
+                expected_revision,
+                expires_after,
                 ack,
             })
             .await

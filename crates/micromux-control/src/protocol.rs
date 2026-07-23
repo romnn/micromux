@@ -7,7 +7,7 @@
 //! already-running sessions.
 
 use micromux::{
-    DynamicServiceAck, DynamicServiceParams, HealthAttempt, LogLine, LogRunSummary,
+    DynamicServiceAck, DynamicServiceParams, HealthAttempt, Lease, LogLine, LogRunSummary,
     ServiceCommandAck, ServiceEvent, ServiceID, ServiceSnapshot, SessionChange,
 };
 use schemars::JsonSchema;
@@ -136,6 +136,15 @@ pub enum Request {
         expected_revision: u64,
         /// Replacement definition, clone source, and lease request.
         params: DynamicServiceParams,
+    },
+    /// Renew a live dynamic service's lease without restarting it.
+    RenewDynamicService {
+        /// Existing dynamic service id.
+        service: ServiceID,
+        /// Required current revision.
+        expected_revision: u64,
+        /// Requested replacement lease; omission uses the session policy default.
+        expires_after: Option<Lease>,
     },
     /// Retire a dynamic service.
     StopDynamicService {

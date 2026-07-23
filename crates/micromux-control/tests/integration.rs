@@ -96,6 +96,22 @@ async fn dynamic_caps(client: &mut Client) -> eyre::Result<micromux_control::Dyn
         .ok_or_else(|| eyre::eyre!("dynamic capability missing"))
 }
 
+async fn renew_dynamic_over_socket(client: &mut Client) -> eyre::Result<()> {
+    let renewed = client
+        .request(Request::RenewDynamicService {
+            service: "debug".to_string(),
+            expected_revision: 1,
+            expires_after: Some(micromux::Lease::After(Duration::from_mins(30))),
+        })
+        .await?;
+    let Response::DynamicService(renewed) = renewed else {
+        eyre::bail!("expected dynamic-service receipt, got {renewed:?}");
+    };
+    assert_eq!(renewed.revision, 1);
+    assert!(renewed.expires_at_unix_ms.is_some());
+    Ok(())
+}
+
 async fn request_until<F>(
     endpoint: &ControlEndpoint,
     request: Request,
@@ -271,6 +287,8 @@ services:
     })
     .await?;
     assert_eq!(dynamic_caps(&mut client).await?.live_services, 1);
+
+    renew_dynamic_over_socket(&mut client).await?;
 
     let stale = client
         .request(Request::ReplaceDynamicService {

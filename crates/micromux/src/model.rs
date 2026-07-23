@@ -483,6 +483,8 @@ pub enum ServiceEventKind {
     Created,
     /// A dynamic service was replaced or revived.
     Replaced,
+    /// A dynamic service's lease was renewed without restarting it.
+    LeaseRenewed,
     /// A dynamic service was explicitly stopped or expired.
     Retired,
     /// A newer peer sent an event kind this binary does not know yet.
