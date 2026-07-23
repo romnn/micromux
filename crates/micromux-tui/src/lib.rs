@@ -6,6 +6,7 @@
 
 mod event;
 mod json_log;
+mod remote;
 mod render;
 mod source;
 mod state;
@@ -17,6 +18,7 @@ use ratatui::DefaultTerminal;
 use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 
+pub use remote::RemoteSource;
 pub use source::{LocalSource, SessionSource};
 
 /// Terminal application state.
@@ -528,6 +530,7 @@ impl App {
 
     fn exit(&mut self) {
         // Send shutdown (cancellation) signal
+        self.source.cancel();
         self.shutdown.cancel();
         self.running = false;
     }
