@@ -388,6 +388,63 @@ fn project_execution_maps_the_desired_execution_table() {
 }
 
 #[test]
+fn roster_entry_state_classifies_origin_and_retirement() -> eyre::Result<()> {
+    let configured = Service::new(
+        "configured",
+        Path::new("."),
+        service_config("configured", ("true", &[])),
+    )?;
+    let mut dynamic = Service::new(
+        "dynamic",
+        Path::new("."),
+        service_config("dynamic", ("true", &[])),
+    )?;
+    dynamic.origin = ServiceOrigin::Dynamic(DynamicOrigin {
+        created_at_unix_ms: 1,
+        expires_at_unix_ms: None,
+        owner: None,
+        revision: 1,
+    });
+    let mut runtimes = HashMap::from([
+        (
+            configured.id.clone(),
+            ServiceRuntime::new(ServiceRuntimeInit::from(&configured)),
+        ),
+        (
+            dynamic.id.clone(),
+            ServiceRuntime::new(ServiceRuntimeInit::from(&dynamic)),
+        ),
+    ]);
+
+    assert_eq!(
+        roster_entry_state(&runtimes, &configured.id, &configured),
+        Some(RosterEntryState::LiveConfigured)
+    );
+    assert_eq!(
+        roster_entry_state(&runtimes, &dynamic.id, &dynamic),
+        Some(RosterEntryState::LiveDynamic)
+    );
+
+    if let Some(runtime) = runtimes.get_mut(&configured.id) {
+        runtime.retired = Some(RetiredReason::Removed);
+    }
+    if let Some(runtime) = runtimes.get_mut(&dynamic.id) {
+        runtime.retired = Some(RetiredReason::Stopped);
+    }
+    assert_eq!(
+        roster_entry_state(&runtimes, &configured.id, &configured),
+        Some(RosterEntryState::RetiredConfigured)
+    );
+    assert_eq!(
+        roster_entry_state(&runtimes, &dynamic.id, &dynamic),
+        Some(RosterEntryState::RetiredDynamic)
+    );
+    let missing = "missing".to_string();
+    assert_eq!(roster_entry_state(&runtimes, &missing, &configured), None);
+    Ok(())
+}
+
+#[test]
 fn failed_start_advances_generation_and_records_exit() {
     let mut runtime = ServiceRuntime::new(ServiceRuntimeInit {
         restart_policy: &crate::service::RestartPolicy::Never,

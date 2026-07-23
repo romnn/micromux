@@ -244,6 +244,28 @@ pub(super) struct ServiceRuntime {
     last_blocked_on: Vec<ServiceID>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RosterEntryState {
+    LiveConfigured,
+    RetiredConfigured,
+    LiveDynamic,
+    RetiredDynamic,
+}
+
+fn roster_entry_state(
+    runtimes: &HashMap<ServiceID, ServiceRuntime>,
+    service_id: &ServiceID,
+    service: &Service,
+) -> Option<RosterEntryState> {
+    let retired = runtimes.get(service_id)?.is_retired();
+    Some(match (&service.origin, retired) {
+        (ServiceOrigin::Configured, false) => RosterEntryState::LiveConfigured,
+        (ServiceOrigin::Configured, true) => RosterEntryState::RetiredConfigured,
+        (ServiceOrigin::Dynamic(_), false) => RosterEntryState::LiveDynamic,
+        (ServiceOrigin::Dynamic(_), true) => RosterEntryState::RetiredDynamic,
+    })
+}
+
 #[derive(Clone, Copy)]
 struct ServiceRuntimeInit<'a> {
     restart_policy: &'a service::RestartPolicy,
@@ -293,6 +315,14 @@ impl ServiceRuntime {
 
     fn reconfigure(&mut self, policy: &service::RestartPolicy) {
         self.restart.reconfigure(policy);
+    }
+
+    fn is_live(&self) -> bool {
+        self.retired.is_none()
+    }
+
+    fn is_retired(&self) -> bool {
+        self.retired.is_some()
     }
 
     fn current_run_id(&self) -> Option<RunId> {
@@ -675,20 +705,14 @@ fn validate_reloaded_services(
     let configured = current
         .iter()
         .filter_map(|(id, service)| {
-            (matches!(service.origin, ServiceOrigin::Configured)
-                && runtimes
-                    .get(id)
-                    .is_some_and(|runtime| runtime.retired.is_none()))
-            .then_some(id)
+            (roster_entry_state(runtimes, id, service) == Some(RosterEntryState::LiveConfigured))
+                .then_some(id)
         })
         .collect::<std::collections::HashSet<_>>();
     let missing = current
         .iter()
         .filter(|(id, service)| {
-            matches!(service.origin, ServiceOrigin::Configured)
-                && runtimes
-                    .get(*id)
-                    .is_some_and(|runtime| runtime.retired.is_none())
+            roster_entry_state(runtimes, id, service) == Some(RosterEntryState::LiveConfigured)
         })
         .map(|(id, _)| id)
         .filter(|service_id| !updated.contains_key(*service_id))
@@ -1083,11 +1107,8 @@ impl SchedulerRuntime {
         services
             .iter()
             .filter(|(id, service)| {
-                matches!(service.origin, ServiceOrigin::Dynamic(_))
-                    && self
-                        .services
-                        .get(*id)
-                        .is_some_and(|runtime| runtime.retired.is_none())
+                roster_entry_state(&self.services, id, service)
+                    == Some(RosterEntryState::LiveDynamic)
             })
             .count()
     }
@@ -1118,13 +1139,10 @@ impl SchedulerRuntime {
             return Ok(ack);
         }
         if services.contains_key(&params.service) {
-            let retired_dynamic = services
-                .get(&params.service)
-                .is_some_and(|service| matches!(service.origin, ServiceOrigin::Dynamic(_)))
-                && self
-                    .services
-                    .get(&params.service)
-                    .is_some_and(|runtime| runtime.retired.is_some());
+            let retired_dynamic = services.get(&params.service).is_some_and(|service| {
+                roster_entry_state(&self.services, &params.service, service)
+                    == Some(RosterEntryState::RetiredDynamic)
+            });
             let guidance = if retired_dynamic {
                 "; use replace_dynamic_service to revive the retired entry"
             } else {
@@ -1213,10 +1231,8 @@ impl SchedulerRuntime {
                 actual: current_origin.revision,
             });
         }
-        let reviving = self
-            .services
-            .get(service_id)
-            .is_some_and(|runtime| runtime.retired.is_some());
+        let reviving = roster_entry_state(&self.services, service_id, current)
+            == Some(RosterEntryState::RetiredDynamic);
         if reviving {
             self.require_dynamic_slot(services)?;
         }
@@ -1296,7 +1312,7 @@ impl SchedulerRuntime {
             .get_mut(service_id)
             .ok_or(CommandRejection::UnknownService)?;
         let observed_generation = runtime.run_generation();
-        let already_retired = runtime.retired.is_some();
+        let already_retired = runtime.is_retired();
         if !already_retired {
             runtime.disable();
             runtime.retired = Some(RetiredReason::Stopped);
@@ -1342,7 +1358,7 @@ impl SchedulerRuntime {
             .services
             .get(service_id)
             .ok_or(CommandRejection::UnknownService)?;
-        if runtime.retired.is_some() {
+        if runtime.is_retired() {
             return Err(CommandRejection::InvalidState(
                 "the dynamic service is retired; use replace_dynamic_service to revive it"
                     .to_string(),
@@ -1393,8 +1409,7 @@ impl SchedulerRuntime {
             .services
             .iter()
             .filter(|(_, runtime)| {
-                runtime.retired.is_none()
-                    && runtime.expires_at.is_some_and(|deadline| deadline <= now)
+                runtime.is_live() && runtime.expires_at.is_some_and(|deadline| deadline <= now)
             })
             .map(|(id, _)| id.clone())
             .collect::<Vec<_>>();
@@ -1418,7 +1433,7 @@ impl SchedulerRuntime {
     fn next_expiry(&self) -> Option<tokio::time::Instant> {
         self.services
             .values()
-            .filter(|runtime| runtime.retired.is_none())
+            .filter(|runtime| runtime.is_live())
             .filter_map(|runtime| runtime.expires_at)
             .min()
     }
@@ -1428,18 +1443,14 @@ impl SchedulerRuntime {
             let retired_count = self
                 .services
                 .values()
-                .filter(|runtime| runtime.retired.is_some())
+                .filter(|runtime| runtime.is_retired())
                 .count();
             if retired_count <= MAX_RETIRED_SERVICES {
                 return;
             }
             let depended_on = services
                 .iter()
-                .filter(|(id, _)| {
-                    self.services
-                        .get(*id)
-                        .is_some_and(|runtime| runtime.retired.is_none())
-                })
+                .filter(|(id, _)| self.services.get(*id).is_some_and(ServiceRuntime::is_live))
                 .flat_map(|(_, service)| {
                     service
                         .spec
@@ -1452,7 +1463,7 @@ impl SchedulerRuntime {
                 .keys()
                 .filter_map(|id| {
                     let runtime = self.services.get(id)?;
-                    (runtime.retired.is_some()
+                    (runtime.is_retired()
                         && runtime.running.is_none()
                         && runtime.draining_log_readers.is_empty()
                         && !depended_on.contains(id))
@@ -1478,12 +1489,14 @@ impl SchedulerRuntime {
 
         let mut merged = updated;
         for (service_id, service) in services.iter().filter(|(service_id, service)| {
-            matches!(service.origin, ServiceOrigin::Dynamic(_))
-                || (matches!(service.origin, ServiceOrigin::Configured)
-                    && self
-                        .services
-                        .get(*service_id)
-                        .is_some_and(|runtime| runtime.retired.is_some()))
+            matches!(
+                roster_entry_state(&self.services, service_id, service),
+                Some(
+                    RosterEntryState::RetiredConfigured
+                        | RosterEntryState::LiveDynamic
+                        | RosterEntryState::RetiredDynamic
+                )
+            )
         }) {
             merged.insert(service_id.clone(), service.clone());
         }
@@ -1493,11 +1506,8 @@ impl SchedulerRuntime {
         let changed = services
             .iter()
             .filter(|(service_id, service)| {
-                matches!(service.origin, ServiceOrigin::Configured)
-                    && self
-                        .services
-                        .get(*service_id)
-                        .is_some_and(|runtime| runtime.retired.is_none())
+                roster_entry_state(&self.services, service_id, service)
+                    == Some(RosterEntryState::LiveConfigured)
             })
             .filter_map(|(service_id, service)| {
                 merged
@@ -1536,11 +1546,8 @@ impl SchedulerRuntime {
         let mut actions = Vec::new();
         for (service_id, updated_service) in updated {
             let current = services.get(service_id).filter(|service| {
-                matches!(service.origin, ServiceOrigin::Configured)
-                    && self
-                        .services
-                        .get(service_id)
-                        .is_some_and(|runtime| runtime.retired.is_none())
+                roster_entry_state(&self.services, service_id, service)
+                    == Some(RosterEntryState::LiveConfigured)
             });
             let Some(current) = current else {
                 actions.push(ReconcileAction {
@@ -1576,11 +1583,8 @@ impl SchedulerRuntime {
             services
                 .iter()
                 .filter(|(service_id, service)| {
-                    matches!(service.origin, ServiceOrigin::Configured)
-                        && self
-                            .services
-                            .get(*service_id)
-                            .is_some_and(|runtime| runtime.retired.is_none())
+                    roster_entry_state(&self.services, service_id, service)
+                        == Some(RosterEntryState::LiveConfigured)
                         && !updated.contains_key(*service_id)
                 })
                 .map(|(service_id, _)| ReconcileAction {
@@ -1617,11 +1621,8 @@ impl SchedulerRuntime {
         let mut dependents = services
             .iter()
             .filter(|(service_id, service)| {
-                matches!(service.origin, ServiceOrigin::Dynamic(_))
-                    && self
-                        .services
-                        .get(*service_id)
-                        .is_some_and(|runtime| runtime.retired.is_none())
+                roster_entry_state(&self.services, service_id, service)
+                    == Some(RosterEntryState::LiveDynamic)
                     && service
                         .spec
                         .depends_on
@@ -1640,12 +1641,12 @@ impl SchedulerRuntime {
 
         let mut candidate = updated.clone();
         for (service_id, service) in services {
-            let preserved_dynamic = matches!(service.origin, ServiceOrigin::Dynamic(_));
-            let already_retired_configured = matches!(service.origin, ServiceOrigin::Configured)
-                && self
-                    .services
-                    .get(service_id)
-                    .is_some_and(|runtime| runtime.retired.is_some())
+            let state = roster_entry_state(&self.services, service_id, service);
+            let preserved_dynamic = matches!(
+                state,
+                Some(RosterEntryState::LiveDynamic | RosterEntryState::RetiredDynamic)
+            );
+            let already_retired_configured = state == Some(RosterEntryState::RetiredConfigured)
                 && !updated.contains_key(service_id);
             let retained_tombstone =
                 removed.contains(service_id.as_str()) || already_retired_configured;
@@ -1674,13 +1675,10 @@ impl SchedulerRuntime {
             };
             match action.action {
                 ReconcileActionKind::Added => {
-                    let reviving = services
-                        .get(service_id)
-                        .is_some_and(|current| matches!(current.origin, ServiceOrigin::Configured))
-                        && self
-                            .services
-                            .get(service_id)
-                            .is_some_and(|runtime| runtime.retired.is_some());
+                    let reviving = services.get(service_id).is_some_and(|current| {
+                        roster_entry_state(&self.services, service_id, current)
+                            == Some(RosterEntryState::RetiredConfigured)
+                    });
                     if reviving {
                         if let Some(runtime) = self.services.get_mut(service_id) {
                             runtime.retired = None;
@@ -1968,9 +1966,7 @@ impl SchedulerRuntime {
             let restart = self
                 .services
                 .get_mut(service_id)
-                .filter(|runtime| {
-                    runtime.desired == DesiredState::Enabled && runtime.retired.is_none()
-                })
+                .filter(|runtime| runtime.desired == DesiredState::Enabled && runtime.is_live())
                 .map(|runtime| {
                     let observed_generation = runtime.run_generation();
                     runtime.request_restart();
