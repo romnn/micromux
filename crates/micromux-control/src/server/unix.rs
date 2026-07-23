@@ -3,8 +3,8 @@ use std::sync::Arc;
 
 use futures::{SinkExt, StreamExt};
 use micromux::{
-    ChangeKind, CommandRejection, SchedulerStopped, ServiceCommandResult, SessionChange,
-    SessionModelReader, trim_to_last_bytes,
+    ChangeKind, CommandRejection, SchedulerStopped, ServiceCommandResult, ServiceSnapshot,
+    SessionChange, SessionModelReader, trim_to_last_bytes,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::sync::CancellationToken;
@@ -24,6 +24,14 @@ const MAX_LOG_TAIL: usize = 2000;
 const DEFAULT_EVENT_TAIL: usize = 50;
 /// Hard cap on the event `tail`; the model retains at most this many events per service.
 const MAX_EVENT_TAIL: usize = micromux::EVENT_HISTORY;
+/// Change kinds replayed per surviving service after broadcast loss. `Roster` is deliberately
+/// absent: the roster invalidation is session-wide and sent once, ahead of these.
+const LAG_REPLAY_SERVICE_KINDS: [ChangeKind; 4] = [
+    ChangeKind::Status,
+    ChangeKind::Logs,
+    ChangeKind::Health,
+    ChangeKind::Events,
+];
 /// Response byte budget for log/health payloads; oldest content beyond it is dropped so a chatty
 /// service can't blow the frame.
 const RESPONSE_MAX_BYTES: usize = 512 * 1024;
@@ -235,27 +243,13 @@ where
                         }
                     }
                     Err(RecvError::Lagged(_)) => {
-                        // A roster entry evicted *during* the lag is not enumerated here; its
-                        // disappearance still reaches consumers because the surviving services'
-                        // synthesized `Roster` changes trigger a full resync, and configured
-                        // services always exist.
-                        for snapshot in server.reader.services() {
-                            for kind in [
-                                ChangeKind::Status,
-                                ChangeKind::Logs,
-                                ChangeKind::Health,
-                                ChangeKind::Roster,
-                                ChangeKind::Events,
-                            ] {
-                                let Ok(line) = serde_json::to_string(&Response::Change(SessionChange {
-                                    service_id: snapshot.id.clone(),
-                                    kind,
-                                })) else {
-                                    continue;
-                                };
-                                if sink.send(line).await.is_err() {
-                                    break 'stream;
-                                }
+                        let snapshots = server.reader.services();
+                        for change in lag_replay_changes(&snapshots) {
+                            let Ok(line) = serde_json::to_string(&Response::Change(change)) else {
+                                continue;
+                            };
+                            if sink.send(line).await.is_err() {
+                                break 'stream;
                             }
                         }
                     }
@@ -264,6 +258,24 @@ where
             }
         }
     }
+}
+
+/// Synthesizes a complete invalidation after broadcast loss.
+///
+/// The roster notification is unconditional because the current roster may be empty after the
+/// client lagged across removal of its final service. Its service id is
+/// [`SessionChange::SESSION_WIDE`]; consumers re-read the whole roster for this change kind.
+fn lag_replay_changes(snapshots: &[ServiceSnapshot]) -> impl Iterator<Item = SessionChange> + '_ {
+    std::iter::once(SessionChange {
+        service_id: SessionChange::SESSION_WIDE.to_string(),
+        kind: ChangeKind::Roster,
+    })
+    .chain(snapshots.iter().flat_map(|snapshot| {
+        LAG_REPLAY_SERVICE_KINDS.map(|kind| SessionChange {
+            service_id: snapshot.id.clone(),
+            kind,
+        })
+    }))
 }
 
 async fn dispatch(server: &ControlServer, request: Request) -> Response {
@@ -671,12 +683,12 @@ fn acknowledge_reconcile(result: Result<micromux::ReconcileResult, SchedulerStop
 
 #[cfg(test)]
 mod tests {
-    use micromux::LogLine;
+    use micromux::{ChangeKind, LogLine, RestartPolicy, ServiceSnapshot, SessionChange};
     use similar_asserts::assert_eq;
 
     use super::{
         MAX_LOG_TAIL, RESPONSE_MAX_BYTES, bound_follow_response_lines,
-        bound_follow_response_lines_page, bound_tail_response_lines,
+        bound_follow_response_lines_page, bound_tail_response_lines, lag_replay_changes,
     };
 
     fn line(seq: u64, len: usize) -> LogLine {
@@ -686,6 +698,50 @@ mod tests {
             timestamp_unix_ms: 1_700_000_000_000 + seq,
             line: "x".repeat(len),
         }
+    }
+
+    fn snapshot(id: &str) -> ServiceSnapshot {
+        ServiceSnapshot::initial(
+            id.to_string(),
+            id.to_string(),
+            Vec::new(),
+            None,
+            RestartPolicy::Never,
+            vec!["true".to_string()],
+            None,
+        )
+    }
+
+    #[test]
+    fn lag_replay_invalidates_an_empty_roster() {
+        let changes = lag_replay_changes(&[]).collect::<Vec<_>>();
+
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].service_id, SessionChange::SESSION_WIDE);
+        assert_eq!(changes[0].kind, ChangeKind::Roster);
+    }
+
+    #[test]
+    fn lag_replay_invalidates_the_roster_once_and_each_surviving_service() {
+        let snapshots = [snapshot("alpha"), snapshot("beta")];
+        let changes = lag_replay_changes(&snapshots)
+            .map(|change| (change.service_id, change.kind))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            changes,
+            vec![
+                (SessionChange::SESSION_WIDE.to_string(), ChangeKind::Roster),
+                ("alpha".to_string(), ChangeKind::Status),
+                ("alpha".to_string(), ChangeKind::Logs),
+                ("alpha".to_string(), ChangeKind::Health),
+                ("alpha".to_string(), ChangeKind::Events),
+                ("beta".to_string(), ChangeKind::Status),
+                ("beta".to_string(), ChangeKind::Logs),
+                ("beta".to_string(), ChangeKind::Health),
+                ("beta".to_string(), ChangeKind::Events),
+            ]
+        );
     }
 
     #[test]

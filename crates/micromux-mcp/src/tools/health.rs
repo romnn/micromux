@@ -3,7 +3,9 @@ use std::io;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::time::Duration;
 
-use micromux::{ChangeKind, Execution, Health, HealthAttempt, ServiceEvent, ServiceSnapshot};
+use micromux::{
+    ChangeKind, Execution, Health, HealthAttempt, ServiceEvent, ServiceSnapshot, SessionChange,
+};
 use micromux_control::{Client, ControlEndpoint, ErrorCode, Request};
 use schemars::JsonSchema;
 use serde::Serialize;
@@ -447,15 +449,18 @@ pub(crate) async fn wait_for_snapshot<V>(
         }
         let wait = deadline.saturating_duration_since(now).min(WAIT_POLL_FLOOR);
 
-        // Wake on a relevant change (this service; ignore log appends, which don't affect
-        // snapshots), but never wait longer than the poll floor before re-polling. Drop the
-        // subscription if its stream ends — polling still converges.
+        // Wake on a relevant change (this service, or a session-wide invalidation synthesized
+        // after broadcast loss; ignore log appends, which don't affect snapshots), but never wait
+        // longer than the poll floor before re-polling. Drop the subscription if its stream ends —
+        // polling still converges.
         let drop_subscription = if let Some(stream) = subscription.as_mut() {
             let relevant = tokio::time::timeout(wait, async {
                 loop {
                     match stream.recv().await {
                         Ok(Some(change))
-                            if change.service_id == service && change.kind != ChangeKind::Logs =>
+                            if (change.service_id == service
+                                || change.service_id == SessionChange::SESSION_WIDE)
+                                && change.kind != ChangeKind::Logs =>
                         {
                             return true;
                         }

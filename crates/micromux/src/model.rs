@@ -506,7 +506,7 @@ pub enum ChangeKind {
     Logs,
     /// Healthcheck history changed.
     Health,
-    /// The service roster changed.
+    /// The session roster changed; consumers re-read the complete roster.
     Roster,
     /// Lifecycle timeline history changed.
     Events,
@@ -519,10 +519,20 @@ pub enum ChangeKind {
 /// be the carrier of content — subscribers re-query the model.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SessionChange {
-    /// The service that changed.
+    /// The service that changed, or [`SessionChange::SESSION_WIDE`] for a synthesized session-wide
+    /// roster invalidation.
     pub service_id: ServiceID,
     /// What changed.
     pub kind: ChangeKind,
+}
+
+impl SessionChange {
+    /// `service_id` marker for a change not scoped to one service.
+    ///
+    /// Only synthesized notifications carry it (the control server's replay after broadcast loss);
+    /// the model itself always publishes real service ids. Consumers waiting on a specific service
+    /// should treat a session-wide change as touching that service too.
+    pub const SESSION_WIDE: &'static str = "*";
 }
 
 mod disk;
