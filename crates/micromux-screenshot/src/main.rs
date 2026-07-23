@@ -32,7 +32,7 @@ const SCENARIOS: &[Scenario] = &[
     // The dashboard: the default frame the config settles into, `api` selected with its logs.
     Scenario {
         name: "overview",
-        cols: 180,
+        cols: 200,
         rows: 44,
         keys: &[],
     },
@@ -41,7 +41,7 @@ const SCENARIOS: &[Scenario] = &[
     // long probe command line is readable instead of truncated.
     Scenario {
         name: "healthcheck",
-        cols: 180,
+        cols: 200,
         rows: 44,
         keys: &[b"jjjjjj" as &[u8], b"H", b"w"],
     },
@@ -49,7 +49,7 @@ const SCENARIOS: &[Scenario] = &[
     // row turns gray (DISABLED) and the process is stopped, while its captured logs remain.
     Scenario {
         name: "disable",
-        cols: 180,
+        cols: 200,
         rows: 44,
         keys: &[b"j" as &[u8], b"d"],
     },
