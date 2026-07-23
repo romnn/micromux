@@ -10,6 +10,7 @@
 mod client;
 mod endpoint;
 mod protocol;
+mod select;
 mod server;
 
 use std::time::Duration;
@@ -39,6 +40,11 @@ pub use micromux::{DynamicServiceAck, ReconcileAction, ReconcileActionKind, Reco
 pub use protocol::{
     DynamicServicesCaps, ErrorCode, PROTOCOL_VERSION, ProtocolVersion, Request, Response,
     ServiceBrief, SessionCapabilities, SessionInfo,
+};
+pub use select::{
+    ProbeReport, ResolvedSession, RuntimeDirDetail, SelectError, SessionSelector,
+    SocketProbeDetail, SocketProbeStatus, config_for_target, probe_detail, resolve_selector,
+    resolve_selector_in_runtime_dirs, session_config_path_is_under, session_matches_config_path,
 };
 pub use server::{ControlServer, EndpointGuard, SessionIdentity, bind, endpoint_owner_lock_held};
 

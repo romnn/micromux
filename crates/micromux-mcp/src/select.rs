@@ -1,16 +1,21 @@
 //! Read-only, connect-to-verify session selection.
 //!
-//! The proxy prepares candidate runtime directories but never prunes endpoints or mutates sessions.
-//! A typed selector resolves to exactly one live session, or a typed error
-//! (`NoSession`/`Ambiguous`/`Unsupported`).
+//! The control crate owns selector parsing and endpoint resolution. This layer applies the
+//! `MICROMUX_SESSION` fallback and enriches transport probe reports with agent-facing diagnostics;
+//! it never prunes endpoints or mutates sessions.
 
 use std::path::{Path, PathBuf};
 
 use micromux_control::{
-    ControlEndpoint, ControlError, EndpointProbe, EndpointProbeResult, ProtocolVersion,
-    RuntimeDirStatus, SessionInfo, endpoint_for, endpoint_from_hash, endpoint_hash,
-    probe_endpoints, probe_runtime_dirs, runtime_dir_statuses, unique_answering_session_probes,
-    usable_runtime_dirs,
+    ControlError, EndpointProbe, EndpointProbeResult, ProbeReport, ResolvedSession,
+    RuntimeDirDetail, RuntimeDirStatus, SelectError, SessionInfo, SessionSelector,
+    SocketProbeDetail, probe_detail, probe_runtime_dirs, resolve_selector, runtime_dir_statuses,
+    unique_answering_session_probes, usable_runtime_dirs,
+};
+#[cfg(all(test, unix))]
+use micromux_control::{
+    ProtocolVersion, SocketProbeStatus, resolve_selector_in_runtime_dirs,
+    session_config_path_is_under, session_matches_config_path,
 };
 use schemars::JsonSchema;
 use serde::Serialize;
@@ -74,32 +79,6 @@ pub struct DiscoveryDiagnostics {
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
-pub struct RuntimeDirDetail {
-    pub path: String,
-    pub usable: bool,
-    pub error: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, JsonSchema)]
-pub struct SocketProbeDetail {
-    pub endpoint: String,
-    pub status: SocketProbeStatus,
-    pub message: Option<String>,
-    pub peer_protocol_version: Option<ProtocolVersion>,
-    pub client_protocol_version: Option<ProtocolVersion>,
-    pub session: Option<SessionInfo>,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum SocketProbeStatus {
-    Session,
-    Absent,
-    ProtocolMismatch,
-    Unreachable,
-}
-
-#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct SessionList {
     pub sessions: Vec<SessionInfo>,
     pub diagnostics: DiscoveryDiagnostics,
@@ -117,41 +96,7 @@ impl From<ControlError> for ToolError {
     }
 }
 
-/// A resolved session: the endpoint to drive and its live identity.
-pub struct Resolved {
-    /// The control endpoint to connect to.
-    pub endpoint: ControlEndpoint,
-    /// The session's live identity (carries `config_path` so the target is legible).
-    pub info: SessionInfo,
-}
-
-enum Selector {
-    Current,
-    Name(String),
-    Pid(u32),
-    Hash(String),
-}
-
-fn parse_selector(raw: Option<String>) -> Selector {
-    let raw = raw.or_else(|| std::env::var("MICROMUX_SESSION").ok());
-    let Some(raw) = raw else {
-        return Selector::Current;
-    };
-    let raw = raw.trim();
-    if raw.is_empty() || raw.eq_ignore_ascii_case("current") {
-        Selector::Current
-    } else if let Some(pid) = raw.strip_prefix("pid:") {
-        pid.trim()
-            .parse()
-            .map_or_else(|_| Selector::Name(raw.to_string()), Selector::Pid)
-    } else if let Some(hash) = raw.strip_prefix("hash:") {
-        Selector::Hash(hash.trim().to_string())
-    } else if let Some(name) = raw.strip_prefix("name:") {
-        Selector::Name(name.trim().to_string())
-    } else {
-        Selector::Name(raw.to_string())
-    }
-}
+pub(crate) type Resolved = ResolvedSession;
 
 /// Resolve the config path for a start target: an existing config *file* is used directly; a
 /// directory (or the default cwd) is searched upward. Returns the canonical config path.
@@ -194,24 +139,37 @@ async fn find_config_upward_with_home(start: &Path, home: Option<&Path>) -> Opti
     }
 }
 
-async fn verify_any(
-    endpoints: Vec<ControlEndpoint>,
-    describe: &str,
-    absent: impl Fn(Vec<SocketProbeDetail>) -> DiscoveryDiagnostics,
-) -> Result<Resolved, ToolError> {
-    let probes = probe_endpoints(&endpoints).await;
-    let matches = unique_answering_session_probes(&probes)
-        .into_iter()
-        .map(|(endpoint, info)| Resolved { endpoint, info })
-        .collect::<Vec<_>>();
-    classify_probe_matches(
-        matches,
-        probes,
-        describe,
-        "use pid: or name: to disambiguate",
-        "endpoint(s)",
-        absent,
-    )
+fn selector_with_environment_fallback(raw: Option<String>) -> Option<SessionSelector> {
+    raw.or_else(|| std::env::var("MICROMUX_SESSION").ok())
+        .as_deref()
+        .map(SessionSelector::parse)
+}
+
+fn diagnostics_from_report(cwd: &Path, report: ProbeReport) -> DiscoveryDiagnostics {
+    DiscoveryDiagnostics {
+        summary: report.summary,
+        executable: std::env::current_exe()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|_| "<unknown>".to_string()),
+        version: env!("CARGO_PKG_VERSION"),
+        cwd: cwd.display().to_string(),
+        config_path: report.config_path,
+        xdg_runtime_dir: std::env::var("XDG_RUNTIME_DIR").ok(),
+        runtime_dirs: report.runtime_dirs,
+        socket_probes: report.socket_probes,
+    }
+}
+
+fn map_select_error(cwd: &Path, error: SelectError) -> ToolError {
+    match error {
+        SelectError::NoSession(report) => {
+            ToolError::NoSession(Box::new(diagnostics_from_report(cwd, *report)))
+        }
+        SelectError::Ambiguous(message) => ToolError::Ambiguous(message),
+        SelectError::Busy(message) => ToolError::Busy(message),
+        SelectError::Unsupported => ToolError::Unsupported,
+        SelectError::Control(error) => ToolError::from(error),
+    }
 }
 
 /// Resolve a selector to a single live session.
@@ -221,21 +179,10 @@ async fn verify_any(
 /// Returns [`ToolError::NoSession`] when nothing answers, [`ToolError::Ambiguous`] when a name
 /// matches more than one, or [`ToolError::Unsupported`] on a platform without a transport.
 pub async fn resolve(cwd: &Path, selector: Option<String>) -> Result<Resolved, ToolError> {
-    if !micromux_control::transport_supported() {
-        return Err(ToolError::Unsupported);
-    }
-    let dir_statuses = runtime_dir_statuses();
-    let runtime_dirs = usable_runtime_dirs(&dir_statuses);
-    if runtime_dirs.is_empty() {
-        return Err(ToolError::NoSession(Box::new(discovery_diagnostics(
-            cwd,
-            "no runtime directory could be resolved".to_string(),
-            None,
-            &dir_statuses,
-            Vec::new(),
-        ))));
-    }
-    resolve_in_dirs(&runtime_dirs, &dir_statuses, cwd, selector).await
+    let selector = selector_with_environment_fallback(selector);
+    resolve_selector(cwd, selector, None)
+        .await
+        .map_err(|error| map_select_error(cwd, error))
 }
 
 /// Resolve a selector against an explicit runtime directory (testable variant of [`resolve`]).
@@ -250,303 +197,25 @@ pub(crate) async fn resolve_in(
     selector: Option<String>,
 ) -> Result<Resolved, ToolError> {
     let runtime_dirs = vec![runtime_dir.to_path_buf()];
-    let dir_statuses = runtime_dirs
-        .iter()
-        .cloned()
-        .map(|path| RuntimeDirStatus {
-            path,
-            usable: true,
-            error: None,
-        })
-        .collect::<Vec<_>>();
+    let dir_statuses = vec![RuntimeDirStatus {
+        path: runtime_dir.to_path_buf(),
+        usable: true,
+        error: None,
+    }];
     resolve_in_dirs(&runtime_dirs, &dir_statuses, cwd, selector).await
 }
 
+#[cfg(all(test, unix))]
 async fn resolve_in_dirs(
     runtime_dirs: &[PathBuf],
     dir_statuses: &[RuntimeDirStatus],
     cwd: &Path,
     selector: Option<String>,
 ) -> Result<Resolved, ToolError> {
-    match parse_selector(selector) {
-        Selector::Current => resolve_current(runtime_dirs, dir_statuses, cwd).await,
-        Selector::Hash(hash) => resolve_hash(runtime_dirs, dir_statuses, cwd, &hash).await,
-        Selector::Name(name) => resolve_name(runtime_dirs, dir_statuses, cwd, &name).await,
-        Selector::Pid(pid) => resolve_pid(runtime_dirs, dir_statuses, cwd, pid).await,
-    }
-}
-
-async fn resolve_current(
-    runtime_dirs: &[PathBuf],
-    dir_statuses: &[RuntimeDirStatus],
-    cwd: &Path,
-) -> Result<Resolved, ToolError> {
-    let config_path = find_config_upward(cwd).await.ok_or_else(|| {
-        ToolError::NoSession(Box::new(discovery_diagnostics(
-            cwd,
-            "no micromux config found from the current directory".to_string(),
-            None,
-            dir_statuses,
-            Vec::new(),
-        )))
-    })?;
-    let endpoints = runtime_dirs
-        .iter()
-        .map(|runtime_dir| endpoint_for(runtime_dir, &config_path))
-        .collect();
-    match verify_any(
-        endpoints,
-        "the current config",
-        |socket_probes| {
-            let dir = config_path.parent().unwrap_or(config_path.as_path());
-            discovery_diagnostics(
-                cwd,
-                format!(
-                    "no running micromux session for {}; start one with the start_session tool, or run `micromux` in {}",
-                    config_path.display(),
-                    dir.display(),
-                ),
-                Some(&config_path),
-                dir_statuses,
-                socket_probes,
-            )
-        },
-    )
-    .await
-    {
-        Ok(resolved) => Ok(resolved),
-        Err(err @ ToolError::Busy(_)) => {
-            match resolve_current_config_by_scanning(runtime_dirs, &config_path).await? {
-                Some(resolved) => Ok(resolved),
-                None => Err(err),
-            }
-        }
-        Err(err @ ToolError::NoSession(_)) => {
-            match resolve_current_project_by_scanning(runtime_dirs, cwd, &config_path).await? {
-                Some(resolved) => Ok(resolved),
-                None => Err(err),
-            }
-        }
-        Err(err) => Err(err),
-    }
-}
-
-async fn resolve_current_config_by_scanning(
-    runtime_dirs: &[PathBuf],
-    config_path: &Path,
-) -> Result<Option<Resolved>, ToolError> {
-    let probes = probe_runtime_dirs(runtime_dirs)
+    let selector = selector_with_environment_fallback(selector);
+    resolve_selector_in_runtime_dirs(runtime_dirs, dir_statuses, cwd, selector, None)
         .await
-        .map_err(ToolError::from)?;
-    resolve_current_config_matches(&probes, config_path)
-}
-
-async fn resolve_current_project_by_scanning(
-    runtime_dirs: &[PathBuf],
-    cwd: &Path,
-    config_path: &Path,
-) -> Result<Option<Resolved>, ToolError> {
-    let probes = probe_runtime_dirs(runtime_dirs)
-        .await
-        .map_err(ToolError::from)?;
-
-    if let Some(resolved) = resolve_current_config_matches(&probes, config_path)? {
-        return Ok(Some(resolved));
-    }
-
-    let project_matches =
-        current_scan_matches(&probes, |info| session_config_path_is_under(info, cwd));
-    resolve_unique_current_scan_matches(project_matches, "a config under the current directory")
-}
-
-fn resolve_current_config_matches(
-    probes: &[EndpointProbe],
-    config_path: &Path,
-) -> Result<Option<Resolved>, ToolError> {
-    let config_matches = current_scan_matches(probes, |info| {
-        session_matches_config_path(info, config_path)
-    });
-    resolve_unique_current_scan_matches(config_matches, "the current config")
-}
-
-fn current_scan_matches(
-    probes: &[EndpointProbe],
-    matches_session: impl Fn(&SessionInfo) -> bool,
-) -> Vec<Resolved> {
-    unique_answering_session_probes(probes)
-        .into_iter()
-        .filter(|(_endpoint, info)| matches_session(info))
-        .map(|(endpoint, info)| Resolved { endpoint, info })
-        .collect()
-}
-
-fn resolve_unique_current_scan_matches(
-    matches: Vec<Resolved>,
-    describe: &str,
-) -> Result<Option<Resolved>, ToolError> {
-    if matches.len() > 1 {
-        return Err(ToolError::Ambiguous(format!(
-            "{describe} matched {} live sessions; use pid: or name: to disambiguate",
-            matches.len()
-        )));
-    }
-    Ok(matches.into_iter().next())
-}
-
-fn session_matches_config_path(info: &SessionInfo, config_path: &Path) -> bool {
-    info.id == endpoint_hash(config_path)
-}
-
-fn session_config_path_is_under(info: &SessionInfo, cwd: &Path) -> bool {
-    if info.config_path.is_empty() {
-        return false;
-    }
-    let session_config_path = canonicalize_for_match(Path::new(&info.config_path));
-    let cwd = canonicalize_for_match(cwd);
-    session_config_path.starts_with(&cwd)
-}
-
-fn canonicalize_for_match(path: &Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
-}
-
-async fn resolve_hash(
-    runtime_dirs: &[PathBuf],
-    dir_statuses: &[RuntimeDirStatus],
-    cwd: &Path,
-    hash: &str,
-) -> Result<Resolved, ToolError> {
-    let endpoints = runtime_dirs
-        .iter()
-        .map(|runtime_dir| endpoint_from_hash(runtime_dir, hash))
-        .collect();
-    let describe = format!("hash {hash}");
-    verify_any(endpoints, &describe, |socket_probes| {
-        discovery_diagnostics(
-            cwd,
-            format!("no session with hash {hash}"),
-            None,
-            dir_statuses,
-            socket_probes,
-        )
-    })
-    .await
-}
-
-async fn resolve_name(
-    runtime_dirs: &[PathBuf],
-    dir_statuses: &[RuntimeDirStatus],
-    cwd: &Path,
-    name: &str,
-) -> Result<Resolved, ToolError> {
-    resolve_scanned_selector(
-        runtime_dirs,
-        dir_statuses,
-        cwd,
-        &format!("name `{name}`"),
-        "use pid: or hash: to disambiguate",
-        |info| info.name == name,
-    )
-    .await
-}
-
-async fn resolve_pid(
-    runtime_dirs: &[PathBuf],
-    dir_statuses: &[RuntimeDirStatus],
-    cwd: &Path,
-    pid: u32,
-) -> Result<Resolved, ToolError> {
-    resolve_scanned_selector(
-        runtime_dirs,
-        dir_statuses,
-        cwd,
-        &format!("pid {pid}"),
-        "use hash: to disambiguate",
-        |info| info.pid == pid,
-    )
-    .await
-}
-
-async fn resolve_scanned_selector(
-    runtime_dirs: &[PathBuf],
-    dir_statuses: &[RuntimeDirStatus],
-    cwd: &Path,
-    describe: &str,
-    disambiguate_hint: &str,
-    matches_session: impl Fn(&SessionInfo) -> bool,
-) -> Result<Resolved, ToolError> {
-    let probes = probe_runtime_dirs(runtime_dirs)
-        .await
-        .map_err(ToolError::from)?;
-    let matches = unique_answering_session_probes(&probes)
-        .into_iter()
-        .filter(|(_endpoint, info)| matches_session(info))
-        .map(|(endpoint, info)| Resolved { endpoint, info })
-        .collect();
-    resolve_probe_matches(
-        matches,
-        probes,
-        dir_statuses,
-        cwd,
-        describe,
-        disambiguate_hint,
-    )
-}
-
-fn resolve_probe_matches(
-    matches: Vec<Resolved>,
-    probes: Vec<EndpointProbe>,
-    dir_statuses: &[RuntimeDirStatus],
-    cwd: &Path,
-    describe: &str,
-    disambiguate_hint: &str,
-) -> Result<Resolved, ToolError> {
-    classify_probe_matches(
-        matches,
-        probes,
-        describe,
-        disambiguate_hint,
-        "session(s)",
-        |socket_probes| {
-            discovery_diagnostics(
-                cwd,
-                format!("no session matched {describe}"),
-                None,
-                dir_statuses,
-                socket_probes,
-            )
-        },
-    )
-}
-
-fn classify_probe_matches(
-    matches: Vec<Resolved>,
-    probes: Vec<EndpointProbe>,
-    describe: &str,
-    disambiguate_hint: &str,
-    busy_unit: &str,
-    diagnostics: impl FnOnce(Vec<SocketProbeDetail>) -> DiscoveryDiagnostics,
-) -> Result<Resolved, ToolError> {
-    if matches.len() > 1 {
-        return Err(ToolError::Ambiguous(format!(
-            "{describe} matched {} live sessions; {disambiguate_hint}",
-            matches.len()
-        )));
-    }
-    if let Some(resolved) = matches.into_iter().next() {
-        return Ok(resolved);
-    }
-    let unusable = unusable_messages(&probes);
-    if !unusable.is_empty() {
-        return Err(ToolError::Busy(format!(
-            "no answering session matched {describe}; {} live {busy_unit} were reachable but unusable and may be the target: {}",
-            unusable.len(),
-            unusable.join("; ")
-        )));
-    }
-    Err(ToolError::NoSession(Box::new(diagnostics(
-        probes.into_iter().map(probe_detail).collect(),
-    ))))
+        .map_err(|error| map_select_error(cwd, error))
 }
 
 pub(crate) fn discovery_diagnostics(
@@ -576,62 +245,6 @@ pub(crate) fn discovery_diagnostics(
         socket_probes,
     }
 }
-
-fn probe_detail(probe: EndpointProbe) -> SocketProbeDetail {
-    match probe.result {
-        EndpointProbeResult::Session(info) => SocketProbeDetail {
-            endpoint: probe.endpoint.to_string(),
-            status: SocketProbeStatus::Session,
-            message: None,
-            peer_protocol_version: Some(info.protocol_version),
-            client_protocol_version: Some(micromux_control::PROTOCOL_VERSION),
-            session: Some(*info),
-        },
-        EndpointProbeResult::Absent(reason) => SocketProbeDetail {
-            endpoint: probe.endpoint.to_string(),
-            status: SocketProbeStatus::Absent,
-            message: Some(reason),
-            peer_protocol_version: None,
-            client_protocol_version: Some(micromux_control::PROTOCOL_VERSION),
-            session: None,
-        },
-        EndpointProbeResult::ProtocolMismatch { peer, ours } => SocketProbeDetail {
-            endpoint: probe.endpoint.to_string(),
-            status: SocketProbeStatus::ProtocolMismatch,
-            message: Some(format!(
-                "control protocol version mismatch: peer={peer}, ours={ours}"
-            )),
-            peer_protocol_version: Some(peer),
-            client_protocol_version: Some(ours),
-            session: None,
-        },
-        EndpointProbeResult::Unreachable(reason) => SocketProbeDetail {
-            endpoint: probe.endpoint.to_string(),
-            status: SocketProbeStatus::Unreachable,
-            message: Some(reason),
-            peer_protocol_version: None,
-            client_protocol_version: Some(micromux_control::PROTOCOL_VERSION),
-            session: None,
-        },
-    }
-}
-
-fn unusable_messages(probes: &[EndpointProbe]) -> Vec<String> {
-    probes
-        .iter()
-        .filter_map(|probe| match &probe.result {
-            EndpointProbeResult::ProtocolMismatch { peer, ours } => Some(format!(
-                "{} -> protocol mismatch: peer={peer}, ours={ours}",
-                probe.endpoint
-            )),
-            EndpointProbeResult::Unreachable(reason) => {
-                Some(format!("{} -> {reason}", probe.endpoint))
-            }
-            EndpointProbeResult::Session(_) | EndpointProbeResult::Absent(_) => None,
-        })
-        .collect()
-}
-
 fn session_infos_from_probes(probes: &[EndpointProbe]) -> Vec<SessionInfo> {
     unique_answering_session_probes(probes)
         .into_iter()
@@ -690,7 +303,7 @@ pub async fn answering_sessions() -> Result<Vec<Resolved>, ToolError> {
     let probes = probe_runtime_dirs(&runtime_dirs).await?;
     Ok(unique_answering_session_probes(&probes)
         .into_iter()
-        .map(|(endpoint, info)| Resolved { endpoint, info })
+        .map(|(endpoint, info)| ResolvedSession { endpoint, info })
         .collect())
 }
 
@@ -729,7 +342,9 @@ mod tests {
 
     use fs2::FileExt;
     use micromux::CancellationToken;
-    use micromux_control::{ControlEndpoint, ControlServer, SessionIdentity, bind, endpoint_for};
+    use micromux_control::{
+        ControlEndpoint, ControlServer, SessionIdentity, bind, endpoint_for, endpoint_hash,
+    };
     use similar_asserts::assert_eq;
     use tokio::io::AsyncWriteExt;
 
