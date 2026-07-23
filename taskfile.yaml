@@ -60,13 +60,44 @@ tasks:
       - task: goreleaser
         vars: { GORELEASER_ARGS: "release --clean" }
 
-  screenshots:
-    desc: "regenerate the docs screenshots from examples/ (needs charmbracelet/freeze)"
+  docs:screenshots:
+    desc: "regenerate the documentation screenshots of the TUI (needs charmbracelet/freeze)"
+    aliases: [screenshots]
+    sources:
+      - crates/micromux-screenshot/src/**/*.rs
+      - examples/demo/micromux.yaml
+    generates:
+      - docs/static/images/*.png
     cmds:
       # micromux-screenshot drives the real micromux binary in a pty, so build it first; it is
       # found as a sibling in target/debug (override with MICROMUX_BIN).
       - cargo build -p micromux-cli
       - cargo run -p micromux-screenshot
+
+  docs:terminals:
+    desc: "regenerate the documentation terminal snippets (needs terminal-to-html)"
+    sources:
+      - scripts/terminals.sh
+      - crates/micromux-cli/src/**/*.rs
+      - examples/demo/micromux.yaml
+    generates:
+      - docs/assets/terminals/*.html
+    cmds:
+      - bash scripts/terminals.sh
+
+  docs:build:
+    desc: "build the static documentation site into docs/public (needs hugo extended + go)"
+    dir: docs
+    cmds:
+      - hugo --minify --gc {{.CLI_ARGS}}
+
+  docs:serve:
+    desc: "serve the documentation website with hot reload (needs hugo extended + go)"
+    aliases: [docs]
+    dir: docs
+    interactive: true
+    cmds:
+      - hugo server --disableFastRender {{.CLI_ARGS}}
 
   typos:
     desc: "check repository for typos"
@@ -101,8 +132,8 @@ tasks:
         \( -name '.intentionally-empty-file.o' -o -name '*detect_compiler_family.o' \)
         -delete
 
-  docs:
-    desc: "open documentation preview"
+  docs:cargo:
+    desc: "open rustdoc preview"
     env:
       RUSTDOCFLAGS: "--cfg docsrs"
     cmds:
