@@ -51,7 +51,7 @@ use crate::tools::logs::{
 };
 use crate::tools::sessions::{
     CHILD_EXIT_GRACE, START_READY_TIMEOUT, already_running_any, reachable_session_for_start,
-    spawn_detached_serve, start_session_report,
+    remove_captured_stderr, spawn_detached_serve, start_failure_message, start_session_report,
 };
 #[cfg(unix)]
 use crate::tools::sessions::{STOP_CONFIRM_TIMEOUT, wait_until_stopped};
@@ -125,6 +125,43 @@ struct ServiceArgs {
     /// Optional session selector (see `list_sessions`); omit for the current project.
     #[serde(default)]
     session: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct ServiceEventsArgs {
+    /// The id of the target service.
+    service: String,
+    /// Optional session selector; omit for the current project.
+    #[serde(default)]
+    session: Option<String>,
+    /// Return events with a sequence strictly greater than this cursor.
+    #[serde(default)]
+    after_seq: Option<u64>,
+    /// Maximum events to return (default 50, capped at 256).
+    #[serde(default)]
+    tail: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct DynamicServiceArgs {
+    /// Optional session selector; omit for the current project.
+    #[serde(default)]
+    session: Option<String>,
+    /// Dynamic service definition, clone source, lease, and idempotency key.
+    #[serde(flatten)]
+    params: micromux::DynamicServiceParams,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct ReplaceDynamicServiceArgs {
+    /// Revision currently observed by the caller.
+    expected_revision: u64,
+    /// Optional session selector; omit for the current project.
+    #[serde(default)]
+    session: Option<String>,
+    /// Replacement definition, clone source, lease, and idempotency key.
+    #[serde(flatten)]
+    params: micromux::DynamicServiceParams,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -231,6 +268,32 @@ struct StartArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+struct ValidateConfigArgs {
+    /// Project directory or config file to validate. A directory is searched upward; omit to use
+    /// the MCP server's working directory.
+    #[serde(default)]
+    path: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct EnsureReadyArgs {
+    /// The id of the service to make ready.
+    service: String,
+    /// Optional session selector; omit for the current project.
+    #[serde(default)]
+    session: Option<String>,
+    /// Project directory or config file to start if no session is running.
+    #[serde(default)]
+    path: Option<String>,
+    /// Maximum seconds to wait (default 60, capped at 600).
+    #[serde(default)]
+    timeout_secs: Option<u64>,
+    /// Maximum likely-cause log entries used by follow-up diagnosis (default 5, capped at 20).
+    #[serde(default)]
+    log_limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 struct WaitArgs {
     /// The id of the target service.
     service: String,
@@ -308,6 +371,10 @@ struct LogFilePathArgs {
     run_generation: Option<u64>,
 }
 
+/// Common session identity flattened into every mutation receipt.
+///
+/// Receipts name two known generations `previous_generation` and `run_generation`; when
+/// only the pre-action latch is known, they use `generation`.
 #[derive(Serialize, JsonSchema)]
 struct SessionRef {
     session: String,
@@ -334,10 +401,22 @@ struct MutationResult {
     accepted: Vec<micromux::ServiceCommandAck>,
     service: String,
     generation: Option<u64>,
+    /// The service's last visible log seq, captured before the mutation was sent; pass it to
+    /// `follow_logs` as `after_seq` to read exactly the output this action caused.
+    log_cursor: Option<u64>,
+}
+
+#[derive(Serialize, JsonSchema)]
+struct DynamicMutationResult {
+    #[serde(flatten)]
+    session_ref: SessionRef,
+    #[serde(flatten)]
+    receipt: micromux_control::DynamicServiceAck,
 }
 
 #[derive(Serialize, JsonSchema)]
 struct RestartAndWaitResult {
+    #[serde(flatten)]
     session_ref: SessionRef,
     service: String,
     previous_generation: u64,
@@ -346,6 +425,9 @@ struct RestartAndWaitResult {
     snapshot: ServiceSnapshot,
     logs: Vec<logproc::ProcessedEntry>,
     logs_truncated: bool,
+    /// Lifecycle timeline events for the restart (from the pre-restart generation onward), so a
+    /// failed wait explains itself (blocked dependency, backoff, spawn failure) without another call.
+    events: Vec<micromux::ServiceEvent>,
     #[serde(skip_serializing_if = "Option::is_none")]
     diagnosis: Option<ServiceDiagnosis>,
 }
@@ -504,6 +586,47 @@ struct HealthResult {
     service: String,
     snapshot: ServiceSnapshot,
     latest_healthcheck: Option<HealthAttempt>,
+}
+
+#[derive(Serialize, JsonSchema)]
+struct ServiceEventsResult {
+    #[serde(flatten)]
+    session_ref: SessionRef,
+    service: String,
+    /// Lifecycle timeline events, oldest first.
+    events: Vec<micromux::ServiceEvent>,
+    /// Highest event seq returned; pass as `after_seq` to follow incrementally.
+    next_seq: Option<u64>,
+    /// Whether older events were dropped by the tail bound or ring eviction.
+    truncated: bool,
+}
+
+#[derive(Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum EnsureActionKind {
+    StartedSession,
+    EnabledService,
+    Waited,
+}
+
+#[derive(Serialize, JsonSchema)]
+struct EnsureAction {
+    /// What the tool did on the caller's behalf.
+    kind: EnsureActionKind,
+    detail: String,
+}
+
+#[derive(Serialize, JsonSchema)]
+struct EnsureServiceReadyResult {
+    #[serde(flatten)]
+    session_ref: SessionRef,
+    service: String,
+    /// Every state change this call performed, in order; empty when already ready.
+    actions: Vec<EnsureAction>,
+    outcome: WaitResult,
+    snapshot: ServiceSnapshot,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    diagnosis: Option<ServiceDiagnosis>,
 }
 
 #[derive(Serialize, JsonSchema)]
@@ -790,9 +913,12 @@ impl McpServer {
         let resolved = select::resolve(&self.cwd, session)
             .await
             .map_err(error_data)?;
-        let response = send_request(&resolved.endpoint, request)
+        let mut conn = SessionConn::connect(&resolved.endpoint)
             .await
             .map_err(error_data)?;
+        let log_cursor =
+            service_result(service, current_service_cursor(&mut conn, service).await).await?;
+        let response = conn.request(request).await.map_err(error_data)?;
         let acks = service_result(service, convert::accepted(response)).await?;
         let generation = acks
             .iter()
@@ -803,6 +929,161 @@ impl McpServer {
             accepted: acks,
             service: service.to_string(),
             generation,
+            log_cursor: Some(log_cursor),
+        }))
+    }
+
+    async fn start_for_target(&self, target: PathBuf) -> Result<StartSessionResult, ErrorData> {
+        if !transport_supported() {
+            return Err(error_data(ToolError::Unsupported));
+        }
+        let config_path = select::config_for_target(&target).await.ok_or_else(|| {
+            ErrorData::invalid_params(
+                format!("no micromux config found at or above {}", target.display()),
+                None,
+            )
+        })?;
+        let dir_statuses = runtime_dir_statuses();
+        let runtime_dirs = usable_runtime_dirs(&dir_statuses);
+        if runtime_dirs.is_empty() {
+            let diagnostics = select::discovery_diagnostics(
+                &self.cwd,
+                "no runtime directory could be resolved".to_string(),
+                Some(&config_path),
+                &dir_statuses,
+                Vec::new(),
+            );
+            return Err(ErrorData::internal_error(
+                "no runtime directory could be resolved",
+                serde_json::to_value(diagnostics).ok(),
+            ));
+        }
+        let endpoints = runtime_dirs
+            .iter()
+            .map(|runtime_dir| endpoint_for(runtime_dir, &config_path))
+            .collect::<Vec<_>>();
+
+        // If a session answers, this is a no-op. Otherwise let `serve` try the lifetime lock: that
+        // keeps duplicate prevention in one place and lets it reclaim stale/bad socket files.
+        if let Some(report) = already_running_any(&endpoints, &config_path)
+            .await
+            .map_err(error_data)?
+        {
+            return Ok(report);
+        }
+
+        let spawned = spawn_detached_serve(&config_path).map_err(|err| {
+            // On a platform without the control transport, surface the canonical unsupported error
+            // rather than a generic spawn failure.
+            if err.kind() == std::io::ErrorKind::Unsupported {
+                error_data(ToolError::Unsupported)
+            } else {
+                ErrorData::internal_error(format!("failed to spawn `micromux serve`: {err}"), None)
+            }
+        })?;
+        let mut child = spawned.child;
+        let stderr_path = spawned.stderr_path;
+        let mut deadline = tokio::time::Instant::now() + START_READY_TIMEOUT;
+        let mut child_exit: Option<std::process::ExitStatus> = None;
+        loop {
+            // Observe early exit before deciding whether an answering session is ours; after the
+            // child is reaped, its pid is no longer a trustworthy ownership signal.
+            if child_exit.is_none()
+                && let Ok(Some(status)) = child.try_wait()
+            {
+                child_exit = Some(status);
+                deadline = deadline.min(tokio::time::Instant::now() + CHILD_EXIT_GRACE);
+            }
+            let child_pid = child_exit.is_none().then(|| child.id()).flatten();
+            match reachable_session_for_start(&endpoints, &config_path, child_pid).await {
+                Ok(Some((started, info))) => {
+                    // Reachable. Report `started` only when the answering process is the child this
+                    // call spawned; otherwise a concurrent start won the endpoint lock. If our child
+                    // is still around in that case, stop it so a duplicate session cannot linger.
+                    if !started && child_exit.is_none() {
+                        let _ = child.kill().await;
+                    }
+                    remove_captured_stderr(&stderr_path);
+                    return Ok(start_session_report(&info, started));
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    // A discovery error (e.g. an ambiguous selector) is caller-actionable and has
+                    // nothing to do with the child's stderr; keep the typed error.
+                    if child_exit.is_none() {
+                        let _ = child.kill().await;
+                    }
+                    remove_captured_stderr(&stderr_path);
+                    return Err(error_data(err));
+                }
+            }
+            // If our child exited, keep polling briefly. A concurrent start_session that won the
+            // lifetime-lock race makes our loser child exit too, and the winner may still be
+            // binding.
+            if tokio::time::Instant::now() >= deadline {
+                if child_exit.is_none() {
+                    // Still running but never bound — don't leak a session that may hold the ports.
+                    let _ = child.kill().await;
+                }
+                let base = match child_exit {
+                    Some(status) => format!(
+                        "`micromux serve` for {} exited ({status}) before becoming reachable",
+                        config_path.display(),
+                    ),
+                    None => format!(
+                        "`micromux serve` for {} did not become reachable within {}s and was stopped",
+                        config_path.display(),
+                        START_READY_TIMEOUT.as_secs(),
+                    ),
+                };
+                return Err(ErrorData::internal_error(
+                    start_failure_message(&base, &stderr_path),
+                    None,
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+    }
+
+    fn require_dynamic_capability(info: &SessionInfo) -> Result<(), ErrorData> {
+        let enabled = info
+            .capabilities
+            .as_ref()
+            .and_then(|capabilities| capabilities.dynamic_services.as_ref())
+            .is_some();
+        if enabled {
+            Ok(())
+        } else {
+            Err(ErrorData::invalid_params(
+                format!(
+                    "PolicyDenied: dynamic services are disabled for this session; set \
+                     control.dynamic_services.enabled: true in {} and restart the session",
+                    info.config_path
+                ),
+                None,
+            ))
+        }
+    }
+
+    /// Shared pipeline for the three dynamic-service tools: resolve, capability pre-flight (a
+    /// courtesy — the session enforces regardless), send, convert, wrap with the session ref.
+    async fn dynamic_mutation(
+        &self,
+        session: Option<String>,
+        service: &str,
+        request: Request,
+    ) -> ToolResult<DynamicMutationResult> {
+        let resolved = select::resolve(&self.cwd, session)
+            .await
+            .map_err(error_data)?;
+        Self::require_dynamic_capability(&resolved.info)?;
+        let response = send_request(&resolved.endpoint, request)
+            .await
+            .map_err(error_data)?;
+        let receipt = service_result(service, convert::dynamic_service(response)).await?;
+        Ok(Json(DynamicMutationResult {
+            session_ref: SessionRef::from(&resolved.info),
+            receipt,
         }))
     }
 }
@@ -811,7 +1092,8 @@ impl McpServer {
 impl McpServer {
     #[tool(
         description = "List all micromux sessions currently running for this user, with their \
-        name, pid, config path, working directory, and discovery diagnostics."
+        name, pid, config path, working directory, advertised capabilities, and discovery \
+        diagnostics."
     )]
     async fn list_sessions(&self) -> ToolResult<SessionListResult> {
         let list = select::list_sessions().await.map_err(error_data)?;
@@ -822,10 +1104,42 @@ impl McpServer {
     }
 
     #[tool(
+        description = "Validate a micromux config without starting a session. Runs the same parse, \
+        service normalization, environment-file/interpolation, port, and dependency-graph checks \
+        used at startup and returns structured plus ANSI-free rendered diagnostics. Environment \
+        interpolation uses the MCP process environment, so unset-variable warnings can differ \
+        from the eventual session environment."
+    )]
+    async fn validate_config(
+        &self,
+        args: Parameters<ValidateConfigArgs>,
+    ) -> ToolResult<micromux::ValidationReport> {
+        let Parameters(args) = args;
+        let target = args
+            .path
+            .as_deref()
+            .map_or_else(|| self.cwd.clone(), PathBuf::from);
+        let config_path = select::config_for_target(&target).await.ok_or_else(|| {
+            ErrorData::invalid_params(
+                format!("no micromux config found at or above {}", target.display()),
+                None,
+            )
+        })?;
+        let report = tokio::task::spawn_blocking(move || {
+            // `None` lets the config's own `strict:` key decide, matching session startup.
+            micromux::validate_config_file(&config_path, None)
+        })
+        .await
+        .map_err(|err| ErrorData::internal_error(format!("validation task failed: {err}"), None))?
+        .map_err(|err| ErrorData::invalid_params(err.to_string(), None))?;
+        Ok(Json(report))
+    }
+
+    #[tool(
         description = "List the services in a session with their desired/execution state, health, \
         advertised ports, pid, start time, config drift, uptime, restart state/policy, last exit \
-        code, run generation, resolved command (argv), and working directory. The result carries a \
-        copy-pasteable session_selector."
+        code, run generation, configured/dynamic origin and revision, resolved command (argv), and \
+        working directory. The result carries a copy-pasteable session_selector."
     )]
     async fn list_services(&self, args: Parameters<SessionArgs>) -> ToolResult<ServiceListResult> {
         let Parameters(args) = args;
@@ -849,8 +1163,8 @@ impl McpServer {
         description = "Locate a service by id or name across every running micromux session. \
         Returns each matching session's copy-pasteable selector, config path, working directory, \
         and the service's current snapshot (state, health, run generation, command, advertised \
-        ports), so a service can be targeted without the list_sessions -> pick a hash -> \
-        list_services dance."
+        ports and configured/dynamic origin), so dynamic services appear like every other roster \
+        entry and can be targeted without the list_sessions -> pick a hash -> list_services dance."
     )]
     async fn find_service(
         &self,
@@ -1103,9 +1417,11 @@ impl McpServer {
 
     #[tool(
         description = "Restart a service. Returns the run generation *before* the restart; pass \
-        it to wait_for_healthy as after_generation. Reloads the latest micromux config before \
-        spawning the replacement, so edited command flags, healthchecks, and log retention take \
-        effect. Restarting a disabled service is rejected."
+        it to wait_for_healthy as after_generation. Also returns log_cursor, the pre-restart log \
+        position; pass it to follow_logs as after_seq to read exactly the new run's output. \
+        Reloads the latest micromux config before spawning the replacement, so edited command \
+        flags, healthchecks, and log retention take effect. Restarting a disabled service is \
+        rejected."
     )]
     async fn restart_service(&self, args: Parameters<ServiceArgs>) -> ToolResult<MutationResult> {
         let Parameters(args) = args;
@@ -1121,8 +1437,8 @@ impl McpServer {
 
     #[tool(
         description = "Convenience wrapper that captures log cursors, restarts one service, waits \
-        for the replacement run, and returns its snapshot plus compact new logs and failure \
-        diagnosis. The primitive tools remain the right choice for finer control. Do not use this \
+        for the replacement run, and returns its snapshot plus compact new logs, lifecycle events, \
+        and failure diagnosis. The primitive tools remain the right choice for finer control. Do not use this \
         for hot-reload services, which never restart; use log_cursors followed by follow_all_logs \
         for those."
     )]
@@ -1210,6 +1526,19 @@ impl McpServer {
         } else {
             None
         };
+        let events_response = conn
+            .request(Request::GetEvents {
+                service: args.service.clone(),
+                after: None,
+                tail: Some(micromux::EVENT_HISTORY),
+            })
+            .await
+            .map_err(error_data)?;
+        let (events, _) = service_result(&args.service, convert::events(events_response)).await?;
+        let events = events
+            .into_iter()
+            .filter(|event| event.run_generation >= previous_generation)
+            .collect();
         let outcome = WaitResult::from_conclusion(args.service.clone(), timeout, &conclusion);
 
         Ok(Json(RestartAndWaitResult {
@@ -1221,13 +1550,16 @@ impl McpServer {
             snapshot,
             logs,
             logs_truncated,
+            events,
             diagnosis,
         }))
     }
 
     #[tool(
-        description = "Restart all enabled services in a session (disabled services are skipped). \
-        Reloads the latest micromux config before requesting restarts."
+        description = "Restart all enabled services in a session, including live dynamic services \
+        (disabled and retired services are skipped). Reloads the latest micromux config before \
+        requesting restarts. This receipt has no per-service log cursor; use log_cursors before \
+        restart_all when you need logs since the action."
     )]
     async fn restart_all(
         &self,
@@ -1248,9 +1580,10 @@ impl McpServer {
     }
 
     #[tool(
-        description = "Enable (and start) a service. Returns the run generation before enabling. \
-        Reloads the latest micromux config before spawning, so edited command flags, healthchecks, \
-        and log retention take effect."
+        description = "Enable (and start) a service. Returns the run generation before enabling \
+        plus log_cursor, the pre-enable log position (pass to follow_logs as after_seq). Reloads \
+        the latest micromux config before spawning, so edited command flags, healthchecks, and \
+        log retention take effect."
     )]
     async fn enable_service(&self, args: Parameters<ServiceArgs>) -> ToolResult<MutationResult> {
         let Parameters(args) = args;
@@ -1275,6 +1608,71 @@ impl McpServer {
             &args.service,
         )
         .await
+    }
+
+    #[tool(
+        description = "Create and start a runtime service in the target session. Requires \
+        control.dynamic_services.enabled in that session's micromux.yaml. Dynamic services stop \
+        with the session and always have a TTL. from_service clones any existing service \
+        (configured or dynamic) server-side, including environment values that are never \
+        displayed; extra_args append to the resolved argv (for a CMD-SHELL command they become \
+        shell positional parameters, not appended script text). Pass idempotency_key when \
+        retrying. Then call wait_for_healthy with after_generation=observed_generation."
+    )]
+    async fn start_dynamic_service(
+        &self,
+        args: Parameters<DynamicServiceArgs>,
+    ) -> ToolResult<DynamicMutationResult> {
+        let Parameters(args) = args;
+        let service = args.params.service.clone();
+        self.dynamic_mutation(
+            args.session,
+            &service,
+            Request::StartDynamicService {
+                params: args.params,
+            },
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Replace or revive a runtime service using optimistic concurrency. Requires \
+        control.dynamic_services.enabled in the target session's micromux.yaml. Dynamic services \
+        stop with the session and always have a fresh TTL after replacement. from_service clones \
+        any existing service (configured or dynamic) server-side, including environment values \
+        that are never displayed. Pass idempotency_key when retrying, then compose with \
+        wait_for_healthy(after_generation=observed_generation)."
+    )]
+    async fn replace_dynamic_service(
+        &self,
+        args: Parameters<ReplaceDynamicServiceArgs>,
+    ) -> ToolResult<DynamicMutationResult> {
+        let Parameters(args) = args;
+        let service = args.params.service.clone();
+        let request = Request::ReplaceDynamicService {
+            service: service.clone(),
+            expected_revision: args.expected_revision,
+            params: args.params,
+        };
+        self.dynamic_mutation(args.session, &service, request).await
+    }
+
+    #[tool(
+        description = "Retire a runtime service while preserving its bounded logs and snapshot for \
+        post-mortem inspection. Requires control.dynamic_services.enabled in the target session's \
+        micromux.yaml. Stop is idempotent; the service also stops with the session and always \
+        carries a TTL."
+    )]
+    async fn stop_dynamic_service(
+        &self,
+        args: Parameters<ServiceArgs>,
+    ) -> ToolResult<DynamicMutationResult> {
+        let Parameters(args) = args;
+        let request = Request::StopDynamicService {
+            service: args.service.clone(),
+        };
+        self.dynamic_mutation(args.session, &args.service, request)
+            .await
     }
 
     #[tool(
@@ -1323,118 +1721,12 @@ impl McpServer {
         session binds the same ports, stop it first with stop_session."
     )]
     async fn start_session(&self, args: Parameters<StartArgs>) -> ToolResult<StartSessionResult> {
-        if !transport_supported() {
-            return Err(error_data(ToolError::Unsupported));
-        }
         let Parameters(args) = args;
         let target = args
             .path
             .as_deref()
             .map_or_else(|| self.cwd.clone(), PathBuf::from);
-        let config_path = select::config_for_target(&target).await.ok_or_else(|| {
-            ErrorData::invalid_params(
-                format!("no micromux config found at or above {}", target.display()),
-                None,
-            )
-        })?;
-        let dir_statuses = runtime_dir_statuses();
-        let runtime_dirs = usable_runtime_dirs(&dir_statuses);
-        if runtime_dirs.is_empty() {
-            let diagnostics = select::discovery_diagnostics(
-                &self.cwd,
-                "no runtime directory could be resolved".to_string(),
-                Some(&config_path),
-                &dir_statuses,
-                Vec::new(),
-            );
-            return Err(ErrorData::internal_error(
-                "no runtime directory could be resolved",
-                serde_json::to_value(diagnostics).ok(),
-            ));
-        }
-        let endpoints = runtime_dirs
-            .iter()
-            .map(|runtime_dir| endpoint_for(runtime_dir, &config_path))
-            .collect::<Vec<_>>();
-
-        // If a session answers, this is a no-op. Otherwise let `serve` try the lifetime lock: that
-        // keeps duplicate prevention in one place and lets it reclaim stale/bad socket files.
-        if let Some(report) = already_running_any(&endpoints, &config_path)
-            .await
-            .map_err(error_data)?
-        {
-            return Ok(Json(report));
-        }
-
-        let mut child = spawn_detached_serve(&config_path).map_err(|err| {
-            // On a platform without the control transport, surface the canonical unsupported error
-            // rather than a generic spawn failure.
-            if err.kind() == std::io::ErrorKind::Unsupported {
-                error_data(ToolError::Unsupported)
-            } else {
-                ErrorData::internal_error(format!("failed to spawn `micromux serve`: {err}"), None)
-            }
-        })?;
-
-        let mut deadline = tokio::time::Instant::now() + START_READY_TIMEOUT;
-        let mut child_exit: Option<std::process::ExitStatus> = None;
-        loop {
-            // Observe early exit before deciding whether an answering session is ours; after the
-            // child is reaped, its pid is no longer a trustworthy ownership signal.
-            if child_exit.is_none()
-                && let Ok(Some(status)) = child.try_wait()
-            {
-                child_exit = Some(status);
-                deadline = deadline.min(tokio::time::Instant::now() + CHILD_EXIT_GRACE);
-            }
-            let child_pid = child_exit.is_none().then(|| child.id()).flatten();
-            match reachable_session_for_start(&endpoints, &config_path, child_pid).await {
-                Ok(Some((started, info))) => {
-                    // Reachable. Report `started` only when the answering process is the child this
-                    // call spawned; otherwise a concurrent start won the endpoint lock. If our child
-                    // is still around in that case, stop it so a duplicate session cannot linger.
-                    if !started && child_exit.is_none() {
-                        let _ = child.kill().await;
-                    }
-                    return Ok(Json(start_session_report(&info, started)));
-                }
-                Ok(None) => {}
-                Err(err) => {
-                    if child_exit.is_none() {
-                        let _ = child.kill().await;
-                    }
-                    return Err(error_data(err));
-                }
-            }
-            // If our child exited, keep polling briefly. A concurrent start_session that won the
-            // lifetime-lock race makes our loser child exit too, and the winner may still be
-            // binding.
-            if tokio::time::Instant::now() >= deadline {
-                if child_exit.is_none() {
-                    // Still running but never bound — don't leak a session that may hold the ports.
-                    let _ = child.kill().await;
-                }
-                return Err(ErrorData::internal_error(
-                    match child_exit {
-                        Some(status) => format!(
-                            "`micromux serve` for {} exited ({status}) before becoming reachable — \
-                             run `micromux serve --config {}` to see why",
-                            config_path.display(),
-                            config_path.display(),
-                        ),
-                        None => format!(
-                            "`micromux serve` for {} did not become reachable within {}s and was \
-                             stopped — run `micromux serve --config {}` to diagnose",
-                            config_path.display(),
-                            START_READY_TIMEOUT.as_secs(),
-                            config_path.display(),
-                        ),
-                    },
-                    None,
-                ));
-            }
-            tokio::time::sleep(Duration::from_millis(150)).await;
-        }
+        self.start_for_target(target).await.map(Json)
     }
 
     #[tool(
@@ -1662,10 +1954,44 @@ impl McpServer {
     }
 
     #[tool(
+        description = "Return a service's retained scheduler lifecycle timeline. Use after_seq for \
+        incremental polling; events include dependency gating, spawn/exit, health transitions, \
+        restart backoff, config reloads, and dynamic-service lifecycle changes."
+    )]
+    async fn get_service_events(
+        &self,
+        args: Parameters<ServiceEventsArgs>,
+    ) -> ToolResult<ServiceEventsResult> {
+        let Parameters(args) = args;
+        let resolved = select::resolve(&self.cwd, args.session)
+            .await
+            .map_err(error_data)?;
+        let response = send_request(
+            &resolved.endpoint,
+            Request::GetEvents {
+                service: args.service.clone(),
+                after: args.after_seq,
+                tail: args.tail,
+            },
+        )
+        .await
+        .map_err(error_data)?;
+        let (events, truncated) = service_result(&args.service, convert::events(response)).await?;
+        let next_seq = events.last().map(|event| event.seq).or(args.after_seq);
+        Ok(Json(ServiceEventsResult {
+            session_ref: SessionRef::from(&resolved.info),
+            service: args.service,
+            events,
+            next_seq,
+            truncated,
+        }))
+    }
+
+    #[tool(
         description = "Summarize services that need attention in one call. Returns exited, \
         starting/pending/stopping, or unhealthy services with their full state snapshot, current \
-        live-run healthcheck output when applicable, factual supervisor-state signals, and a \
-        compact tail of likely-cause log lines."
+        live-run healthcheck output when applicable, recent lifecycle events, factual \
+        supervisor-state signals, and a compact tail of likely-cause log lines."
     )]
     async fn diagnose(&self, args: Parameters<DiagnoseArgs>) -> ToolResult<DiagnoseResult> {
         let Parameters(args) = args;
@@ -1737,6 +2063,160 @@ impl McpServer {
             timeout,
             &conclusion,
         )))
+    }
+
+    #[tool(
+        description = "Ensure a service is ready by composing session startup, explicit enabling, \
+        and the generation-aware health wait. Every action taken is reported. An already-healthy \
+        service returns immediately with no actions; an exit or timeout includes bounded failure \
+        diagnosis. Retired dynamic services must be revived with replace_dynamic_service."
+    )]
+    async fn ensure_service_ready(
+        &self,
+        args: Parameters<EnsureReadyArgs>,
+    ) -> ToolResult<EnsureServiceReadyResult> {
+        let Parameters(args) = args;
+        let timeout = Duration::from_secs(
+            args.timeout_secs
+                .unwrap_or(DEFAULT_WAIT_TIMEOUT_SECS)
+                .min(MAX_WAIT_TIMEOUT_SECS),
+        );
+        let log_limit = args
+            .log_limit
+            .unwrap_or(DEFAULT_DIAGNOSE_TAIL)
+            .clamp(1, MAX_DIAGNOSE_TAIL);
+        let mut actions = Vec::new();
+        // Auto-start only for the ambient (cwd-derived) session: with an explicit selector a
+        // NoSession must propagate, or the tool could silently start and then drive a session
+        // for a different project than the one the caller named.
+        let explicit_selector = args.session.is_some();
+        let resolved = match select::resolve(&self.cwd, args.session).await {
+            Ok(resolved) => resolved,
+            Err(ToolError::NoSession(diagnostics)) if explicit_selector => {
+                return Err(error_data(ToolError::NoSession(diagnostics)));
+            }
+            Err(ToolError::NoSession(_)) => {
+                let target = args
+                    .path
+                    .as_deref()
+                    .map_or_else(|| self.cwd.clone(), PathBuf::from);
+                let report = self.start_for_target(target).await?;
+                let id = report.id.clone().ok_or_else(|| {
+                    ErrorData::internal_error(
+                        "start_session did not identify the reachable session",
+                        None,
+                    )
+                })?;
+                actions.push(EnsureAction {
+                    kind: EnsureActionKind::StartedSession,
+                    detail: if report.started {
+                        "started the micromux session".to_string()
+                    } else {
+                        "found the session started concurrently".to_string()
+                    },
+                });
+                select::resolve(&self.cwd, Some(format!("hash:{id}")))
+                    .await
+                    .map_err(error_data)?
+            }
+            Err(err) => return Err(error_data(err)),
+        };
+        let mut conn = SessionConn::connect(&resolved.endpoint)
+            .await
+            .map_err(error_data)?;
+        let mut snapshot = match service_snapshot(&mut conn, &args.service).await {
+            Ok(snapshot) => snapshot,
+            Err(err) => {
+                return Err(error_data(enrich_unknown_service(&args.service, err).await));
+            }
+        };
+        if matches!(
+            convert::evaluate(&snapshot, None),
+            convert::WaitOutcome::Healthy
+        ) {
+            return Ok(Json(EnsureServiceReadyResult {
+                session_ref: SessionRef::from(&resolved.info),
+                service: args.service.clone(),
+                actions,
+                outcome: WaitResult::healthy(args.service, snapshot.run_generation),
+                snapshot,
+                diagnosis: None,
+            }));
+        }
+        if snapshot
+            .dynamic
+            .as_ref()
+            .is_some_and(|dynamic| dynamic.retired.is_some())
+        {
+            return Err(error_data(ToolError::InvalidState(format!(
+                "service `{}` is retired; use replace_dynamic_service to revive it",
+                args.service
+            ))));
+        }
+        let after_generation = if snapshot.desired == Desired::Disabled {
+            let response = conn
+                .request(Request::Enable {
+                    service: args.service.clone(),
+                })
+                .await
+                .map_err(error_data)?;
+            let acks = convert::accepted(response).map_err(error_data)?;
+            let generation = acks
+                .iter()
+                .find(|ack| ack.service == args.service)
+                .map(|ack| ack.observed_generation)
+                .ok_or_else(|| {
+                    ErrorData::internal_error(
+                        format!("enable acknowledgement omitted service `{}`", args.service),
+                        None,
+                    )
+                })?;
+            actions.push(EnsureAction {
+                kind: EnsureActionKind::EnabledService,
+                detail: format!("enabled service from generation {generation}"),
+            });
+            Some(generation)
+        } else {
+            None
+        };
+        let conclusion = match wait_for_health(
+            &resolved.endpoint,
+            &mut conn,
+            &args.service,
+            after_generation,
+            timeout,
+        )
+        .await
+        {
+            Ok(conclusion) => conclusion,
+            Err(err) => {
+                return Err(error_data(enrich_unknown_service(&args.service, err).await));
+            }
+        };
+        snapshot = conclusion.snapshot().clone();
+        let diagnosis = if conclusion.needs_diagnosis() {
+            Some(
+                service_result(
+                    &args.service,
+                    diagnose_service(&mut conn, snapshot.clone(), log_limit).await,
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+        actions.push(EnsureAction {
+            kind: EnsureActionKind::Waited,
+            detail: format!("waited for service readiness up to {}s", timeout.as_secs()),
+        });
+        Ok(Json(EnsureServiceReadyResult {
+            session_ref: SessionRef::from(&resolved.info),
+            service: args.service.clone(),
+            actions,
+            outcome: WaitResult::from_conclusion(args.service, timeout, &conclusion),
+            snapshot,
+            diagnosis,
+        }))
     }
 }
 
@@ -1892,8 +2372,9 @@ pub async fn serve_stdio() -> Result<(), Box<dyn std::error::Error + Send + Sync
 #[cfg(test)]
 mod tests {
     use super::{
-        McpServer, MutationResult, SessionRef, WaitResult, parse_since_text, session_has_service,
-        session_resolves_service_id, session_selector,
+        DynamicMutationResult, McpServer, MutationResult, RestartAndWaitResult,
+        SessionMutationResult, SessionRef, StopSessionResult, WaitResult, parse_since_text,
+        session_has_service, session_resolves_service_id, session_selector,
     };
     use crate::tools::health::health_attempt_matches_snapshot;
     use crate::tools::logs::{
@@ -1905,6 +2386,167 @@ mod tests {
     use similar_asserts::assert_eq;
     use std::collections::BTreeMap;
     use std::time::Duration;
+
+    #[cfg(unix)]
+    use super::{
+        DynamicServiceArgs, EnsureAction, EnsureActionKind, EnsureReadyArgs, LogFilterArgs,
+        LogsArgs, ReplaceDynamicServiceArgs, ServiceArgs, ServiceEventsArgs, SessionArgs,
+        WaitStatus,
+    };
+
+    #[cfg(unix)]
+    use micromux::{DynamicServiceParams, PartialServiceSpec};
+
+    #[cfg(unix)]
+    use rmcp::handler::server::wrapper::{Json, Parameters};
+
+    #[cfg(unix)]
+    use std::sync::Arc;
+
+    #[cfg(unix)]
+    struct RunningMcpSession {
+        shutdown: micromux::CancellationToken,
+        runner: Option<tokio::task::JoinHandle<color_eyre::eyre::Result<()>>>,
+        server: Option<tokio::task::JoinHandle<Result<(), micromux_control::ControlError>>>,
+    }
+
+    #[cfg(unix)]
+    impl RunningMcpSession {
+        async fn finish(mut self) -> color_eyre::eyre::Result<()> {
+            self.shutdown.cancel();
+            if let Some(runner) = self.runner.take() {
+                runner.await??;
+            }
+            if let Some(server) = self.server.take() {
+                server.await??;
+            }
+            Ok(())
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for RunningMcpSession {
+        fn drop(&mut self) {
+            self.shutdown.cancel();
+        }
+    }
+
+    #[cfg(unix)]
+    fn boot_dynamic_mcp_session(
+        project_dir: &std::path::Path,
+    ) -> color_eyre::eyre::Result<(RunningMcpSession, String)> {
+        let yaml = r#"version: 1
+control:
+  dynamic_services:
+    enabled: true
+    allowed_working_roots: [.]
+    max_services: 2
+    max_lifetime: 1m
+services:
+  base:
+    command: ["sh", "-c", "sleep 60"]
+  disabled:
+    command: ["sh", "-c", "sleep 60"]
+    disabled: true
+"#;
+        let config_path = project_dir.join("micromux.yaml");
+        std::fs::write(&config_path, yaml)?;
+        let config_path = std::fs::canonicalize(config_path)?;
+        let mut diagnostics = Vec::new();
+        let mut config = micromux::from_str(yaml, project_dir, 0usize, None, &mut diagnostics)
+            .map_err(|err| color_eyre::eyre::eyre!("parse config: {err}"))?;
+        config.config_path = Some(config_path.clone());
+
+        let mux = Arc::new(micromux::Micromux::new(&config)?);
+        let shutdown = micromux::CancellationToken::new();
+        let (runner, handles) = mux.clone().start(shutdown.clone());
+        let runner = tokio::spawn(runner);
+
+        let runtime_dirs =
+            micromux_control::usable_runtime_dirs(&micromux_control::runtime_dir_statuses());
+        let runtime_dir = runtime_dirs
+            .first()
+            .ok_or_else(|| color_eyre::eyre::eyre!("no usable control runtime directory"))?;
+        let endpoint = micromux_control::endpoint_for(runtime_dir, &config_path);
+        let guard = micromux_control::bind(&endpoint)?
+            .ok_or_else(|| color_eyre::eyre::eyre!("control endpoint is already owned"))?;
+        let identity = micromux_control::SessionIdentity::new(
+            "mcp-dynamic-test".to_string(),
+            project_dir,
+            &config_path,
+        );
+        let selector = format!("hash:{}", identity.id);
+        let server = Arc::new(micromux_control::ControlServer::new(
+            handles.reader.clone(),
+            handles.service_control(),
+            identity,
+            handles.dynamic_services.clone(),
+        ));
+        let server = tokio::spawn({
+            let shutdown = shutdown.clone();
+            async move { server.serve(guard, shutdown).await }
+        });
+
+        Ok((
+            RunningMcpSession {
+                shutdown,
+                runner: Some(runner),
+                server: Some(server),
+            },
+            selector,
+        ))
+    }
+
+    #[cfg(unix)]
+    fn dynamic_params(idempotency_key: Option<&str>) -> DynamicServiceParams {
+        DynamicServiceParams {
+            service: "debug".to_string(),
+            spec: PartialServiceSpec {
+                command: Some(vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    "echo dynamic-mcp-log; sleep 60".to_string(),
+                ]),
+                ..PartialServiceSpec::default()
+            },
+            from_service: None,
+            extra_args: Vec::new(),
+            expires_after: Some(Duration::from_secs(30)),
+            owner: Some("mcp-integration-test".to_string()),
+            idempotency_key: idempotency_key.map(str::to_string),
+        }
+    }
+
+    #[cfg(unix)]
+    async fn dynamic_log_visible(
+        server: &McpServer,
+        selector: &str,
+    ) -> color_eyre::eyre::Result<bool> {
+        let result = server
+            .get_logs(Parameters(LogsArgs {
+                service: "debug".to_string(),
+                session: Some(selector.to_string()),
+                run_generation: None,
+                tail: Some(20),
+                filters: LogFilterArgs {
+                    raw: false,
+                    grep: None,
+                    grep_context: None,
+                    min_level: None,
+                    since: None,
+                    since_unix_ms: None,
+                    trace_id: None,
+                    format: crate::logproc::LogFormat::Full,
+                },
+            }))
+            .await
+            .map_err(|err| color_eyre::eyre::eyre!(err.message))?;
+        let Json(result) = result;
+        Ok(result
+            .entries
+            .iter()
+            .any(|entry| entry.line.contains("dynamic-mcp-log")))
+    }
 
     #[test]
     fn server_builds_typed_tool_schemas() -> color_eyre::Result<()> {
@@ -1935,6 +2577,24 @@ mod tests {
         assert!(output_schema.contains("run_generation"));
         assert!(output_schema.contains("snapshot"));
         assert!(output_schema.contains("diagnosis"));
+        assert!(output_schema.contains("session"));
+        assert!(!output_schema.contains("session_ref"));
+        let ensure_schema =
+            serde_json::to_string(&schemars::schema_for!(super::EnsureServiceReadyResult))?;
+        assert!(ensure_schema.contains("diagnosis"));
+        for name in [
+            "start_dynamic_service",
+            "replace_dynamic_service",
+            "stop_dynamic_service",
+            "get_service_events",
+            "validate_config",
+            "ensure_service_ready",
+        ] {
+            assert!(
+                tools.iter().any(|tool| tool.name == name),
+                "missing {name} tool"
+            );
+        }
         Ok(())
     }
 
@@ -1955,7 +2615,221 @@ mod tests {
                 })
                 .collect(),
             micromux_version: env!("CARGO_PKG_VERSION").to_string(),
+            capabilities: None,
         }
+    }
+
+    fn test_session_ref() -> SessionRef {
+        SessionRef {
+            session: "proj".to_string(),
+            id: "abc".to_string(),
+            pid: 123,
+            config_path: "/w/micromux.yaml".to_string(),
+        }
+    }
+
+    fn assert_json_keys(
+        value: &impl serde::Serialize,
+        expected: &[&str],
+    ) -> color_eyre::eyre::Result<()> {
+        let value = serde_json::to_value(value)?;
+        let mut actual = value
+            .as_object()
+            .map(|object| object.keys().map(String::as_str).collect::<Vec<_>>())
+            .ok_or_else(|| color_eyre::eyre::eyre!("receipt did not serialize as an object"))?;
+        actual.sort_unstable();
+        let mut expected = expected.to_vec();
+        expected.sort_unstable();
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn dynamic_capability_preflight_names_the_target_config() -> color_eyre::Result<()> {
+        let info = session_info("h", &["svc"]);
+
+        let error = McpServer::require_dynamic_capability(&info)
+            .err()
+            .ok_or_else(|| color_eyre::eyre::eyre!("missing capability was accepted"))?;
+
+        assert!(error.message.contains("PolicyDenied"));
+        assert!(error.message.contains("/w/micromux.yaml"));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dynamic_service_lifecycle_crosses_the_mcp_tool_layer() -> color_eyre::eyre::Result<()>
+    {
+        let project = tempfile::tempdir()?;
+        let (session, selector) = boot_dynamic_mcp_session(project.path())?;
+        let mut server = McpServer::new();
+        server.cwd = project.path().to_path_buf();
+        let params = dynamic_params(Some("create-debug"));
+
+        let Json(created) = server
+            .start_dynamic_service(Parameters(DynamicServiceArgs {
+                session: Some(selector.clone()),
+                params: params.clone(),
+            }))
+            .await
+            .map_err(|err| color_eyre::eyre::eyre!(err.message))?;
+        assert_eq!(created.receipt.service, "debug");
+        assert_eq!(created.receipt.revision, 1);
+        assert!(!created.receipt.idempotent_replay);
+
+        let Json(replayed) = server
+            .start_dynamic_service(Parameters(DynamicServiceArgs {
+                session: Some(selector.clone()),
+                params,
+            }))
+            .await
+            .map_err(|err| color_eyre::eyre::eyre!(err.message))?;
+        assert!(replayed.receipt.idempotent_replay);
+        assert_eq!(replayed.receipt.revision, created.receipt.revision);
+
+        let Json(listed) = server
+            .list_services(Parameters(SessionArgs {
+                session: Some(selector.clone()),
+            }))
+            .await
+            .map_err(|err| color_eyre::eyre::eyre!(err.message))?;
+        let dynamic = listed
+            .services
+            .iter()
+            .find(|snapshot| snapshot.id == "debug")
+            .ok_or_else(|| color_eyre::eyre::eyre!("dynamic service is missing from roster"))?;
+        assert_eq!(dynamic.origin, micromux::OriginKind::Dynamic);
+        assert_eq!(dynamic.dynamic.as_ref().map(|info| info.revision), Some(1));
+
+        let Json(events) = server
+            .get_service_events(Parameters(ServiceEventsArgs {
+                service: "debug".to_string(),
+                session: Some(selector.clone()),
+                after_seq: None,
+                tail: Some(20),
+            }))
+            .await
+            .map_err(|err| color_eyre::eyre::eyre!(err.message))?;
+        assert!(
+            events
+                .events
+                .iter()
+                .any(|event| event.kind == micromux::ServiceEventKind::Created)
+        );
+        assert!(events.next_seq.is_some());
+        assert!(!events.truncated);
+
+        let stale = server
+            .replace_dynamic_service(Parameters(ReplaceDynamicServiceArgs {
+                expected_revision: 0,
+                session: Some(selector.clone()),
+                params: dynamic_params(None),
+            }))
+            .await
+            .err()
+            .ok_or_else(|| color_eyre::eyre::eyre!("stale replacement was accepted"))?;
+        assert!(stale.message.contains("RevisionMismatch"));
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !dynamic_log_visible(&server, &selector).await? {
+            if tokio::time::Instant::now() >= deadline {
+                color_eyre::eyre::bail!("dynamic service log did not become visible");
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let Json(stopped) = server
+            .stop_dynamic_service(Parameters(ServiceArgs {
+                service: "debug".to_string(),
+                session: Some(selector.clone()),
+            }))
+            .await
+            .map_err(|err| color_eyre::eyre::eyre!(err.message))?;
+        assert!(!stopped.receipt.already_retired);
+
+        let Json(listed) = server
+            .list_services(Parameters(SessionArgs {
+                session: Some(selector.clone()),
+            }))
+            .await
+            .map_err(|err| color_eyre::eyre::eyre!(err.message))?;
+        let retired = listed
+            .services
+            .iter()
+            .find(|snapshot| snapshot.id == "debug")
+            .and_then(|snapshot| snapshot.dynamic.as_ref())
+            .and_then(|info| info.retired);
+        assert_eq!(retired, Some(micromux::RetiredReason::Stopped));
+        assert!(dynamic_log_visible(&server, &selector).await?);
+
+        session.finish().await?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ensure_ready_enables_waits_short_circuits_and_enriches_misses()
+    -> color_eyre::eyre::Result<()> {
+        let project = tempfile::tempdir()?;
+        let (session, selector) = boot_dynamic_mcp_session(project.path())?;
+        let mut server = McpServer::new();
+        server.cwd = project.path().to_path_buf();
+
+        let Json(enabled) = server
+            .ensure_service_ready(Parameters(EnsureReadyArgs {
+                service: "disabled".to_string(),
+                session: Some(selector.clone()),
+                path: None,
+                timeout_secs: Some(5),
+                log_limit: Some(2),
+            }))
+            .await
+            .map_err(|err| color_eyre::eyre::eyre!(err.message))?;
+        assert!(matches!(
+            enabled.actions.as_slice(),
+            [
+                EnsureAction {
+                    kind: EnsureActionKind::EnabledService,
+                    ..
+                },
+                EnsureAction {
+                    kind: EnsureActionKind::Waited,
+                    ..
+                }
+            ]
+        ));
+        assert!(matches!(enabled.outcome.status, WaitStatus::Healthy));
+
+        let Json(already_ready) = server
+            .ensure_service_ready(Parameters(EnsureReadyArgs {
+                service: "disabled".to_string(),
+                session: Some(selector.clone()),
+                path: None,
+                timeout_secs: Some(5),
+                log_limit: Some(2),
+            }))
+            .await
+            .map_err(|err| color_eyre::eyre::eyre!(err.message))?;
+        assert!(already_ready.actions.is_empty());
+        assert!(matches!(already_ready.outcome.status, WaitStatus::Healthy));
+
+        let missing = server
+            .ensure_service_ready(Parameters(EnsureReadyArgs {
+                service: "missing".to_string(),
+                session: Some(selector),
+                path: None,
+                timeout_secs: Some(1),
+                log_limit: Some(2),
+            }))
+            .await
+            .err()
+            .ok_or_else(|| color_eyre::eyre::eyre!("unknown service was accepted"))?;
+        assert!(missing.message.contains("UnknownService"));
+        assert!(missing.message.contains("missing"));
+
+        session.finish().await?;
+        Ok(())
     }
 
     #[test]
@@ -1975,18 +2849,14 @@ mod tests {
     #[test]
     fn mutation_result_serializes_flat_session_fields() -> color_eyre::Result<()> {
         let result = MutationResult {
-            session_ref: SessionRef {
-                session: "proj".to_string(),
-                id: "abc".to_string(),
-                pid: 123,
-                config_path: "/w/micromux.yaml".to_string(),
-            },
+            session_ref: test_session_ref(),
             accepted: vec![ServiceCommandAck {
                 service: "api".to_string(),
                 observed_generation: 7,
             }],
             service: "api".to_string(),
             generation: Some(7),
+            log_cursor: Some(42),
         };
 
         let value = serde_json::to_value(result)?;
@@ -1999,6 +2869,130 @@ mod tests {
         );
         assert_eq!(value.get("service"), Some(&serde_json::json!("api")));
         assert_eq!(value.get("generation"), Some(&serde_json::json!(7)));
+        assert_eq!(value.get("log_cursor"), Some(&serde_json::json!(42)));
+        let mut keys = value
+            .as_object()
+            .map(|object| object.keys().map(String::as_str).collect::<Vec<_>>())
+            .unwrap_or_default();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                "accepted",
+                "config_path",
+                "generation",
+                "id",
+                "log_cursor",
+                "pid",
+                "service",
+                "session"
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn session_mutation_receipts_have_exact_flat_key_sets() -> color_eyre::Result<()> {
+        let restart_all = SessionMutationResult {
+            session_ref: test_session_ref(),
+            accepted: Vec::new(),
+        };
+        assert_json_keys(
+            &restart_all,
+            &["accepted", "config_path", "id", "pid", "session"],
+        )?;
+
+        let stop = StopSessionResult {
+            stopped: true,
+            session_ref: test_session_ref(),
+            note: None,
+        };
+        assert_json_keys(
+            &stop,
+            &["config_path", "id", "note", "pid", "session", "stopped"],
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn dynamic_and_bundle_receipts_have_exact_flat_key_sets() -> color_eyre::Result<()> {
+        let dynamic = DynamicMutationResult {
+            session_ref: test_session_ref(),
+            receipt: micromux_control::DynamicServiceAck {
+                service: "debug".to_string(),
+                revision: 2,
+                observed_generation: 1,
+                expires_at_unix_ms: 1234,
+                command: vec!["true".to_string()],
+                working_dir: Some("/w".to_string()),
+                ports: Vec::new(),
+                env_keys: Vec::new(),
+                restart: micromux::RestartPolicy::Never,
+                healthcheck_configured: false,
+                already_retired: false,
+                idempotent_replay: false,
+            },
+        };
+        assert_json_keys(
+            &dynamic,
+            &[
+                "already_retired",
+                "command",
+                "config_path",
+                "env_keys",
+                "expires_at_unix_ms",
+                "healthcheck_configured",
+                "id",
+                "idempotent_replay",
+                "observed_generation",
+                "pid",
+                "ports",
+                "restart",
+                "revision",
+                "service",
+                "session",
+                "working_dir",
+            ],
+        )?;
+
+        let snapshot = ServiceSnapshot::initial(
+            "svc".to_string(),
+            "svc".to_string(),
+            Vec::new(),
+            None,
+            micromux::RestartPolicy::Never,
+            Vec::new(),
+            None,
+        );
+        let bundle = RestartAndWaitResult {
+            session_ref: test_session_ref(),
+            service: "svc".to_string(),
+            previous_generation: 1,
+            run_generation: 2,
+            outcome: WaitResult::healthy("svc".to_string(), 2),
+            snapshot,
+            logs: Vec::new(),
+            logs_truncated: false,
+            events: Vec::new(),
+            diagnosis: None,
+        };
+        assert_json_keys(
+            &bundle,
+            &[
+                "config_path",
+                "events",
+                "id",
+                "logs",
+                "logs_truncated",
+                "outcome",
+                "pid",
+                "previous_generation",
+                "run_generation",
+                "service",
+                "session",
+                "snapshot",
+            ],
+        )?;
         Ok(())
     }
 

@@ -1,14 +1,16 @@
+use std::fmt::Write as _;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::time::Duration;
 
-use micromux::{ChangeKind, Execution, Health, HealthAttempt, ServiceSnapshot};
+use micromux::{ChangeKind, Execution, Health, HealthAttempt, ServiceEvent, ServiceSnapshot};
 use micromux_control::{Client, ControlEndpoint, ErrorCode, Request};
 use schemars::JsonSchema;
 use serde::Serialize;
 
 use crate::select::ToolError;
-use crate::{DIAGNOSE_LOG_SCAN, SessionConn, WAIT_POLL_FLOOR, convert, logproc};
+use crate::tools::portowner;
+use crate::{DIAGNOSE_LOG_SCAN, SessionConn, WAIT_POLL_FLOOR, convert, logproc, select};
 
 const PORT_PROBE_BUDGET: Duration = Duration::from_millis(50);
 
@@ -34,6 +36,7 @@ pub(crate) struct ServiceDiagnosis {
     pub(crate) service: String,
     pub(crate) snapshot: ServiceSnapshot,
     pub(crate) latest_healthcheck: Option<HealthAttempt>,
+    pub(crate) timeline: Vec<ServiceEvent>,
     pub(crate) signals: Vec<Signal>,
     pub(crate) error_log_tail: Vec<logproc::ProcessedEntry>,
     pub(crate) logs_truncated: bool,
@@ -256,17 +259,79 @@ async fn port_signals(snapshot: &ServiceSnapshot) -> Vec<Signal> {
     let mut signals = Vec::new();
     for port in &snapshot.advertised_ports {
         if probe_port(*port).await == PortProbe::Held {
+            let mut detail = format!(
+                "advertised port {port} is already held on 127.0.0.1 while the service is {:?}",
+                snapshot.execution
+            );
+            let micromux_owner = micromux_port_owner(*port).await;
+            if let Some(owner) = &micromux_owner {
+                let _ = write!(
+                    detail,
+                    "; held by service '{}' of session '{}' ({})",
+                    owner.service, owner.session, owner.config_path
+                );
+            }
+            let process_owner = tokio::task::spawn_blocking({
+                let port = *port;
+                move || portowner::listening_owner(port)
+            })
+            .await
+            .ok()
+            .flatten();
+            match (micromux_owner, process_owner) {
+                (_, Some(owner)) => {
+                    let _ = write!(
+                        detail,
+                        "; listener process pid {}: {}",
+                        owner.pid, owner.command
+                    );
+                }
+                // Never assert "another user" when the micromux cross-reference already named
+                // the (same-user) owner and only the OS-level lookup came up empty.
+                (None, None) => {
+                    detail.push_str("; held by a process owned by another user or unknown");
+                }
+                (Some(_), None) => {}
+            }
             signals.push(Signal {
                 kind: SignalKind::PortUnavailable,
-                detail: format!(
-                    "advertised port {port} is already held on 127.0.0.1 while the service is {:?}",
-                    snapshot.execution
-                ),
-                next_probe: "identify the process listening on the advertised port",
+                detail,
+                next_probe: "confirm before freeing the port — micromux never kills it for you",
             });
         }
     }
     signals
+}
+
+struct MicromuxPortOwner {
+    service: String,
+    session: String,
+    config_path: String,
+}
+
+async fn micromux_port_owner(port: u16) -> Option<MicromuxPortOwner> {
+    for resolved in select::answering_sessions().await.ok()? {
+        let Ok(mut client) = Client::connect(&resolved.endpoint).await else {
+            continue;
+        };
+        let Ok(response) = client.request(Request::ListServices).await else {
+            continue;
+        };
+        let Ok(services) = convert::services(response) else {
+            continue;
+        };
+        if let Some(service) = services.into_iter().find(|service| {
+            matches!(service.execution, Execution::Running | Execution::Stopping)
+                && service.advertised_ports.contains(&port)
+        }) {
+            return Some(MicromuxPortOwner {
+                service: service.id,
+                session: resolved.info.name,
+                config_path: resolved.info.config_path,
+            });
+        }
+    }
+    None
 }
 
 pub(crate) async fn supervisor_signals(
@@ -294,12 +359,23 @@ pub(crate) async fn diagnose_service(
         .await
         .map(bounded_attempt);
     let signals = supervisor_signals(&snapshot, latest_healthcheck.as_ref()).await;
+    let timeline = conn
+        .request(Request::GetEvents {
+            service: snapshot.id.clone(),
+            after: None,
+            tail: Some(10),
+        })
+        .await
+        .ok()
+        .and_then(|response| convert::events(response).ok())
+        .map_or_else(Vec::new, |(events, _)| events);
     let (error_log_tail, logs_truncated) = likely_cause_log_tail(conn, &snapshot, tail).await?;
     let hint = diagnosis_hint(&snapshot, latest_healthcheck.as_ref(), &error_log_tail);
     Ok(ServiceDiagnosis {
         service: snapshot.id.clone(),
         snapshot,
         latest_healthcheck,
+        timeline,
         signals,
         error_log_tail,
         logs_truncated,
@@ -339,9 +415,18 @@ pub(crate) async fn wait_for_health(
             convert::WaitOutcome::Healthy => return Ok(WaitConclusion::Healthy(snapshot)),
             convert::WaitOutcome::Exited(_) => return Ok(WaitConclusion::Exited(snapshot)),
             convert::WaitOutcome::InvalidState => {
-                return Err(ToolError::InvalidState(format!(
-                    "service `{service}` is disabled and will not become healthy"
-                )));
+                let message = if snapshot
+                    .dynamic
+                    .as_ref()
+                    .is_some_and(|dynamic| dynamic.retired.is_some())
+                {
+                    format!(
+                        "service `{service}` is retired; use replace_dynamic_service to revive it"
+                    )
+                } else {
+                    format!("service `{service}` is disabled and will not become healthy")
+                };
+                return Err(ToolError::InvalidState(message));
             }
             convert::WaitOutcome::Pending => {}
         }

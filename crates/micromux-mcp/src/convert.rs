@@ -2,7 +2,7 @@
 
 use micromux::{
     Desired, Execution, Health, HealthAttempt, LogLine, LogRunSummary, ServiceCommandAck,
-    ServiceSnapshot,
+    ServiceEvent, ServiceSnapshot,
 };
 use micromux_control::{ErrorCode, Response};
 
@@ -31,6 +31,10 @@ fn remote_error(code: ErrorCode, message: String) -> ToolError {
         ErrorCode::UnknownService
         | ErrorCode::UnknownRun
         | ErrorCode::NoSession
+        | ErrorCode::PolicyDenied
+        | ErrorCode::LimitExceeded
+        | ErrorCode::RevisionMismatch
+        | ErrorCode::InvalidSpec
         | ErrorCode::BadRequest
         | ErrorCode::Unknown => ToolError::Remote { code, message },
     }
@@ -88,6 +92,19 @@ pub fn health(response: Response) -> Result<Option<HealthAttempt>, ToolError> {
     }
 }
 
+/// Extract a page of lifecycle events and its truncation marker.
+///
+/// # Errors
+///
+/// Returns a [`ToolError`] if the session replied with an error or an unexpected response.
+pub fn events(response: Response) -> Result<(Vec<ServiceEvent>, bool), ToolError> {
+    match response {
+        Response::Events { events, truncated } => Ok((events, truncated)),
+        Response::Error { code, message } => Err(remote_error(code, message)),
+        other => Err(ToolError::Unexpected(format!("{other:?}"))),
+    }
+}
+
 /// Extract the acknowledgements of a mutation.
 ///
 /// # Errors
@@ -96,6 +113,21 @@ pub fn health(response: Response) -> Result<Option<HealthAttempt>, ToolError> {
 pub fn accepted(response: Response) -> Result<Vec<ServiceCommandAck>, ToolError> {
     match response {
         Response::Accepted { services } => Ok(services),
+        Response::Error { code, message } => Err(remote_error(code, message)),
+        other => Err(ToolError::Unexpected(format!("{other:?}"))),
+    }
+}
+
+/// Extract a dynamic-service mutation receipt.
+///
+/// # Errors
+///
+/// Returns a [`ToolError`] if the session replied with an error or an unexpected response.
+pub fn dynamic_service(
+    response: Response,
+) -> Result<micromux_control::DynamicServiceAck, ToolError> {
+    match response {
+        Response::DynamicService(receipt) => Ok(receipt),
         Response::Error { code, message } => Err(remote_error(code, message)),
         other => Err(ToolError::Unexpected(format!("{other:?}"))),
     }

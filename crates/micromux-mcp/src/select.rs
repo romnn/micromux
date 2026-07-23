@@ -781,6 +781,7 @@ mod tests {
             handles.reader.clone(),
             handles.service_control(),
             identity,
+            handles.dynamic_services.clone(),
         ));
         tokio::spawn({
             let shutdown = shutdown.clone();
@@ -1315,6 +1316,7 @@ mod tests {
                     name: "svc".to_string(),
                 }],
                 micromux_version: env!("CARGO_PKG_VERSION").to_string(),
+                capabilities: None,
             }
         }
 
@@ -1358,6 +1360,7 @@ mod tests {
             config_path: "/different/display/path.yaml".to_string(),
             services: Vec::new(),
             micromux_version: env!("CARGO_PKG_VERSION").to_string(),
+            capabilities: None,
         };
 
         assert!(session_matches_config_path(&info, &config_path));
@@ -1383,6 +1386,7 @@ mod tests {
                 .to_string(),
             services: Vec::new(),
             micromux_version: env!("CARGO_PKG_VERSION").to_string(),
+            capabilities: None,
         };
 
         assert!(session_config_path_is_under(&info, project_dir.path()));
