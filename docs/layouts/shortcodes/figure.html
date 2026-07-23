@@ -1,0 +1,10 @@
+{{- /* A captioned screenshot. Resolves src under /static against the site baseURL
+       (works from any page depth and under a Pages subpath). Usage:
+       {{< figure src="images/overview.png" alt="…" caption="…" >}} */ -}}
+{{- $src := .Get "src" -}}
+{{- $alt := .Get "alt" | default "" -}}
+{{- $caption := .Get "caption" | default "" -}}
+<figure class="mm-figure">
+  <img src="{{ $src | relURL }}"{{ with $alt }} alt="{{ . }}"{{ end }} loading="lazy" />
+  {{- with $caption }}<figcaption>{{ . | markdownify }}</figcaption>{{ end }}
+</figure>

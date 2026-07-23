@@ -1,0 +1,25 @@
+<span class="term-fg32 term-fg1">$</span> micromux --help
+&nbsp;
+A micromux subcommand. With no subcommand, micromux runs the TUI for the current project
+&nbsp;
+<span class="term-fg1 term-fg4">Usage:</span> <span class="term-fg1">micromux</span> [OPTIONS] [COMMAND]
+&nbsp;
+<span class="term-fg1 term-fg4">Commands:</span>
+  <span class="term-fg1">attach</span>  Attach the TUI to an already-running micromux session
+  <span class="term-fg1">ctl</span>     Control a running micromux session over its local endpoint (dogfoods the control protocol)
+  <span class="term-fg1">mcp</span>     Run the MCP server over stdio (configure once in Claude Code &#47; Codex like playwright-mcp)
+  <span class="term-fg1">serve</span>   Run the supervisor headless (no TUI), serving the control plane until stopped. Intended for agent-managed sessions — see the MCP `start_session`&#47;`stop_session` tools
+  <span class="term-fg1">help</span>    Print this message or the help of the given subcommand(s)
+&nbsp;
+<span class="term-fg1 term-fg4">Options:</span>
+  <span class="term-fg1">-c</span>, <span class="term-fg1">--config</span> &lt;CONFIG_PATH&gt;  path to config file
+      <span class="term-fg1">--strict</span> &lt;STRICT&gt;       enable strict mode [env: MICROMUX_STRICT=] [possible values: true, false]
+      <span class="term-fg1">--color</span> &lt;COLOR_CHOICE&gt;  enable or disable color [env: MICROMUX_COLOR=]
+  <span class="term-fg1">-v</span>, <span class="term-fg1">--verbose</span>...            Increase logging verbosity
+  <span class="term-fg1">-q</span>, <span class="term-fg1">--quiet</span>...              Decrease logging verbosity
+      <span class="term-fg1">--log</span> &lt;LOG_LEVEL&gt;       Log level. When using a more sophisticated logging setup using RUST_LOG environment variable, this option is overwritten. [env: MICROMUX_LOG_LEVEL=]
+      <span class="term-fg1">--log-file</span> &lt;LOG_FILE&gt;   Log file [env: MICROMUX_LOG_FILE=]
+      <span class="term-fg1">--no-pretty-json-logs</span>   show structured JSON logs as raw JSON in the TUI (also configurable via `ui: { pretty_json_logs: false }`) [env: MICROMUX_NO_PRETTY_JSON_LOGS=]
+      <span class="term-fg1">--no-control</span>            disable the agent control plane (also configurable via `control: { enabled: false }`) [env: MICROMUX_NO_CONTROL=]
+  <span class="term-fg1">-h</span>, <span class="term-fg1">--help</span>                  Print help
+  <span class="term-fg1">-V</span>, <span class="term-fg1">--version</span>               Print version

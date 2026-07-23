@@ -10,8 +10,10 @@
 
  Think of it as **Docker Compose for local processes** (not containers) — like **preconfigured tmux panes** that come with Compose-style dependencies, healthchecks, and restarts.
 
+ 📚 **Documentation: [romnn.github.io/micromux](https://romnn.github.io/micromux/)**
+
  <p align="center">
-   <img src="https://raw.githubusercontent.com/romnn/micromux/main/docs/overview.png" alt="micromux TUI" width="900" />
+   <img src="https://raw.githubusercontent.com/romnn/micromux/main/docs/static/images/overview.png" alt="micromux TUI" width="900" />
  </p>
 
  It runs multiple long-lived commands (your dev “services”) on your machine, tracks their state, and gives you a single place to:
@@ -21,13 +23,13 @@
  - **send input to a service** (local PTY input mode)
 
  <p align="center">
-   <img src="https://raw.githubusercontent.com/romnn/micromux/main/docs/healthcheck.png" alt="micromux healthcheck pane showing a failed probe" width="820" />
+   <img src="https://raw.githubusercontent.com/romnn/micromux/main/docs/static/images/healthcheck.png" alt="micromux healthcheck pane showing a failed probe" width="820" />
    <br />
    <sub>Per-service healthcheck pane — a failing probe with its command and output.</sub>
  </p>
 
  <p align="center">
-   <img src="https://raw.githubusercontent.com/romnn/micromux/main/docs/disable.png" alt="micromux with a service disabled" width="820" />
+   <img src="https://raw.githubusercontent.com/romnn/micromux/main/docs/static/images/disable.png" alt="micromux with a service disabled" width="820" />
    <br />
    <sub>Disable a service on the fly — it stops and its row turns gray.</sub>
  </p>
