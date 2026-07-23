@@ -98,46 +98,7 @@ impl From<ControlError> for ToolError {
 
 pub(crate) type Resolved = ResolvedSession;
 
-/// Resolve the config path for a start target: an existing config *file* is used directly; a
-/// directory (or the default cwd) is searched upward. Returns the canonical config path.
-pub(crate) async fn config_for_target(path: &Path) -> Option<PathBuf> {
-    if tokio::fs::metadata(path)
-        .await
-        .is_ok_and(|meta| meta.is_file())
-    {
-        return tokio::fs::canonicalize(path).await.ok();
-    }
-    find_config_upward(path).await
-}
-
-/// Walk upward from `start`, returning the first canonicalized micromux config path found.
-///
-/// Reimplemented here (rather than calling `micromux::find_config_file`) so the future does not
-/// capture that function's `|name| dir.join(name)` closure, which the rmcp `#[tool]` macro's
-/// higher-ranked `'static` bound on the tool future rejects.
-pub(crate) async fn find_config_upward(start: &Path) -> Option<PathBuf> {
-    let home = directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf());
-    find_config_upward_with_home(start, home.as_deref()).await
-}
-
-async fn find_config_upward_with_home(start: &Path, home: Option<&Path>) -> Option<PathBuf> {
-    let mut dir = start.to_path_buf();
-    loop {
-        for name in micromux::config_file_names() {
-            let candidate = dir.join(name);
-            if let Ok(canonical) = tokio::fs::canonicalize(&candidate).await {
-                return Some(canonical);
-            }
-        }
-        if home.is_some_and(|home| dir == home) {
-            return None;
-        }
-        match dir.parent() {
-            Some(parent) => dir = parent.to_path_buf(),
-            None => return None,
-        }
-    }
-}
+pub(crate) use micromux_control::config_for_target;
 
 fn selector_with_environment_fallback(raw: Option<String>) -> Option<SessionSelector> {
     raw.or_else(|| std::env::var("MICROMUX_SESSION").ok())
@@ -408,38 +369,6 @@ mod tests {
             shutdown,
             _runner: runner,
         })
-    }
-
-    #[tokio::test]
-    async fn upward_config_search_stops_after_checking_home() -> color_eyre::eyre::Result<()> {
-        let root = temp_dir("home-boundary")?;
-        let home = root.path().join("home/me");
-        let project = home.join("repo/subdir");
-        std::fs::create_dir_all(&project)?;
-        std::fs::write(
-            root.path().join("micromux.yaml"),
-            "version: 1\nservices: {}\n",
-        )?;
-
-        let found = find_config_upward_with_home(&project, Some(&home)).await;
-
-        assert_eq!(found, None);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn upward_config_search_outside_home_still_walks_to_root() -> color_eyre::eyre::Result<()>
-    {
-        let root = temp_dir("outside-home")?;
-        let project = root.path().join("tmp/project");
-        std::fs::create_dir_all(&project)?;
-        let config = root.path().join("micromux.yaml");
-        std::fs::write(&config, "version: 1\nservices: {}\n")?;
-
-        let found = find_config_upward_with_home(&project, Some(Path::new("/home/me"))).await;
-
-        assert_eq!(found, Some(std::fs::canonicalize(config)?));
-        Ok(())
     }
 
     #[tokio::test]
