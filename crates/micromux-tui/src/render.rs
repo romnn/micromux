@@ -477,7 +477,7 @@ impl App {
         };
         spans.extend([
             status.session.name.bold(),
-            format!(" ({}) — q detaches", status.session.config_path).into(),
+            format!(" ({})", status.session.config_path).into(),
         ]);
         if let Some(notice) = status.notice {
             spans.extend([" — ".into(), notice.fg(tailwind::RED.c400)]);

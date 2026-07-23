@@ -529,7 +529,7 @@ impl App {
     }
 
     fn exit(&mut self) {
-        // Send shutdown (cancellation) signal
+        // A remote source owns only its mirror task, so cancelling it cannot stop the session.
         self.source.cancel();
         self.shutdown.cancel();
         self.running = false;

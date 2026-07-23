@@ -1,18 +1,21 @@
 //! Client-side session mirror used by attach mode.
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 use std::time::Duration;
 
 use indexmap::IndexMap;
 use micromux::{
-    CancellationToken, ChangeKind, HealthAttempt, LogLine, ServiceID, ServiceSnapshot,
-    SessionChange,
+    CancellationToken, ChangeKind, HealthAttempt, LogLine, ServiceCommandAck, ServiceID,
+    ServiceSnapshot, SessionChange,
 };
 use micromux_control::{
     Client, ControlEndpoint, ControlError, ErrorCode, Request, Response, SessionInfo, Subscription,
 };
 use parking_lot::RwLock;
 use tokio::sync::{broadcast, mpsc};
+
+use crate::source::AttachmentStatus;
 
 const CHANGE_CHANNEL_CAPACITY: usize = 1024;
 const COMMAND_CHANNEL_CAPACITY: usize = 64;
@@ -22,7 +25,7 @@ const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(5);
 
 /// A synchronous mirror of a remote session, maintained by one background task.
 pub struct RemoteSource {
-    store: std::sync::Arc<RwLock<MirrorStore>>,
+    store: Arc<RwLock<MirrorStore>>,
     changes: broadcast::Sender<SessionChange>,
     commands: mpsc::Sender<RemoteCommand>,
     shutdown: CancellationToken,
@@ -41,6 +44,9 @@ struct MirrorEntry {
     next_log_seq: u64,
     first_retained_seq: Option<u64>,
     health: Vec<HealthAttempt>,
+    // Manual restarts clear visible logs without resetting their sequence. The acknowledged
+    // generation distinguishes that clear from an automatic restart, which retains logs.
+    clear_logs_after_generation: Option<u64>,
 }
 
 enum RemoteCommand {
@@ -49,6 +55,12 @@ enum RemoteCommand {
     Enable(ServiceID),
     Disable(ServiceID),
     StopDynamic(ServiceID),
+}
+
+enum ExpectedCommandResponse {
+    Accepted,
+    RestartAccepted,
+    Dynamic,
 }
 
 enum ConnectedLoopExit {
@@ -77,16 +89,15 @@ impl RemoteSource {
     pub async fn connect(endpoint: ControlEndpoint) -> Result<Self, ControlError> {
         let mut request = Client::connect(&endpoint).await?;
         let session = request.describe().await?;
-        let store = std::sync::Arc::new(RwLock::new(MirrorStore {
+        let store = Arc::new(RwLock::new(MirrorStore {
             session,
             services: IndexMap::new(),
             connected: false,
             notice: None,
         }));
         let (changes, _) = broadcast::channel(CHANGE_CHANNEL_CAPACITY);
-        full_sync(&mut request, &store).await?;
-        let subscription = Client::subscribe(&endpoint).await?;
-        let service_ids = full_sync(&mut request, &store).await?;
+        let (subscription, service_ids) =
+            subscribe_without_sync_gap(&endpoint, &mut request, &store).await?;
         store.write().connected = true;
         publish_full_refresh(&changes, &service_ids);
 
@@ -94,7 +105,7 @@ impl RemoteSource {
         let shutdown = CancellationToken::new();
         tokio::spawn(run_remote(
             endpoint,
-            std::sync::Arc::clone(&store),
+            Arc::clone(&store),
             changes.clone(),
             command_rx,
             shutdown.clone(),
@@ -110,22 +121,13 @@ impl RemoteSource {
         })
     }
 
-    /// Return the current session identity.
-    #[must_use]
-    pub fn session(&self) -> SessionInfo {
-        self.store.read().session.clone()
-    }
-
-    /// Return whether both remote connections are currently usable.
-    #[must_use]
-    pub fn connected(&self) -> bool {
-        self.store.read().connected
-    }
-
-    /// Return the latest remote command rejection, if one is awaiting display.
-    #[must_use]
-    pub fn notice(&self) -> Option<String> {
-        self.store.read().notice.clone()
+    pub(crate) fn attachment_status(&self) -> AttachmentStatus {
+        let store = self.store.read();
+        AttachmentStatus {
+            session: store.session.clone(),
+            connected: store.connected,
+            notice: store.notice.clone(),
+        }
     }
 
     /// Return every mirrored service in server order.
@@ -155,6 +157,19 @@ impl RemoteSource {
         self.store.read().services.get(id).map_or_else(
             || (None, Vec::new()),
             |entry| {
+                // A cursor at or beyond the newest exposed seq means the caller cached a seq
+                // space this mirror no longer serves — the session instance was replaced or the
+                // service entry was recreated, restarting server sequences from one. Callers
+                // track a strictly lower cursor (the render path re-fetches its newest seq), so
+                // this cannot occur within one seq space. Report a cleared history with the full
+                // tail so the caller drops its dead cache and repopulates in the same query.
+                let regressed = entry
+                    .logs
+                    .back()
+                    .is_some_and(|newest| after >= newest.seq);
+                if regressed {
+                    return (None, entry.logs.iter().cloned().collect());
+                }
                 (
                     entry.first_retained_seq,
                     entry
@@ -223,7 +238,7 @@ impl Drop for RemoteSource {
 
 async fn run_remote(
     endpoint: ControlEndpoint,
-    store: std::sync::Arc<RwLock<MirrorStore>>,
+    store: Arc<RwLock<MirrorStore>>,
     changes: broadcast::Sender<SessionChange>,
     mut commands: mpsc::Receiver<RemoteCommand>,
     shutdown: CancellationToken,
@@ -274,7 +289,7 @@ async fn run_remote(
 async fn run_connected(
     request: &mut Client,
     subscription: &mut Subscription,
-    store: &std::sync::Arc<RwLock<MirrorStore>>,
+    store: &Arc<RwLock<MirrorStore>>,
     changes: &broadcast::Sender<SessionChange>,
     commands: &mut mpsc::Receiver<RemoteCommand>,
     shutdown: &CancellationToken,
@@ -317,29 +332,44 @@ async fn run_connected(
 
 async fn establish(
     endpoint: &ControlEndpoint,
-    store: &std::sync::Arc<RwLock<MirrorStore>>,
+    store: &Arc<RwLock<MirrorStore>>,
     changes: &broadcast::Sender<SessionChange>,
 ) -> Result<(Client, Subscription), ControlError> {
     let mut request = Client::connect(endpoint).await?;
     let session = request.describe().await?;
-    {
-        let mut guard = store.write();
-        if !guard.session.is_same_instance(&session) {
-            guard.services.clear();
-        }
-        guard.session = session;
-    }
-    full_sync(&mut request, store).await?;
-    let subscription = Client::subscribe(endpoint).await?;
-    let service_ids = full_sync(&mut request, store).await?;
+    update_session(store, session);
+    let (subscription, service_ids) =
+        subscribe_without_sync_gap(endpoint, &mut request, store).await?;
     store.write().connected = true;
     publish_full_refresh(changes, &service_ids);
     Ok((request, subscription))
 }
 
+fn update_session(store: &Arc<RwLock<MirrorStore>>, session: SessionInfo) {
+    let mut guard = store.write();
+    if !guard.session.is_same_instance(&session) {
+        guard.services.clear();
+        guard.notice = None;
+    }
+    guard.session = session;
+}
+
+async fn subscribe_without_sync_gap(
+    endpoint: &ControlEndpoint,
+    request: &mut Client,
+    store: &Arc<RwLock<MirrorStore>>,
+) -> Result<(Subscription, Vec<ServiceID>), ControlError> {
+    // The second sync catches changes that preceded subscription; changes during that sync stay
+    // queued for the connected loop, so the handoff cannot lose a transition.
+    full_sync(request, store).await?;
+    let subscription = Client::subscribe(endpoint).await?;
+    let service_ids = full_sync(request, store).await?;
+    Ok((subscription, service_ids))
+}
+
 async fn full_sync<C: RequestConnection>(
     request: &mut C,
-    store: &std::sync::Arc<RwLock<MirrorStore>>,
+    store: &Arc<RwLock<MirrorStore>>,
 ) -> Result<Vec<ServiceID>, ControlError> {
     let snapshots = request_services(request).await?;
     reconcile_services(store, snapshots);
@@ -353,7 +383,7 @@ async fn full_sync<C: RequestConnection>(
 
 async fn refresh_and_forward<C: RequestConnection>(
     request: &mut C,
-    store: &std::sync::Arc<RwLock<MirrorStore>>,
+    store: &Arc<RwLock<MirrorStore>>,
     changes: &broadcast::Sender<SessionChange>,
     change: SessionChange,
 ) -> Result<(), ControlError> {
@@ -371,11 +401,11 @@ async fn refresh_and_forward<C: RequestConnection>(
 
 async fn refresh_roster<C: RequestConnection>(
     request: &mut C,
-    store: &std::sync::Arc<RwLock<MirrorStore>>,
+    store: &Arc<RwLock<MirrorStore>>,
 ) -> Result<(), ControlError> {
     let snapshots = request_services(request).await?;
-    let added = reconcile_services(store, snapshots);
-    for service_id in added {
+    let needs_hydration = reconcile_services(store, snapshots);
+    for service_id in needs_hydration {
         refresh_logs(request, store, &service_id).await?;
         refresh_health(request, store, &service_id).await?;
     }
@@ -392,37 +422,46 @@ async fn request_services<C: RequestConnection>(
 }
 
 fn reconcile_services(
-    store: &std::sync::Arc<RwLock<MirrorStore>>,
+    store: &Arc<RwLock<MirrorStore>>,
     snapshots: Vec<ServiceSnapshot>,
 ) -> Vec<ServiceID> {
     let mut guard = store.write();
     let mut old = std::mem::take(&mut guard.services);
     let mut reconciled = IndexMap::with_capacity(snapshots.len());
-    let mut added = Vec::new();
+    let mut needs_hydration = Vec::new();
     for snapshot in snapshots {
         let id = snapshot.id.clone();
         let entry = if let Some(mut entry) = old.shift_remove(&id) {
+            if entry
+                .clear_logs_after_generation
+                .is_some_and(|generation| snapshot.run_generation > generation)
+            {
+                replace_log_tail(&mut entry, Vec::new());
+                entry.clear_logs_after_generation = None;
+                needs_hydration.push(id.clone());
+            }
             entry.snapshot = snapshot;
             entry
         } else {
-            added.push(id.clone());
+            needs_hydration.push(id.clone());
             MirrorEntry {
                 snapshot,
                 logs: VecDeque::new(),
                 next_log_seq: 0,
                 first_retained_seq: None,
                 health: Vec::new(),
+                clear_logs_after_generation: None,
             }
         };
         reconciled.insert(id, entry);
     }
     guard.services = reconciled;
-    added
+    needs_hydration
 }
 
 async fn refresh_logs<C: RequestConnection>(
     request: &mut C,
-    store: &std::sync::Arc<RwLock<MirrorStore>>,
+    store: &Arc<RwLock<MirrorStore>>,
     service_id: &str,
 ) -> Result<(), ControlError> {
     let Some(cursor) = store
@@ -443,15 +482,14 @@ async fn refresh_logs<C: RequestConnection>(
     if cursor > 0
         && lines
             .first()
-            .is_some_and(|line| line.seq > cursor.saturating_add(1))
+            .is_none_or(|line| line.seq > cursor.saturating_add(1))
     {
-        let first_retained = lines.first().map(|line| line.seq);
         let Some((tail, _)) = request_log_page(request, service_id, None).await? else {
             store.write().services.shift_remove(service_id);
             return Ok(());
         };
         if let Some(entry) = store.write().services.get_mut(service_id) {
-            replace_log_tail(entry, tail, first_retained);
+            replace_log_tail(entry, tail);
         }
         return Ok(());
     }
@@ -530,19 +568,16 @@ fn append_log_page(entry: &mut MirrorEntry, lines: Vec<LogLine>) {
     entry.first_retained_seq = entry.logs.front().map(|line| line.seq);
 }
 
-fn replace_log_tail(entry: &mut MirrorEntry, lines: Vec<LogLine>, first_retained_seq: Option<u64>) {
+fn replace_log_tail(entry: &mut MirrorEntry, lines: Vec<LogLine>) {
     entry.logs.clear();
     entry.next_log_seq = 0;
-    entry.first_retained_seq = first_retained_seq;
+    entry.first_retained_seq = None;
     append_log_page(entry, lines);
-    if entry.logs.is_empty() {
-        entry.first_retained_seq = first_retained_seq;
-    }
 }
 
 async fn refresh_health<C: RequestConnection>(
     request: &mut C,
-    store: &std::sync::Arc<RwLock<MirrorStore>>,
+    store: &Arc<RwLock<MirrorStore>>,
     service_id: &str,
 ) -> Result<(), ControlError> {
     match request
@@ -569,23 +604,42 @@ async fn refresh_health<C: RequestConnection>(
 
 async fn execute_command(
     request: &mut Client,
-    store: &std::sync::Arc<RwLock<MirrorStore>>,
+    store: &Arc<RwLock<MirrorStore>>,
     changes: &broadcast::Sender<SessionChange>,
     command: RemoteCommand,
 ) -> Result<(), ControlError> {
-    let (request_message, expects_dynamic) = match command {
-        RemoteCommand::Restart(service) => (Request::Restart { service }, false),
-        RemoteCommand::RestartAll => (Request::RestartAll, false),
-        RemoteCommand::Enable(service) => (Request::Enable { service }, false),
-        RemoteCommand::Disable(service) => (Request::Disable { service }, false),
-        RemoteCommand::StopDynamic(service) => (Request::StopDynamicService { service }, true),
+    let (request_message, expected_response) = match command {
+        RemoteCommand::Restart(service) => (
+            Request::Restart { service },
+            ExpectedCommandResponse::RestartAccepted,
+        ),
+        RemoteCommand::RestartAll => (
+            Request::RestartAll,
+            ExpectedCommandResponse::RestartAccepted,
+        ),
+        RemoteCommand::Enable(service) => (
+            Request::Enable { service },
+            ExpectedCommandResponse::Accepted,
+        ),
+        RemoteCommand::Disable(service) => (
+            Request::Disable { service },
+            ExpectedCommandResponse::Accepted,
+        ),
+        RemoteCommand::StopDynamic(service) => (
+            Request::StopDynamicService { service },
+            ExpectedCommandResponse::Dynamic,
+        ),
     };
     let response = request.request(request_message).await?;
-    let notice = match response {
-        Response::Accepted { .. } if !expects_dynamic => None,
-        Response::DynamicService(_) if expects_dynamic => None,
-        Response::Error { message, .. } => Some(message),
-        other => Some(format!("unexpected control response: {other:?}")),
+    let notice = match (response, expected_response) {
+        (Response::Accepted { services }, ExpectedCommandResponse::RestartAccepted) => {
+            mark_pending_log_clears(store, &services);
+            None
+        }
+        (Response::Accepted { .. }, ExpectedCommandResponse::Accepted)
+        | (Response::DynamicService(_), ExpectedCommandResponse::Dynamic) => None,
+        (Response::Error { message, .. }, _) => Some(message),
+        (other, _) => Some(format!("unexpected control response: {other:?}")),
     };
     store.write().notice = notice;
     publish(
@@ -596,6 +650,21 @@ async fn execute_command(
         },
     );
     Ok(())
+}
+
+fn mark_pending_log_clears(store: &Arc<RwLock<MirrorStore>>, services: &[ServiceCommandAck]) {
+    let mut guard = store.write();
+    for acknowledgement in services {
+        if let Some(entry) = guard.services.get_mut(&acknowledgement.service) {
+            entry.clear_logs_after_generation = Some(
+                entry
+                    .clear_logs_after_generation
+                    .map_or(acknowledgement.observed_generation, |generation| {
+                        generation.max(acknowledgement.observed_generation)
+                    }),
+            );
+        }
+    }
 }
 
 fn unexpected_response(response: &Response) -> ControlError {
@@ -613,10 +682,7 @@ fn reconnect_after_subscription_error(error: &ControlError) -> bool {
     matches!(error, ControlError::Io(_) | ControlError::Closed)
 }
 
-fn mark_disconnected(
-    store: &std::sync::Arc<RwLock<MirrorStore>>,
-    changes: &broadcast::Sender<SessionChange>,
-) {
+fn mark_disconnected(store: &Arc<RwLock<MirrorStore>>, changes: &broadcast::Sender<SessionChange>) {
     store.write().connected = false;
     publish(
         changes,
@@ -628,7 +694,7 @@ fn mark_disconnected(
 }
 
 fn record_notice(
-    store: &std::sync::Arc<RwLock<MirrorStore>>,
+    store: &Arc<RwLock<MirrorStore>>,
     changes: &broadcast::Sender<SessionChange>,
     notice: String,
 ) {
@@ -734,8 +800,8 @@ mod tests {
         }
     }
 
-    fn store_with(entry: MirrorEntry) -> std::sync::Arc<RwLock<MirrorStore>> {
-        std::sync::Arc::new(RwLock::new(MirrorStore {
+    fn store_with(entry: MirrorEntry) -> Arc<RwLock<MirrorStore>> {
+        Arc::new(RwLock::new(MirrorStore {
             session: session(),
             services: [(entry.snapshot.id.clone(), entry)].into_iter().collect(),
             connected: true,
@@ -750,10 +816,11 @@ mod tests {
             next_log_seq: seq,
             first_retained_seq: Some(seq),
             health: Vec::new(),
+            clear_logs_after_generation: None,
         }
     }
 
-    fn source_for(store: std::sync::Arc<RwLock<MirrorStore>>) -> RemoteSource {
+    fn source_for(store: Arc<RwLock<MirrorStore>>) -> RemoteSource {
         let (changes, _) = broadcast::channel(8);
         let (commands, _) = mpsc::channel(8);
         RemoteSource {
@@ -795,6 +862,65 @@ mod tests {
             Some(Request::FollowLogs { after: None, .. })
         ));
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn empty_incremental_page_clears_the_cache_and_retails() -> color_eyre::eyre::Result<()> {
+        let store = store_with(entry_with_log(10, "old incarnation"));
+        let mut request = ScriptedConnection::new([
+            Response::Logs {
+                lines: Vec::new(),
+                truncated: false,
+            },
+            Response::Logs {
+                lines: vec![line(11, "new line")],
+                truncated: false,
+            },
+        ]);
+
+        refresh_logs(&mut request, &store, "svc").await?;
+
+        let source = source_for(store);
+        let (first_retained, lines) = source.logs_since("svc", 0);
+        assert_eq!(first_retained, Some(11));
+        assert_eq!(
+            lines
+                .iter()
+                .map(|line| (line.seq, line.line.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(11, "new line")]
+        );
+        assert!(matches!(
+            request.requests.as_slice(),
+            [
+                Request::FollowLogs { after: Some(9), .. },
+                Request::FollowLogs { after: None, .. }
+            ]
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn stale_cursor_beyond_the_exposed_seq_space_reports_a_cleared_history() {
+        let source = source_for(store_with(entry_with_log(3, "fresh instance")));
+
+        let (first_retained, lines) = source.logs_since("svc", 59);
+        assert_eq!(first_retained, None);
+        assert_eq!(
+            lines
+                .iter()
+                .map(|line| (line.seq, line.line.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(3, "fresh instance")]
+        );
+
+        let (first_retained, lines) = source.logs_since("svc", 3);
+        assert_eq!(first_retained, None);
+        assert_eq!(lines.len(), 1);
+
+        let (first_retained, lines) = source.logs_since("svc", 2);
+        assert_eq!(first_retained, Some(3));
+        assert_eq!(lines.len(), 1);
     }
 
     #[tokio::test]
@@ -845,6 +971,7 @@ mod tests {
                 .map(|entry| entry.snapshot.run_generation),
             Some(2)
         );
+        assert_eq!(store.read().services["svc"].logs.len(), 1);
         Ok(())
     }
 
@@ -867,5 +994,52 @@ mod tests {
 
         assert!(store.read().services.is_empty());
         Ok(())
+    }
+
+    #[test]
+    fn replacing_the_session_instance_clears_cached_state() {
+        let store = store_with(entry_with_log(4, "old"));
+        store.write().notice = Some("old rejection".to_string());
+
+        let mut same_instance = session();
+        same_instance.name = "renamed".to_string();
+        update_session(&store, same_instance);
+        assert!(store.read().services.contains_key("svc"));
+        assert_eq!(store.read().notice.as_deref(), Some("old rejection"));
+
+        let mut replacement = session();
+        replacement.start_time = 2;
+        update_session(&store, replacement);
+
+        let guard = store.read();
+        assert_eq!(guard.session.start_time, 2);
+        assert!(guard.services.is_empty());
+        assert_eq!(guard.notice, None);
+    }
+
+    #[test]
+    fn acknowledged_restart_clears_logs_after_generation_advances() {
+        let store = store_with(entry_with_log(4, "old"));
+        mark_pending_log_clears(
+            &store,
+            &[ServiceCommandAck {
+                service: "svc".to_string(),
+                observed_generation: 1,
+            }],
+        );
+
+        assert!(reconcile_services(&store, vec![snapshot("svc", 1)]).is_empty());
+        assert_eq!(store.read().services["svc"].logs.len(), 1);
+
+        assert_eq!(
+            reconcile_services(&store, vec![snapshot("svc", 2)]),
+            vec!["svc".to_string()]
+        );
+        let guard = store.read();
+        let entry = &guard.services["svc"];
+        assert!(entry.logs.is_empty());
+        assert_eq!(entry.next_log_seq, 0);
+        assert_eq!(entry.first_retained_seq, None);
+        assert_eq!(entry.clear_logs_after_generation, None);
     }
 }

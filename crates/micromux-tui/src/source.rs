@@ -128,11 +128,7 @@ impl SessionSource {
     pub(crate) fn attachment_status(&self) -> Option<AttachmentStatus> {
         match self {
             Self::Local(_) => None,
-            Self::Remote(source) => Some(AttachmentStatus {
-                session: source.session(),
-                connected: source.connected(),
-                notice: source.notice(),
-            }),
+            Self::Remote(source) => Some(source.attachment_status()),
         }
     }
 }
