@@ -163,10 +163,7 @@ impl RemoteSource {
                 // track a strictly lower cursor (the render path re-fetches its newest seq), so
                 // this cannot occur within one seq space. Report a cleared history with the full
                 // tail so the caller drops its dead cache and repopulates in the same query.
-                let regressed = entry
-                    .logs
-                    .back()
-                    .is_some_and(|newest| after >= newest.seq);
+                let regressed = entry.logs.back().is_some_and(|newest| after >= newest.seq);
                 if regressed {
                     return (None, entry.logs.iter().cloned().collect());
                 }
