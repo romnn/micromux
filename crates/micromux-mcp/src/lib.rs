@@ -101,8 +101,8 @@ usual cursor/restart/wait/log flow. Use `wait_for_log` after external actions, `
 one-shot failure summary, `list_log_runs` for retained runs, and `log_cursors` plus \
 `follow_all_logs` around hot reloads. Log tools strip ANSI by default and support regex, context, \
 time, trace-id, compact JSON, and minimum-level filters. Actions go through micromux and retain its \
-dependency and restart semantics. Use `start_session` and `stop_session` to manage a project's \
-headless session.";
+dependency and restart semantics. Use `start_session` to create a project's headless session; a \
+human can run `micromux attach` to observe it. Use `stop_session` to stop it explicitly.";
 
 /// The MCP server handler. Cheap to clone; holds no supervision state.
 #[derive(Clone)]
@@ -3335,6 +3335,7 @@ services:
             "get_service_events",
             "ensure_service_ready",
             "wait_for_exit",
+            "micromux attach",
         ] {
             assert!(
                 super::INSTRUCTIONS.contains(surface),

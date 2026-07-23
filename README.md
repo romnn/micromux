@@ -18,7 +18,7 @@
  - **see logs** (ANSI/interactive output supported)
  - **restart/disable services**
  - **gate startup by dependencies + healthchecks**
- - **send input to a service** (PTY-backed “attach” mode)
+ - **send input to a service** (local PTY input mode)
 
  <p align="center">
    <img src="https://raw.githubusercontent.com/romnn/micromux/main/docs/healthcheck.png" alt="micromux healthcheck pane showing a failed probe" width="820" />
@@ -94,11 +94,30 @@ from the TUI or with the control plane.
  - **Navigate**: `j`/`k` (or arrows)
  - **Restart**: `r` (current), `R` (all)
  - **Disable/enable**: `d`
- - **Attach mode (send input)**: `a` (exit attach mode with `Alt+Esc`)
+ - **PTY input mode (send input)**: `a` (exit input mode with `Alt+Esc`)
  - **Toggle panes/focus**: `Tab`, healthchecks pane: `H`
  - **Logs**: wrap `w`, follow-tail `t`
  - **Quit**: `q` (or `Esc`)
- 
+
+## Attach to a running session
+
+When an agent starts a detached `micromux serve` session, open the same TUI without starting a
+second supervisor:
+
+```bash
+micromux attach                         # session for the config resolved from cwd
+micromux attach --config ./micromux.yaml
+micromux attach --session name:my-project
+```
+
+Explicit selectors also accept `pid:<pid>` and `hash:<session-id>`. More than one attach client can
+observe and operate the same session at once.
+
+The attached TUI follows service status, logs, and healthchecks, and its lifecycle keys still
+restart, enable/disable, or retire services. In v1 it does not forward service PTY input or terminal
+resize events. Pressing `q` or Ctrl-C only detaches the client; it never stops the session or its
+services. To stop the session explicitly, use `micromux ctl stop` or the MCP `stop_session` tool.
+
  ## Agent control (MCP)
 
 Micromux exposes an **MCP server** so coding agents (Claude Code, Codex) can discover and control your running sessions — list services, read logs, restart/enable/disable them, check health, and wait for a service to become healthy. Actions go through the **same control plane the TUI uses**, so dependency gating, healthchecks, and restart policy are respected — restarting a service via micromux is *more correct* than `kill` + rerun.
@@ -201,16 +220,16 @@ receipts return only key names.
 
 Use `validate_config` to check a candidate config without a running session. For edits to the active
 session's on-disk config, run `reconcile_config` as a dry run first, then apply it; additions and
-removals take effect immediately, while changed definitions are used on the next restart. Terminal
-attachment is deliberately not part of this control surface yet; its design is tracked in the
-[attach plan](plan/attach.md).
+removals take effect immediately, while changed definitions are used on the next restart. MCP
+deliberately exposes no service PTY input tool; human observation of a headless session goes through
+`micromux attach`.
 
 Build a lean TUI-only binary with the MCP server compiled out via `cargo install --no-default-features micromux-cli`.
 
 **Platform support.** micromux is developed and fully supported on Linux and macOS. On Windows the
-TUI runs, but the agent control plane (`micromux ctl`, `micromux mcp`, `micromux serve`) is not yet
-available, and stopping a service kills it immediately without a graceful-termination phase. Windows
-named-pipe support is planned (`ControlEndpoint::WindowsNamedPipe` reserves the slot).
+TUI runs, but the control plane (`micromux attach`, `micromux ctl`, `micromux mcp`, `micromux serve`)
+is not yet available, and stopping a service kills it immediately without a graceful-termination
+phase. Windows named-pipe support is planned (`ControlEndpoint::WindowsNamedPipe` reserves the slot).
 
  ## How it differs from Docker Compose
  
