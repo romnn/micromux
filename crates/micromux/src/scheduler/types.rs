@@ -177,10 +177,10 @@ impl std::fmt::Display for Event {
 
 /// A command sent to the scheduler.
 ///
-/// The service-control variants carry an optional [`CommandAck`]: the trusted in-process TUI passes
-/// `None` (fire-and-forget), while the narrow [`super::ServiceControl`] port attaches an ack so the
-/// scheduler validates and latches the generation request/response. `Command` is not `Clone`
-/// because an ack is single-shot.
+/// Acknowledged variants carry an optional reply half: the trusted in-process TUI passes `None`
+/// (fire-and-forget), while the narrow [`super::ServiceControl`] port attaches an ack so the
+/// scheduler validates and replies request/response. `Command` is not `Clone` because an ack is
+/// single-shot.
 #[derive(Debug)]
 pub enum Command {
     /// Restart a single service.
@@ -220,8 +220,8 @@ pub enum Command {
     StartDynamic {
         /// Definition and lease request.
         params: DynamicServiceParams,
-        /// Required reply channel.
-        ack: DynamicCommandAck,
+        /// Optional reply channel for acknowledged commands.
+        ack: Option<DynamicCommandAck>,
     },
     /// Replace or revive a dynamic service.
     ReplaceDynamic {
@@ -231,8 +231,8 @@ pub enum Command {
         expected_revision: u64,
         /// Replacement definition and lease request.
         params: DynamicServiceParams,
-        /// Required reply channel.
-        ack: DynamicCommandAck,
+        /// Optional reply channel for acknowledged commands.
+        ack: Option<DynamicCommandAck>,
     },
     /// Renew a live dynamic service's lease without restarting it.
     RenewDynamic {
@@ -242,15 +242,15 @@ pub enum Command {
         expected_revision: u64,
         /// Requested replacement lease.
         expires_after: Option<Lease>,
-        /// Required reply channel.
-        ack: DynamicCommandAck,
+        /// Optional reply channel for acknowledged commands.
+        ack: Option<DynamicCommandAck>,
     },
     /// Retire a dynamic service.
     StopDynamic {
         /// Dynamic service id.
         service: ServiceID,
-        /// Required reply channel.
-        ack: DynamicCommandAck,
+        /// Optional reply channel for acknowledged commands.
+        ack: Option<DynamicCommandAck>,
     },
     /// Send a raw input payload to a service.
     SendInput(ServiceID, Vec<u8>),
@@ -286,5 +286,11 @@ impl Command {
     #[must_use]
     pub fn enable(service: ServiceID) -> Self {
         Self::Enable { service, ack: None }
+    }
+
+    /// Fire-and-forget retirement of a dynamic service.
+    #[must_use]
+    pub fn stop_dynamic(service: ServiceID) -> Self {
+        Self::StopDynamic { service, ack: None }
     }
 }

@@ -329,7 +329,10 @@ impl ServiceControl {
     ) -> Result<DynamicServiceResult, SchedulerStopped> {
         let (ack, rx) = DynamicCommandAck::new();
         self.tx
-            .send(Command::StartDynamic { params, ack })
+            .send(Command::StartDynamic {
+                params,
+                ack: Some(ack),
+            })
             .await
             .map_err(|_| SchedulerStopped)?;
         rx.await.map_err(|_| SchedulerStopped)
@@ -352,7 +355,7 @@ impl ServiceControl {
                 service: service.clone(),
                 expected_revision,
                 params,
-                ack,
+                ack: Some(ack),
             })
             .await
             .map_err(|_| SchedulerStopped)?;
@@ -376,7 +379,7 @@ impl ServiceControl {
                 service: service.clone(),
                 expected_revision,
                 expires_after,
-                ack,
+                ack: Some(ack),
             })
             .await
             .map_err(|_| SchedulerStopped)?;
@@ -396,7 +399,7 @@ impl ServiceControl {
         self.tx
             .send(Command::StopDynamic {
                 service: service.clone(),
-                ack,
+                ack: Some(ack),
             })
             .await
             .map_err(|_| SchedulerStopped)?;

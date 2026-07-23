@@ -134,6 +134,11 @@ pub enum CtlAction {
         /// The service to disable.
         service: String,
     },
+    /// Retire a dynamic service while preserving its post-mortem state.
+    StopDynamic {
+        /// The dynamic service to retire.
+        service: String,
+    },
     /// Reconcile configured services with the on-disk config.
     Reconcile {
         /// Show the semantic diff without changing the running session.

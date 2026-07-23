@@ -36,6 +36,9 @@ fn request_for(action: &CtlAction) -> Request {
         CtlAction::Disable { service } => Request::Disable {
             service: service.clone(),
         },
+        CtlAction::StopDynamic { service } => Request::StopDynamicService {
+            service: service.clone(),
+        },
         CtlAction::Reconcile { dry_run } => Request::ReconcileConfig { dry_run: *dry_run },
         CtlAction::Health { service } => Request::GetHealth {
             service: service.clone(),
@@ -73,6 +76,13 @@ fn print_services(services: &[micromux::ServiceSnapshot]) {
             service.run_generation
         );
     }
+}
+
+fn dynamic_receipt_line(receipt: &micromux_control::DynamicServiceAck) -> String {
+    format!(
+        "accepted {} (revision {}, generation {}, already_retired={})",
+        receipt.service, receipt.revision, receipt.observed_generation, receipt.already_retired
+    )
 }
 
 fn print_response(response: &Response) -> eyre::Result<()> {
@@ -139,10 +149,7 @@ fn print_response(response: &Response) -> eyre::Result<()> {
             }
         }
         Response::DynamicService(receipt) => {
-            println!(
-                "accepted {} (revision {}, generation {})",
-                receipt.service, receipt.revision, receipt.observed_generation
-            );
+            println!("{}", dynamic_receipt_line(receipt));
         }
         Response::Reconcile(receipt) => {
             println!(
@@ -373,4 +380,42 @@ pub async fn run(action: CtlAction, config_path: Option<&Path>) -> eyre::Result<
 
     let response = client.request(request_for(&action)).await?;
     print_response(&response)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{dynamic_receipt_line, request_for};
+    use crate::options::CtlAction;
+    use micromux_control::{DynamicServiceAck, Request};
+    use similar_asserts::assert_eq;
+
+    #[test]
+    fn stop_dynamic_maps_to_the_control_request_and_prints_retirement_state() {
+        let request = request_for(&CtlAction::StopDynamic {
+            service: "debug".to_string(),
+        });
+        assert!(matches!(
+            request,
+            Request::StopDynamicService { service } if service == "debug"
+        ));
+
+        let line = dynamic_receipt_line(&DynamicServiceAck {
+            service: "debug".to_string(),
+            revision: 2,
+            observed_generation: 3,
+            expires_at_unix_ms: None,
+            command: vec!["true".to_string()],
+            working_dir: None,
+            ports: Vec::new(),
+            env_keys: Vec::new(),
+            restart: micromux::RestartPolicy::Never,
+            healthcheck_configured: false,
+            already_retired: true,
+            idempotent_replay: false,
+        });
+        assert_eq!(
+            line,
+            "accepted debug (revision 2, generation 3, already_retired=true)"
+        );
+    }
 }

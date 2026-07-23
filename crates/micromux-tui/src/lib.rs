@@ -336,6 +336,8 @@ impl App {
             // Disable current service
             KeyCode::Char('d') => self.disable_current_service(),
 
+            KeyCode::Char('s') => self.stop_current_dynamic_service(),
+
             // Restart service
             KeyCode::Char('r') => self.restart_current_service(),
 
@@ -541,6 +543,21 @@ impl App {
             micromux::Desired::Unknown => return,
         };
         let _ = self.commands_tx.try_send(command);
+    }
+
+    fn stop_current_dynamic_service(&self) {
+        let Some(service) = self.state.current_service() else {
+            return;
+        };
+        if service.snapshot.origin != micromux::OriginKind::Dynamic
+            || service.snapshot.retired.is_some()
+        {
+            return;
+        }
+        tracing::info!(service_id = service.snapshot.id, "retiring dynamic service");
+        let _ = self
+            .commands_tx
+            .try_send(Command::stop_dynamic(service.snapshot.id.clone()));
     }
 
     /// Restart service
@@ -810,6 +827,68 @@ mod tests {
             micromux::Command::Restart { service, .. } => assert_eq!(service, "svc"),
             other => color_eyre::eyre::bail!("expected restart command, got {other:?}"),
         }
+        assert!(matches!(
+            commands_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stop_key_only_sends_for_a_live_dynamic_service() -> color_eyre::eyre::Result<()> {
+        let yaml = indoc! {r#"
+            version: 1
+            services:
+              svc:
+                command: ["sh", "-c", "true"]
+        "#};
+        let mut diagnostics: Vec<Diagnostic<usize>> = vec![];
+        let parsed = micromux::from_str(yaml, Path::new("."), 0usize, None, &mut diagnostics)
+            .map_err(|err| color_eyre::eyre::eyre!(err.to_string()))?;
+        let mux = std::sync::Arc::new(
+            micromux::Micromux::new(&parsed)
+                .map_err(|err| color_eyre::eyre::eyre!(err.to_string()))?,
+        );
+        let shutdown = micromux::CancellationToken::new();
+        let (_runner, handles) = mux.start(shutdown.clone());
+        let (commands_tx, mut commands_rx) = mpsc::channel(4);
+        let mut app = App::new(handles.reader.clone(), commands_tx, shutdown, true);
+        let stop_key = KeyEvent {
+            code: KeyCode::Char('s'),
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        };
+
+        app.handle_key_press(stop_key);
+        assert!(matches!(
+            commands_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+
+        if let Some(service) = app.state.current_service_mut() {
+            service.snapshot.origin = micromux::OriginKind::Dynamic;
+            service.snapshot.dynamic = Some(micromux::DynamicServiceInfo {
+                created_at_unix_ms: 1,
+                expires_at_unix_ms: None,
+                owner: None,
+                revision: 1,
+            });
+        }
+        app.handle_key_press(stop_key);
+        match commands_rx.try_recv()? {
+            micromux::Command::StopDynamic { service, ack } => {
+                assert_eq!(service, "svc");
+                assert!(ack.is_none());
+            }
+            other => color_eyre::eyre::bail!("expected stop-dynamic command, got {other:?}"),
+        }
+
+        if let Some(service) = app.state.current_service_mut() {
+            service.snapshot.retired = Some(micromux::RetiredReason::Stopped);
+        }
+        app.handle_key_press(stop_key);
         assert!(matches!(
             commands_rx.try_recv(),
             Err(mpsc::error::TryRecvError::Empty)

@@ -1618,6 +1618,7 @@ dependencies = [
  "micromux-control",
  "micromux-mcp",
  "micromux-tui",
+ "similar-asserts",
  "termcolor",
  "tokio",
  "tracing",

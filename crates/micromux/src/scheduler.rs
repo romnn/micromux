@@ -1808,6 +1808,12 @@ impl SchedulerRuntime {
         }
     }
 
+    fn reply_dynamic(ack: Option<control::DynamicCommandAck>, result: DynamicServiceResult) {
+        if let Some(ack) = ack {
+            ack.send(result);
+        }
+    }
+
     /// Restart a service, latching the run generation *before* the restart. Restarting a disabled
     /// service is invalid for every caller: `enable` is the operation that starts disabled services.
     fn apply_restart(
@@ -1977,7 +1983,7 @@ impl SchedulerRuntime {
             }
             Command::StartDynamic { params, ack } => {
                 let result = self.start_dynamic(services, params);
-                ack.send(result);
+                Self::reply_dynamic(ack, result);
                 true
             }
             Command::ReplaceDynamic {
@@ -1987,7 +1993,7 @@ impl SchedulerRuntime {
                 ack,
             } => {
                 let result = self.replace_dynamic(services, &service, expected_revision, params);
-                ack.send(result);
+                Self::reply_dynamic(ack, result);
                 true
             }
             Command::RenewDynamic {
@@ -1998,12 +2004,12 @@ impl SchedulerRuntime {
             } => {
                 let result =
                     self.renew_dynamic(services, &service, expected_revision, expires_after);
-                ack.send(result);
+                Self::reply_dynamic(ack, result);
                 true
             }
             Command::StopDynamic { service, ack } => {
                 let result = self.stop_dynamic(services, &service);
-                ack.send(result);
+                Self::reply_dynamic(ack, result);
                 true
             }
             Command::SendInput(service_id, data) => {

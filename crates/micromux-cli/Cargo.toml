@@ -60,3 +60,6 @@ futures.workspace = true
 
 # parse cli arguments
 clap = { version = "4", features = ["derive", "env"] }
+
+[dev-dependencies]
+similar-asserts.workspace = true

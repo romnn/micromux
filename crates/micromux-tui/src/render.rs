@@ -766,6 +766,7 @@ impl App {
             Keys::new("r", "Restart"),
             Keys::new("R", "Restart All"),
             Keys::new("d", "Disable/Enable"),
+            Keys::new("s", "Stop dynamic"),
             Keys::new("q", "Quit"),
         ];
 
