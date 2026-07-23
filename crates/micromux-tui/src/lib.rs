@@ -66,21 +66,7 @@ impl App {
         let changes = reader.subscribe();
         let snapshots = reader.services();
 
-        let services = snapshots
-            .into_iter()
-            .map(|snapshot| state::Service {
-                snapshot,
-                cached_lines: std::collections::VecDeque::new(),
-                cached_text: ratatui::text::Text::default(),
-                text_dirty: true,
-                cached_wrapped_lines: 0,
-                cached_wrap: None,
-                logs_dirty: true,
-                healthcheck_cached_num_lines: 0,
-                healthcheck_cached_text: String::new(),
-                healthcheck_dirty: true,
-            })
-            .collect();
+        let services = snapshots.into_iter().map(state::Service::new).collect();
 
         let log_view = render::log_view::LogView::default();
         let healthcheck_view = render::log_view::LogView::default();
@@ -257,19 +243,45 @@ impl App {
                     service.healthcheck_dirty = true;
                 }
             }
-            ChangeKind::Unknown => self.resync(),
+            ChangeKind::Roster | ChangeKind::Unknown => self.resync(),
+            ChangeKind::Events => {}
         }
     }
 
-    /// Re-read every service snapshot and mark caches dirty (used on first draw and after a lag).
+    /// Reconcile the roster while retaining render caches for services that still exist.
     fn resync(&mut self) {
-        for snapshot in self.reader.services() {
-            if let Some(service) = self.service_mut(&snapshot.id) {
-                service.snapshot = snapshot;
-                service.logs_dirty = true;
-                service.healthcheck_dirty = true;
-            }
-        }
+        let selected_id = self
+            .state
+            .current_service()
+            .map(|service| service.snapshot.id.clone());
+        let previous_index = self.state.selected_service;
+        let mut existing = std::mem::take(&mut self.state.services)
+            .into_iter()
+            .map(|service| (service.snapshot.id.clone(), service))
+            .collect::<std::collections::HashMap<_, _>>();
+        self.state.services = self
+            .reader
+            .services()
+            .into_iter()
+            .map(|snapshot| {
+                if let Some(mut service) = existing.remove(&snapshot.id) {
+                    service.snapshot = snapshot;
+                    service.logs_dirty = true;
+                    service.healthcheck_dirty = true;
+                    service
+                } else {
+                    state::Service::new(snapshot)
+                }
+            })
+            .collect();
+        self.state.selected_service = selected_id
+            .and_then(|selected_id| {
+                self.state
+                    .services
+                    .iter()
+                    .position(|service| service.snapshot.id == selected_id)
+            })
+            .unwrap_or_else(|| previous_index.min(self.state.services.len().saturating_sub(1)));
     }
 
     fn service_mut(&mut self, id: &str) -> Option<&mut state::Service> {
@@ -803,6 +815,57 @@ mod tests {
             Err(mpsc::error::TryRecvError::Empty)
         ));
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resync_reconciles_rows_and_preserves_selection_by_id() -> color_eyre::Result<()> {
+        fn handles_for(yaml: &str) -> color_eyre::Result<micromux::Handles> {
+            let mut diagnostics: Vec<Diagnostic<usize>> = Vec::new();
+            let parsed = micromux::from_str(yaml, Path::new("."), 0, None, &mut diagnostics)
+                .map_err(|err| color_eyre::eyre::eyre!(err.to_string()))?;
+            let mux = std::sync::Arc::new(micromux::Micromux::new(&parsed)?);
+            let (_runner, handles) = mux.start(micromux::CancellationToken::new());
+            Ok(handles)
+        }
+
+        let initial = handles_for(indoc! {r#"
+            version: 1
+            services:
+              a: { command: ["true"] }
+              b: { command: ["true"] }
+        "#})?;
+        let shutdown = micromux::CancellationToken::new();
+        let mut app = App::new(initial.reader, initial.commands, shutdown, true);
+        app.state.selected_service = 1;
+        if let Some(service) = app.state.current_service_mut() {
+            service.cached_text = ratatui::text::Text::from("preserved");
+        }
+
+        let updated = handles_for(indoc! {r#"
+            version: 1
+            services:
+              b: { command: ["true"] }
+              c: { command: ["true"] }
+        "#})?;
+        app.reader = updated.reader;
+        app.resync();
+
+        assert_eq!(
+            app.state
+                .services
+                .iter()
+                .map(|service| service.snapshot.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["b", "c"]
+        );
+        assert_eq!(app.state.selected_service, 0);
+        assert_eq!(
+            app.state
+                .current_service()
+                .map(|service| service.cached_text.clone()),
+            Some(ratatui::text::Text::from("preserved"))
+        );
         Ok(())
     }
 }

@@ -14,6 +14,23 @@ pub struct Service {
     pub healthcheck_dirty: bool,
 }
 
+impl Service {
+    pub(crate) fn new(snapshot: micromux::ServiceSnapshot) -> Self {
+        Self {
+            snapshot,
+            cached_lines: std::collections::VecDeque::new(),
+            cached_text: ratatui::text::Text::default(),
+            text_dirty: true,
+            cached_wrapped_lines: 0,
+            cached_wrap: None,
+            logs_dirty: true,
+            healthcheck_cached_num_lines: 0,
+            healthcheck_cached_text: String::new(),
+            healthcheck_dirty: true,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct State {
     pub services: Vec<Service>,

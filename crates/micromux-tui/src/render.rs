@@ -462,17 +462,26 @@ impl App {
                     .iter()
                     .map(|i| format!(":{i}").fg(tailwind::GRAY.c400));
 
-                let line = [status, " ".into(), service.snapshot.id.as_str().into()]
-                    .into_iter()
-                    .chain(if ports.len() > 0 {
-                        [" [".into()]
-                            .into_iter()
-                            .chain(intersperse(ports, ", ".into()))
-                            .chain(["]".into()])
-                            .collect()
-                    } else {
-                        vec!["".into()]
-                    });
+                let origin = match service.snapshot.origin {
+                    micromux::OriginKind::Dynamic => "+",
+                    micromux::OriginKind::Configured | micromux::OriginKind::Unknown => " ",
+                };
+                let line = [
+                    status,
+                    " ".into(),
+                    origin.fg(tailwind::GRAY.c400),
+                    service.snapshot.id.as_str().into(),
+                ]
+                .into_iter()
+                .chain(if ports.len() > 0 {
+                    [" [".into()]
+                        .into_iter()
+                        .chain(intersperse(ports, ", ".into()))
+                        .chain(["]".into()])
+                        .collect()
+                } else {
+                    vec!["".into()]
+                });
 
                 ListItem::new(line.collect::<Line>())
             })
