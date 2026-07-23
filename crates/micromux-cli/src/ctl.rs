@@ -97,6 +97,21 @@ fn dynamic_receipt_line(receipt: &micromux_control::DynamicServiceAck) -> String
     )
 }
 
+fn print_health_attempt(attempt: &micromux::HealthAttempt) {
+    println!(
+        "attempt {} `{}` -> {}",
+        attempt.attempt,
+        attempt.command,
+        attempt.result.map_or_else(
+            || "running".to_string(),
+            |result| format!("success={} exit_code={}", result.success, result.exit_code)
+        )
+    );
+    for line in &attempt.output {
+        println!("  {}", line.line);
+    }
+}
+
 fn print_response(response: &Response) -> eyre::Result<()> {
     match response {
         Response::Services(services) => print_services(services),
@@ -117,17 +132,14 @@ fn print_response(response: &Response) -> eyre::Result<()> {
             }
         }
         Response::Health(Some(attempt)) => {
-            println!(
-                "attempt {} `{}` -> {}",
-                attempt.attempt,
-                attempt.command,
-                attempt.result.map_or_else(
-                    || "running".to_string(),
-                    |result| format!("success={} exit_code={}", result.success, result.exit_code)
-                )
-            );
-            for line in &attempt.output {
-                println!("  {}", line.line);
+            print_health_attempt(attempt);
+        }
+        Response::HealthHistory { attempts } => {
+            if attempts.is_empty() {
+                println!("no healthcheck attempts recorded");
+            }
+            for attempt in attempts {
+                print_health_attempt(attempt);
             }
         }
         Response::Health(None) => println!("no healthcheck attempts recorded"),

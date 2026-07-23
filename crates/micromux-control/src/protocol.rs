@@ -97,6 +97,11 @@ pub enum Request {
         /// Target service.
         service: ServiceID,
     },
+    /// Return retained healthcheck attempts for a service's current or latest run.
+    GetHealthHistory {
+        /// Target service.
+        service: ServiceID,
+    },
     /// Return retained scheduler lifecycle events for a service.
     GetEvents {
         /// Target service.
@@ -302,6 +307,11 @@ pub enum Response {
     },
     /// Reply to [`Request::GetHealth`].
     Health(Option<HealthAttempt>),
+    /// Reply to [`Request::GetHealthHistory`].
+    HealthHistory {
+        /// Retained attempts in oldest-first order.
+        attempts: Vec<HealthAttempt>,
+    },
     /// Reply to [`Request::GetEvents`].
     Events {
         /// Retained lifecycle events in ascending sequence order.
@@ -497,6 +507,38 @@ mod tests {
             panic!("expected a reconcile response");
         };
         assert_eq!(decoded, receipt);
+    }
+
+    #[test]
+    fn health_history_request_and_response_round_trip() -> serde_json::Result<()> {
+        let request = Request::GetHealthHistory {
+            service: "api".to_string(),
+        };
+        let encoded = serde_json::to_value(&request)?;
+        assert!(matches!(
+            serde_json::from_value::<Request>(encoded)?,
+            Request::GetHealthHistory { service } if service == "api"
+        ));
+
+        let response = Response::HealthHistory {
+            attempts: vec![HealthAttempt {
+                run_generation: 2,
+                attempt: 3,
+                command: "probe".to_string(),
+                output: Vec::new(),
+                result: None,
+            }],
+        };
+        let encoded = serde_json::to_value(response)?;
+        let Response::HealthHistory { attempts } = serde_json::from_value::<Response>(encoded)?
+        else {
+            return Err(serde_json::Error::io(std::io::Error::other(
+                "unexpected health-history response variant",
+            )));
+        };
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts.first().map(|attempt| attempt.attempt), Some(3));
+        Ok(())
     }
 
     #[test]

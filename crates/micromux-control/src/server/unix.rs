@@ -332,6 +332,7 @@ async fn dispatch(server: &ControlServer, request: Request) -> Response {
             bound_health_attempt(&mut attempt);
             Response::Health(attempt)
         }
+        Request::GetHealthHistory { service } => get_health_history(&server.reader, &service),
         Request::GetEvents {
             service,
             after,
@@ -602,6 +603,19 @@ fn bound_health_attempt(attempt: &mut Option<micromux::HealthAttempt>) {
         return;
     };
 
+    bound_health_attempt_to(attempt, RESPONSE_MAX_BYTES);
+}
+
+fn get_health_history(reader: &SessionModelReader, service: &str) -> Response {
+    if reader.service(service).is_none() {
+        return unknown_service(service);
+    }
+    let mut attempts = reader.healthchecks(service);
+    bound_health_history(&mut attempts);
+    Response::HealthHistory { attempts }
+}
+
+fn bound_health_attempt_to(attempt: &mut micromux::HealthAttempt, max_bytes: usize) {
     let mut total = attempt.command.len()
         + attempt
             .output
@@ -610,7 +624,7 @@ fn bound_health_attempt(attempt: &mut Option<micromux::HealthAttempt>) {
             .sum::<usize>();
     let mut drop_count = 0;
     for line in &attempt.output {
-        if total <= RESPONSE_MAX_BYTES {
+        if total <= max_bytes {
             break;
         }
         total = total.saturating_sub(line.line.len());
@@ -619,9 +633,38 @@ fn bound_health_attempt(attempt: &mut Option<micromux::HealthAttempt>) {
     if drop_count > 0 {
         attempt.output.drain(0..drop_count);
     }
-    if total > RESPONSE_MAX_BYTES {
-        attempt.command =
-            trim_to_last_bytes(std::mem::take(&mut attempt.command), RESPONSE_MAX_BYTES);
+    if total > max_bytes {
+        attempt.command = trim_to_last_bytes(std::mem::take(&mut attempt.command), max_bytes);
+    }
+}
+
+fn health_attempt_bytes(attempt: &micromux::HealthAttempt) -> usize {
+    attempt.command.len()
+        + attempt
+            .output
+            .iter()
+            .map(|line| line.line.len())
+            .sum::<usize>()
+}
+
+/// Drop whole oldest attempts before trimming content from the oldest attempt that survives.
+fn bound_health_history(attempts: &mut Vec<micromux::HealthAttempt>) {
+    let mut total = attempts.iter().map(health_attempt_bytes).sum::<usize>();
+    let mut drop_count = 0;
+    for attempt in attempts.iter() {
+        if total <= RESPONSE_MAX_BYTES || attempts.len().saturating_sub(drop_count) <= 1 {
+            break;
+        }
+        total = total.saturating_sub(health_attempt_bytes(attempt));
+        drop_count += 1;
+    }
+    if drop_count > 0 {
+        attempts.drain(0..drop_count);
+    }
+    if let Some(attempt) = attempts.first_mut()
+        && total > RESPONSE_MAX_BYTES
+    {
+        bound_health_attempt_to(attempt, RESPONSE_MAX_BYTES);
     }
 }
 
@@ -683,12 +726,16 @@ fn acknowledge_reconcile(result: Result<micromux::ReconcileResult, SchedulerStop
 
 #[cfg(test)]
 mod tests {
-    use micromux::{ChangeKind, LogLine, RestartPolicy, ServiceSnapshot, SessionChange};
+    use micromux::{
+        ChangeKind, HealthAttempt, HealthLine, LogLine, OutputStream, RestartPolicy,
+        ServiceSnapshot, SessionChange,
+    };
     use similar_asserts::assert_eq;
 
     use super::{
         MAX_LOG_TAIL, RESPONSE_MAX_BYTES, bound_follow_response_lines,
-        bound_follow_response_lines_page, bound_tail_response_lines, lag_replay_changes,
+        bound_follow_response_lines_page, bound_health_history, bound_tail_response_lines,
+        health_attempt_bytes, lag_replay_changes,
     };
 
     fn line(seq: u64, len: usize) -> LogLine {
@@ -710,6 +757,43 @@ mod tests {
             vec!["true".to_string()],
             None,
         )
+    }
+
+    fn health_attempt(attempt: u64, output_bytes: usize) -> HealthAttempt {
+        HealthAttempt {
+            run_generation: 1,
+            attempt,
+            command: "probe".to_string(),
+            output: vec![HealthLine {
+                stream: OutputStream::Stdout,
+                line: "x".repeat(output_bytes),
+            }],
+            result: None,
+        }
+    }
+
+    #[test]
+    fn health_history_bounding_drops_oldest_attempts_before_trimming() {
+        let mut attempts = vec![
+            health_attempt(1, RESPONSE_MAX_BYTES / 2),
+            health_attempt(2, RESPONSE_MAX_BYTES / 2),
+        ];
+
+        bound_health_history(&mut attempts);
+
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts.first().map(|attempt| attempt.attempt), Some(2));
+        assert!(attempts.iter().map(health_attempt_bytes).sum::<usize>() <= RESPONSE_MAX_BYTES);
+    }
+
+    #[test]
+    fn health_history_bounding_trims_an_oversized_surviving_attempt() {
+        let mut attempts = vec![health_attempt(7, RESPONSE_MAX_BYTES + 100)];
+
+        bound_health_history(&mut attempts);
+
+        assert_eq!(attempts.first().map(|attempt| attempt.attempt), Some(7));
+        assert!(attempts.iter().map(health_attempt_bytes).sum::<usize>() <= RESPONSE_MAX_BYTES);
     }
 
     #[test]

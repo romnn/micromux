@@ -22,6 +22,7 @@ fn unique_dir(prefix: &str) -> eyre::Result<tempfile::TempDir> {
 
 struct Session {
     endpoint: ControlEndpoint,
+    reader: micromux::SessionModelReader,
     shutdown: CancellationToken,
     _runner: tokio::task::JoinHandle<eyre::Result<()>>,
 }
@@ -61,9 +62,76 @@ fn build_session_yaml(dir: &Path, yaml: &str) -> eyre::Result<Session> {
 
     Ok(Session {
         endpoint,
+        reader: handles.reader,
         shutdown,
         _runner: runner,
     })
+}
+
+#[tokio::test]
+async fn health_history_is_oldest_first_and_unknown_services_are_typed() -> eyre::Result<()> {
+    let dir = unique_dir("health-history")?;
+    let session = build_session_yaml(
+        dir.path(),
+        r#"version: 1
+services:
+  svc:
+    command: ["sh", "-c", "sleep 60"]
+    healthcheck:
+      test: ["CMD-SHELL", "echo unhealthy; exit 1"]
+      start_delay: "10ms"
+      interval: "100ms"
+      timeout: "1s"
+      retries: 20
+"#,
+    )?;
+
+    let response = request_until(
+        &session.endpoint,
+        Request::GetHealthHistory {
+            service: "svc".to_string(),
+        },
+        |response| matches!(response, Response::HealthHistory { attempts } if attempts.len() >= 2),
+    )
+    .await?;
+    let Response::HealthHistory { attempts } = response else {
+        eyre::bail!("expected health history, got {response:?}");
+    };
+    let model_attempts = session.reader.healthchecks("svc");
+    assert!(attempts.len() >= 2);
+    assert!(
+        attempts
+            .windows(2)
+            .all(|pair| pair[0].attempt < pair[1].attempt)
+    );
+    assert_eq!(
+        attempts
+            .iter()
+            .map(|attempt| attempt.attempt)
+            .collect::<Vec<_>>(),
+        model_attempts
+            .iter()
+            .take(attempts.len())
+            .map(|attempt| attempt.attempt)
+            .collect::<Vec<_>>()
+    );
+
+    let mut client = Client::connect(&session.endpoint).await?;
+    let unknown = client
+        .request(Request::GetHealthHistory {
+            service: "nope".to_string(),
+        })
+        .await?;
+    assert!(matches!(
+        unknown,
+        Response::Error {
+            code: micromux_control::ErrorCode::UnknownService,
+            ..
+        }
+    ));
+
+    session.shutdown.cancel();
+    Ok(())
 }
 
 fn dynamic_params(id: &str, command: &[&str]) -> micromux::DynamicServiceParams {

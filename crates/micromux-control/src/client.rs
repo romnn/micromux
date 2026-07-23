@@ -204,6 +204,27 @@ impl Client {
             other => Err(ControlError::Unexpected(format!("{other:?}"))),
         }
     }
+
+    /// Fetch retained healthcheck attempts in oldest-first order.
+    ///
+    /// # Errors
+    ///
+    /// Returns a transport error if the request fails, or [`ControlError::Unexpected`] if the peer
+    /// returns a typed rejection or a response for another request.
+    pub async fn health_history(
+        &mut self,
+        service: &str,
+    ) -> Result<Vec<micromux::HealthAttempt>, ControlError> {
+        match self
+            .request(Request::GetHealthHistory {
+                service: service.to_string(),
+            })
+            .await?
+        {
+            Response::HealthHistory { attempts } => Ok(attempts),
+            other => Err(ControlError::Unexpected(format!("{other:?}"))),
+        }
+    }
 }
 
 impl Subscription {
