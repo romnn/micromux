@@ -355,6 +355,7 @@ async fn dispatch(server: &ControlServer, request: Request) -> Response {
         Request::StopDynamicService { service } => {
             acknowledge_dynamic(server.control.stop_dynamic(&service).await)
         }
+        Request::ReconcileConfig { dry_run } => reconcile(server, dry_run).await,
         // Subscribe is intercepted before dispatch; reaching here is a protocol misuse.
         Request::Subscribe => Response::error(
             ErrorCode::BadRequest,
@@ -365,6 +366,10 @@ async fn dispatch(server: &ControlServer, request: Request) -> Response {
             Response::error(ErrorCode::BadRequest, "shutdown is handled before dispatch")
         }
     }
+}
+
+async fn reconcile(server: &ControlServer, dry_run: bool) -> Response {
+    acknowledge_reconcile(server.control.reconcile_config(dry_run).await)
 }
 
 fn get_events(
@@ -488,11 +493,7 @@ fn describe(server: &ControlServer) -> SessionInfo {
         let live_services = snapshots
             .iter()
             .filter(|snapshot| {
-                snapshot.origin == micromux::OriginKind::Dynamic
-                    && snapshot
-                        .dynamic
-                        .as_ref()
-                        .is_some_and(|dynamic| dynamic.retired.is_none())
+                snapshot.origin == micromux::OriginKind::Dynamic && snapshot.retired.is_none()
             })
             .count();
         crate::DynamicServicesCaps {
@@ -654,6 +655,16 @@ fn acknowledge_dynamic(
 ) -> Response {
     match result {
         Ok(Ok(ack)) => Response::DynamicService(ack),
+        Ok(Err(rejection)) => rejection_response(rejection),
+        Err(SchedulerStopped) => {
+            Response::error(ErrorCode::SchedulerStopped, "the scheduler has stopped")
+        }
+    }
+}
+
+fn acknowledge_reconcile(result: Result<micromux::ReconcileResult, SchedulerStopped>) -> Response {
+    match result {
+        Ok(Ok(receipt)) => Response::Reconcile(receipt),
         Ok(Err(rejection)) => rejection_response(rejection),
         Err(SchedulerStopped) => {
             Response::error(ErrorCode::SchedulerStopped, "the scheduler has stopped")

@@ -237,6 +237,59 @@ async fn describe_list_logs_and_restart_over_the_socket() -> eyre::Result<()> {
 }
 
 #[tokio::test]
+async fn reconcile_dry_run_and_apply_cross_the_socket() -> eyre::Result<()> {
+    let dir = unique_dir("reconcile")?;
+    let session = build_session(dir.path(), "sleep 60")?;
+    let config_path = dir.path().join("micromux.yaml");
+    std::fs::write(
+        &config_path,
+        r#"version: 1
+services:
+  svc:
+    command: ["sh", "-c", "sleep 60"]
+  added:
+    command: ["sh", "-c", "sleep 60"]
+"#,
+    )?;
+    let mut client = Client::connect(&session.endpoint).await?;
+
+    let dry_run = client
+        .request(Request::ReconcileConfig { dry_run: true })
+        .await?;
+    let Response::Reconcile(dry_run) = dry_run else {
+        eyre::bail!("expected reconcile receipt, got {dry_run:?}");
+    };
+    assert!(dry_run.dry_run);
+    assert_eq!(dry_run.actions.len(), 1);
+    assert_eq!(dry_run.actions[0].service, "added");
+    assert_eq!(
+        dry_run.actions[0].action,
+        micromux::ReconcileActionKind::Added
+    );
+    let before_apply = client.request(Request::ListServices).await?;
+    assert!(matches!(before_apply, Response::Services(services) if services.len() == 1));
+
+    let applied = client
+        .request(Request::ReconcileConfig { dry_run: false })
+        .await?;
+    let Response::Reconcile(applied) = applied else {
+        eyre::bail!("expected reconcile receipt, got {applied:?}");
+    };
+    assert!(!applied.dry_run);
+    assert_eq!(applied.actions, dry_run.actions);
+    request_until(&session.endpoint, Request::ListServices, |response| {
+        matches!(response, Response::Services(services)
+        if services.iter().any(|service| {
+            service.id == "added" && service.execution == micromux::Execution::Running
+        }))
+    })
+    .await?;
+
+    session.shutdown.cancel();
+    Ok(())
+}
+
+#[tokio::test]
 async fn dynamic_service_lifecycle_and_capabilities_cross_the_socket() -> eyre::Result<()> {
     let dir = unique_dir("dynamic")?;
     let session = build_session_yaml(
@@ -328,9 +381,7 @@ services:
         matches!(response, Response::Services(services)
         if services.iter().any(|service| {
             service.id == "debug"
-                && service.dynamic.as_ref().is_some_and(|dynamic| {
-                    dynamic.retired == Some(micromux::RetiredReason::Stopped)
-                })
+                && service.retired == Some(micromux::RetiredReason::Stopped)
         }))
     })
     .await?;

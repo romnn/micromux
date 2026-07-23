@@ -89,13 +89,15 @@ pub enum OriginKind {
     Unknown,
 }
 
-/// Why a dynamic service reached its terminal state.
+/// Why a service reached its terminal state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub enum RetiredReason {
     /// Explicitly stopped through the control plane.
     Stopped,
     /// Its lease expired.
     Expired,
+    /// It was removed from the reconciled session configuration.
+    Removed,
     /// A newer peer sent a retirement reason this binary does not know yet.
     #[serde(other)]
     Unknown,
@@ -114,12 +116,6 @@ pub struct DynamicServiceInfo {
     pub owner: Option<String>,
     /// Optimistic-concurrency revision.
     pub revision: u64,
-    /// Terminal reason, present after retirement.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub retired: Option<RetiredReason>,
-    /// Retirement time in Unix milliseconds.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub retired_at_unix_ms: Option<u64>,
 }
 
 #[derive(JsonSchema)]
@@ -180,6 +176,12 @@ pub struct ServiceSnapshot {
     /// Dynamic lifecycle metadata, present only for dynamic services.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dynamic: Option<DynamicServiceInfo>,
+    /// Terminal reason, present after retirement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retired: Option<RetiredReason>,
+    /// Retirement time in Unix milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retired_at_unix_ms: Option<u64>,
     /// Requested state (`Disabled` is a desire, not an execution).
     pub desired: Desired,
     /// Observed lifecycle phase.
@@ -257,6 +259,8 @@ impl ServiceSnapshot {
             name,
             origin: OriginKind::Configured,
             dynamic: None,
+            retired: None,
+            retired_at_unix_ms: None,
             desired: Desired::Enabled,
             execution: Execution::Pending,
             health: None,
@@ -479,13 +483,13 @@ pub enum ServiceEventKind {
     DependencyBlocked,
     /// Previously blocking dependencies became ready.
     DependencyReady,
-    /// A dynamic service was created.
+    /// A service was created or added to the live roster.
     Created,
     /// A dynamic service was replaced or revived.
     Replaced,
     /// A dynamic service's lease was renewed without restarting it.
     LeaseRenewed,
-    /// A dynamic service was explicitly stopped or expired.
+    /// A service was retired after an explicit stop, lease expiry, or config removal.
     Retired,
     /// A newer peer sent an event kind this binary does not know yet.
     #[serde(other)]
@@ -1455,12 +1459,29 @@ mod tests {
         assert_eq!(snapshot.health, None);
         assert_eq!(snapshot.origin, OriginKind::Configured);
         assert!(snapshot.dynamic.is_none());
+        assert_eq!(snapshot.retired, None);
+        assert_eq!(snapshot.retired_at_unix_ms, None);
 
         let encoded = serde_json::to_string(&snapshot)?;
         let decoded = serde_json::from_str::<ServiceSnapshot>(&encoded)?;
         assert_eq!(decoded.id, "svc");
         assert_eq!(decoded.pid, None);
         assert_eq!(decoded.started_at_unix_ms, None);
+        Ok(())
+    }
+
+    #[test]
+    fn configured_retirement_serializes_at_snapshot_top_level() -> serde_json::Result<()> {
+        let mut snapshot = running_snapshot("removed");
+        snapshot.origin = OriginKind::Configured;
+        snapshot.dynamic = None;
+        snapshot.retired = Some(RetiredReason::Removed);
+        snapshot.retired_at_unix_ms = Some(1234);
+
+        let encoded = serde_json::to_value(snapshot)?;
+        assert_eq!(encoded.get("retired"), Some(&json!("Removed")));
+        assert_eq!(encoded.get("retired_at_unix_ms"), Some(&json!(1234)));
+        assert!(encoded.get("dynamic").is_none());
         Ok(())
     }
 

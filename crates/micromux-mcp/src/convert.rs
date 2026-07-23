@@ -133,6 +133,19 @@ pub fn dynamic_service(
     }
 }
 
+/// Extract a config-reconciliation receipt.
+///
+/// # Errors
+///
+/// Returns a [`ToolError`] if the session replied with an error or an unexpected response.
+pub fn reconcile(response: Response) -> Result<micromux::ReconcileReceipt, ToolError> {
+    match response {
+        Response::Reconcile(receipt) => Ok(receipt),
+        Response::Error { code, message } => Err(remote_error(code, message)),
+        other => Err(ToolError::Unexpected(format!("{other:?}"))),
+    }
+}
+
 /// Confirm a shutdown was acknowledged.
 ///
 /// # Errors
@@ -155,7 +168,7 @@ pub enum WaitOutcome {
     Healthy,
     /// The target run exited; carries its exit code.
     Exited(Option<i32>),
-    /// The service is disabled and will never become healthy.
+    /// The service is disabled or retired and will never become healthy.
     InvalidState,
 }
 

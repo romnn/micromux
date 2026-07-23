@@ -17,6 +17,9 @@ pub fn health_style(health: Option<micromux::Health>) -> Style {
 
 #[must_use]
 pub fn service_style(snapshot: &micromux::ServiceSnapshot) -> Style {
+    if snapshot.retired.is_some() {
+        return Style::default().fg(tailwind::GRAY.c500);
+    }
     if snapshot.desired == micromux::Desired::Disabled {
         return Style::default().fg(Color::White).fg(tailwind::GRAY.c500);
     }

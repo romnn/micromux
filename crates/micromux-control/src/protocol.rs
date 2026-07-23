@@ -1,14 +1,14 @@
 //! The control wire protocol: newline-delimited JSON request/response envelopes.
 //!
 //! Domain payloads (`ServiceSnapshot`, `HealthAttempt`, `LogLine`, `SessionChange`,
-//! `ServiceCommandAck`, `DynamicServiceAck`, `ServiceEvent`, and `DynamicServiceParams`) are the
-//! stable core types reused directly — no DTO mirror. The session and the proxy accept peers that
-//! speak the same major protocol version, so additive payload changes do not orphan
-//! already-running sessions.
+//! `ServiceCommandAck`, `DynamicServiceAck`, `ReconcileReceipt`, `ServiceEvent`, and
+//! `DynamicServiceParams`) are the stable core types reused directly — no DTO mirror. The session
+//! and the proxy accept peers that speak the same major protocol version, so additive payload
+//! changes do not orphan already-running sessions.
 
 use micromux::{
     DynamicServiceAck, DynamicServiceParams, HealthAttempt, Lease, LogLine, LogRunSummary,
-    ServiceCommandAck, ServiceEvent, ServiceID, ServiceSnapshot, SessionChange,
+    ReconcileReceipt, ServiceCommandAck, ServiceEvent, ServiceID, ServiceSnapshot, SessionChange,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -150,6 +150,13 @@ pub enum Request {
     StopDynamicService {
         /// Dynamic service id.
         service: ServiceID,
+    },
+    /// Reconcile configured services against the session's on-disk config.
+    ///
+    /// The config file is the authority, so this operation has no dynamic-service capability gate.
+    ReconcileConfig {
+        /// Compute the semantic diff without mutating the session.
+        dry_run: bool,
     },
     /// Stop the whole session: stop every service and exit the session process (graceful, like the
     /// operator pressing Ctrl-C), freeing its ports. Acknowledged with [`Response::ShuttingDown`]
@@ -309,6 +316,8 @@ pub enum Response {
     },
     /// Reply to a dynamic-service mutation.
     DynamicService(DynamicServiceAck),
+    /// Reply to a config reconciliation.
+    Reconcile(ReconcileReceipt),
     /// A streamed change notification (only after [`Request::Subscribe`]).
     Change(SessionChange),
     /// Acknowledgement of [`Request::Shutdown`], written just before the session begins exiting.
@@ -461,6 +470,32 @@ mod tests {
         assert_eq!(minimal.expires_at_unix_ms, None);
         assert!(minimal.ports.is_empty());
         assert!(!minimal.already_retired);
+    }
+
+    #[test]
+    fn reconcile_request_and_receipt_round_trip() {
+        let request = Request::ReconcileConfig { dry_run: true };
+        let encoded = serde_json::to_value(&request).unwrap();
+        assert!(matches!(
+            serde_json::from_value::<Request>(encoded).unwrap(),
+            Request::ReconcileConfig { dry_run: true }
+        ));
+
+        let receipt = micromux::ReconcileReceipt {
+            config_path: "/project/micromux.yaml".to_string(),
+            dry_run: true,
+            actions: vec![micromux::ReconcileAction {
+                service: "worker".to_string(),
+                action: micromux::ReconcileActionKind::Changed,
+                detail: "changed service spec".to_string(),
+            }],
+        };
+        let encoded = serde_json::to_value(Response::Reconcile(receipt.clone())).unwrap();
+        let Response::Reconcile(decoded) = serde_json::from_value::<Response>(encoded).unwrap()
+        else {
+            panic!("expected a reconcile response");
+        };
+        assert_eq!(decoded, receipt);
     }
 
     #[test]

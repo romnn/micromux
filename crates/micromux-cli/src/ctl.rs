@@ -36,6 +36,7 @@ fn request_for(action: &CtlAction) -> Request {
         CtlAction::Disable { service } => Request::Disable {
             service: service.clone(),
         },
+        CtlAction::Reconcile { dry_run } => Request::ReconcileConfig { dry_run: *dry_run },
         CtlAction::Health { service } => Request::GetHealth {
             service: service.clone(),
         },
@@ -49,7 +50,7 @@ fn service_origin_label(service: &micromux::ServiceSnapshot) -> String {
         (micromux::OriginKind::Configured, _) => "configured".to_string(),
         (micromux::OriginKind::Dynamic, Some(dynamic)) => format!(
             "dynamic(revision={}, retired={:?})",
-            dynamic.revision, dynamic.retired
+            dynamic.revision, service.retired
         ),
         (micromux::OriginKind::Dynamic, None) => "dynamic".to_string(),
         (micromux::OriginKind::Unknown, _) => "unknown".to_string(),
@@ -142,6 +143,24 @@ fn print_response(response: &Response) -> eyre::Result<()> {
                 "accepted {} (revision {}, generation {})",
                 receipt.service, receipt.revision, receipt.observed_generation
             );
+        }
+        Response::Reconcile(receipt) => {
+            println!(
+                "reconcile {}{}",
+                receipt.config_path,
+                if receipt.dry_run { " (dry run)" } else { "" }
+            );
+            if receipt.actions.is_empty() {
+                println!("  no changes");
+            }
+            for action in &receipt.actions {
+                let action_name = match action.action {
+                    micromux::ReconcileActionKind::Added => "added",
+                    micromux::ReconcileActionKind::Removed => "removed",
+                    micromux::ReconcileActionKind::Changed => "changed",
+                };
+                println!("  {action_name:<7} {}: {}", action.service, action.detail);
+            }
         }
         Response::Error { code, message } => {
             eyre::bail!("{code:?}: {message}");

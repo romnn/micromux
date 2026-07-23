@@ -18,7 +18,7 @@ fn rendered_line_count(paragraph: &Paragraph<'_>, width: u16) -> u16 {
 
 #[cfg(test)]
 mod tests {
-    use super::{log_view::LogView, rendered_line_count};
+    use super::{log_view::LogView, rendered_line_count, state_name};
     use ratatui::{
         buffer::Buffer,
         layout::Rect,
@@ -80,6 +80,23 @@ mod tests {
         assert_eq!(wrapped_text_height(text.clone(), 4), 3);
         assert_eq!(wrapped_text_height(text.clone(), 5), 2);
         assert_eq!(wrapped_text_height(text, 10), 1);
+    }
+
+    #[test]
+    fn retired_state_takes_precedence_over_disabled_state() {
+        let mut snapshot = micromux::ServiceSnapshot::initial(
+            "removed".to_string(),
+            "removed".to_string(),
+            Vec::new(),
+            None,
+            micromux::RestartPolicy::Never,
+            Vec::new(),
+            None,
+        );
+        snapshot.desired = micromux::Desired::Disabled;
+        snapshot.retired = Some(micromux::RetiredReason::Removed);
+
+        assert_eq!(state_name(&snapshot), "RETIRED");
     }
 
     #[test]
@@ -377,6 +394,9 @@ fn build_healthcheck_text(configured: bool, attempts: &[micromux::HealthAttempt]
 }
 
 fn state_name(snapshot: &micromux::ServiceSnapshot) -> &'static str {
+    if snapshot.retired.is_some() {
+        return "RETIRED";
+    }
     if snapshot.desired == micromux::Desired::Disabled {
         return "DISABLED";
     }

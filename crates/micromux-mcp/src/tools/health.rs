@@ -509,14 +509,9 @@ pub(crate) async fn wait_for_health(
             snapshot,
             verdict: HealthVerdict::InvalidState,
         } => {
-            let message = if snapshot
-                .dynamic
-                .as_ref()
-                .is_some_and(|dynamic| dynamic.retired.is_some())
-            {
-                format!("service `{service}` is retired; use replace_dynamic_service to revive it")
-            } else {
-                format!("service `{service}` is disabled and will not become healthy")
+            let message = match snapshot.retired {
+                Some(reason) => retired_service_message(service, reason),
+                None => format!("service `{service}` is disabled and will not become healthy"),
             };
             Err(ToolError::InvalidState(message))
         }
@@ -529,6 +524,17 @@ pub(crate) async fn wait_for_health(
                 latest_healthcheck,
             })
         }
+    }
+}
+
+/// Explain how to revive a service according to its retirement authority.
+pub(crate) fn retired_service_message(service: &str, reason: micromux::RetiredReason) -> String {
+    if reason == micromux::RetiredReason::Removed {
+        format!(
+            "service `{service}` was removed; re-add it to micromux.yaml and run reconcile_config"
+        )
+    } else {
+        format!("service `{service}` is retired; use replace_dynamic_service to revive it")
     }
 }
 
@@ -688,6 +694,14 @@ mod tests {
                 "missing `{expected}` for exit code {exit_code}"
             );
         }
+    }
+
+    #[test]
+    fn removed_service_guidance_points_to_config_reconciliation() {
+        let message = retired_service_message("worker", micromux::RetiredReason::Removed);
+
+        assert!(message.contains("re-add it to micromux.yaml"));
+        assert!(message.contains("reconcile_config"));
     }
 
     #[test]

@@ -35,7 +35,7 @@ pub use endpoint::{
     ControlEndpoint, RuntimeDirStatus, endpoint_for, endpoint_from_hash, endpoint_hash,
     runtime_dir, runtime_dir_statuses, transport_supported, usable_runtime_dirs,
 };
-pub use micromux::DynamicServiceAck;
+pub use micromux::{DynamicServiceAck, ReconcileAction, ReconcileActionKind, ReconcileReceipt};
 pub use protocol::{
     DynamicServicesCaps, ErrorCode, PROTOCOL_VERSION, ProtocolVersion, Request, Response,
     ServiceBrief, SessionCapabilities, SessionInfo,

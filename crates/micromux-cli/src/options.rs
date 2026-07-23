@@ -134,6 +134,12 @@ pub enum CtlAction {
         /// The service to disable.
         service: String,
     },
+    /// Reconcile configured services with the on-disk config.
+    Reconcile {
+        /// Show the semantic diff without changing the running session.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Show the latest healthcheck attempt for a service's current live run.
     Health {
         /// The service to inspect.

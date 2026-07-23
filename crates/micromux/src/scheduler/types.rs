@@ -1,6 +1,6 @@
 //! Scheduler command and lifecycle types.
 
-use super::control::{CommandAck, DynamicCommandAck};
+use super::control::{CommandAck, DynamicCommandAck, ReconcileCommandAck};
 use crate::health_check::Health;
 use crate::{DynamicServiceParams, Lease};
 
@@ -208,6 +208,13 @@ pub enum Command {
         service: ServiceID,
         /// Optional reply channel for acknowledged commands.
         ack: Option<CommandAck>,
+    },
+    /// Reconcile configured services against the on-disk config.
+    ReconcileConfig {
+        /// Compute the semantic diff without mutating the session.
+        dry_run: bool,
+        /// Required reply channel.
+        ack: ReconcileCommandAck,
     },
     /// Create a dynamic service.
     StartDynamic {

@@ -59,7 +59,8 @@ pub use model::{
 };
 pub use scheduler::{
     Command, CommandRejection, DynamicServiceAck, DynamicServiceResult, OutputStream,
-    SchedulerStopped, ServiceCommandAck, ServiceCommandResult, ServiceControl, ServiceID,
+    ReconcileAction, ReconcileActionKind, ReconcileReceipt, ReconcileResult, SchedulerStopped,
+    ServiceCommandAck, ServiceCommandResult, ServiceControl, ServiceID,
 };
 pub use service::RestartPolicy;
 pub use spec::{

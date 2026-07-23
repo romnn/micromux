@@ -126,6 +126,43 @@ pub type ServiceCommandResult = Result<Vec<ServiceCommandAck>, CommandRejection>
 /// Result of one dynamic-service mutation.
 pub type DynamicServiceResult = Result<DynamicServiceAck, CommandRejection>;
 
+/// Kind of semantic change reported by config reconciliation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ReconcileActionKind {
+    /// A configured service will be added or revived.
+    Added,
+    /// A configured service will be retired.
+    Removed,
+    /// A configured service definition changed in place.
+    Changed,
+}
+
+/// One configured-service change reported by config reconciliation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ReconcileAction {
+    /// Affected service.
+    pub service: ServiceID,
+    /// Semantic change kind.
+    pub action: ReconcileActionKind,
+    /// Human-readable summary of the changed definition components.
+    pub detail: String,
+}
+
+/// Scheduler acknowledgement for a config reconciliation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ReconcileReceipt {
+    /// Config file read by the scheduler.
+    pub config_path: String,
+    /// Whether this invocation only computed the semantic diff.
+    pub dry_run: bool,
+    /// Changed services, ordered by service id.
+    pub actions: Vec<ReconcileAction>,
+}
+
+/// Result of one config reconciliation.
+pub type ReconcileResult = Result<ReconcileReceipt, CommandRejection>;
+
 /// The scheduler dropped the reply channel (it is shutting down) before acknowledging a command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error("the scheduler has stopped")]
@@ -143,6 +180,12 @@ pub struct CommandAck {
 #[derive(Debug)]
 pub struct DynamicCommandAck {
     tx: oneshot::Sender<DynamicServiceResult>,
+}
+
+/// Reply half for a config-reconciliation command.
+#[derive(Debug)]
+pub struct ReconcileCommandAck {
+    tx: oneshot::Sender<ReconcileResult>,
 }
 
 impl CommandAck {
@@ -164,6 +207,17 @@ impl DynamicCommandAck {
     }
 
     pub(crate) fn send(self, result: DynamicServiceResult) {
+        let _ = self.tx.send(result);
+    }
+}
+
+impl ReconcileCommandAck {
+    pub(crate) fn new() -> (Self, oneshot::Receiver<ReconcileResult>) {
+        let (tx, rx) = oneshot::channel();
+        (Self { tx }, rx)
+    }
+
+    pub(crate) fn send(self, result: ReconcileResult) {
         let _ = self.tx.send(result);
     }
 }
@@ -243,6 +297,25 @@ impl ServiceControl {
             ack: Some(ack),
         })
         .await
+    }
+
+    /// Reconcile configured services against the current on-disk config.
+    ///
+    /// This operation has no dynamic-service capability gate: the config file is the authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SchedulerStopped`] if the scheduler is no longer accepting commands.
+    pub async fn reconcile_config(
+        &self,
+        dry_run: bool,
+    ) -> Result<ReconcileResult, SchedulerStopped> {
+        let (ack, rx) = ReconcileCommandAck::new();
+        self.tx
+            .send(Command::ReconcileConfig { dry_run, ack })
+            .await
+            .map_err(|_| SchedulerStopped)?;
+        rx.await.map_err(|_| SchedulerStopped)
     }
 
     /// Create and start a dynamic service.

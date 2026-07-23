@@ -25,7 +25,7 @@ const RESTART_BACKOFF_BASE: Duration = Duration::from_millis(250);
 const RESTART_BACKOFF_MAX: Duration = Duration::from_secs(10);
 /// Minimum uptime after which a service is considered stable and its backoff is reset.
 const RESTART_BACKOFF_RESET: Duration = RESTART_BACKOFF_MAX;
-const MAX_RETIRED_DYNAMIC: usize = 8;
+const MAX_RETIRED_SERVICES: usize = 8;
 const IDEMPOTENCY_WINDOW: usize = 64;
 
 #[path = "scheduler/types.rs"]
@@ -39,7 +39,8 @@ pub(crate) use types::{LogUpdateKind, ProcessEvent, RunId, State};
 mod control;
 pub(crate) use control::CommandAck;
 pub use control::{
-    CommandRejection, DynamicServiceAck, DynamicServiceResult, SchedulerStopped, ServiceCommandAck,
+    CommandRejection, DynamicServiceAck, DynamicServiceResult, ReconcileAction,
+    ReconcileActionKind, ReconcileReceipt, ReconcileResult, SchedulerStopped, ServiceCommandAck,
     ServiceCommandResult, ServiceControl,
 };
 
@@ -520,10 +521,10 @@ pub(super) fn project_snapshot(
                 expires_at_unix_ms: origin.expires_at_unix_ms,
                 owner: origin.owner.clone(),
                 revision: origin.revision,
-                retired: runtime.retired,
-                retired_at_unix_ms: runtime.retired_at_unix_ms,
             }),
         },
+        retired: runtime.retired,
+        retired_at_unix_ms: runtime.retired_at_unix_ms,
         desired: match runtime.desired {
             DesiredState::Enabled => Desired::Enabled,
             DesiredState::Disabled => Desired::Disabled,
@@ -643,7 +644,11 @@ fn load_services_from_disk(reload: &ReloadConfig) -> Result<ServiceMap, String> 
     Ok(services)
 }
 
-fn validate_reloaded_services(current: &ServiceMap, updated: &ServiceMap) -> Result<(), String> {
+fn validate_reloaded_services(
+    current: &ServiceMap,
+    runtimes: &HashMap<ServiceID, ServiceRuntime>,
+    updated: &ServiceMap,
+) -> Result<(), String> {
     if let Some(id) = updated.keys().find(|id| {
         current
             .get(*id)
@@ -656,12 +661,21 @@ fn validate_reloaded_services(current: &ServiceMap, updated: &ServiceMap) -> Res
     let configured = current
         .iter()
         .filter_map(|(id, service)| {
-            matches!(service.origin, ServiceOrigin::Configured).then_some(id)
+            (matches!(service.origin, ServiceOrigin::Configured)
+                && runtimes
+                    .get(id)
+                    .is_some_and(|runtime| runtime.retired.is_none()))
+            .then_some(id)
         })
         .collect::<std::collections::HashSet<_>>();
     let missing = current
         .iter()
-        .filter(|(_, service)| matches!(service.origin, ServiceOrigin::Configured))
+        .filter(|(id, service)| {
+            matches!(service.origin, ServiceOrigin::Configured)
+                && runtimes
+                    .get(*id)
+                    .is_some_and(|runtime| runtime.retired.is_none())
+        })
         .map(|(id, _)| id)
         .filter(|service_id| !updated.contains_key(*service_id))
         .map(|id| (*id).clone())
@@ -679,11 +693,11 @@ fn validate_reloaded_services(current: &ServiceMap, updated: &ServiceMap) -> Res
             missing.join(", ")
         )),
         (true, false) => Err(format!(
-            "config reload cannot add services while the session is running: {}",
+            "config reload cannot add services while the session is running; use reconcile_config: {}",
             added.join(", ")
         )),
         (false, false) => Err(format!(
-            "config reload cannot add/remove services while the session is running; removed: {}; added: {}",
+            "config reload cannot add/remove services while the session is running; use reconcile_config; removed: {}; added: {}",
             missing.join(", "),
             added.join(", ")
         )),
@@ -1393,7 +1407,7 @@ impl SchedulerRuntime {
                 .values()
                 .filter(|runtime| runtime.retired.is_some())
                 .count();
-            if retired_count <= MAX_RETIRED_DYNAMIC {
+            if retired_count <= MAX_RETIRED_SERVICES {
                 return;
             }
             let depended_on = services
@@ -1436,13 +1450,18 @@ impl SchedulerRuntime {
             return Ok(());
         };
         let updated = load_services_from_disk(reload).map_err(CommandRejection::ConfigReload)?;
-        validate_reloaded_services(services, &updated).map_err(CommandRejection::ConfigReload)?;
+        validate_reloaded_services(services, &self.services, &updated)
+            .map_err(CommandRejection::ConfigReload)?;
 
         let mut merged = updated;
-        for (service_id, service) in services
-            .iter()
-            .filter(|(_, service)| matches!(service.origin, ServiceOrigin::Dynamic(_)))
-        {
+        for (service_id, service) in services.iter().filter(|(service_id, service)| {
+            matches!(service.origin, ServiceOrigin::Dynamic(_))
+                || (matches!(service.origin, ServiceOrigin::Configured)
+                    && self
+                        .services
+                        .get(*service_id)
+                        .is_some_and(|runtime| runtime.retired.is_some()))
+        }) {
             merged.insert(service_id.clone(), service.clone());
         }
         ServiceGraph::new(&merged)
@@ -1450,7 +1469,13 @@ impl SchedulerRuntime {
 
         let changed = services
             .iter()
-            .filter(|(_, service)| matches!(service.origin, ServiceOrigin::Configured))
+            .filter(|(service_id, service)| {
+                matches!(service.origin, ServiceOrigin::Configured)
+                    && self
+                        .services
+                        .get(*service_id)
+                        .is_some_and(|runtime| runtime.retired.is_none())
+            })
             .filter_map(|(service_id, service)| {
                 merged
                     .get(service_id)
@@ -1478,6 +1503,245 @@ impl SchedulerRuntime {
             }
         }
         Ok(())
+    }
+
+    fn reconcile_actions(
+        &self,
+        services: &ServiceMap,
+        updated: &ServiceMap,
+    ) -> Vec<ReconcileAction> {
+        let mut actions = Vec::new();
+        for (service_id, updated_service) in updated {
+            let current = services.get(service_id).filter(|service| {
+                matches!(service.origin, ServiceOrigin::Configured)
+                    && self
+                        .services
+                        .get(service_id)
+                        .is_some_and(|runtime| runtime.retired.is_none())
+            });
+            let Some(current) = current else {
+                actions.push(ReconcileAction {
+                    service: service_id.clone(),
+                    action: ReconcileActionKind::Added,
+                    detail: "configured service added".to_string(),
+                });
+                continue;
+            };
+
+            let mut changed = Vec::new();
+            if current.spec != updated_service.spec {
+                changed.push("service spec");
+            }
+            if current.startup_mode != updated_service.startup_mode {
+                changed.push("startup mode");
+            }
+            if current.log_retention != updated_service.log_retention {
+                changed.push("log retention");
+            }
+            if !changed.is_empty() {
+                actions.push(ReconcileAction {
+                    service: service_id.clone(),
+                    action: ReconcileActionKind::Changed,
+                    detail: format!("changed {}", changed.join(", ")),
+                });
+            }
+        }
+        actions.extend(
+            services
+                .iter()
+                .filter(|(service_id, service)| {
+                    matches!(service.origin, ServiceOrigin::Configured)
+                        && self
+                            .services
+                            .get(*service_id)
+                            .is_some_and(|runtime| runtime.retired.is_none())
+                        && !updated.contains_key(*service_id)
+                })
+                .map(|(service_id, _)| ReconcileAction {
+                    service: service_id.clone(),
+                    action: ReconcileActionKind::Removed,
+                    detail: "configured service removed".to_string(),
+                }),
+        );
+        actions.sort_by(|left, right| left.service.cmp(&right.service));
+        actions
+    }
+
+    fn validate_reconcile_candidate(
+        &self,
+        services: &ServiceMap,
+        updated: &ServiceMap,
+        actions: &[ReconcileAction],
+    ) -> Result<(), CommandRejection> {
+        if let Some(service_id) = updated.keys().find(|service_id| {
+            services
+                .get(*service_id)
+                .is_some_and(|service| matches!(service.origin, ServiceOrigin::Dynamic(_)))
+        }) {
+            return Err(CommandRejection::InvalidSpec(format!(
+                "service `{service_id}` exists as a live or retired dynamic service; stop it or rename the configured service"
+            )));
+        }
+
+        let removed = actions
+            .iter()
+            .filter(|action| action.action == ReconcileActionKind::Removed)
+            .map(|action| action.service.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        let mut dependents = services
+            .iter()
+            .filter(|(service_id, service)| {
+                matches!(service.origin, ServiceOrigin::Dynamic(_))
+                    && self
+                        .services
+                        .get(*service_id)
+                        .is_some_and(|runtime| runtime.retired.is_none())
+                    && service
+                        .spec
+                        .depends_on
+                        .iter()
+                        .any(|dependency| removed.contains(dependency.service.as_str()))
+            })
+            .map(|(service_id, _)| service_id.clone())
+            .collect::<Vec<_>>();
+        dependents.sort();
+        if !dependents.is_empty() {
+            return Err(CommandRejection::InvalidSpec(format!(
+                "cannot remove configured services while live dynamic services depend on them: {}",
+                dependents.join(", ")
+            )));
+        }
+
+        let mut candidate = updated.clone();
+        for (service_id, service) in services {
+            let preserved_dynamic = matches!(service.origin, ServiceOrigin::Dynamic(_));
+            let already_retired_configured = matches!(service.origin, ServiceOrigin::Configured)
+                && self
+                    .services
+                    .get(service_id)
+                    .is_some_and(|runtime| runtime.retired.is_some())
+                && !updated.contains_key(service_id);
+            let retained_tombstone =
+                removed.contains(service_id.as_str()) || already_retired_configured;
+            if preserved_dynamic || retained_tombstone {
+                candidate.insert(service_id.clone(), service.clone());
+            }
+        }
+        ServiceGraph::new(&candidate)
+            .map(|_| ())
+            .map_err(|err| CommandRejection::InvalidSpec(err.to_string()))
+    }
+
+    fn apply_reconcile(
+        &mut self,
+        services: &mut ServiceMap,
+        updated: &ServiceMap,
+        actions: &[ReconcileAction],
+    ) {
+        let by_service = actions
+            .iter()
+            .map(|action| (action.service.as_str(), action))
+            .collect::<HashMap<_, _>>();
+        for (service_id, service) in updated {
+            let Some(action) = by_service.get(service_id.as_str()) else {
+                continue;
+            };
+            match action.action {
+                ReconcileActionKind::Added => {
+                    let reviving = services
+                        .get(service_id)
+                        .is_some_and(|current| matches!(current.origin, ServiceOrigin::Configured))
+                        && self
+                            .services
+                            .get(service_id)
+                            .is_some_and(|runtime| runtime.retired.is_some());
+                    if reviving {
+                        if let Some(runtime) = self.services.get_mut(service_id) {
+                            runtime.retired = None;
+                            runtime.retired_at_unix_ms = None;
+                            runtime.expires_at = None;
+                            runtime.reconfigure(&service.spec.restart);
+                            match service.startup_mode {
+                                StartupMode::Enabled => runtime.request_restart(),
+                                StartupMode::Disabled => runtime.disable(),
+                            }
+                        }
+                        services.insert(service_id.clone(), service.clone());
+                        self.writer
+                            .reconfigure_log_retention(service_id, service.log_retention);
+                        self.sync(services, service_id);
+                    } else {
+                        let runtime = ServiceRuntime::new(ServiceRuntimeInit::from(service));
+                        let (snapshot, _) = project_snapshot(service, &runtime);
+                        services.insert(service_id.clone(), service.clone());
+                        self.services.insert(service_id.clone(), runtime);
+                        self.writer.insert_service(snapshot, service.log_retention);
+                    }
+                    self.append_event(
+                        service_id,
+                        ServiceEventKind::Created,
+                        "configured service added by config reconciliation",
+                    );
+                }
+                ReconcileActionKind::Changed => {
+                    if let Some(runtime) = self.services.get_mut(service_id) {
+                        runtime.reconfigure(&service.spec.restart);
+                    }
+                    services.insert(service_id.clone(), service.clone());
+                    self.writer
+                        .reconfigure_log_retention(service_id, service.log_retention);
+                    self.sync(services, service_id);
+                    self.append_event(
+                        service_id,
+                        ServiceEventKind::ConfigReloaded,
+                        format!("config reconciliation {}", action.detail),
+                    );
+                }
+                ReconcileActionKind::Removed => {}
+            }
+        }
+        for action in actions
+            .iter()
+            .filter(|action| action.action == ReconcileActionKind::Removed)
+        {
+            let service_id = &action.service;
+            if let Some(runtime) = self.services.get_mut(service_id) {
+                runtime.disable();
+                runtime.retired = Some(RetiredReason::Removed);
+                runtime.retired_at_unix_ms = unix_now_ms();
+                runtime.expires_at = None;
+            }
+            self.sync(services, service_id);
+            self.append_event(
+                service_id,
+                ServiceEventKind::Retired,
+                "configured service retired because it was removed by config reconciliation",
+            );
+        }
+    }
+
+    fn reconcile_config(
+        &mut self,
+        services: &mut ServiceMap,
+        dry_run: bool,
+    ) -> Result<ReconcileReceipt, CommandRejection> {
+        let reload = self.reload_config.as_ref().ok_or_else(|| {
+            CommandRejection::ConfigReload(
+                "session has no config path; config reconciliation is unavailable".to_string(),
+            )
+        })?;
+        let config_path = reload.config_path.display().to_string();
+        let updated = load_services_from_disk(reload).map_err(CommandRejection::ConfigReload)?;
+        let actions = self.reconcile_actions(services, &updated);
+        if !dry_run {
+            self.validate_reconcile_candidate(services, &updated, &actions)?;
+            self.apply_reconcile(services, &updated, &actions);
+        }
+        Ok(ReconcileReceipt {
+            config_path,
+            dry_run,
+            actions,
+        })
     }
 
     fn has_due_auto_restart(&self, services: &ServiceMap) -> bool {
@@ -1704,6 +1968,11 @@ impl SchedulerRuntime {
                     self.test_events.forward(Event::Disabled(service.clone()));
                 }
                 Self::reply(ack, result);
+                true
+            }
+            Command::ReconcileConfig { dry_run, ack } => {
+                let result = self.reconcile_config(services, dry_run);
+                ack.send(result);
                 true
             }
             Command::StartDynamic { params, ack } => {

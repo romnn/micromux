@@ -41,8 +41,8 @@ use serde::{Deserialize, Serialize};
 use crate::select::ToolError;
 use crate::tools::health::{
     ServiceDiagnosis, SnapshotWait, WaitConclusion, bounded_attempt, diagnose_service,
-    latest_health_for_snapshot, service_needs_diagnosis, service_snapshot, timeout_hint,
-    wait_for_health, wait_for_snapshot,
+    latest_health_for_snapshot, retired_service_message, service_needs_diagnosis, service_snapshot,
+    timeout_hint, wait_for_health, wait_for_snapshot,
 };
 use crate::tools::logs::{
     FollowGap, ServiceFollowGap, compact_logs_since, current_cursors, current_service_cursor,
@@ -116,6 +116,16 @@ struct SessionArgs {
     /// target the micromux running in the current project directory.
     #[serde(default)]
     session: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct ReconcileConfigArgs {
+    /// Optional session selector; omit for the current project.
+    #[serde(default)]
+    session: Option<String>,
+    /// Compute and return the semantic diff without changing the session.
+    #[serde(default)]
+    dry_run: bool,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -581,6 +591,14 @@ struct SessionMutationResult {
 }
 
 #[derive(Serialize, JsonSchema)]
+struct ReconcileConfigResult {
+    #[serde(flatten)]
+    session_ref: SessionRef,
+    dry_run: bool,
+    actions: Vec<micromux::ReconcileAction>,
+}
+
+#[derive(Serialize, JsonSchema)]
 struct StopSessionResult {
     stopped: bool,
     #[serde(flatten)]
@@ -785,10 +803,7 @@ fn classify_exit(snapshot: &ServiceSnapshot, after_generation: Option<u64>) -> O
         return Some(ExitVerdict::Exited);
     }
 
-    let retired = snapshot
-        .dynamic
-        .as_ref()
-        .is_some_and(|dynamic| dynamic.retired.is_some());
+    let retired = snapshot.retired.is_some();
     let unavailable = snapshot.desired == Desired::Disabled || retired;
     let qualifying_run_in_flight = generation_ready
         && matches!(
@@ -1251,6 +1266,36 @@ impl McpServer {
         .map_err(|err| ErrorData::internal_error(format!("validation task failed: {err}"), None))?
         .map_err(|err| ErrorData::invalid_params(err.to_string(), None))?;
         Ok(Json(report))
+    }
+
+    #[tool(
+        description = "Reconcile a running session's configured services with its on-disk \
+        micromux.yaml. Run with dry_run=true first to inspect the semantic add/remove/change diff; \
+        validate_config provides a no-session pre-flight. Changed services are not restarted, so \
+        follow with restart_service or restart_service_and_wait when the new definition should run."
+    )]
+    async fn reconcile_config(
+        &self,
+        args: Parameters<ReconcileConfigArgs>,
+    ) -> ToolResult<ReconcileConfigResult> {
+        let Parameters(args) = args;
+        let resolved = select::resolve(&self.cwd, args.session)
+            .await
+            .map_err(error_data)?;
+        let response = send_request(
+            &resolved.endpoint,
+            Request::ReconcileConfig {
+                dry_run: args.dry_run,
+            },
+        )
+        .await
+        .map_err(error_data)?;
+        let receipt = convert::reconcile(response).map_err(error_data)?;
+        Ok(Json(ReconcileConfigResult {
+            session_ref: SessionRef::from(&resolved.info),
+            dry_run: receipt.dry_run,
+            actions: receipt.actions,
+        }))
     }
 
     #[tool(
@@ -2352,15 +2397,8 @@ impl McpServer {
                 snapshot,
                 verdict: ExitVerdict::InvalidState,
             } => {
-                let message = if snapshot
-                    .dynamic
-                    .as_ref()
-                    .is_some_and(|dynamic| dynamic.retired.is_some())
-                {
-                    format!(
-                        "service `{}` is retired with no qualifying run in flight",
-                        args.service
-                    )
+                let message = if let Some(reason) = snapshot.retired {
+                    retired_service_message(&args.service, reason)
                 } else {
                     format!(
                         "service `{}` is disabled with no qualifying run in flight",
@@ -2467,15 +2505,10 @@ impl McpServer {
                 diagnosis: None,
             }));
         }
-        if snapshot
-            .dynamic
-            .as_ref()
-            .is_some_and(|dynamic| dynamic.retired.is_some())
-        {
-            return Err(error_data(ToolError::InvalidState(format!(
-                "service `{}` is retired; use replace_dynamic_service to revive it",
-                args.service
-            ))));
+        if let Some(reason) = snapshot.retired {
+            return Err(error_data(ToolError::InvalidState(
+                retired_service_message(&args.service, reason),
+            )));
         }
         let after_generation = if snapshot.desired == Desired::Disabled {
             let response = conn
@@ -2716,8 +2749,8 @@ mod tests {
     #[cfg(unix)]
     use super::{
         DynamicServiceArgs, EnsureAction, EnsureActionKind, EnsureReadyArgs, LogFilterArgs,
-        LogsArgs, RenewDynamicServiceArgs, ReplaceDynamicServiceArgs, ServiceArgs,
-        ServiceEventsArgs, SessionArgs, StartDynamicAndWaitArgs, WaitForExitArgs,
+        LogsArgs, ReconcileConfigArgs, RenewDynamicServiceArgs, ReplaceDynamicServiceArgs,
+        ServiceArgs, ServiceEventsArgs, SessionArgs, StartDynamicAndWaitArgs, WaitForExitArgs,
         WaitForExitStatus, WaitStatus,
     };
 
@@ -2968,6 +3001,7 @@ services:
             "stop_dynamic_service",
             "get_service_events",
             "validate_config",
+            "reconcile_config",
             "ensure_service_ready",
             "wait_for_exit",
         ] {
@@ -2976,6 +3010,91 @@ services:
                 "missing {name} tool"
             );
         }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reconcile_config_round_trips_through_the_mcp_tool() -> color_eyre::eyre::Result<()> {
+        let project = tempfile::tempdir()?;
+        let (session, selector) = boot_dynamic_mcp_session(project.path())?;
+        let mut server = McpServer::new();
+        server.cwd = project.path().to_path_buf();
+        std::fs::write(
+            project.path().join("micromux.yaml"),
+            r#"version: 1
+control:
+  dynamic_services:
+    enabled: true
+    allowed_working_roots: [.]
+    max_services: 2
+    max_lifetime: 1m
+services:
+  base:
+    command: ["sh", "-c", "sleep 60"]
+  disabled:
+    command: ["sh", "-c", "sleep 60"]
+    disabled: true
+  added:
+    command: ["sh", "-c", "sleep 60"]
+"#,
+        )?;
+
+        let Json(dry_run) = server
+            .reconcile_config(Parameters(ReconcileConfigArgs {
+                session: Some(selector.clone()),
+                dry_run: true,
+            }))
+            .await
+            .map_err(|err| color_eyre::eyre::eyre!(err.message))?;
+        assert!(dry_run.dry_run);
+        assert!(!dry_run.session_ref.id.is_empty());
+        assert_eq!(dry_run.actions.len(), 1);
+        assert_eq!(dry_run.actions[0].service, "added");
+        assert_eq!(
+            dry_run.actions[0].action,
+            micromux::ReconcileActionKind::Added
+        );
+        assert_json_keys(
+            &dry_run,
+            &["session", "id", "pid", "config_path", "dry_run", "actions"],
+        )?;
+        let Json(before_apply) = server
+            .list_services(Parameters(SessionArgs {
+                session: Some(selector.clone()),
+            }))
+            .await
+            .map_err(|err| color_eyre::eyre::eyre!(err.message))?;
+        assert!(
+            before_apply
+                .services
+                .iter()
+                .all(|snapshot| snapshot.id != "added")
+        );
+
+        let Json(applied) = server
+            .reconcile_config(Parameters(ReconcileConfigArgs {
+                session: Some(selector.clone()),
+                dry_run: false,
+            }))
+            .await
+            .map_err(|err| color_eyre::eyre::eyre!(err.message))?;
+        assert!(!applied.dry_run);
+        assert_eq!(applied.actions, dry_run.actions);
+        let Json(after_apply) = server
+            .list_services(Parameters(SessionArgs {
+                session: Some(selector),
+            }))
+            .await
+            .map_err(|err| color_eyre::eyre::eyre!(err.message))?;
+        assert!(
+            after_apply
+                .services
+                .iter()
+                .any(|snapshot| snapshot.id == "added")
+        );
+
+        session.finish().await?;
         Ok(())
     }
 
@@ -3298,8 +3417,7 @@ services:
             .services
             .iter()
             .find(|snapshot| snapshot.id == "debug")
-            .and_then(|snapshot| snapshot.dynamic.as_ref())
-            .and_then(|info| info.retired);
+            .and_then(|snapshot| snapshot.retired);
         assert_eq!(retired, Some(micromux::RetiredReason::Stopped));
         assert!(dynamic_log_visible(&server, &selector).await?);
 

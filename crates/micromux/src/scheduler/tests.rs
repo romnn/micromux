@@ -133,6 +133,14 @@ fn dynamic_accepted(
         .map_err(|rejection| eyre::eyre!("unexpected rejection: {rejection}"))
 }
 
+fn reconcile_accepted(
+    result: Result<ReconcileResult, SchedulerStopped>,
+) -> eyre::Result<ReconcileReceipt> {
+    result
+        .map_err(|_| eyre::eyre!("scheduler stopped"))?
+        .map_err(|rejection| eyre::eyre!("unexpected rejection: {rejection}"))
+}
+
 async fn assert_idempotency_collision(control: &ServiceControl) -> eyre::Result<()> {
     let mut collision = dynamic_params("debug", &["true"]);
     collision.idempotency_key = Some("create-debug".to_string());
@@ -182,10 +190,7 @@ async fn assert_dynamic_retirement(harness: &Harness) -> eyre::Result<()> {
     let stopped = dynamic_accepted(harness.control.stop_dynamic(&"debug".to_string()).await)?;
     assert!(!stopped.already_retired);
     let retired = wait_until(&harness.reader, "debug", |snapshot| {
-        snapshot
-            .dynamic
-            .as_ref()
-            .is_some_and(|dynamic| dynamic.retired == Some(RetiredReason::Stopped))
+        snapshot.retired == Some(RetiredReason::Stopped)
     })
     .await?;
     assert_eq!(retired.desired, Desired::Disabled);
@@ -676,10 +681,7 @@ async fn dynamic_policy_limit_ttl_and_dependency_gating() -> eyre::Result<()> {
     })
     .await?;
     wait_until(&harness.reader, "worker", |snapshot| {
-        snapshot
-            .dynamic
-            .as_ref()
-            .is_some_and(|dynamic| dynamic.retired == Some(RetiredReason::Expired))
+        snapshot.retired == Some(RetiredReason::Expired)
     })
     .await?;
     let events = harness.reader.events("worker", None, None).0;
@@ -753,7 +755,7 @@ async fn unbounded_dynamic_lease_has_no_expiry_and_does_not_retire() -> eyre::Re
         .dynamic
         .ok_or_else(|| eyre::eyre!("unbounded service has no dynamic metadata"))?;
     assert_eq!(dynamic.expires_at_unix_ms, None);
-    assert_eq!(dynamic.retired, None);
+    assert_eq!(snapshot.retired, None);
 
     harness.shutdown.cancel();
     harness.handle.await??;
@@ -914,15 +916,12 @@ async fn reviving_retired_dynamic_requires_a_free_live_slot() -> eyre::Result<()
         replacement,
         Err(CommandRejection::LimitExceeded(_))
     ));
-    assert!(
-        harness
-            .reader
-            .service("retired")
-            .and_then(|snapshot| snapshot.dynamic)
-            .is_some_and(|dynamic| {
-                dynamic.revision == 1 && dynamic.retired == Some(RetiredReason::Stopped)
-            })
-    );
+    assert!(harness.reader.service("retired").is_some_and(|snapshot| {
+        snapshot
+            .dynamic
+            .is_some_and(|dynamic| dynamic.revision == 1)
+            && snapshot.retired == Some(RetiredReason::Stopped)
+    }));
 
     harness.shutdown.cancel();
     harness.handle.await??;
@@ -1029,7 +1028,7 @@ async fn dynamic_replace_rejects_cycles_before_mutating() -> eyre::Result<()> {
 async fn retired_eviction_keeps_live_dependency_targets() -> eyre::Result<()> {
     let dir = tempfile::tempdir()?;
     let mut policy = enabled_dynamic_policy(dir.path())?;
-    policy.max_services = MAX_RETIRED_DYNAMIC + 4;
+    policy.max_services = MAX_RETIRED_SERVICES + 4;
     let harness =
         spawn_harness_with_policy(ServiceMap::new(), None, dir.path().to_path_buf(), policy);
 
@@ -1056,7 +1055,7 @@ async fn retired_eviction_keeps_live_dependency_targets() -> eyre::Result<()> {
     .await?;
     dynamic_accepted(harness.control.stop_dynamic(&"anchor".to_string()).await)?;
 
-    for index in 0..(MAX_RETIRED_DYNAMIC + 2) {
+    for index in 0..(MAX_RETIRED_SERVICES + 2) {
         let id = format!("disposable-{index:02}");
         dynamic_accepted(
             harness
@@ -1076,14 +1075,9 @@ async fn retired_eviction_keeps_live_dependency_targets() -> eyre::Result<()> {
         let snapshots = harness.reader.services();
         let retired = snapshots
             .iter()
-            .filter(|snapshot| {
-                snapshot
-                    .dynamic
-                    .as_ref()
-                    .is_some_and(|dynamic| dynamic.retired.is_some())
-            })
+            .filter(|snapshot| snapshot.retired.is_some())
             .count();
-        if retired <= MAX_RETIRED_DYNAMIC {
+        if retired <= MAX_RETIRED_SERVICES {
             assert!(snapshots.iter().any(|snapshot| snapshot.id == "anchor"));
             assert!(snapshots.iter().any(|snapshot| snapshot.id == "dependent"));
             // Eviction removes the *oldest* evictable entries: the first disposable goes even
@@ -1093,7 +1087,7 @@ async fn retired_eviction_keeps_live_dependency_targets() -> eyre::Result<()> {
                     .iter()
                     .any(|snapshot| snapshot.id == "disposable-00")
             );
-            let newest = format!("disposable-{:02}", MAX_RETIRED_DYNAMIC + 1);
+            let newest = format!("disposable-{:02}", MAX_RETIRED_SERVICES + 1);
             assert!(snapshots.iter().any(|snapshot| snapshot.id == newest));
             break;
         }
@@ -1112,10 +1106,10 @@ async fn retired_eviction_keeps_live_dependency_targets() -> eyre::Result<()> {
 async fn retired_eviction_waits_for_slow_processes_and_log_readers() -> eyre::Result<()> {
     let dir = tempfile::tempdir()?;
     let mut policy = enabled_dynamic_policy(dir.path())?;
-    policy.max_services = MAX_RETIRED_DYNAMIC + 2;
+    policy.max_services = MAX_RETIRED_SERVICES + 2;
     let harness =
         spawn_harness_with_policy(ServiceMap::new(), None, dir.path().to_path_buf(), policy);
-    let retired_ids = (0..=MAX_RETIRED_DYNAMIC)
+    let retired_ids = (0..=MAX_RETIRED_SERVICES)
         .map(|index| format!("slow-{index:02}"))
         .collect::<Vec<_>>();
 
@@ -1270,6 +1264,345 @@ services:
     fs::write(&config_path, yaml("true"))?;
     let err = load_services_from_disk(&reload).expect_err("strict reload should reject warning");
     assert!(err.contains("unknown service field"));
+    Ok(())
+}
+
+async fn assert_reconcile_dry_run(
+    harness: &Harness,
+    before_x: &crate::model::ServiceSnapshot,
+    before_y: &crate::model::ServiceSnapshot,
+) -> eyre::Result<ReconcileReceipt> {
+    let dry_run = reconcile_accepted(harness.control.reconcile_config(true).await)?;
+    assert!(dry_run.dry_run);
+    assert_eq!(
+        dry_run
+            .actions
+            .iter()
+            .map(|action| (action.service.as_str(), action.action))
+            .collect::<Vec<_>>(),
+        vec![
+            ("x", ReconcileActionKind::Removed),
+            ("y", ReconcileActionKind::Changed),
+            ("z", ReconcileActionKind::Added),
+        ]
+    );
+    let changed = dry_run
+        .actions
+        .iter()
+        .find(|action| action.service == "y")
+        .ok_or_else(|| eyre::eyre!("missing y action"))?;
+    for component in ["service spec", "startup mode", "log retention"] {
+        assert!(changed.detail.contains(component), "{}", changed.detail);
+    }
+    assert_eq!(
+        harness.reader.service("x").map(|snapshot| (
+            snapshot.run_generation,
+            snapshot.command,
+            snapshot.retired,
+        )),
+        Some((before_x.run_generation, before_x.command.clone(), None))
+    );
+    assert_eq!(
+        harness.reader.service("y").map(|snapshot| (
+            snapshot.run_generation,
+            snapshot.command,
+            snapshot.retired,
+        )),
+        Some((before_y.run_generation, before_y.command.clone(), None))
+    );
+    assert!(harness.reader.service("z").is_none());
+    Ok(dry_run)
+}
+
+async fn apply_reconcile_and_assert(
+    harness: &Harness,
+    config_path: &Path,
+    before_x: &crate::model::ServiceSnapshot,
+    before_y: &crate::model::ServiceSnapshot,
+    dry_run: &ReconcileReceipt,
+) -> eyre::Result<()> {
+    let applied = reconcile_accepted(harness.control.reconcile_config(false).await)?;
+    assert!(!applied.dry_run);
+    assert_eq!(applied.actions, dry_run.actions);
+    let removed = wait_until(&harness.reader, "x", |snapshot| {
+        snapshot.retired == Some(RetiredReason::Removed)
+    })
+    .await?;
+    assert_eq!(removed.desired, Desired::Disabled);
+    assert!(removed.retired_at_unix_ms.is_some());
+    assert!(
+        harness
+            .reader
+            .logs("x", None)
+            .iter()
+            .any(|line| line.line.contains("x-old"))
+    );
+    wait_for_log(&harness.reader, "z", "z-new").await?;
+    let stale_y = harness
+        .reader
+        .service("y")
+        .ok_or_else(|| eyre::eyre!("missing y after reconcile"))?;
+    assert_eq!(stale_y.run_generation, before_y.run_generation);
+    assert_eq!(stale_y.pid, before_y.pid);
+    assert!(stale_y.config_stale);
+    assert_eq!(stale_y.command, before_y.command);
+
+    accepted(harness.control.restart(&"y".to_string()).await)?;
+    wait_until(&harness.reader, "y", |snapshot| {
+        snapshot.run_generation == before_y.run_generation + 1
+            && snapshot.execution == Execution::Running
+    })
+    .await?;
+    wait_for_log(&harness.reader, "y", "y-new").await?;
+
+    fs::write(
+        config_path,
+        r#"version: 1
+services:
+  x:
+    command: ["sh", "-c", "echo x-revived; sleep 60"]
+  y:
+    command: ["sh", "-c", "echo y-new; sleep 60"]
+    disabled: true
+    logs:
+      retained_runs: 2
+  z:
+    command: ["sh", "-c", "echo z-new; sleep 60"]
+"#,
+    )?;
+    let implicit_revival = harness
+        .control
+        .restart(&"y".to_string())
+        .await
+        .map_err(|_| eyre::eyre!("scheduler stopped"))?;
+    assert!(
+        matches!(implicit_revival, Err(CommandRejection::ConfigReload(message)) if message.contains("reconcile_config"))
+    );
+    let revived = reconcile_accepted(harness.control.reconcile_config(false).await)?;
+    let [revived_action] = revived.actions.as_slice() else {
+        eyre::bail!("expected one revival action, got {:?}", revived.actions);
+    };
+    assert_eq!(revived_action.service, "x");
+    assert_eq!(revived_action.action, ReconcileActionKind::Added);
+    let revived_x = wait_until(&harness.reader, "x", |snapshot| {
+        snapshot.retired.is_none()
+            && snapshot.run_generation == before_x.run_generation + 1
+            && snapshot.execution == Execution::Running
+    })
+    .await?;
+    assert_eq!(revived_x.origin, OriginKind::Configured);
+    wait_for_log(&harness.reader, "x", "x-revived").await
+}
+
+#[tokio::test]
+async fn reconcile_dry_run_and_apply_cover_add_remove_change_reload_and_revival() -> eyre::Result<()>
+{
+    let dir = tempfile::tempdir()?;
+    let config_path = dir.path().join("micromux.yaml");
+    fs::write(
+        &config_path,
+        r#"version: 1
+services:
+  x:
+    command: ["sh", "-c", "echo x-old; sleep 60"]
+  y:
+    command: ["sh", "-c", "echo y-old; sleep 60"]
+"#,
+    )?;
+    let services = services_from_config_path(&config_path)?;
+    let harness = spawn_harness(
+        services,
+        Some(ReloadConfig {
+            config_path: config_path.clone(),
+            strict_override: None,
+        }),
+    );
+    wait_for_log(&harness.reader, "x", "x-old").await?;
+    wait_for_log(&harness.reader, "y", "y-old").await?;
+    let before_x = harness
+        .reader
+        .service("x")
+        .ok_or_else(|| eyre::eyre!("missing x"))?;
+    let before_y = harness
+        .reader
+        .service("y")
+        .ok_or_else(|| eyre::eyre!("missing y"))?;
+
+    fs::write(
+        &config_path,
+        r#"version: 1
+services:
+  y:
+    command: ["sh", "-c", "echo y-new; sleep 60"]
+    disabled: true
+    logs:
+      retained_runs: 2
+  z:
+    command: ["sh", "-c", "echo z-new; sleep 60"]
+"#,
+    )?;
+    let dry_run = assert_reconcile_dry_run(&harness, &before_x, &before_y).await?;
+    apply_reconcile_and_assert(&harness, &config_path, &before_x, &before_y, &dry_run).await?;
+
+    harness.shutdown.cancel();
+    harness.handle.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn reconcile_rejects_dynamic_dependencies_collisions_and_invalid_files_without_mutation()
+-> eyre::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let config_path = dir.path().join("micromux.yaml");
+    fs::write(&config_path, reload_test_yaml("base-running"))?;
+    let services = services_from_config_path(&config_path)?;
+    let harness = spawn_harness_with_policy(
+        services,
+        Some(ReloadConfig {
+            config_path: config_path.clone(),
+            strict_override: None,
+        }),
+        dir.path().to_path_buf(),
+        enabled_dynamic_policy(dir.path())?,
+    );
+    wait_for_log(&harness.reader, "svc", "base-running").await?;
+    let mut params = dynamic_params("job", &["sh", "-c", "sleep 60"]);
+    params.spec.depends_on = Some(vec![crate::DependencySpec {
+        service: "svc".to_string(),
+        condition: config::DependencyCondition::Started,
+    }]);
+    dynamic_accepted(harness.control.start_dynamic(params).await)?;
+    wait_until(&harness.reader, "job", |snapshot| {
+        snapshot.execution == Execution::Running
+    })
+    .await?;
+
+    fs::write(&config_path, "version: 1\nservices: {}\n")?;
+    let depended_on = harness
+        .control
+        .reconcile_config(false)
+        .await
+        .map_err(|_| eyre::eyre!("scheduler stopped"))?;
+    assert!(
+        matches!(depended_on, Err(CommandRejection::InvalidSpec(message)) if message.contains("job"))
+    );
+    assert!(harness.reader.service("svc").is_some());
+
+    fs::write(
+        &config_path,
+        r#"version: 1
+services:
+  svc:
+    command: ["sh", "-c", "echo base-running; sleep 60"]
+  job:
+    command: ["true"]
+"#,
+    )?;
+    let collision = harness
+        .control
+        .reconcile_config(false)
+        .await
+        .map_err(|_| eyre::eyre!("scheduler stopped"))?;
+    assert!(
+        matches!(collision, Err(CommandRejection::InvalidSpec(message)) if message.contains("live or retired dynamic service"))
+    );
+    assert_eq!(harness.reader.services().len(), 2);
+    dynamic_accepted(harness.control.stop_dynamic(&"job".to_string()).await)?;
+    wait_until(&harness.reader, "job", |snapshot| {
+        snapshot.retired == Some(RetiredReason::Stopped)
+    })
+    .await?;
+    let retired_collision = harness
+        .control
+        .reconcile_config(false)
+        .await
+        .map_err(|_| eyre::eyre!("scheduler stopped"))?;
+    assert!(
+        matches!(retired_collision, Err(CommandRejection::InvalidSpec(message)) if message.contains("live or retired dynamic service"))
+    );
+
+    let before = harness
+        .reader
+        .service("svc")
+        .ok_or_else(|| eyre::eyre!("missing svc"))?;
+    fs::write(
+        &config_path,
+        r"version: 1
+services:
+  svc:
+    working_dir: ./
+",
+    )?;
+    let invalid = harness
+        .control
+        .reconcile_config(false)
+        .await
+        .map_err(|_| eyre::eyre!("scheduler stopped"))?;
+    assert!(matches!(invalid, Err(CommandRejection::ConfigReload(_))));
+    let after = harness
+        .reader
+        .service("svc")
+        .ok_or_else(|| eyre::eyre!("svc disappeared"))?;
+    assert_eq!(after.run_generation, before.run_generation);
+    assert_eq!(after.pid, before.pid);
+    assert_eq!(harness.reader.services().len(), 2);
+
+    harness.shutdown.cancel();
+    harness.handle.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn reconcile_requires_a_reloadable_config_path() -> eyre::Result<()> {
+    let harness = spawn_harness(ServiceMap::new(), None);
+    let result = harness
+        .control
+        .reconcile_config(false)
+        .await
+        .map_err(|_| eyre::eyre!("scheduler stopped"))?;
+    assert!(
+        matches!(result, Err(CommandRejection::ConfigReload(message)) if message.contains("no config path"))
+    );
+    harness.shutdown.cancel();
+    harness.handle.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn reconcile_add_honors_disabled_startup_mode() -> eyre::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let config_path = dir.path().join("micromux.yaml");
+    fs::write(&config_path, "version: 1\nservices: {}\n")?;
+    let services = services_from_config_path(&config_path)?;
+    let harness = spawn_harness(
+        services,
+        Some(ReloadConfig {
+            config_path: config_path.clone(),
+            strict_override: None,
+        }),
+    );
+    fs::write(
+        &config_path,
+        r#"version: 1
+services:
+  parked:
+    command: ["sh", "-c", "sleep 60"]
+    disabled: true
+"#,
+    )?;
+
+    reconcile_accepted(harness.control.reconcile_config(false).await)?;
+    let parked = harness
+        .reader
+        .service("parked")
+        .ok_or_else(|| eyre::eyre!("disabled addition is missing"))?;
+    assert_eq!(parked.desired, Desired::Disabled);
+    assert_eq!(parked.execution, Execution::Pending);
+    assert_eq!(parked.run_generation, 0);
+    assert_eq!(parked.pid, None);
+
+    harness.shutdown.cancel();
+    harness.handle.await??;
     Ok(())
 }
 
