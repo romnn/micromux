@@ -18,7 +18,10 @@ fn rendered_line_count(paragraph: &Paragraph<'_>, width: u16) -> u16 {
 
 #[cfg(test)]
 mod tests {
-    use super::{log_view::LogView, rendered_line_count, state_name};
+    use super::{
+        lease_phrase, log_view::LogView, rendered_line_count, service_detail_line, shell_join,
+        state_name,
+    };
     use ratatui::{
         buffer::Buffer,
         layout::Rect,
@@ -45,7 +48,7 @@ mod tests {
         } else {
             u16::try_from(text.height()).unwrap_or(u16::MAX)
         };
-        view.render(log_area, scrollbar_area, num_lines, text, buf)
+        view.render(log_area, scrollbar_area, num_lines, text, None, buf)
     }
 
     fn count_thumb(buf: &Buffer, area: Rect) -> usize {
@@ -97,6 +100,70 @@ mod tests {
         snapshot.retired = Some(micromux::RetiredReason::Removed);
 
         assert_eq!(state_name(&snapshot), "RETIRED");
+    }
+
+    #[test]
+    fn shell_join_quotes_only_arguments_a_shell_would_split() {
+        let argv = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "echo hi".to_string(),
+            String::new(),
+        ];
+        assert_eq!(shell_join(&argv), r#"sh -c "echo hi" """#);
+    }
+
+    #[test]
+    fn lease_phrase_covers_every_magnitude_and_the_unbounded_lease() {
+        assert_eq!(lease_phrase(None, 1_000), "no expiry");
+        assert_eq!(lease_phrase(Some(500), 1_000), "expired");
+        assert_eq!(lease_phrase(Some(31_000), 1_000), "expires in ~30s");
+        assert_eq!(lease_phrase(Some(91_000), 1_000), "expires in ~1m");
+        assert_eq!(lease_phrase(Some(7_201_000), 1_000), "expires in ~2h");
+        assert_eq!(lease_phrase(Some(259_201_000), 1_000), "expires in ~3d");
+    }
+
+    #[test]
+    fn service_detail_shows_the_command_generation_and_dynamic_lease_facts() {
+        let mut snapshot = micromux::ServiceSnapshot::initial(
+            "svc".to_string(),
+            "svc".to_string(),
+            Vec::new(),
+            None,
+            micromux::RestartPolicy::Never,
+            vec!["sh".to_string(), "-c".to_string(), "sleep 60".to_string()],
+            None,
+        );
+        snapshot.run_generation = 3;
+        let configured = service_detail_line(&snapshot, 1_000)
+            .map(|line| line.to_string())
+            .unwrap_or_default();
+        assert_eq!(configured, r#" $ sh -c "sleep 60"  gen 3 "#);
+
+        snapshot.origin = micromux::OriginKind::Dynamic;
+        snapshot.dynamic = Some(micromux::DynamicServiceInfo {
+            created_at_unix_ms: 0,
+            expires_at_unix_ms: Some(61_000),
+            owner: Some("agent".to_string()),
+            revision: 2,
+        });
+        let dynamic = service_detail_line(&snapshot, 1_000)
+            .map(|line| line.to_string())
+            .unwrap_or_default();
+        assert_eq!(
+            dynamic,
+            r#" $ sh -c "sleep 60"  gen 3  dynamic · rev 2 · expires in ~1m · owner agent "#
+        );
+
+        // A countdown on a dead lease would only mislead; retirement owns the status column.
+        snapshot.retired = Some(micromux::RetiredReason::Expired);
+        let retired = service_detail_line(&snapshot, 1_000)
+            .map(|line| line.to_string())
+            .unwrap_or_default();
+        assert_eq!(
+            retired,
+            r#" $ sh -c "sleep 60"  gen 3  dynamic · rev 2 · owner agent "#
+        );
     }
 
     #[test]
@@ -416,6 +483,81 @@ fn state_name(snapshot: &micromux::ServiceSnapshot) -> &'static str {
     }
 }
 
+/// Join argv for display, quoting only arguments a shell would split.
+fn shell_join(argv: &[String]) -> String {
+    argv.iter()
+        .map(|arg| {
+            if arg.is_empty() || arg.chars().any(char::is_whitespace) {
+                format!("{arg:?}")
+            } else {
+                arg.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Wall clock in the unit lease expiries are expressed in.
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+        })
+}
+
+/// Human phrase for a dynamic service's lease. The remaining time is computed at draw time and
+/// marked approximate — the TUI redraws on changes, not on a clock.
+fn lease_phrase(expires_at_unix_ms: Option<u64>, now_unix_ms: u64) -> String {
+    let Some(expires_at_unix_ms) = expires_at_unix_ms else {
+        return "no expiry".to_string();
+    };
+    let Some(remaining_ms) = expires_at_unix_ms.checked_sub(now_unix_ms) else {
+        return "expired".to_string();
+    };
+    let secs = remaining_ms / 1000;
+    if secs < 60 {
+        format!("expires in ~{secs}s")
+    } else if secs < 3600 {
+        format!("expires in ~{}m", secs / 60)
+    } else if secs < 86_400 {
+        format!("expires in ~{}h", secs / 3600)
+    } else {
+        format!("expires in ~{}d", secs / 86_400)
+    }
+}
+
+/// One-line identity of the selected service for the logs pane frame: the resolved command it
+/// runs, its run generation, and for dynamic services the definition revision plus the lease and
+/// ownership facts an operator needs at a glance.
+fn service_detail_line(
+    snapshot: &micromux::ServiceSnapshot,
+    now_unix_ms: u64,
+) -> Option<Line<'static>> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let command = shell_join(&snapshot.command);
+    if !command.is_empty() {
+        spans.push(format!(" $ {command} ").fg(tailwind::GRAY.c400));
+    }
+    spans.push(format!(" gen {} ", snapshot.run_generation).fg(tailwind::GRAY.c400));
+    if snapshot.origin == micromux::OriginKind::Dynamic {
+        let mut facts = vec!["dynamic".to_string()];
+        if let Some(dynamic) = &snapshot.dynamic {
+            facts.push(format!("rev {}", dynamic.revision));
+            // Retirement already owns the status column; a countdown on a dead lease would only
+            // mislead.
+            if snapshot.retired.is_none() {
+                facts.push(lease_phrase(dynamic.expires_at_unix_ms, now_unix_ms));
+            }
+            if let Some(owner) = &dynamic.owner {
+                facts.push(format!("owner {owner}"));
+            }
+        }
+        spans.push(format!(" {} ", facts.join(" · ")).fg(tailwind::YELLOW.c500));
+    }
+    (!spans.is_empty()).then(|| Line::from(spans))
+}
+
 impl Widget for &mut App {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let [header_area, main_area, footer_area] = Layout::default()
@@ -633,6 +775,7 @@ impl App {
         };
         let num_lines = current_service.cached_wrapped_lines;
         let text = current_service.cached_text.clone();
+        let detail = service_detail_line(&current_service.snapshot, now_unix_ms());
         tracing::trace!(
             service_id = current_service.snapshot.id,
             num_lines,
@@ -640,7 +783,7 @@ impl App {
         );
 
         self.log_view
-            .render(logs_area, scrollbar_area, num_lines, text, buf);
+            .render(logs_area, scrollbar_area, num_lines, text, detail, buf);
     }
 
     fn render_healthchecks(&mut self, area: Rect, buf: &mut Buffer) {
@@ -875,12 +1018,15 @@ pub mod log_view {
     impl LogView {
         /// Render the log view and return the wrap-aware rendered line count, so callers can
         /// clamp keyboard scrolling consistently with the scrollbar/follow-tail behavior.
+        ///
+        /// `detail` is drawn into the bottom border as the selected service's identity line.
         pub fn render(
             &mut self,
             log_area: Rect,
             scrollbar_area: Rect,
             num_lines: u16,
             text: ratatui::text::Text<'static>,
+            detail: Option<ratatui::text::Line<'static>>,
             buf: &mut Buffer,
         ) -> u16 {
             Clear.render(log_area, buf);
@@ -907,9 +1053,11 @@ pub mod log_view {
                 .viewport_content_length(viewport_height.into())
                 .position(self.scroll_offset as usize);
 
-            let paragraph = paragraph
-                .block(Block::default().borders(Borders::ALL).title("Logs"))
-                .scroll((self.scroll_offset, 0)); // scroll by lines then cols
+            let mut block = Block::default().borders(Borders::ALL).title("Logs");
+            if let Some(detail) = detail {
+                block = block.title_bottom(detail);
+            }
+            let paragraph = paragraph.block(block).scroll((self.scroll_offset, 0)); // scroll by lines then cols
 
             Widget::render(&paragraph, log_area, buf);
 
