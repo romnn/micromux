@@ -40,9 +40,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::select::ToolError;
 use crate::tools::health::{
-    ServiceDiagnosis, WaitConclusion, bounded_attempt, diagnose_service,
+    ServiceDiagnosis, SnapshotWait, WaitConclusion, bounded_attempt, diagnose_service,
     latest_health_for_snapshot, service_needs_diagnosis, service_snapshot, timeout_hint,
-    wait_for_health,
+    wait_for_health, wait_for_snapshot,
 };
 use crate::tools::logs::{
     FollowGap, ServiceFollowGap, compact_logs_since, current_cursors, current_service_cursor,
@@ -321,6 +321,24 @@ struct WaitArgs {
     /// Maximum seconds to wait (default 60, capped at 600).
     #[serde(default)]
     timeout_secs: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct WaitForExitArgs {
+    /// The id of the target service.
+    service: String,
+    /// Optional session selector; omit for the current project.
+    #[serde(default)]
+    session: Option<String>,
+    /// Resolve only once a run with generation greater than this exits.
+    #[serde(default)]
+    after_generation: Option<u64>,
+    /// Maximum seconds to wait (default 60, capped at 600).
+    #[serde(default)]
+    timeout_secs: Option<u64>,
+    /// Maximum compact log entries to return (default 100, capped at 1000).
+    #[serde(default)]
+    log_limit: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -734,6 +752,50 @@ enum WaitStatus {
     Healthy,
     Exited,
     Timeout,
+}
+
+#[derive(Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum WaitForExitStatus {
+    Exited,
+    Timeout,
+}
+
+#[derive(Serialize, JsonSchema)]
+struct WaitForExitResult {
+    #[serde(flatten)]
+    session_ref: SessionRef,
+    service: String,
+    status: WaitForExitStatus,
+    exit_code: Option<i32>,
+    run_generation: u64,
+    snapshot: ServiceSnapshot,
+    logs: Vec<logproc::ProcessedEntry>,
+    waited_secs: u64,
+}
+
+enum ExitVerdict {
+    Exited,
+    InvalidState,
+}
+
+fn classify_exit(snapshot: &ServiceSnapshot, after_generation: Option<u64>) -> Option<ExitVerdict> {
+    let generation_ready = convert::generation_ready(snapshot, after_generation);
+    if generation_ready && snapshot.execution == Execution::Exited {
+        return Some(ExitVerdict::Exited);
+    }
+
+    let retired = snapshot
+        .dynamic
+        .as_ref()
+        .is_some_and(|dynamic| dynamic.retired.is_some());
+    let unavailable = snapshot.desired == Desired::Disabled || retired;
+    let qualifying_run_in_flight = generation_ready
+        && matches!(
+            snapshot.execution,
+            Execution::Starting | Execution::Running | Execution::Stopping
+        );
+    (unavailable && !qualifying_run_in_flight).then_some(ExitVerdict::InvalidState)
 }
 
 impl WaitResult {
@@ -2238,6 +2300,96 @@ impl McpServer {
     }
 
     #[tool(
+        description = "Wait for a service run to exit and return its exit code plus compact logs \
+        produced after this call began. Intended for one-shot jobs; use wait_for_healthy for \
+        servers. Pass after_generation to require a newer run. A disabled or retired service with \
+        no qualifying run in flight fails immediately."
+    )]
+    async fn wait_for_exit(
+        &self,
+        args: Parameters<WaitForExitArgs>,
+    ) -> ToolResult<WaitForExitResult> {
+        let Parameters(args) = args;
+        let resolved = select::resolve(&self.cwd, args.session)
+            .await
+            .map_err(error_data)?;
+        let timeout = Duration::from_secs(
+            args.timeout_secs
+                .unwrap_or(DEFAULT_WAIT_TIMEOUT_SECS)
+                .min(MAX_WAIT_TIMEOUT_SECS),
+        );
+        let log_limit = args
+            .log_limit
+            .unwrap_or(DEFAULT_RESTART_LOG_LIMIT)
+            .clamp(1, MAX_RESTART_LOG_LIMIT);
+        let mut conn = SessionConn::connect(&resolved.endpoint)
+            .await
+            .map_err(error_data)?;
+        let cursor = service_result(
+            &args.service,
+            current_service_cursor(&mut conn, &args.service).await,
+        )
+        .await?;
+        let started = tokio::time::Instant::now();
+        let waited = service_result(
+            &args.service,
+            wait_for_snapshot(
+                &resolved.endpoint,
+                &mut conn,
+                &args.service,
+                timeout,
+                |snapshot| classify_exit(snapshot, args.after_generation),
+            )
+            .await,
+        )
+        .await?;
+        let (status, exit_code, snapshot) = match waited {
+            SnapshotWait::Matched {
+                snapshot,
+                verdict: ExitVerdict::Exited,
+            } => (WaitForExitStatus::Exited, snapshot.last_exit_code, snapshot),
+            SnapshotWait::Matched {
+                snapshot,
+                verdict: ExitVerdict::InvalidState,
+            } => {
+                let message = if snapshot
+                    .dynamic
+                    .as_ref()
+                    .is_some_and(|dynamic| dynamic.retired.is_some())
+                {
+                    format!(
+                        "service `{}` is retired with no qualifying run in flight",
+                        args.service
+                    )
+                } else {
+                    format!(
+                        "service `{}` is disabled with no qualifying run in flight",
+                        args.service
+                    )
+                };
+                return Err(error_data(ToolError::InvalidState(message)));
+            }
+            SnapshotWait::Timeout(snapshot) => (WaitForExitStatus::Timeout, None, snapshot),
+        };
+        let (logs, _) = service_result(
+            &args.service,
+            compact_logs_since(&mut conn, &args.service, cursor, log_limit).await,
+        )
+        .await?;
+
+        Ok(Json(WaitForExitResult {
+            session_ref: SessionRef::from(&resolved.info),
+            service: args.service,
+            status,
+            exit_code,
+            run_generation: snapshot.run_generation,
+            snapshot,
+            logs,
+            waited_secs: started.elapsed().as_secs(),
+        }))
+    }
+
+    #[tool(
         description = "Ensure a service is ready by composing session startup, explicit enabling, \
         and the generation-aware health wait. Every action taken is reported. An already-healthy \
         service returns immediately with no actions; an exit or timeout includes bounded failure \
@@ -2544,16 +2696,18 @@ pub async fn serve_stdio() -> Result<(), Box<dyn std::error::Error + Send + Sync
 #[cfg(test)]
 mod tests {
     use super::{
-        DynamicMutationResult, McpServer, MutationResult, RestartAndWaitResult,
-        SessionMutationResult, SessionRef, StopSessionResult, WaitResult, parse_since_text,
-        session_has_service, session_resolves_service_id, session_selector,
+        DynamicMutationResult, ExitVerdict, McpServer, MutationResult, RestartAndWaitResult,
+        SessionMutationResult, SessionRef, StopSessionResult, WaitResult, classify_exit,
+        parse_since_text, session_has_service, session_resolves_service_id, session_selector,
     };
     use crate::tools::health::health_attempt_matches_snapshot;
     use crate::tools::logs::{
         MergedFollowPage, follow_all_after_seq, follow_gap, merge_follow_pages, next_follow_cursor,
         truncate_wait_matches,
     };
-    use micromux::{Execution, HealthAttempt, LogLine, ServiceCommandAck, ServiceSnapshot};
+    use micromux::{
+        Desired, Execution, HealthAttempt, LogLine, ServiceCommandAck, ServiceSnapshot,
+    };
     use micromux_control::{PROTOCOL_VERSION, ServiceBrief, SessionInfo};
     use similar_asserts::assert_eq;
     use std::collections::BTreeMap;
@@ -2563,11 +2717,12 @@ mod tests {
     use super::{
         DynamicServiceArgs, EnsureAction, EnsureActionKind, EnsureReadyArgs, LogFilterArgs,
         LogsArgs, RenewDynamicServiceArgs, ReplaceDynamicServiceArgs, ServiceArgs,
-        ServiceEventsArgs, SessionArgs, StartDynamicAndWaitArgs, WaitStatus,
+        ServiceEventsArgs, SessionArgs, StartDynamicAndWaitArgs, WaitForExitArgs,
+        WaitForExitStatus, WaitStatus,
     };
 
     #[cfg(unix)]
-    use micromux::{DynamicServiceParams, Lease, PartialServiceSpec};
+    use micromux::{DynamicServiceParams, HealthcheckSpec, Lease, PartialServiceSpec, SpecField};
 
     #[cfg(unix)]
     use rmcp::handler::server::wrapper::{Json, Parameters};
@@ -2814,6 +2969,7 @@ services:
             "get_service_events",
             "validate_config",
             "ensure_service_ready",
+            "wait_for_exit",
         ] {
             assert!(
                 tools.iter().any(|tool| tool.name == name),
@@ -2821,6 +2977,34 @@ services:
             );
         }
         Ok(())
+    }
+
+    #[test]
+    fn exit_wait_allows_a_disabled_run_to_finish_draining() {
+        let mut snapshot = ServiceSnapshot::initial(
+            "job".to_string(),
+            "job".to_string(),
+            Vec::new(),
+            None,
+            micromux::RestartPolicy::Never,
+            Vec::new(),
+            None,
+        );
+        snapshot.desired = Desired::Disabled;
+        snapshot.execution = Execution::Stopping;
+        snapshot.run_generation = 1;
+        assert!(classify_exit(&snapshot, None).is_none());
+
+        snapshot.execution = Execution::Exited;
+        snapshot.last_exit_code = Some(3);
+        assert!(matches!(
+            classify_exit(&snapshot, None),
+            Some(ExitVerdict::Exited)
+        ));
+        assert!(matches!(
+            classify_exit(&snapshot, Some(1)),
+            Some(ExitVerdict::InvalidState)
+        ));
     }
 
     #[cfg(unix)]
@@ -2831,11 +3015,25 @@ services:
         let (session, selector) = boot_dynamic_mcp_session(project.path())?;
         let mut server = McpServer::new();
         server.cwd = project.path().to_path_buf();
-        let healthy_params = dynamic_params_for(
+        let mut healthy_params = dynamic_params_for(
             "healthy-job",
-            &["sh", "-c", "echo bundled-ready; sleep 60"],
+            &[
+                "sh",
+                "-c",
+                "echo bundled-ready; touch bundle.ready; sleep 60",
+            ],
             Some("bundle-healthy"),
         );
+        healthy_params.spec.healthcheck = SpecField::Value(HealthcheckSpec {
+            test: vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "test -f bundle.ready".to_string(),
+            ],
+            interval: Duration::from_millis(10),
+            timeout: Duration::from_secs(1),
+            ..HealthcheckSpec::default()
+        });
 
         let Json(healthy) = server
             .start_dynamic_service_and_wait(Parameters(StartDynamicAndWaitArgs {
@@ -2890,6 +3088,67 @@ services:
                 .iter()
                 .any(|event| event.kind == micromux::ServiceEventKind::SpawnFailed)
         );
+
+        session.finish().await?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wait_for_exit_returns_job_output_times_out_and_rejects_disabled()
+    -> color_eyre::eyre::Result<()> {
+        let project = tempfile::tempdir()?;
+        let (session, selector) = boot_dynamic_mcp_session(project.path())?;
+        let mut server = McpServer::new();
+        server.cwd = project.path().to_path_buf();
+        let params = dynamic_params_for("job", &["sh", "-c", "sleep 0.2; echo done; exit 3"], None);
+        let Json(started) = server
+            .start_dynamic_service(Parameters(DynamicServiceArgs {
+                session: Some(selector.clone()),
+                params,
+            }))
+            .await
+            .map_err(|err| color_eyre::eyre::eyre!(err.message))?;
+
+        let Json(exited) = server
+            .wait_for_exit(Parameters(WaitForExitArgs {
+                service: "job".to_string(),
+                session: Some(selector.clone()),
+                after_generation: Some(started.receipt.observed_generation),
+                timeout_secs: Some(5),
+                log_limit: Some(20),
+            }))
+            .await
+            .map_err(|err| color_eyre::eyre::eyre!(err.message))?;
+        assert!(matches!(exited.status, WaitForExitStatus::Exited));
+        assert_eq!(exited.exit_code, Some(3));
+        assert!(exited.logs.iter().any(|entry| entry.line.contains("done")));
+
+        let Json(timed_out) = server
+            .wait_for_exit(Parameters(WaitForExitArgs {
+                service: "base".to_string(),
+                session: Some(selector.clone()),
+                after_generation: None,
+                timeout_secs: Some(1),
+                log_limit: Some(20),
+            }))
+            .await
+            .map_err(|err| color_eyre::eyre::eyre!(err.message))?;
+        assert!(matches!(timed_out.status, WaitForExitStatus::Timeout));
+        assert_eq!(timed_out.exit_code, None);
+
+        let disabled = server
+            .wait_for_exit(Parameters(WaitForExitArgs {
+                service: "disabled".to_string(),
+                session: Some(selector),
+                after_generation: None,
+                timeout_secs: Some(1),
+                log_limit: Some(20),
+            }))
+            .await
+            .err()
+            .ok_or_else(|| color_eyre::eyre::eyre!("disabled service unexpectedly waited"))?;
+        assert!(disabled.message.contains("disabled with no qualifying run"));
 
         session.finish().await?;
         Ok(())

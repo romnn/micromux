@@ -159,6 +159,16 @@ pub enum WaitOutcome {
     InvalidState,
 }
 
+/// Return whether a snapshot belongs to the run selected by a generation gate.
+#[must_use]
+pub fn generation_ready(snapshot: &ServiceSnapshot, after: Option<u64>) -> bool {
+    match after {
+        Some(generation) => snapshot.run_generation > generation,
+        // `run_generation == 0` means never started: wait for the first run to come up.
+        None => snapshot.run_generation >= 1,
+    }
+}
+
 /// Evaluate the generation-aware healthy condition against a snapshot.
 ///
 /// With `after = Some(G)` we resolve only on a run with `run_generation > G`, so a restart's caller
@@ -170,12 +180,7 @@ pub fn evaluate(snapshot: &ServiceSnapshot, after: Option<u64>) -> WaitOutcome {
         return WaitOutcome::InvalidState;
     }
 
-    let generation_ready = match after {
-        Some(generation) => snapshot.run_generation > generation,
-        // `run_generation == 0` means never started: wait for the first run to come up.
-        None => snapshot.run_generation >= 1,
-    };
-    if !generation_ready {
+    if !generation_ready(snapshot, after) {
         return WaitOutcome::Pending;
     }
 
