@@ -339,6 +339,22 @@ struct RestartAndWaitArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+struct StartDynamicAndWaitArgs {
+    /// Optional session selector; omit for the current project.
+    #[serde(default)]
+    session: Option<String>,
+    /// Dynamic service definition, clone source, lease, and idempotency key.
+    #[serde(flatten)]
+    params: micromux::DynamicServiceParams,
+    /// Maximum seconds to wait (default 60, capped at 600).
+    #[serde(default)]
+    timeout_secs: Option<u64>,
+    /// Maximum compact log entries to return (default 100, capped at 1000).
+    #[serde(default)]
+    log_limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 struct DiagnoseArgs {
     /// Optional session selector; omit for the current project.
     #[serde(default)]
@@ -428,6 +444,20 @@ struct DynamicMutationResult {
     receipt: micromux_control::DynamicServiceAck,
 }
 
+struct DynamicMutation {
+    resolved: select::Resolved,
+    receipt: micromux_control::DynamicServiceAck,
+}
+
+impl DynamicMutation {
+    fn into_result(self) -> DynamicMutationResult {
+        DynamicMutationResult {
+            session_ref: SessionRef::from(&self.resolved.info),
+            receipt: self.receipt,
+        }
+    }
+}
+
 #[derive(Serialize, JsonSchema)]
 struct RestartAndWaitResult {
     #[serde(flatten)]
@@ -441,6 +471,21 @@ struct RestartAndWaitResult {
     logs_truncated: bool,
     /// Lifecycle timeline events for the restart (from the pre-restart generation onward), so a
     /// failed wait explains itself (blocked dependency, backoff, spawn failure) without another call.
+    events: Vec<micromux::ServiceEvent>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    diagnosis: Option<ServiceDiagnosis>,
+}
+
+#[derive(Serialize, JsonSchema)]
+struct StartDynamicAndWaitResult {
+    #[serde(flatten)]
+    session_ref: SessionRef,
+    #[serde(flatten)]
+    receipt: micromux_control::DynamicServiceAck,
+    outcome: WaitResult,
+    snapshot: ServiceSnapshot,
+    logs: Vec<logproc::ProcessedEntry>,
+    logs_truncated: bool,
     events: Vec<micromux::ServiceEvent>,
     #[serde(skip_serializing_if = "Option::is_none")]
     diagnosis: Option<ServiceDiagnosis>,
@@ -1086,7 +1131,7 @@ impl McpServer {
         session: Option<String>,
         service: &str,
         request: Request,
-    ) -> ToolResult<DynamicMutationResult> {
+    ) -> Result<DynamicMutation, ErrorData> {
         let resolved = select::resolve(&self.cwd, session)
             .await
             .map_err(error_data)?;
@@ -1095,10 +1140,7 @@ impl McpServer {
             .await
             .map_err(error_data)?;
         let receipt = service_result(service, convert::dynamic_service(response)).await?;
-        Ok(Json(DynamicMutationResult {
-            session_ref: SessionRef::from(&resolved.info),
-            receipt,
-        }))
+        Ok(DynamicMutation { resolved, receipt })
     }
 }
 
@@ -1639,14 +1681,101 @@ impl McpServer {
     ) -> ToolResult<DynamicMutationResult> {
         let Parameters(args) = args;
         let service = args.params.service.clone();
-        self.dynamic_mutation(
-            args.session,
+        let mutation = self
+            .dynamic_mutation(
+                args.session,
+                &service,
+                Request::StartDynamicService {
+                    params: args.params,
+                },
+            )
+            .await?;
+        Ok(Json(mutation.into_result()))
+    }
+
+    #[tool(
+        description = "Create a runtime service, wait for its existing or newly created run, and \
+        return the mutation receipt, compact logs, lifecycle events, and failure diagnosis. This \
+        preserves start_dynamic_service policy and idempotency semantics; an idempotent replay \
+        waits on the original run. Use the primitive tools when finer control is needed."
+    )]
+    async fn start_dynamic_service_and_wait(
+        &self,
+        args: Parameters<StartDynamicAndWaitArgs>,
+    ) -> ToolResult<StartDynamicAndWaitResult> {
+        let Parameters(args) = args;
+        let service = args.params.service.clone();
+        let timeout = Duration::from_secs(
+            args.timeout_secs
+                .unwrap_or(DEFAULT_WAIT_TIMEOUT_SECS)
+                .min(MAX_WAIT_TIMEOUT_SECS),
+        );
+        let log_limit = args
+            .log_limit
+            .unwrap_or(DEFAULT_RESTART_LOG_LIMIT)
+            .clamp(1, MAX_RESTART_LOG_LIMIT);
+        let mutation = self
+            .dynamic_mutation(
+                args.session,
+                &service,
+                Request::StartDynamicService {
+                    params: args.params,
+                },
+            )
+            .await?;
+        let mut conn = SessionConn::connect(&mutation.resolved.endpoint)
+            .await
+            .map_err(error_data)?;
+        let conclusion = service_result(
             &service,
-            Request::StartDynamicService {
-                params: args.params,
-            },
+            wait_for_health(
+                &mutation.resolved.endpoint,
+                &mut conn,
+                &service,
+                Some(mutation.receipt.observed_generation),
+                timeout,
+            )
+            .await,
         )
-        .await
+        .await?;
+        let snapshot = conclusion.snapshot().clone();
+        let (logs, logs_truncated) = service_result(
+            &service,
+            compact_logs_since(&mut conn, &service, 0, log_limit).await,
+        )
+        .await?;
+        let diagnosis = if conclusion.needs_diagnosis() {
+            Some(
+                service_result(
+                    &service,
+                    diagnose_service(&mut conn, snapshot.clone(), DEFAULT_DIAGNOSE_TAIL).await,
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+        let events_response = conn
+            .request(Request::GetEvents {
+                service: service.clone(),
+                after: None,
+                tail: Some(micromux::EVENT_HISTORY),
+            })
+            .await
+            .map_err(error_data)?;
+        let (events, _) = service_result(&service, convert::events(events_response)).await?;
+        let outcome = WaitResult::from_conclusion(service, timeout, &conclusion);
+
+        Ok(Json(StartDynamicAndWaitResult {
+            session_ref: SessionRef::from(&mutation.resolved.info),
+            receipt: mutation.receipt,
+            outcome,
+            snapshot,
+            logs,
+            logs_truncated,
+            events,
+            diagnosis,
+        }))
     }
 
     #[tool(
@@ -1668,7 +1797,10 @@ impl McpServer {
             expected_revision: args.expected_revision,
             params: args.params,
         };
-        self.dynamic_mutation(args.session, &service, request).await
+        let mutation = self
+            .dynamic_mutation(args.session, &service, request)
+            .await?;
+        Ok(Json(mutation.into_result()))
     }
 
     #[tool(
@@ -1689,8 +1821,10 @@ impl McpServer {
             expected_revision: args.expected_revision,
             expires_after: args.expires_after,
         };
-        self.dynamic_mutation(args.session, &args.service, request)
-            .await
+        let mutation = self
+            .dynamic_mutation(args.session, &args.service, request)
+            .await?;
+        Ok(Json(mutation.into_result()))
     }
 
     #[tool(
@@ -1707,8 +1841,10 @@ impl McpServer {
         let request = Request::StopDynamicService {
             service: args.service.clone(),
         };
-        self.dynamic_mutation(args.session, &args.service, request)
-            .await
+        let mutation = self
+            .dynamic_mutation(args.session, &args.service, request)
+            .await?;
+        Ok(Json(mutation.into_result()))
     }
 
     #[tool(
@@ -2427,7 +2563,7 @@ mod tests {
     use super::{
         DynamicServiceArgs, EnsureAction, EnsureActionKind, EnsureReadyArgs, LogFilterArgs,
         LogsArgs, RenewDynamicServiceArgs, ReplaceDynamicServiceArgs, ServiceArgs,
-        ServiceEventsArgs, SessionArgs, WaitStatus,
+        ServiceEventsArgs, SessionArgs, StartDynamicAndWaitArgs, WaitStatus,
     };
 
     #[cfg(unix)]
@@ -2534,15 +2670,15 @@ services:
     }
 
     #[cfg(unix)]
-    fn dynamic_params(idempotency_key: Option<&str>) -> DynamicServiceParams {
+    fn dynamic_params_for(
+        service: &str,
+        command: &[&str],
+        idempotency_key: Option<&str>,
+    ) -> DynamicServiceParams {
         DynamicServiceParams {
-            service: "debug".to_string(),
+            service: service.to_string(),
             spec: PartialServiceSpec {
-                command: Some(vec![
-                    "sh".to_string(),
-                    "-c".to_string(),
-                    "echo dynamic-mcp-log; sleep 60".to_string(),
-                ]),
+                command: Some(command.iter().map(|part| (*part).to_string()).collect()),
                 ..PartialServiceSpec::default()
             },
             from_service: None,
@@ -2551,6 +2687,15 @@ services:
             owner: Some("mcp-integration-test".to_string()),
             idempotency_key: idempotency_key.map(str::to_string),
         }
+    }
+
+    #[cfg(unix)]
+    fn dynamic_params(idempotency_key: Option<&str>) -> DynamicServiceParams {
+        dynamic_params_for(
+            "debug",
+            &["sh", "-c", "echo dynamic-mcp-log; sleep 60"],
+            idempotency_key,
+        )
     }
 
     #[cfg(unix)]
@@ -2662,6 +2807,7 @@ services:
         assert!(ensure_schema.contains("diagnosis"));
         for name in [
             "start_dynamic_service",
+            "start_dynamic_service_and_wait",
             "replace_dynamic_service",
             "renew_dynamic_service",
             "stop_dynamic_service",
@@ -2674,6 +2820,78 @@ services:
                 "missing {name} tool"
             );
         }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn start_dynamic_and_wait_returns_success_failure_and_replay_context()
+    -> color_eyre::eyre::Result<()> {
+        let project = tempfile::tempdir()?;
+        let (session, selector) = boot_dynamic_mcp_session(project.path())?;
+        let mut server = McpServer::new();
+        server.cwd = project.path().to_path_buf();
+        let healthy_params = dynamic_params_for(
+            "healthy-job",
+            &["sh", "-c", "echo bundled-ready; sleep 60"],
+            Some("bundle-healthy"),
+        );
+
+        let Json(healthy) = server
+            .start_dynamic_service_and_wait(Parameters(StartDynamicAndWaitArgs {
+                session: Some(selector.clone()),
+                params: healthy_params.clone(),
+                timeout_secs: Some(5),
+                log_limit: Some(20),
+            }))
+            .await
+            .map_err(|err| color_eyre::eyre::eyre!(err.message))?;
+        assert!(matches!(healthy.outcome.status, WaitStatus::Healthy));
+        assert!(
+            healthy
+                .logs
+                .iter()
+                .any(|entry| entry.line.contains("bundled-ready"))
+        );
+        assert!(healthy.diagnosis.is_none());
+
+        let Json(replayed) = server
+            .start_dynamic_service_and_wait(Parameters(StartDynamicAndWaitArgs {
+                session: Some(selector.clone()),
+                params: healthy_params,
+                timeout_secs: Some(5),
+                log_limit: Some(20),
+            }))
+            .await
+            .map_err(|err| color_eyre::eyre::eyre!(err.message))?;
+        assert!(replayed.receipt.idempotent_replay);
+        assert!(matches!(replayed.outcome.status, WaitStatus::Healthy));
+
+        let failing_params = dynamic_params_for(
+            "failing-job",
+            &["micromux-definitely-missing-command"],
+            None,
+        );
+        let Json(failed) = server
+            .start_dynamic_service_and_wait(Parameters(StartDynamicAndWaitArgs {
+                session: Some(selector),
+                params: failing_params,
+                timeout_secs: Some(5),
+                log_limit: Some(20),
+            }))
+            .await
+            .map_err(|err| color_eyre::eyre::eyre!(err.message))?;
+        assert!(matches!(failed.outcome.status, WaitStatus::Exited));
+        assert_eq!(failed.snapshot.last_exit_code, Some(-1));
+        assert!(failed.diagnosis.is_some());
+        assert!(
+            failed
+                .events
+                .iter()
+                .any(|event| event.kind == micromux::ServiceEventKind::SpawnFailed)
+        );
+
+        session.finish().await?;
         Ok(())
     }
 
