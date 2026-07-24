@@ -383,11 +383,8 @@ mod tests {
 
         let worst_case_dir = representative_macos_tmp.join(worst_case_name);
         let hash = hash_path(Path::new("/any/project/micromux.yaml"));
-        let socket_path = match endpoint_from_hash(&worst_case_dir, &hash) {
-            ControlEndpoint::Unix(path) => path,
-            ControlEndpoint::WindowsNamedPipe(_) => {
-                eyre::bail!("a unix build must derive unix socket endpoints")
-            }
+        let ControlEndpoint::Unix(socket_path) = endpoint_from_hash(&worst_case_dir, &hash) else {
+            eyre::bail!("a unix build must derive unix socket endpoints");
         };
 
         let len = socket_path.as_os_str().as_bytes().len();

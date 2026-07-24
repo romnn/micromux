@@ -193,19 +193,19 @@ mod tests {
     }
 
     #[test]
-    fn session_identity_id_uses_raw_config_path_hash() -> std::io::Result<()> {
+    fn session_identity_id_uses_raw_config_path_hash() {
         use similar_asserts::assert_eq;
         use std::ffi::OsString;
         use std::os::unix::ffi::OsStringExt;
+        use std::path::PathBuf;
 
-        // A real config file whose name is not valid UTF-8: the identity must hash the raw path
-        // bytes, not the lossy string it advertises to clients.
-        let dir = tempfile::tempdir()?;
-        let config_path = dir
-            .path()
-            .join(OsString::from_vec(b"micromux-\xff.yaml".to_vec()));
-        std::fs::write(&config_path, "version: 1\nservices: {}\n")?;
-        let config_path = CanonicalConfigPath::new(&config_path)?;
+        // A path whose bytes are not valid UTF-8: the identity must hash the raw bytes, not the
+        // lossy string it advertises to clients. Built through the trusted constructor rather than
+        // a real file because macOS filesystems reject non-UTF-8 filenames outright (EILSEQ), and
+        // the property under test is byte handling, not canonicalization.
+        let config_path = CanonicalConfigPath::from_canonicalized(PathBuf::from(
+            OsString::from_vec(b"/tmp/micromux-\xff.yaml".to_vec()),
+        ));
         let identity = SessionIdentity::new("test".to_string(), Path::new("."), &config_path);
 
         assert_eq!(identity.id, endpoint_hash(&config_path));
@@ -213,6 +213,5 @@ mod tests {
             identity.id,
             crate::endpoint::hash_path(Path::new(&identity.config_path))
         );
-        Ok(())
     }
 }
