@@ -343,7 +343,7 @@ pub async fn probe_endpoint(endpoint: &ControlEndpoint) -> EndpointProbe {
                 }
             }
             Ok(Err(ProbeError::Connect(ControlError::Io(err))))
-                if is_hard_connection_error(&err) =>
+                if is_hard_connection_error(&err) || !endpoint_path_is_socket(endpoint) =>
             {
                 EndpointProbe {
                     endpoint: endpoint.clone(),
@@ -386,6 +386,26 @@ fn is_hard_connection_error(err: &std::io::Error) -> bool {
         err.kind(),
         std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
     )
+}
+
+/// Whether the endpoint path is actually a socket file.
+///
+/// A path that exists but is not a socket — a leaked regular file, a directory — can never have a
+/// listener, so a failed connect there means the endpoint is absent, not that a live session is
+/// wedged. Platforms disagree on the errno for connecting to a non-socket (Linux reports
+/// `ECONNREFUSED`, which [`is_hard_connection_error`] already covers; macOS does not), so decide on
+/// the file type instead of the error. Misreading these as unreachable makes callers report
+/// "session busy" where they should report "no session".
+#[cfg(unix)]
+fn endpoint_path_is_socket(endpoint: &ControlEndpoint) -> bool {
+    use std::os::unix::fs::FileTypeExt as _;
+
+    match endpoint {
+        ControlEndpoint::Unix(path) => {
+            std::fs::metadata(path).is_ok_and(|metadata| metadata.file_type().is_socket())
+        }
+        ControlEndpoint::WindowsNamedPipe(_) => false,
+    }
 }
 
 #[cfg(unix)]
@@ -471,6 +491,27 @@ mod tests {
                 ControlEndpoint::Unix(dir.path().join("a.sock")),
                 ControlEndpoint::Unix(dir.path().join("z.sock")),
             ],
+        );
+        Ok(())
+    }
+
+    /// A leaked regular file in the runtime dir must probe as `Absent`, never `Unreachable`:
+    /// selectors treat unreachable endpoints as "possibly the target, but busy" and report
+    /// `session busy` instead of `no session`. Linux reaches this via `ECONNREFUSED`, macOS via a
+    /// different errno, so the classification is pinned here for every unix platform.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn probe_reports_a_leaked_non_socket_file_as_absent() -> eyre::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let leaked = dir.path().join("dead.sock");
+        std::fs::write(&leaked, b"")?;
+
+        let probe = probe_endpoint(&ControlEndpoint::Unix(leaked)).await;
+
+        assert!(
+            matches!(probe.result, EndpointProbeResult::Absent(_)),
+            "a non-socket file must be absent, got {:?}",
+            probe.result
         );
         Ok(())
     }
