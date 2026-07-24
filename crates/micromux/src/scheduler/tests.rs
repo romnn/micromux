@@ -2526,10 +2526,12 @@ async fn pty_append_records_are_lossless_under_load() -> eyre::Result<()> {
     })
     .await?;
 
+    // Wait for at least the expected count rather than exactly it: stopping at `>=` lets the
+    // assertions below describe a surplus record instead of timing out with only a bare count.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     let logs = loop {
         let logs = harness.reader.logs("svc", None);
-        if logs.len() == 5000 {
+        if logs.len() >= 5000 {
             break logs;
         }
         if tokio::time::Instant::now() >= deadline {
@@ -2537,11 +2539,40 @@ async fn pty_append_records_are_lossless_under_load() -> eyre::Result<()> {
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     };
-    assert_eq!(logs.len(), 5000);
-    for (idx, line) in logs.iter().enumerate() {
-        assert_eq!(line.line, (idx + 1).to_string());
+
+    // Losslessness is a property of the record *contents*, so report the first divergence with its
+    // neighbours: that distinguishes a split record (a real PTY framing bug) from a spurious blank
+    // one, which a bare length mismatch cannot.
+    let divergence = logs
+        .iter()
+        .map(|line| line.line.as_str())
+        .zip(1..=5000)
+        .enumerate()
+        .find(|(_, (actual, expected))| *actual != expected.to_string());
+    if let Some((idx, (actual, expected))) = divergence {
+        let start = idx.saturating_sub(2);
+        let context = logs
+            .get(start..(idx + 3).min(logs.len()))
+            .unwrap_or_default()
+            .iter()
+            .map(|line| line.line.as_str())
+            .collect::<Vec<_>>();
+        eyre::bail!(
+            "record {idx} is {actual:?}, expected {expected:?}; records {start}.. are {context:?} \
+             ({} records total)",
+            logs.len(),
+        );
     }
-    assert_eq!(logs.last().map(|line| line.line.as_str()), Some("5000"));
+    assert_eq!(
+        logs.len(),
+        5000,
+        "trailing records past the expected 5000: {:?}",
+        logs.get(5000..)
+            .unwrap_or_default()
+            .iter()
+            .map(|line| line.line.as_str())
+            .collect::<Vec<_>>()
+    );
 
     harness.shutdown.cancel();
     harness.handle.await??;
