@@ -1,5 +1,5 @@
 use super::{LogUpdateKind, OutputStream, ProcessEvent, RunId, ServiceID};
-use crate::{health_check, service::Service};
+use crate::{health_check, model::RunSink, service::Service};
 use color_eyre::eyre;
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -45,6 +45,9 @@ pub(super) struct PtyHandles {
 }
 
 pub(super) struct StartedPty {
+    /// Pid of the spawned child, when the pty backend reports one. A missing pid must never fail
+    /// the start — it only degrades the runtime-identity snapshot.
+    pub(super) pid: Option<u32>,
     pub(super) handles: PtyHandles,
     pub(super) log_reader: LogReaderHandle,
 }
@@ -92,6 +95,7 @@ impl alacritty_terminal::grid::Dimensions for TermSize {
 
 fn env_vars_for_service(service: &Service) -> HashMap<String, String> {
     let mut env_vars: HashMap<String, String> = service
+        .spec
         .environment
         .iter()
         .map(|(k, v)| (k.clone(), v.clone()))
@@ -129,7 +133,6 @@ struct AnsiFilter {
     state: AnsiState,
     esc_seen: bool,
     csi_buf: Vec<u8>,
-    saw_non_sgr_csi: bool,
 }
 
 impl AnsiFilter {
@@ -138,20 +141,14 @@ impl AnsiFilter {
             state: AnsiState::Ground,
             esc_seen: false,
             csi_buf: Vec::new(),
-            saw_non_sgr_csi: false,
         }
-    }
-
-    fn take_saw_non_sgr_csi(&mut self) -> bool {
-        std::mem::take(&mut self.saw_non_sgr_csi)
     }
 
     /// Feed one byte into the filter. Printable text and SGR color
     /// sequences are appended to `out`. Returns `true` when a
-    /// cursor-positioning or screen-clearing CSI sequence just
-    /// finished, signalling the caller to flush accumulated text
-    /// (this turns ncurses-style screen redraws into discrete lines).
-    #[allow(clippy::too_many_lines)]
+    /// screen-clearing CSI sequence just finished, signalling the caller to flush accumulated
+    /// text. Other cursor/progress controls are filtered but do not change the log record mode:
+    /// wrapping belongs to the TUI renderer, not to captured service logs.
     fn push(&mut self, b: u8, out: &mut Vec<u8>) -> bool {
         match self.state {
             AnsiState::Ground => {
@@ -216,7 +213,6 @@ impl AnsiFilter {
                         self.csi_buf.clear();
                         false
                     } else {
-                        self.saw_non_sgr_csi = true;
                         self.csi_buf.clear();
                         matches!(b, b'J')
                     }
@@ -424,10 +420,6 @@ impl RateLimit {
         self.window_start = Instant::now();
         self.sent_in_window = 0;
         self.warned_in_window = false;
-        self.start_snapshot_line();
-    }
-
-    fn start_snapshot_line(&mut self) {
         self.snapshot_id = self.snapshot_id.wrapping_add(1).max(1);
     }
 
@@ -540,7 +532,13 @@ impl LogReaderHandle {
 
     // On Unix this drops the cancellation pipe's write end, waking the reader's poll; other
     // platforms have no such pipe, so cancellation is a no-op and the receiver goes unused there.
-    #[cfg_attr(not(unix), allow(clippy::unused_self))]
+    #[cfg_attr(
+        not(unix),
+        expect(
+            clippy::unused_self,
+            reason = "Unix cancellation consumes an owned pipe fd; unsupported platforms keep the same handle API"
+        )
+    )]
     pub(super) fn cancel(&mut self) {
         #[cfg(unix)]
         {
@@ -552,6 +550,39 @@ impl LogReaderHandle {
 impl Drop for LogReaderHandle {
     fn drop(&mut self) {
         self.cancel();
+    }
+}
+
+#[cfg(all(test, unix))]
+impl LogReaderHandle {
+    /// A handle with no cancellation pipe, for unit tests that only exercise handle bookkeeping.
+    pub(super) fn test_dummy() -> Self {
+        Self { cancel_write: None }
+    }
+}
+
+#[cfg(all(test, unix))]
+impl PtyHandles {
+    /// Handles over a fresh PTY with no child attached, for unit tests that need a
+    /// `RunningService` without spawning a process.
+    pub(super) fn test_dummy() -> eyre::Result<Self> {
+        let pair = portable_pty::native_pty_system()
+            .openpty(portable_pty::PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .map_err(|err| eyre::eyre!("failed to open test pty: {err}"))?;
+        let writer = pair
+            .master
+            .take_writer()
+            .map_err(|err| eyre::eyre!("failed to take test pty writer: {err}"))?;
+        Ok(Self {
+            master: Arc::new(Mutex::new(pair.master)),
+            writer: Arc::new(Mutex::new(writer)),
+            size: Arc::new(AtomicU32::new(0)),
+        })
     }
 }
 
@@ -686,6 +717,7 @@ impl Drop for ActiveLogReaderGuard {
 struct LogReaderArgs {
     service_id: ServiceID,
     run_id: RunId,
+    sink: RunSink,
     reader: PtyOutputReader,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     events_tx: mpsc::Sender<ProcessEvent>,
@@ -694,7 +726,10 @@ struct LogReaderArgs {
     pty_size: Arc<AtomicU32>,
 }
 
-#[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the PTY reader thread owns the terminal emulator and rate-limit state in one loop"
+)]
 fn spawn_log_reader_thread(args: LogReaderArgs) {
     thread::spawn(move || {
         #[derive(Clone)]
@@ -735,37 +770,28 @@ fn spawn_log_reader_thread(args: LogReaderArgs) {
             }
         }
 
-        fn send_log(
+        fn send_log_reader_finished(
             events_tx: &mpsc::Sender<ProcessEvent>,
             service_id: &ServiceID,
             run_id: RunId,
-            update: LogUpdateKind,
-            text: String,
         ) {
-            let _ = events_tx.try_send(ProcessEvent::LogLine {
+            let _ = events_tx.blocking_send(ProcessEvent::LogReaderFinished {
                 service_id: service_id.clone(),
                 run_id,
-                stream: OutputStream::Stdout,
-                update,
-                line: text,
             });
         }
 
         fn emit_snapshot(
             term: &Term<PtyEventProxy>,
             rate: &mut RateLimit,
-            events_tx: &mpsc::Sender<ProcessEvent>,
-            service_id: &ServiceID,
-            run_id: RunId,
+            sink: &RunSink,
             force: bool,
         ) {
             match rate.snapshot_decision(force, Instant::now()) {
                 SnapshotDecision::Emit => {}
                 SnapshotDecision::Warn => {
-                    send_log(
-                        events_tx,
-                        service_id,
-                        run_id,
+                    sink.append_log(
+                        OutputStream::Stdout,
                         LogUpdateKind::Append,
                         "[micromux] interactive output rate-limited".to_string(),
                     );
@@ -842,10 +868,8 @@ fn spawn_log_reader_thread(args: LogReaderArgs) {
                 }
             }
 
-            send_log(
-                events_tx,
-                service_id,
-                run_id,
+            sink.append_log(
+                OutputStream::Stdout,
                 LogUpdateKind::LiveSnapshot {
                     id: rate.snapshot_id(),
                 },
@@ -854,12 +878,7 @@ fn spawn_log_reader_thread(args: LogReaderArgs) {
             rate.record_snapshot_sent();
         }
 
-        fn flush(
-            line: &mut Vec<u8>,
-            events_tx: &mpsc::Sender<ProcessEvent>,
-            service_id: &ServiceID,
-            run_id: RunId,
-        ) {
+        fn flush(line: &mut Vec<u8>, sink: &RunSink) {
             if line.is_empty() {
                 return;
             }
@@ -874,7 +893,7 @@ fn spawn_log_reader_thread(args: LogReaderArgs) {
             }
 
             let s = String::from_utf8_lossy(line).to_string();
-            send_log(events_tx, service_id, run_id, LogUpdateKind::Append, s);
+            sink.append_log(OutputStream::Stdout, LogUpdateKind::Append, s);
             line.clear();
         }
 
@@ -883,36 +902,30 @@ fn spawn_log_reader_thread(args: LogReaderArgs) {
         /// Unlike [`flush`] (used for partial lines at EOF / the 16 KiB overflow guard), this
         /// emits the record even when empty so intentional blank lines are not silently dropped.
         /// `line` never contains the terminating newline bytes themselves.
-        fn flush_record(
-            line: &mut Vec<u8>,
-            events_tx: &mpsc::Sender<ProcessEvent>,
-            service_id: &ServiceID,
-            run_id: RunId,
-        ) {
+        fn flush_record(line: &mut Vec<u8>, sink: &RunSink) {
             let s = String::from_utf8_lossy(line).to_string();
-            send_log(events_tx, service_id, run_id, LogUpdateKind::Append, s);
+            sink.append_log(OutputStream::Stdout, LogUpdateKind::Append, s);
             line.clear();
         }
 
         fn finish_stream(
-            interactive: bool,
+            snapshot_mode: bool,
             term: &Term<PtyEventProxy>,
             rate: &mut RateLimit,
-            events_tx: &mpsc::Sender<ProcessEvent>,
-            service_id: &ServiceID,
-            run_id: RunId,
+            sink: &RunSink,
             line: &mut Vec<u8>,
         ) {
-            if interactive {
-                emit_snapshot(term, rate, events_tx, service_id, run_id, true);
+            if snapshot_mode {
+                emit_snapshot(term, rate, sink, true);
             } else {
-                flush(line, events_tx, service_id, run_id);
+                flush(line, sink);
             }
         }
 
         let LogReaderArgs {
             service_id,
             run_id,
+            sink,
             reader,
             writer,
             events_tx,
@@ -943,7 +956,7 @@ fn spawn_log_reader_thread(args: LogReaderArgs) {
         };
         let mut term: Term<PtyEventProxy> = Term::new(config, &size, proxy);
         let mut processor: ansi::Processor<ansi::StdSyncHandler> = ansi::Processor::default();
-        let mut interactive = false;
+        let mut snapshot_mode = false;
         let mut last_snapshot_at: Option<Instant> = None;
         let mut dirty = false;
         let mut last_size = 0u32;
@@ -971,42 +984,21 @@ fn spawn_log_reader_thread(args: LogReaderArgs) {
             let n = match read {
                 PtyRead::Bytes(n) => n,
                 PtyRead::Eof => {
-                    finish_stream(
-                        interactive,
-                        &term,
-                        &mut rate,
-                        &events_tx,
-                        &service_id,
-                        run_id,
-                        &mut line,
-                    );
+                    finish_stream(snapshot_mode, &term, &mut rate, &sink, &mut line);
+                    send_log_reader_finished(&events_tx, &service_id, run_id);
                     break;
                 }
                 #[cfg(unix)]
                 PtyRead::Cancelled => {
-                    finish_stream(
-                        interactive,
-                        &term,
-                        &mut rate,
-                        &events_tx,
-                        &service_id,
-                        run_id,
-                        &mut line,
-                    );
+                    finish_stream(snapshot_mode, &term, &mut rate, &sink, &mut line);
+                    send_log_reader_finished(&events_tx, &service_id, run_id);
                     break;
                 }
             };
 
             if n == 0 {
-                finish_stream(
-                    interactive,
-                    &term,
-                    &mut rate,
-                    &events_tx,
-                    &service_id,
-                    run_id,
-                    &mut line,
-                );
+                finish_stream(snapshot_mode, &term, &mut rate, &sink, &mut line);
+                send_log_reader_finished(&events_tx, &service_id, run_id);
                 break;
             }
 
@@ -1020,11 +1012,18 @@ fn spawn_log_reader_thread(args: LogReaderArgs) {
             if alt_screen != last_alt_screen {
                 last_alt_screen = alt_screen;
                 rate.set_alt_screen(alt_screen);
-                interactive = true;
-                dirty = true;
-                line.clear();
+                snapshot_mode = alt_screen;
+                dirty = alt_screen;
+                if alt_screen {
+                    flush_record(&mut line, &sink);
+                } else {
+                    line.clear();
+                }
+                // The mode switch ends the current line record, so a CR seen before the flip must
+                // not carry over and swallow the next newline once we are back in line mode.
+                prev_was_cr = false;
             }
-            if interactive {
+            if snapshot_mode {
                 dirty = true;
             }
 
@@ -1032,49 +1031,44 @@ fn spawn_log_reader_thread(args: LogReaderArgs) {
                 match b {
                     // \r and \n both terminate a line. A \r\n pair is coalesced (the \r flushes,
                     // the trailing \n is swallowed) so it produces one record, while a lone \n
-                    // still flushes — preserving intentional blank lines. ncurses apps (watch)
-                    // use ESC[B + \r for line breaks; cursor-positioned text is additionally
-                    // flushed by the CSI H/f/J boundary detection in AnsiFilter.
+                    // still flushes — preserving intentional blank lines.
                     b'\r' => {
-                        if !interactive {
-                            flush_record(&mut line, &events_tx, &service_id, run_id);
+                        if !snapshot_mode {
+                            flush_record(&mut line, &sink);
                         }
                         prev_was_cr = true;
                     }
                     b'\n' => {
-                        if !interactive && !prev_was_cr {
-                            flush_record(&mut line, &events_tx, &service_id, run_id);
+                        if !snapshot_mode && !prev_was_cr {
+                            flush_record(&mut line, &sink);
                         }
                         prev_was_cr = false;
                     }
                     _ => {
                         prev_was_cr = false;
-                        if interactive {
+                        if snapshot_mode {
                             scratch.clear();
                             let _ = filter.push(b, &mut scratch);
                         } else {
                             let boundary = filter.push(b, &mut line);
-                            if boundary || filter.take_saw_non_sgr_csi() {
-                                interactive = true;
-                                dirty = true;
-                                rate.start_snapshot_line();
-                                line.clear();
+                            if boundary {
+                                flush(&mut line, &sink);
                             }
                         }
 
-                        if !interactive && line.len() >= 16 * 1024 {
-                            flush(&mut line, &events_tx, &service_id, run_id);
+                        if !snapshot_mode && line.len() >= 16 * 1024 {
+                            flush(&mut line, &sink);
                         }
                     }
                 }
             }
 
-            if interactive {
+            if snapshot_mode {
                 let interval = Duration::from_millis(250);
                 let now = Instant::now();
                 let due = last_snapshot_at.is_none_or(|t| now.duration_since(t) >= interval);
                 if dirty && due {
-                    emit_snapshot(&term, &mut rate, &events_tx, &service_id, run_id, false);
+                    emit_snapshot(&term, &mut rate, &sink, false);
                     last_snapshot_at = Some(now);
                     dirty = false;
                 }
@@ -1222,11 +1216,36 @@ fn spawn_termination_task(args: TerminationTaskArgs) {
             pid,
             process_group_leader_id,
         };
+        // A blocking wait consumes one blocking-pool thread until the child is reaped. The
+        // termination guard escalates to SIGKILL, so runtime shutdown is only held up by a process
+        // the OS itself cannot reap.
+        let mut wait_handle = tokio::task::spawn_blocking(move || child.wait());
         let mut termination_started = false;
         let mut hard_killed = false;
         let mut kill_deadline: Option<tokio::time::Instant> = None;
         loop {
             tokio::select! {
+                res = &mut wait_handle => {
+                    let code = match res {
+                        Ok(Ok(status)) => i32::try_from(status.exit_code()).unwrap_or(i32::MAX),
+                        Ok(Err(err)) => {
+                            tracing::error!(?err, "failed to wait for process");
+                            -1
+                        }
+                        Err(err) => {
+                            tracing::error!(?err, "process wait task failed");
+                            -1
+                        }
+                    };
+                    let _ = events_tx
+                        .send(ProcessEvent::Exited {
+                            service_id: service_id.clone(),
+                            run_id,
+                            exit_code: code,
+                        })
+                        .await;
+                    break;
+                }
                 () = shutdown.cancelled(), if !termination_started => {
                     let started = target.request(&events_tx, &service_id, run_id).await;
                     kill_deadline = started.kill_deadline;
@@ -1239,54 +1258,31 @@ fn spawn_termination_task(args: TerminationTaskArgs) {
                     hard_killed = started.hard_killed;
                     termination_started = true;
                 }
-                () = tokio::time::sleep(std::time::Duration::from_millis(25)) => {}
-            }
-
-            if termination_started
-                && !hard_killed
-                && let Some(deadline) = kill_deadline
-                && tokio::time::Instant::now() >= deadline
-            {
-                // Escalate to SIGKILL on the whole process group (mirroring the SIGTERM path),
-                // not just the group leader. Otherwise a leader that ignored SIGTERM is killed
-                // while its descendants survive and are orphaned once try_wait reaps the leader.
-                target.force_kill();
-                hard_killed = true;
-            }
-
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    let code = i32::try_from(status.exit_code()).unwrap_or(i32::MAX);
-                    let _ = events_tx
-                        .send(ProcessEvent::Exited {
-                            service_id: service_id.clone(),
-                            run_id,
-                            exit_code: code,
-                        })
-                        .await;
-                    break;
-                }
-                Ok(None) => {}
-                Err(err) => {
-                    tracing::error!(?err, "failed to poll process status");
-                    let _ = events_tx
-                        .send(ProcessEvent::Exited {
-                            service_id: service_id.clone(),
-                            run_id,
-                            exit_code: -1,
-                        })
-                        .await;
-                    break;
+                () = async {
+                    match kill_deadline {
+                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                }, if termination_started && !hard_killed => {
+                    // Escalate to SIGKILL on the whole process group (mirroring the SIGTERM path),
+                    // not just the group leader. Otherwise a leader that ignored SIGTERM is killed
+                    // while its descendants survive and are orphaned once wait reaps the leader.
+                    target.force_kill();
+                    hard_killed = true;
                 }
             }
         }
     });
 }
 
-#[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "process startup wires PTY, reader, waiter, and ownership guards in one fallible path"
+)]
 pub(super) fn start_service_with_pty_size(
     service: &Service,
     run_id: RunId,
+    sink: RunSink,
     events_tx: &mpsc::Sender<ProcessEvent>,
     shutdown: &CancellationToken,
     terminate: &CancellationToken,
@@ -1295,7 +1291,9 @@ pub(super) fn start_service_with_pty_size(
     use portable_pty::{CommandBuilder, PtySize};
 
     let service_id = service.id.clone();
-    let (prog, args) = &service.command;
+    let Some((prog, args)) = service.spec.command.split_first() else {
+        return Err(eyre::eyre!("service command is empty"));
+    };
 
     let env_vars = env_vars_for_service(service);
     let env_vars = {
@@ -1306,7 +1304,10 @@ pub(super) fn start_service_with_pty_size(
         env_vars
     };
 
-    tracing::info!(service_id, prog, ?args, ?env_vars, "start service");
+    let mut env_keys = env_vars.keys().map(String::as_str).collect::<Vec<_>>();
+    env_keys.sort_unstable();
+    // Values may contain secrets from env files; log only the key names.
+    tracing::info!(service_id, prog, ?args, ?env_keys, "start service");
 
     let pty_system = portable_pty::native_pty_system();
     let pair = pty_system
@@ -1320,7 +1321,7 @@ pub(super) fn start_service_with_pty_size(
 
     let mut cmd = CommandBuilder::new(prog);
     cmd.args(args);
-    if let Some(dir) = &service.working_dir {
+    if let Some(dir) = &service.spec.working_dir {
         cmd.cwd(dir);
     }
     for (k, v) in &env_vars {
@@ -1358,6 +1359,7 @@ pub(super) fn start_service_with_pty_size(
     spawn_log_reader_thread(LogReaderArgs {
         service_id: service_id.clone(),
         run_id,
+        sink: sink.clone(),
         reader,
         writer: writer.clone(),
         events_tx: events_tx.clone(),
@@ -1379,11 +1381,12 @@ pub(super) fn start_service_with_pty_size(
     });
     child_guard.disarm();
 
-    if let Some(health_check) = service.health_check.clone() {
+    if let Some(health_check) = service.spec.healthcheck.clone() {
         tokio::spawn({
             let service_id = service_id.clone();
-            let working_dir = service.working_dir.clone();
+            let working_dir = service.spec.working_dir.clone();
             let environment: std::collections::HashMap<String, String> = service
+                .spec
                 .environment
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone()))
@@ -1397,6 +1400,7 @@ pub(super) fn start_service_with_pty_size(
                     health_check::RunLoopParams {
                         service_id,
                         run_id,
+                        sink,
                         working_dir,
                         environment,
                         events_tx,
@@ -1410,6 +1414,7 @@ pub(super) fn start_service_with_pty_size(
     }
 
     Ok(StartedPty {
+        pid,
         handles: PtyHandles {
             master,
             writer,
@@ -1432,16 +1437,6 @@ mod tests {
         rate.set_alt_screen(true);
         assert_eq!(rate.snapshot_id(), 1);
         rate.set_alt_screen(false);
-        assert_eq!(rate.snapshot_id(), 2);
-    }
-
-    #[test]
-    fn rate_limit_boundary_transition_increments_id() {
-        let mut rate = RateLimit::new();
-
-        rate.start_snapshot_line();
-        assert_eq!(rate.snapshot_id(), 1);
-        rate.start_snapshot_line();
         assert_eq!(rate.snapshot_id(), 2);
     }
 

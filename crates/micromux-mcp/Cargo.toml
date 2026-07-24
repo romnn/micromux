@@ -1,0 +1,51 @@
+[package]
+name = "micromux-mcp"
+license-file = "../../LICENSE"
+readme = "../../README.md"
+documentation = "https://docs.rs/micromux-mcp"
+publish = true
+
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description.workspace = true
+homepage.workspace = true
+repository.workspace = true
+categories = [
+  "command-line-utilities",
+]
+keywords = [
+  "terminal",
+  "multiplexer",
+  "tui",
+]
+
+[lints]
+workspace = true
+
+[dependencies]
+micromux = { path = "../micromux/" }
+micromux-control = { path = "../micromux-control/" }
+
+rmcp = { version = "2.2.0", features = ["server", "transport-io", "macros"] }
+schemars.workspace = true
+
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+chrono.workspace = true
+
+regex = "1"
+strip-ansi-escapes.workspace = true
+
+tokio.workspace = true
+
+# Confirm a stopped session's process is gone (safe `kill(pid, 0)` wrapper).
+[target.'cfg(unix)'.dependencies]
+nix = { workspace = true, features = ["signal"] }
+
+[dev-dependencies]
+similar-asserts.workspace = true
+color-eyre.workspace = true
+tempfile.workspace = true
+fs2 = "0.4"

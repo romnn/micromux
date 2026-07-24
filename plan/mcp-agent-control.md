@@ -590,7 +590,7 @@ All session identity/metadata is returned *live* by `Describe`, never stored in 
 file:
 
 ```
-Describe → { protocol_version, pid, start_time, name, working_dir,
+Describe → { protocol_version: { major, minor }, pid, start_time, name, working_dir,
              config_path, services: [..], micromux_version }
 ```
 
@@ -723,26 +723,32 @@ oversized frames are rejected, not buffered) and **per-request + idle timeouts**
 enum Request {
     Describe,
     ListServices,
-    GetLogs { service: ServiceID, tail: Option<usize> },
+    GetLogs { service: ServiceID, run_generation: Option<u64>, tail: Option<usize> },
+    FollowLogs { service: ServiceID, run_generation: Option<u64>, after: Option<u64> },
+    ListLogRuns { service: ServiceID },
     GetHealth { service: ServiceID },
     Restart { service: ServiceID },
     RestartAll,
     Enable { service: ServiceID },
     Disable { service: ServiceID },
+    Shutdown,
     Subscribe,                          // streams SessionChange until the client disconnects
 }
 enum Response {
     Description(SessionInfo),
     Services(Vec<ServiceSnapshot>),
-    Logs { lines: Vec<LogLine> },
+    Logs { lines: Vec<LogLine>, truncated: bool },
+    LogRuns { runs: Vec<LogRunSummary> },
     Health(Option<HealthAttempt>),
     Accepted { services: Vec<ServiceCommandAck> }, // queued (validated) — NOT "completed"
     Change(SessionChange),              // only after Subscribe
+    ShuttingDown,
     Error { code: ErrorCode, message: String },
 }
 struct ServiceCommandAck { service: ServiceID, observed_generation: u64 }
-enum ErrorCode { UnknownService, NoSession, Ambiguous, Busy, Timeout, InvalidState,
-                 SchedulerStopped, UnsupportedPlatform, ProtocolVersionMismatch, BadRequest, Internal }
+enum ErrorCode { UnknownService, UnknownRun, NoSession, Ambiguous, Busy, Timeout,
+                 InvalidState, ConfigReload, SchedulerStopped, UnsupportedPlatform,
+                 ProtocolVersionMismatch, BadRequest, Internal, Unknown }
 ```
 
 `Accepted` carries a list so it fits `RestartAll` (every affected service) as well
@@ -750,17 +756,14 @@ as single-service mutations and enable/disable. The MCP `restart_service` tool
 flattens the single ack and surfaces its `observed_generation` as `G` for
 `wait_for_healthy(after_generation = G)`.
 
-`Describe` carries `protocol_version`; a mismatch yields a hard
-`ProtocolVersionMismatch` so an old proxy against a new session (or vice versa)
-fails loudly, not weirdly. **Compatibility expectation:** the session and the proxy
-are expected to be the *same installed binary version* (they are literally the same
-binary, `micromux mcp` vs `micromux`); there is **no cross-version compatibility
-guarantee pre-1.0**, and a mismatch is a hard error, not a negotiation. Protocol
-envelopes (`Request`, `Response`, `Describe`) live in `micromux-control`; domain
-payloads (`ServiceSnapshot`, `HealthAttempt`, `LogLine`, etc.) are stable core
-types that derive serde and are reused directly. If compatibility pressure appears
-later, DTO mirrors can be introduced then; v1 should not duplicate payload structs
-for a same-version internal protocol.
+`Describe` carries `protocol_version`; peers accept the same major line and reject
+major mismatches with `ProtocolVersionMismatch`. Minor bumps are for additive,
+compatible changes: optional/defaulted fields, tolerant unit-enum additions, or
+new MCP tools that reuse existing control requests. Request/response changes that
+old peers cannot parse or safely ignore require a major bump. Protocol envelopes
+(`Request`, `Response`, `Describe`) live in `micromux-control`; domain payloads
+(`ServiceSnapshot`, `HealthAttempt`, `LogLine`, etc.) are stable core types that
+derive serde and are reused directly.
 
 ### Session selection (MCP server) — read-only, connect-to-verify, typed selector
 
@@ -919,8 +922,9 @@ across `.await`" (see robustness).
 - **Registry JSON file + self-healing reaper (earlier draft) — superseded** by the
   socket-only design. The separate metadata file was the brittle part:
   write-before-bind races, a metadata file that can outlive (or precede) its
-  socket, and a reaper that could mis-fire on a merely-laggy session. Deleting the
-  file and fetching identity via `Describe` removes the whole failure class.
+  socket, and a reaper that could incorrectly fire on a merely-laggy session. 
+  Deleting the file and fetching identity via `Describe` removes the whole failure 
+  class.
 - **mDNS / Bonjour — no.** Cross-*host* multicast discovery: wrong scope, would
   expose dev services on the LAN, needs avahi/bonjour. Solves a problem we don't
   have and adds ones we don't want.

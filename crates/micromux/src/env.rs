@@ -8,8 +8,18 @@ pub struct EnvMap {
     inner: IndexMap<String, String>,
 }
 
+#[cfg(test)]
 pub fn interpolate_str(input: &str, env: &HashMap<String, String>) -> String {
-    interpolate(input, env)
+    let mut missing = Vec::new();
+    interpolate_tracking(input, env, &mut missing)
+}
+
+pub fn interpolate_str_tracking(
+    input: &str,
+    env: &HashMap<String, String>,
+    missing: &mut Vec<String>,
+) -> String {
+    interpolate_tracking(input, env, missing)
 }
 
 impl Default for EnvMap {
@@ -180,12 +190,22 @@ pub fn load_env_files_sync(paths: &[PathBuf]) -> eyre::Result<EnvMap> {
     Ok(env)
 }
 
+#[cfg(test)]
 pub fn expand_env_values(env: &EnvMap, base: &HashMap<String, String>) -> EnvMap {
+    let mut missing = Vec::new();
+    expand_env_values_tracking(env, base, &mut missing)
+}
+
+pub fn expand_env_values_tracking(
+    env: &EnvMap,
+    base: &HashMap<String, String>,
+    missing: &mut Vec<String>,
+) -> EnvMap {
     let mut current: HashMap<String, String> = base.clone();
     let mut out = EnvMap::new();
 
     for (k, v) in env.iter() {
-        let expanded = interpolate(v, &current);
+        let expanded = interpolate_tracking(v, &current, missing);
         out.insert(k.clone(), expanded.clone());
         current.insert(k.clone(), expanded);
     }
@@ -205,7 +225,11 @@ pub fn resolve_path(config_dir: &Path, raw: &str) -> eyre::Result<PathBuf> {
     }
 }
 
-fn interpolate(input: &str, env: &HashMap<String, String>) -> String {
+fn interpolate_tracking(
+    input: &str,
+    env: &HashMap<String, String>,
+    missing: &mut Vec<String>,
+) -> String {
     let mut out = String::with_capacity(input.len());
     let mut chars = input.chars().peekable();
 
@@ -237,6 +261,8 @@ fn interpolate(input: &str, env: &HashMap<String, String>) -> String {
             }
             if let Some(value) = env.get(&key) {
                 out.push_str(value);
+            } else if !key.is_empty() {
+                missing.push(key);
             }
             continue;
         }
@@ -259,6 +285,8 @@ fn interpolate(input: &str, env: &HashMap<String, String>) -> String {
             }
             if let Some(value) = env.get(&key) {
                 out.push_str(value);
+            } else {
+                missing.push(key);
             }
             continue;
         }
@@ -295,9 +323,22 @@ mod tests {
         let mut m = HashMap::new();
         m.insert("A".to_string(), "x".to_string());
         m.insert("B".to_string(), "y".to_string());
-        assert_eq!(interpolate("$A-$B", &m), "x-y");
-        assert_eq!(interpolate("${A}${B}", &m), "xy");
-        assert_eq!(interpolate("$$A", &m), "$A");
+        assert_eq!(interpolate_str("$A-$B", &m), "x-y");
+        assert_eq!(interpolate_str("${A}${B}", &m), "xy");
+        assert_eq!(interpolate_str("$$A", &m), "$A");
+    }
+
+    #[test]
+    fn interpolation_tracking_records_missing_variables() {
+        let mut m = HashMap::new();
+        m.insert("A".to_string(), "x".to_string());
+        let mut missing = Vec::new();
+
+        assert_eq!(
+            interpolate_str_tracking("$A-${MISSING}-$OTHER-$$OK", &m, &mut missing),
+            "x---$OK"
+        );
+        assert_eq!(missing, vec!["MISSING", "OTHER"]);
     }
 
     #[test]

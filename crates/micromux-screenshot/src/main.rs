@@ -32,7 +32,7 @@ const SCENARIOS: &[Scenario] = &[
     // The dashboard: the default frame the config settles into, `api` selected with its logs.
     Scenario {
         name: "overview",
-        cols: 180,
+        cols: 200,
         rows: 44,
         keys: &[],
     },
@@ -41,7 +41,7 @@ const SCENARIOS: &[Scenario] = &[
     // long probe command line is readable instead of truncated.
     Scenario {
         name: "healthcheck",
-        cols: 180,
+        cols: 200,
         rows: 44,
         keys: &[b"jjjjjj" as &[u8], b"H", b"w"],
     },
@@ -49,7 +49,7 @@ const SCENARIOS: &[Scenario] = &[
     // row turns gray (DISABLED) and the process is stopped, while its captured logs remain.
     Scenario {
         name: "disable",
-        cols: 180,
+        cols: 200,
         rows: 44,
         keys: &[b"j" as &[u8], b"d"],
     },
@@ -61,10 +61,12 @@ fn main() -> eyre::Result<()> {
     let workspace = workspace_dir()?;
     let micromux = micromux_bin(&workspace)?;
     let example_dir = workspace.join("examples").join("demo");
-    let docs = workspace.join("docs");
+    // The screenshots live in the Hugo static tree so the docs site and the README can both serve
+    // them (README via a raw.githubusercontent URL, the site as /images/<name>.png).
+    let images = workspace.join("docs").join("static").join("images");
 
     ensure_freeze()?;
-    std::fs::create_dir_all(&docs).wrap_err("failed to create docs directory")?;
+    std::fs::create_dir_all(&images).wrap_err("failed to create docs images directory")?;
 
     for scenario in SCENARIOS {
         let ansi = capture(&micromux, &example_dir, scenario)
@@ -73,7 +75,7 @@ fn main() -> eyre::Result<()> {
         let tmp = std::env::temp_dir().join(format!("micromux-screenshot-{}.ansi", scenario.name));
         std::fs::write(&tmp, &ansi).wrap_err("failed to write captured ANSI")?;
 
-        let png = docs.join(format!("{}.png", scenario.name));
+        let png = images.join(format!("{}.png", scenario.name));
         run_freeze(&tmp, &png)?;
         let _ = std::fs::remove_file(&tmp);
         println!("wrote {}", png.display());

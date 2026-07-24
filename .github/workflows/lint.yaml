@@ -40,7 +40,7 @@ jobs:
       - name: Audit
         run: task audit
 
-  outdated:
+  dependency-cooldown:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v6
@@ -49,9 +49,8 @@ jobs:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
       - uses: Homebrew/actions/setup-homebrew@master
       - uses: dtolnay/rust-toolchain@stable
-      - run: brew install cargo-outdated
-      - name: Check for outdated dependencies
-        run: task outdated
+      - name: Check that all dependencies are cooled down
+        run: cooldown check
 
   unused-dependencies:
     runs-on: ubuntu-24.04

@@ -1,5 +1,6 @@
 .DS_Store
 *.log
+/plan
 
 # rust
 target/
@@ -12,3 +13,8 @@ goreleaser-dist/
 # cooldown
 .cooldown.lock
 .cooldown-versions-*
+
+# hugo documentation site (docs/)
+docs/public
+docs/resources
+docs/.hugo_build.lock

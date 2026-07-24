@@ -1,59 +1,34 @@
-use color_eyre::eyre;
-use std::path::{Path, PathBuf};
-use yaml_spanned::Spanned;
-
 use crate::{
     config::{self},
     env,
+    model::LogRetention,
     scheduler::ServiceID,
+    spec::{DependencySpec, HealthcheckSpec, ServiceOrigin, ServiceSpec},
 };
+use color_eyre::eyre;
+use std::path::Path;
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config;
-    use indexmap::IndexMap;
+    use crate::{
+        config,
+        test_util::{service_config, spanned_string, unique_tmp_dir},
+    };
     use similar_asserts::assert_eq;
     use std::fs;
-
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::Duration;
     use yaml_spanned::Spanned;
 
-    fn spanned_string(value: &str) -> Spanned<String> {
-        Spanned {
-            span: yaml_spanned::spanned::Span::default(),
-            inner: value.to_string(),
-        }
-    }
-
-    fn unique_tmp_dir(prefix: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        std::env::temp_dir().join(format!("micromux-{prefix}-{nanos}"))
-    }
-
-    fn service_config(name: &str, command: (&str, &[&str])) -> config::Service {
-        config::Service {
-            name: spanned_string(name),
-            command: (
-                spanned_string(command.0),
-                command
-                    .1
-                    .iter()
-                    .map(|v| spanned_string(v))
-                    .collect::<Vec<_>>(),
-            ),
-            working_dir: None,
-            env_file: vec![],
-            environment: IndexMap::new(),
-            depends_on: vec![],
-            healthcheck: None,
-            ports: vec![],
-            restart: None,
-            color: None,
-        }
+    #[test]
+    fn argv_flattens_program_and_args_and_defaults_working_dir() -> eyre::Result<()> {
+        let dir = unique_tmp_dir("argv");
+        std::fs::create_dir_all(&dir)?;
+        let cfg = service_config("ui", ("task", &["tool:rag:ui:run:release"]));
+        let service = Service::new("ui", &dir, cfg)?;
+        assert_eq!(service.argv(), vec!["task", "tool:rag:ui:run:release"]);
+        assert_eq!(service.working_dir_display(), None);
+        Ok(())
     }
 
     #[test]
@@ -113,7 +88,7 @@ mod tests {
 
         let svc = Service::new("svc", &dir, cfg)?;
         assert_eq!(
-            svc.environment.get("FOO").map(String::as_str),
+            svc.spec.environment.get("FOO").map(String::as_str),
             Some("from_config")
         );
         Ok(())
@@ -136,10 +111,84 @@ mod tests {
 
         let svc = Service::new("svc", &dir, cfg)?;
         assert_eq!(
-            svc.environment.get("PORT").map(String::as_str),
+            svc.spec.environment.get("PORT").map(String::as_str),
             Some("1023")
         );
-        assert_eq!(svc.open_ports, vec![1023]);
+        assert_eq!(svc.spec.ports, vec![1023]);
+        Ok(())
+    }
+
+    #[test]
+    fn config_service_materializes_one_complete_normalized_spec() -> eyre::Result<()> {
+        let dir = unique_tmp_dir("normalized-spec");
+        fs::create_dir_all(dir.join("work"))?;
+        fs::write(dir.join("service.env"), "BASE=10\nFROM_FILE=yes\n")?;
+        let mut cfg = service_config("worker", ("sh", &["-c", "echo ok"]));
+        cfg.working_dir = Some(spanned_string("work"));
+        cfg.env_file = vec![config::EnvFile {
+            path: spanned_string("service.env"),
+        }];
+        cfg.environment
+            .insert(spanned_string("PORT"), spanned_string("${BASE}23"));
+        cfg.environment
+            .insert(spanned_string("FROM_FILE"), spanned_string("overridden"));
+        cfg.depends_on = vec![config::Dependency {
+            name: spanned_string("database"),
+            condition: Some(Spanned {
+                span: yaml_spanned::spanned::Span::default(),
+                inner: config::DependencyCondition::Healthy,
+            }),
+        }];
+        cfg.healthcheck = Some(config::HealthCheck {
+            test: (spanned_string("true"), Vec::new()),
+            start_delay: Some(Spanned {
+                span: yaml_spanned::spanned::Span::default(),
+                inner: Duration::from_millis(250),
+            }),
+            interval: Some(Spanned {
+                span: yaml_spanned::spanned::Span::default(),
+                inner: Duration::from_secs(2),
+            }),
+            timeout: Some(Spanned {
+                span: yaml_spanned::spanned::Span::default(),
+                inner: Duration::from_secs(1),
+            }),
+            retries: Some(Spanned {
+                span: yaml_spanned::spanned::Span::default(),
+                inner: 0,
+            }),
+        });
+        cfg.ports = vec![spanned_string("${PORT}")];
+        cfg.restart_policy = RestartPolicy::Always;
+
+        let service = Service::new("worker", &dir, cfg)?;
+
+        assert_eq!(
+            service.spec,
+            ServiceSpec {
+                name: Some("worker".to_string()),
+                command: vec!["sh".to_string(), "-c".to_string(), "echo ok".to_string()],
+                working_dir: Some(dir.join("work")),
+                environment: indexmap::IndexMap::from([
+                    ("BASE".to_string(), "10".to_string()),
+                    ("FROM_FILE".to_string(), "overridden".to_string()),
+                    ("PORT".to_string(), "1023".to_string()),
+                ]),
+                depends_on: vec![DependencySpec {
+                    service: "database".to_string(),
+                    condition: config::DependencyCondition::Healthy,
+                }],
+                healthcheck: Some(HealthcheckSpec {
+                    test: vec!["true".to_string()],
+                    start_delay: Some(Duration::from_millis(250)),
+                    interval: Duration::from_secs(2),
+                    timeout: Duration::from_secs(1),
+                    retries: 1,
+                }),
+                ports: vec![1023],
+                restart: RestartPolicy::Always,
+            }
+        );
         Ok(())
     }
 
@@ -159,7 +208,8 @@ mod tests {
 
         let svc = Service::new("svc", &dir, cfg)?;
         assert_eq!(
-            svc.environment
+            svc.spec
+                .environment
                 .get("AIRTYPE_API_SPICEDB_ENDPOINT")
                 .map(String::as_str),
             Some("http://0.0.0.0:50051")
@@ -168,12 +218,29 @@ mod tests {
     }
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug,
+    Default,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+    schemars::JsonSchema,
+)]
+/// How a service should be restarted after it exits.
 pub enum RestartPolicy {
+    /// Always restart the service when it exits.
     Always,
+    /// Restart the service unless it was explicitly stopped.
     UnlessStopped,
+    /// Never restart the service automatically.
     #[default]
     Never,
+    /// Restart only after a non-zero exit.
     OnFailure {
         /// Maximum number of automatic restarts after a non-zero exit.
         ///
@@ -196,21 +263,43 @@ impl std::fmt::Display for RestartPolicy {
     }
 }
 
-#[derive(Debug)]
+/// Determines how a service enters a new session.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum StartupMode {
+    /// Start automatically once dependencies are ready.
+    #[default]
+    Enabled,
+    /// Wait for an explicit enable request.
+    Disabled,
+}
+
+#[derive(Debug, Clone)]
 pub struct Service {
     pub id: ServiceID,
-    pub name: Spanned<String>,
-    pub command: (String, Vec<String>),
-    pub working_dir: Option<PathBuf>,
-    pub restart_policy: RestartPolicy,
-    pub depends_on: Vec<config::Dependency>,
-    pub environment: indexmap::IndexMap<String, String>,
-    pub health_check: Option<config::HealthCheck>,
-    pub open_ports: Vec<u16>,
+    pub spec: ServiceSpec,
+    pub origin: ServiceOrigin,
+    pub startup_mode: StartupMode,
     pub enable_color: bool,
+    pub log_retention: LogRetention,
 }
 
 impl Service {
+    pub(crate) fn dynamic(
+        id: ServiceID,
+        spec: ServiceSpec,
+        origin: ServiceOrigin,
+        log_retention: LogRetention,
+    ) -> Self {
+        Self {
+            id,
+            spec,
+            origin,
+            startup_mode: StartupMode::Enabled,
+            enable_color: true,
+            log_retention,
+        }
+    }
+
     pub fn new(
         id: impl Into<ServiceID>,
         config_dir: &Path,
@@ -232,8 +321,10 @@ impl Service {
             .collect::<Result<Vec<_>, _>>()?;
 
         let base_env: std::collections::HashMap<String, String> = std::env::vars().collect();
+        let mut missing_env = Vec::new();
         let env_file_env = env::load_env_files_sync(&env_files)?;
-        let env_file_env = env::expand_env_values(&env_file_env, &base_env);
+        let env_file_env =
+            env::expand_env_values_tracking(&env_file_env, &base_env, &mut missing_env);
 
         let mut base_with_env_file = base_env.clone();
         for (k, v) in env_file_env.iter() {
@@ -244,23 +335,35 @@ impl Service {
         for (k, v) in &config.environment {
             config_env_map.insert(k.as_ref().clone(), v.as_ref().clone());
         }
-        let config_env_map = env::expand_env_values(&config_env_map, &base_with_env_file);
+        let config_env_map =
+            env::expand_env_values_tracking(&config_env_map, &base_with_env_file, &mut missing_env);
 
         let mut full_env = base_with_env_file.clone();
         for (k, v) in config_env_map.iter() {
             full_env.insert(k.clone(), v.clone());
         }
 
-        let open_ports = config
+        let advertised_ports = config
             .ports
             .iter()
             .map(|port| {
-                let expanded = env::interpolate_str(port.as_ref(), &full_env);
+                let expanded =
+                    env::interpolate_str_tracking(port.as_ref(), &full_env, &mut missing_env);
                 expanded
                     .parse::<u16>()
                     .map_err(|err| eyre::eyre!("invalid port `{}`: {err}", expanded))
             })
             .collect::<Result<Vec<_>, _>>()?;
+
+        missing_env.sort_unstable();
+        missing_env.dedup();
+        if !missing_env.is_empty() {
+            tracing::warn!(
+                service_id = %id,
+                missing = ?missing_env,
+                "environment interpolation referenced unset variables"
+            );
+        }
 
         let mut environment = indexmap::IndexMap::new();
         for (k, v) in env_file_env.iter() {
@@ -270,22 +373,54 @@ impl Service {
             environment.insert(k.clone(), v.clone());
         }
 
+        let healthcheck = config.healthcheck.map(HealthcheckSpec::from);
+        let depends_on = config
+            .depends_on
+            .into_iter()
+            .map(|dependency| DependencySpec {
+                service: dependency.name.into_inner(),
+                condition: dependency
+                    .condition
+                    .map(yaml_spanned::Spanned::into_inner)
+                    .unwrap_or_default(),
+            })
+            .collect();
+        let mut command = vec![prog.into_inner()];
+        command.extend(args.into_iter().map(yaml_spanned::Spanned::into_inner));
+
         Ok(Self {
             id,
-            name: config.name,
-            command: (
-                prog.into_inner(),
-                args.into_iter()
-                    .map(|value| value.to_string())
-                    .collect::<Vec<_>>(),
-            ),
-            working_dir,
-            open_ports,
-            restart_policy: config.restart.unwrap_or_default(),
-            depends_on: config.depends_on,
-            environment,
-            health_check: config.healthcheck,
+            spec: ServiceSpec {
+                name: Some(config.name.into_inner()),
+                command,
+                working_dir,
+                environment,
+                depends_on,
+                healthcheck,
+                ports: advertised_ports,
+                restart: config.restart_policy,
+            },
+            origin: ServiceOrigin::Configured,
+            startup_mode: config.startup_mode,
             enable_color: config.color.as_deref().copied().unwrap_or(true),
+            log_retention: config.log_retention,
         })
+    }
+
+    /// The resolved program and arguments this service runs, as a single argv vector.
+    #[must_use]
+    pub fn argv(&self) -> Vec<String> {
+        self.spec.command.clone()
+    }
+
+    /// The service's overridden working directory as a display string, or `None` when it inherits
+    /// the session's working directory (the directory micromux was launched in).
+    #[must_use]
+    pub fn working_dir_display(&self) -> Option<String> {
+        self.spec.working_dir_display()
+    }
+
+    pub fn display_name(&self) -> &str {
+        self.spec.name.as_deref().unwrap_or(&self.id)
     }
 }

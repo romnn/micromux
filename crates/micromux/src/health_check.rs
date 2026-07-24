@@ -1,4 +1,7 @@
-use crate::scheduler::{OutputStream, ProcessEvent, RunId, ServiceID};
+use crate::{
+    model::RunSink,
+    scheduler::{OutputStream, ProcessEvent, RunId, ServiceID},
+};
 use itertools::Itertools;
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -6,22 +9,39 @@ use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, strum::Display)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    strum::Display,
+    serde::Serialize,
+    serde::Deserialize,
+    schemars::JsonSchema,
+)]
+/// The resolved health verdict for a service.
 pub enum Health {
+    /// The service's healthcheck is currently passing.
     Healthy,
+    /// The service's healthcheck is currently failing.
     Unhealthy,
+    /// A newer peer sent a health verdict this binary does not know yet.
+    #[serde(other)]
+    Unknown,
 }
 
-/// Default probe interval when none is configured (matches Docker Compose).
-const DEFAULT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
-/// Default probe timeout when none is configured (matches Docker Compose).
-const DEFAULT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// How long to wait for stdout/stderr readers to flush after the probe process exits.
 const OUTPUT_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
 
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use crate::model::SessionModelReader;
+    use crate::test_util::{initial_model_entry, spanned_string, unique_tmp_dir};
     use similar_asserts::assert_eq;
     use std::path::PathBuf;
     use yaml_spanned::Spanned;
@@ -30,13 +50,7 @@ mod tests {
 
     impl TempDir {
         fn new(prefix: &str) -> color_eyre::eyre::Result<Self> {
-            use std::time::{SystemTime, UNIX_EPOCH};
-
-            let nanos = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos();
-            let dir = std::env::temp_dir().join(format!("{prefix}-{nanos}"));
+            let dir = unique_tmp_dir(prefix);
             std::fs::create_dir_all(&dir)?;
             Ok(Self(dir))
         }
@@ -48,11 +62,11 @@ mod tests {
         }
     }
 
-    fn spanned_string(value: &str) -> Spanned<String> {
-        Spanned {
-            span: yaml_spanned::spanned::Span::default(),
-            inner: value.to_string(),
-        }
+    fn run_sink(id: &str, run_generation: u64) -> (SessionModelReader, RunSink) {
+        let (reader, writer) = crate::model::new([initial_model_entry(id)]);
+        let id = id.to_string();
+        writer.begin_run(&id, run_generation);
+        (reader, writer.run_sink(&id, run_generation))
     }
 
     #[cfg(unix)]
@@ -65,7 +79,7 @@ mod tests {
         let dir = TempDir::new("micromux-hc-timeout")?;
         let pid_path = dir.0.join("pid");
 
-        let hc = crate::config::HealthCheck {
+        let hc: crate::HealthcheckSpec = crate::config::HealthCheck {
             test: (
                 spanned_string("sh"),
                 vec![
@@ -86,24 +100,22 @@ mod tests {
                 span: yaml_spanned::spanned::Span::default(),
                 inner: 1,
             }),
-        };
+        }
+        .into();
 
-        let (events_tx, mut events_rx) = mpsc::channel(64);
+        let (reader, sink) = run_sink("svc", 1);
         let shutdown = CancellationToken::new();
         let terminate = CancellationToken::new();
         let env = std::collections::HashMap::new();
-        let service_id: ServiceID = "svc".to_string();
 
         let start = tokio::time::Instant::now();
         let res = super::run(
             &hc,
-            &service_id,
-            RunId::new(1),
             1,
             RunParams {
                 working_dir: Some(dir.0.as_path()),
                 environment: &env,
-                events_tx,
+                sink,
                 shutdown,
                 terminate,
             },
@@ -121,22 +133,82 @@ mod tests {
         let pid_str = std::fs::read_to_string(&pid_path)?;
         let pid: i32 = pid_str.trim().parse()?;
 
-        let mut saw_finished = false;
-        for _ in 0..50 {
-            if let Some(ev) = events_rx.recv().await
-                && let ProcessEvent::HealthCheckFinished { success: false, .. } = ev
-            {
-                saw_finished = true;
-                break;
-            }
-        }
-        assert!(saw_finished);
+        let history = reader.healthchecks("svc");
+        let result = history
+            .last()
+            .and_then(|attempt| attempt.result.as_ref())
+            .ok_or_else(|| color_eyre::eyre::eyre!("missing finished timeout attempt"))?;
+        assert!(!result.success);
+        assert!(!result.cancelled);
 
         match kill(Pid::from_raw(pid), None) {
             Err(Errno::ESRCH) => {}
             other => color_eyre::eyre::bail!("expected ESRCH for dead pid, got {other:?}"),
         }
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn terminated_probe_emits_cancelled_finished() -> color_eyre::eyre::Result<()> {
+        let hc: crate::HealthcheckSpec = crate::config::HealthCheck {
+            test: (
+                spanned_string("sh"),
+                vec![spanned_string("-c"), spanned_string("sleep 5")],
+            ),
+            start_delay: None,
+            interval: None,
+            timeout: Some(Spanned {
+                span: yaml_spanned::spanned::Span::default(),
+                inner: std::time::Duration::from_secs(5),
+            }),
+            retries: Some(Spanned {
+                span: yaml_spanned::spanned::Span::default(),
+                inner: 1,
+            }),
+        }
+        .into();
+
+        let (reader, sink) = run_sink("svc", 1);
+        let mut changes = reader.subscribe();
+        let shutdown = CancellationToken::new();
+        let terminate = CancellationToken::new();
+        let run_handle = tokio::spawn({
+            let terminate = terminate.clone();
+            async move {
+                let env = std::collections::HashMap::new();
+                super::run(
+                    &hc,
+                    1,
+                    RunParams {
+                        working_dir: None,
+                        environment: &env,
+                        sink,
+                        shutdown,
+                        terminate,
+                    },
+                )
+                .await
+            }
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while reader.healthchecks("svc").is_empty() {
+                let _ = changes.recv().await;
+            }
+        })
+        .await
+        .map_err(|_| color_eyre::eyre::eyre!("probe did not start"))?;
+        terminate.cancel();
+
+        let outcome = run_handle.await?;
+        assert!(matches!(outcome, Ok(Outcome::Cancelled)));
+        let history = reader.healthchecks("svc");
+        let result = history
+            .last()
+            .and_then(|attempt| attempt.result.as_ref())
+            .ok_or_else(|| color_eyre::eyre::eyre!("missing finished cancelled attempt"))?;
+        assert!(result.cancelled);
         Ok(())
     }
 
@@ -151,7 +223,7 @@ mod tests {
         let dir = TempDir::new("micromux-hc-bg-stdout")?;
         let pid_path = dir.0.join("pid");
 
-        let hc = crate::config::HealthCheck {
+        let hc: crate::HealthcheckSpec = crate::config::HealthCheck {
             test: (
                 spanned_string("sh"),
                 vec![
@@ -172,25 +244,23 @@ mod tests {
                 span: yaml_spanned::spanned::Span::default(),
                 inner: 1,
             }),
-        };
+        }
+        .into();
 
-        let (events_tx, _events_rx) = mpsc::channel(64);
+        let (_reader, sink) = run_sink("svc", 1);
         let shutdown = CancellationToken::new();
         let terminate = CancellationToken::new();
         let env = std::collections::HashMap::new();
-        let service_id: ServiceID = "svc".to_string();
 
         let res = tokio::time::timeout(
             std::time::Duration::from_secs(2),
             super::run(
                 &hc,
-                &service_id,
-                RunId::new(1),
                 1,
                 RunParams {
                     working_dir: Some(dir.0.as_path()),
                     environment: &env,
-                    events_tx,
+                    sink,
                     shutdown,
                     terminate,
                 },
@@ -229,7 +299,7 @@ mod tests {
     }
 
     async fn started_attempts_before_unhealthy(retries: usize) -> color_eyre::eyre::Result<usize> {
-        let hc = crate::config::HealthCheck {
+        let hc: crate::HealthcheckSpec = crate::config::HealthCheck {
             test: (
                 spanned_string("sh"),
                 vec![spanned_string("-c"), spanned_string("exit 1")],
@@ -247,13 +317,15 @@ mod tests {
                 span: yaml_spanned::spanned::Span::default(),
                 inner: retries,
             }),
-        };
+        }
+        .into();
 
         let (events_tx, mut events_rx) = mpsc::channel(64);
         let shutdown = CancellationToken::new();
         let terminate = CancellationToken::new();
         let service_id: ServiceID = "svc".to_string();
         let run_id = RunId::new(1);
+        let (reader, sink) = run_sink(&service_id, run_id.get());
 
         let handle = tokio::spawn({
             let terminate = terminate.clone();
@@ -263,6 +335,7 @@ mod tests {
                     RunLoopParams {
                         service_id,
                         run_id,
+                        sink,
                         working_dir: None,
                         environment: std::collections::HashMap::new(),
                         events_tx,
@@ -274,28 +347,18 @@ mod tests {
             }
         });
 
-        let mut starts = 0;
         loop {
             let event = tokio::time::timeout(std::time::Duration::from_secs(2), events_rx.recv())
                 .await?
                 .ok_or_else(|| color_eyre::eyre::eyre!("healthcheck event channel closed"))?;
-            match event {
-                ProcessEvent::HealthCheckStarted { .. } => {
-                    starts += 1;
-                    if starts > 1 {
-                        color_eyre::eyre::bail!(
-                            "healthcheck needed more than one failure to become unhealthy"
-                        );
-                    }
-                }
-                ProcessEvent::Unhealthy { .. } => break,
-                _ => {}
+            if let ProcessEvent::Unhealthy { .. } = event {
+                break;
             }
         }
 
         terminate.cancel();
         handle.await?;
-        Ok(starts)
+        Ok(reader.healthchecks("svc").len())
     }
 
     #[tokio::test]
@@ -332,7 +395,7 @@ pub struct Error {
 struct RunParams<'a> {
     pub working_dir: Option<&'a std::path::Path>,
     pub environment: &'a std::collections::HashMap<String, String>,
-    pub events_tx: mpsc::Sender<ProcessEvent>,
+    pub sink: RunSink,
     pub shutdown: CancellationToken,
     pub terminate: CancellationToken,
 }
@@ -340,6 +403,7 @@ struct RunParams<'a> {
 pub(crate) struct RunLoopParams {
     pub service_id: ServiceID,
     pub run_id: RunId,
+    pub sink: RunSink,
     pub working_dir: Option<std::path::PathBuf>,
     pub environment: std::collections::HashMap<String, String>,
     pub events_tx: mpsc::Sender<ProcessEvent>,
@@ -426,18 +490,10 @@ async fn record_probe_failure(
     }
 }
 
-pub async fn run_loop(health_check: crate::config::HealthCheck, params: RunLoopParams) {
-    let max_retries = health_check.retries.as_deref().copied().unwrap_or(1).max(1);
-    let start_delay = health_check
-        .start_delay
-        .as_deref()
-        .copied()
-        .unwrap_or_default();
-    let interval = health_check
-        .interval
-        .as_deref()
-        .copied()
-        .unwrap_or(DEFAULT_INTERVAL);
+pub async fn run_loop(health_check: crate::HealthcheckSpec, params: RunLoopParams) {
+    let max_retries = health_check.retries;
+    let start_delay = health_check.start_delay.unwrap_or_default();
+    let interval = health_check.interval;
     tracing::info!(
         service_id = params.service_id,
         ?start_delay,
@@ -462,13 +518,11 @@ pub async fn run_loop(health_check: crate::config::HealthCheck, params: RunLoopP
 
         let res = run(
             &health_check,
-            &params.service_id,
-            params.run_id,
             attempt_id,
             RunParams {
                 working_dir: params.working_dir.as_deref(),
                 environment: &params.environment,
-                events_tx: params.events_tx.clone(),
+                sink: params.sink.clone(),
                 shutdown: params.shutdown.clone(),
                 terminate: params.terminate.clone(),
             },
@@ -507,99 +561,30 @@ pub async fn run_loop(health_check: crate::config::HealthCheck, params: RunLoopP
     }
 }
 
-fn command_string(health_check: &crate::config::HealthCheck) -> String {
-    let (prog, args) = &health_check.test;
-    [prog]
-        .into_iter()
-        .chain(args.iter())
-        .map(|value| value.as_str())
-        .join(" ")
+fn command_string(health_check: &crate::HealthcheckSpec) -> String {
+    health_check.test.iter().join(" ")
 }
 
-async fn emit_started(
-    events_tx: &mpsc::Sender<ProcessEvent>,
-    service_id: &ServiceID,
-    run_id: RunId,
-    attempt: u64,
-    command: String,
-) {
-    let _ = events_tx
-        .send(ProcessEvent::HealthCheckStarted {
-            service_id: service_id.clone(),
-            run_id,
-            attempt,
-            command,
-        })
-        .await;
-}
-
-async fn emit_finished(
-    events_tx: &mpsc::Sender<ProcessEvent>,
-    service_id: &ServiceID,
-    run_id: RunId,
-    attempt: u64,
-    success: bool,
-    exit_code: i32,
-) {
-    let _ = events_tx
-        .send(ProcessEvent::HealthCheckFinished {
-            service_id: service_id.clone(),
-            run_id,
-            attempt,
-            success,
-            exit_code,
-        })
-        .await;
-}
-
-fn try_emit_spawn_failed(
-    events_tx: &mpsc::Sender<ProcessEvent>,
-    service_id: &ServiceID,
-    run_id: RunId,
-    attempt: u64,
-    source: &std::io::Error,
-) {
-    let _ = events_tx.try_send(ProcessEvent::HealthCheckLogLine {
-        service_id: service_id.clone(),
-        run_id,
-        attempt,
-        stream: OutputStream::Stderr,
-        line: source.to_string(),
-    });
-    let _ = events_tx.try_send(ProcessEvent::HealthCheckFinished {
-        service_id: service_id.clone(),
-        run_id,
-        attempt,
-        success: false,
-        exit_code: -1,
-    });
+fn emit_spawn_failed(sink: &RunSink, attempt: u64, source: &std::io::Error) {
+    sink.append_health_line(attempt, OutputStream::Stderr, source.to_string());
+    sink.finish_health_attempt(attempt, false, -1, false);
 }
 
 fn spawn_output_task(
     mut lines: tokio::io::Lines<BufReader<impl tokio::io::AsyncRead + Unpin + Send + 'static>>,
-    service_id: ServiceID,
-    run_id: RunId,
     attempt: u64,
     stream: OutputStream,
-    events_tx: mpsc::Sender<ProcessEvent>,
+    sink: RunSink,
 ) -> tokio::task::JoinHandle<()> {
     tokio::task::spawn(async move {
         loop {
             match lines.next_line().await {
                 Ok(Some(line)) => {
-                    let _ = events_tx
-                        .send(ProcessEvent::HealthCheckLogLine {
-                            service_id: service_id.clone(),
-                            run_id,
-                            attempt,
-                            stream,
-                            line,
-                        })
-                        .await;
+                    sink.append_health_line(attempt, stream, line);
                 }
                 Ok(None) => break,
                 Err(err) => {
-                    tracing::error!(service_id, ?err, "health check: failed to read line");
+                    tracing::error!(?err, "health check: failed to read line");
                 }
             }
         }
@@ -675,11 +660,9 @@ impl Drop for OutputReaders {
 }
 
 struct Running {
-    service_id: ServiceID,
-    run_id: RunId,
+    sink: RunSink,
     attempt: u64,
     command: String,
-    events_tx: mpsc::Sender<ProcessEvent>,
     output_readers: OutputReaders,
     wait_handle: tokio::task::JoinHandle<Result<std::process::ExitStatus, std::io::Error>>,
     kill_token: CancellationToken,
@@ -764,15 +747,9 @@ async fn finish_with_exit(running: &mut Running, success: bool, exit_code: i32) 
         running.output_readers.abort_and_join().await;
     }
 
-    emit_finished(
-        &running.events_tx,
-        &running.service_id,
-        running.run_id,
-        running.attempt,
-        success,
-        exit_code,
-    )
-    .await;
+    running
+        .sink
+        .finish_health_attempt(running.attempt, success, exit_code, false);
 }
 
 #[cfg(unix)]
@@ -788,28 +765,33 @@ fn kill_reaped_probe_group(pid: i32) {
     let _ = nix::sys::signal::killpg(pid, nix::sys::signal::Signal::SIGKILL);
 }
 
-#[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the probe lifecycle keeps spawn, timeout, output drain, and cleanup ordering together"
+)]
 async fn run(
-    health_check: &crate::config::HealthCheck,
-    service_id: &ServiceID,
-    run_id: RunId,
+    health_check: &crate::HealthcheckSpec,
     attempt: u64,
     params: RunParams<'_>,
 ) -> Result<Outcome, Error> {
-    let (prog, args) = &health_check.test;
     let command = command_string(health_check);
 
-    emit_started(
-        &params.events_tx,
-        service_id,
-        run_id,
-        attempt,
-        command.clone(),
-    )
-    .await;
+    let Some((prog, args)) = health_check.test.split_first() else {
+        let source = std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "healthcheck command is empty",
+        );
+        emit_spawn_failed(&params.sink, attempt, &source);
+        return Err(Error {
+            command,
+            source: ErrorReason::Spawn(source),
+        });
+    };
 
-    let mut cmd = Command::new(prog.as_ref());
-    cmd.args(args.iter().map(std::convert::AsRef::as_ref))
+    params.sink.start_health_attempt(attempt, command.clone());
+
+    let mut cmd = Command::new(prog);
+    cmd.args(args)
         .envs(params.environment.iter())
         .stderr(Stdio::piped())
         .stdout(Stdio::piped());
@@ -822,7 +804,7 @@ async fn run(
     }
 
     let mut process = cmd.spawn().map_err(|source| {
-        try_emit_spawn_failed(&params.events_tx, service_id, run_id, attempt, &source);
+        emit_spawn_failed(&params.sink, attempt, &source);
         Error {
             command: command.clone(),
             source: ErrorReason::Spawn(source),
@@ -833,22 +815,18 @@ async fn run(
     if let Some(stderr) = process.stderr.take() {
         output_readers.set_stderr(spawn_output_task(
             BufReader::new(stderr).lines(),
-            service_id.clone(),
-            run_id,
             attempt,
             OutputStream::Stderr,
-            params.events_tx.clone(),
+            params.sink.clone(),
         ));
     }
 
     if let Some(stdout) = process.stdout.take() {
         output_readers.set_stdout(spawn_output_task(
             BufReader::new(stdout).lines(),
-            service_id.clone(),
-            run_id,
             attempt,
             OutputStream::Stdout,
-            params.events_tx.clone(),
+            params.sink.clone(),
         ));
     }
 
@@ -857,12 +835,7 @@ async fn run(
     let kill_token = CancellationToken::new();
     let mut wait_handle = spawn_wait_task(process, &kill_token);
     // Always bound the probe so a hung command cannot block the loop (and dependents) forever.
-    let timeout = Some(
-        health_check
-            .timeout
-            .as_ref()
-            .map_or(DEFAULT_TIMEOUT, |t| t.inner),
-    );
+    let timeout = Some(health_check.timeout);
 
     let completion = select_completion(
         timeout,
@@ -873,11 +846,9 @@ async fn run(
     .await;
 
     let mut running = Running {
-        service_id: service_id.clone(),
-        run_id,
+        sink: params.sink,
         attempt,
         command,
-        events_tx: params.events_tx.clone(),
         output_readers,
         wait_handle,
         kill_token,
@@ -890,28 +861,14 @@ async fn run(
             // The service is being stopped/restarted: this is a cancellation, not a probe
             // result. Tear down the probe but do NOT report it as healthy or unhealthy.
             cleanup_after_cancel(&mut running).await;
-            emit_finished(
-                &running.events_tx,
-                &running.service_id,
-                run_id,
-                attempt,
-                false,
-                -1,
-            )
-            .await;
+            running.sink.finish_health_attempt(attempt, false, -1, true);
             Ok(Outcome::Cancelled)
         }
         Completion::Timeout => {
             cleanup_after_cancel(&mut running).await;
-            emit_finished(
-                &running.events_tx,
-                &running.service_id,
-                run_id,
-                attempt,
-                false,
-                -1,
-            )
-            .await;
+            running
+                .sink
+                .finish_health_attempt(attempt, false, -1, false);
             let command = std::mem::take(&mut running.command);
             Err(Error {
                 command,

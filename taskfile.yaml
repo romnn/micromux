@@ -1,5 +1,10 @@
 # yaml-language-server: $schema=https://taskfile.dev/schema.json
 version: "3"
+
+vars:
+  ZIGBUILD_IMAGE: ghcr.io/rust-cross/cargo-zigbuild:latest
+  GORELEASER_VERSION: "2.17.0"
+
 tasks:
   default:
     cmds:
@@ -21,47 +26,78 @@ tasks:
     cmds:
       - cargo build --all-targets --release {{.CLI_ARGS}}
 
+  goreleaser:
+    internal: true
+    requires:
+      vars: [GORELEASER_ARGS]
+    cmds:
+      # The image ships zig, cargo-zigbuild, rust and every release target; only goreleaser
+      # is missing. safe.directory: the bind-mounted repo is owned by another uid.
+      # prettier-ignore
+      - >-
+        docker run --rm
+        -e GITHUB_TOKEN -e TAP_GITHUB_TOKEN
+        -e "HOST_UID=$(id -u)" -e "HOST_GID=$(id -g)"
+        -v "${PWD}:/workspace" -w /workspace
+        {{.ZIGBUILD_IMAGE}}
+        bash -euo pipefail -c '
+        fix_perms() { for d in target target-goreleaser goreleaser-dist; do [ -e "$d" ] && chown -R "${HOST_UID}:${HOST_GID}" "$d" || true; done; };
+        trap fix_perms EXIT;
+        case "$(uname -m)" in x86_64) arch=x86_64 ;; aarch64|arm64) arch=arm64 ;; *) echo "unsupported arch" >&2; exit 1 ;; esac;
+        curl -sSfL "https://github.com/goreleaser/goreleaser/releases/download/v{{.GORELEASER_VERSION}}/goreleaser_Linux_${arch}.tar.gz" | tar -xz -C /usr/local/bin goreleaser;
+        git config --global --add safe.directory "$(pwd)";
+        goreleaser {{.GORELEASER_ARGS}}'
+
   build:goreleaser:
     desc: "build in release mode using goreleaser"
     cmds:
-      # pretter-ignore
-      - >-
-        docker run --rm
-        -e "HOST_UID=$(id -u)"
-        -e "HOST_GID=$(id -g)"
-        -v "${PWD}:/workspace"
-        -w /workspace
-        ghcr.io/rust-cross/cargo-zigbuild
-        bash -c 'set -euo pipefail;
-        fix_perms() { for d in target target-goreleaser goreleaser-dist; do [ -e "$d" ] && chown -R "${HOST_UID}:${HOST_GID}" "$d" || true; done; };
-        trap fix_perms EXIT;
-        ./release.sh && goreleaser build --snapshot --clean'
+      - task: goreleaser
+        vars: { GORELEASER_ARGS: "build --snapshot --clean" }
 
   release:
     desc: "release using goreleaser"
     cmds:
-      # pretter-ignore
-      - >-
-        docker run --rm
-        -e "GITHUB_TOKEN=${GITHUB_TOKEN}"
-        -e "TAP_GITHUB_TOKEN=${TAP_GITHUB_TOKEN}"
-        -e "HOST_UID=$(id -u)"
-        -e "HOST_GID=$(id -g)"
-        -v "${PWD}:/workspace"
-        -w /workspace
-        ghcr.io/rust-cross/cargo-zigbuild
-        bash -c 'set -euo pipefail;
-        fix_perms() { for d in target target-goreleaser goreleaser-dist; do [ -e "$d" ] && chown -R "${HOST_UID}:${HOST_GID}" "$d" || true; done; };
-        trap fix_perms EXIT;
-        ./release.sh && goreleaser release --clean'
+      - task: goreleaser
+        vars: { GORELEASER_ARGS: "release --clean" }
 
-  screenshots:
-    desc: "regenerate the docs screenshots from examples/ (needs charmbracelet/freeze)"
+  docs:screenshots:
+    desc: "regenerate the documentation screenshots of the TUI (needs charmbracelet/freeze)"
+    aliases: [screenshots]
+    sources:
+      - crates/micromux-screenshot/src/**/*.rs
+      - examples/demo/micromux.yaml
+    generates:
+      - docs/static/images/*.png
     cmds:
       # micromux-screenshot drives the real micromux binary in a pty, so build it first; it is
       # found as a sibling in target/debug (override with MICROMUX_BIN).
       - cargo build -p micromux-cli
       - cargo run -p micromux-screenshot
+
+  docs:terminals:
+    desc: "regenerate the documentation terminal snippets (needs terminal-to-html)"
+    sources:
+      - scripts/terminals.sh
+      - crates/micromux-cli/src/**/*.rs
+      - examples/demo/micromux.yaml
+    generates:
+      - docs/assets/terminals/*.html
+    cmds:
+      - bash scripts/terminals.sh
+
+  docs:build:
+    desc: "build the static documentation site into docs/public (needs hugo extended + go)"
+    dir: docs
+    cmds:
+      - hugo --minify --gc {{.CLI_ARGS}}
+
+  docs:serve:
+    desc: "serve the documentation website with hot reload (needs hugo extended + go)"
+    aliases: [docs]
+    dir: docs
+    interactive: true
+    cmds:
+      - hugo server --disableFastRender {{.CLI_ARGS}}
 
   typos:
     desc: "check repository for typos"
@@ -96,8 +132,8 @@ tasks:
         \( -name '.intentionally-empty-file.o' -o -name '*detect_compiler_family.o' \)
         -delete
 
-  docs:
-    desc: "open documentation preview"
+  docs:cargo:
+    desc: "open rustdoc preview"
     env:
       RUSTDOCFLAGS: "--cfg docsrs"
     cmds:
@@ -148,7 +184,7 @@ tasks:
   lint:fc:
     desc: "lint cargo workspace for all combinations of features"
     cmds:
-      - cargo fc lint --dedup {{.CLI_ARGS}}
+      - cargo fc lint {{.CLI_ARGS}}
 
   lint:fix:
     desc: "lint and fix cargo workspace"

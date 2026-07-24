@@ -1,6 +1,11 @@
 [files]
 ignore-files = true
 extend-exclude = [
+  # Generated docs assets (marked linguist-generated in .gitattributes):
+  # chroma syntax CSS is full of short class names (.nd, .na, …) and the
+  # terminal snippets are captured verbatim from real output.
+  "docs/assets/_syntax.scss",
+  "docs/assets/terminals/",
 ]
 
 [default]

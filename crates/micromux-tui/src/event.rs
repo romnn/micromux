@@ -1,32 +1,22 @@
 use color_eyre::eyre::OptionExt;
 use crossterm::event::{KeyEvent, KeyEventKind, MouseEvent};
-use futures::{FutureExt, StreamExt};
+use futures::StreamExt;
 use ratatui::crossterm::event::Event as CrosstermEvent;
-use std::time::Duration;
 use tokio::sync::mpsc;
 
-/// The frequency at which tick events are emitted.
-const DRAW_TICK_FPS: f64 = 30.0; // 30 fps
-
-/// Representation of all possible events.
+/// Representation of all possible input events.
+///
+/// The TUI redraws on each of these and on every model [`micromux::SessionChange`], so there is no
+/// periodic tick — nothing in the view is time-animated, and live output arrives as model changes.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Hash)]
 pub enum Input {
-    /// An event that is emitted on a regular schedule.
-    ///
-    /// Use this event to run any code which has to run outside of being a direct response to a user
-    /// event. e.g. polling external systems, updating animations, or rendering the UI based on a
-    /// fixed frame rate.
-    Tick,
-    /// Crossterm events.
-    ///
-    /// These events are emitted by the terminal.
+    /// Crossterm events emitted by the terminal.
     Event(CrosstermEvent),
 }
 
 impl std::fmt::Display for Input {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Tick => write!(f, "Tick"),
             Self::Event(CrosstermEvent::Key(KeyEvent { code, kind, .. })) => match kind {
                 KeyEventKind::Press => write!(f, "KeyPress({code:?})"),
                 KeyEventKind::Release => write!(f, "KeyRelease({code:?})"),
@@ -35,24 +25,13 @@ impl std::fmt::Display for Input {
             Self::Event(CrosstermEvent::Resize(cols, rows)) => {
                 write!(f, "Resize(cols={cols}, rows={rows})")
             }
-            // TODO match kind
             Self::Event(CrosstermEvent::Mouse(MouseEvent {
-                column,
-                row,
-                kind: _,
-                ..
+                column, row, kind, ..
             })) => {
-                write!(f, "Mouse(col={column}, row={row})")
+                write!(f, "Mouse({kind:?}, col={column}, row={row})")
             }
             other @ Self::Event(_) => std::fmt::Debug::fmt(other, f),
         }
-    }
-}
-
-impl Input {
-    #[must_use]
-    pub fn is_tick(&self) -> bool {
-        matches!(self, Input::Tick)
     }
 }
 
@@ -66,7 +45,7 @@ pub struct InputHandler {
 }
 
 impl InputHandler {
-    /// Constructs a new instance of [`EventHandler`] and spawns a new task to handle events.
+    /// Constructs a new instance of [`InputHandler`] and spawns a task to handle terminal events.
     #[must_use]
     pub fn new() -> Self {
         let (sender, receiver) = mpsc::unbounded_channel();
@@ -85,7 +64,7 @@ impl InputHandler {
     /// # Errors
     ///
     /// This function returns an error if the sender channel is disconnected. This can happen if an
-    /// error occurs in the event thread. In practice, this should not happen unless there is a
+    /// error occurs in the event task. In practice, this should not happen unless there is a
     /// problem with the underlying terminal.
     pub async fn next(&mut self) -> color_eyre::Result<Input> {
         self.receiver
@@ -95,39 +74,30 @@ impl InputHandler {
     }
 }
 
-/// A thread that handles reading crossterm events and emitting tick events on a regular schedule.
+/// Task that forwards terminal events until the receiver is dropped.
 struct EventTask {
     /// Event sender channel.
     sender: mpsc::UnboundedSender<Input>,
 }
 
 impl EventTask {
-    /// Constructs a new instance of [`EventThread`].
+    /// Constructs a new instance of [`EventTask`].
     fn new(sender: mpsc::UnboundedSender<Input>) -> Self {
         Self { sender }
     }
 
-    /// Runs the event thread.
-    ///
-    /// This function emits tick events at a fixed rate and polls for crossterm events in between.
+    /// Runs the event task, forwarding crossterm events until the receiver is dropped.
     async fn run(self) -> color_eyre::Result<()> {
-        let tick_rate = Duration::from_secs_f64(1.0 / DRAW_TICK_FPS);
         let mut reader = crossterm::event::EventStream::new();
-        let mut tick = tokio::time::interval(tick_rate);
         loop {
-            let tick_delay_fut = tick.tick();
-            let crossterm_event_fut = reader.next().fuse();
             tokio::select! {
-              () = self.sender.closed() => {
-                break;
-              }
-              _ = tick_delay_fut => {
-                self.send(Input::Tick);
-              }
-              Some(Ok(event)) = crossterm_event_fut => {
-                self.send(Input::Event(event));
-              }
-            };
+              () = self.sender.closed() => break,
+              event = reader.next() => match event {
+                Some(Ok(event)) => self.send(Input::Event(event)),
+                Some(Err(_)) => {}
+                None => break,
+              },
+            }
         }
         Ok(())
     }

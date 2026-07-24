@@ -1,0 +1,895 @@
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use futures::{SinkExt, StreamExt};
+use micromux::{
+    ChangeKind, CommandRejection, SchedulerStopped, ServiceCommandResult, ServiceSnapshot,
+    SessionChange, SessionModelReader, trim_to_last_bytes,
+};
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio_util::sync::CancellationToken;
+
+use super::ControlServer;
+use crate::endpoint::ControlEndpoint;
+use crate::protocol::{ErrorCode, PROTOCOL_VERSION, Request, Response, ServiceBrief, SessionInfo};
+use crate::{
+    ControlError, Framing, IDLE_TIMEOUT, REQUEST_TIMEOUT, framed, read_message, write_message,
+};
+
+/// Default number of recent log lines returned when a client does not specify `tail`.
+const DEFAULT_LOG_TAIL: usize = 200;
+/// Hard cap on `tail`, independent of the request frame.
+const MAX_LOG_TAIL: usize = 2000;
+/// Default number of recent timeline events returned when a client does not specify `tail`.
+const DEFAULT_EVENT_TAIL: usize = 50;
+/// Hard cap on the event `tail`; the model retains at most this many events per service.
+const MAX_EVENT_TAIL: usize = micromux::EVENT_HISTORY;
+/// Change kinds replayed per surviving service after broadcast loss. `Roster` is deliberately
+/// absent: the roster invalidation is session-wide and sent once, ahead of these.
+const LAG_REPLAY_SERVICE_KINDS: [ChangeKind; 4] = [
+    ChangeKind::Status,
+    ChangeKind::Logs,
+    ChangeKind::Health,
+    ChangeKind::Events,
+];
+/// Response byte budget for log/health payloads; oldest content beyond it is dropped so a chatty
+/// service can't blow the frame.
+const RESPONSE_MAX_BYTES: usize = 512 * 1024;
+
+/// A bound control endpoint plus the lifetime ownership lock. Dropping it unlinks the socket while
+/// the lock is still held, so a successor (which cannot acquire the lock until this process exits)
+/// never has its fresh socket removed.
+pub struct EndpointGuard {
+    listener: tokio::net::UnixListener,
+    socket_path: PathBuf,
+    // Held for the whole process lifetime; the OS releases the advisory lock on exit (incl. crash).
+    _lock: std::fs::File,
+}
+
+impl Drop for EndpointGuard {
+    fn drop(&mut self) {
+        // Unlink the socket under the still-held lock. The permanent `<hash>.lock` file is left in
+        // place; only its advisory lock is released (when `_lock` drops).
+        let _ = std::fs::remove_file(&self.socket_path);
+    }
+}
+
+pub(super) fn bind(endpoint: &ControlEndpoint) -> Result<Option<EndpointGuard>, ControlError> {
+    match endpoint {
+        ControlEndpoint::Unix(path) => bind_unix(path),
+        ControlEndpoint::WindowsNamedPipe(_) => Err(ControlError::Unsupported),
+    }
+}
+
+pub(super) fn endpoint_owner_lock_held(endpoint: &ControlEndpoint) -> Result<bool, ControlError> {
+    match endpoint {
+        ControlEndpoint::Unix(path) => owner_lock_held_unix(path),
+        ControlEndpoint::WindowsNamedPipe(_) => Err(ControlError::Unsupported),
+    }
+}
+
+fn bind_unix(socket_path: &Path) -> Result<Option<EndpointGuard>, ControlError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let lock_path = socket_path.with_extension("lock");
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)?;
+
+    // The lifetime-held lock is the authoritative ownership signal — more robust than connect-probing
+    // a possibly-wedged listener. "lock acquirable" ⇔ "no live owner".
+    match fs2::FileExt::try_lock_exclusive(&lock_file) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
+        Err(err) => return Err(err.into()),
+    }
+
+    // We hold the lock ⇒ no live owner: unlink any crash-leaked socket and bind.
+    if let Err(err) = std::fs::remove_file(socket_path)
+        && err.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(err.into());
+    }
+    let listener = tokio::net::UnixListener::bind(socket_path)?;
+    // Defence in depth: the directory mode (0700) is what actually gates `connect`.
+    std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600))?;
+
+    Ok(Some(EndpointGuard {
+        listener,
+        socket_path: socket_path.to_path_buf(),
+        _lock: lock_file,
+    }))
+}
+
+fn owner_lock_held_unix(socket_path: &Path) -> Result<bool, ControlError> {
+    let lock_path = socket_path.with_extension("lock");
+    let lock_file = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+    {
+        Ok(lock_file) => lock_file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(err.into()),
+    };
+
+    match fs2::FileExt::try_lock_exclusive(&lock_file) {
+        Ok(()) => Ok(false),
+        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => Ok(true),
+        Err(err) => Err(err.into()),
+    }
+}
+
+pub(super) async fn serve(
+    server: Arc<ControlServer>,
+    guard: EndpointGuard,
+    shutdown: CancellationToken,
+) -> Result<(), ControlError> {
+    loop {
+        tokio::select! {
+            () = shutdown.cancelled() => break,
+            accepted = guard.listener.accept() => {
+                match accepted {
+                    Ok((stream, _addr)) => {
+                        let server = Arc::clone(&server);
+                        let shutdown = shutdown.clone();
+                        tokio::spawn(async move {
+                            handle_connection(server, stream, shutdown).await;
+                        });
+                    }
+                    Err(err) => {
+                        // Back off briefly so a persistent accept error (e.g. EMFILE) cannot hot-spin.
+                        tracing::warn!(?err, "control: accept failed");
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                }
+            }
+        }
+    }
+    // Dropping `guard` here unlinks the socket while the lock is still held.
+    drop(guard);
+    Ok(())
+}
+
+async fn handle_connection<S>(server: Arc<ControlServer>, stream: S, shutdown: CancellationToken)
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let mut conn = framed(stream);
+    loop {
+        let read = tokio::select! {
+            () = shutdown.cancelled() => return,
+            read = tokio::time::timeout(IDLE_TIMEOUT, read_message::<S, Request>(&mut conn)) => read,
+        };
+        let request = match read {
+            Ok(Ok(Some(request))) => request,
+            Ok(Err(err)) => {
+                tracing::debug!(?err, "control: rejecting bad request frame");
+                let _ = write_message(
+                    &mut conn,
+                    &Response::error(ErrorCode::BadRequest, err.to_string()),
+                )
+                .await;
+                return;
+            }
+            // Client disconnected (None) or idle timeout (Err): close the connection.
+            Ok(Ok(None)) | Err(_) => return,
+        };
+
+        if matches!(request, Request::Subscribe) {
+            stream_changes(&server, conn, shutdown).await;
+            return;
+        }
+
+        if matches!(request, Request::Shutdown) {
+            // Acknowledge first, then cancel the shared session token: the accept loop, scheduler,
+            // and TUI all observe it, so this stops the whole session (the same path as Ctrl-C).
+            // Writing before cancelling ensures the client sees the ack before the endpoint vanishes.
+            let _ = write_message(&mut conn, &Response::ShuttingDown).await;
+            shutdown.cancel();
+            return;
+        }
+
+        // Read-only requests return instantly; a mutation awaits the scheduler, so bound it — a
+        // wedged scheduler must not pin this task, and shutdown must stay responsive during dispatch.
+        let response = tokio::select! {
+            () = shutdown.cancelled() => return,
+            dispatched = tokio::time::timeout(REQUEST_TIMEOUT, dispatch(&server, request)) => {
+                match dispatched {
+                    Ok(response) => response,
+                    Err(_) => {
+                        Response::error(ErrorCode::Timeout, "the scheduler did not respond in time")
+                    }
+                }
+            }
+        };
+        if write_message(&mut conn, &response).await.is_err() {
+            return;
+        }
+    }
+}
+
+async fn stream_changes<S>(server: &ControlServer, conn: Framing<S>, shutdown: CancellationToken)
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    use tokio::sync::broadcast::error::RecvError;
+
+    let (mut sink, mut stream) = conn.split();
+    let mut changes = server.reader.subscribe();
+    'stream: loop {
+        tokio::select! {
+            () = shutdown.cancelled() => break,
+            incoming = stream.next() => {
+                // A subscription is one-directional from here: the client signals only via EOF
+                // (None) or a transport error (Some(Err)). Either way, stop — never spin on a
+                // persistent read error.
+                match incoming {
+                    None | Some(Err(_)) => break,
+                    Some(Ok(_)) => {}
+                }
+            }
+            change = changes.recv() => {
+                match change {
+                    Ok(change) => {
+                        let Ok(line) = serde_json::to_string(&Response::Change(change)) else {
+                            continue;
+                        };
+                        if sink.send(line).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(RecvError::Lagged(_)) => {
+                        let snapshots = server.reader.services();
+                        for change in lag_replay_changes(&snapshots) {
+                            let Ok(line) = serde_json::to_string(&Response::Change(change)) else {
+                                continue;
+                            };
+                            if sink.send(line).await.is_err() {
+                                break 'stream;
+                            }
+                        }
+                    }
+                    Err(RecvError::Closed) => break,
+                }
+            }
+        }
+    }
+}
+
+/// Synthesizes a complete invalidation after broadcast loss.
+///
+/// The roster notification is unconditional because the current roster may be empty after the
+/// client lagged across removal of its final service. Its service id is
+/// [`SessionChange::SESSION_WIDE`]; consumers re-read the whole roster for this change kind.
+fn lag_replay_changes(snapshots: &[ServiceSnapshot]) -> impl Iterator<Item = SessionChange> + '_ {
+    std::iter::once(SessionChange {
+        service_id: SessionChange::SESSION_WIDE.to_string(),
+        kind: ChangeKind::Roster,
+    })
+    .chain(snapshots.iter().flat_map(|snapshot| {
+        LAG_REPLAY_SERVICE_KINDS.map(|kind| SessionChange {
+            service_id: snapshot.id.clone(),
+            kind,
+        })
+    }))
+}
+
+async fn dispatch(server: &ControlServer, request: Request) -> Response {
+    match request {
+        Request::Describe => Response::Description(describe(server)),
+        Request::ListServices => Response::Services(server.reader.services()),
+        Request::GetLogs {
+            service,
+            run_generation,
+            tail,
+        } => {
+            let reader = server.reader.clone();
+            match tokio::task::spawn_blocking(move || {
+                get_logs(&reader, &service, run_generation, tail)
+            })
+            .await
+            {
+                Ok(response) => response,
+                Err(err) => {
+                    Response::error(ErrorCode::Internal, format!("log read task failed: {err}"))
+                }
+            }
+        }
+        Request::FollowLogs {
+            service,
+            run_generation,
+            after,
+        } => {
+            let reader = server.reader.clone();
+            match tokio::task::spawn_blocking(move || {
+                follow_logs(&reader, &service, run_generation, after)
+            })
+            .await
+            {
+                Ok(response) => response,
+                Err(err) => {
+                    Response::error(ErrorCode::Internal, format!("log read task failed: {err}"))
+                }
+            }
+        }
+        Request::ListLogRuns { service } => {
+            if server.reader.service(&service).is_none() {
+                return unknown_service(&service);
+            }
+            Response::LogRuns {
+                runs: server.reader.log_runs(&service),
+            }
+        }
+        Request::GetHealth { service } => {
+            if server.reader.service(&service).is_none() {
+                return unknown_service(&service);
+            }
+            let mut attempt = server.reader.latest_health(&service);
+            bound_health_attempt(&mut attempt);
+            Response::Health(attempt)
+        }
+        Request::GetHealthHistory { service } => get_health_history(&server.reader, &service),
+        Request::GetEvents {
+            service,
+            after,
+            tail,
+        } => get_events(&server.reader, &service, after, tail),
+        Request::Restart { service } => acknowledge(server.control.restart(&service).await),
+        Request::RestartAll => acknowledge(server.control.restart_all().await),
+        Request::Enable { service } => acknowledge(server.control.enable(&service).await),
+        Request::Disable { service } => acknowledge(server.control.disable(&service).await),
+        Request::StartDynamicService { params } => {
+            acknowledge_dynamic(server.control.start_dynamic(params).await)
+        }
+        Request::ReplaceDynamicService {
+            service,
+            expected_revision,
+            params,
+        } => acknowledge_dynamic(
+            server
+                .control
+                .replace_dynamic(&service, expected_revision, params)
+                .await,
+        ),
+        Request::RenewDynamicService {
+            service,
+            expected_revision,
+            expires_after,
+        } => acknowledge_dynamic(
+            server
+                .control
+                .renew_dynamic(&service, expected_revision, expires_after)
+                .await,
+        ),
+        Request::StopDynamicService { service } => {
+            acknowledge_dynamic(server.control.stop_dynamic(&service).await)
+        }
+        Request::ReconcileConfig { dry_run } => reconcile(server, dry_run).await,
+        // Subscribe is intercepted before dispatch; reaching here is a protocol misuse.
+        Request::Subscribe => Response::error(
+            ErrorCode::BadRequest,
+            "subscribe must be the only request on a connection",
+        ),
+        // Shutdown is intercepted before dispatch; reaching here is a protocol misuse.
+        Request::Shutdown => {
+            Response::error(ErrorCode::BadRequest, "shutdown is handled before dispatch")
+        }
+    }
+}
+
+async fn reconcile(server: &ControlServer, dry_run: bool) -> Response {
+    acknowledge_reconcile(server.control.reconcile_config(dry_run).await)
+}
+
+fn get_events(
+    reader: &SessionModelReader,
+    service: &str,
+    after: Option<u64>,
+    tail: Option<usize>,
+) -> Response {
+    if reader.service(service).is_none() {
+        return unknown_service(service);
+    }
+    let requested_tail = tail.unwrap_or(DEFAULT_EVENT_TAIL);
+    let (events, truncated) =
+        reader.events(service, after, Some(requested_tail.min(MAX_EVENT_TAIL)));
+    Response::Events { events, truncated }
+}
+
+fn get_logs(
+    reader: &SessionModelReader,
+    service: &str,
+    run_generation: Option<u64>,
+    tail: Option<usize>,
+) -> Response {
+    if reader.service(service).is_none() {
+        return unknown_service(service);
+    }
+    let requested_tail = tail.unwrap_or(if run_generation.is_some() {
+        MAX_LOG_TAIL
+    } else {
+        DEFAULT_LOG_TAIL
+    });
+    let tail = requested_tail.min(MAX_LOG_TAIL);
+    let mut truncated = false;
+    let mut lines = match run_generation {
+        Some(run_generation) => {
+            let Some(run) = reader.run_log(service, run_generation, Some(tail)) else {
+                return unknown_run(service, run_generation);
+            };
+            run.lines
+        }
+        None => reader.logs(service, Some(tail)),
+    };
+    truncated |= requested_tail > MAX_LOG_TAIL && lines.len() >= tail;
+    if let Some(run_generation) = run_generation
+        && tail == MAX_LOG_TAIL
+    {
+        truncated |= reader
+            .log_runs(service)
+            .into_iter()
+            .find(|run| run.run_generation == run_generation)
+            .is_some_and(|run| run.line_count > lines.len());
+    }
+    truncated |= bound_tail_response_lines(&mut lines);
+    Response::Logs { lines, truncated }
+}
+
+fn follow_logs(
+    reader: &SessionModelReader,
+    service: &str,
+    run_generation: Option<u64>,
+    after: Option<u64>,
+) -> Response {
+    if reader.service(service).is_none() {
+        return unknown_service(service);
+    }
+
+    // A retained disk run pages strictly forward from `after` — or from the very beginning when it
+    // is omitted — keeping the oldest contiguous page, so a run longer than MAX_LOG_TAIL is fully
+    // reachable by following `next_seq` rather than being pinned to its tail.
+    if let Some(run_generation) = run_generation {
+        let Some(run) =
+            reader.run_log_after(service, run_generation, after, Some(MAX_LOG_TAIL + 1))
+        else {
+            return unknown_run(service, run_generation);
+        };
+        let mut lines = run.lines;
+        if let Some(cursor) = after {
+            lines.retain(|line| line.seq > cursor);
+        }
+        let (lines, truncated) = bound_follow_response_lines_page(lines);
+        return Response::Logs { lines, truncated };
+    }
+
+    // The bounded visible stream: page forward from a cursor, else return its most recent tail.
+    let mut lines = reader.logs(service, None);
+    if let Some(cursor) = after {
+        lines.retain(|line| line.seq > cursor);
+        let (lines, truncated) = bound_follow_response_lines_page(lines);
+        return Response::Logs { lines, truncated };
+    }
+
+    let mut truncated = false;
+    if lines.len() > MAX_LOG_TAIL {
+        let drop = lines.len() - MAX_LOG_TAIL;
+        lines.drain(0..drop);
+        truncated = true;
+    }
+    truncated |= bound_tail_response_lines(&mut lines);
+    Response::Logs { lines, truncated }
+}
+
+fn bound_follow_response_lines_page(
+    mut lines: Vec<micromux::LogLine>,
+) -> (Vec<micromux::LogLine>, bool) {
+    let capped = lines.len() > MAX_LOG_TAIL;
+    lines.truncate(MAX_LOG_TAIL);
+    let truncated = capped || bound_follow_response_lines(&mut lines);
+    (lines, truncated)
+}
+
+fn describe(server: &ControlServer) -> SessionInfo {
+    let snapshots = server.reader.services();
+    let services = snapshots
+        .iter()
+        .map(|snapshot| ServiceBrief {
+            id: snapshot.id.clone(),
+            name: snapshot.name.clone(),
+        })
+        .collect();
+    let dynamic_services = server.dynamic_policy.enabled.then(|| {
+        let live_services = snapshots
+            .iter()
+            .filter(|snapshot| {
+                snapshot.origin == micromux::OriginKind::Dynamic && snapshot.retired.is_none()
+            })
+            .count();
+        crate::DynamicServicesCaps {
+            max_services: server.dynamic_policy.max_services,
+            live_services,
+            max_lifetime_secs: server
+                .dynamic_policy
+                .max_lifetime
+                .map(|value| value.as_secs()),
+            allowed_working_roots: server
+                .dynamic_policy
+                .allowed_working_roots
+                .iter()
+                .map(|root| root.display().to_string())
+                .collect(),
+        }
+    });
+    SessionInfo {
+        protocol_version: PROTOCOL_VERSION,
+        id: server.identity.id.clone(),
+        pid: server.identity.pid,
+        start_time: server.identity.start_time,
+        name: server.identity.name.clone(),
+        working_dir: server.identity.working_dir.clone(),
+        config_path: server.identity.config_path.clone(),
+        services,
+        micromux_version: server.identity.micromux_version.clone(),
+        capabilities: Some(crate::SessionCapabilities { dynamic_services }),
+    }
+}
+
+fn unknown_service(service: &str) -> Response {
+    Response::error(
+        ErrorCode::UnknownService,
+        format!("unknown service `{service}`"),
+    )
+}
+
+fn unknown_run(service: &str, run_generation: u64) -> Response {
+    Response::error(
+        ErrorCode::UnknownRun,
+        format!("service `{service}` has no retained run `{run_generation}`"),
+    )
+}
+
+/// Drop oldest log lines until the payload fits the response byte budget.
+fn bound_tail_response_lines(lines: &mut Vec<micromux::LogLine>) -> bool {
+    let mut total: usize = lines.iter().map(|line| line.line.len()).sum();
+    let mut drop_count = 0;
+    for line in lines.iter() {
+        if total <= RESPONSE_MAX_BYTES || lines.len().saturating_sub(drop_count) <= 1 {
+            break;
+        }
+        total = total.saturating_sub(line.line.len());
+        drop_count += 1;
+    }
+    if drop_count > 0 {
+        lines.drain(0..drop_count);
+    }
+    let mut truncated = drop_count > 0;
+    if total > RESPONSE_MAX_BYTES
+        && let Some(line) = lines.first_mut()
+    {
+        line.line = trim_to_last_bytes(std::mem::take(&mut line.line), RESPONSE_MAX_BYTES);
+        truncated = true;
+    }
+    truncated
+}
+
+/// Keep the oldest contiguous log page after a cursor, bounded by response bytes.
+fn bound_follow_response_lines(lines: &mut Vec<micromux::LogLine>) -> bool {
+    let mut total = 0usize;
+    let mut keep = 0usize;
+    for line in lines.iter_mut() {
+        let line_len = line.line.len();
+        if keep == 0 && line_len > RESPONSE_MAX_BYTES {
+            line.line = trim_to_last_bytes(std::mem::take(&mut line.line), RESPONSE_MAX_BYTES);
+            keep = 1;
+            break;
+        }
+        if total.saturating_add(line_len) > RESPONSE_MAX_BYTES {
+            break;
+        }
+        total += line_len;
+        keep += 1;
+    }
+    let truncated = keep < lines.len();
+    lines.truncate(keep);
+    truncated
+}
+
+fn bound_health_attempt(attempt: &mut Option<micromux::HealthAttempt>) {
+    let Some(attempt) = attempt else {
+        return;
+    };
+
+    bound_health_attempt_to(attempt, RESPONSE_MAX_BYTES);
+}
+
+fn get_health_history(reader: &SessionModelReader, service: &str) -> Response {
+    if reader.service(service).is_none() {
+        return unknown_service(service);
+    }
+    let mut attempts = reader.healthchecks(service);
+    bound_health_history(&mut attempts);
+    Response::HealthHistory { attempts }
+}
+
+fn bound_health_attempt_to(attempt: &mut micromux::HealthAttempt, max_bytes: usize) {
+    let mut total = attempt.command.len()
+        + attempt
+            .output
+            .iter()
+            .map(|line| line.line.len())
+            .sum::<usize>();
+    let mut drop_count = 0;
+    for line in &attempt.output {
+        if total <= max_bytes {
+            break;
+        }
+        total = total.saturating_sub(line.line.len());
+        drop_count += 1;
+    }
+    if drop_count > 0 {
+        attempt.output.drain(0..drop_count);
+    }
+    if total > max_bytes {
+        attempt.command = trim_to_last_bytes(std::mem::take(&mut attempt.command), max_bytes);
+    }
+}
+
+fn health_attempt_bytes(attempt: &micromux::HealthAttempt) -> usize {
+    attempt.command.len()
+        + attempt
+            .output
+            .iter()
+            .map(|line| line.line.len())
+            .sum::<usize>()
+}
+
+/// Drop whole oldest attempts before trimming content from the oldest attempt that survives.
+fn bound_health_history(attempts: &mut Vec<micromux::HealthAttempt>) {
+    let mut total = attempts.iter().map(health_attempt_bytes).sum::<usize>();
+    let mut drop_count = 0;
+    for attempt in attempts.iter() {
+        if total <= RESPONSE_MAX_BYTES || attempts.len().saturating_sub(drop_count) <= 1 {
+            break;
+        }
+        total = total.saturating_sub(health_attempt_bytes(attempt));
+        drop_count += 1;
+    }
+    if drop_count > 0 {
+        attempts.drain(0..drop_count);
+    }
+    if let Some(attempt) = attempts.first_mut()
+        && total > RESPONSE_MAX_BYTES
+    {
+        bound_health_attempt_to(attempt, RESPONSE_MAX_BYTES);
+    }
+}
+
+/// Map a scheduler rejection to its wire error. Shared by every mutation acknowledgement so a
+/// new [`CommandRejection`] variant only needs handling once.
+fn rejection_response(rejection: CommandRejection) -> Response {
+    match rejection {
+        CommandRejection::UnknownService => {
+            Response::error(ErrorCode::UnknownService, "unknown service")
+        }
+        CommandRejection::InvalidState(message) => {
+            Response::error(ErrorCode::InvalidState, message)
+        }
+        CommandRejection::ConfigReload(message) => {
+            Response::error(ErrorCode::ConfigReload, message)
+        }
+        CommandRejection::PolicyDenied(message) => {
+            Response::error(ErrorCode::PolicyDenied, message)
+        }
+        CommandRejection::LimitExceeded(message) => {
+            Response::error(ErrorCode::LimitExceeded, message)
+        }
+        CommandRejection::RevisionMismatch { expected, actual } => Response::error(
+            ErrorCode::RevisionMismatch,
+            format!("expected revision {expected}, actual revision {actual}"),
+        ),
+        CommandRejection::InvalidSpec(message) => Response::error(ErrorCode::InvalidSpec, message),
+    }
+}
+
+/// Shared acknowledgement plumbing: only the success payload differs between the mutation
+/// families, so rejections and a stopped scheduler are mapped exactly once.
+fn acknowledge_with<T>(
+    result: Result<Result<T, CommandRejection>, SchedulerStopped>,
+    ok: impl FnOnce(T) -> Response,
+) -> Response {
+    match result {
+        Ok(Ok(value)) => ok(value),
+        Ok(Err(rejection)) => rejection_response(rejection),
+        Err(SchedulerStopped) => {
+            Response::error(ErrorCode::SchedulerStopped, "the scheduler has stopped")
+        }
+    }
+}
+
+fn acknowledge(result: Result<ServiceCommandResult, SchedulerStopped>) -> Response {
+    acknowledge_with(result, |services| Response::Accepted { services })
+}
+
+fn acknowledge_dynamic(
+    result: Result<micromux::DynamicServiceResult, SchedulerStopped>,
+) -> Response {
+    acknowledge_with(result, Response::DynamicService)
+}
+
+fn acknowledge_reconcile(result: Result<micromux::ReconcileResult, SchedulerStopped>) -> Response {
+    acknowledge_with(result, Response::Reconcile)
+}
+
+#[cfg(test)]
+mod tests {
+    use micromux::{
+        ChangeKind, HealthAttempt, HealthLine, LogLine, OutputStream, RestartPolicy,
+        ServiceSnapshot, SessionChange,
+    };
+    use similar_asserts::assert_eq;
+
+    use super::{
+        MAX_LOG_TAIL, RESPONSE_MAX_BYTES, bound_follow_response_lines,
+        bound_follow_response_lines_page, bound_health_history, bound_tail_response_lines,
+        health_attempt_bytes, lag_replay_changes,
+    };
+
+    fn line(seq: u64, len: usize) -> LogLine {
+        LogLine {
+            seq,
+            run_generation: 1,
+            timestamp_unix_ms: 1_700_000_000_000 + seq,
+            line: "x".repeat(len),
+        }
+    }
+
+    fn snapshot(id: &str) -> ServiceSnapshot {
+        ServiceSnapshot::initial(
+            id.to_string(),
+            id.to_string(),
+            Vec::new(),
+            None,
+            RestartPolicy::Never,
+            vec!["true".to_string()],
+            None,
+        )
+    }
+
+    fn health_attempt(attempt: u64, output_bytes: usize) -> HealthAttempt {
+        HealthAttempt {
+            run_generation: 1,
+            attempt,
+            command: "probe".to_string(),
+            output: vec![HealthLine {
+                stream: OutputStream::Stdout,
+                line: "x".repeat(output_bytes),
+            }],
+            result: None,
+        }
+    }
+
+    #[test]
+    fn health_history_bounding_drops_oldest_attempts_before_trimming() {
+        let mut attempts = vec![
+            health_attempt(1, RESPONSE_MAX_BYTES / 2),
+            health_attempt(2, RESPONSE_MAX_BYTES / 2),
+        ];
+
+        bound_health_history(&mut attempts);
+
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts.first().map(|attempt| attempt.attempt), Some(2));
+        assert!(attempts.iter().map(health_attempt_bytes).sum::<usize>() <= RESPONSE_MAX_BYTES);
+    }
+
+    #[test]
+    fn health_history_bounding_trims_an_oversized_surviving_attempt() {
+        let mut attempts = vec![health_attempt(7, RESPONSE_MAX_BYTES + 100)];
+
+        bound_health_history(&mut attempts);
+
+        assert_eq!(attempts.first().map(|attempt| attempt.attempt), Some(7));
+        assert!(attempts.iter().map(health_attempt_bytes).sum::<usize>() <= RESPONSE_MAX_BYTES);
+    }
+
+    #[test]
+    fn lag_replay_invalidates_an_empty_roster() {
+        let changes = lag_replay_changes(&[]).collect::<Vec<_>>();
+
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].service_id, SessionChange::SESSION_WIDE);
+        assert_eq!(changes[0].kind, ChangeKind::Roster);
+    }
+
+    #[test]
+    fn lag_replay_invalidates_the_roster_once_and_each_surviving_service() {
+        let snapshots = [snapshot("alpha"), snapshot("beta")];
+        let changes = lag_replay_changes(&snapshots)
+            .map(|change| (change.service_id, change.kind))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            changes,
+            vec![
+                (SessionChange::SESSION_WIDE.to_string(), ChangeKind::Roster),
+                ("alpha".to_string(), ChangeKind::Status),
+                ("alpha".to_string(), ChangeKind::Logs),
+                ("alpha".to_string(), ChangeKind::Health),
+                ("alpha".to_string(), ChangeKind::Events),
+                ("beta".to_string(), ChangeKind::Status),
+                ("beta".to_string(), ChangeKind::Logs),
+                ("beta".to_string(), ChangeKind::Health),
+                ("beta".to_string(), ChangeKind::Events),
+            ]
+        );
+    }
+
+    #[test]
+    fn tail_bounding_keeps_the_newest_lines() {
+        let mut lines = vec![
+            line(0, 200 * 1024),
+            line(1, 200 * 1024),
+            line(2, 200 * 1024),
+            line(3, 200 * 1024),
+        ];
+
+        assert!(bound_tail_response_lines(&mut lines));
+
+        let seqs: Vec<u64> = lines.into_iter().map(|line| line.seq).collect();
+        assert_eq!(seqs, vec![2, 3]);
+    }
+
+    #[test]
+    fn follow_bounding_keeps_the_oldest_contiguous_page() {
+        let mut lines = vec![
+            line(0, 200 * 1024),
+            line(1, 200 * 1024),
+            line(2, 200 * 1024),
+            line(3, 200 * 1024),
+        ];
+
+        assert!(bound_follow_response_lines(&mut lines));
+
+        let seqs: Vec<u64> = lines.into_iter().map(|line| line.seq).collect();
+        assert_eq!(seqs, vec![0, 1]);
+    }
+
+    #[test]
+    fn follow_bounding_trims_an_oversized_first_line_so_the_cursor_can_advance() {
+        let mut lines = vec![line(7, RESPONSE_MAX_BYTES + 10), line(8, 1)];
+
+        assert!(bound_follow_response_lines(&mut lines));
+
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines.first().map(|line| line.seq), Some(7));
+        assert_eq!(
+            lines.first().map(|line| line.line.len()),
+            Some(RESPONSE_MAX_BYTES)
+        );
+    }
+
+    #[test]
+    fn follow_page_reports_truncated_when_a_sentinel_line_was_fetched() {
+        fn seq(value: usize) -> u64 {
+            u64::try_from(value).unwrap_or(u64::MAX)
+        }
+
+        let lines = (0..=MAX_LOG_TAIL)
+            .map(|value| line(seq(value), 1))
+            .collect::<Vec<_>>();
+
+        let (lines, truncated) = bound_follow_response_lines_page(lines);
+
+        assert!(truncated);
+        assert_eq!(lines.len(), MAX_LOG_TAIL);
+        assert_eq!(lines.first().map(|line| line.seq), Some(0));
+        assert_eq!(
+            lines.last().map(|line| line.seq),
+            Some(seq(MAX_LOG_TAIL.saturating_sub(1)))
+        );
+    }
+}

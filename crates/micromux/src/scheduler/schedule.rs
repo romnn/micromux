@@ -1,49 +1,46 @@
 use super::{
-    DesiredState, Event, ProcessEvent, RunningService, ServiceID, ServiceRuntime, State, pty,
+    DesiredState, ProcessEvent, RunConfig, RunningService, ServiceID, ServiceRuntime,
+    SessionModelWriter, State, pty, service_event, sync_model,
 };
-use crate::{ServiceMap, health_check::Health};
-use color_eyre::eyre;
+#[cfg(test)]
+use super::{Event, ServiceRuntimeInit, TestEventSink};
+use crate::{ServiceEventKind, ServiceMap, health_check::Health};
 use std::collections::HashMap;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 pub(super) struct ScheduleContext<'a> {
     pub(super) services: &'a ServiceMap,
-    pub(super) graph: &'a petgraph::graphmap::DiGraphMap<&'a str, ()>,
     pub(super) runtimes: &'a mut HashMap<ServiceID, ServiceRuntime>,
     pub(super) current_pty_size: portable_pty::PtySize,
     pub(super) events_tx: &'a mpsc::Sender<ProcessEvent>,
-    pub(super) ui_tx: &'a mpsc::Sender<Event>,
+    #[cfg(test)]
+    pub(super) test_events: &'a mut TestEventSink,
+    pub(super) writer: &'a SessionModelWriter,
     pub(super) shutdown: &'a CancellationToken,
 }
 
-fn dependencies_ready(
+fn blocking_dependencies(
     ctx: &ScheduleContext<'_>,
-    service_id: &str,
     service: &crate::service::Service,
-) -> bool {
+) -> Vec<ServiceID> {
     use crate::config::DependencyCondition;
 
-    ctx.graph
-        .neighbors_directed(service_id, petgraph::Incoming)
-        .all(|dep| {
-            let condition = service
-                .depends_on
-                .iter()
-                .find(|dep_config| dep_config.name.as_ref() == dep)
-                .and_then(|dep_config| dep_config.condition.as_ref())
-                .map(std::convert::AsRef::as_ref)
-                .copied()
-                .unwrap_or_default();
-            let Some(runtime) = ctx.runtimes.get(dep) else {
-                return false;
+    service
+        .spec
+        .depends_on
+        .iter()
+        .filter_map(|dep| {
+            let condition = dep.condition;
+            let Some(runtime) = ctx.runtimes.get(dep.service.as_str()) else {
+                return Some(dep.service.clone());
             };
 
             if runtime.desired == DesiredState::Disabled || runtime.start_requested {
-                return false;
+                return Some(dep.service.clone());
             }
 
-            match condition {
+            let ready = match condition {
                 DependencyCondition::Started => matches!(runtime.state, State::Running { .. }),
                 DependencyCondition::Healthy => matches!(
                     runtime.state,
@@ -55,8 +52,10 @@ fn dependencies_ready(
                 DependencyCondition::CompletedSuccessfully => {
                     matches!(runtime.state, State::Exited { exit_code: 0, .. })
                 }
-            }
+            };
+            (!ready).then(|| dep.service.clone())
         })
+        .collect()
 }
 
 enum StartCheck {
@@ -69,8 +68,6 @@ fn should_consider_start(
     service_id: &ServiceID,
     service: &crate::service::Service,
 ) -> StartCheck {
-    use crate::service::RestartPolicy;
-
     let Some(runtime) = ctx.runtimes.get(service_id) else {
         return StartCheck::Skip;
     };
@@ -92,38 +89,14 @@ fn should_consider_start(
             StartCheck::Skip
         }
         State::Exited { exit_code } => {
-            if runtime.start_requested {
+            if runtime.start_requested
+                || runtime.will_auto_restart(&service.spec.restart, exit_code)
+            {
                 StartCheck::Consider {
                     exited_code: Some(exit_code),
                 }
             } else {
-                match &service.restart_policy {
-                    RestartPolicy::Never => StartCheck::Skip,
-                    RestartPolicy::Always | RestartPolicy::UnlessStopped => StartCheck::Consider {
-                        exited_code: Some(exit_code),
-                    },
-                    RestartPolicy::OnFailure { max_attempts } => {
-                        if exit_code == 0 {
-                            StartCheck::Skip
-                        } else if max_attempts.is_some() {
-                            if runtime
-                                .restart
-                                .remaining_failure_restarts(&service.restart_policy)
-                                .is_some_and(|remaining| remaining > 0)
-                            {
-                                StartCheck::Consider {
-                                    exited_code: Some(exit_code),
-                                }
-                            } else {
-                                StartCheck::Skip
-                            }
-                        } else {
-                            StartCheck::Consider {
-                                exited_code: Some(exit_code),
-                            }
-                        }
-                    }
-                }
+                StartCheck::Skip
             }
         }
     }
@@ -138,81 +111,195 @@ fn decrement_failure_budget(
     if !explicit_start
         && exited_code.is_some_and(|exit_code| exit_code != 0)
         && matches!(
-            service.restart_policy,
+            service.spec.restart,
             crate::service::RestartPolicy::OnFailure { .. }
         )
     {
         runtime
             .restart
-            .decrement_failure_restart(&service.restart_policy);
+            .decrement_failure_restart(&service.spec.restart);
     }
 }
 
-async fn start_service_if_ready(
+fn record_dependency_block(
+    ctx: &mut ScheduleContext<'_>,
+    service_id: &ServiceID,
+    blocked_on: Vec<ServiceID>,
+) {
+    let generation = ctx.runtimes.get_mut(service_id).and_then(|runtime| {
+        if runtime.last_blocked_on == blocked_on {
+            None
+        } else {
+            runtime.last_blocked_on.clone_from(&blocked_on);
+            Some(runtime.run_generation())
+        }
+    });
+    if let Some(generation) = generation {
+        let mut event = service_event(
+            generation,
+            ServiceEventKind::DependencyBlocked,
+            format!("waiting for dependencies: {}", blocked_on.join(", ")),
+        );
+        event.blocked_on = Some(blocked_on);
+        ctx.writer.append_event(service_id, event);
+    }
+}
+
+fn finish_service_start(
+    ctx: &mut ScheduleContext<'_>,
+    service_id: &ServiceID,
+    service: &crate::service::Service,
+    run_id: super::RunId,
+    terminate: CancellationToken,
+    #[cfg(test)] clear_logs: bool,
+    result: color_eyre::eyre::Result<pty::StartedPty>,
+) {
+    let Some(runtime) = ctx.runtimes.get_mut(service_id) else {
+        return;
+    };
+    match result {
+        Ok(started) => {
+            let pid = started.pid;
+            runtime.mark_started(RunningService {
+                run_id,
+                pid,
+                terminate,
+                log_reader: Some(started.log_reader),
+                pty: started.handles,
+                since: tokio::time::Instant::now(),
+            });
+            sync_model(ctx.writer, service, runtime);
+            let mut event = service_event(
+                run_id.get(),
+                ServiceEventKind::Spawned,
+                pid.map_or_else(
+                    || "spawned service process".to_string(),
+                    |pid| format!("spawned service process with pid {pid}"),
+                ),
+            );
+            event.pid = pid;
+            ctx.writer.append_event(service_id, event);
+            #[cfg(test)]
+            {
+                if clear_logs {
+                    ctx.test_events
+                        .forward(Event::ClearLogs(service_id.clone()));
+                }
+                ctx.test_events.forward(Event::Started {
+                    service_id: service_id.clone(),
+                });
+            }
+        }
+        Err(err) => {
+            tracing::error!(?err, service_id, "failed to start service");
+            runtime.finish_failed_start(&service.spec.restart, run_id, -1);
+            sync_model(ctx.writer, service, runtime);
+            ctx.writer.append_event(
+                service_id,
+                service_event(
+                    run_id.get(),
+                    ServiceEventKind::SpawnFailed,
+                    format!("failed to spawn service: {err}"),
+                ),
+            );
+            let mut exited = service_event(
+                run_id.get(),
+                ServiceEventKind::Exited,
+                "service spawn failed",
+            );
+            exited.exit_code = Some(-1);
+            ctx.writer.append_event(service_id, exited);
+            if let Some(delay) = runtime.restart.backoff_delay {
+                let mut backoff = service_event(
+                    run_id.get(),
+                    ServiceEventKind::BackoffScheduled,
+                    format!("automatic restart scheduled after {} ms", delay.as_millis()),
+                );
+                backoff.delay_ms = u64::try_from(delay.as_millis()).ok();
+                ctx.writer.append_event(service_id, backoff);
+            }
+            #[cfg(test)]
+            ctx.test_events
+                .forward(Event::Exited(service_id.clone(), -1));
+        }
+    }
+}
+
+fn start_service_if_ready(
     ctx: &mut ScheduleContext<'_>,
     service_id: &ServiceID,
     service: &crate::service::Service,
     exited_code: Option<i32>,
-) -> eyre::Result<()> {
-    if !dependencies_ready(ctx, service_id.as_str(), service) {
-        return Ok(());
+) {
+    let blocked_on = blocking_dependencies(ctx, service);
+    if !blocked_on.is_empty() {
+        record_dependency_block(ctx, service_id, blocked_on);
+        return;
     }
 
     tracing::info!(service_id, "starting service");
 
     let Some(runtime) = ctx.runtimes.get_mut(service_id) else {
-        return Ok(());
+        return;
     };
+    if !runtime.last_blocked_on.is_empty() {
+        runtime.last_blocked_on.clear();
+        ctx.writer.append_event(
+            service_id,
+            service_event(
+                runtime.run_generation(),
+                ServiceEventKind::DependencyReady,
+                "dependencies are ready",
+            ),
+        );
+    }
     let explicit_start = runtime.start_requested;
     let clear_logs = runtime.clear_logs_on_start;
     decrement_failure_budget(runtime, service, explicit_start, exited_code);
 
     runtime.start_requested = false;
     runtime.clear_logs_on_start = false;
-    runtime.state = State::Starting;
+    // A still-draining reader only feeds the finished run's retained log from here on. That tail
+    // is worth capturing until the replacement run begins, but not worth pinning a reader thread
+    // and its fds for as long as some descendant keeps the PTY slave open — so the new run's start
+    // caps the drain.
+    for (_, log_reader) in &mut runtime.draining_log_readers {
+        log_reader.cancel();
+    }
+    runtime.mark_starting();
+    runtime.run_config = Some(RunConfig::from(service));
+    sync_model(ctx.writer, service, runtime);
 
     let run_id = runtime.allocate_run_id();
     let terminate = CancellationToken::new();
+    ctx.writer.begin_run(service_id, run_id.get());
+    if clear_logs {
+        ctx.writer.clear_logs(service_id);
+    }
+    let sink = ctx.writer.run_sink(service_id, run_id.get());
 
-    match pty::start_service_with_pty_size(
+    let result = pty::start_service_with_pty_size(
         service,
         run_id,
+        sink,
         ctx.events_tx,
         ctx.shutdown,
         &terminate,
         ctx.current_pty_size,
-    ) {
-        Ok(started) => {
-            runtime.running = Some(RunningService {
-                run_id,
-                terminate,
-                log_reader: started.log_reader,
-                pty: started.handles,
-                since: tokio::time::Instant::now(),
-            });
-            runtime.state = State::Running { health: None };
-            if clear_logs {
-                ctx.ui_tx.send(Event::ClearLogs(service_id.clone())).await?;
-            }
-            ctx.ui_tx
-                .send(Event::Started {
-                    service_id: service_id.clone(),
-                })
-                .await?;
-        }
-        Err(err) => {
-            tracing::error!(?err, service_id, "failed to start service");
-            runtime.finish_current_run(&service.restart_policy, -1);
-            ctx.ui_tx
-                .send(Event::Exited(service_id.clone(), -1))
-                .await?;
-        }
-    }
-
-    Ok(())
+    );
+    finish_service_start(
+        ctx,
+        service_id,
+        service,
+        run_id,
+        terminate,
+        #[cfg(test)]
+        clear_logs,
+        result,
+    );
 }
 
-pub(super) async fn schedule_ready(ctx: &mut ScheduleContext<'_>) -> eyre::Result<()> {
+pub(super) fn schedule_ready(ctx: &mut ScheduleContext<'_>) {
     for (service_id, service) in ctx.services {
         let exited_code = match should_consider_start(ctx, service_id, service) {
             StartCheck::Skip => continue,
@@ -225,8 +312,118 @@ pub(super) async fn schedule_ready(ctx: &mut ScheduleContext<'_>) -> eyre::Resul
             "evaluating service"
         );
 
-        start_service_if_ready(ctx, service_id, service, exited_code).await?;
+        start_service_if_ready(ctx, service_id, service, exited_code);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        config::{Dependency, DependencyCondition},
+        model::SessionModelWriter,
+        service::Service,
+        test_util::{service_config, spanned_string},
+    };
+    use similar_asserts::assert_eq;
+    use std::collections::HashMap;
+    use std::path::Path;
+    use tokio::sync::mpsc;
+    use yaml_spanned::Spanned;
+
+    fn test_service(id: &str) -> color_eyre::Result<Service> {
+        let cfg = service_config(id, ("true", &[]));
+        Service::new(id, Path::new("."), cfg)
     }
 
-    Ok(())
+    fn dependency(name: &str, condition: DependencyCondition) -> Dependency {
+        Dependency {
+            name: spanned_string(name),
+            condition: Some(Spanned {
+                span: yaml_spanned::spanned::Span::default(),
+                inner: condition,
+            }),
+        }
+    }
+
+    fn test_context<'a>(
+        services: &'a ServiceMap,
+        runtimes: &'a mut HashMap<ServiceID, ServiceRuntime>,
+        events_tx: &'a mpsc::Sender<ProcessEvent>,
+        writer: &'a SessionModelWriter,
+        shutdown: &'a CancellationToken,
+        #[cfg(test)] test_events: &'a mut TestEventSink,
+    ) -> ScheduleContext<'a> {
+        ScheduleContext {
+            services,
+            runtimes,
+            current_pty_size: portable_pty::PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            },
+            events_tx,
+            #[cfg(test)]
+            test_events,
+            writer,
+            shutdown,
+        }
+    }
+
+    #[test]
+    fn dependencies_ready_honors_each_duplicate_entry_condition() -> color_eyre::Result<()> {
+        let dep = test_service("dep")?;
+        let mut svc = test_service("svc")?;
+        svc.spec.depends_on = vec![
+            dependency("dep", DependencyCondition::Started),
+            dependency("dep", DependencyCondition::Healthy),
+        ]
+        .into_iter()
+        .map(|dependency| crate::DependencySpec {
+            service: dependency.name.into_inner(),
+            condition: dependency
+                .condition
+                .map(Spanned::into_inner)
+                .unwrap_or_default(),
+        })
+        .collect();
+
+        let mut services = ServiceMap::new();
+        services.insert("dep".to_string(), dep.clone());
+        services.insert("svc".to_string(), svc.clone());
+
+        let mut runtimes = HashMap::new();
+        let mut runtime = ServiceRuntime::new(ServiceRuntimeInit::from(&dep));
+        runtime.state = State::Running { health: None };
+        runtimes.insert("dep".to_string(), runtime);
+        runtimes.insert(
+            "svc".to_string(),
+            ServiceRuntime::new(ServiceRuntimeInit::from(&svc)),
+        );
+
+        let (events_tx, _events_rx) = mpsc::channel(1);
+        let (_reader, writer) = crate::model::new([]);
+        let shutdown = CancellationToken::new();
+        let (test_tx, _test_rx) = mpsc::channel(1);
+        let mut test_events = TestEventSink::new(test_tx);
+        let ctx = test_context(
+            &services,
+            &mut runtimes,
+            &events_tx,
+            &writer,
+            &shutdown,
+            &mut test_events,
+        );
+
+        assert_eq!(blocking_dependencies(&ctx, &svc), vec!["dep"]);
+
+        if let Some(runtime) = ctx.runtimes.get_mut("dep") {
+            runtime.state = State::Running {
+                health: Some(Health::Healthy),
+            };
+        }
+        assert!(blocking_dependencies(&ctx, &svc).is_empty());
+        Ok(())
+    }
 }

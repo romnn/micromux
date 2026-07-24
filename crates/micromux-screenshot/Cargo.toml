@@ -18,5 +18,5 @@ path = "src/main.rs"
 
 [dependencies]
 color-eyre.workspace = true
-portable-pty = "0.9"
+portable-pty.workspace = true
 vt100 = "0"

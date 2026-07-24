@@ -18,10 +18,14 @@ fn rendered_line_count(paragraph: &Paragraph<'_>, width: u16) -> u16 {
 
 #[cfg(test)]
 mod tests {
-    use super::{log_view::LogView, rendered_line_count};
+    use super::{
+        lease_phrase, log_view::LogView, rendered_line_count, service_detail_line, shell_join,
+        state_name,
+    };
     use ratatui::{
         buffer::Buffer,
         layout::Rect,
+        text::Text,
         widgets::{Paragraph, Wrap},
     };
     use similar_asserts::assert_eq;
@@ -29,6 +33,22 @@ mod tests {
     fn wrapped_text_height(text: ratatui::text::Text, wrap_width: u16) -> u16 {
         let paragraph = Paragraph::new(text).wrap(Wrap { trim: false });
         rendered_line_count(&paragraph, wrap_width)
+    }
+
+    fn render_logs(
+        view: &mut LogView,
+        log_area: Rect,
+        scrollbar_area: Rect,
+        logs: &str,
+        buf: &mut Buffer,
+    ) -> u16 {
+        let text = Text::from(logs.to_string());
+        let num_lines = if view.wrap {
+            wrapped_text_height(text.clone(), log_area.width.saturating_sub(2))
+        } else {
+            u16::try_from(text.height()).unwrap_or(u16::MAX)
+        };
+        view.render(log_area, scrollbar_area, num_lines, text, None, buf)
     }
 
     fn count_thumb(buf: &Buffer, area: Rect) -> usize {
@@ -63,6 +83,109 @@ mod tests {
         assert_eq!(wrapped_text_height(text.clone(), 4), 3);
         assert_eq!(wrapped_text_height(text.clone(), 5), 2);
         assert_eq!(wrapped_text_height(text, 10), 1);
+    }
+
+    #[test]
+    fn retired_state_takes_precedence_over_disabled_state() {
+        let mut snapshot = micromux::ServiceSnapshot::initial(
+            "removed".to_string(),
+            "removed".to_string(),
+            Vec::new(),
+            None,
+            micromux::RestartPolicy::Never,
+            Vec::new(),
+            None,
+        );
+        snapshot.desired = micromux::Desired::Disabled;
+        snapshot.retired = Some(micromux::RetiredReason::Removed);
+
+        assert_eq!(state_name(&snapshot), "RETIRED");
+    }
+
+    #[test]
+    fn shell_join_quotes_only_arguments_a_shell_would_split() {
+        let argv = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "echo hi".to_string(),
+            String::new(),
+        ];
+        assert_eq!(shell_join(&argv), r#"sh -c "echo hi" """#);
+    }
+
+    #[test]
+    fn detail_command_is_capped_so_bounded_facts_survive_pathological_commands() {
+        let mut snapshot = micromux::ServiceSnapshot::initial(
+            "svc".to_string(),
+            "svc".to_string(),
+            Vec::new(),
+            None,
+            micromux::RestartPolicy::Never,
+            vec!["sh".to_string(), "-c".to_string(), "x".repeat(500)],
+            None,
+        );
+        snapshot.run_generation = 1;
+
+        let line = service_detail_line(&snapshot, 1_000)
+            .map(|line| line.to_string())
+            .unwrap_or_default();
+
+        assert!(line.contains('…'));
+        assert!(line.ends_with(" gen 1 "));
+        assert!(line.chars().count() < 100);
+    }
+
+    #[test]
+    fn lease_phrase_covers_every_magnitude_and_the_unbounded_lease() {
+        assert_eq!(lease_phrase(None, 1_000), "no expiry");
+        assert_eq!(lease_phrase(Some(500), 1_000), "expired");
+        assert_eq!(lease_phrase(Some(31_000), 1_000), "expires in ~30s");
+        assert_eq!(lease_phrase(Some(91_000), 1_000), "expires in ~1m");
+        assert_eq!(lease_phrase(Some(7_201_000), 1_000), "expires in ~2h");
+        assert_eq!(lease_phrase(Some(259_201_000), 1_000), "expires in ~3d");
+    }
+
+    #[test]
+    fn service_detail_shows_the_command_generation_and_dynamic_lease_facts() {
+        let mut snapshot = micromux::ServiceSnapshot::initial(
+            "svc".to_string(),
+            "svc".to_string(),
+            Vec::new(),
+            None,
+            micromux::RestartPolicy::Never,
+            vec!["sh".to_string(), "-c".to_string(), "sleep 60".to_string()],
+            None,
+        );
+        snapshot.run_generation = 3;
+        let configured = service_detail_line(&snapshot, 1_000)
+            .map(|line| line.to_string())
+            .unwrap_or_default();
+        assert_eq!(configured, r#" $ sh -c "sleep 60"  gen 3 "#);
+
+        snapshot.origin = micromux::OriginKind::Dynamic;
+        snapshot.dynamic = Some(micromux::DynamicServiceInfo {
+            created_at_unix_ms: 0,
+            expires_at_unix_ms: Some(61_000),
+            owner: Some("agent".to_string()),
+            revision: 2,
+        });
+        let dynamic = service_detail_line(&snapshot, 1_000)
+            .map(|line| line.to_string())
+            .unwrap_or_default();
+        assert_eq!(
+            dynamic,
+            r#" $ sh -c "sleep 60"  gen 3  dynamic · rev 2 · expires in ~1m · owner agent "#
+        );
+
+        // A countdown on a dead lease would only mislead; retirement owns the status column.
+        snapshot.retired = Some(micromux::RetiredReason::Expired);
+        let retired = service_detail_line(&snapshot, 1_000)
+            .map(|line| line.to_string())
+            .unwrap_or_default();
+        assert_eq!(
+            retired,
+            r#" $ sh -c "sleep 60"  gen 3  dynamic · rev 2 · owner agent "#
+        );
     }
 
     #[test]
@@ -105,7 +228,7 @@ mod tests {
             height: 5,
         };
 
-        view.render(log_area, scrollbar_area, 0, "one line", &mut buf);
+        render_logs(&mut view, log_area, scrollbar_area, "one line", &mut buf);
 
         assert_eq!(
             count_thumb(&buf, scrollbar_area),
@@ -142,7 +265,7 @@ mod tests {
             .map(|i| format!("line{i}"))
             .collect::<Vec<_>>()
             .join("\n");
-        view.render(log_area, scrollbar_area, 0, &logs, &mut buf);
+        render_logs(&mut view, log_area, scrollbar_area, &logs, &mut buf);
 
         assert!(count_thumb(&buf, scrollbar_area) < scrollbar_area.height as usize);
         assert!(has_thumb_at(
@@ -180,12 +303,12 @@ mod tests {
 
         let mut buf1 = Buffer::empty(buf_area);
         view.wrap = false;
-        view.render(log_area, scrollbar_area, 0, logs, &mut buf1);
+        render_logs(&mut view, log_area, scrollbar_area, logs, &mut buf1);
         let thumb_unwrapped = count_thumb(&buf1, scrollbar_area);
 
         let mut buf2 = Buffer::empty(buf_area);
         view.wrap = true;
-        view.render(log_area, scrollbar_area, 0, logs, &mut buf2);
+        render_logs(&mut view, log_area, scrollbar_area, logs, &mut buf2);
         let thumb_wrapped = count_thumb(&buf2, scrollbar_area);
 
         assert!(thumb_wrapped <= thumb_unwrapped);
@@ -219,10 +342,10 @@ mod tests {
             height: 2,
         };
 
-        let rendered = view.render(
+        let rendered = render_logs(
+            &mut view,
             log_area,
             scrollbar_area,
-            0,
             "abcdefghijklmnopqrstuvwx",
             &mut buf,
         );
@@ -232,16 +355,244 @@ mod tests {
         assert_eq!(row_text(&buf, 1, 1, 6), "mnopqr");
         assert_eq!(row_text(&buf, 1, 2, 6), "stuvwx");
     }
+
+    #[test]
+    fn healthcheck_text_matches_the_model_format() {
+        use super::build_healthcheck_text;
+        use micromux::{HealthAttempt, HealthLine, HealthResult, OutputStream};
+
+        assert_eq!(
+            build_healthcheck_text(false, &[]),
+            "no healthcheck configured"
+        );
+        assert_eq!(build_healthcheck_text(true, &[]), "healthcheck pending");
+
+        let ok = HealthAttempt {
+            run_generation: 1,
+            attempt: 1,
+            command: "curl -f localhost".to_string(),
+            output: vec![
+                HealthLine {
+                    stream: OutputStream::Stdout,
+                    line: "ok".to_string(),
+                },
+                HealthLine {
+                    stream: OutputStream::Stderr,
+                    line: "warn".to_string(),
+                },
+            ],
+            result: Some(HealthResult {
+                success: true,
+                exit_code: 0,
+                cancelled: false,
+            }),
+        };
+        assert_eq!(
+            build_healthcheck_text(true, std::slice::from_ref(&ok)),
+            "\x1b[32m[healthcheck ok exit_code=0]\x1b[0m curl -f localhost\n\nok\n[stderr] warn"
+        );
+
+        let running = HealthAttempt {
+            run_generation: 1,
+            attempt: 2,
+            command: "probe".to_string(),
+            output: vec![],
+            result: None,
+        };
+        assert_eq!(
+            build_healthcheck_text(true, std::slice::from_ref(&running)),
+            "\x1b[33m[healthcheck running]\x1b[0m probe\n\n"
+        );
+
+        let cancelled = HealthAttempt {
+            run_generation: 1,
+            attempt: 3,
+            command: "probe".to_string(),
+            output: Vec::new(),
+            result: Some(HealthResult {
+                success: false,
+                exit_code: -1,
+                cancelled: true,
+            }),
+        };
+        assert_eq!(
+            build_healthcheck_text(true, std::slice::from_ref(&cancelled)),
+            "\x1b[90m[healthcheck cancelled]\x1b[0m probe\n\n"
+        );
+    }
 }
 
-#[must_use]
-pub fn state_name(service: crate::state::Execution) -> &'static str {
-    match service {
-        crate::state::Execution::Running {
-            health: Some(health),
-        } => health.into(),
-        state => state.into(),
+/// Build the healthcheck pane text from the model's bounded attempt history.
+fn build_healthcheck_text(configured: bool, attempts: &[micromux::HealthAttempt]) -> String {
+    let mut out = String::new();
+    if !configured {
+        out.push_str("no healthcheck configured");
+        return out;
     }
+    if attempts.is_empty() {
+        out.push_str("healthcheck pending");
+        return out;
+    }
+    for (idx, attempt) in attempts.iter().enumerate() {
+        if idx > 0 {
+            out.push('\n');
+        }
+
+        let result = attempt.result;
+
+        // Separator line rendered with ANSI so ansi_to_tui can color it reliably.
+        let status = match result {
+            Some(result) if result.cancelled => {
+                "\x1b[90m[healthcheck cancelled]\x1b[0m".to_string()
+            }
+            Some(result) if result.success => {
+                let code = result.exit_code;
+                format!("\x1b[32m[healthcheck ok exit_code={code}]\x1b[0m")
+            }
+            Some(result) => {
+                let code = result.exit_code;
+                format!("\x1b[31m[healthcheck failed exit_code={code}]\x1b[0m")
+            }
+            None => "\x1b[33m[healthcheck running]\x1b[0m".to_string(),
+        };
+
+        out.push_str(&status);
+        if !attempt.command.is_empty() {
+            out.push(' ');
+            out.push_str(&attempt.command);
+        }
+        out.push('\n');
+        out.push('\n');
+
+        let attempt_text = attempt
+            .output
+            .iter()
+            .map(|line| match line.stream {
+                micromux::OutputStream::Stderr => format!("[stderr] {}", line.line),
+                micromux::OutputStream::Stdout | micromux::OutputStream::Unknown => {
+                    line.line.clone()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !attempt_text.is_empty() {
+            out.push_str(&attempt_text);
+        }
+    }
+    out
+}
+
+fn state_name(snapshot: &micromux::ServiceSnapshot) -> &'static str {
+    if snapshot.retired.is_some() {
+        return "RETIRED";
+    }
+    if snapshot.desired == micromux::Desired::Disabled {
+        return "DISABLED";
+    }
+
+    match snapshot.execution {
+        micromux::Execution::Pending => "PENDING",
+        micromux::Execution::Starting => "STARTING",
+        micromux::Execution::Running => match snapshot.health {
+            Some(micromux::Health::Healthy) => "HEALTHY",
+            Some(micromux::Health::Unhealthy) => "UNHEALTHY",
+            Some(micromux::Health::Unknown) => "UNKNOWN",
+            None => "RUNNING",
+        },
+        micromux::Execution::Stopping => "KILLED",
+        micromux::Execution::Exited => "EXITED",
+        micromux::Execution::Unknown => "UNKNOWN",
+    }
+}
+
+/// Join argv for display, quoting only arguments a shell would split.
+fn shell_join(argv: &[String]) -> String {
+    argv.iter()
+        .map(|arg| {
+            if arg.is_empty() || arg.chars().any(char::is_whitespace) {
+                format!("{arg:?}")
+            } else {
+                arg.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Longest command rendered in the detail line. An unbounded command would push the bounded
+/// facts (generation, revision, lease) off the border; the full command stays available through
+/// `ctl ls` and the MCP snapshot.
+const DETAIL_COMMAND_MAX_CHARS: usize = 80;
+
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let mut truncated: String = text.chars().take(max_chars.saturating_sub(1)).collect();
+    truncated.push('…');
+    truncated
+}
+
+/// Wall clock in the unit lease expiries are expressed in.
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+        })
+}
+
+/// Human phrase for a dynamic service's lease. The remaining time is computed at draw time and
+/// marked approximate — the TUI redraws on changes, not on a clock.
+fn lease_phrase(expires_at_unix_ms: Option<u64>, now_unix_ms: u64) -> String {
+    let Some(expires_at_unix_ms) = expires_at_unix_ms else {
+        return "no expiry".to_string();
+    };
+    let Some(remaining_ms) = expires_at_unix_ms.checked_sub(now_unix_ms) else {
+        return "expired".to_string();
+    };
+    let secs = remaining_ms / 1000;
+    if secs < 60 {
+        format!("expires in ~{secs}s")
+    } else if secs < 3600 {
+        format!("expires in ~{}m", secs / 60)
+    } else if secs < 86_400 {
+        format!("expires in ~{}h", secs / 3600)
+    } else {
+        format!("expires in ~{}d", secs / 86_400)
+    }
+}
+
+/// One-line identity of the selected service for the logs pane frame: the resolved command it
+/// runs, its run generation, and for dynamic services the definition revision plus the lease and
+/// ownership facts an operator needs at a glance.
+fn service_detail_line(
+    snapshot: &micromux::ServiceSnapshot,
+    now_unix_ms: u64,
+) -> Option<Line<'static>> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let command = shell_join(&snapshot.command);
+    if !command.is_empty() {
+        let command = truncate_chars(&command, DETAIL_COMMAND_MAX_CHARS);
+        spans.push(format!(" $ {command} ").fg(tailwind::GRAY.c400));
+    }
+    spans.push(format!(" gen {} ", snapshot.run_generation).fg(tailwind::GRAY.c400));
+    if snapshot.origin == micromux::OriginKind::Dynamic {
+        let mut facts = vec!["dynamic".to_string()];
+        if let Some(dynamic) = &snapshot.dynamic {
+            facts.push(format!("rev {}", dynamic.revision));
+            // Retirement already owns the status column; a countdown on a dead lease would only
+            // mislead.
+            if snapshot.retired.is_none() {
+                facts.push(lease_phrase(dynamic.expires_at_unix_ms, now_unix_ms));
+            }
+            if let Some(owner) = &dynamic.owner {
+                facts.push(format!("owner {owner}"));
+            }
+        }
+        spans.push(format!(" {} ", facts.join(" · ")).fg(tailwind::YELLOW.c500));
+    }
+    (!spans.is_empty()).then(|| Line::from(spans))
 }
 
 impl Widget for &mut App {
@@ -276,10 +627,12 @@ impl Widget for &mut App {
             [main_right_area, Rect::default()]
         };
 
-        let header = format!("micromux v{}", env!("CARGO_PKG_VERSION"))
-            .bold()
-            .fg(App::HEADER_COLOR)
-            .into_centered_line();
+        let header = self.attachment_header().unwrap_or_else(|| {
+            format!("micromux v{}", env!("CARGO_PKG_VERSION"))
+                .bold()
+                .fg(App::HEADER_COLOR)
+                .into_centered_line()
+        });
         Paragraph::new(header).render(header_area, buf);
         self.render_services(services_area, buf);
         self.render_logs(logs_area, buf);
@@ -294,32 +647,59 @@ impl App {
     const HEADER_COLOR: Color = tailwind::YELLOW.c500;
     const HIGHLIGHT_COLOR: Color = tailwind::GRAY.c900;
 
+    fn attachment_header(&self) -> Option<Line<'static>> {
+        let status = self.source.attachment_status()?;
+        let mut spans = if status.connected {
+            vec!["attached: ".fg(tailwind::GREEN.c400).bold()]
+        } else {
+            vec!["reconnecting… ".fg(tailwind::RED.c400).bold()]
+        };
+        spans.extend([
+            status.session.name.bold(),
+            format!(" ({})", status.session.config_path).into(),
+        ]);
+        if let Some(notice) = status.notice {
+            spans.extend([" — ".into(), notice.fg(tailwind::RED.c400)]);
+        }
+        Some(Line::from(spans).centered())
+    }
+
     fn render_services(&self, area: Rect, buf: &mut Buffer) {
         let items: Vec<ListItem> = self
             .state
             .services
             .iter()
-            .map(|(_name, service)| {
-                let status = format!("{: >10}", state_name(service.exec_state))
-                    .set_style(crate::style::service_style(service.exec_state));
+            .map(|service| {
+                let status = format!("{: >10}", state_name(&service.snapshot))
+                    .set_style(crate::style::service_style(&service.snapshot));
 
                 // Combine into one line.
                 let ports = service
-                    .open_ports
+                    .snapshot
+                    .advertised_ports
                     .iter()
                     .map(|i| format!(":{i}").fg(tailwind::GRAY.c400));
 
-                let line = [status, " ".into(), service.id.as_str().into()]
-                    .into_iter()
-                    .chain(if ports.len() > 0 {
-                        [" [".into()]
-                            .into_iter()
-                            .chain(intersperse(ports, ", ".into()))
-                            .chain(["]".into()])
-                            .collect()
-                    } else {
-                        vec!["".into()]
-                    });
+                let origin = match service.snapshot.origin {
+                    micromux::OriginKind::Dynamic => "+",
+                    micromux::OriginKind::Configured | micromux::OriginKind::Unknown => " ",
+                };
+                let line = [
+                    status,
+                    " ".into(),
+                    origin.fg(tailwind::GRAY.c400),
+                    service.snapshot.id.as_str().into(),
+                ]
+                .into_iter()
+                .chain(if ports.len() > 0 {
+                    [" [".into()]
+                        .into_iter()
+                        .chain(intersperse(ports, ", ".into()))
+                        .chain(["]".into()])
+                        .collect()
+                } else {
+                    vec!["".into()]
+                });
 
                 ListItem::new(line.collect::<Line>())
             })
@@ -340,21 +720,49 @@ impl App {
     }
 
     fn render_logs(&mut self, area: Rect, buf: &mut Buffer) {
-        let Some(current_service) = self.state.current_service_mut() else {
+        let Some(current_id) = self
+            .state
+            .current_service()
+            .map(|service| service.snapshot.id.clone())
+        else {
             return;
         };
-        if current_service.logs_dirty {
-            let (num_lines, logs) = current_service.logs.full_text();
-            current_service.cached_num_lines = num_lines;
-            current_service.cached_logs = logs;
-            current_service.logs_dirty = false;
+        let dirty = self
+            .state
+            .current_service()
+            .is_some_and(|service| service.logs_dirty);
+        if dirty {
+            let after = self
+                .state
+                .current_service()
+                .and_then(|service| service.cached_lines.back())
+                .map_or(0, |(seq, _)| seq.saturating_sub(1));
+            let (first_retained, new_lines) = self.source.logs_since(&current_id, after);
+            if let Some(service) = self.state.current_service_mut() {
+                match first_retained {
+                    None => service.cached_lines.clear(),
+                    Some(first) => {
+                        while service
+                            .cached_lines
+                            .front()
+                            .is_some_and(|(seq, _)| *seq < first)
+                        {
+                            service.cached_lines.pop_front();
+                        }
+                    }
+                }
+                for line in new_lines {
+                    let formatted = crate::json_log::format_line(&line.line, self.pretty_json_logs);
+                    match service.cached_lines.back_mut() {
+                        Some((seq, cached)) if *seq == line.seq => *cached = formatted,
+                        _ => service.cached_lines.push_back((line.seq, formatted)),
+                    }
+                }
+                service.text_dirty = true;
+                service.logs_dirty = false;
+            }
         }
 
-        let num_lines = current_service.cached_num_lines;
-        let current_logs = current_service.cached_logs.as_str();
-        tracing::trace!(service_id = current_service.id, num_lines, "collected logs");
-
-        // Split into a main pane and a thin scrollbar pane
         let [logs_area, scrollbar_area] = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
@@ -371,69 +779,82 @@ impl App {
             height: scrollbar_area.height.saturating_sub(2),
         };
 
-        let rendered_lines =
-            self.log_view
-                .render(logs_area, scrollbar_area, num_lines, current_logs, buf);
-
-        // Persist the wrap-aware rendered line count so keyboard scrolling (scroll_logs_down)
-        // clamps to the same bottom the scrollbar uses, even when wrapping is enabled.
-        if let Some(current_service) = self.state.current_service_mut() {
-            current_service.cached_num_lines = rendered_lines;
+        let wrap = self.log_view.wrap;
+        let wrap_width = logs_area.width.saturating_sub(2);
+        if let Some(service) = self.state.current_service_mut()
+            && (service.text_dirty || service.cached_wrap != Some((wrap, wrap_width)))
+        {
+            let joined = service
+                .cached_lines
+                .iter()
+                .map(|(_, line)| line.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            service.cached_text = joined.as_str().into_text().unwrap_or_else(|err| {
+                let escaped = strip_ansi_escapes::strip_str(&joined);
+                tracing::error!(?err, escaped, "failed to sanitize log line");
+                escaped.into()
+            });
+            let raw_num_lines = u16::try_from(service.cached_text.height()).unwrap_or(u16::MAX);
+            service.cached_wrapped_lines = if wrap {
+                let paragraph =
+                    Paragraph::new(service.cached_text.clone()).wrap(Wrap { trim: false });
+                rendered_line_count(&paragraph, wrap_width)
+            } else {
+                raw_num_lines
+            };
+            service.cached_wrap = Some((wrap, wrap_width));
+            service.text_dirty = false;
         }
+
+        let Some(current_service) = self.state.current_service() else {
+            return;
+        };
+        let num_lines = current_service.cached_wrapped_lines;
+        let text = current_service.cached_text.clone();
+        let detail = service_detail_line(&current_service.snapshot, now_unix_ms());
+        tracing::trace!(
+            service_id = current_service.snapshot.id,
+            num_lines,
+            "collected logs"
+        );
+
+        self.log_view
+            .render(logs_area, scrollbar_area, num_lines, text, detail, buf);
     }
 
     fn render_healthchecks(&mut self, area: Rect, buf: &mut Buffer) {
-        let Some(current_service) = self.state.current_service_mut() else {
+        let Some(current_id) = self
+            .state
+            .current_service()
+            .map(|service| service.snapshot.id.clone())
+        else {
             return;
         };
-        if current_service.healthcheck_dirty {
-            let mut out = String::new();
-
-            if !current_service.healthcheck_configured {
-                out.push_str("no healthcheck configured");
-            } else if current_service.healthcheck_attempts.is_empty() {
-                out.push_str("healthcheck pending");
-            } else {
-                for (idx, attempt) in current_service.healthcheck_attempts.iter().enumerate() {
-                    if idx > 0 {
-                        out.push('\n');
-                    }
-
-                    let (success, exit_code) = attempt
-                        .result
-                        .map_or((None, None), |r| (Some(r.success), Some(r.exit_code)));
-
-                    // Separator line rendered with ANSI so ansi_to_tui can color it reliably.
-                    let status = match (success, exit_code) {
-                        (Some(true), Some(code)) => {
-                            format!("\x1b[32m[healthcheck ok exit_code={code}]\x1b[0m")
-                        }
-                        (Some(false), Some(code)) => {
-                            format!("\x1b[31m[healthcheck failed exit_code={code}]\x1b[0m")
-                        }
-                        _ => "\x1b[33m[healthcheck running]\x1b[0m".to_string(),
-                    };
-
-                    out.push_str(&status);
-                    if !attempt.command.is_empty() {
-                        out.push(' ');
-                        out.push_str(&attempt.command);
-                    }
-                    out.push('\n');
-                    out.push('\n');
-
-                    let attempt_text = attempt.output.full_text();
-                    if !attempt_text.is_empty() {
-                        out.push_str(&attempt_text);
-                    }
-                }
+        let (dirty, configured) = self
+            .state
+            .current_service()
+            .map_or((false, false), |service| {
+                (
+                    service.healthcheck_dirty,
+                    service.snapshot.healthcheck_configured,
+                )
+            });
+        if dirty {
+            let attempts = self.source.healthchecks(&current_id);
+            let out = build_healthcheck_text(configured, &attempts);
+            if let Some(service) = self.state.current_service_mut() {
+                service.healthcheck_cached_text = out;
+                service.healthcheck_dirty = false;
             }
-
-            current_service.healthcheck_cached_text = out;
-            current_service.healthcheck_dirty = false;
         }
 
-        let text = current_service.healthcheck_cached_text.as_str();
+        let cached_text = self
+            .state
+            .current_service()
+            .map(|service| service.healthcheck_cached_text.clone())
+            .unwrap_or_default();
+        let text = cached_text.as_str();
 
         let [pane_area, scrollbar_area] = Layout::default()
             .direction(Direction::Horizontal)
@@ -465,7 +886,9 @@ impl App {
         } else {
             raw_num_lines
         };
-        current_service.healthcheck_cached_num_lines = num_lines;
+        if let Some(service) = self.state.current_service_mut() {
+            service.healthcheck_cached_num_lines = num_lines;
+        }
 
         let viewport_height = scrollbar_area.height;
         let max_off = num_lines.saturating_sub(viewport_height);
@@ -523,27 +946,41 @@ impl App {
             "OFF"
         };
         let wrap = if self.log_view.wrap { "ON" } else { "OFF" };
-        let attach = if self.attach_mode { "ON" } else { "OFF" };
+        let pty_input = if self.pty_input_mode { "ON" } else { "OFF" };
         let focus = match self.focus {
             crate::Focus::Services => "SERVICES",
             crate::Focus::Logs => "LOGS",
             crate::Focus::Healthcheck => "HEALTH",
         };
 
-        let footer_text = [
+        let mut footer_text = vec![
             Keys::new("↑/↓", "Navigate"),
             Keys::new("←/→", "Resize"),
             Keys::new("Tab", format!("Focus:{focus}")),
-            Keys::new("a", format!("Attach:{attach}")),
-            Keys::new("Alt+Esc", "Detach"),
+        ];
+        if self.input.is_some() {
+            footer_text.extend([
+                Keys::new("a", format!("PTY Input:{pty_input}")),
+                Keys::new("Alt+Esc", "Exit input"),
+            ]);
+        }
+        footer_text.extend([
             Keys::new("H", "Health"),
             Keys::new("w", format!("Wrap:{wrap}")),
             Keys::new("t", format!("Tail:{tail}")),
             Keys::new("r", "Restart"),
             Keys::new("R", "Restart All"),
             Keys::new("d", "Disable/Enable"),
-            Keys::new("q", "Quit"),
-        ];
+            Keys::new("s", "Stop dynamic"),
+            Keys::new(
+                "q",
+                if self.source.attachment_status().is_some() {
+                    "Detach"
+                } else {
+                    "Quit"
+                },
+            ),
+        ]);
 
         let widget = Paragraph::new(
             Line::from(
@@ -583,7 +1020,6 @@ impl App {
 }
 
 pub mod log_view {
-    use ansi_to_tui::IntoText;
     use ratatui::{
         buffer::Buffer,
         layout::Rect,
@@ -619,36 +1055,24 @@ pub mod log_view {
     impl LogView {
         /// Render the log view and return the wrap-aware rendered line count, so callers can
         /// clamp keyboard scrolling consistently with the scrollbar/follow-tail behavior.
+        ///
+        /// `detail` is drawn into the bottom border as the selected service's identity line.
         pub fn render(
             &mut self,
             log_area: Rect,
             scrollbar_area: Rect,
-            _num_lines: u16,
-            logs: &str,
+            num_lines: u16,
+            text: ratatui::text::Text<'static>,
+            detail: Option<ratatui::text::Line<'static>>,
             buf: &mut Buffer,
         ) -> u16 {
             Clear.render(log_area, buf);
             Clear.render(scrollbar_area, buf);
 
-            // Strip ANSI control codes that could confuse our TUI
-            let text: ratatui::text::Text = logs.into_text().unwrap_or_else(|err| {
-                // As a fallback, remove all ANSI controls (losing all color)
-                let escaped = strip_ansi_escapes::strip_str(logs);
-                tracing::error!(?err, escaped, "failed to sanitize log line");
-                escaped.into()
-            });
-
-            let raw_num_lines = u16::try_from(text.height()).unwrap_or(u16::MAX);
-            let wrap_width = log_area.width.saturating_sub(2);
             let mut paragraph = Paragraph::new(text);
             if self.wrap {
                 paragraph = paragraph.wrap(Wrap { trim: false });
             }
-            let num_lines = if self.wrap {
-                super::rendered_line_count(&paragraph, wrap_width)
-            } else {
-                raw_num_lines
-            };
 
             let viewport_height = scrollbar_area.height;
             let max_off = num_lines.saturating_sub(viewport_height);
@@ -666,9 +1090,11 @@ pub mod log_view {
                 .viewport_content_length(viewport_height.into())
                 .position(self.scroll_offset as usize);
 
-            let paragraph = paragraph
-                .block(Block::default().borders(Borders::ALL).title("Logs"))
-                .scroll((self.scroll_offset, 0)); // scroll by lines then cols
+            let mut block = Block::default().borders(Borders::ALL).title("Logs");
+            if let Some(detail) = detail {
+                block = block.title_bottom(detail);
+            }
+            let paragraph = paragraph.block(block).scroll((self.scroll_offset, 0)); // scroll by lines then cols
 
             Widget::render(&paragraph, log_area, buf);
 
