@@ -64,11 +64,66 @@ pub const fn transport_supported() -> bool {
     false
 }
 
+/// A session config path in canonical form, the only input endpoint names are derived from.
+///
+/// The session binding an endpoint and every client re-deriving it must hash the exact same
+/// bytes, or the two sides silently compute different socket names for the same project. A path
+/// that reaches the config through a symlink diverges from its canonical form — macOS does this
+/// for entire standard trees (`/tmp` and `/var` live under `/private`) — so raw user-supplied
+/// paths are never acceptable input. Holding this type is proof the divergence was resolved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanonicalConfigPath(PathBuf);
+
+impl CanonicalConfigPath {
+    /// Canonicalize `path` (which must exist) and wrap it.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying I/O error when `path` does not exist or cannot be canonicalized.
+    pub fn new(path: impl AsRef<Path>) -> std::io::Result<Self> {
+        Ok(Self(std::fs::canonicalize(path)?))
+    }
+
+    /// Wrap a path that is already canonical (e.g. `tokio::fs::canonicalize` output).
+    ///
+    /// Crate-private on purpose: external callers must prove canonicalization through
+    /// [`Self::new`], while in-crate async resolvers may trust their own canonicalize calls.
+    pub(crate) fn from_canonicalized(path: PathBuf) -> Self {
+        Self(path)
+    }
+
+    /// The canonical path.
+    #[must_use]
+    pub fn as_path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl std::ops::Deref for CanonicalConfigPath {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl AsRef<Path> for CanonicalConfigPath {
+    fn as_ref(&self) -> &Path {
+        &self.0
+    }
+}
+
 /// The deterministic short digest of a canonical config path. Fixed length keeps the macOS
 /// `sun_path` budget under control.
 #[must_use]
-pub fn endpoint_hash(config_path: &Path) -> String {
-    let input = endpoint_hash_input(config_path);
+pub fn endpoint_hash(config_path: &CanonicalConfigPath) -> String {
+    hash_path(config_path.as_path())
+}
+
+/// Raw digest of an arbitrary path's bytes. Crate-private: the typed [`endpoint_hash`] is the
+/// public entrypoint, so endpoint names are only ever derived from canonical config paths.
+pub(crate) fn hash_path(path: &Path) -> String {
+    let input = endpoint_hash_input(path);
     let digest = Sha256::digest(input.as_ref());
     let mut out = String::with_capacity(16);
     for byte in digest.iter().take(8) {
@@ -251,26 +306,111 @@ pub fn endpoint_from_hash(runtime_dir: &Path, hash: &str) -> ControlEndpoint {
 
 /// Compute the control endpoint for a session's canonical config path within `runtime_dir`.
 #[must_use]
-pub fn endpoint_for(runtime_dir: &Path, config_path: &Path) -> ControlEndpoint {
+pub fn endpoint_for(runtime_dir: &Path, config_path: &CanonicalConfigPath) -> ControlEndpoint {
     endpoint_from_hash(runtime_dir, &endpoint_hash(config_path))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use color_eyre::eyre;
     use similar_asserts::assert_eq;
     #[cfg(all(unix, target_os = "linux"))]
     use std::io;
 
     #[test]
     fn endpoint_hash_is_deterministic_and_fixed_length() {
-        let a = endpoint_hash(Path::new("/home/user/project/micromux.yaml"));
-        let b = endpoint_hash(Path::new("/home/user/project/micromux.yaml"));
-        let c = endpoint_hash(Path::new("/home/user/other/micromux.yaml"));
+        let a = hash_path(Path::new("/home/user/project/micromux.yaml"));
+        let b = hash_path(Path::new("/home/user/project/micromux.yaml"));
+        let c = hash_path(Path::new("/home/user/other/micromux.yaml"));
         assert_eq!(a, b);
         assert_eq!(a, "3f98f83e6e2c8d23");
         assert_eq!(a.len(), 16);
         assert_ne!(a, c);
+    }
+
+    /// The invariant [`CanonicalConfigPath`] exists to enforce: a config reached through a
+    /// symlink and through its real path must derive the identical endpoint.
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_and_real_config_paths_derive_the_same_endpoint() -> eyre::Result<()> {
+        let root = tempfile::tempdir()?;
+        let project = root.path().join("project");
+        std::fs::create_dir(&project)?;
+        let config = project.join("micromux.yaml");
+        std::fs::write(&config, "version: 1\nservices: {}\n")?;
+        let alias = root.path().join("alias");
+        std::os::unix::fs::symlink(&project, &alias)?;
+
+        let through_real = CanonicalConfigPath::new(&config)?;
+        let through_alias = CanonicalConfigPath::new(alias.join("micromux.yaml"))?;
+
+        assert_eq!(through_real, through_alias);
+        assert_eq!(
+            endpoint_for(root.path(), &through_real),
+            endpoint_for(root.path(), &through_alias)
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn per_user_fallback_socket_path_fits_the_darwin_sun_path_budget() -> eyre::Result<()> {
+        use std::os::unix::ffi::OsStrExt;
+
+        // macOS has the tightest `sockaddr_un` budget of the supported platforms: `sun_path` is
+        // 104 bytes including the NUL terminator. The whole endpoint design (fixed 16-hex hash,
+        // short per-user runtime dirs) exists to stay under it, so a regression here — a longer
+        // hash, a longer dir name — must fail on every platform, not only once macOS CI runs.
+        const DARWIN_SUN_PATH_LEN: usize = 104;
+        // The observed shape of a real macOS per-user temp dir (`$TMPDIR`), the longest runtime
+        // dir base among the supported platforms.
+        let representative_macos_tmp =
+            Path::new("/var/folders/8j/sfr9qqcj73j4p6nhwcfpr0th0000gn/T");
+
+        // Worst-case the variable part of the production fallback dir name: the largest uid.
+        let uid = nix::unistd::Uid::current().to_string();
+        let fallback_name = per_user_fallback_dir()
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .ok_or_else(|| eyre::eyre!("fallback runtime dir has no final component"))?;
+        assert!(
+            fallback_name.contains(&uid),
+            "fallback dir name {fallback_name:?} no longer embeds the uid; update this test"
+        );
+        let worst_case_name = fallback_name.replace(&uid, &u32::MAX.to_string());
+
+        let worst_case_dir = representative_macos_tmp.join(worst_case_name);
+        let hash = hash_path(Path::new("/any/project/micromux.yaml"));
+        let socket_path = match endpoint_from_hash(&worst_case_dir, &hash) {
+            ControlEndpoint::Unix(path) => path,
+            ControlEndpoint::WindowsNamedPipe(_) => {
+                eyre::bail!("a unix build must derive unix socket endpoints")
+            }
+        };
+
+        let len = socket_path.as_os_str().as_bytes().len();
+        assert!(
+            len < DARWIN_SUN_PATH_LEN,
+            "worst-case fallback socket path is {len} bytes, over the {DARWIN_SUN_PATH_LEN}-byte \
+             macOS sun_path budget: {}",
+            socket_path.display()
+        );
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn non_unix_endpoints_are_named_pipes_and_transport_is_unsupported() {
+        let hash = hash_path(Path::new("C:/project/micromux.yaml"));
+        let endpoint = endpoint_from_hash(Path::new("ignored"), &hash);
+
+        assert_eq!(
+            endpoint,
+            ControlEndpoint::WindowsNamedPipe(format!(r"\\.\pipe\micromux-{hash}"))
+        );
+        assert!(!transport_supported());
     }
 
     #[cfg(unix)]
@@ -282,7 +422,7 @@ mod tests {
         let first = PathBuf::from(OsString::from_vec(b"/tmp/micromux-\xff.yaml".to_vec()));
         let second = PathBuf::from(OsString::from_vec(b"/tmp/micromux-\xfe.yaml".to_vec()));
 
-        assert_ne!(endpoint_hash(&first), endpoint_hash(&second));
+        assert_ne!(hash_path(&first), hash_path(&second));
     }
 
     #[cfg(unix)]

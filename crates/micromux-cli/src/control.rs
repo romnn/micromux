@@ -10,7 +10,9 @@ use std::path::Path;
 use std::sync::Arc;
 
 use micromux::{CancellationToken, Handles};
-use micromux_control::{ControlServer, SessionIdentity, bind, endpoint_for, runtime_dir};
+use micromux_control::{
+    CanonicalConfigPath, ControlServer, SessionIdentity, bind, endpoint_for, runtime_dir,
+};
 
 /// Resolve a human-readable session name: the config `name:` if set, else `basename(working_dir)`.
 fn session_name(configured: Option<String>, working_dir: &Path) -> String {
@@ -31,7 +33,7 @@ fn session_name(configured: Option<String>, working_dir: &Path) -> String {
 /// session would be useless).
 pub fn spawn(
     handles: &Handles,
-    config_path: &Path,
+    config_path: &CanonicalConfigPath,
     working_dir: &Path,
     name: Option<String>,
     shutdown: CancellationToken,
@@ -86,12 +88,12 @@ pub fn spawn(
 pub async fn resolve_config_path(
     explicit: Option<&Path>,
     working_dir: &Path,
-) -> Result<std::path::PathBuf, crate::Error> {
+) -> Result<CanonicalConfigPath, crate::Error> {
     let config_path = match explicit {
         Some(path) => Some(path.to_path_buf()),
         None => micromux::find_config_file(working_dir).await?,
     };
     let config_path =
         config_path.ok_or_else(|| crate::Error::Message("missing config file".to_string()))?;
-    Ok(config_path.canonicalize()?)
+    Ok(CanonicalConfigPath::new(config_path)?)
 }

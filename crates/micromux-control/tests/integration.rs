@@ -17,7 +17,19 @@ use similar_asserts::assert_eq;
 fn unique_dir(prefix: &str) -> eyre::Result<tempfile::TempDir> {
     Ok(tempfile::Builder::new()
         .prefix(&format!("micromux-control-{prefix}-"))
-        .tempdir()?)
+        .tempdir_in(socket_test_base())?)
+}
+
+/// Base directory for endpoint sockets in tests. macOS caps `AF_UNIX` paths at `SUN_LEN` (104
+/// bytes) and its default temp dir (`/var/folders/…`) is long enough that the appended
+/// `<hash>.sock` overflows it, so root sockets under the short, always-present `/tmp`.
+fn socket_test_base() -> std::path::PathBuf {
+    let tmp = std::path::PathBuf::from("/tmp");
+    if tmp.is_dir() {
+        tmp
+    } else {
+        std::env::temp_dir()
+    }
 }
 
 struct Session {
@@ -39,7 +51,10 @@ fn build_session_yaml(dir: &Path, yaml: &str) -> eyre::Result<Session> {
         .map_err(|err| eyre::eyre!("parse config: {err}"))?;
     let config_path = dir.join("micromux.yaml");
     std::fs::write(&config_path, yaml)?;
-    config.config_path = Some(config_path.clone());
+    // Mirror production startup: the endpoint is derived from the canonical config path (the
+    // `CanonicalConfigPath` signature makes any other input a compile error).
+    let config_path = micromux_control::CanonicalConfigPath::new(&config_path)?;
+    config.config_path = Some(config_path.as_path().to_path_buf());
     let mux = Arc::new(micromux::Micromux::new(&config)?);
 
     let shutdown = CancellationToken::new();
@@ -198,7 +213,9 @@ async fn describe_list_logs_and_restart_over_the_socket() -> eyre::Result<()> {
     assert_eq!(info.name, "test");
     assert_eq!(
         info.id,
-        micromux_control::endpoint_hash(&dir.path().join("micromux.yaml"))
+        micromux_control::endpoint_hash(&micromux_control::CanonicalConfigPath::new(
+            dir.path().join("micromux.yaml"),
+        )?)
     );
     assert_eq!(info.services.len(), 1);
     assert_eq!(

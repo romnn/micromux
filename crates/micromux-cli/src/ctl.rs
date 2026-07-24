@@ -342,7 +342,7 @@ async fn connect_project_session(
     dir_statuses: &[RuntimeDirStatus],
     runtime_dirs: &[PathBuf],
     working_dir: &Path,
-    config_path: &Path,
+    config_path: &micromux_control::CanonicalConfigPath,
 ) -> Result<Client, crate::Error> {
     let endpoints = runtime_dirs
         .iter()

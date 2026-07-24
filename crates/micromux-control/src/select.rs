@@ -6,9 +6,9 @@ use schemars::JsonSchema;
 use serde::Serialize;
 
 use crate::{
-    ControlEndpoint, ControlError, EndpointProbe, EndpointProbeResult, PROTOCOL_VERSION,
-    ProtocolVersion, RuntimeDirStatus, SessionInfo, endpoint_for, endpoint_from_hash,
-    endpoint_hash, probe_endpoints, probe_runtime_dirs, runtime_dir_statuses,
+    CanonicalConfigPath, ControlEndpoint, ControlError, EndpointProbe, EndpointProbeResult,
+    PROTOCOL_VERSION, ProtocolVersion, RuntimeDirStatus, SessionInfo, endpoint_for,
+    endpoint_from_hash, endpoint_hash, probe_endpoints, probe_runtime_dirs, runtime_dir_statuses,
     unique_answering_session_probes, usable_runtime_dirs,
 };
 
@@ -289,7 +289,7 @@ async fn resolve_current(
 
 async fn resolve_current_config_by_scanning(
     runtime_dirs: &[PathBuf],
-    config_path: &Path,
+    config_path: &CanonicalConfigPath,
 ) -> Result<Option<ResolvedSession>, SelectError> {
     let probes = probe_runtime_dirs(runtime_dirs).await?;
     resolve_current_config_matches(&probes, config_path)
@@ -298,7 +298,7 @@ async fn resolve_current_config_by_scanning(
 async fn resolve_current_project_by_scanning(
     runtime_dirs: &[PathBuf],
     cwd: &Path,
-    config_path: &Path,
+    config_path: &CanonicalConfigPath,
 ) -> Result<Option<ResolvedSession>, SelectError> {
     let probes = probe_runtime_dirs(runtime_dirs).await?;
     if let Some(resolved) = resolve_current_config_matches(&probes, config_path)? {
@@ -311,7 +311,7 @@ async fn resolve_current_project_by_scanning(
 
 fn resolve_current_config_matches(
     probes: &[EndpointProbe],
-    config_path: &Path,
+    config_path: &CanonicalConfigPath,
 ) -> Result<Option<ResolvedSession>, SelectError> {
     let config_matches = current_scan_matches(probes, |info| {
         session_matches_config_path(info, config_path)
@@ -348,11 +348,15 @@ fn resolve_unique_current_scan_matches(
 
 /// Return whether a session's identity hash matches a canonical config path.
 #[must_use]
-pub fn session_matches_config_path(info: &SessionInfo, config_path: &Path) -> bool {
+pub fn session_matches_config_path(info: &SessionInfo, config_path: &CanonicalConfigPath) -> bool {
     info.id == endpoint_hash(config_path)
 }
 
 /// Return whether a session's canonical config path is inside a directory.
+///
+/// Deliberately takes a raw [`Path`], not [`CanonicalConfigPath`]: `directory` is an arbitrary
+/// user directory (not a config file), and the session side must keep best-effort fallback
+/// semantics when its advertised config file no longer exists on disk.
 #[must_use]
 pub fn session_config_path_is_under(info: &SessionInfo, directory: &Path) -> bool {
     if info.config_path.is_empty() {
@@ -571,12 +575,15 @@ fn probe_report(
 
 /// Resolve a config target: use a file directly or search upward from a directory.
 #[must_use]
-pub async fn config_for_target(path: &Path) -> Option<PathBuf> {
+pub async fn config_for_target(path: &Path) -> Option<CanonicalConfigPath> {
     if tokio::fs::metadata(path)
         .await
         .is_ok_and(|metadata| metadata.is_file())
     {
-        return tokio::fs::canonicalize(path).await.ok();
+        return tokio::fs::canonicalize(path)
+            .await
+            .ok()
+            .map(CanonicalConfigPath::from_canonicalized);
     }
     find_config_upward(path).await
 }
@@ -588,18 +595,21 @@ pub async fn config_for_target(path: &Path) -> Option<PathBuf> {
 /// captures a path-joining closure, which the rmcp `#[tool]` macro's higher-ranked `'static`
 /// bound rejects in the MCP tool futures that await this resolver — this future must stay
 /// closure-free.
-async fn find_config_upward(start: &Path) -> Option<PathBuf> {
+async fn find_config_upward(start: &Path) -> Option<CanonicalConfigPath> {
     let home = directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf());
     find_config_upward_with_home(start, home.as_deref()).await
 }
 
-async fn find_config_upward_with_home(start: &Path, home: Option<&Path>) -> Option<PathBuf> {
+async fn find_config_upward_with_home(
+    start: &Path,
+    home: Option<&Path>,
+) -> Option<CanonicalConfigPath> {
     let mut directory = start.to_path_buf();
     loop {
         for name in micromux::config_file_names() {
             let candidate = directory.join(name);
             if let Ok(canonical) = tokio::fs::canonicalize(&candidate).await {
-                return Some(canonical);
+                return Some(CanonicalConfigPath::from_canonicalized(canonical));
             }
         }
         if home.is_some_and(|home| directory == home) {
@@ -628,7 +638,11 @@ mod tests {
         _runner: tokio::task::JoinHandle<Result<(), micromux::Error>>,
     }
 
-    fn boot(runtime_dir: &Path, working_dir: &Path, config_path: &Path) -> eyre::Result<Running> {
+    fn boot(
+        runtime_dir: &Path,
+        working_dir: &Path,
+        config_path: &CanonicalConfigPath,
+    ) -> eyre::Result<Running> {
         let yaml = "version: 1\nservices:\n  svc:\n    command: [\"sh\", \"-c\", \"sleep 60\"]\n";
         let mut diagnostics = Vec::new();
         let config = micromux::from_str(yaml, working_dir, 0usize, None, &mut diagnostics)
@@ -689,7 +703,10 @@ mod tests {
 
         let found = find_config_upward_with_home(&project, Some(Path::new("/home/me"))).await;
 
-        assert_eq!(found, Some(std::fs::canonicalize(config)?));
+        assert_eq!(
+            found.as_deref(),
+            Some(std::fs::canonicalize(config)?.as_path())
+        );
         Ok(())
     }
 
@@ -722,7 +739,7 @@ mod tests {
             &config_path,
             "version: 1\nservices:\n  svc:\n    command: [\"sh\", \"-c\", \"sleep 60\"]\n",
         )?;
-        let config_path = std::fs::canonicalize(config_path)?;
+        let config_path = CanonicalConfigPath::new(config_path)?;
         let running = boot(runtime_dir.path(), project.path(), &config_path)?;
         let statuses = vec![RuntimeDirStatus {
             path: runtime_dir.path().to_path_buf(),
@@ -735,12 +752,64 @@ mod tests {
             &statuses,
             cwd.path(),
             None,
-            Some(&config_path),
+            Some(config_path.as_path()),
         )
         .await?;
 
         assert_eq!(resolved.info.name, "selected");
-        assert_eq!(Path::new(&resolved.info.config_path), config_path);
+        assert_eq!(Path::new(&resolved.info.config_path), config_path.as_path());
+        running.shutdown.cancel();
+        Ok(())
+    }
+
+    /// The session binds under the *canonical* config path; a client whose cwd or `--config`
+    /// override reaches that config only through a symlink must still derive the same endpoint.
+    /// macOS hits this constantly (`/tmp` and `/var` are symlinks into `/private`); the explicit
+    /// symlink makes the divergence deterministic on every unix platform.
+    #[tokio::test]
+    async fn selector_resolves_through_a_symlinked_project_path() -> eyre::Result<()> {
+        let runtime_dir = tempfile::tempdir()?;
+        let root = tempfile::tempdir()?;
+        let project = root.path().join("real-project");
+        std::fs::create_dir(&project)?;
+        let alias = root.path().join("alias");
+        std::os::unix::fs::symlink(&project, &alias)?;
+        let config_path = project.join("micromux.yaml");
+        std::fs::write(
+            &config_path,
+            "version: 1\nservices:\n  svc:\n    command: [\"sh\", \"-c\", \"sleep 60\"]\n",
+        )?;
+        // Mirror production startup: the endpoint is derived from the canonical config path.
+        let canonical = CanonicalConfigPath::new(&config_path)?;
+        let running = boot(runtime_dir.path(), &project, &canonical)?;
+        let statuses = vec![RuntimeDirStatus {
+            path: runtime_dir.path().to_path_buf(),
+            usable: true,
+            error: None,
+        }];
+
+        // Current-directory discovery from inside the symlinked alias.
+        let resolved = resolve_selector_in_runtime_dirs(
+            &[runtime_dir.path().to_path_buf()],
+            &statuses,
+            &alias,
+            None,
+            None,
+        )
+        .await?;
+        assert_eq!(resolved.info.name, "selected");
+
+        // An explicit config override spelled through the symlink.
+        let resolved = resolve_selector_in_runtime_dirs(
+            &[runtime_dir.path().to_path_buf()],
+            &statuses,
+            root.path(),
+            None,
+            Some(&alias.join("micromux.yaml")),
+        )
+        .await?;
+        assert_eq!(resolved.info.name, "selected");
+
         running.shutdown.cancel();
         Ok(())
     }

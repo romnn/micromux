@@ -2982,11 +2982,11 @@ services:
     ) -> eyre::Result<(RunningMcpSession, String)> {
         let config_path = project_dir.join("micromux.yaml");
         std::fs::write(&config_path, yaml)?;
-        let config_path = std::fs::canonicalize(config_path)?;
+        let config_path = micromux_control::CanonicalConfigPath::new(config_path)?;
         let mut diagnostics = Vec::new();
         let mut config = micromux::from_str(yaml, project_dir, 0usize, None, &mut diagnostics)
             .map_err(|err| eyre::eyre!("parse config: {err}"))?;
-        config.config_path = Some(config_path.clone());
+        config.config_path = Some(config_path.as_path().to_path_buf());
 
         let mux = Arc::new(micromux::Micromux::new(&config)?);
         let shutdown = micromux::CancellationToken::new();

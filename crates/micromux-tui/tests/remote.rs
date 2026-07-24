@@ -14,7 +14,7 @@ use similar_asserts::assert_eq;
 
 struct Session {
     endpoint: ControlEndpoint,
-    config_path: std::path::PathBuf,
+    config_path: micromux_control::CanonicalConfigPath,
     reader: micromux::SessionModelReader,
     shutdown: CancellationToken,
     _runner: tokio::task::JoinHandle<Result<(), micromux::Error>>,
@@ -33,13 +33,36 @@ services:
     command: ["sh", "-c", "echo attached-line-$$; while true; do echo tick; sleep 0.1; done"]
 "#;
 
+fn unique_dir(prefix: &str) -> eyre::Result<tempfile::TempDir> {
+    Ok(tempfile::Builder::new()
+        .prefix(&format!("micromux-tui-{prefix}-"))
+        .tempdir_in(socket_test_base())?)
+}
+
+/// Base directory for endpoint sockets in tests. macOS caps `AF_UNIX` paths at `SUN_LEN` (104
+/// bytes) and its default temp dir (`/var/folders/…`) is long enough that the appended
+/// `<hash>.sock` overflows it, so root sockets under the short, always-present `/tmp`.
+fn socket_test_base() -> std::path::PathBuf {
+    let tmp = std::path::PathBuf::from("/tmp");
+    if tmp.is_dir() {
+        tmp
+    } else {
+        std::env::temp_dir()
+    }
+}
+
 fn build_session(dir: &Path, yaml: &str) -> eyre::Result<Session> {
     let mut diagnostics = vec![];
     let mut config = micromux::from_str(yaml, dir, 0usize, None, &mut diagnostics)
         .map_err(|err| eyre::eyre!("parse config: {err}"))?;
     let config_path = dir.join("micromux.yaml");
     std::fs::write(&config_path, yaml)?;
-    config.config_path = Some(config_path.clone());
+    // Mirror production: the session's config path is canonicalized before the endpoint hash is
+    // derived, so the selector resolver (which also canonicalizes) computes the same endpoint even
+    // when the temp dir sits behind a symlink (macOS `/var` -> `/private/var`). The
+    // `CanonicalConfigPath` signatures below make any other input a compile error.
+    let config_path = micromux_control::CanonicalConfigPath::new(&config_path)?;
+    config.config_path = Some(config_path.as_path().to_path_buf());
     let mux = Arc::new(micromux::Micromux::new(&config)?);
 
     let shutdown = CancellationToken::new();
@@ -87,9 +110,7 @@ async fn wait_for_running(source: &RemoteSource) -> eyre::Result<u64> {
 
 #[tokio::test]
 async fn remote_source_observes_logs_and_restart_generation() -> eyre::Result<()> {
-    let dir = tempfile::Builder::new()
-        .prefix("micromux-tui-remote-")
-        .tempdir()?;
+    let dir = unique_dir("remote")?;
     let session = build_session(dir.path(), SESSION_YAML)?;
     let source = RemoteSource::connect(session.endpoint.clone()).await?;
 
@@ -184,9 +205,7 @@ async fn boot_replacement(dir: &Path) -> eyre::Result<Session> {
 
 #[tokio::test]
 async fn replaced_session_instance_recovers_the_render_log_cursor() -> eyre::Result<()> {
-    let dir = tempfile::Builder::new()
-        .prefix("micromux-tui-replace-")
-        .tempdir()?;
+    let dir = unique_dir("replace")?;
     let session = build_session(dir.path(), TICKER_YAML)?;
     let source = RemoteSource::connect(session.endpoint.clone()).await?;
 
@@ -226,9 +245,7 @@ async fn replaced_session_instance_recovers_the_render_log_cursor() -> eyre::Res
 
 #[tokio::test]
 async fn detach_after_resolution_leaves_the_session_running() -> eyre::Result<()> {
-    let dir = tempfile::Builder::new()
-        .prefix("micromux-tui-detach-")
-        .tempdir()?;
+    let dir = unique_dir("detach")?;
     let session = build_session(dir.path(), SESSION_YAML)?;
     let runtime_dirs = vec![dir.path().to_path_buf()];
     let dir_statuses = vec![micromux_control::RuntimeDirStatus {

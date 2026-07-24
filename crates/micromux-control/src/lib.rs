@@ -33,8 +33,8 @@ pub use client::{
     unique_answering_session_probes,
 };
 pub use endpoint::{
-    ControlEndpoint, RuntimeDirStatus, endpoint_for, endpoint_from_hash, endpoint_hash,
-    runtime_dir, runtime_dir_statuses, transport_supported, usable_runtime_dirs,
+    CanonicalConfigPath, ControlEndpoint, RuntimeDirStatus, endpoint_for, endpoint_from_hash,
+    endpoint_hash, runtime_dir, runtime_dir_statuses, transport_supported, usable_runtime_dirs,
 };
 pub use micromux::{DynamicServiceAck, ReconcileAction, ReconcileActionKind, ReconcileReceipt};
 pub use protocol::{

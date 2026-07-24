@@ -22,7 +22,7 @@ use micromux::{ServiceControl, SessionModelReader};
 use tokio_util::sync::CancellationToken;
 
 use crate::ControlError;
-use crate::endpoint::{ControlEndpoint, endpoint_hash};
+use crate::endpoint::{CanonicalConfigPath, ControlEndpoint, endpoint_hash};
 
 pub use platform::EndpointGuard;
 
@@ -50,7 +50,7 @@ pub struct SessionIdentity {
 impl SessionIdentity {
     /// Build an identity for the current process.
     #[must_use]
-    pub fn new(name: String, working_dir: &Path, config_path: &Path) -> Self {
+    pub fn new(name: String, working_dir: &Path, config_path: &CanonicalConfigPath) -> Self {
         Self {
             id: endpoint_hash(config_path),
             pid: std::process::id(),
@@ -158,6 +158,28 @@ impl ControlServer {
     }
 }
 
+/// Platforms without a control transport must degrade to a typed `Unsupported` error — never
+/// panic, never bind. This is the contract the CLI's `control::spawn` and every client rely on.
+#[cfg(all(test, not(unix)))]
+mod unsupported_transport_tests {
+    use std::path::Path;
+
+    use super::{bind, endpoint_owner_lock_held};
+    use crate::ControlError;
+    use crate::endpoint::endpoint_from_hash;
+
+    #[test]
+    fn bind_and_owner_probe_report_unsupported_transport() {
+        let endpoint = endpoint_from_hash(Path::new("ignored"), "0011223344556677");
+
+        assert!(matches!(bind(&endpoint), Err(ControlError::Unsupported)));
+        assert!(matches!(
+            endpoint_owner_lock_held(&endpoint),
+            Err(ControlError::Unsupported)
+        ));
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -171,16 +193,26 @@ mod tests {
     }
 
     #[test]
-    fn session_identity_id_uses_raw_config_path_hash() {
+    fn session_identity_id_uses_raw_config_path_hash() -> std::io::Result<()> {
         use similar_asserts::assert_eq;
         use std::ffi::OsString;
         use std::os::unix::ffi::OsStringExt;
-        use std::path::PathBuf;
 
-        let config_path = PathBuf::from(OsString::from_vec(b"/tmp/micromux-\xff.yaml".to_vec()));
+        // A real config file whose name is not valid UTF-8: the identity must hash the raw path
+        // bytes, not the lossy string it advertises to clients.
+        let dir = tempfile::tempdir()?;
+        let config_path = dir
+            .path()
+            .join(OsString::from_vec(b"micromux-\xff.yaml".to_vec()));
+        std::fs::write(&config_path, "version: 1\nservices: {}\n")?;
+        let config_path = CanonicalConfigPath::new(&config_path)?;
         let identity = SessionIdentity::new("test".to_string(), Path::new("."), &config_path);
 
         assert_eq!(identity.id, endpoint_hash(&config_path));
-        assert_ne!(identity.id, endpoint_hash(Path::new(&identity.config_path)));
+        assert_ne!(
+            identity.id,
+            crate::endpoint::hash_path(Path::new(&identity.config_path))
+        );
+        Ok(())
     }
 }

@@ -305,7 +305,8 @@ mod tests {
     use fs2::FileExt;
     use micromux::CancellationToken;
     use micromux_control::{
-        ControlEndpoint, ControlServer, SessionIdentity, bind, endpoint_for, endpoint_hash,
+        CanonicalConfigPath, ControlEndpoint, ControlServer, SessionIdentity, bind, endpoint_for,
+        endpoint_from_hash, endpoint_hash,
     };
     use similar_asserts::assert_eq;
     use tokio::io::AsyncWriteExt;
@@ -318,17 +319,43 @@ mod tests {
     fn temp_dir(prefix: &str) -> eyre::Result<tempfile::TempDir> {
         Ok(tempfile::Builder::new()
             .prefix(&format!("micromux-mcp-{prefix}-"))
-            .tempdir()?)
+            .tempdir_in(socket_test_base())?)
     }
 
-    fn boot(runtime_dir: &Path, name: &str, config_path: &Path) -> eyre::Result<Running> {
+    /// Base directory for endpoint sockets in tests. macOS caps `AF_UNIX` paths at `SUN_LEN` (104
+    /// bytes) and its default temp dir (`/var/folders/…`) is long enough that the appended
+    /// `<hash>.sock` overflows it, so root sockets under the short, always-present `/tmp`.
+    fn socket_test_base() -> PathBuf {
+        let tmp = PathBuf::from("/tmp");
+        if tmp.is_dir() {
+            tmp
+        } else {
+            std::env::temp_dir()
+        }
+    }
+
+    /// Write a minimal config at `path` (creating parent dirs) and return its canonical form —
+    /// the only form the typed endpoint-derivation APIs accept.
+    fn write_config(path: &Path) -> eyre::Result<CanonicalConfigPath> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, "version: 1\nservices: {}\n")?;
+        Ok(CanonicalConfigPath::new(path)?)
+    }
+
+    fn boot(
+        runtime_dir: &Path,
+        name: &str,
+        config_path: &CanonicalConfigPath,
+    ) -> eyre::Result<Running> {
         boot_at_endpoint(&endpoint_for(runtime_dir, config_path), name, config_path)
     }
 
     fn boot_at_endpoint(
         endpoint: &ControlEndpoint,
         name: &str,
-        config_path: &Path,
+        config_path: &CanonicalConfigPath,
     ) -> eyre::Result<Running> {
         boot_at_endpoint_with_working_dir(endpoint, name, config_path, Path::new("."))
     }
@@ -336,7 +363,7 @@ mod tests {
     fn boot_at_endpoint_with_working_dir(
         endpoint: &ControlEndpoint,
         name: &str,
-        config_path: &Path,
+        config_path: &CanonicalConfigPath,
         working_dir: &Path,
     ) -> eyre::Result<Running> {
         let yaml = "version: 1\nservices:\n  svc:\n    command: [\"sh\", \"-c\", \"sleep 60\"]\n";
@@ -371,7 +398,7 @@ mod tests {
     #[tokio::test]
     async fn resolves_by_name_skips_dead_and_detects_ambiguity() -> eyre::Result<()> {
         let runtime_dir = temp_dir("select")?;
-        let config_a = runtime_dir.path().join("proj-a/micromux.yaml");
+        let config_a = write_config(&runtime_dir.path().join("proj-a/micromux.yaml"))?;
         let alpha = boot(runtime_dir.path(), "alpha", &config_a)?;
 
         // A leaked, non-connectable socket file must be skipped, never resolved or pruned.
@@ -390,7 +417,7 @@ mod tests {
         assert!(matches!(missing, Err(ToolError::NoSession(_))));
 
         // A second session sharing the name must be reported Ambiguous, never picked arbitrarily.
-        let config_b = runtime_dir.path().join("proj-b/micromux.yaml");
+        let config_b = write_config(&runtime_dir.path().join("proj-b/micromux.yaml"))?;
         let beta = boot(runtime_dir.path(), "alpha", &config_b)?;
         let ambiguous = resolve_in(
             runtime_dir.path(),
@@ -415,7 +442,7 @@ mod tests {
             project_dir.path().join("micromux.yaml"),
             "version: 1\nservices:\n  svc:\n    command: [\"sh\", \"-c\", \"sleep 60\"]\n",
         )?;
-        let config_path = std::fs::canonicalize(project_dir.path().join("micromux.yaml"))?;
+        let config_path = CanonicalConfigPath::new(project_dir.path().join("micromux.yaml"))?;
         let session = boot(second_runtime.path(), "live", &config_path)?;
 
         let ControlEndpoint::Unix(garbage_path) = endpoint_for(first_runtime.path(), &config_path)
@@ -461,7 +488,7 @@ mod tests {
             project_dir.path().join("micromux.yaml"),
             "version: 1\nservices:\n  svc:\n    command: [\"sh\", \"-c\", \"sleep 60\"]\n",
         )?;
-        let config_path = std::fs::canonicalize(project_dir.path().join("micromux.yaml"))?;
+        let config_path = CanonicalConfigPath::new(project_dir.path().join("micromux.yaml"))?;
 
         let ControlEndpoint::Unix(direct_path) = endpoint_for(runtime_dir.path(), &config_path)
         else {
@@ -491,7 +518,7 @@ mod tests {
         let resolved =
             resolve_in_dirs(&runtime_dirs, &dir_statuses, project_dir.path(), None).await?;
         assert_eq!(resolved.info.name, "live");
-        assert_eq!(Path::new(&resolved.info.config_path), config_path);
+        assert_eq!(Path::new(&resolved.info.config_path), config_path.as_path());
 
         garbage.abort();
         session.shutdown.cancel();
@@ -512,7 +539,7 @@ mod tests {
             project_dir.path().join("tools/micromux.yaml"),
             "version: 1\nservices:\n  live:\n    command: [\"sh\", \"-c\", \"sleep 60\"]\n",
         )?;
-        let live_config = std::fs::canonicalize(project_dir.path().join("tools/micromux.yaml"))?;
+        let live_config = CanonicalConfigPath::new(project_dir.path().join("tools/micromux.yaml"))?;
 
         let alias_endpoint = ControlEndpoint::Unix(runtime_dir.path().join("tools-session.sock"));
         let session = boot_at_endpoint_with_working_dir(
@@ -535,7 +562,7 @@ mod tests {
         let resolved =
             resolve_in_dirs(&runtime_dirs, &dir_statuses, project_dir.path(), None).await?;
         assert_eq!(resolved.info.name, "live");
-        assert_eq!(Path::new(&resolved.info.config_path), live_config);
+        assert_eq!(Path::new(&resolved.info.config_path), live_config.as_path());
 
         session.shutdown.cancel();
         Ok(())
@@ -555,8 +582,8 @@ mod tests {
             project_dir.path().join("tools/micromux.yaml"),
             "version: 1\nservices:\n  live:\n    command: [\"sh\", \"-c\", \"sleep 60\"]\n",
         )?;
-        let current_config = std::fs::canonicalize(project_dir.path().join("micromux.yaml"))?;
-        let live_config = std::fs::canonicalize(project_dir.path().join("tools/micromux.yaml"))?;
+        let current_config = CanonicalConfigPath::new(project_dir.path().join("micromux.yaml"))?;
+        let live_config = CanonicalConfigPath::new(project_dir.path().join("tools/micromux.yaml"))?;
 
         let ControlEndpoint::Unix(direct_path) = endpoint_for(runtime_dir.path(), &current_config)
         else {
@@ -571,7 +598,7 @@ mod tests {
                 "start_time": 99,
                 "name": "malformed-root",
                 "working_dir": project_dir.path(),
-                "config_path": current_config,
+                "config_path": current_config.as_path(),
                 "services": [],
                 "micromux_version": "malformed"
             }
@@ -629,8 +656,8 @@ mod tests {
             project_dir.path().join("tools/micromux.yaml"),
             "version: 1\nservices:\n  live:\n    command: [\"sh\", \"-c\", \"sleep 60\"]\n",
         )?;
-        let current_config = std::fs::canonicalize(project_dir.path().join("micromux.yaml"))?;
-        let live_config = std::fs::canonicalize(project_dir.path().join("tools/micromux.yaml"))?;
+        let current_config = CanonicalConfigPath::new(project_dir.path().join("micromux.yaml"))?;
+        let live_config = CanonicalConfigPath::new(project_dir.path().join("tools/micromux.yaml"))?;
 
         let ControlEndpoint::Unix(direct_path) = endpoint_for(runtime_dir.path(), &current_config)
         else {
@@ -645,7 +672,7 @@ mod tests {
                 "start_time": 99,
                 "name": "old-root",
                 "working_dir": project_dir.path(),
-                "config_path": current_config,
+                "config_path": current_config.as_path(),
                 "services": [],
                 "micromux_version": "old"
             }
@@ -703,8 +730,8 @@ mod tests {
             project_dir.path().join("tools/micromux.yaml"),
             "version: 1\nservices:\n  live:\n    command: [\"sh\", \"-c\", \"sleep 60\"]\n",
         )?;
-        let current_config = std::fs::canonicalize(project_dir.path().join("micromux.yaml"))?;
-        let live_config = std::fs::canonicalize(project_dir.path().join("tools/micromux.yaml"))?;
+        let current_config = CanonicalConfigPath::new(project_dir.path().join("micromux.yaml"))?;
+        let live_config = CanonicalConfigPath::new(project_dir.path().join("tools/micromux.yaml"))?;
 
         let ControlEndpoint::Unix(direct_path) = endpoint_for(runtime_dir.path(), &current_config)
         else {
@@ -758,7 +785,7 @@ mod tests {
             project_dir.path().join("micromux.yaml"),
             "version: 1\nservices:\n  svc:\n    command: [\"sh\", \"-c\", \"sleep 60\"]\n",
         )?;
-        let config_path = std::fs::canonicalize(project_dir.path().join("micromux.yaml"))?;
+        let config_path = CanonicalConfigPath::new(project_dir.path().join("micromux.yaml"))?;
         let first = boot(first_runtime.path(), "first", &config_path)?;
         let second = boot(second_runtime.path(), "second", &config_path)?;
 
@@ -798,7 +825,7 @@ mod tests {
             project_dir.path().join("micromux.yaml"),
             "version: 1\nservices:\n  svc:\n    command: [\"sh\", \"-c\", \"sleep 60\"]\n",
         )?;
-        let config_path = std::fs::canonicalize(project_dir.path().join("micromux.yaml"))?;
+        let config_path = CanonicalConfigPath::new(project_dir.path().join("micromux.yaml"))?;
         let session = boot(runtime_dir.path(), "live", &config_path)?;
 
         let runtime_dirs = vec![
@@ -888,8 +915,9 @@ mod tests {
     }
 
     #[test]
-    fn session_config_match_uses_identity_hash_not_display_path() {
-        let config_path = PathBuf::from("/workspace/micromux.yaml");
+    fn session_config_match_uses_identity_hash_not_display_path() -> eyre::Result<()> {
+        let project_dir = tempfile::tempdir()?;
+        let config_path = write_config(&project_dir.path().join("micromux.yaml"))?;
         let info = SessionInfo {
             protocol_version: micromux_control::PROTOCOL_VERSION,
             id: endpoint_hash(&config_path),
@@ -897,6 +925,8 @@ mod tests {
             start_time: 99,
             name: "live".to_string(),
             working_dir: "/workspace".to_string(),
+            // The advertised display path deliberately diverges: matching must key on the
+            // identity hash, never on this string.
             config_path: "/different/display/path.yaml".to_string(),
             services: Vec::new(),
             micromux_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -904,6 +934,7 @@ mod tests {
         };
 
         assert!(session_matches_config_path(&info, &config_path));
+        Ok(())
     }
 
     #[test]
@@ -911,6 +942,14 @@ mod tests {
         let project_dir = tempfile::tempdir()?;
         let nested_dir = project_dir.path().join("tools");
         std::fs::create_dir(&nested_dir)?;
+        // The config file must exist on disk: `session_config_path_is_under` canonicalizes the
+        // session's config path, and a real session always has one. Without it the canonicalize
+        // falls back to the raw path while the directory side still resolves, so the `starts_with`
+        // check breaks where the temp dir sits behind a symlink (macOS `/var` -> `/private/var`).
+        std::fs::write(
+            nested_dir.join("micromux.yaml"),
+            "version: 1\nservices: {}\n",
+        )?;
         let info = SessionInfo {
             protocol_version: micromux_control::PROTOCOL_VERSION,
             id: "live".to_string(),
@@ -930,6 +969,40 @@ mod tests {
 
         assert!(session_config_path_is_under(&info, project_dir.path()));
         assert!(session_config_path_is_under(&info, &nested_dir));
+        Ok(())
+    }
+
+    /// A session advertises its *canonical* config path; asking whether it lives under a
+    /// symlinked alias of the project must still match, because both sides canonicalize.
+    /// This is the deterministic form of macOS's `/var` -> `/private/var` divergence.
+    #[test]
+    fn session_config_path_match_accepts_a_symlinked_directory() -> eyre::Result<()> {
+        let root = tempfile::tempdir()?;
+        let project = root.path().join("project");
+        std::fs::create_dir(&project)?;
+        std::fs::write(project.join("micromux.yaml"), "version: 1\nservices: {}\n")?;
+        let alias = root.path().join("alias");
+        std::os::unix::fs::symlink(&project, &alias)?;
+        let unrelated = root.path().join("unrelated");
+        std::fs::create_dir(&unrelated)?;
+
+        let info = SessionInfo {
+            protocol_version: micromux_control::PROTOCOL_VERSION,
+            id: "live".to_string(),
+            pid: 42,
+            start_time: 99,
+            name: "live".to_string(),
+            working_dir: project.display().to_string(),
+            config_path: std::fs::canonicalize(project.join("micromux.yaml"))?
+                .display()
+                .to_string(),
+            services: Vec::new(),
+            micromux_version: env!("CARGO_PKG_VERSION").to_string(),
+            capabilities: None,
+        };
+
+        assert!(session_config_path_is_under(&info, &alias));
+        assert!(!session_config_path_is_under(&info, &unrelated));
         Ok(())
     }
 
@@ -956,7 +1029,7 @@ mod tests {
     async fn already_running_reports_a_live_session_and_skips_a_dead_endpoint() -> eyre::Result<()>
     {
         let runtime_dir = temp_dir("already-running")?;
-        let config_path = runtime_dir.path().join("proj/micromux.yaml");
+        let config_path = write_config(&runtime_dir.path().join("proj/micromux.yaml"))?;
         let session = boot(runtime_dir.path(), "live", &config_path)?;
 
         // A live session makes start_session a no-op.
@@ -1019,11 +1092,9 @@ mod tests {
             .ok_or_else(|| eyre::eyre!("expected existing session report"))?;
         assert_eq!(report.session.as_deref(), Some("live"));
 
-        // A project with no listener is free to start.
-        let dead = endpoint_for(
-            runtime_dir.path(),
-            &runtime_dir.path().join("absent/micromux.yaml"),
-        );
+        // A project with no listener is free to start. The absent project has no config file to
+        // canonicalize, so derive its would-be endpoint directly from a hash.
+        let dead = endpoint_from_hash(runtime_dir.path(), "00ff00ff00ff00ff");
         let endpoints = vec![dead];
         assert!(
             crate::already_running_any(&endpoints, &config_path)
@@ -1042,7 +1113,7 @@ mod tests {
         let first_runtime = temp_dir("already-running-ambiguous-first")?;
         let second_runtime = temp_dir("already-running-ambiguous-second")?;
         let project_dir = temp_dir("already-running-ambiguous-project")?;
-        let config_path = project_dir.path().join("micromux.yaml");
+        let config_path = write_config(&project_dir.path().join("micromux.yaml"))?;
         let first = boot(first_runtime.path(), "first", &config_path)?;
         let second = boot(second_runtime.path(), "second", &config_path)?;
         let endpoints = vec![

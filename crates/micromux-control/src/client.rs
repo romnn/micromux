@@ -474,4 +474,22 @@ mod tests {
         );
         Ok(())
     }
+
+    /// On platforms without a control transport, `connect` must fail with the typed
+    /// `Unsupported` error for every endpoint kind — clients map it to a clear message.
+    #[cfg(not(unix))]
+    #[tokio::test]
+    async fn connect_reports_unsupported_transport_off_unix() {
+        let pipe = ControlEndpoint::WindowsNamedPipe(r"\\.\pipe\micromux-test".to_string());
+        assert!(matches!(
+            Client::connect(&pipe).await,
+            Err(ControlError::Unsupported)
+        ));
+
+        let socket = ControlEndpoint::Unix(PathBuf::from("/never/bound.sock"));
+        assert!(matches!(
+            Client::connect(&socket).await,
+            Err(ControlError::Unsupported)
+        ));
+    }
 }

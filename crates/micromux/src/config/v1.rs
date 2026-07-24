@@ -1660,15 +1660,70 @@ mod tests {
             defaults.config.control.dynamic_services.max_lifetime,
             Some(std::time::Duration::from_hours(12))
         );
+        // Dynamic services are disabled here, so the default root is resolved but deliberately not
+        // canonicalized (see `parse_dynamic_roots`); it is the config dir itself. Asserting the
+        // canonicalized form would wrongly fail where the temp dir sits behind a symlink (macOS
+        // `/var` -> `/private/var`, Windows short 8.3 names / `\\?\` verbatim prefix).
         assert_eq!(
             defaults
                 .config
                 .control
                 .dynamic_services
                 .allowed_working_roots,
-            vec![dir.path().canonicalize()?]
+            vec![dir.path().to_path_buf()]
         );
         Ok(())
+    }
+
+    #[test]
+    fn dynamic_working_roots_are_lazy_when_disabled_and_canonicalized_when_enabled()
+    -> eyre::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let yaml_disabled = indoc! {r#"
+            version: 1
+            control:
+              dynamic_services:
+                allowed_working_roots: [gone]
+            services:
+              app:
+                command: ["true"]
+        "#};
+        // With the feature disabled (the default) a root that does not exist on disk must not fail
+        // the load; the root is resolved against the config dir but deliberately not canonicalized.
+        let mut diagnostics: Vec<Diagnostic<usize>> = Vec::new();
+        let parsed = config::from_str(yaml_disabled, dir.path(), 0, None, &mut diagnostics)?;
+        assert!(!parsed.config.control.dynamic_services.enabled);
+        assert_eq!(
+            parsed.config.control.dynamic_services.allowed_working_roots,
+            vec![dir.path().join("gone")]
+        );
+
+        let yaml_enabled = indoc! {r#"
+            version: 1
+            control:
+              dynamic_services:
+                enabled: true
+                allowed_working_roots: [gone]
+            services:
+              app:
+                command: ["true"]
+        "#};
+        // With the feature enabled the roots are consulted for policy checks, so a missing root is
+        // a hard config error surfaced through canonicalization.
+        let mut diagnostics: Vec<Diagnostic<usize>> = Vec::new();
+        match config::from_str(yaml_enabled, dir.path(), 0, None, &mut diagnostics) {
+            Ok(_) => Err(eyre::eyre!(
+                "expected a missing allowed working root to fail an enabled policy"
+            )),
+            Err(err) => {
+                let message = err.to_string();
+                assert!(
+                    message.contains("failed to canonicalize allowed working root"),
+                    "unexpected error: {message}"
+                );
+                Ok(())
+            }
+        }
     }
 
     #[test]
