@@ -2580,6 +2580,109 @@ async fn pty_append_records_are_lossless_under_load() -> eyre::Result<()> {
 }
 
 #[tokio::test]
+async fn repeated_carriage_returns_do_not_emit_blank_records() -> eyre::Result<()> {
+    let config_dir = Path::new(".");
+    // `a\r\r\n` carries a redundant carriage return: the cursor is already at column 0, so it must
+    // not open a second record. macos ptys emit exactly this, duplicating the CR of a CRLF pair
+    // when output-queue backpressure splits the write. `b\n\n` must still keep its blank line.
+    let cfg = service_config("svc", ("sh", &["-c", "printf 'a\\r\\r\\nb\\n\\nc\\n'"]));
+    let mut services: ServiceMap = ServiceMap::new();
+    services.insert("svc".to_string(), Service::new("svc", config_dir, cfg)?);
+    let harness = spawn_harness(services, None);
+
+    wait_until(&harness.reader, "svc", |snapshot| {
+        snapshot.execution == Execution::Exited
+    })
+    .await?;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let logs = loop {
+        let logs = harness.reader.logs("svc", None);
+        if logs.len() >= 4 {
+            break logs;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            eyre::bail!(
+                "expected 4 records, got {:?}",
+                logs.iter()
+                    .map(|line| line.line.as_str())
+                    .collect::<Vec<_>>()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+
+    assert_eq!(
+        logs.iter()
+            .map(|line| line.line.as_str())
+            .collect::<Vec<_>>(),
+        vec!["a", "b", "", "c"]
+    );
+
+    harness.shutdown.cancel();
+    harness.handle.await??;
+    Ok(())
+}
+
+/// Records must match what a terminal would display for every CR/LF permutation. A carriage
+/// return at column 0 is a cursor no-op unless a line feed completes it into a blank line — this
+/// is what makes the reader robust against BSD/macOS tty drivers re-emitting a CR around an
+/// ONLCR-expanded `\r\n` pair, on whichever side of the pair the duplicate lands.
+///
+/// The scripts run through a real pty, so the line discipline expands each `\n` the child writes
+/// into `\r\n` on the wire (ONLCR); the raw `\r`s pass through untouched.
+#[tokio::test]
+async fn carriage_return_records_match_terminal_semantics() -> eyre::Result<()> {
+    let cases: &[(&str, &[&str])] = &[
+        // A CR re-emitted after a completed `\r\n` pair must not open a blank record.
+        ("printf '559\\n\\r560\\n'", &["559", "560"]),
+        // A leading CR at column 0 is a cursor no-op, not a blank line.
+        ("printf '\\rfoo\\n'", &["foo"]),
+        // Any run of CRs collapses into one record boundary.
+        ("printf 'a\\r\\r\\r\\nb\\n'", &["a", "b"]),
+        // Progress-bar rewrites stay separate records (lossless capture, not screen-final state).
+        ("printf 'x\\ry\\rz\\n'", &["x", "y", "z"]),
+        // Genuine blank lines (LF-completed) survive, including consecutive ones.
+        ("printf 'a\\n\\n\\nb\\n'", &["a", "", "", "b"]),
+        // A blank line written explicitly as CRLF pairs survives too.
+        ("printf 'a\\r\\n\\r\\nb\\r\\n'", &["a", "", "b"]),
+    ];
+
+    let config_dir = Path::new(".");
+    for (script, expected) in cases {
+        let cfg = service_config("svc", ("sh", &["-c", script]));
+        let mut services: ServiceMap = ServiceMap::new();
+        services.insert("svc".to_string(), Service::new("svc", config_dir, cfg)?);
+        let harness = spawn_harness(services, None);
+
+        wait_until(&harness.reader, "svc", |snapshot| {
+            snapshot.execution == Execution::Exited
+        })
+        .await?;
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let logs = harness.reader.logs("svc", None);
+            let lines = logs
+                .iter()
+                .map(|line| line.line.as_str())
+                .collect::<Vec<_>>();
+            if lines == *expected {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                eyre::bail!("{script}: expected {expected:?}, got {lines:?}");
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        harness.shutdown.cancel();
+        harness.handle.await??;
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn pty_reader_exits_after_child_exit_when_grandchild_holds_slave() -> eyre::Result<()> {
     let config_dir = Path::new(".");
     let service_id = "leaky-pty-reader".to_string();

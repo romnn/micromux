@@ -989,6 +989,12 @@ fn spawn_log_reader_thread(args: LogReaderArgs) {
         // Tracks a pending CR so a following LF (i.e. a \r\n pair) does not emit a second,
         // spurious blank record after the \r already flushed the line.
         let mut prev_was_cr = false;
+        // A CR seen at column 0 (empty line buffer) is ambiguous one byte early: an LF next makes
+        // it the CRLF of a blank line, while content, EOF, or nothing makes it a cursor no-op that
+        // must produce no record. Defer the blank until the next byte decides. BSD/macOS tty
+        // drivers re-emit a CR around an ONLCR-expanded `\r\n` when output-queue backpressure
+        // splits the write, so undeferred CRs inject spurious blank records under load.
+        let mut pending_cr_blank = false;
 
         let mut rate = RateLimit::new();
 
@@ -1047,6 +1053,7 @@ fn spawn_log_reader_thread(args: LogReaderArgs) {
                 // The mode switch ends the current line record, so a CR seen before the flip must
                 // not carry over and swallow the next newline once we are back in line mode.
                 prev_was_cr = false;
+                pending_cr_blank = false;
             }
             if snapshot_mode {
                 dirty = true;
@@ -1057,19 +1064,36 @@ fn spawn_log_reader_thread(args: LogReaderArgs) {
                     // \r and \n both terminate a line. A \r\n pair is coalesced (the \r flushes,
                     // the trailing \n is swallowed) so it produces one record, while a lone \n
                     // still flushes — preserving intentional blank lines.
+                    //
+                    // Records mirror what a terminal displays: a \r that arrives at column 0
+                    // (empty line buffer) is a cursor no-op, not a line ending. It becomes a blank
+                    // record only when an LF completes it (`pending_cr_blank`); content or EOF
+                    // after it produces nothing. This absorbs the duplicated CR that BSD/macOS tty
+                    // drivers emit around an ONLCR-expanded `\r\n` under load — whichever side of
+                    // the pair the duplicate lands on — while keeping genuine blank lines intact.
                     b'\r' => {
                         if !snapshot_mode {
-                            flush_record(&mut line, &sink);
+                            if line.is_empty() {
+                                // Successive CRs collapse: after a CR the cursor is already at
+                                // column 0, so returning it again cannot open another record.
+                                if !prev_was_cr {
+                                    pending_cr_blank = true;
+                                }
+                            } else {
+                                flush_record(&mut line, &sink);
+                            }
                         }
                         prev_was_cr = true;
                     }
                     b'\n' => {
-                        if !snapshot_mode && !prev_was_cr {
+                        if !snapshot_mode && (pending_cr_blank || !prev_was_cr) {
                             flush_record(&mut line, &sink);
                         }
+                        pending_cr_blank = false;
                         prev_was_cr = false;
                     }
                     _ => {
+                        pending_cr_blank = false;
                         prev_was_cr = false;
                         if snapshot_mode {
                             scratch.clear();
