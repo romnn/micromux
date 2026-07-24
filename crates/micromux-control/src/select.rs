@@ -621,27 +621,24 @@ mod tests {
 
     use super::*;
     use crate::{ControlServer, SessionIdentity, bind};
+    use color_eyre::eyre;
 
     struct Running {
         shutdown: CancellationToken,
-        _runner: tokio::task::JoinHandle<color_eyre::eyre::Result<()>>,
+        _runner: tokio::task::JoinHandle<Result<(), micromux::Error>>,
     }
 
-    fn boot(
-        runtime_dir: &Path,
-        working_dir: &Path,
-        config_path: &Path,
-    ) -> color_eyre::eyre::Result<Running> {
+    fn boot(runtime_dir: &Path, working_dir: &Path, config_path: &Path) -> eyre::Result<Running> {
         let yaml = "version: 1\nservices:\n  svc:\n    command: [\"sh\", \"-c\", \"sleep 60\"]\n";
         let mut diagnostics = Vec::new();
         let config = micromux::from_str(yaml, working_dir, 0usize, None, &mut diagnostics)
-            .map_err(|error| color_eyre::eyre::eyre!("parse: {error}"))?;
+            .map_err(|error| eyre::eyre!("parse: {error}"))?;
         let mux = Arc::new(micromux::Micromux::new(&config)?);
         let shutdown = CancellationToken::new();
         let (runner, handles) = mux.clone().start(shutdown.clone());
         let runner = tokio::spawn(runner);
         let endpoint = endpoint_for(runtime_dir, config_path);
-        let guard = bind(&endpoint)?.ok_or_else(|| color_eyre::eyre::eyre!("bind failed"))?;
+        let guard = bind(&endpoint)?.ok_or_else(|| eyre::eyre!("bind failed"))?;
         let identity = SessionIdentity::new("selected".to_string(), working_dir, config_path);
         let server = Arc::new(ControlServer::new(
             handles.reader.clone(),
@@ -662,7 +659,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upward_config_search_stops_after_checking_home() -> color_eyre::eyre::Result<()> {
+    async fn upward_config_search_stops_after_checking_home() -> eyre::Result<()> {
         let root = tempfile::Builder::new()
             .prefix("micromux-control-home-boundary-")
             .tempdir()?;
@@ -681,8 +678,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upward_config_search_outside_home_still_walks_to_root() -> color_eyre::eyre::Result<()>
-    {
+    async fn upward_config_search_outside_home_still_walks_to_root() -> eyre::Result<()> {
         let root = tempfile::Builder::new()
             .prefix("micromux-control-outside-home-")
             .tempdir()?;
@@ -717,7 +713,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn config_override_selects_a_session_outside_the_cwd() -> color_eyre::eyre::Result<()> {
+    async fn config_override_selects_a_session_outside_the_cwd() -> eyre::Result<()> {
         let runtime_dir = tempfile::tempdir()?;
         let cwd = tempfile::tempdir()?;
         let project = tempfile::tempdir()?;

@@ -640,12 +640,13 @@ pub fn from_str<F: Copy + PartialEq>(
 
 #[cfg(test)]
 mod tests {
+    use color_eyre::eyre;
     use indoc::indoc;
     use jsonschema::{Draft, Validator};
     use similar_asserts::assert_eq;
     use std::path::Path;
 
-    fn compiled_schema() -> color_eyre::eyre::Result<Validator> {
+    fn compiled_schema() -> eyre::Result<Validator> {
         let schema: serde_json::Value =
             serde_json::from_str(include_str!("../../../../micromux.schema.json"))?;
         let schema: &'static serde_json::Value = Box::leak(Box::new(schema));
@@ -655,7 +656,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_config_basic_and_special_cases() -> color_eyre::eyre::Result<()> {
+    fn parse_config_basic_and_special_cases() -> eyre::Result<()> {
         let yaml = indoc! {r#"
             version: "1"
             services:
@@ -703,7 +704,7 @@ mod tests {
             .iter()
             .find(|(name, _svc)| name.as_ref() == "app")
             .map(|(_name, svc)| svc)
-            .ok_or_else(|| color_eyre::eyre::eyre!("missing service 'app'"))?;
+            .ok_or_else(|| eyre::eyre!("missing service 'app'"))?;
 
         let db = parsed
             .config
@@ -711,7 +712,7 @@ mod tests {
             .iter()
             .find(|(name, _svc)| name.as_ref() == "db")
             .map(|(_name, svc)| svc)
-            .ok_or_else(|| color_eyre::eyre::eyre!("missing service 'db'"))?;
+            .ok_or_else(|| eyre::eyre!("missing service 'db'"))?;
 
         // command parsing: string form is split
         assert_eq!(app.command.0.as_ref(), "./start.sh");
@@ -722,13 +723,13 @@ mod tests {
         let app_env_file = app
             .env_file
             .first()
-            .ok_or_else(|| color_eyre::eyre::eyre!("missing app.env_file entry"))?;
+            .ok_or_else(|| eyre::eyre!("missing app.env_file entry"))?;
         assert_eq!(app_env_file.path.as_ref(), ".env");
         assert_eq!(db.env_file.len(), 1);
         let db_env_file = db
             .env_file
             .first()
-            .ok_or_else(|| color_eyre::eyre::eyre!("missing db.env_file entry"))?;
+            .ok_or_else(|| eyre::eyre!("missing db.env_file entry"))?;
         assert_eq!(db_env_file.path.as_ref(), "./db.env");
 
         // depends_on parsing: string + mapping condition alias
@@ -736,13 +737,13 @@ mod tests {
         let app_dep = app
             .depends_on
             .first()
-            .ok_or_else(|| color_eyre::eyre::eyre!("missing app.depends_on entry"))?;
+            .ok_or_else(|| eyre::eyre!("missing app.depends_on entry"))?;
         assert_eq!(app_dep.name.as_ref(), "db");
         assert_eq!(db.depends_on.len(), 1);
         let db_dep = db
             .depends_on
             .first()
-            .ok_or_else(|| color_eyre::eyre::eyre!("missing db.depends_on entry"))?;
+            .ok_or_else(|| eyre::eyre!("missing db.depends_on entry"))?;
         assert_eq!(db_dep.name.as_ref(), "app");
         assert_eq!(
             db_dep.condition.as_ref().map(|c| *c.as_ref()),
@@ -755,7 +756,7 @@ mod tests {
                 assert_eq!(*max_attempts, Some(3));
             }
             other => {
-                return Err(color_eyre::eyre::eyre!(format!(
+                return Err(eyre::eyre!(format!(
                     "unexpected restart policy for app: {other:?}"
                 )));
             }
@@ -769,7 +770,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_config_ui_options() -> color_eyre::eyre::Result<()> {
+    fn parse_config_ui_options() -> eyre::Result<()> {
         let yaml = indoc! {r#"
             version: "1"
             ui:
@@ -790,8 +791,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_config_missing_version_emits_warning_and_defaults_to_v1()
-    -> color_eyre::eyre::Result<()> {
+    fn parse_config_missing_version_emits_warning_and_defaults_to_v1() -> eyre::Result<()> {
         let yaml = indoc! {r#"
             services:
               app:
@@ -817,7 +817,7 @@ mod tests {
     }
 
     #[test]
-    fn config_strict_escalates_early_warnings() -> color_eyre::eyre::Result<()> {
+    fn config_strict_escalates_early_warnings() -> eyre::Result<()> {
         let yaml = indoc! {r#"
             strict: true
             services:
@@ -857,7 +857,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_validates_complex_config() -> color_eyre::eyre::Result<()> {
+    fn schema_validates_complex_config() -> eyre::Result<()> {
         let compiled = compiled_schema()?;
 
         let yaml = indoc! {r#"
@@ -930,14 +930,14 @@ mod tests {
                 .map(|err| err.to_string())
                 .collect::<Vec<_>>()
                 .join("\n");
-            return Err(color_eyre::eyre::eyre!(message));
+            return Err(eyre::eyre!(message));
         }
 
         Ok(())
     }
 
     #[test]
-    fn schema_rejects_missing_command() -> color_eyre::eyre::Result<()> {
+    fn schema_rejects_missing_command() -> eyre::Result<()> {
         let compiled = compiled_schema()?;
 
         let yaml = indoc! {r#"

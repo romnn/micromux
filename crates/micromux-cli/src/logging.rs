@@ -1,8 +1,17 @@
-use color_eyre::eyre;
 use std::path::Path;
 use std::time::Duration;
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt};
+
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Filter(#[from] tracing_subscriber::filter::ParseError),
+    #[error(transparent)]
+    Subscriber(#[from] tracing::subscriber::SetGlobalDefaultError),
+}
 
 #[derive(Debug)]
 pub enum LogFile<'a> {
@@ -42,7 +51,7 @@ fn prune_old_rolling_logs(cache_dir: &Path) {
 pub fn setup(
     log_level: Option<tracing::metadata::Level>,
     log_file: &LogFile<'_>,
-) -> eyre::Result<tracing_appender::non_blocking::WorkerGuard> {
+) -> Result<tracing_appender::non_blocking::WorkerGuard, Error> {
     let (log_writer, guard) = match log_file {
         LogFile::RollingLog { cache_dir } => {
             prune_old_rolling_logs(cache_dir);

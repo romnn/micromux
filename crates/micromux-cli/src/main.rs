@@ -15,8 +15,30 @@ mod options;
 
 use clap::Parser;
 use codespan_reporting::diagnostic::Diagnostic;
-use color_eyre::eyre;
 use micromux::{Printer as DiagnosticsPrinter, ToDiagnostics};
+
+#[derive(Debug, thiserror::Error)]
+enum Error {
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Micromux(#[from] micromux::Error),
+    #[error(transparent)]
+    Tui(#[from] micromux_tui::Error),
+    #[error(transparent)]
+    Control(#[from] micromux_control::ControlError),
+    #[error(transparent)]
+    Diagnostics(#[from] codespan_reporting::files::Error),
+    #[error(transparent)]
+    Logging(#[from] logging::Error),
+    #[error(transparent)]
+    Join(#[from] tokio::task::JoinError),
+    #[cfg(feature = "mcp")]
+    #[error("mcp server error: {0}")]
+    Mcp(Box<dyn std::error::Error + Send + Sync>),
+    #[error("{0}")]
+    Message(String),
+}
 
 fn spawn_shutdown_handler(shutdown: micromux::CancellationToken) {
     tokio::spawn(async move {
@@ -64,9 +86,9 @@ fn effective_log_level(options: &options::Options) -> tracing::metadata::Level {
 
 fn setup_logging(
     options: &options::Options,
-) -> eyre::Result<tracing_appender::non_blocking::WorkerGuard> {
-    let project_dir =
-        micromux::project_dir().ok_or_else(|| eyre::eyre!("failed to create project directory"))?;
+) -> Result<tracing_appender::non_blocking::WorkerGuard, Error> {
+    let project_dir = micromux::project_dir()
+        .ok_or_else(|| Error::Message("failed to create project directory".to_string()))?;
     let log_file = match options.log_file.as_deref() {
         Some(path) => logging::LogFile::LogFile { path },
         None => logging::LogFile::RollingLog {
@@ -80,18 +102,18 @@ fn setup_logging(
 async fn load_config(
     options: &options::Options,
     color_choice: termcolor::ColorChoice,
-) -> eyre::Result<micromux::ConfigFile<usize>> {
+) -> Result<micromux::ConfigFile<usize>, Error> {
     let working_dir = std::env::current_dir()?;
     let config_path = match options.config_path.as_ref() {
         Some(config_path) => Some(config_path.clone()),
         None => micromux::find_config_file(&working_dir).await?,
     };
     let config_path = config_path
-        .ok_or_else(|| eyre::eyre!("missing config file"))?
+        .ok_or_else(|| Error::Message("missing config file".to_string()))?
         .canonicalize()?;
     let config_dir = config_path
         .parent()
-        .ok_or_else(|| eyre::eyre!("failed to get config file"))?;
+        .ok_or_else(|| Error::Message("failed to get config file".to_string()))?;
 
     let raw_config = tokio::fs::read_to_string(&config_path).await?;
 
@@ -121,18 +143,17 @@ async fn load_config(
     }
 
     let Some(mut config) = config else {
-        eyre::bail!("failed to parse config");
+        return Err(Error::Message("failed to parse config".to_string()));
     };
     if has_error {
-        eyre::bail!("failed to parse config");
+        return Err(Error::Message("failed to parse config".to_string()));
     }
 
     config.config_path = Some(config_path);
     Ok(config)
 }
 
-async fn run() -> eyre::Result<()> {
-    color_eyre::install()?;
+async fn run() -> Result<(), Error> {
     let mut options = options::Options::parse();
 
     match options.command.take() {
@@ -228,7 +249,7 @@ async fn run() -> eyre::Result<()> {
 /// Run the supervisor headless: scheduler + control plane, no TUI, until shutdown (a signal or a
 /// `stop_session`/`Shutdown` request). Intended for agent-managed sessions spawned by the MCP
 /// `start_session` tool.
-async fn run_headless(options: options::Options) -> eyre::Result<()> {
+async fn run_headless(options: options::Options) -> Result<(), Error> {
     let shutdown = micromux::CancellationToken::new();
     spawn_shutdown_handler(shutdown.clone());
 
@@ -255,9 +276,10 @@ async fn run_headless(options: options::Options) -> eyre::Result<()> {
     if !bound {
         // Another live session already owns this project (or there is no transport): a headless
         // session with no reachable control plane is useless, so don't even start the scheduler.
-        eyre::bail!(
+        return Err(Error::Message(
             "could not start the control plane for `serve` (another micromux may already own this project)"
-        );
+                .to_string(),
+        ));
     }
 
     tracing::info!(config = %config_path.display(), "micromux serve: headless supervisor running");
@@ -266,6 +288,7 @@ async fn run_headless(options: options::Options) -> eyre::Result<()> {
 }
 
 #[tokio::main]
-async fn main() -> eyre::Result<()> {
-    run().await
+async fn main() -> color_eyre::Result<()> {
+    color_eyre::install()?;
+    Ok(run().await?)
 }

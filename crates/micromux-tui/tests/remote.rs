@@ -17,7 +17,7 @@ struct Session {
     config_path: std::path::PathBuf,
     reader: micromux::SessionModelReader,
     shutdown: CancellationToken,
-    _runner: tokio::task::JoinHandle<eyre::Result<()>>,
+    _runner: tokio::task::JoinHandle<Result<(), micromux::Error>>,
 }
 
 const SESSION_YAML: &str = r#"version: 1

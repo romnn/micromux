@@ -671,6 +671,7 @@ async fn fetch_log_tail(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use color_eyre::eyre;
     use micromux::{HealthResult, HealthcheckConfig, RestartPolicy, RestartState};
     use similar_asserts::assert_eq;
 
@@ -784,7 +785,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn held_advertised_port_emits_unavailable_signal() -> color_eyre::Result<()> {
+    async fn held_advertised_port_emits_unavailable_signal() -> eyre::Result<()> {
         let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
         let port = listener.local_addr()?.port();
         let mut snapshot = snapshot(Execution::Exited);

@@ -11,7 +11,6 @@ use crate::{
     service::{self, Service, StartupMode},
 };
 use codespan_reporting::diagnostic::Severity;
-use color_eyre::eyre;
 use std::collections::{HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
@@ -2275,7 +2274,7 @@ pub(crate) struct SchedulerInput {
     pub(crate) default_log_retention: LogRetention,
 }
 
-pub(crate) async fn scheduler(input: SchedulerInput) -> eyre::Result<()> {
+pub(crate) async fn scheduler(input: SchedulerInput) -> Result<(), crate::graph::Error> {
     let SchedulerInput {
         mut services,
         reload_config,

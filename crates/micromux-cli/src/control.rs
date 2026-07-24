@@ -9,7 +9,6 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use color_eyre::eyre;
 use micromux::{CancellationToken, Handles};
 use micromux_control::{ControlServer, SessionIdentity, bind, endpoint_for, runtime_dir};
 
@@ -87,11 +86,12 @@ pub fn spawn(
 pub async fn resolve_config_path(
     explicit: Option<&Path>,
     working_dir: &Path,
-) -> eyre::Result<std::path::PathBuf> {
+) -> Result<std::path::PathBuf, crate::Error> {
     let config_path = match explicit {
         Some(path) => Some(path.to_path_buf()),
         None => micromux::find_config_file(working_dir).await?,
     };
-    let config_path = config_path.ok_or_else(|| eyre::eyre!("missing config file"))?;
+    let config_path =
+        config_path.ok_or_else(|| crate::Error::Message("missing config file".to_string()))?;
     Ok(config_path.canonicalize()?)
 }

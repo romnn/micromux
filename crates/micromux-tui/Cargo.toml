@@ -24,10 +24,10 @@ keywords = [
 workspace = true
 
 [dependencies]
-color-eyre.workspace = true
 itertools.workspace = true
 indexmap.workspace = true
 parking_lot.workspace = true
+thiserror.workspace = true
 
 # tracing
 tracing.workspace = true
@@ -50,6 +50,7 @@ tokio.workspace = true
 futures.workspace = true
 
 [dev-dependencies]
+color-eyre.workspace = true
 codespan-reporting.workspace = true
 indoc.workspace = true
 similar-asserts.workspace = true

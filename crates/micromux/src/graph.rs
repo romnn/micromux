@@ -1,12 +1,30 @@
 use crate::ServiceMap;
-use color_eyre::eyre;
 use petgraph::graphmap::DiGraphMap;
+
+/// Errors from validating service dependencies.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum Error {
+    /// A dependency names a service that is not configured.
+    #[error("service `{service}` depends on unknown `{dependency}`")]
+    UnknownDependency {
+        /// Service declaring the dependency.
+        service: String,
+        /// Missing dependency id.
+        dependency: String,
+    },
+    /// The dependency graph contains a cycle.
+    #[error("cycle detected at service: `{service}`")]
+    Cycle {
+        /// A service participating in the cycle.
+        service: String,
+    },
+}
 
 #[derive(Debug)]
 pub struct ServiceGraph;
 
 impl ServiceGraph {
-    pub fn new(services: &ServiceMap) -> eyre::Result<ServiceGraph> {
+    pub fn new(services: &ServiceMap) -> Result<ServiceGraph, Error> {
         // Build an empty directed graph keyed by service name
         let mut graph: DiGraphMap<&str, ()> = DiGraphMap::new();
 
@@ -17,17 +35,16 @@ impl ServiceGraph {
 
         // Add node for each service and edges for its dependencies
         for (name, service) in services {
-            let name = name.as_ref();
+            let name: &str = name.as_ref();
             for dep in &service.spec.depends_on {
                 let dep_name = dep.service.as_str();
 
                 // Validate that the dependency actually exists
                 if !graph.contains_node(dep_name) {
-                    return Err(eyre::eyre!(
-                        "service `{}` depends on unknown `{}`",
-                        name,
-                        dep_name
-                    ));
+                    return Err(Error::UnknownDependency {
+                        service: name.to_string(),
+                        dependency: dep_name.to_string(),
+                    });
                 }
                 graph.add_edge(dep_name, name, ());
             }
@@ -40,7 +57,9 @@ impl ServiceGraph {
                 .node_weight(cycle.node_id())
                 .copied()
                 .unwrap_or("<unknown>");
-            eyre::eyre!("cycle detected at service: `{}`", service)
+            Error::Cycle {
+                service: service.to_string(),
+            }
         })?;
 
         Ok(Self)

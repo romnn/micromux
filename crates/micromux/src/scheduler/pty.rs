@@ -1,6 +1,5 @@
 use super::{LogUpdateKind, OutputStream, ProcessEvent, RunId, ServiceID};
 use crate::{health_check, model::RunSink, service::Service};
-use color_eyre::eyre;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
@@ -10,6 +9,26 @@ use std::thread;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+
+#[derive(Debug, thiserror::Error)]
+pub(super) enum Error {
+    #[error("service command is empty")]
+    EmptyCommand,
+    #[error("{operation}: {message}")]
+    Operation {
+        operation: &'static str,
+        message: String,
+    },
+}
+
+impl Error {
+    fn operation(operation: &'static str, error: impl std::fmt::Display) -> Self {
+        Self::Operation {
+            operation,
+            message: error.to_string(),
+        }
+    }
+}
 
 use alacritty_terminal::{
     event::{Event as AlacrittyEvent, EventListener, WindowSize},
@@ -474,7 +493,9 @@ enum PtyOutputReader {
 }
 
 impl PtyOutputReader {
-    fn new(master: &(dyn portable_pty::MasterPty + Send)) -> eyre::Result<(Self, LogReaderHandle)> {
+    fn new(
+        master: &(dyn portable_pty::MasterPty + Send),
+    ) -> Result<(Self, LogReaderHandle), Error> {
         #[cfg(unix)]
         {
             let (cancel_read, log_reader) = LogReaderHandle::pipe()?;
@@ -486,7 +507,7 @@ impl PtyOutputReader {
         {
             let reader = master
                 .try_clone_reader()
-                .map_err(|err| eyre::eyre!("failed to clone pty reader: {err}"))?;
+                .map_err(|err| Error::operation("failed to clone pty reader", err))?;
             Ok((
                 Self::Blocking(std::io::BufReader::new(reader)),
                 LogReaderHandle::new(),
@@ -514,9 +535,10 @@ pub(super) struct LogReaderHandle {
 
 impl LogReaderHandle {
     #[cfg(unix)]
-    fn pipe() -> eyre::Result<(FileDescriptor, Self)> {
-        let pipe = Pipe::new()
-            .map_err(|err| eyre::eyre!("failed to create pty reader cancellation pipe: {err}"))?;
+    fn pipe() -> Result<(FileDescriptor, Self), Error> {
+        let pipe = Pipe::new().map_err(|err| {
+            Error::operation("failed to create pty reader cancellation pipe", err)
+        })?;
         Ok((
             pipe.read,
             Self {
@@ -565,7 +587,7 @@ impl LogReaderHandle {
 impl PtyHandles {
     /// Handles over a fresh PTY with no child attached, for unit tests that need a
     /// `RunningService` without spawning a process.
-    pub(super) fn test_dummy() -> eyre::Result<Self> {
+    pub(super) fn test_dummy() -> Result<Self, Error> {
         let pair = portable_pty::native_pty_system()
             .openpty(portable_pty::PtySize {
                 rows: 24,
@@ -573,11 +595,11 @@ impl PtyHandles {
                 pixel_width: 0,
                 pixel_height: 0,
             })
-            .map_err(|err| eyre::eyre!("failed to open test pty: {err}"))?;
+            .map_err(|err| Error::operation("failed to open test pty", err))?;
         let writer = pair
             .master
             .take_writer()
-            .map_err(|err| eyre::eyre!("failed to take test pty writer: {err}"))?;
+            .map_err(|err| Error::operation("failed to take test pty writer", err))?;
         Ok(Self {
             master: Arc::new(Mutex::new(pair.master)),
             writer: Arc::new(Mutex::new(writer)),
@@ -608,15 +630,18 @@ impl PollingPtyReader {
     fn new(
         master: &(dyn portable_pty::MasterPty + Send),
         cancel_read: FileDescriptor,
-    ) -> eyre::Result<Self> {
-        let pty_fd = master
-            .as_raw_fd()
-            .ok_or_else(|| eyre::eyre!("native pty master did not expose a raw fd"))?;
+    ) -> Result<Self, Error> {
+        let pty_fd = master.as_raw_fd().ok_or_else(|| {
+            Error::operation(
+                "failed to access native pty",
+                "master did not expose a raw fd",
+            )
+        })?;
         let poll_read = FileDescriptor::dup(&BorrowedRawFd(pty_fd))
-            .map_err(|err| eyre::eyre!("failed to clone pty poll fd: {err}"))?;
+            .map_err(|err| Error::operation("failed to clone pty poll fd", err))?;
         let reader = master
             .try_clone_reader()
-            .map_err(|err| eyre::eyre!("failed to clone pty reader: {err}"))?;
+            .map_err(|err| Error::operation("failed to clone pty reader", err))?;
         Ok(Self {
             reader,
             poll_read,
@@ -1287,12 +1312,12 @@ pub(super) fn start_service_with_pty_size(
     shutdown: &CancellationToken,
     terminate: &CancellationToken,
     pty_size: portable_pty::PtySize,
-) -> eyre::Result<StartedPty> {
+) -> Result<StartedPty, Error> {
     use portable_pty::{CommandBuilder, PtySize};
 
     let service_id = service.id.clone();
     let Some((prog, args)) = service.spec.command.split_first() else {
-        return Err(eyre::eyre!("service command is empty"));
+        return Err(Error::EmptyCommand);
     };
 
     let env_vars = env_vars_for_service(service);
@@ -1317,7 +1342,7 @@ pub(super) fn start_service_with_pty_size(
             pixel_width: pty_size.pixel_width,
             pixel_height: pty_size.pixel_height,
         })
-        .map_err(|err| eyre::eyre!("failed to open pty: {err}"))?;
+        .map_err(|err| Error::operation("failed to open pty", err))?;
 
     let mut cmd = CommandBuilder::new(prog);
     cmd.args(args);
@@ -1331,7 +1356,7 @@ pub(super) fn start_service_with_pty_size(
     let child = pair
         .slave
         .spawn_command(cmd)
-        .map_err(|err| eyre::eyre!("failed to spawn in pty: {err}"))?;
+        .map_err(|err| Error::operation("failed to spawn in pty", err))?;
 
     let pid = child.process_id();
     let killer = child.clone_killer();
@@ -1348,7 +1373,7 @@ pub(super) fn start_service_with_pty_size(
     let writer = pair
         .master
         .take_writer()
-        .map_err(|err| eyre::eyre!("failed to take pty writer: {err}"))?;
+        .map_err(|err| Error::operation("failed to take pty writer", err))?;
 
     let master = Arc::new(Mutex::new(pair.master));
     let writer = Arc::new(Mutex::new(writer));

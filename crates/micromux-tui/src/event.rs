@@ -1,4 +1,3 @@
-use color_eyre::eyre::OptionExt;
 use crossterm::event::{KeyEvent, KeyEventKind, MouseEvent};
 use futures::StreamExt;
 use ratatui::crossterm::event::Event as CrosstermEvent;
@@ -50,7 +49,7 @@ impl InputHandler {
     pub fn new() -> Self {
         let (sender, receiver) = mpsc::unbounded_channel();
         let actor = EventTask::new(sender.clone());
-        tokio::spawn(async { actor.run().await });
+        tokio::spawn(async move { actor.run().await });
         Self {
             _sender: sender,
             receiver,
@@ -61,16 +60,8 @@ impl InputHandler {
     ///
     /// This function blocks until an event is received.
     ///
-    /// # Errors
-    ///
-    /// This function returns an error if the sender channel is disconnected. This can happen if an
-    /// error occurs in the event task. In practice, this should not happen unless there is a
-    /// problem with the underlying terminal.
-    pub async fn next(&mut self) -> color_eyre::Result<Input> {
-        self.receiver
-            .recv()
-            .await
-            .ok_or_eyre("Failed to receive event")
+    pub async fn next(&mut self) -> Option<Input> {
+        self.receiver.recv().await
     }
 }
 
@@ -87,7 +78,7 @@ impl EventTask {
     }
 
     /// Runs the event task, forwarding crossterm events until the receiver is dropped.
-    async fn run(self) -> color_eyre::Result<()> {
+    async fn run(self) {
         let mut reader = crossterm::event::EventStream::new();
         loop {
             tokio::select! {
@@ -99,7 +90,6 @@ impl EventTask {
               },
             }
         }
-        Ok(())
     }
 
     /// Sends an event to the receiver.

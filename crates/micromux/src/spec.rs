@@ -452,11 +452,11 @@ mod duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use color_eyre::eyre;
     use similar_asserts::assert_eq;
 
     #[test]
-    fn service_spec_round_trips_humantime_without_normalizing_commands()
-    -> color_eyre::eyre::Result<()> {
+    fn service_spec_round_trips_humantime_without_normalizing_commands() -> eyre::Result<()> {
         let spec = ServiceSpec {
             command: vec!["CMD-SHELL".to_string(), "echo hi".to_string()],
             healthcheck: Some(HealthcheckSpec {
@@ -477,7 +477,7 @@ mod tests {
     }
 
     #[test]
-    fn command_normalization_is_explicit() -> color_eyre::eyre::Result<()> {
+    fn command_normalization_is_explicit() -> eyre::Result<()> {
         let mut spec = ServiceSpec {
             command: vec![
                 "CMD-SHELL".to_string(),
@@ -495,7 +495,7 @@ mod tests {
     }
 
     #[test]
-    fn normalization_floors_healthcheck_retries() -> color_eyre::eyre::Result<()> {
+    fn normalization_floors_healthcheck_retries() -> eyre::Result<()> {
         let mut spec = ServiceSpec {
             command: vec!["true".to_string()],
             healthcheck: Some(HealthcheckSpec {
@@ -516,7 +516,7 @@ mod tests {
     }
 
     #[test]
-    fn partial_spec_distinguishes_omitted_fields_from_explicit_null() -> color_eyre::Result<()> {
+    fn partial_spec_distinguishes_omitted_fields_from_explicit_null() -> eyre::Result<()> {
         let partial = serde_json::from_value::<PartialServiceSpec>(serde_json::json!({
             "name": null,
             "healthcheck": null,

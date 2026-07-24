@@ -408,6 +408,8 @@ fn runtime_dir_endpoints(runtime_dir: &Path) -> Vec<ControlEndpoint> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use color_eyre::eyre;
     use similar_asserts::assert_eq;
     use std::path::PathBuf;
 
@@ -455,7 +457,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn runtime_dir_endpoints_are_sorted() -> color_eyre::Result<()> {
+    fn runtime_dir_endpoints_are_sorted() -> eyre::Result<()> {
         let dir = tempfile::tempdir()?;
         std::fs::write(dir.path().join("z.sock"), b"")?;
         std::fs::write(dir.path().join("a.sock"), b"")?;

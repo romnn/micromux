@@ -24,7 +24,7 @@ struct Session {
     endpoint: ControlEndpoint,
     reader: micromux::SessionModelReader,
     shutdown: CancellationToken,
-    _runner: tokio::task::JoinHandle<eyre::Result<()>>,
+    _runner: tokio::task::JoinHandle<Result<(), micromux::Error>>,
 }
 
 fn build_session(dir: &Path, command: &str) -> eyre::Result<Session> {
@@ -239,7 +239,9 @@ async fn describe_list_logs_and_restart_over_the_socket() -> eyre::Result<()> {
         Response::Accepted { services } => {
             assert_eq!(services.first().map(|a| a.observed_generation), Some(1));
         }
-        other => eyre::bail!("expected Accepted, got {other:?}"),
+        other => {
+            eyre::bail!("expected Accepted, got {other:?}");
+        }
     }
 
     // An unknown service is a typed error, not a panic.
@@ -622,7 +624,9 @@ async fn retained_run_logs_are_queryable_after_restart() -> eyre::Result<()> {
             let generations: Vec<u64> = runs.into_iter().map(|run| run.run_generation).collect();
             assert_eq!(generations, vec![1, 2]);
         }
-        other => eyre::bail!("expected LogRuns, got {other:?}"),
+        other => {
+            eyre::bail!("expected LogRuns, got {other:?}");
+        }
     }
 
     let previous = client

@@ -1400,6 +1400,7 @@ pub(crate) fn new(
 mod tests {
     use super::*;
     use crate::test_util::{initial_model_entry as entry, initial_snapshot as snapshot};
+    use color_eyre::eyre;
     use serde_json::json;
     use similar_asserts::assert_eq;
 
@@ -1531,7 +1532,7 @@ mod tests {
     }
 
     #[test]
-    fn service_snapshot_uptime_schema_matches_duration_wire_shape() -> color_eyre::Result<()> {
+    fn service_snapshot_uptime_schema_matches_duration_wire_shape() -> eyre::Result<()> {
         let mut snapshot = snapshot("svc");
         snapshot.uptime = Some(Duration::new(3, 4));
 
@@ -1552,6 +1553,26 @@ mod tests {
             .tempdir()
             .expect("create temp spool")
             .keep()
+    }
+
+    fn wait_for_run_log_lines(
+        reader: &SessionModelReader,
+        id: &str,
+        run_generation: u64,
+        expected_lines: usize,
+    ) -> Option<LogRun> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(run) = reader.run_log(id, run_generation, None)
+                && run.lines.len() == expected_lines
+            {
+                return Some(run);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[test]
@@ -1789,7 +1810,8 @@ mod tests {
 
     #[test]
     fn visible_logs_span_runs_until_cleared_but_runs_remain_queryable() {
-        let (reader, writer) = new([entry("svc")]);
+        let (reader, writer) =
+            new_with_retention([entry("svc")], Some(unique_spool_dir("visible-runs")), None);
         let id = "svc".to_string();
 
         writer.begin_run(&id, 1);
@@ -1823,8 +1845,7 @@ mod tests {
 
         let visible: Vec<String> = reader.logs(&id, None).into_iter().map(|l| l.line).collect();
         assert_eq!(visible, vec!["after clear".to_string()]);
-        let run_one: Vec<String> = reader
-            .run_log(&id, 1, None)
+        let run_one: Vec<String> = wait_for_run_log_lines(&reader, &id, 1, 1)
             .expect("run one retained")
             .lines
             .into_iter()
@@ -1834,7 +1855,7 @@ mod tests {
     }
 
     #[test]
-    fn late_log_is_retained_with_its_run_but_not_visible() -> color_eyre::Result<()> {
+    fn late_log_is_retained_with_its_run_but_not_visible() -> eyre::Result<()> {
         let (reader, writer) =
             new_with_retention([entry("svc")], Some(unique_spool_dir("late-run-log")), None);
         let id = "svc".to_string();
@@ -1869,7 +1890,7 @@ mod tests {
         assert_eq!(visible, vec!["before restart", "current run"]);
         let retained = reader
             .run_log(&id, 1, None)
-            .ok_or_else(|| color_eyre::eyre::eyre!("missing retained first run"))?
+            .ok_or_else(|| eyre::eyre!("missing retained first run"))?
             .lines
             .into_iter()
             .map(|line| line.line)
@@ -2477,7 +2498,7 @@ mod tests {
     }
 
     #[test]
-    fn roster_removal_deletes_retained_run_files() -> color_eyre::Result<()> {
+    fn roster_removal_deletes_retained_run_files() -> eyre::Result<()> {
         let spool = unique_spool_dir("removed-service");
         let (reader, writer) = new_with_retention([entry("dynamic")], Some(spool.clone()), None);
         let id = "dynamic".to_string();
@@ -2494,7 +2515,7 @@ mod tests {
             .into_iter()
             .find_map(|run| run.path)
             .map(PathBuf::from)
-            .ok_or_else(|| color_eyre::eyre::eyre!("missing retained run path"))?;
+            .ok_or_else(|| eyre::eyre!("missing retained run path"))?;
         let _ = reader.run_log(&id, 1, None);
         assert!(path.exists());
 

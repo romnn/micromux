@@ -5,8 +5,24 @@ use crate::{
     scheduler::ServiceID,
     spec::{DependencySpec, HealthcheckSpec, ServiceOrigin, ServiceSpec},
 };
-use color_eyre::eyre;
 use std::path::Path;
+
+/// Errors from materializing a runnable service definition.
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    /// Environment files or configured paths could not be resolved.
+    #[error(transparent)]
+    Environment(#[from] env::Error),
+    /// An advertised port is not a valid TCP/UDP port number.
+    #[error("invalid port `{port}`: {source}")]
+    InvalidPort {
+        /// Expanded port value.
+        port: String,
+        /// Underlying integer parse error.
+        #[source]
+        source: std::num::ParseIntError,
+    },
+}
 
 #[cfg(test)]
 mod tests {
@@ -15,6 +31,7 @@ mod tests {
         config,
         test_util::{service_config, spanned_string, unique_tmp_dir},
     };
+    use color_eyre::eyre;
     use similar_asserts::assert_eq;
     use std::fs;
     use std::time::Duration;
@@ -304,7 +321,7 @@ impl Service {
         id: impl Into<ServiceID>,
         config_dir: &Path,
         config: config::Service,
-    ) -> eyre::Result<Self> {
+    ) -> Result<Self, Error> {
         let (prog, args) = config.command;
         let id: ServiceID = id.into();
 
@@ -351,7 +368,10 @@ impl Service {
                     env::interpolate_str_tracking(port.as_ref(), &full_env, &mut missing_env);
                 expanded
                     .parse::<u16>()
-                    .map_err(|err| eyre::eyre!("invalid port `{}`: {err}", expanded))
+                    .map_err(|source| Error::InvalidPort {
+                        port: expanded,
+                        source,
+                    })
             })
             .collect::<Result<Vec<_>, _>>()?;
 

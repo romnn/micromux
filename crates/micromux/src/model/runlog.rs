@@ -351,13 +351,14 @@ pub(super) fn read_run_log_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use color_eyre::eyre;
     #[cfg(unix)]
     use similar_asserts::assert_eq;
     use std::fs::{self, File, OpenOptions};
 
     #[cfg(unix)]
     #[test]
-    fn created_spool_dir_is_owner_private() -> color_eyre::Result<()> {
+    fn created_spool_dir_is_owner_private() -> eyre::Result<()> {
         use std::os::unix::fs::PermissionsExt;
 
         let base = tempfile::tempdir()?;
@@ -371,7 +372,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_spool_gc_removes_only_unlocked_owned_dirs() -> color_eyre::Result<()> {
+    fn stale_spool_gc_removes_only_unlocked_owned_dirs() -> eyre::Result<()> {
         use fs2::FileExt as _;
 
         let base = tempfile::tempdir()?;

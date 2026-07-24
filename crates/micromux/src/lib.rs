@@ -9,8 +9,7 @@
 //! Parse a configuration file and construct a [`Micromux`] instance:
 //!
 //! ```no_run
-//! # use color_eyre::eyre;
-//! # fn main() -> eyre::Result<()> {
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! let raw = std::fs::read_to_string("./micromux.yaml")?;
 //! let config_dir = std::path::Path::new(".");
 //! let file_id = 0usize;
@@ -34,7 +33,6 @@ pub mod structured_log;
 pub(crate) mod test_util;
 
 use codespan_reporting::{diagnostic::Severity, files::SimpleFiles};
-use color_eyre::eyre;
 use schemars::JsonSchema;
 use serde::Serialize;
 use std::future::Future;
@@ -49,6 +47,8 @@ pub use config::{
     find_config_file, from_str,
 };
 pub use diagnostics::{Printer, ToDiagnostics, render_to_string};
+pub use env::Error as EnvironmentError;
+pub use graph::Error as GraphError;
 pub use health_check::Health;
 pub use model::{
     ChangeKind, Desired, DiskLogRetention, DynamicServiceInfo, EVENT_HISTORY, Execution,
@@ -62,7 +62,7 @@ pub use scheduler::{
     ReconcileAction, ReconcileActionKind, ReconcileReceipt, ReconcileResult, SchedulerStopped,
     ServiceCommandAck, ServiceCommandResult, ServiceControl, ServiceID,
 };
-pub use service::RestartPolicy;
+pub use service::{Error as ServiceError, RestartPolicy};
 pub use spec::{
     DependencySpec, DynamicOrigin, DynamicServiceParams, HealthcheckSpec, Lease,
     PartialServiceSpec, ServiceOrigin, ServiceSpec, SpecError, SpecField,
@@ -75,6 +75,29 @@ pub use structured_log::{
 
 pub(crate) type ServiceMap = indexmap::IndexMap<ServiceID, service::Service>;
 
+/// Errors from constructing, validating, or running a micromux session.
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    /// Filesystem access failed.
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    /// The canonical configuration path has no parent directory.
+    #[error("config path has no parent directory: {}", path.display())]
+    MissingConfigParent {
+        /// Canonical configuration path.
+        path: PathBuf,
+    },
+    /// Rendering configuration diagnostics failed.
+    #[error(transparent)]
+    Diagnostics(#[from] codespan_reporting::files::Error),
+    /// A service definition could not be materialized.
+    #[error(transparent)]
+    Service(#[from] ServiceError),
+    /// Service dependencies are invalid.
+    #[error(transparent)]
+    Graph(#[from] GraphError),
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct ReloadConfig {
     pub(crate) config_path: PathBuf,
@@ -83,7 +106,7 @@ pub(crate) struct ReloadConfig {
 
 pub(crate) fn service_map_from_config<F>(
     config_file: &config::ConfigFile<F>,
-) -> eyre::Result<ServiceMap> {
+) -> Result<ServiceMap, ServiceError> {
     let config_dir = config_file.config_dir.clone();
     config_file
         .config
@@ -93,7 +116,7 @@ pub(crate) fn service_map_from_config<F>(
             let service_id = name.as_ref().clone();
             let service =
                 service::Service::new(name.as_ref().clone(), &config_dir, service_config.clone())?;
-            Ok::<_, eyre::Report>((service_id, service))
+            Ok::<_, ServiceError>((service_id, service))
         })
         .collect::<Result<ServiceMap, _>>()
 }
@@ -146,13 +169,15 @@ pub struct ValidationReport {
 pub fn validate_config_file(
     path: &std::path::Path,
     strict_override: Option<bool>,
-) -> eyre::Result<ValidationReport> {
+) -> Result<ValidationReport, Error> {
     const MAX_RENDERED: usize = 16 * 1024;
 
     let config_path = path.canonicalize()?;
     let config_dir = config_path
         .parent()
-        .ok_or_else(|| eyre::eyre!("config path has no parent directory"))?;
+        .ok_or_else(|| Error::MissingConfigParent {
+            path: config_path.clone(),
+        })?;
     let raw = std::fs::read_to_string(&config_path)?;
     let mut files = SimpleFiles::new();
     let file_id = files.add(config_path.display().to_string(), raw.clone());
@@ -306,7 +331,7 @@ impl Micromux {
     ///
     /// Returns an error if a service definition in the configuration cannot be normalized
     /// (e.g. invalid environment interpolation, invalid port parsing, etc.).
-    pub fn new(config_file: &config::ConfigFile<diagnostics::FileId>) -> eyre::Result<Self> {
+    pub fn new(config_file: &config::ConfigFile<diagnostics::FileId>) -> Result<Self, Error> {
         let services = service_map_from_config(config_file)?;
         let reload_config = config_file
             .config_path
@@ -336,7 +361,7 @@ impl Micromux {
     pub fn start(
         self: Arc<Self>,
         shutdown: CancellationToken,
-    ) -> (impl Future<Output = eyre::Result<()>> + 'static, Handles) {
+    ) -> (impl Future<Output = Result<(), Error>> + 'static, Handles) {
         let (reader, writer) = model::new(initial_model_entries(&self.services));
         let (commands_tx, commands_rx) = mpsc::channel(1024);
         let handles = Handles {
@@ -365,7 +390,7 @@ impl Micromux {
             })
             .await?;
             tracing::info!("exiting");
-            Ok(())
+            Ok::<(), Error>(())
         };
 
         (runner, handles)
@@ -376,6 +401,7 @@ impl Micromux {
 mod tests {
     use super::*;
     use crate::model::{Desired, Execution};
+    use color_eyre::eyre;
     use similar_asserts::assert_eq;
     use std::path::Path;
 

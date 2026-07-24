@@ -1,7 +1,6 @@
 use crate::App;
 
 use ansi_to_tui::IntoText;
-use color_eyre::eyre;
 use itertools::intersperse;
 use ratatui::{
     buffer::Buffer,
@@ -1009,7 +1008,7 @@ impl App {
     /// Returns an error if:
     /// - The terminal backend fails to initialize or restore.
     /// - The underlying event loop (`App::run`) fails.
-    pub async fn render(self) -> eyre::Result<()> {
+    pub async fn render(self) -> Result<(), crate::Error> {
         let terminal = ratatui::init();
         // Always restore the terminal, even when the event loop returns an error, so a failure
         // never leaves the user's shell stuck in raw mode / the alternate screen.

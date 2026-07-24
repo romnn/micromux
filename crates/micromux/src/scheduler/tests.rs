@@ -20,7 +20,7 @@ async fn run_test_scheduler(
     events_tx: mpsc::Sender<ProcessEvent>,
     test_events_tx: mpsc::Sender<Event>,
     shutdown: CancellationToken,
-) -> eyre::Result<()> {
+) -> Result<(), crate::GraphError> {
     let (_reader, writer) = crate::model::new(crate::initial_model_entries(services));
     scheduler(SchedulerInput {
         services: services.clone(),
@@ -44,7 +44,7 @@ struct Harness {
     control: ServiceControl,
     commands: mpsc::Sender<Command>,
     shutdown: CancellationToken,
-    handle: tokio::task::JoinHandle<eyre::Result<()>>,
+    handle: tokio::task::JoinHandle<Result<(), crate::GraphError>>,
 }
 
 fn spawn_harness(services: ServiceMap, reload_config: Option<ReloadConfig>) -> Harness {
@@ -1368,7 +1368,7 @@ fn services_from_config_path(config_path: &Path) -> eyre::Result<ServiceMap> {
         .ok_or_else(|| eyre::eyre!("missing config parent"))?;
     let mut diagnostics = Vec::new();
     let config = crate::config::from_str(&raw, config_dir, 0usize, None, &mut diagnostics)?;
-    crate::service_map_from_config(&config)
+    Ok(crate::service_map_from_config(&config)?)
 }
 
 #[test]
@@ -2267,7 +2267,9 @@ async fn shutdown_drains_running_service() -> eyre::Result<()> {
 
     match kill(Pid::from_raw(pid), None) {
         Err(Errno::ESRCH) => {}
-        other => eyre::bail!("expected service process to be reaped, got {other:?}"),
+        other => {
+            eyre::bail!("expected service process to be reaped, got {other:?}");
+        }
     }
 
     Ok(())

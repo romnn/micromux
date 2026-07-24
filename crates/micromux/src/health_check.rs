@@ -42,6 +42,7 @@ mod tests {
     use super::*;
     use crate::model::SessionModelReader;
     use crate::test_util::{initial_model_entry, spanned_string, unique_tmp_dir};
+    use color_eyre::eyre;
     use similar_asserts::assert_eq;
     use std::path::PathBuf;
     use yaml_spanned::Spanned;
@@ -49,7 +50,7 @@ mod tests {
     struct TempDir(PathBuf);
 
     impl TempDir {
-        fn new(prefix: &str) -> color_eyre::eyre::Result<Self> {
+        fn new(prefix: &str) -> eyre::Result<Self> {
             let dir = unique_tmp_dir(prefix);
             std::fs::create_dir_all(&dir)?;
             Ok(Self(dir))
@@ -71,7 +72,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn timeout_kills_child_and_emits_finished() -> color_eyre::eyre::Result<()> {
+    async fn timeout_kills_child_and_emits_finished() -> eyre::Result<()> {
         use nix::errno::Errno;
         use nix::sys::signal::kill;
         use nix::unistd::Pid;
@@ -137,20 +138,22 @@ mod tests {
         let result = history
             .last()
             .and_then(|attempt| attempt.result.as_ref())
-            .ok_or_else(|| color_eyre::eyre::eyre!("missing finished timeout attempt"))?;
+            .ok_or_else(|| eyre::eyre!("missing finished timeout attempt"))?;
         assert!(!result.success);
         assert!(!result.cancelled);
 
         match kill(Pid::from_raw(pid), None) {
             Err(Errno::ESRCH) => {}
-            other => color_eyre::eyre::bail!("expected ESRCH for dead pid, got {other:?}"),
+            other => {
+                eyre::bail!("expected ESRCH for dead pid, got {other:?}");
+            }
         }
 
         Ok(())
     }
 
     #[tokio::test]
-    async fn terminated_probe_emits_cancelled_finished() -> color_eyre::eyre::Result<()> {
+    async fn terminated_probe_emits_cancelled_finished() -> eyre::Result<()> {
         let hc: crate::HealthcheckSpec = crate::config::HealthCheck {
             test: (
                 spanned_string("sh"),
@@ -198,7 +201,7 @@ mod tests {
             }
         })
         .await
-        .map_err(|_| color_eyre::eyre::eyre!("probe did not start"))?;
+        .map_err(|_| eyre::eyre!("probe did not start"))?;
         terminate.cancel();
 
         let outcome = run_handle.await?;
@@ -207,15 +210,14 @@ mod tests {
         let result = history
             .last()
             .and_then(|attempt| attempt.result.as_ref())
-            .ok_or_else(|| color_eyre::eyre::eyre!("missing finished cancelled attempt"))?;
+            .ok_or_else(|| eyre::eyre!("missing finished cancelled attempt"))?;
         assert!(result.cancelled);
         Ok(())
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn successful_probe_does_not_wait_for_background_stdout_holder()
-    -> color_eyre::eyre::Result<()> {
+    async fn successful_probe_does_not_wait_for_background_stdout_holder() -> eyre::Result<()> {
         use nix::errno::Errno;
         use nix::sys::signal::kill;
         use nix::unistd::Pid;
@@ -267,9 +269,7 @@ mod tests {
             ),
         )
         .await
-        .map_err(|_| {
-            color_eyre::eyre::eyre!("healthcheck waited for a background stdout holder")
-        })?;
+        .map_err(|_| eyre::eyre!("healthcheck waited for a background stdout holder"))?;
 
         assert!(matches!(res, Ok(Outcome::Healthy)));
 
@@ -281,14 +281,14 @@ mod tests {
                 Err(Errno::ESRCH) => break,
                 other if tokio::time::Instant::now() < deadline => {
                     if !matches!(other, Ok(())) {
-                        color_eyre::eyre::bail!(
+                        eyre::bail!(
                             "unexpected signal probe result for background process: {other:?}"
                         );
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                 }
                 other => {
-                    color_eyre::eyre::bail!(
+                    eyre::bail!(
                         "expected background healthcheck process to be gone, got {other:?}"
                     );
                 }
@@ -298,7 +298,7 @@ mod tests {
         Ok(())
     }
 
-    async fn started_attempts_before_unhealthy(retries: usize) -> color_eyre::eyre::Result<usize> {
+    async fn started_attempts_before_unhealthy(retries: usize) -> eyre::Result<usize> {
         let hc: crate::HealthcheckSpec = crate::config::HealthCheck {
             test: (
                 spanned_string("sh"),
@@ -350,7 +350,7 @@ mod tests {
         loop {
             let event = tokio::time::timeout(std::time::Duration::from_secs(2), events_rx.recv())
                 .await?
-                .ok_or_else(|| color_eyre::eyre::eyre!("healthcheck event channel closed"))?;
+                .ok_or_else(|| eyre::eyre!("healthcheck event channel closed"))?;
             if let ProcessEvent::Unhealthy { .. } = event {
                 break;
             }
@@ -362,13 +362,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retries_is_number_of_failures_before_unhealthy() -> color_eyre::eyre::Result<()> {
+    async fn retries_is_number_of_failures_before_unhealthy() -> eyre::Result<()> {
         assert_eq!(started_attempts_before_unhealthy(1).await?, 1);
         Ok(())
     }
 
     #[tokio::test]
-    async fn zero_retries_is_floored_to_one_failure() -> color_eyre::eyre::Result<()> {
+    async fn zero_retries_is_floored_to_one_failure() -> eyre::Result<()> {
         assert_eq!(started_attempts_before_unhealthy(0).await?, 1);
         Ok(())
     }

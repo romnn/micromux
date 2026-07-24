@@ -1,7 +1,50 @@
-use color_eyre::eyre;
 use indexmap::IndexMap;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+
+/// Errors from loading and resolving service environment data.
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    /// A dotenv line does not contain a key-value separator.
+    #[error("invalid env file line {line}: missing '='")]
+    MissingSeparator {
+        /// One-based line number.
+        line: usize,
+    },
+    /// A dotenv line contains an empty key.
+    #[error("invalid env file line {line}: empty key")]
+    EmptyKey {
+        /// One-based line number.
+        line: usize,
+    },
+    /// An environment file could not be read.
+    #[error("failed to read env file {}: {source}", path.display())]
+    ReadFile {
+        /// Path of the unreadable file.
+        path: PathBuf,
+        /// Underlying filesystem error.
+        #[source]
+        source: std::io::Error,
+    },
+    /// An environment file contains invalid dotenv syntax.
+    #[error("failed to parse env file {}: {source}", path.display())]
+    ParseFile {
+        /// Path of the invalid file.
+        path: PathBuf,
+        /// Underlying dotenv error.
+        #[source]
+        source: Box<Self>,
+    },
+    /// Shell-style expansion failed for a configured path.
+    #[error("failed to expand path `{raw}`: {source}")]
+    ExpandPath {
+        /// Unexpanded configured path.
+        raw: String,
+        /// Underlying environment lookup error.
+        #[source]
+        source: shellexpand::LookupError<std::env::VarError>,
+    },
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnvMap {
@@ -149,7 +192,7 @@ fn parse_value(raw_value: &str) -> String {
     value
 }
 
-pub fn parse_dotenv(contents: &str) -> eyre::Result<EnvMap> {
+pub fn parse_dotenv(contents: &str) -> Result<EnvMap, Error> {
     let mut env = EnvMap::new();
 
     for (idx, raw_line) in contents.lines().enumerate() {
@@ -163,11 +206,11 @@ pub fn parse_dotenv(contents: &str) -> eyre::Result<EnvMap> {
 
         let (key, raw_value) = line
             .split_once('=')
-            .ok_or_else(|| eyre::eyre!("invalid env file line {line_no}: missing '='"))?;
+            .ok_or(Error::MissingSeparator { line: line_no })?;
 
         let key = key.trim();
         if key.is_empty() {
-            return Err(eyre::eyre!("invalid env file line {line_no}: empty key"));
+            return Err(Error::EmptyKey { line: line_no });
         }
 
         let value = parse_value(strip_value_inline_comment(raw_value));
@@ -178,13 +221,17 @@ pub fn parse_dotenv(contents: &str) -> eyre::Result<EnvMap> {
     Ok(env)
 }
 
-pub fn load_env_files_sync(paths: &[PathBuf]) -> eyre::Result<EnvMap> {
+pub fn load_env_files_sync(paths: &[PathBuf]) -> Result<EnvMap, Error> {
     let mut env = EnvMap::new();
     for path in paths {
-        let content = std::fs::read_to_string(path)
-            .map_err(|err| eyre::eyre!("failed to read env file {}: {err}", path.display()))?;
-        let parsed = parse_dotenv(&content)
-            .map_err(|err| eyre::eyre!("failed to parse env file {}: {err}", path.display()))?;
+        let content = std::fs::read_to_string(path).map_err(|source| Error::ReadFile {
+            path: path.clone(),
+            source,
+        })?;
+        let parsed = parse_dotenv(&content).map_err(|source| Error::ParseFile {
+            path: path.clone(),
+            source: Box::new(source),
+        })?;
         env.extend(parsed);
     }
     Ok(env)
@@ -213,9 +260,12 @@ pub fn expand_env_values_tracking(
     out
 }
 
-pub fn resolve_path(config_dir: &Path, raw: &str) -> eyre::Result<PathBuf> {
+pub fn resolve_path(config_dir: &Path, raw: &str) -> Result<PathBuf, Error> {
     let expanded = shellexpand::full(raw)
-        .map_err(|err| eyre::eyre!("failed to expand path `{raw}`: {err}"))?
+        .map_err(|source| Error::ExpandPath {
+            raw: raw.to_string(),
+            source,
+        })?
         .to_string();
     let path = PathBuf::from(expanded);
     if path.is_absolute() {
@@ -308,6 +358,7 @@ fn is_var_continue(c: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use color_eyre::eyre;
     use similar_asserts::assert_eq;
 
     #[test]

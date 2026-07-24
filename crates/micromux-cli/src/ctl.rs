@@ -2,7 +2,6 @@
 
 use std::path::{Path, PathBuf};
 
-use color_eyre::eyre;
 use micromux_control::{
     Client, ControlEndpoint, EndpointProbe, EndpointProbeResult, Request, Response,
     RuntimeDirStatus, SessionInfo, answering_session_probes, endpoint_for, probe_endpoints,
@@ -121,7 +120,7 @@ fn print_health_attempt(attempt: &micromux::HealthAttempt) {
     }
 }
 
-fn print_response(response: &Response) -> eyre::Result<()> {
+fn print_response(response: &Response) -> Result<(), crate::Error> {
     match response {
         Response::Services(services) => print_services(services),
         Response::Logs { lines, truncated } => {
@@ -203,7 +202,7 @@ fn print_response(response: &Response) -> eyre::Result<()> {
             }
         }
         Response::Error { code, message } => {
-            eyre::bail!("{code:?}: {message}");
+            return Err(crate::Error::Message(format!("{code:?}: {message}")));
         }
         Response::ShuttingDown => {
             println!("session is shutting down");
@@ -344,7 +343,7 @@ async fn connect_project_session(
     runtime_dirs: &[PathBuf],
     working_dir: &Path,
     config_path: &Path,
-) -> eyre::Result<Client> {
+) -> Result<Client, crate::Error> {
     let endpoints = runtime_dirs
         .iter()
         .map(|runtime_dir| endpoint_for(runtime_dir, config_path))
@@ -358,10 +357,12 @@ async fn connect_project_session(
         .collect::<Vec<_>>();
 
     if unique_sessions.len() > 1 {
-        eyre::bail!(
-            "{}",
-            ambiguous_session_message(dir_statuses, &unique_sessions, config_path, working_dir)
-        );
+        return Err(crate::Error::Message(ambiguous_session_message(
+            dir_statuses,
+            &unique_sessions,
+            config_path,
+            working_dir,
+        )));
     }
 
     if let Some((_, selected)) = unique_sessions.into_iter().next() {
@@ -381,10 +382,12 @@ async fn connect_project_session(
         }
     }
 
-    eyre::bail!(
-        "{}",
-        no_session_message(dir_statuses, &failed_probes, config_path, working_dir)
-    );
+    Err(crate::Error::Message(no_session_message(
+        dir_statuses,
+        &failed_probes,
+        config_path,
+        working_dir,
+    )))
 }
 
 /// Connect to the current project's session endpoint and run a single `ctl` action.
@@ -393,9 +396,11 @@ async fn connect_project_session(
 ///
 /// Returns an error if no session is running for this project, the runtime dir is unresolvable, or
 /// the request fails.
-pub async fn run(action: CtlAction, config_path: Option<&Path>) -> eyre::Result<()> {
+pub async fn run(action: CtlAction, config_path: Option<&Path>) -> Result<(), crate::Error> {
     if !micromux_control::transport_supported() {
-        eyre::bail!("the micromux control plane is not supported on this platform");
+        return Err(crate::Error::Message(
+            "the micromux control plane is not supported on this platform".to_string(),
+        ));
     }
 
     let working_dir = std::env::current_dir()?;
@@ -403,10 +408,12 @@ pub async fn run(action: CtlAction, config_path: Option<&Path>) -> eyre::Result<
     let dir_statuses = runtime_dir_statuses();
     let runtime_dirs = usable_runtime_dirs(&dir_statuses);
     if runtime_dirs.is_empty() {
-        eyre::bail!(
-            "{}",
-            no_session_message(&dir_statuses, &[], &config_path, &working_dir)
-        );
+        return Err(crate::Error::Message(no_session_message(
+            &dir_statuses,
+            &[],
+            &config_path,
+            &working_dir,
+        )));
     }
     let mut client =
         connect_project_session(&dir_statuses, &runtime_dirs, &working_dir, &config_path).await?;

@@ -152,7 +152,7 @@ fn finish_service_start(
     run_id: super::RunId,
     terminate: CancellationToken,
     #[cfg(test)] clear_logs: bool,
-    result: color_eyre::eyre::Result<pty::StartedPty>,
+    result: Result<pty::StartedPty, pty::Error>,
 ) {
     let Some(runtime) = ctx.runtimes.get_mut(service_id) else {
         return;
@@ -325,15 +325,16 @@ mod tests {
         service::Service,
         test_util::{service_config, spanned_string},
     };
+    use color_eyre::eyre;
     use similar_asserts::assert_eq;
     use std::collections::HashMap;
     use std::path::Path;
     use tokio::sync::mpsc;
     use yaml_spanned::Spanned;
 
-    fn test_service(id: &str) -> color_eyre::Result<Service> {
+    fn test_service(id: &str) -> eyre::Result<Service> {
         let cfg = service_config(id, ("true", &[]));
-        Service::new(id, Path::new("."), cfg)
+        Ok(Service::new(id, Path::new("."), cfg)?)
     }
 
     fn dependency(name: &str, condition: DependencyCondition) -> Dependency {
@@ -372,7 +373,7 @@ mod tests {
     }
 
     #[test]
-    fn dependencies_ready_honors_each_duplicate_entry_condition() -> color_eyre::Result<()> {
+    fn dependencies_ready_honors_each_duplicate_entry_condition() -> eyre::Result<()> {
         let dep = test_service("dep")?;
         let mut svc = test_service("svc")?;
         svc.spec.depends_on = vec![

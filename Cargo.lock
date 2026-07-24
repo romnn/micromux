@@ -1620,6 +1620,7 @@ dependencies = [
  "micromux-tui",
  "similar-asserts",
  "termcolor",
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
  "tracing-appender",
@@ -1674,8 +1675,8 @@ dependencies = [
 name = "micromux-screenshot"
 version = "0.0.7"
 dependencies = [
- "color-eyre",
  "portable-pty",
+ "thiserror 2.0.18",
  "vt100",
 ]
 
@@ -1699,6 +1700,7 @@ dependencies = [
  "similar-asserts",
  "strip-ansi-escapes",
  "tempfile",
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
 ]

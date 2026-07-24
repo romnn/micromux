@@ -2,7 +2,6 @@
 
 use std::fmt::Write as _;
 
-use color_eyre::eyre;
 use micromux_control::{
     AmbiguousSelection, ControlError, ProbeReport, SelectError, SessionSelector, SocketProbeDetail,
     SocketProbeStatus,
@@ -11,9 +10,11 @@ use micromux_control::{
 use crate::options::Options;
 
 /// Resolve a live session and run the existing TUI over its remote mirror.
-pub(crate) async fn run(options: &Options, raw_session: Option<&str>) -> eyre::Result<()> {
+pub(crate) async fn run(options: &Options, raw_session: Option<&str>) -> Result<(), crate::Error> {
     if !micromux_control::transport_supported() {
-        eyre::bail!("the micromux control plane is not supported on this platform");
+        return Err(crate::Error::Message(
+            "the micromux control plane is not supported on this platform".to_string(),
+        ));
     }
 
     let cwd = std::env::current_dir()?;
@@ -21,10 +22,10 @@ pub(crate) async fn run(options: &Options, raw_session: Option<&str>) -> eyre::R
     let resolved =
         micromux_control::resolve_selector(&cwd, selector, options.config_path.as_deref())
             .await
-            .map_err(|error| eyre::eyre!(format_select_error(error)))?;
+            .map_err(|error| crate::Error::Message(format_select_error(error)))?;
     let remote = micromux_tui::RemoteSource::connect(resolved.endpoint)
         .await
-        .map_err(|error| eyre::eyre!(format_control_error(error)))?;
+        .map_err(|error| crate::Error::Message(format_control_error(error)))?;
 
     let shutdown = micromux::CancellationToken::new();
     crate::spawn_shutdown_handler(shutdown.clone());
@@ -35,7 +36,7 @@ pub(crate) async fn run(options: &Options, raw_session: Option<&str>) -> eyre::R
         shutdown,
         !options.no_pretty_json_logs,
     );
-    app.render().await
+    Ok(app.render().await?)
 }
 
 fn format_select_error(error: SelectError) -> String {

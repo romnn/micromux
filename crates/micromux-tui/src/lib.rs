@@ -12,7 +12,6 @@ mod source;
 mod state;
 mod style;
 
-use color_eyre::eyre;
 use micromux::{ChangeKind, Command, SessionChange};
 use ratatui::DefaultTerminal;
 use tokio::sync::broadcast;
@@ -20,6 +19,17 @@ use tokio::sync::mpsc;
 
 pub use remote::RemoteSource;
 pub use source::{LocalSource, SessionSource};
+
+/// Errors from running or rendering the terminal interface.
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    /// The terminal event task stopped before the application shut down.
+    #[error("terminal input event channel closed")]
+    InputClosed,
+    /// The terminal backend failed.
+    #[error(transparent)]
+    Terminal(#[from] std::io::Error),
+}
 
 /// Terminal application state.
 pub struct App {
@@ -173,7 +183,7 @@ impl App {
     /// Returns an error if:
     /// - Receiving an input event fails.
     /// - The underlying terminal backend fails to draw.
-    pub async fn run(mut self, mut terminal: DefaultTerminal) -> eyre::Result<()> {
+    pub async fn run(mut self, mut terminal: DefaultTerminal) -> Result<(), Error> {
         enum Wake {
             Input(event::Input),
             Change(SessionChange),
@@ -193,7 +203,9 @@ impl App {
         while self.is_running() {
             let wake = tokio::select! {
                 () = self.shutdown.cancelled() => None,
-                input = self.input_event_handler.next() => Some(Wake::Input(input?)),
+                input = self.input_event_handler.next() => {
+                    Some(Wake::Input(input.ok_or(Error::InputClosed)?))
+                },
                 change = self.changes.recv() => match change {
                     Ok(change) => Some(Wake::Change(change)),
                     Err(broadcast::error::RecvError::Lagged(_)) => Some(Wake::Resync),
@@ -642,6 +654,7 @@ fn key_event_to_bytes(
 mod tests {
     use super::*;
     use codespan_reporting::diagnostic::Diagnostic;
+    use color_eyre::eyre;
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
     use indoc::indoc;
     use ratatui::widgets::Widget as _;
@@ -751,7 +764,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tab_cycles_focus_with_and_without_healthcheck_pane() -> color_eyre::eyre::Result<()> {
+    async fn tab_cycles_focus_with_and_without_healthcheck_pane() -> eyre::Result<()> {
         let yaml = indoc! {r#"
             version: 1
             services:
@@ -760,10 +773,9 @@ mod tests {
         "#};
         let mut diagnostics: Vec<Diagnostic<usize>> = vec![];
         let parsed = micromux::from_str(yaml, Path::new("."), 0usize, None, &mut diagnostics)
-            .map_err(|err| color_eyre::eyre::eyre!(err.to_string()))?;
+            .map_err(|err| eyre::eyre!(err.to_string()))?;
         let mux = std::sync::Arc::new(
-            micromux::Micromux::new(&parsed)
-                .map_err(|err| color_eyre::eyre::eyre!(err.to_string()))?,
+            micromux::Micromux::new(&parsed).map_err(|err| eyre::eyre!(err.to_string()))?,
         );
         let shutdown = micromux::CancellationToken::new();
         // The runner is not spawned; the model reader is seeded with initial snapshots and is all
@@ -800,8 +812,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pty_input_and_resize_keys_are_inert_without_an_input_sender()
-    -> color_eyre::eyre::Result<()> {
+    async fn pty_input_and_resize_keys_are_inert_without_an_input_sender() -> eyre::Result<()> {
         let yaml = indoc! {r#"
             version: 1
             services:
@@ -810,7 +821,7 @@ mod tests {
         "#};
         let mut diagnostics: Vec<Diagnostic<usize>> = vec![];
         let parsed = micromux::from_str(yaml, Path::new("."), 0usize, None, &mut diagnostics)
-            .map_err(|err| color_eyre::eyre::eyre!(err.to_string()))?;
+            .map_err(|err| eyre::eyre!(err.to_string()))?;
         let mux = std::sync::Arc::new(micromux::Micromux::new(&parsed)?);
         let shutdown = micromux::CancellationToken::new();
         let (_runner, handles) = mux.start(shutdown.clone());
@@ -854,8 +865,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restart_key_on_disabled_service_does_not_send_enable() -> color_eyre::eyre::Result<()>
-    {
+    async fn restart_key_on_disabled_service_does_not_send_enable() -> eyre::Result<()> {
         let yaml = indoc! {r#"
             version: 1
             services:
@@ -864,10 +874,9 @@ mod tests {
         "#};
         let mut diagnostics: Vec<Diagnostic<usize>> = vec![];
         let parsed = micromux::from_str(yaml, Path::new("."), 0usize, None, &mut diagnostics)
-            .map_err(|err| color_eyre::eyre::eyre!(err.to_string()))?;
+            .map_err(|err| eyre::eyre!(err.to_string()))?;
         let mux = std::sync::Arc::new(
-            micromux::Micromux::new(&parsed)
-                .map_err(|err| color_eyre::eyre::eyre!(err.to_string()))?,
+            micromux::Micromux::new(&parsed).map_err(|err| eyre::eyre!(err.to_string()))?,
         );
         let shutdown = micromux::CancellationToken::new();
         let (_runner, handles) = mux.start(shutdown.clone());
@@ -890,7 +899,9 @@ mod tests {
 
         match commands_rx.try_recv()? {
             micromux::Command::Restart { service, .. } => assert_eq!(service, "svc"),
-            other => color_eyre::eyre::bail!("expected restart command, got {other:?}"),
+            other => {
+                eyre::bail!("expected restart command, got {other:?}");
+            }
         }
         assert!(matches!(
             commands_rx.try_recv(),
@@ -901,7 +912,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stop_key_only_sends_for_a_live_dynamic_service() -> color_eyre::eyre::Result<()> {
+    async fn stop_key_only_sends_for_a_live_dynamic_service() -> eyre::Result<()> {
         let yaml = indoc! {r#"
             version: 1
             services:
@@ -910,10 +921,9 @@ mod tests {
         "#};
         let mut diagnostics: Vec<Diagnostic<usize>> = vec![];
         let parsed = micromux::from_str(yaml, Path::new("."), 0usize, None, &mut diagnostics)
-            .map_err(|err| color_eyre::eyre::eyre!(err.to_string()))?;
+            .map_err(|err| eyre::eyre!(err.to_string()))?;
         let mux = std::sync::Arc::new(
-            micromux::Micromux::new(&parsed)
-                .map_err(|err| color_eyre::eyre::eyre!(err.to_string()))?,
+            micromux::Micromux::new(&parsed).map_err(|err| eyre::eyre!(err.to_string()))?,
         );
         let shutdown = micromux::CancellationToken::new();
         let (_runner, handles) = mux.start(shutdown.clone());
@@ -955,7 +965,9 @@ mod tests {
                 assert_eq!(service, "svc");
                 assert!(ack.is_none());
             }
-            other => color_eyre::eyre::bail!("expected stop-dynamic command, got {other:?}"),
+            other => {
+                eyre::bail!("expected stop-dynamic command, got {other:?}");
+            }
         }
 
         if let Some(service) = app.state.current_service_mut() {
@@ -971,11 +983,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resync_reconciles_rows_and_preserves_selection_by_id() -> color_eyre::Result<()> {
-        fn handles_for(yaml: &str) -> color_eyre::Result<micromux::Handles> {
+    async fn resync_reconciles_rows_and_preserves_selection_by_id() -> eyre::Result<()> {
+        fn handles_for(yaml: &str) -> eyre::Result<micromux::Handles> {
             let mut diagnostics: Vec<Diagnostic<usize>> = Vec::new();
             let parsed = micromux::from_str(yaml, Path::new("."), 0, None, &mut diagnostics)
-                .map_err(|err| color_eyre::eyre::eyre!(err.to_string()))?;
+                .map_err(|err| eyre::eyre!(err.to_string()))?;
             let mux = std::sync::Arc::new(micromux::Micromux::new(&parsed)?);
             let (_runner, handles) = mux.start(micromux::CancellationToken::new());
             Ok(handles)

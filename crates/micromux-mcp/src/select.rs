@@ -301,6 +301,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
+    use color_eyre::eyre;
     use fs2::FileExt;
     use micromux::CancellationToken;
     use micromux_control::{
@@ -311,20 +312,16 @@ mod tests {
 
     struct Running {
         shutdown: CancellationToken,
-        _runner: tokio::task::JoinHandle<color_eyre::eyre::Result<()>>,
+        _runner: tokio::task::JoinHandle<Result<(), micromux::Error>>,
     }
 
-    fn temp_dir(prefix: &str) -> color_eyre::eyre::Result<tempfile::TempDir> {
+    fn temp_dir(prefix: &str) -> eyre::Result<tempfile::TempDir> {
         Ok(tempfile::Builder::new()
             .prefix(&format!("micromux-mcp-{prefix}-"))
             .tempdir()?)
     }
 
-    fn boot(
-        runtime_dir: &Path,
-        name: &str,
-        config_path: &Path,
-    ) -> color_eyre::eyre::Result<Running> {
+    fn boot(runtime_dir: &Path, name: &str, config_path: &Path) -> eyre::Result<Running> {
         boot_at_endpoint(&endpoint_for(runtime_dir, config_path), name, config_path)
     }
 
@@ -332,7 +329,7 @@ mod tests {
         endpoint: &ControlEndpoint,
         name: &str,
         config_path: &Path,
-    ) -> color_eyre::eyre::Result<Running> {
+    ) -> eyre::Result<Running> {
         boot_at_endpoint_with_working_dir(endpoint, name, config_path, Path::new("."))
     }
 
@@ -341,17 +338,17 @@ mod tests {
         name: &str,
         config_path: &Path,
         working_dir: &Path,
-    ) -> color_eyre::eyre::Result<Running> {
+    ) -> eyre::Result<Running> {
         let yaml = "version: 1\nservices:\n  svc:\n    command: [\"sh\", \"-c\", \"sleep 60\"]\n";
         let mut diagnostics = vec![];
         let config = micromux::from_str(yaml, working_dir, 0usize, None, &mut diagnostics)
-            .map_err(|err| color_eyre::eyre::eyre!("parse: {err}"))?;
+            .map_err(|err| eyre::eyre!("parse: {err}"))?;
         let mux = Arc::new(micromux::Micromux::new(&config)?);
         let shutdown = CancellationToken::new();
         let (runner, handles) = mux.clone().start(shutdown.clone());
         let runner = tokio::spawn(runner);
 
-        let guard = bind(endpoint)?.ok_or_else(|| color_eyre::eyre::eyre!("bind failed"))?;
+        let guard = bind(endpoint)?.ok_or_else(|| eyre::eyre!("bind failed"))?;
         let identity = SessionIdentity::new(name.to_string(), working_dir, config_path);
         let server = Arc::new(ControlServer::new(
             handles.reader.clone(),
@@ -372,7 +369,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolves_by_name_skips_dead_and_detects_ambiguity() -> color_eyre::eyre::Result<()> {
+    async fn resolves_by_name_skips_dead_and_detects_ambiguity() -> eyre::Result<()> {
         let runtime_dir = temp_dir("select")?;
         let config_a = runtime_dir.path().join("proj-a/micromux.yaml");
         let alpha = boot(runtime_dir.path(), "alpha", &config_a)?;
@@ -410,7 +407,7 @@ mod tests {
 
     #[tokio::test]
     async fn current_selector_checks_later_runtime_dirs_after_unreachable_endpoint()
-    -> color_eyre::eyre::Result<()> {
+    -> eyre::Result<()> {
         let first_runtime = temp_dir("current-first")?;
         let second_runtime = temp_dir("current-second")?;
         let project_dir = temp_dir("current-project")?;
@@ -423,7 +420,7 @@ mod tests {
 
         let ControlEndpoint::Unix(garbage_path) = endpoint_for(first_runtime.path(), &config_path)
         else {
-            color_eyre::eyre::bail!("expected unix endpoint");
+            eyre::bail!("expected unix endpoint");
         };
         let listener = tokio::net::UnixListener::bind(&garbage_path)?;
         let garbage = tokio::spawn(async move {
@@ -457,7 +454,7 @@ mod tests {
 
     #[tokio::test]
     async fn current_selector_scans_for_unique_session_when_direct_endpoint_is_unusable()
-    -> color_eyre::eyre::Result<()> {
+    -> eyre::Result<()> {
         let runtime_dir = temp_dir("current-scan-fallback")?;
         let project_dir = temp_dir("current-scan-fallback-project")?;
         std::fs::write(
@@ -468,7 +465,7 @@ mod tests {
 
         let ControlEndpoint::Unix(direct_path) = endpoint_for(runtime_dir.path(), &config_path)
         else {
-            color_eyre::eyre::bail!("expected unix endpoint");
+            eyre::bail!("expected unix endpoint");
         };
         let listener = tokio::net::UnixListener::bind(&direct_path)?;
         let garbage = tokio::spawn(async move {
@@ -503,7 +500,7 @@ mod tests {
 
     #[tokio::test]
     async fn current_selector_scans_for_unique_subconfig_when_current_config_is_absent()
-    -> color_eyre::eyre::Result<()> {
+    -> eyre::Result<()> {
         let runtime_dir = temp_dir("current-subconfig-fallback")?;
         let project_dir = temp_dir("current-subconfig-project")?;
         std::fs::create_dir(project_dir.path().join("tools"))?;
@@ -545,8 +542,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn current_selector_rejects_malformed_current_config_protocol_version()
-    -> color_eyre::eyre::Result<()> {
+    async fn current_selector_rejects_malformed_current_config_protocol_version() -> eyre::Result<()>
+    {
         let runtime_dir = temp_dir("current-malformed-protocol-no-subconfig-fallback")?;
         let project_dir = temp_dir("current-malformed-protocol-project")?;
         std::fs::create_dir(project_dir.path().join("tools"))?;
@@ -563,7 +560,7 @@ mod tests {
 
         let ControlEndpoint::Unix(direct_path) = endpoint_for(runtime_dir.path(), &current_config)
         else {
-            color_eyre::eyre::bail!("expected unix endpoint");
+            eyre::bail!("expected unix endpoint");
         };
         let listener = tokio::net::UnixListener::bind(&direct_path)?;
         let malformed_response = serde_json::to_vec(&serde_json::json!({
@@ -608,7 +605,7 @@ mod tests {
         let resolved =
             resolve_in_dirs(&runtime_dirs, &dir_statuses, project_dir.path(), None).await;
         let Err(ToolError::Busy(message)) = resolved else {
-            color_eyre::eyre::bail!("expected malformed current config socket to block fallback");
+            eyre::bail!("expected malformed current config socket to block fallback");
         };
         assert!(message.contains("the current config"));
         assert!(message.contains("invalid type"));
@@ -620,7 +617,7 @@ mod tests {
 
     #[tokio::test]
     async fn current_selector_does_not_retarget_on_current_config_protocol_mismatch()
-    -> color_eyre::eyre::Result<()> {
+    -> eyre::Result<()> {
         let runtime_dir = temp_dir("current-protocol-mismatch-no-subconfig-fallback")?;
         let project_dir = temp_dir("current-protocol-mismatch-project")?;
         std::fs::create_dir(project_dir.path().join("tools"))?;
@@ -637,7 +634,7 @@ mod tests {
 
         let ControlEndpoint::Unix(direct_path) = endpoint_for(runtime_dir.path(), &current_config)
         else {
-            color_eyre::eyre::bail!("expected unix endpoint");
+            eyre::bail!("expected unix endpoint");
         };
         let listener = tokio::net::UnixListener::bind(&direct_path)?;
         let mismatched_response = serde_json::to_vec(&serde_json::json!({
@@ -682,7 +679,7 @@ mod tests {
         let resolved =
             resolve_in_dirs(&runtime_dirs, &dir_statuses, project_dir.path(), None).await;
         let Err(ToolError::Busy(message)) = resolved else {
-            color_eyre::eyre::bail!("expected protocol mismatch to block fallback");
+            eyre::bail!("expected protocol mismatch to block fallback");
         };
         assert!(message.contains("the current config"));
         assert!(message.contains("protocol mismatch"));
@@ -694,7 +691,7 @@ mod tests {
 
     #[tokio::test]
     async fn current_selector_does_not_retarget_to_subconfig_when_current_config_is_busy()
-    -> color_eyre::eyre::Result<()> {
+    -> eyre::Result<()> {
         let runtime_dir = temp_dir("current-busy-no-subconfig-fallback")?;
         let project_dir = temp_dir("current-busy-project")?;
         std::fs::create_dir(project_dir.path().join("tools"))?;
@@ -711,7 +708,7 @@ mod tests {
 
         let ControlEndpoint::Unix(direct_path) = endpoint_for(runtime_dir.path(), &current_config)
         else {
-            color_eyre::eyre::bail!("expected unix endpoint");
+            eyre::bail!("expected unix endpoint");
         };
         let listener = tokio::net::UnixListener::bind(&direct_path)?;
         let garbage = tokio::spawn(async move {
@@ -742,7 +739,7 @@ mod tests {
         let resolved =
             resolve_in_dirs(&runtime_dirs, &dir_statuses, project_dir.path(), None).await;
         let Err(ToolError::Busy(message)) = resolved else {
-            color_eyre::eyre::bail!("expected busy current config");
+            eyre::bail!("expected busy current config");
         };
         assert!(message.contains("the current config"));
 
@@ -752,8 +749,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn current_selector_reports_ambiguous_same_config_across_runtime_dirs()
-    -> color_eyre::eyre::Result<()> {
+    async fn current_selector_reports_ambiguous_same_config_across_runtime_dirs() -> eyre::Result<()>
+    {
         let first_runtime = temp_dir("current-ambiguous-first")?;
         let second_runtime = temp_dir("current-ambiguous-second")?;
         let project_dir = temp_dir("current-ambiguous-project")?;
@@ -781,7 +778,7 @@ mod tests {
         let resolved =
             resolve_in_dirs(&runtime_dirs, &dir_statuses, project_dir.path(), None).await;
         let Err(ToolError::Ambiguous(message)) = resolved else {
-            color_eyre::eyre::bail!("expected ambiguous current session");
+            eyre::bail!("expected ambiguous current session");
         };
         assert_eq!(
             message,
@@ -794,8 +791,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn current_selector_dedupes_aliases_to_the_same_session() -> color_eyre::eyre::Result<()>
-    {
+    async fn current_selector_dedupes_aliases_to_the_same_session() -> eyre::Result<()> {
         let runtime_dir = temp_dir("current-aliased")?;
         let project_dir = temp_dir("current-aliased-project")?;
         std::fs::write(
@@ -911,8 +907,7 @@ mod tests {
     }
 
     #[test]
-    fn session_config_path_match_accepts_current_dir_descendant_configs()
-    -> color_eyre::eyre::Result<()> {
+    fn session_config_path_match_accepts_current_dir_descendant_configs() -> eyre::Result<()> {
         let project_dir = tempfile::tempdir()?;
         let nested_dir = project_dir.path().join("tools");
         std::fs::create_dir(&nested_dir)?;
@@ -958,8 +953,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn already_running_reports_a_live_session_and_skips_a_dead_endpoint()
-    -> color_eyre::eyre::Result<()> {
+    async fn already_running_reports_a_live_session_and_skips_a_dead_endpoint() -> eyre::Result<()>
+    {
         let runtime_dir = temp_dir("already-running")?;
         let config_path = runtime_dir.path().join("proj/micromux.yaml");
         let session = boot(runtime_dir.path(), "live", &config_path)?;
@@ -976,7 +971,7 @@ mod tests {
 
         let garbage = ControlEndpoint::Unix(runtime_dir.path().join("garbage.sock"));
         let ControlEndpoint::Unix(garbage_path) = &garbage else {
-            color_eyre::eyre::bail!("expected unix endpoint");
+            eyre::bail!("expected unix endpoint");
         };
         let listener = tokio::net::UnixListener::bind(garbage_path)?;
         let garbage_task = tokio::spawn(async move {
@@ -995,7 +990,7 @@ mod tests {
 
         let locked_garbage = ControlEndpoint::Unix(runtime_dir.path().join("locked-garbage.sock"));
         let ControlEndpoint::Unix(locked_garbage_path) = &locked_garbage else {
-            color_eyre::eyre::bail!("expected unix endpoint");
+            eyre::bail!("expected unix endpoint");
         };
         let locked_listener = tokio::net::UnixListener::bind(locked_garbage_path)?;
         let lock_file = std::fs::OpenOptions::new()
@@ -1014,14 +1009,14 @@ mod tests {
         let endpoints = vec![locked_garbage.clone()];
         let locked_report = crate::already_running_any(&endpoints, &config_path)
             .await?
-            .ok_or_else(|| color_eyre::eyre::eyre!("expected lock-held owner report"))?;
+            .ok_or_else(|| eyre::eyre!("expected lock-held owner report"))?;
         assert_eq!(locked_report.reachable, Some(false));
 
         let endpoint = endpoint_for(runtime_dir.path(), &config_path);
         let endpoints = vec![garbage, endpoint];
         let report = crate::already_running_any(&endpoints, &config_path)
             .await?
-            .ok_or_else(|| color_eyre::eyre::eyre!("expected existing session report"))?;
+            .ok_or_else(|| eyre::eyre!("expected existing session report"))?;
         assert_eq!(report.session.as_deref(), Some("live"));
 
         // A project with no listener is free to start.
@@ -1043,7 +1038,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn already_running_reports_ambiguous_distinct_sessions() -> color_eyre::eyre::Result<()> {
+    async fn already_running_reports_ambiguous_distinct_sessions() -> eyre::Result<()> {
         let first_runtime = temp_dir("already-running-ambiguous-first")?;
         let second_runtime = temp_dir("already-running-ambiguous-second")?;
         let project_dir = temp_dir("already-running-ambiguous-project")?;

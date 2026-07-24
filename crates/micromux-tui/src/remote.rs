@@ -733,6 +733,7 @@ fn publish(changes: &broadcast::Sender<SessionChange>, change: SessionChange) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use color_eyre::eyre;
     use micromux::RestartPolicy;
     use similar_asserts::assert_eq;
 
@@ -829,7 +830,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn discontinuity_clears_the_cache_and_retails() -> color_eyre::eyre::Result<()> {
+    async fn discontinuity_clears_the_cache_and_retails() -> eyre::Result<()> {
         let store = store_with(entry_with_log(10, "old"));
         let mut request = ScriptedConnection::new([
             Response::Logs {
@@ -862,7 +863,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn empty_incremental_page_clears_the_cache_and_retails() -> color_eyre::eyre::Result<()> {
+    async fn empty_incremental_page_clears_the_cache_and_retails() -> eyre::Result<()> {
         let store = store_with(entry_with_log(10, "old incarnation"));
         let mut request = ScriptedConnection::new([
             Response::Logs {
@@ -921,8 +922,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn same_sequence_snapshot_reaches_logs_since_through_the_mirror()
-    -> color_eyre::eyre::Result<()> {
+    async fn same_sequence_snapshot_reaches_logs_since_through_the_mirror() -> eyre::Result<()> {
         let store = store_with(entry_with_log(7, "frame one"));
         let mut request = ScriptedConnection::new([Response::Logs {
             lines: vec![line(7, "frame two")],
@@ -946,7 +946,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refresh_stores_before_it_notifies() -> color_eyre::eyre::Result<()> {
+    async fn refresh_stores_before_it_notifies() -> eyre::Result<()> {
         let store = store_with(entry_with_log(1, "line"));
         let mut request = ScriptedConnection::new([Response::Services(vec![snapshot("svc", 2)])]);
         let (changes, _) = broadcast::channel(8);
@@ -973,8 +973,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_wide_roster_change_reconciles_without_service_lookup()
-    -> color_eyre::eyre::Result<()> {
+    async fn session_wide_roster_change_reconciles_without_service_lookup() -> eyre::Result<()> {
         let store = store_with(entry_with_log(1, "line"));
         let mut request = ScriptedConnection::new([Response::Services(Vec::new())]);
         let (changes, _) = broadcast::channel(8);

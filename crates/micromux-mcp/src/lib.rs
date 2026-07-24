@@ -2899,6 +2899,7 @@ mod tests {
         MergedFollowPage, follow_all_after_seq, follow_gap, merge_follow_pages, next_follow_cursor,
         truncate_wait_matches,
     };
+    use color_eyre::eyre;
     use micromux::{
         Desired, Execution, HealthAttempt, LogLine, ServiceCommandAck, ServiceSnapshot,
     };
@@ -2927,13 +2928,13 @@ mod tests {
     #[cfg(unix)]
     struct RunningMcpSession {
         shutdown: micromux::CancellationToken,
-        runner: Option<tokio::task::JoinHandle<color_eyre::eyre::Result<()>>>,
+        runner: Option<tokio::task::JoinHandle<Result<(), micromux::Error>>>,
         server: Option<tokio::task::JoinHandle<Result<(), micromux_control::ControlError>>>,
     }
 
     #[cfg(unix)]
     impl RunningMcpSession {
-        async fn finish(mut self) -> color_eyre::eyre::Result<()> {
+        async fn finish(mut self) -> eyre::Result<()> {
             self.shutdown.cancel();
             if let Some(runner) = self.runner.take() {
                 runner.await??;
@@ -2955,7 +2956,7 @@ mod tests {
     #[cfg(unix)]
     fn boot_dynamic_mcp_session(
         project_dir: &std::path::Path,
-    ) -> color_eyre::eyre::Result<(RunningMcpSession, String)> {
+    ) -> eyre::Result<(RunningMcpSession, String)> {
         let yaml = r#"version: 1
 control:
   dynamic_services:
@@ -2978,13 +2979,13 @@ services:
         project_dir: &std::path::Path,
         name: &str,
         yaml: &str,
-    ) -> color_eyre::eyre::Result<(RunningMcpSession, String)> {
+    ) -> eyre::Result<(RunningMcpSession, String)> {
         let config_path = project_dir.join("micromux.yaml");
         std::fs::write(&config_path, yaml)?;
         let config_path = std::fs::canonicalize(config_path)?;
         let mut diagnostics = Vec::new();
         let mut config = micromux::from_str(yaml, project_dir, 0usize, None, &mut diagnostics)
-            .map_err(|err| color_eyre::eyre::eyre!("parse config: {err}"))?;
+            .map_err(|err| eyre::eyre!("parse config: {err}"))?;
         config.config_path = Some(config_path.clone());
 
         let mux = Arc::new(micromux::Micromux::new(&config)?);
@@ -2996,10 +2997,10 @@ services:
             micromux_control::usable_runtime_dirs(&micromux_control::runtime_dir_statuses());
         let runtime_dir = runtime_dirs
             .first()
-            .ok_or_else(|| color_eyre::eyre::eyre!("no usable control runtime directory"))?;
+            .ok_or_else(|| eyre::eyre!("no usable control runtime directory"))?;
         let endpoint = micromux_control::endpoint_for(runtime_dir, &config_path);
         let guard = micromux_control::bind(&endpoint)?
-            .ok_or_else(|| color_eyre::eyre::eyre!("control endpoint is already owned"))?;
+            .ok_or_else(|| eyre::eyre!("control endpoint is already owned"))?;
         let identity =
             micromux_control::SessionIdentity::new(name.to_string(), project_dir, &config_path);
         let selector = format!("hash:{}", identity.id);
@@ -3054,10 +3055,7 @@ services:
     }
 
     #[cfg(unix)]
-    async fn dynamic_log_visible(
-        server: &McpServer,
-        selector: &str,
-    ) -> color_eyre::eyre::Result<bool> {
+    async fn dynamic_log_visible(server: &McpServer, selector: &str) -> eyre::Result<bool> {
         let result = server
             .get_logs(Parameters(LogsArgs {
                 service: "debug".to_string(),
@@ -3076,7 +3074,7 @@ services:
                 },
             }))
             .await
-            .map_err(|err| color_eyre::eyre::eyre!(err.message))?;
+            .map_err(|err| eyre::eyre!(err.message))?;
         let Json(result) = result;
         Ok(result
             .entries
@@ -3088,7 +3086,7 @@ services:
     async fn assert_dynamic_renewal_and_events(
         server: &McpServer,
         selector: &str,
-    ) -> color_eyre::eyre::Result<()> {
+    ) -> eyre::Result<()> {
         let Json(renewed) = server
             .renew_dynamic_service(Parameters(RenewDynamicServiceArgs {
                 service: "debug".to_string(),
@@ -3097,7 +3095,7 @@ services:
                 session: Some(selector.to_string()),
             }))
             .await
-            .map_err(|err| color_eyre::eyre::eyre!(err.message))?;
+            .map_err(|err| eyre::eyre!(err.message))?;
         assert_eq!(renewed.receipt.revision, 1);
 
         let Json(events) = server
@@ -3109,9 +3107,9 @@ services:
                 tail: Some(20),
             }))
             .await
-            .map_err(|err| color_eyre::eyre::eyre!(err.message))?;
+            .map_err(|err| eyre::eyre!(err.message))?;
         let ServiceEventsResult::Single(events) = events else {
-            color_eyre::eyre::bail!("single-service event request returned a session-wide page");
+            eyre::bail!("single-service event request returned a session-wide page");
         };
         assert!(
             events
@@ -3131,10 +3129,7 @@ services:
     }
 
     #[cfg(unix)]
-    async fn start_event_test_services(
-        server: &McpServer,
-        selector: &str,
-    ) -> color_eyre::eyre::Result<()> {
+    async fn start_event_test_services(server: &McpServer, selector: &str) -> eyre::Result<()> {
         for service in ["first", "second"] {
             let idempotency_key = format!("create-{service}");
             server
@@ -3147,7 +3142,7 @@ services:
                     ),
                 }))
                 .await
-                .map_err(|err| color_eyre::eyre::eyre!(err.message))?;
+                .map_err(|err| eyre::eyre!(err.message))?;
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
         Ok(())
@@ -3159,7 +3154,7 @@ services:
         selector: &str,
         services: &[&str],
         lease_secs: u64,
-    ) -> color_eyre::eyre::Result<()> {
+    ) -> eyre::Result<()> {
         for service in services {
             server
                 .renew_dynamic_service(Parameters(RenewDynamicServiceArgs {
@@ -3169,7 +3164,7 @@ services:
                     session: Some(selector.to_string()),
                 }))
                 .await
-                .map_err(|err| color_eyre::eyre::eyre!(err.message))?;
+                .map_err(|err| eyre::eyre!(err.message))?;
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
         Ok(())
@@ -3180,7 +3175,7 @@ services:
         server: &McpServer,
         selector: &str,
         after: Option<BTreeMap<String, u64>>,
-    ) -> color_eyre::eyre::Result<SessionServiceEventsResult> {
+    ) -> eyre::Result<SessionServiceEventsResult> {
         let Json(page) = server
             .get_service_events(Parameters(ServiceEventsArgs {
                 service: "*".to_string(),
@@ -3190,17 +3185,15 @@ services:
                 tail: Some(micromux::EVENT_HISTORY),
             }))
             .await
-            .map_err(|err| color_eyre::eyre::eyre!(err.message))?;
+            .map_err(|err| eyre::eyre!(err.message))?;
         let ServiceEventsResult::Session(page) = page else {
-            color_eyre::eyre::bail!("wildcard event request returned a single-service page");
+            eyre::bail!("wildcard event request returned a single-service page");
         };
         Ok(page)
     }
 
     #[cfg(unix)]
-    fn assert_initial_event_page(
-        page: &SessionServiceEventsResult,
-    ) -> color_eyre::eyre::Result<()> {
+    fn assert_initial_event_page(page: &SessionServiceEventsResult) -> eyre::Result<()> {
         assert!(!page.truncated);
         assert!(page.events.windows(2).all(|events| {
             let left = &events[0];
@@ -3287,8 +3280,7 @@ services:
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn session_events_merge_and_page_with_per_service_cursors() -> color_eyre::eyre::Result<()>
-    {
+    async fn session_events_merge_and_page_with_per_service_cursors() -> eyre::Result<()> {
         let project = tempfile::tempdir()?;
         let (session, selector) = boot_dynamic_mcp_session(project.path())?;
         let mut server = McpServer::new();
@@ -3314,7 +3306,7 @@ services:
             }))
             .await
             .err()
-            .ok_or_else(|| color_eyre::eyre::eyre!("wildcard scalar cursor was accepted"))?;
+            .ok_or_else(|| eyre::eyre!("wildcard scalar cursor was accepted"))?;
         assert!(invalid.message.contains("after_seq is service-scoped"));
 
         session.finish().await?;
@@ -3322,13 +3314,13 @@ services:
     }
 
     #[test]
-    fn server_builds_typed_tool_schemas() -> color_eyre::Result<()> {
+    fn server_builds_typed_tool_schemas() -> eyre::Result<()> {
         let server = McpServer::new();
         let tools = server.tool_router.list_all();
         let restart = tools
             .iter()
             .find(|tool| tool.name == "restart_service_and_wait")
-            .ok_or_else(|| color_eyre::eyre::eyre!("missing restart_service_and_wait tool"))?;
+            .ok_or_else(|| eyre::eyre!("missing restart_service_and_wait tool"))?;
         assert!(
             restart
                 .description
@@ -3339,7 +3331,7 @@ services:
             .input_schema
             .get("properties")
             .and_then(serde_json::Value::as_object)
-            .ok_or_else(|| color_eyre::eyre::eyre!("missing input properties"))?;
+            .ok_or_else(|| eyre::eyre!("missing input properties"))?;
         assert!(input_properties.contains_key("service"));
         assert!(input_properties.contains_key("timeout_secs"));
         assert!(input_properties.contains_key("log_limit"));
@@ -3378,7 +3370,7 @@ services:
                 .iter()
                 .find(|tool| tool.name == name)
                 .and_then(|tool| tool.description.as_deref())
-                .ok_or_else(|| color_eyre::eyre::eyre!("missing {name} description"))?;
+                .ok_or_else(|| eyre::eyre!("missing {name} description"))?;
             assert!(description.contains("from_service equal to service"));
             assert!(description.contains("extra_args re-append"));
         }
@@ -3405,7 +3397,7 @@ services:
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn get_health_history_returns_attempts_oldest_first() -> color_eyre::eyre::Result<()> {
+    async fn get_health_history_returns_attempts_oldest_first() -> eyre::Result<()> {
         let project = tempfile::tempdir()?;
         let yaml = r#"version: 1
 services:
@@ -3431,12 +3423,12 @@ services:
                     session: Some(selector.clone()),
                 }))
                 .await
-                .map_err(|err| color_eyre::eyre::eyre!("get_health_history: {err:?}"))?;
+                .map_err(|err| eyre::eyre!("get_health_history: {err:?}"))?;
             if result.attempts.len() >= 2 {
                 break result;
             }
             if tokio::time::Instant::now() >= deadline {
-                color_eyre::eyre::bail!("healthcheck history did not accumulate two attempts");
+                eyre::bail!("healthcheck history did not accumulate two attempts");
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         };
@@ -3453,7 +3445,7 @@ services:
             .attempts
             .iter()
             .find(|attempt| attempt.result.is_some())
-            .ok_or_else(|| color_eyre::eyre::eyre!("no completed attempt in history"))?;
+            .ok_or_else(|| eyre::eyre!("no completed attempt in history"))?;
         assert!(
             completed
                 .output
@@ -3465,7 +3457,7 @@ services:
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn reconcile_config_round_trips_through_the_mcp_tool() -> color_eyre::eyre::Result<()> {
+    async fn reconcile_config_round_trips_through_the_mcp_tool() -> eyre::Result<()> {
         let project = tempfile::tempdir()?;
         let (session, selector) = boot_dynamic_mcp_session(project.path())?;
         let mut server = McpServer::new();
@@ -3496,7 +3488,7 @@ services:
                 dry_run: true,
             }))
             .await
-            .map_err(|err| color_eyre::eyre::eyre!(err.message))?;
+            .map_err(|err| eyre::eyre!(err.message))?;
         assert!(dry_run.dry_run);
         assert!(!dry_run.session_ref.id.is_empty());
         assert_eq!(dry_run.actions.len(), 1);
@@ -3514,7 +3506,7 @@ services:
                 session: Some(selector.clone()),
             }))
             .await
-            .map_err(|err| color_eyre::eyre::eyre!(err.message))?;
+            .map_err(|err| eyre::eyre!(err.message))?;
         assert!(
             before_apply
                 .services
@@ -3528,7 +3520,7 @@ services:
                 dry_run: false,
             }))
             .await
-            .map_err(|err| color_eyre::eyre::eyre!(err.message))?;
+            .map_err(|err| eyre::eyre!(err.message))?;
         assert!(!applied.dry_run);
         assert_eq!(applied.actions, dry_run.actions);
         let Json(after_apply) = server
@@ -3536,7 +3528,7 @@ services:
                 session: Some(selector),
             }))
             .await
-            .map_err(|err| color_eyre::eyre::eyre!(err.message))?;
+            .map_err(|err| eyre::eyre!(err.message))?;
         assert!(
             after_apply
                 .services
@@ -3578,8 +3570,8 @@ services:
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn start_dynamic_and_wait_returns_success_failure_and_replay_context()
-    -> color_eyre::eyre::Result<()> {
+    async fn start_dynamic_and_wait_returns_success_failure_and_replay_context() -> eyre::Result<()>
+    {
         let project = tempfile::tempdir()?;
         let (session, selector) = boot_dynamic_mcp_session(project.path())?;
         let mut server = McpServer::new();
@@ -3612,7 +3604,7 @@ services:
                 log_limit: Some(20),
             }))
             .await
-            .map_err(|err| color_eyre::eyre::eyre!(err.message))?;
+            .map_err(|err| eyre::eyre!(err.message))?;
         assert!(matches!(healthy.outcome.status, WaitStatus::Healthy));
         assert!(
             healthy
@@ -3630,7 +3622,7 @@ services:
                 log_limit: Some(20),
             }))
             .await
-            .map_err(|err| color_eyre::eyre::eyre!(err.message))?;
+            .map_err(|err| eyre::eyre!(err.message))?;
         assert!(replayed.receipt.idempotent_replay);
         assert!(matches!(replayed.outcome.status, WaitStatus::Healthy));
 
@@ -3647,7 +3639,7 @@ services:
                 log_limit: Some(20),
             }))
             .await
-            .map_err(|err| color_eyre::eyre::eyre!(err.message))?;
+            .map_err(|err| eyre::eyre!(err.message))?;
         assert!(matches!(failed.outcome.status, WaitStatus::Exited));
         assert_eq!(failed.snapshot.last_exit_code, Some(-1));
         assert!(failed.diagnosis.is_some());
@@ -3664,8 +3656,7 @@ services:
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn wait_for_exit_returns_job_output_times_out_and_rejects_disabled()
-    -> color_eyre::eyre::Result<()> {
+    async fn wait_for_exit_returns_job_output_times_out_and_rejects_disabled() -> eyre::Result<()> {
         let project = tempfile::tempdir()?;
         let (session, selector) = boot_dynamic_mcp_session(project.path())?;
         let mut server = McpServer::new();
@@ -3677,7 +3668,7 @@ services:
                 params,
             }))
             .await
-            .map_err(|err| color_eyre::eyre::eyre!(err.message))?;
+            .map_err(|err| eyre::eyre!(err.message))?;
 
         let Json(exited) = server
             .wait_for_exit(Parameters(WaitForExitArgs {
@@ -3688,7 +3679,7 @@ services:
                 log_limit: Some(20),
             }))
             .await
-            .map_err(|err| color_eyre::eyre::eyre!(err.message))?;
+            .map_err(|err| eyre::eyre!(err.message))?;
         assert!(matches!(exited.status, WaitForExitStatus::Exited));
         assert_eq!(exited.exit_code, Some(3));
         assert!(exited.logs.iter().any(|entry| entry.line.contains("done")));
@@ -3702,7 +3693,7 @@ services:
                 log_limit: Some(20),
             }))
             .await
-            .map_err(|err| color_eyre::eyre::eyre!(err.message))?;
+            .map_err(|err| eyre::eyre!(err.message))?;
         assert!(matches!(timed_out.status, WaitForExitStatus::Timeout));
         assert_eq!(timed_out.exit_code, None);
 
@@ -3716,7 +3707,7 @@ services:
             }))
             .await
             .err()
-            .ok_or_else(|| color_eyre::eyre::eyre!("disabled service unexpectedly waited"))?;
+            .ok_or_else(|| eyre::eyre!("disabled service unexpectedly waited"))?;
         assert!(disabled.message.contains("disabled with no qualifying run"));
 
         session.finish().await?;
@@ -3753,15 +3744,12 @@ services:
         }
     }
 
-    fn assert_json_keys(
-        value: &impl serde::Serialize,
-        expected: &[&str],
-    ) -> color_eyre::eyre::Result<()> {
+    fn assert_json_keys(value: &impl serde::Serialize, expected: &[&str]) -> eyre::Result<()> {
         let value = serde_json::to_value(value)?;
         let mut actual = value
             .as_object()
             .map(|object| object.keys().map(String::as_str).collect::<Vec<_>>())
-            .ok_or_else(|| color_eyre::eyre::eyre!("receipt did not serialize as an object"))?;
+            .ok_or_else(|| eyre::eyre!("receipt did not serialize as an object"))?;
         actual.sort_unstable();
         let mut expected = expected.to_vec();
         expected.sort_unstable();
@@ -3770,12 +3758,12 @@ services:
     }
 
     #[test]
-    fn dynamic_capability_preflight_names_the_target_config() -> color_eyre::Result<()> {
+    fn dynamic_capability_preflight_names_the_target_config() -> eyre::Result<()> {
         let info = session_info("h", &["svc"]);
 
         let error = McpServer::require_dynamic_capability(&info)
             .err()
-            .ok_or_else(|| color_eyre::eyre::eyre!("missing capability was accepted"))?;
+            .ok_or_else(|| eyre::eyre!("missing capability was accepted"))?;
 
         assert!(error.message.contains("PolicyDenied"));
         assert!(error.message.contains("/w/micromux.yaml"));
@@ -3784,8 +3772,7 @@ services:
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn dynamic_service_lifecycle_crosses_the_mcp_tool_layer() -> color_eyre::eyre::Result<()>
-    {
+    async fn dynamic_service_lifecycle_crosses_the_mcp_tool_layer() -> eyre::Result<()> {
         let project = tempfile::tempdir()?;
         let (session, selector) = boot_dynamic_mcp_session(project.path())?;
         let mut server = McpServer::new();
@@ -3798,7 +3785,7 @@ services:
                 params: params.clone(),
             }))
             .await
-            .map_err(|err| color_eyre::eyre::eyre!(err.message))?;
+            .map_err(|err| eyre::eyre!(err.message))?;
         assert_eq!(created.receipt.service, "debug");
         assert_eq!(created.receipt.revision, 1);
         assert!(!created.receipt.idempotent_replay);
@@ -3809,7 +3796,7 @@ services:
                 params,
             }))
             .await
-            .map_err(|err| color_eyre::eyre::eyre!(err.message))?;
+            .map_err(|err| eyre::eyre!(err.message))?;
         assert!(replayed.receipt.idempotent_replay);
         assert_eq!(replayed.receipt.revision, created.receipt.revision);
 
@@ -3818,12 +3805,12 @@ services:
                 session: Some(selector.clone()),
             }))
             .await
-            .map_err(|err| color_eyre::eyre::eyre!(err.message))?;
+            .map_err(|err| eyre::eyre!(err.message))?;
         let dynamic = listed
             .services
             .iter()
             .find(|snapshot| snapshot.id == "debug")
-            .ok_or_else(|| color_eyre::eyre::eyre!("dynamic service is missing from roster"))?;
+            .ok_or_else(|| eyre::eyre!("dynamic service is missing from roster"))?;
         assert_eq!(dynamic.origin, micromux::OriginKind::Dynamic);
         assert_eq!(dynamic.dynamic.as_ref().map(|info| info.revision), Some(1));
 
@@ -3837,13 +3824,13 @@ services:
             }))
             .await
             .err()
-            .ok_or_else(|| color_eyre::eyre::eyre!("stale replacement was accepted"))?;
+            .ok_or_else(|| eyre::eyre!("stale replacement was accepted"))?;
         assert!(stale.message.contains("RevisionMismatch"));
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         while !dynamic_log_visible(&server, &selector).await? {
             if tokio::time::Instant::now() >= deadline {
-                color_eyre::eyre::bail!("dynamic service log did not become visible");
+                eyre::bail!("dynamic service log did not become visible");
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -3854,7 +3841,7 @@ services:
                 session: Some(selector.clone()),
             }))
             .await
-            .map_err(|err| color_eyre::eyre::eyre!(err.message))?;
+            .map_err(|err| eyre::eyre!(err.message))?;
         assert!(!stopped.receipt.already_retired);
 
         let Json(listed) = server
@@ -3862,7 +3849,7 @@ services:
                 session: Some(selector.clone()),
             }))
             .await
-            .map_err(|err| color_eyre::eyre::eyre!(err.message))?;
+            .map_err(|err| eyre::eyre!(err.message))?;
         let retired = listed
             .services
             .iter()
@@ -3877,8 +3864,7 @@ services:
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn ensure_ready_enables_waits_short_circuits_and_enriches_misses()
-    -> color_eyre::eyre::Result<()> {
+    async fn ensure_ready_enables_waits_short_circuits_and_enriches_misses() -> eyre::Result<()> {
         let project = tempfile::tempdir()?;
         let (session, selector) = boot_dynamic_mcp_session(project.path())?;
         let mut server = McpServer::new();
@@ -3893,7 +3879,7 @@ services:
                 log_limit: Some(2),
             }))
             .await
-            .map_err(|err| color_eyre::eyre::eyre!(err.message))?;
+            .map_err(|err| eyre::eyre!(err.message))?;
         assert!(matches!(
             enabled.actions.as_slice(),
             [
@@ -3918,7 +3904,7 @@ services:
                 log_limit: Some(2),
             }))
             .await
-            .map_err(|err| color_eyre::eyre::eyre!(err.message))?;
+            .map_err(|err| eyre::eyre!(err.message))?;
         assert!(already_ready.actions.is_empty());
         assert!(matches!(already_ready.outcome.status, WaitStatus::Healthy));
 
@@ -3932,7 +3918,7 @@ services:
             }))
             .await
             .err()
-            .ok_or_else(|| color_eyre::eyre::eyre!("unknown service was accepted"))?;
+            .ok_or_else(|| eyre::eyre!("unknown service was accepted"))?;
         assert!(missing.message.contains("UnknownService"));
         assert!(missing.message.contains("missing"));
 
@@ -3955,7 +3941,7 @@ services:
     }
 
     #[test]
-    fn mutation_result_serializes_flat_session_fields() -> color_eyre::Result<()> {
+    fn mutation_result_serializes_flat_session_fields() -> eyre::Result<()> {
         let result = MutationResult {
             session_ref: test_session_ref(),
             accepted: vec![ServiceCommandAck {
@@ -4000,7 +3986,7 @@ services:
     }
 
     #[test]
-    fn session_mutation_receipts_have_exact_flat_key_sets() -> color_eyre::Result<()> {
+    fn session_mutation_receipts_have_exact_flat_key_sets() -> eyre::Result<()> {
         let restart_all = SessionMutationResult {
             session_ref: test_session_ref(),
             accepted: Vec::new(),
@@ -4023,7 +4009,7 @@ services:
     }
 
     #[test]
-    fn dynamic_and_bundle_receipts_have_exact_flat_key_sets() -> color_eyre::Result<()> {
+    fn dynamic_and_bundle_receipts_have_exact_flat_key_sets() -> eyre::Result<()> {
         let dynamic = DynamicMutationResult {
             session_ref: test_session_ref(),
             receipt: micromux_control::DynamicServiceAck {
@@ -4108,7 +4094,7 @@ services:
     // The double-flattened bundles are exactly what these key-set pins protect: a colliding
     // field name in SessionRef, the ack, or the body would silently shadow on the wire.
     #[test]
-    fn wait_bundles_have_exact_flat_key_sets() -> color_eyre::Result<()> {
+    fn wait_bundles_have_exact_flat_key_sets() -> eyre::Result<()> {
         let start_bundle = StartDynamicAndWaitResult {
             session_ref: test_session_ref(),
             receipt: micromux_control::DynamicServiceAck {
@@ -4224,7 +4210,7 @@ services:
     }
 
     #[test]
-    fn wait_result_keeps_present_null_fields() -> color_eyre::Result<()> {
+    fn wait_result_keeps_present_null_fields() -> eyre::Result<()> {
         let exited = serde_json::to_value(WaitResult::exited("svc".to_string(), None, 7))?;
         assert!(
             exited

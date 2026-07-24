@@ -7,13 +7,55 @@
 //! user would keeps the screenshots honest and keeps all of this tooling out of the published
 //! crates.
 
-use color_eyre::eyre::{self, WrapErr as _, eyre};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use std::fmt::Write as _;
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant};
+
+#[derive(Debug, thiserror::Error)]
+enum Error {
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error("{operation}: {message}")]
+    Operation {
+        operation: &'static str,
+        message: String,
+    },
+    #[error("current executable has no parent directory")]
+    MissingExecutableParent,
+    #[error(
+        "micromux binary not found at {}; build it with `cargo build -p micromux-cli` or set MICROMUX_BIN\nworkspace: {}",
+        candidate.display(),
+        workspace.display()
+    )]
+    BinaryNotFound {
+        candidate: PathBuf,
+        workspace: PathBuf,
+    },
+    #[error("`freeze` not found; install it from https://github.com/charmbracelet/freeze")]
+    FreezeMissing,
+    #[error(
+        "micromux exited before capture (status: {status:?}); check the demo config in {}",
+        example_dir.display()
+    )]
+    EarlyExit {
+        status: portable_pty::ExitStatus,
+        example_dir: PathBuf,
+    },
+    #[error("freeze failed for {}", input.display())]
+    FreezeFailed { input: PathBuf },
+}
+
+impl Error {
+    fn operation(operation: &'static str, error: impl std::fmt::Display) -> Self {
+        Self::Operation {
+            operation,
+            message: error.to_string(),
+        }
+    }
+}
 
 /// A single screenshot to capture from the demo config.
 struct Scenario {
@@ -55,9 +97,7 @@ const SCENARIOS: &[Scenario] = &[
     },
 ];
 
-fn main() -> eyre::Result<()> {
-    color_eyre::install()?;
-
+fn main() -> Result<(), Error> {
     let workspace = workspace_dir()?;
     let micromux = micromux_bin(&workspace)?;
     let example_dir = workspace.join("examples").join("demo");
@@ -66,14 +106,13 @@ fn main() -> eyre::Result<()> {
     let images = workspace.join("docs").join("static").join("images");
 
     ensure_freeze()?;
-    std::fs::create_dir_all(&images).wrap_err("failed to create docs images directory")?;
+    std::fs::create_dir_all(&images)?;
 
     for scenario in SCENARIOS {
-        let ansi = capture(&micromux, &example_dir, scenario)
-            .wrap_err_with(|| format!("failed to capture scenario `{}`", scenario.name))?;
+        let ansi = capture(&micromux, &example_dir, scenario)?;
 
         let tmp = std::env::temp_dir().join(format!("micromux-screenshot-{}.ansi", scenario.name));
-        std::fs::write(&tmp, &ansi).wrap_err("failed to write captured ANSI")?;
+        std::fs::write(&tmp, &ansi)?;
 
         let png = images.join(format!("{}.png", scenario.name));
         run_freeze(&tmp, &png)?;
@@ -85,25 +124,22 @@ fn main() -> eyre::Result<()> {
 }
 
 /// Absolute path to the workspace root (this crate lives at `crates/micromux-screenshot`).
-fn workspace_dir() -> eyre::Result<PathBuf> {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
+fn workspace_dir() -> Result<PathBuf, Error> {
+    Ok(Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("..")
-        .canonicalize()
-        .wrap_err("failed to resolve workspace root")
+        .canonicalize()?)
 }
 
 /// Locate the `micromux` binary: `$MICROMUX_BIN` if set, otherwise the sibling of this tool's own
 /// executable (the same `target/<profile>` directory).
-fn micromux_bin(workspace: &Path) -> eyre::Result<PathBuf> {
+fn micromux_bin(workspace: &Path) -> Result<PathBuf, Error> {
     if let Some(path) = std::env::var_os("MICROMUX_BIN") {
         return Ok(PathBuf::from(path));
     }
 
-    let exe = std::env::current_exe().wrap_err("failed to resolve current executable")?;
-    let dir = exe
-        .parent()
-        .ok_or_else(|| eyre!("current executable has no parent directory"))?;
+    let exe = std::env::current_exe()?;
+    let dir = exe.parent().ok_or(Error::MissingExecutableParent)?;
     let name = if cfg!(windows) {
         "micromux.exe"
     } else {
@@ -114,16 +150,14 @@ fn micromux_bin(workspace: &Path) -> eyre::Result<PathBuf> {
         return Ok(candidate);
     }
 
-    Err(eyre!(
-        "micromux binary not found at {} — build it first with `cargo build -p micromux-cli` \
-         (or point $MICROMUX_BIN at it).\nworkspace: {}",
-        candidate.display(),
-        workspace.display()
-    ))
+    Err(Error::BinaryNotFound {
+        candidate,
+        workspace: workspace.to_path_buf(),
+    })
 }
 
 /// Fail early with a helpful message if `freeze` is not installed.
-fn ensure_freeze() -> eyre::Result<()> {
+fn ensure_freeze() -> Result<(), Error> {
     let ok = std::process::Command::new("freeze")
         .arg("--version")
         .stdout(std::process::Stdio::null())
@@ -134,15 +168,13 @@ fn ensure_freeze() -> eyre::Result<()> {
     if ok {
         Ok(())
     } else {
-        Err(eyre!(
-            "`freeze` not found — install it from https://github.com/charmbracelet/freeze"
-        ))
+        Err(Error::FreezeMissing)
     }
 }
 
 /// Run `micromux` in a PTY against `example_dir`, drive the scenario, and return the settled screen
 /// as a plain ANSI string (one row per line).
-fn capture(micromux: &Path, example_dir: &Path, scenario: &Scenario) -> eyre::Result<String> {
+fn capture(micromux: &Path, example_dir: &Path, scenario: &Scenario) -> Result<String, Error> {
     let pty = native_pty_system();
     let pair = pty
         .openpty(PtySize {
@@ -151,7 +183,7 @@ fn capture(micromux: &Path, example_dir: &Path, scenario: &Scenario) -> eyre::Re
             pixel_width: 0,
             pixel_height: 0,
         })
-        .map_err(|err| eyre!("failed to open pty: {err}"))?;
+        .map_err(|err| Error::operation("failed to open pty", err))?;
 
     let mut cmd = CommandBuilder::new(micromux);
     cmd.cwd(example_dir);
@@ -161,17 +193,17 @@ fn capture(micromux: &Path, example_dir: &Path, scenario: &Scenario) -> eyre::Re
     let mut child = pair
         .slave
         .spawn_command(cmd)
-        .map_err(|err| eyre!("failed to spawn micromux: {err}"))?;
+        .map_err(|err| Error::operation("failed to spawn micromux", err))?;
     drop(pair.slave);
 
     let mut reader = pair
         .master
         .try_clone_reader()
-        .map_err(|err| eyre!("failed to clone pty reader: {err}"))?;
+        .map_err(|err| Error::operation("failed to clone pty reader", err))?;
     let mut writer = pair
         .master
         .take_writer()
-        .map_err(|err| eyre!("failed to take pty writer: {err}"))?;
+        .map_err(|err| Error::operation("failed to take pty writer", err))?;
 
     let (tx, rx) = mpsc::channel::<Vec<u8>>();
     let reader_thread = std::thread::spawn(move || {
@@ -192,17 +224,14 @@ fn capture(micromux: &Path, example_dir: &Path, scenario: &Scenario) -> eyre::Re
 
     settle(&rx, &mut parser);
     if let Ok(Some(status)) = child.try_wait() {
-        return Err(eyre!(
-            "micromux exited before it could be captured (status: {status:?}); \
-             check the demo config in {}",
-            example_dir.display()
-        ));
+        return Err(Error::EarlyExit {
+            status,
+            example_dir: example_dir.to_path_buf(),
+        });
     }
 
     for keys in scenario.keys {
-        writer
-            .write_all(keys)
-            .wrap_err("failed to send keystroke")?;
+        writer.write_all(keys)?;
         writer.flush().ok();
         settle(&rx, &mut parser);
     }
@@ -414,7 +443,7 @@ fn wait_for_exit(child: &mut dyn portable_pty::Child) {
 }
 
 /// Render a captured ANSI file to a PNG with `freeze`, using window chrome that matches the docs.
-fn run_freeze(input: &Path, output: &Path) -> eyre::Result<()> {
+fn run_freeze(input: &Path, output: &Path) -> Result<(), Error> {
     let status = std::process::Command::new("freeze")
         .arg("--language")
         .arg("text")
@@ -428,12 +457,13 @@ fn run_freeze(input: &Path, output: &Path) -> eyre::Result<()> {
         .arg("--padding")
         .arg("20")
         .arg(input)
-        .status()
-        .wrap_err("failed to run freeze")?;
+        .status()?;
 
     if status.success() {
         Ok(())
     } else {
-        Err(eyre!("freeze failed for {}", input.display()))
+        Err(Error::FreezeFailed {
+            input: input.to_path_buf(),
+        })
     }
 }
