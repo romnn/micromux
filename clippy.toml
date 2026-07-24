@@ -6,6 +6,10 @@ allow-expect-in-tests = true
 allow-panic-in-tests = true
 allow-indexing-slicing-in-tests = true
 
+# Proper nouns that look like code identifiers but should not be backticked in prose.
+# `..` appends to clippy's built-in list instead of replacing it.
+doc-valid-idents = [".."]
+
 # Tests must assert equality with `similar_asserts::assert_eq`, which renders a
 # readable diff on failure instead of dumping two large opaque values. Import
 # `use similar_asserts::assert_eq;` in tests and call `assert_eq!`. This bans

@@ -2,10 +2,10 @@
 # Developer tools
 zig = "latest"
 task = "latest"
-ast-grep = "latest"
 typos = "latest"
 actionlint = "latest"
-goreleaser = "latest"
+"github:romnn/cooldown" = { version = "latest", minimum_release_age = "0" }
+"github:romnn/bumpversion" = { version = "latest", matching = "bumpversion", minimum_release_age = "0" }
 "aqua:charmbracelet/freeze" = "latest"
 
 # Documentation site (docs/, Hugo + hugo-book theme).
@@ -23,8 +23,8 @@ go = "latest"
 "aqua:rustsec/rustsec/cargo-audit" = "latest"
 "github:romnn/cargo-feature-combinations" = { version = "latest", matching = "cargo-fc", minimum_release_age = "0" }
 "github:est31/cargo-udeps" = "latest"
-"github:kbknapp/cargo-outdated" = "latest"
 "aqua:nextest-rs/nextest/cargo-nextest" = "latest"
 
 [settings]
 lockfile = true
+lockfile_platforms = ["linux-x64", "macos-arm64", "windows-x64"]

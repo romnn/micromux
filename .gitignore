@@ -3,12 +3,12 @@
 /plan
 
 # rust
-target/
+/target/
 
 # goreleaser
-target-goreleaser/
 goreleaser-dist/
 .intentionally-empty-file.o
+*_compiler_family.o
 
 # cooldown
 .cooldown.lock

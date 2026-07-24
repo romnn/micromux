@@ -51,12 +51,12 @@ struct_excessive_bools = "allow"
 
 [workspace.metadata.cargo-fc]
 install_missing_targets = true
-dedup = true
-aggregate_targets = true
+dedupe = true
+aggregate_targets = false
 targets = [
 	"x86_64-unknown-linux-gnu",
 	"x86_64-pc-windows-gnu",
-	"aarch64-apple-darwin"
+	"aarch64-apple-darwin",
 ]
 
 [workspace.metadata.cargo-fc.subcommands.lint]
