@@ -147,26 +147,26 @@ url = "https://github.com/romnn/bumpversion/releases/download/v0.0.9/bumpversion
 url_api = "https://api.github.com/repos/romnn/bumpversion/releases/assets/392595454"
 
 [[tools."github:romnn/cargo-feature-combinations"]]
-version = "0.4.1"
+version = "0.4.2"
 backend = "github:romnn/cargo-feature-combinations"
 
 [tools."github:romnn/cargo-feature-combinations".options]
 matching = "cargo-fc"
 
 [tools."github:romnn/cargo-feature-combinations"."platforms.linux-x64"]
-checksum = "sha256:dc90c539994bd13568b718ed214da4b031761cd36cf9c6d35b489fc665691cb6"
-url = "https://github.com/romnn/cargo-feature-combinations/releases/download/v0.4.1/cargo-fc_0.4.1_linux_amd64.tar.gz"
-url_api = "https://api.github.com/repos/romnn/cargo-feature-combinations/releases/assets/482530275"
+checksum = "sha256:6171d8159bd67a3385847cf36a70663c20c27224fc63fffca5280c8b0446c7e3"
+url = "https://github.com/romnn/cargo-feature-combinations/releases/download/v0.4.2/cargo-fc_0.4.2_linux_amd64.tar.gz"
+url_api = "https://api.github.com/repos/romnn/cargo-feature-combinations/releases/assets/492091514"
 
 [tools."github:romnn/cargo-feature-combinations"."platforms.macos-arm64"]
-checksum = "sha256:4469162078468909cab1de30839f3942cfe2ecabd97f021f7e4c140654cde112"
-url = "https://github.com/romnn/cargo-feature-combinations/releases/download/v0.4.1/cargo-fc_0.4.1_darwin_arm64.tar.gz"
-url_api = "https://api.github.com/repos/romnn/cargo-feature-combinations/releases/assets/482530283"
+checksum = "sha256:477daf33d5ce3eb256b8b1b433218c1c84064c2b31fd17ecd61e7ad9f06b80a4"
+url = "https://github.com/romnn/cargo-feature-combinations/releases/download/v0.4.2/cargo-fc_0.4.2_darwin_arm64.tar.gz"
+url_api = "https://api.github.com/repos/romnn/cargo-feature-combinations/releases/assets/492091522"
 
 [tools."github:romnn/cargo-feature-combinations"."platforms.windows-x64"]
-checksum = "sha256:cc641dd5bcc3dd1bb2d710299fb563ee08716a1bbcfc6e99a36c84db08d56e86"
-url = "https://github.com/romnn/cargo-feature-combinations/releases/download/v0.4.1/cargo-fc_0.4.1_windows_amd64.zip"
-url_api = "https://api.github.com/repos/romnn/cargo-feature-combinations/releases/assets/482530287"
+checksum = "sha256:34f62d3781305d5104f45ede34bd017e4fe7e267198564e82cbd46f72d063522"
+url = "https://github.com/romnn/cargo-feature-combinations/releases/download/v0.4.2/cargo-fc_0.4.2_windows_amd64.zip"
+url_api = "https://api.github.com/repos/romnn/cargo-feature-combinations/releases/assets/492091521"
 
 [[tools."github:romnn/cargo-watchdoc"]]
 version = "0.3.10"
@@ -188,23 +188,23 @@ url = "https://github.com/romnn/cargo-watchdoc/releases/download/v0.3.10/cargo-w
 url_api = "https://api.github.com/repos/romnn/cargo-watchdoc/releases/assets/392595130"
 
 [[tools."github:romnn/cooldown"]]
-version = "0.0.3"
+version = "0.0.12"
 backend = "github:romnn/cooldown"
 
 [tools."github:romnn/cooldown"."platforms.linux-x64"]
-checksum = "sha256:5aa65e42ab9c234486c165f506faa595d8450545b8385c23bb81529df5092f90"
-url = "https://github.com/romnn/cooldown/releases/download/v0.0.3/cooldown_0.0.3_linux_amd64.tar.gz"
-url_api = "https://api.github.com/repos/romnn/cooldown/releases/assets/461505483"
+checksum = "sha256:66da8dde98f0a2bceea6691ee68eb5e33383c6f266f34ba39230f69e478f6695"
+url = "https://github.com/romnn/cooldown/releases/download/v0.0.12/cooldown_0.0.12_linux_amd64.tar.gz"
+url_api = "https://api.github.com/repos/romnn/cooldown/releases/assets/488490542"
 
 [tools."github:romnn/cooldown"."platforms.macos-arm64"]
-checksum = "sha256:b12678ff4bb35973a439588b875ba25cc0e21d5cc46b08eb2d71bae45af3f2b7"
-url = "https://github.com/romnn/cooldown/releases/download/v0.0.3/cooldown_0.0.3_darwin_arm64.tar.gz"
-url_api = "https://api.github.com/repos/romnn/cooldown/releases/assets/461505484"
+checksum = "sha256:a1af8587c8f2e55059f9eaa51a85aab1e3e4abb2fd6c48c23ae57a510515f500"
+url = "https://github.com/romnn/cooldown/releases/download/v0.0.12/cooldown_0.0.12_darwin_arm64.tar.gz"
+url_api = "https://api.github.com/repos/romnn/cooldown/releases/assets/488490543"
 
 [tools."github:romnn/cooldown"."platforms.windows-x64"]
-checksum = "sha256:3f6cfa78109b7f3a1b8d0af70ad506c6bf06cec2651a652b36c5c0f44a986727"
-url = "https://github.com/romnn/cooldown/releases/download/v0.0.3/cooldown_0.0.3_windows_amd64.zip"
-url_api = "https://api.github.com/repos/romnn/cooldown/releases/assets/461505493"
+checksum = "sha256:4c7be9ef650113f5b88ca25361aedf1e55a40a81bcc5824a4803a1abc88842e8"
+url = "https://github.com/romnn/cooldown/releases/download/v0.0.12/cooldown_0.0.12_windows_amd64.zip"
+url_api = "https://api.github.com/repos/romnn/cooldown/releases/assets/488490561"
 
 [[tools."github:rust-cross/cargo-zigbuild"]]
 version = "0.23.0"
