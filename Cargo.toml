@@ -62,6 +62,9 @@ targets = [
 [workspace.metadata.cargo-fc.subcommands.lint]
 dedupe = true
 
+[workspace.metadata.cargo-fc.subcommands.udeps]
+maximal_features = true
+
 [profile.release]
 opt-level = 3
 lto = true
