@@ -11,8 +11,8 @@ Running `micromux` with no subcommand opens the TUI for the current project. It'
 
 ## Layout
 
-- **Sidebar** — every service, one row each, showing its lifecycle state: pending, starting, running, healthy, unhealthy, exited, or disabled. The selected row drives the panes on the right.
-- **Log pane** — the selected service's live output. ANSI color and interactive/redrawing output are supported.
+- **Sidebar** — every service, one row each, showing its lifecycle state: pending, blocked, starting, running, healthy, unhealthy, exited, or disabled. The selected row drives the panes on the right.
+- **Log pane** — the selected service's live output, annotated with the lifecycle transitions that stall it. ANSI color and interactive/redrawing output are supported.
 - **Healthcheck pane** — toggled with `H`, it shows the selected service's latest probe: the command, its exit status, and its output.
 
 ## Keybindings
@@ -39,6 +39,8 @@ Some processes want input — a REPL, a prompt, a dev server waiting on a keypre
 ## Disabling on the fly
 
 Press `d` to disable the selected service: micromux stops it and its row turns gray, while its captured logs remain for inspection. Press `d` again to re-enable and start it.
+
+Those preserved logs would otherwise look frozen, so micromux marks each transition in the log with a blue rule — `=== service disable requested ===`, `=== service enable requested ===`, `=== waiting for postgres to become healthy ===`, `=== automatic restart scheduled after 250 ms ===`. Whatever the log is doing, the last line says why. The same rules appear in `micromux ctl logs` and in the retained run files; the MCP log tools strip their color along with the rest of the ANSI.
 
 {{< figure src="images/disable.png" alt="A disabled service, stopped with its row grayed out" caption="A disabled service — stopped, grayed out, its logs preserved." >}}
 

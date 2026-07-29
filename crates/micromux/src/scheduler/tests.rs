@@ -353,37 +353,52 @@ fn effective_lifetime_clamps_requests_to_the_policy_cap() {
 #[test]
 fn project_execution_maps_the_desired_execution_table() {
     assert_eq!(
-        project_execution(false, &State::Pending, false),
+        project_execution(false, &State::Pending, false, false),
         Execution::Pending
     );
     assert_eq!(
-        project_execution(true, &State::Starting, false),
+        project_execution(true, &State::Starting, false, false),
         Execution::Starting
     );
     assert_eq!(
-        project_execution(true, &State::Running { health: None }, false),
+        project_execution(true, &State::Running { health: None }, false, false),
         Execution::Running
     );
     assert_eq!(
-        project_execution(true, &State::Killed, false),
+        project_execution(true, &State::Killed, false, false),
         Execution::Stopping
     );
     // The decisive row: a disabled service still draining is Stopping, not already-Exited.
     assert_eq!(
-        project_execution(true, &State::Disabled, true),
+        project_execution(true, &State::Disabled, true, false),
         Execution::Stopping
     );
     assert_eq!(
-        project_execution(false, &State::Exited { exit_code: 0 }, true),
+        project_execution(false, &State::Exited { exit_code: 0 }, true, false),
         Execution::Exited
     );
     assert_eq!(
-        project_execution(false, &State::Disabled, true),
+        project_execution(false, &State::Disabled, true, false),
         Execution::Exited
     );
     assert_eq!(
-        project_execution(false, &State::Disabled, false),
+        project_execution(false, &State::Disabled, false, false),
         Execution::Pending
+    );
+    // The other decisive rows: a service held back by a dependency reports the wait rather than the
+    // state it is idling in, both before its first run and between later ones.
+    assert_eq!(
+        project_execution(false, &State::Pending, false, true),
+        Execution::Blocked
+    );
+    assert_eq!(
+        project_execution(false, &State::Exited { exit_code: 0 }, true, true),
+        Execution::Blocked
+    );
+    // A live process is never blocked, whatever the last scheduling pass recorded.
+    assert_eq!(
+        project_execution(true, &State::Running { health: None }, true, true),
+        Execution::Running
     );
 }
 
@@ -779,7 +794,7 @@ async fn dynamic_policy_limit_ttl_and_dependency_gating() -> eyre::Result<()> {
             .is_some_and(|expires_at| expires_at.saturating_sub(now) <= 250)
     );
     let blocked = wait_until(&harness.reader, "worker", |snapshot| {
-        snapshot.execution == Execution::Pending
+        snapshot.execution == Execution::Blocked
     })
     .await?;
     assert_eq!(blocked.run_generation, 0);
@@ -818,12 +833,14 @@ async fn dynamic_policy_limit_ttl_and_dependency_gating() -> eyre::Result<()> {
     })
     .await?;
     let events = harness.reader.events("worker", None, None).0;
+    // Two blocking episodes, not one repeated event: disabling the worker ended the first wait, and
+    // re-enabling it while `dep` was still down started a fresh one.
     assert_eq!(
         events
             .iter()
             .filter(|event| event.kind == ServiceEventKind::DependencyBlocked)
             .count(),
-        1
+        2
     );
     assert!(
         events
@@ -3103,6 +3120,97 @@ async fn disabling_dependency_blocks_pending_dependents_immediately() -> eyre::R
 
     shutdown.cancel();
     handle.await??;
+    Ok(())
+}
+
+/// A dependent held back by `restart_all` is the case that reads as a bug without either half of
+/// this: the sidebar would report the state it happens to be idling in (`Exited`), and its log would
+/// simply stop mid-run with nothing to say why.
+#[tokio::test]
+async fn restart_all_leaves_a_gated_dependent_blocked_with_an_explained_log() -> eyre::Result<()> {
+    let config_dir = Path::new(".");
+    let mut services: ServiceMap = ServiceMap::new();
+    services.insert(
+        "gate".to_string(),
+        Service::new(
+            "gate",
+            config_dir,
+            service_config("gate", ("sh", &["-c", "sleep 60"])),
+        )?,
+    );
+    let mut app_cfg = service_config("app", ("sh", &["-c", "echo app-started; sleep 60"]));
+    app_cfg.depends_on = vec![config::Dependency {
+        name: spanned_string("gate"),
+        condition: Some(Spanned {
+            span: yaml_spanned::spanned::Span::default(),
+            inner: config::DependencyCondition::Started,
+        }),
+    }];
+    services.insert("app".to_string(), Service::new("app", config_dir, app_cfg)?);
+    let harness = spawn_harness(services, None);
+
+    wait_until(&harness.reader, "app", |snapshot| {
+        snapshot.execution == Execution::Running
+    })
+    .await?;
+    wait_for_log(&harness.reader, "app", "app-started").await?;
+
+    // Disabling the gate first makes the block permanent, so the assertions below describe the
+    // stalled state itself rather than a race against a dependency that is about to come back.
+    accepted(harness.control.disable(&"gate".to_string()).await)?;
+    accepted(harness.control.restart_all().await)?;
+
+    let blocked = wait_until(&harness.reader, "app", |snapshot| {
+        snapshot.execution == Execution::Blocked
+    })
+    .await?;
+    assert_eq!(blocked.desired, Desired::Enabled);
+    assert_eq!(blocked.run_generation, 1);
+
+    let logs = harness
+        .reader
+        .logs("app", None)
+        .into_iter()
+        .map(|line| line.line)
+        .collect::<Vec<_>>();
+    // The pre-restart output is still there — the log is frozen on purpose — but it now ends with
+    // the two transitions that explain why nothing further will arrive.
+    assert!(logs.iter().any(|line| line.contains("app-started")));
+    assert!(logs.iter().any(
+        |line| line.contains("service restart requested by restart_all") && line.contains("===")
+    ));
+    assert!(
+        logs.iter()
+            .any(|line| line.contains("waiting for gate to start") && line.contains("==="))
+    );
+
+    let blocked_on = harness
+        .reader
+        .events("app", None, None)
+        .0
+        .into_iter()
+        .filter(|event| event.kind == ServiceEventKind::DependencyBlocked)
+        .filter_map(|event| event.blocked_on)
+        .next_back();
+    assert_eq!(blocked_on, Some(vec!["gate".to_string()]));
+
+    // Reviving the gate releases the dependent, and only then does its log turn over to the new run.
+    accepted(harness.control.enable(&"gate".to_string()).await)?;
+    wait_until(&harness.reader, "app", |snapshot| {
+        snapshot.execution == Execution::Running && snapshot.run_generation == 2
+    })
+    .await?;
+    wait_for_log(&harness.reader, "app", "app-started").await?;
+    assert!(
+        !harness
+            .reader
+            .logs("app", None)
+            .iter()
+            .any(|line| line.line.contains("waiting for gate to start"))
+    );
+
+    harness.shutdown.cancel();
+    harness.handle.await??;
     Ok(())
 }
 

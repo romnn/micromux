@@ -21,7 +21,7 @@ If you need reproducible environments, networking, volumes, or cross-machine par
 
 tmux and screen are **terminal multiplexers**: they tile terminals but know nothing about your services. micromux adds the service layer on top:
 
-- a **structured lifecycle** — pending, starting, running, healthy, unhealthy, exited, disabled — instead of "a shell that may or may not still be running a thing";
+- a **structured lifecycle** — pending, blocked, starting, running, healthy, unhealthy, exited, disabled — instead of "a shell that may or may not still be running a thing";
 - **restart policies** (`always`, `unless-stopped`, `on-failure[:N]`, `no`);
 - **healthchecks and dependency conditions**;
 - a **single aggregated UI** for selecting services and reading logs, plus retained crash logs across restarts.

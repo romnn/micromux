@@ -4,6 +4,7 @@ use super::{
 };
 #[cfg(test)]
 use super::{Event, ServiceRuntimeInit, TestEventSink};
+use crate::config::DependencyCondition;
 use crate::{ServiceEventKind, ServiceMap, health_check::Health};
 use std::collections::HashMap;
 use tokio::sync::mpsc;
@@ -20,24 +21,53 @@ pub(super) struct ScheduleContext<'a> {
     pub(super) shutdown: &'a CancellationToken,
 }
 
+/// One dependency that is holding a service back, kept with its condition so the wait can be
+/// reported as the operator wrote it ("waiting for `db` to become healthy") rather than as a bare
+/// service name.
+struct BlockedDependency {
+    service: ServiceID,
+    condition: DependencyCondition,
+}
+
+impl BlockedDependency {
+    fn describe(&self) -> String {
+        let condition = match self.condition {
+            DependencyCondition::Started => "to start",
+            DependencyCondition::Healthy => "to become healthy",
+            DependencyCondition::CompletedSuccessfully => "to complete successfully",
+        };
+        format!("{} {condition}", self.service)
+    }
+}
+
+fn describe_blockers(blocked: &[BlockedDependency]) -> String {
+    blocked
+        .iter()
+        .map(BlockedDependency::describe)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn blocking_dependencies(
     ctx: &ScheduleContext<'_>,
     service: &crate::service::Service,
-) -> Vec<ServiceID> {
-    use crate::config::DependencyCondition;
-
+) -> Vec<BlockedDependency> {
     service
         .spec
         .depends_on
         .iter()
         .filter_map(|dep| {
             let condition = dep.condition;
+            let blocked = || BlockedDependency {
+                service: dep.service.clone(),
+                condition,
+            };
             let Some(runtime) = ctx.runtimes.get(dep.service.as_str()) else {
-                return Some(dep.service.clone());
+                return Some(blocked());
             };
 
             if runtime.desired == DesiredState::Disabled || runtime.start_requested {
-                return Some(dep.service.clone());
+                return Some(blocked());
             }
 
             let ready = match condition {
@@ -53,7 +83,7 @@ fn blocking_dependencies(
                     matches!(runtime.state, State::Exited { exit_code: 0, .. })
                 }
             };
-            (!ready).then(|| dep.service.clone())
+            (!ready).then(blocked)
         })
         .collect()
 }
@@ -124,25 +154,48 @@ fn decrement_failure_budget(
 fn record_dependency_block(
     ctx: &mut ScheduleContext<'_>,
     service_id: &ServiceID,
-    blocked_on: Vec<ServiceID>,
+    service: &crate::service::Service,
+    blocked: &[BlockedDependency],
 ) {
-    let generation = ctx.runtimes.get_mut(service_id).and_then(|runtime| {
-        if runtime.last_blocked_on == blocked_on {
-            None
-        } else {
-            runtime.last_blocked_on.clone_from(&blocked_on);
-            Some(runtime.run_generation())
-        }
-    });
-    if let Some(generation) = generation {
-        let mut event = service_event(
-            generation,
-            ServiceEventKind::DependencyBlocked,
-            format!("waiting for dependencies: {}", blocked_on.join(", ")),
-        );
-        event.blocked_on = Some(blocked_on);
-        ctx.writer.append_event(service_id, event);
+    let blocked_on = blocked
+        .iter()
+        .map(|dependency| dependency.service.clone())
+        .collect::<Vec<_>>();
+    let Some(runtime) = ctx.runtimes.get_mut(service_id) else {
+        return;
+    };
+    if runtime.blocked_on == blocked_on {
+        return;
     }
+    runtime.blocked_on.clone_from(&blocked_on);
+    let generation = runtime.run_generation();
+    sync_model(ctx.writer, service, runtime);
+
+    let mut event = service_event(
+        generation,
+        ServiceEventKind::DependencyBlocked,
+        format!("waiting for {}", describe_blockers(blocked)),
+    );
+    event.blocked_on = Some(blocked_on);
+    ctx.writer.append_event(service_id, event);
+}
+
+/// Forget a recorded dependency block once the service stops being a start candidate — it was
+/// disabled, retired, or parked in a restart backoff. Without this the snapshot would keep
+/// reporting `Blocked` for a service nothing is waiting to start.
+fn clear_dependency_block(
+    ctx: &mut ScheduleContext<'_>,
+    service_id: &ServiceID,
+    service: &crate::service::Service,
+) {
+    let Some(runtime) = ctx.runtimes.get_mut(service_id) else {
+        return;
+    };
+    if runtime.blocked_on.is_empty() {
+        return;
+    }
+    runtime.blocked_on.clear();
+    sync_model(ctx.writer, service, runtime);
 }
 
 fn finish_service_start(
@@ -231,9 +284,9 @@ fn start_service_if_ready(
     service: &crate::service::Service,
     exited_code: Option<i32>,
 ) {
-    let blocked_on = blocking_dependencies(ctx, service);
-    if !blocked_on.is_empty() {
-        record_dependency_block(ctx, service_id, blocked_on);
+    let blocked = blocking_dependencies(ctx, service);
+    if !blocked.is_empty() {
+        record_dependency_block(ctx, service_id, service, &blocked);
         return;
     }
 
@@ -242,8 +295,8 @@ fn start_service_if_ready(
     let Some(runtime) = ctx.runtimes.get_mut(service_id) else {
         return;
     };
-    if !runtime.last_blocked_on.is_empty() {
-        runtime.last_blocked_on.clear();
+    if !runtime.blocked_on.is_empty() {
+        runtime.blocked_on.clear();
         ctx.writer.append_event(
             service_id,
             service_event(
@@ -302,7 +355,10 @@ fn start_service_if_ready(
 pub(super) fn schedule_ready(ctx: &mut ScheduleContext<'_>) {
     for (service_id, service) in ctx.services {
         let exited_code = match should_consider_start(ctx, service_id, service) {
-            StartCheck::Skip => continue,
+            StartCheck::Skip => {
+                clear_dependency_block(ctx, service_id, service);
+                continue;
+            }
             StartCheck::Consider { exited_code } => exited_code,
         };
 
@@ -417,7 +473,11 @@ mod tests {
             &mut test_events,
         );
 
-        assert_eq!(blocking_dependencies(&ctx, &svc), vec!["dep"]);
+        // Only the `healthy` entry blocks: `dep` is running, so its `started` entry is satisfied.
+        assert_eq!(
+            describe_blockers(&blocking_dependencies(&ctx, &svc)),
+            "dep to become healthy"
+        );
 
         if let Some(runtime) = ctx.runtimes.get_mut("dep") {
             runtime.state = State::Running {

@@ -18,7 +18,7 @@ A local dev stack is several long-lived commands at once — an API, a backgroun
 
 micromux keeps the fast, host-process workflow and adds the service awareness:
 
-- a **structured lifecycle** for every process — pending, starting, running, healthy, unhealthy, exited, disabled;
+- a **structured lifecycle** for every process — pending, blocked, starting, running, healthy, unhealthy, exited, disabled;
 - **dependency and health gating** — start a service only after another has started, become *healthy*, or completed;
 - **restart policies** — `always`, `unless-stopped`, `on-failure[:N]`, or `no`;
 - a **single aggregated UI** to select services, read their (ANSI/interactive) output, and steer them.

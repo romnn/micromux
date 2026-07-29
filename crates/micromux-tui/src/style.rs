@@ -1,4 +1,4 @@
-use ratatui::style::{Color, Style, palette::tailwind};
+use ratatui::style::{Style, palette::tailwind};
 
 pub const INITIAL_SIDEBAR_WIDTH: u16 = 40;
 pub const MIN_SIDEBAR_WIDTH: u16 = 20;
@@ -7,11 +7,9 @@ pub const MIN_SIDEBAR_WIDTH: u16 = 20;
 pub fn health_style(health: Option<micromux::Health>) -> Style {
     match health {
         Some(micromux::Health::Unhealthy) => Style::default().fg(tailwind::RED.c500),
-        Some(micromux::Health::Healthy) => {
-            Style::default().fg(Color::White).fg(tailwind::GREEN.c500)
-        }
+        Some(micromux::Health::Healthy) => Style::default().fg(tailwind::GREEN.c500),
         Some(micromux::Health::Unknown) => Style::default().fg(tailwind::AMBER.c500),
-        None => Style::default().fg(Color::White).fg(tailwind::GREEN.c300),
+        None => Style::default().fg(tailwind::GREEN.c300),
     }
 }
 
@@ -21,11 +19,15 @@ pub fn service_style(snapshot: &micromux::ServiceSnapshot) -> Style {
         return Style::default().fg(tailwind::GRAY.c500);
     }
     if snapshot.desired == micromux::Desired::Disabled {
-        return Style::default().fg(Color::White).fg(tailwind::GRAY.c500);
+        return Style::default().fg(tailwind::GRAY.c500);
     }
 
     match snapshot.execution {
-        micromux::Execution::Pending => Style::default().fg(Color::White).fg(tailwind::BLUE.c500),
+        // A blocked service is waiting to start, not failing — it shares the pre-start blue rather
+        // than the red an `Exited` snapshot would otherwise have given it.
+        micromux::Execution::Pending | micromux::Execution::Blocked => {
+            Style::default().fg(tailwind::BLUE.c500)
+        }
         micromux::Execution::Starting | micromux::Execution::Running => {
             health_style(snapshot.health)
         }

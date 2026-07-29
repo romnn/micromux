@@ -491,6 +491,7 @@ fn state_name(snapshot: &micromux::ServiceSnapshot) -> &'static str {
 
     match snapshot.execution {
         micromux::Execution::Pending => "PENDING",
+        micromux::Execution::Blocked => "BLOCKED",
         micromux::Execution::Starting => "STARTING",
         micromux::Execution::Running => match snapshot.health {
             Some(micromux::Health::Healthy) => "HEALTHY",

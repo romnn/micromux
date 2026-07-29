@@ -61,8 +61,10 @@ pub enum Desired {
 /// The observed lifecycle phase of a service, independent of whether it is `Desired::Enabled`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub enum Execution {
-    /// Not started yet (waiting on dependencies or the initial start), or idle while disabled.
+    /// Not started yet, or idle while disabled.
     Pending,
+    /// Ready to start, held back only by dependencies that have not met their condition yet.
+    Blocked,
     /// A process is being spawned.
     Starting,
     /// A process is live.
@@ -456,6 +458,58 @@ pub struct ServiceEvent {
     pub blocked_on: Option<Vec<ServiceID>>,
 }
 
+impl ServiceEvent {
+    /// The banner this transition contributes to the service's log stream, or `None` when the log
+    /// needs no explanation.
+    ///
+    /// Only transitions that leave the log *without* new process output are mirrored. A spawn, an
+    /// exit, or a health flip happens while a run owns the log and is already legible from the
+    /// record itself; annotating those would mark a log that is not actually stalled, and would
+    /// interleave micromux's own lines with the PTY record a run is supposed to reproduce exactly.
+    fn log_banner(&self) -> Option<String> {
+        match self.kind {
+            ServiceEventKind::RestartRequested
+            | ServiceEventKind::EnableRequested
+            | ServiceEventKind::DisableRequested
+            | ServiceEventKind::SpawnFailed
+            | ServiceEventKind::BackoffScheduled
+            | ServiceEventKind::DependencyBlocked
+            | ServiceEventKind::DependencyReady
+            | ServiceEventKind::Replaced
+            | ServiceEventKind::Retired => Some(banner_line(&self.detail)),
+            ServiceEventKind::ConfigReloaded
+            | ServiceEventKind::Spawned
+            | ServiceEventKind::Healthy
+            | ServiceEventKind::Unhealthy
+            | ServiceEventKind::Exited
+            | ServiceEventKind::Created
+            | ServiceEventKind::LeaseRenewed
+            | ServiceEventKind::Unknown => None,
+        }
+    }
+}
+
+/// Total width of a lifecycle banner: wide enough to stand out against service output, narrow
+/// enough to survive a split log pane without wrapping.
+const BANNER_WIDTH: usize = 56;
+/// Fill kept on each side of a label that would overflow [`BANNER_WIDTH`], so even a long label
+/// still reads as a rule rather than a bare sentence.
+const BANNER_MIN_FILL: usize = 3;
+
+/// Render one lifecycle transition as a rule an operator cannot mistake for service output.
+///
+/// The blue SGR pair rides along inside the line because that is how every consumer already handles
+/// color: the TUI renders logs through an ANSI parser, the MCP log tools strip ANSI by default, and
+/// the retained run file keeps the bytes micromux actually produced.
+fn banner_line(label: &str) -> String {
+    let fill = BANNER_WIDTH
+        .saturating_sub(label.chars().count() + 2)
+        .max(2 * BANNER_MIN_FILL);
+    let left = "=".repeat(fill / 2);
+    let right = "=".repeat(fill - fill / 2);
+    format!("\u{1b}[1;34m{left} {label} {right}\u{1b}[0m")
+}
+
 /// Scheduler lifecycle transition category.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub enum ServiceEventKind {
@@ -728,6 +782,12 @@ impl ServiceEntry {
                 DiskLogOp::ReplaceLast => self.visible.replace_last(line),
             }
         }
+    }
+
+    /// Append a lifecycle banner to the run the visible log currently belongs to, so the annotation
+    /// lands in the same stream — and the same retained run file — as the output it explains.
+    fn append_banner(&mut self, line: String) {
+        self.append_log(self.latest_begun_run, LogUpdateKind::Append, line);
     }
 
     fn clear_visible_logs(&mut self) {
@@ -1210,8 +1270,12 @@ impl SessionModelWriter {
         }
     }
 
-    /// Append one lifecycle event, assigning its per-service sequence number.
+    /// Append one lifecycle event, assigning its per-service sequence number, and mirror the
+    /// transitions that stall the log as a banner in the log stream itself. Both writes happen under
+    /// one lock so a reader never sees the timeline and the log disagree about a transition.
     pub(crate) fn append_event(&self, id: &ServiceID, mut event: ServiceEvent) {
+        let banner = event.log_banner();
+        let mirrored = banner.is_some();
         {
             let mut guard = self.inner.services.write();
             let Some(entry) = guard.get_mut(id) else {
@@ -1224,8 +1288,14 @@ impl SessionModelWriter {
                 entry.events.pop_front();
             }
             entry.events.push_back(event);
+            if let Some(banner) = banner {
+                entry.append_banner(banner);
+            }
         }
         self.inner.publish(id, ChangeKind::Events);
+        if mirrored {
+            self.inner.publish(id, ChangeKind::Logs);
+        }
     }
 
     pub(crate) fn run_sink(&self, service_id: &ServiceID, run_generation: u64) -> RunSink {
@@ -2569,6 +2639,76 @@ mod tests {
             vec![258, 259]
         );
         assert!(truncated);
+    }
+
+    #[test]
+    fn stalling_transitions_are_mirrored_into_the_log_and_run_transitions_are_not() {
+        let (reader, writer) = new([entry("svc")]);
+        let id = "svc".to_string();
+        writer.begin_run(&id, 1);
+        writer.append_log(
+            &id,
+            1,
+            OutputStream::Stdout,
+            LogUpdateKind::Append,
+            "serving".to_string(),
+        );
+
+        let event = |kind, detail: &str| ServiceEvent {
+            seq: 0,
+            at_unix_ms: 0,
+            run_generation: 1,
+            kind,
+            detail: detail.to_string(),
+            exit_code: None,
+            pid: None,
+            delay_ms: None,
+            blocked_on: None,
+        };
+        // A spawn and an exit bracket the run's own record and must leave it untouched.
+        writer.append_event(&id, event(ServiceEventKind::Spawned, "spawned with pid 1"));
+        writer.append_event(&id, event(ServiceEventKind::Exited, "exited with code 0"));
+        writer.append_event(
+            &id,
+            event(
+                ServiceEventKind::DisableRequested,
+                "service disable requested",
+            ),
+        );
+
+        let logs = reader.logs(&id, None);
+        assert_eq!(
+            logs.iter()
+                .map(|line| line.line.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                "serving".to_string(),
+                banner_line("service disable requested"),
+            ]
+        );
+        // The banner rides in the same stream as the output it explains, so it carries the run that
+        // stalled and advances the same cursor a follower is already tracking.
+        let mirrored = logs.last().expect("banner line");
+        assert_eq!(mirrored.run_generation, 1);
+        assert_eq!(mirrored.seq, 2);
+    }
+
+    #[test]
+    fn banner_centers_short_labels_and_still_frames_long_ones() {
+        let short = banner_line("disabled");
+        assert_eq!(
+            short,
+            "\u{1b}[1;34m======================= disabled =======================\u{1b}[0m"
+        );
+        // The visible rule is exactly BANNER_WIDTH wide once the SGR pair is stripped.
+        assert_eq!(
+            short.chars().count() - "\u{1b}[1;34m\u{1b}[0m".chars().count(),
+            BANNER_WIDTH
+        );
+
+        let long = banner_line(&"x".repeat(BANNER_WIDTH));
+        assert!(long.contains(&format!("{} ", "=".repeat(BANNER_MIN_FILL))));
+        assert!(long.contains(&format!(" {}", "=".repeat(BANNER_MIN_FILL))));
     }
 
     #[test]

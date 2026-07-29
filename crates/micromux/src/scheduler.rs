@@ -240,7 +240,10 @@ pub(super) struct ServiceRuntime {
     retired: Option<RetiredReason>,
     retired_at_unix_ms: Option<u64>,
     expires_at: Option<tokio::time::Instant>,
-    last_blocked_on: Vec<ServiceID>,
+    /// Dependencies the last scheduling pass found unmet while this service was otherwise ready to
+    /// start. Non-empty exactly while the service is held back by them, so the projection can report
+    /// a blocked service as such instead of leaving it at its pre-start state.
+    blocked_on: Vec<ServiceID>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -308,7 +311,7 @@ impl ServiceRuntime {
             retired: None,
             retired_at_unix_ms: None,
             expires_at: None,
-            last_blocked_on: Vec::new(),
+            blocked_on: Vec::new(),
         }
     }
 
@@ -528,7 +531,12 @@ pub(super) fn project_snapshot(
 ) -> (ServiceSnapshot, Option<std::time::Instant>) {
     let running = runtime.running.is_some();
     let ran_before = runtime.last_run_id.is_some();
-    let execution = project_execution(running, &runtime.state, ran_before);
+    let execution = project_execution(
+        running,
+        &runtime.state,
+        ran_before,
+        !runtime.blocked_on.is_empty(),
+    );
     let health = match (execution, &runtime.state) {
         (Execution::Running, State::Running { health }) => *health,
         _ => None,
@@ -622,9 +630,12 @@ fn service_event(
     }
 }
 
-/// The decisive desired/execution mapping. The notable row is *running + Disabled → Stopping*: a
-/// disabled service that is still draining is never reported as already-Exited.
-fn project_execution(running: bool, state: &State, ran_before: bool) -> Execution {
+/// The decisive desired/execution mapping. Two rows carry the weight: *running + Disabled →
+/// Stopping*, so a disabled service that is still draining is never reported as already-Exited; and
+/// *not running + blocked → Blocked*, so a service whose restart is waiting on a dependency is not
+/// reported under the state it happens to be sitting in (`Pending` before its first run, `Exited`
+/// after every later one).
+fn project_execution(running: bool, state: &State, ran_before: bool, blocked: bool) -> Execution {
     if running {
         match state {
             State::Running { .. } => Execution::Running,
@@ -637,10 +648,22 @@ fn project_execution(running: bool, state: &State, ran_before: bool) -> Executio
         }
     } else {
         match state {
-            State::Pending => Execution::Pending,
+            State::Pending => {
+                if blocked {
+                    Execution::Blocked
+                } else {
+                    Execution::Pending
+                }
+            }
             State::Starting | State::Running { .. } => Execution::Starting,
             State::Killed => Execution::Stopping,
-            State::Exited { .. } => Execution::Exited,
+            State::Exited { .. } => {
+                if blocked {
+                    Execution::Blocked
+                } else {
+                    Execution::Exited
+                }
+            }
             State::Disabled => {
                 if ran_before {
                     Execution::Exited

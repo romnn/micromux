@@ -136,6 +136,11 @@ pub(crate) fn diagnosis_hint(
                     .to_string()
             }
         }
+        Execution::Blocked => {
+            "service is waiting on a dependency; inspect get_service_events for the blocking \
+             dependencies"
+                .to_string()
+        }
         Execution::Pending | Execution::Starting => {
             "service has not finished starting; inspect recent logs".to_string()
         }
@@ -256,11 +261,11 @@ async fn port_signals(snapshot: &ServiceSnapshot) -> Vec<Signal> {
     // Probe only when micromux holds no live process for this service: a Running service has
     // plausibly bound its own port, a Stopping one is still draining and may hold it too, and
     // Unknown (a newer peer's state) gives no basis to attribute the holder. A held port while
-    // Pending/Starting/Exited is the useful fact — a foreign process or an orphaned child of a
-    // previous run will make the next bind fail.
+    // Pending/Blocked/Starting/Exited is the useful fact — a foreign process or an orphaned child of
+    // a previous run will make the next bind fail.
     if !matches!(
         snapshot.execution,
-        Execution::Pending | Execution::Starting | Execution::Exited
+        Execution::Pending | Execution::Blocked | Execution::Starting | Execution::Exited
     ) {
         return Vec::new();
     }
@@ -555,6 +560,10 @@ pub(crate) fn timeout_hint(snapshot: &ServiceSnapshot) -> &'static str {
                 "the process is running and may still be completing startup — wait again or inspect \
                  get_logs"
             }
+        }
+        Execution::Blocked => {
+            "the service is waiting on a dependency that has not met its condition — inspect \
+             get_service_events for the blocking dependencies, or wait_for_healthy on them first"
         }
         Execution::Pending | Execution::Starting => {
             "the process has not finished starting — wait again with a longer timeout_secs or inspect \

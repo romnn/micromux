@@ -53,9 +53,15 @@ depends_on:
 
 ## How gating shows up
 
-A service waiting on its dependencies sits in the **pending** state until they are satisfied, then transitions to starting. In the TUI a pending service is visibly distinct, so a stack that's mid-startup — or stuck behind an unhealthy dependency — is obvious at a glance.
+A service waiting on its dependencies sits in the **blocked** state until they are satisfied, then transitions to starting. In the TUI a blocked service is visibly distinct, so a stack that's mid-startup — or stuck behind an unhealthy dependency — is obvious at a glance. This holds on a restart too: a dependent that has already run once reports **blocked**, not **exited**, while it waits for its gate to come back.
 
-If a dependency never becomes healthy (its probe keeps failing), the dependent stays pending. Open the [healthcheck pane]({{< relref "../tui.md" >}}) (`H`) on the dependency, or run `micromux ctl health <id>`, to see why.
+Its log pane says the same thing. A service that is waiting has no process to produce output, so micromux writes the transition into the log itself:
+
+```
+======== waiting for postgres to become healthy ========
+```
+
+If a dependency never becomes healthy (its probe keeps failing), the dependent stays blocked. Open the [healthcheck pane]({{< relref "../tui.md" >}}) (`H`) on the dependency, or run `micromux ctl health <id>`, to see why.
 
 ## Restarts respect dependencies
 

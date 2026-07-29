@@ -219,9 +219,11 @@ pub fn evaluate(snapshot: &ServiceSnapshot, after: Option<u64>) -> WaitOutcome {
                 WaitOutcome::Pending
             }
         }
-        Execution::Pending | Execution::Starting | Execution::Stopping | Execution::Unknown => {
-            WaitOutcome::Pending
-        }
+        Execution::Pending
+        | Execution::Blocked
+        | Execution::Starting
+        | Execution::Stopping
+        | Execution::Unknown => WaitOutcome::Pending,
     }
 }
 
