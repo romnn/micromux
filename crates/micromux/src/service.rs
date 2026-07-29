@@ -55,6 +55,7 @@ mod tests {
         let mut cfg = service_config("svc", ("sh", &["-c", "true"]));
         cfg.env_file = vec![config::EnvFile {
             path: spanned_string("./definitely-not-present.env"),
+            optional: false,
         }];
 
         match Service::new("svc", &dir, cfg) {
@@ -68,6 +69,20 @@ mod tests {
     }
 
     #[test]
+    fn optional_missing_env_file_is_skipped() -> eyre::Result<()> {
+        let dir = unique_tmp_dir("env-optional-missing");
+        std::fs::create_dir_all(&dir)?;
+        let mut cfg = service_config("svc", ("sh", &["-c", "true"]));
+        cfg.env_file = vec![config::EnvFile {
+            path: spanned_string("./definitely-not-present.env"),
+            optional: true,
+        }];
+
+        let _service = Service::new("svc", &dir, cfg)?;
+        Ok(())
+    }
+
+    #[test]
     fn env_file_parse_error_is_error() -> eyre::Result<()> {
         let dir = unique_tmp_dir("env-parse-error");
         fs::create_dir_all(&dir)?;
@@ -77,6 +92,7 @@ mod tests {
         let mut cfg = service_config("svc", ("sh", &["-c", "true"]));
         cfg.env_file = vec![config::EnvFile {
             path: spanned_string(env_path.to_string_lossy().as_ref()),
+            optional: false,
         }];
 
         match Service::new("svc", &dir, cfg) {
@@ -99,6 +115,7 @@ mod tests {
         let mut cfg = service_config("svc", ("sh", &["-c", "true"]));
         cfg.env_file = vec![config::EnvFile {
             path: spanned_string(env_path.to_string_lossy().as_ref()),
+            optional: false,
         }];
         cfg.environment
             .insert(spanned_string("FOO"), spanned_string("from_config"));
@@ -121,6 +138,7 @@ mod tests {
         let mut cfg = service_config("svc", ("sh", &["-c", "true"]));
         cfg.env_file = vec![config::EnvFile {
             path: spanned_string(env_path.to_string_lossy().as_ref()),
+            optional: false,
         }];
         cfg.environment
             .insert(spanned_string("PORT"), spanned_string("${BASE}23"));
@@ -144,6 +162,7 @@ mod tests {
         cfg.working_dir = Some(spanned_string("work"));
         cfg.env_file = vec![config::EnvFile {
             path: spanned_string("service.env"),
+            optional: false,
         }];
         cfg.environment
             .insert(spanned_string("PORT"), spanned_string("${BASE}23"));
@@ -221,6 +240,7 @@ mod tests {
         let mut cfg = service_config("svc", ("sh", &["-c", "true"]));
         cfg.env_file = vec![config::EnvFile {
             path: spanned_string("./.env"),
+            optional: false,
         }];
 
         let svc = Service::new("svc", &dir, cfg)?;
@@ -331,11 +351,16 @@ impl Service {
             .map(|dir| env::resolve_path(config_dir, dir.as_ref()))
             .transpose()?;
 
-        let env_files = config
-            .env_file
-            .iter()
-            .map(|env_file| env::resolve_path(config_dir, env_file.path.as_ref()))
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut env_files = Vec::new();
+        for env_file in &config.env_file {
+            let path = env::resolve_path(config_dir, env_file.path.as_ref())?;
+            // A missing optional file is skipped; a present one still
+            // participates fully, including parse errors.
+            if env_file.optional && !path.exists() {
+                continue;
+            }
+            env_files.push(path);
+        }
 
         let base_env: std::collections::HashMap<String, String> = std::env::vars().collect();
         let mut missing_env = Vec::new();

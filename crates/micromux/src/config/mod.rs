@@ -268,6 +268,9 @@ pub struct Dependency {
 pub struct EnvFile {
     /// Path to the `.env` file (relative to `config_dir` unless absolute).
     pub path: Spanned<String>,
+    /// Whether a missing file is skipped instead of failing the service.
+    /// A present file still participates fully, including parse errors.
+    pub optional: bool,
 }
 
 /// Service configuration.

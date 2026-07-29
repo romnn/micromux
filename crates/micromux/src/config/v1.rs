@@ -134,6 +134,7 @@ fn parse_env_file(mapping: &yaml_spanned::Mapping) -> Result<Vec<super::EnvFile>
                         span: *span,
                         inner: path.clone(),
                     },
+                    optional: false,
                 });
             }
             Spanned {
@@ -149,11 +150,27 @@ fn parse_env_file(mapping: &yaml_spanned::Mapping) -> Result<Vec<super::EnvFile>
                 };
                 let (path_span, path) =
                     expect_string(path_value, "env_file.path must be a string".into())?;
+                let optional = match m.get("optional") {
+                    None => false,
+                    Some(Spanned {
+                        span: _,
+                        inner: Value::Bool(optional),
+                    }) => *optional,
+                    Some(other) => {
+                        return Err(ConfigError::UnexpectedType {
+                            message: "env_file.optional must be a boolean".to_string(),
+                            expected: vec![Kind::Bool],
+                            found: other.kind(),
+                            span: other.span().into(),
+                        });
+                    }
+                };
                 env_files.push(super::EnvFile {
                     path: Spanned {
                         span: *path_span,
                         inner: path.clone(),
                     },
+                    optional,
                 });
             }
             _ => {
