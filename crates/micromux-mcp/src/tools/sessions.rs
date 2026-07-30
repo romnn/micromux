@@ -13,6 +13,57 @@ use crate::select::ToolError;
 #[cfg(unix)]
 pub(crate) const STOP_CONFIRM_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Waits for one observed process identity, using a pidfd where the platform provides one.
+///
+/// The fallback polls by PID and therefore retains the usual PID-reuse race on non-Linux Unix.
+#[cfg(unix)]
+pub(crate) struct ProcessExitWatch {
+    pid: u32,
+    #[cfg(target_os = "linux")]
+    pidfd: Option<tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>>,
+    #[cfg(target_os = "linux")]
+    already_exited: bool,
+}
+
+#[cfg(unix)]
+impl ProcessExitWatch {
+    pub(crate) fn new(pid: u32) -> Self {
+        #[cfg(target_os = "linux")]
+        let opened = i32::try_from(pid)
+            .ok()
+            .and_then(rustix::process::Pid::from_raw)
+            .map(|pid| rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty()));
+        #[cfg(target_os = "linux")]
+        let already_exited =
+            matches!(&opened, Some(Err(error)) if *error == rustix::io::Errno::SRCH);
+        #[cfg(target_os = "linux")]
+        let pidfd = opened
+            .and_then(Result::ok)
+            .and_then(|fd| tokio::io::unix::AsyncFd::new(fd).ok());
+        Self {
+            pid,
+            #[cfg(target_os = "linux")]
+            pidfd,
+            #[cfg(target_os = "linux")]
+            already_exited,
+        }
+    }
+
+    pub(crate) async fn wait(self, timeout: Duration) -> bool {
+        #[cfg(target_os = "linux")]
+        if self.already_exited {
+            return true;
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(pidfd) = self.pidfd {
+            return tokio::time::timeout(timeout, pidfd.readable())
+                .await
+                .is_ok_and(|ready| ready.is_ok());
+        }
+        wait_until_stopped(self.pid, timeout).await
+    }
+}
+
 /// Whether a process is still alive, via a signal-0 `kill`. Used to confirm a stopped session exited
 /// (so its ports are freed) before reporting success.
 #[cfg(unix)]

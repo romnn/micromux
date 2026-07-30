@@ -56,7 +56,7 @@ The tools cover the full lifecycle:
 - **Logs** — `get_logs`, `follow_logs`, `follow_all_logs`, `list_log_runs`, with `grep`, time, trace-id, and — for JSON logs — structured `min_level` filters and a token-efficient `compact` format.
 - **Health & forensics** — `get_health`, `get_health_history`, `wait_for_healthy`, `get_service_events`, `diagnose` (a one-shot summary of exited or unhealthy services with likely-cause log lines).
 - **Mutations** — `restart_service`, `enable_service`, `disable_service`, `restart_all`; `restart_service`/`enable_service` return a run **generation** to pass to `wait_for_healthy(after_generation=…)` so you wait for the *new* run, not the old one.
-- **Session lifecycle** — `start_session` spawns a detached headless `micromux serve`; `stop_session` stops a session and frees its ports (handy when switching between git worktrees that bind the same ports).
+- **Session lifecycle** — when the MCP server has `--allow-session-start` (add it to the configuration above if wanted), `start_session` spawns a detached headless `micromux serve`, capped at eight requests per minute; `stop_session` stops a session and frees its ports (handy when switching between git worktrees that bind the same ports).
 - **Config** — `validate_config` (a candidate file) and `reconcile_config` (apply on-disk edits to a live session; see [Reconcile]({{< relref "control-plane.md" >}}#reconcile-on-disk-changes)).
 - **Runtime services** — the `start_dynamic_service` / `replace_dynamic_service` / `stop_dynamic_service` lifecycle. See [Dynamic services]({{< relref "dynamic-services.md" >}}).
 
@@ -64,6 +64,12 @@ Manual restarts, enables, and due automatic restarts reload the latest `micromux
 
 > [!NOTE]
 > MCP deliberately exposes **no service-PTY-input tool** — human observation of a headless session goes through [`micromux attach`]({{< relref "../tui.md" >}}#attach-to-a-running-session). For a lean, TUI-only binary with the MCP server compiled out, build with `cargo install --no-default-features micromux-cli`.
+
+> [!WARNING]
+> The same-user control interface is operator-trusted, not a redacted security boundary. Discovery
+> reports config and working-directory paths, executable/runtime endpoint details, service and
+> healthcheck argv, and captured probe output. Environment values are excluded, but secrets placed
+> in argv or output are visible to connected clients.
 
 ## In this section
 

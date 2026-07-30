@@ -138,6 +138,7 @@ mod tests {
                 working_dir: "/project".to_string(),
                 config_path: "/project/micromux.yaml".to_string(),
                 services: Vec::new(),
+                services_truncated: false,
                 micromux_version: "test".to_string(),
                 capabilities: None,
             }],

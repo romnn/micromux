@@ -96,7 +96,11 @@ pub enum Command {
     },
     /// Run the MCP server over stdio (configure once in Claude Code / Codex like playwright-mcp).
     #[cfg(feature = "mcp")]
-    Mcp,
+    Mcp {
+        /// Permit detached session starts, rate-limited to eight requests per minute.
+        #[arg(long, env = "MICROMUX_MCP_ALLOW_SESSION_START")]
+        allow_session_start: bool,
+    },
     /// Run the supervisor headless (no TUI), serving the control plane until stopped. Intended for
     /// agent-managed sessions — see the MCP `start_session`/`stop_session` tools.
     Serve,

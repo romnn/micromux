@@ -882,6 +882,7 @@ mod tests {
                     id: "svc".into(),
                     name: "svc".to_string(),
                 }],
+                services_truncated: false,
                 micromux_version: env!("CARGO_PKG_VERSION").to_string(),
                 capabilities: None,
             }
@@ -929,6 +930,7 @@ mod tests {
             // identity hash, never on this string.
             config_path: "/different/display/path.yaml".to_string(),
             services: Vec::new(),
+            services_truncated: false,
             micromux_version: env!("CARGO_PKG_VERSION").to_string(),
             capabilities: None,
         };
@@ -963,6 +965,7 @@ mod tests {
                 .display()
                 .to_string(),
             services: Vec::new(),
+            services_truncated: false,
             micromux_version: env!("CARGO_PKG_VERSION").to_string(),
             capabilities: None,
         };
@@ -997,6 +1000,7 @@ mod tests {
                 .display()
                 .to_string(),
             services: Vec::new(),
+            services_truncated: false,
             micromux_version: env!("CARGO_PKG_VERSION").to_string(),
             capabilities: None,
         };

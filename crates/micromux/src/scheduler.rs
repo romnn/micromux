@@ -724,7 +724,7 @@ fn project_execution(running: bool, state: &State, ran_before: bool, blocked: bo
 }
 
 fn load_services_from_disk(reload: &ReloadConfig) -> Result<ServiceMap, String> {
-    let raw = std::fs::read_to_string(&reload.config_path)
+    let raw = crate::config::read_config_file(&reload.config_path)
         .map_err(|err| format!("read {}: {err}", reload.config_path.display()))?;
     let config_dir = reload
         .config_path
@@ -975,11 +975,7 @@ impl SchedulerRuntime {
     }
 
     fn validate_service_id(id: &str) -> Result<(), CommandRejection> {
-        if (1..=64).contains(&id.len())
-            && id
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
-        {
+        if crate::spec::service_id_is_valid(id) {
             Ok(())
         } else {
             Err(CommandRejection::InvalidSpec(format!(
@@ -1142,6 +1138,43 @@ impl SchedulerRuntime {
         services: &ServiceMap,
         candidate: &Service,
     ) -> Result<(), CommandRejection> {
+        if matches!(candidate.origin, ServiceOrigin::Dynamic(_)) {
+            // Recheck the opened directory: its path could have been replaced between the policy
+            // check and `Service` anchoring it.
+            #[cfg(unix)]
+            let working_dir = candidate
+                .spawn_working_directory()
+                .map_err(|err| CommandRejection::InvalidSpec(err.to_string()))?
+                .ok_or_else(|| {
+                    CommandRejection::InvalidSpec(
+                        "dynamic service has no anchored working directory".to_string(),
+                    )
+                })?;
+            #[cfg(not(unix))]
+            let working_dir = candidate.spec.working_dir.clone().ok_or_else(|| {
+                CommandRejection::InvalidSpec(
+                    "dynamic service has no resolved working directory".to_string(),
+                )
+            })?;
+            let working_dir = std::fs::canonicalize(&working_dir).map_err(|err| {
+                CommandRejection::InvalidSpec(format!(
+                    "anchored working directory `{}` cannot be resolved: {err}",
+                    working_dir.display()
+                ))
+            })?;
+            if !self
+                .dynamic_policy
+                .allowed_working_roots
+                .iter()
+                .filter_map(|root| std::fs::canonicalize(root).ok())
+                .any(|root| working_dir.starts_with(root))
+            {
+                return Err(CommandRejection::PolicyDenied(format!(
+                    "anchored working directory `{}` is outside control.dynamic_services.allowed_working_roots",
+                    working_dir.display()
+                )));
+            }
+        }
         for dependency in &candidate.spec.depends_on {
             if dependency.service == candidate.id {
                 return Err(CommandRejection::InvalidSpec(format!(
@@ -1245,7 +1278,8 @@ impl SchedulerRuntime {
             spec.clone(),
             ServiceOrigin::Dynamic(origin),
             self.default_log_retention,
-        );
+        )
+        .map_err(|err| CommandRejection::InvalidSpec(err.to_string()))?;
         self.validate_candidate(services, &service)?;
 
         let mut runtime = ServiceRuntime::new(ServiceRuntimeInit::from(&service));
@@ -1331,7 +1365,9 @@ impl SchedulerRuntime {
             revision,
         };
         let mut candidate = current.clone();
-        candidate.spec = spec.clone();
+        candidate
+            .replace_spec(spec.clone())
+            .map_err(|err| CommandRejection::InvalidSpec(err.to_string()))?;
         candidate.origin = ServiceOrigin::Dynamic(origin.clone());
         self.validate_candidate(services, &candidate)?;
 
@@ -1348,8 +1384,7 @@ impl SchedulerRuntime {
         let service = services
             .get_mut(service_id)
             .ok_or(CommandRejection::UnknownService)?;
-        service.spec = spec.clone();
-        service.origin = ServiceOrigin::Dynamic(origin);
+        *service = candidate;
         self.sync(services, service_id);
         self.append_event(
             service_id,

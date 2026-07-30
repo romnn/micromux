@@ -217,6 +217,14 @@ fn per_user_fallback_dir() -> PathBuf {
     std::env::temp_dir().join(format!("micromux-{uid}"))
 }
 
+#[cfg(unix)]
+pub(crate) fn project_lock_path(config_path: &CanonicalConfigPath) -> std::io::Result<PathBuf> {
+    let uid = nix::unistd::Uid::current();
+    let directory = Path::new("/tmp").join(format!("micromux-{uid}"));
+    ensure_private_dir(&directory)?;
+    Ok(directory.join(format!("{}.session.lock", endpoint_hash(config_path))))
+}
+
 #[cfg(not(unix))]
 fn per_user_fallback_dir() -> PathBuf {
     std::env::temp_dir().join("micromux")

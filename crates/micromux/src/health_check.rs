@@ -772,6 +772,8 @@ struct Running {
     command: String,
     output_readers: OutputReaders,
     process: tokio::process::Child,
+    #[cfg(windows)]
+    process_job: Option<win32job::Job>,
 }
 
 #[cfg(unix)]
@@ -857,6 +859,8 @@ async fn cleanup_after_cancel(running: &mut Running) {
         // recycled before this signal.
         kill_process_group(pid);
     }
+    #[cfg(windows)]
+    drop(running.process_job.take());
     let already_exited = running.process.try_wait().ok().flatten().is_some();
     if !already_exited {
         let _ = running.process.start_kill();
@@ -869,6 +873,8 @@ async fn cleanup_after_cancel(running: &mut Running) {
 }
 
 async fn finish_with_exit(running: &mut Running, success: bool, exit_code: i32) {
+    #[cfg(windows)]
+    drop(running.process_job.take());
     let drained = running.output_readers.drain(OUTPUT_DRAIN_TIMEOUT).await;
 
     if !drained {
@@ -935,6 +941,27 @@ async fn run(
             source: ErrorReason::Spawn(source),
         }
     })?;
+    #[cfg(windows)]
+    let process_job = {
+        let handle = process.raw_handle().ok_or_else(|| {
+            let source = std::io::Error::other("healthcheck child exposed no process handle");
+            emit_spawn_failed(&params.sink, attempt, &source);
+            Error {
+                command: command.clone(),
+                source: ErrorReason::Spawn(source),
+            }
+        })?;
+        Some(
+            crate::windows_job::attach_kill_on_close(handle as isize).map_err(|message| {
+                let source = std::io::Error::other(message);
+                emit_spawn_failed(&params.sink, attempt, &source);
+                Error {
+                    command: command.clone(),
+                    source: ErrorReason::Spawn(source),
+                }
+            })?,
+        )
+    };
 
     let mut output_readers = OutputReaders::default();
     if let Some(stderr) = process.stderr.take() {
@@ -967,6 +994,8 @@ async fn run(
         command,
         output_readers,
         process,
+        #[cfg(windows)]
+        process_job,
     };
 
     match completion {

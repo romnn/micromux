@@ -218,6 +218,7 @@ async fn describe_list_logs_and_restart_over_the_socket() -> eyre::Result<()> {
         )?)
     );
     assert_eq!(info.services.len(), 1);
+    assert!(!info.services_truncated);
     assert_eq!(
         info.services.first().map(|s| s.id.clone()),
         Some("svc".to_string())
@@ -230,6 +231,12 @@ async fn describe_list_logs_and_restart_over_the_socket() -> eyre::Result<()> {
     })
     .await?;
     assert!(matches!(services, Response::Services(_)));
+    let service = client
+        .request(Request::GetService {
+            service: "svc".to_string(),
+        })
+        .await?;
+    assert!(matches!(service, Response::Service(service) if service.id == "svc"));
 
     // Logs flow through the model to the socket.
     request_until(

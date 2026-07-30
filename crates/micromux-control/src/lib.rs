@@ -47,7 +47,9 @@ pub use select::{
     resolve_selector, resolve_selector_in_runtime_dirs, session_config_path_is_under,
     session_matches_config_path,
 };
-pub use server::{ControlServer, EndpointGuard, SessionIdentity, bind, endpoint_owner_lock_held};
+pub use server::{
+    ControlServer, EndpointGuard, SessionIdentity, bind, bind_project, endpoint_owner_lock_held,
+};
 
 /// Maximum size of a single protocol frame. Oversized frames are rejected, not buffered, so a
 /// broken peer cannot pin memory.
@@ -123,6 +125,9 @@ where
     M: Serialize,
 {
     let line = serde_json::to_string(message)?;
+    if line.len() > MAX_FRAME_BYTES {
+        return Err(ControlError::FrameTooLarge);
+    }
     framing.send(line).await?;
     Ok(())
 }
@@ -137,5 +142,22 @@ where
         Some(Ok(line)) => Ok(Some(serde_json::from_str(&line)?)),
         Some(Err(err)) => Err(err.into()),
         None => Ok(None),
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::{ControlError, MAX_FRAME_BYTES, framed, write_message};
+
+    #[tokio::test]
+    async fn encode_rejects_a_frame_over_the_protocol_limit() {
+        let (stream, _peer) = tokio::io::duplex(64);
+        let mut conn = framed(stream);
+        let oversized = "x".repeat(MAX_FRAME_BYTES);
+
+        assert!(matches!(
+            write_message(&mut conn, &oversized).await,
+            Err(ControlError::FrameTooLarge)
+        ));
     }
 }

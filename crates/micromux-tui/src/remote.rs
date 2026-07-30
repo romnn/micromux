@@ -18,7 +18,6 @@ use tokio::sync::{broadcast, mpsc};
 use crate::source::AttachmentStatus;
 
 const CHANGE_CHANNEL_CAPACITY: usize = 1024;
-const COMMAND_CHANNEL_CAPACITY: usize = 64;
 const REMOTE_LOG_TAIL: usize = 200;
 const INITIAL_RECONNECT_DELAY: Duration = Duration::from_millis(250);
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(5);
@@ -27,7 +26,7 @@ const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(5);
 pub struct RemoteSource {
     store: Arc<RwLock<MirrorStore>>,
     changes: broadcast::Sender<SessionChange>,
-    commands: mpsc::Sender<RemoteCommand>,
+    commands: mpsc::UnboundedSender<RemoteCommand>,
     shutdown: CancellationToken,
 }
 
@@ -101,7 +100,7 @@ impl RemoteSource {
         store.write().connected = true;
         publish_full_refresh(&changes, &service_ids);
 
-        let (commands, command_rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
+        let (commands, command_rx) = mpsc::unbounded_channel();
         let shutdown = CancellationToken::new();
         tokio::spawn(run_remote(
             endpoint,
@@ -198,27 +197,27 @@ impl RemoteSource {
 
     /// Queue a remote service restart.
     pub fn restart(&self, id: ServiceID) {
-        let _ = self.commands.try_send(RemoteCommand::Restart(id));
+        let _ = self.commands.send(RemoteCommand::Restart(id));
     }
 
     /// Queue a restart of every enabled service.
     pub fn restart_all(&self) {
-        let _ = self.commands.try_send(RemoteCommand::RestartAll);
+        let _ = self.commands.send(RemoteCommand::RestartAll);
     }
 
     /// Queue a remote service enable.
     pub fn enable(&self, id: ServiceID) {
-        let _ = self.commands.try_send(RemoteCommand::Enable(id));
+        let _ = self.commands.send(RemoteCommand::Enable(id));
     }
 
     /// Queue a remote service disable.
     pub fn disable(&self, id: ServiceID) {
-        let _ = self.commands.try_send(RemoteCommand::Disable(id));
+        let _ = self.commands.send(RemoteCommand::Disable(id));
     }
 
     /// Queue retirement of a remote dynamic service.
     pub fn stop_dynamic(&self, id: ServiceID) {
-        let _ = self.commands.try_send(RemoteCommand::StopDynamic(id));
+        let _ = self.commands.send(RemoteCommand::StopDynamic(id));
     }
 
     /// Stop the mirror task without affecting the remote session.
@@ -237,7 +236,7 @@ async fn run_remote(
     endpoint: ControlEndpoint,
     store: Arc<RwLock<MirrorStore>>,
     changes: broadcast::Sender<SessionChange>,
-    mut commands: mpsc::Receiver<RemoteCommand>,
+    mut commands: mpsc::UnboundedReceiver<RemoteCommand>,
     shutdown: CancellationToken,
     mut request: Client,
     mut subscription: Subscription,
@@ -288,7 +287,7 @@ async fn run_connected(
     subscription: &mut Subscription,
     store: &Arc<RwLock<MirrorStore>>,
     changes: &broadcast::Sender<SessionChange>,
-    commands: &mut mpsc::Receiver<RemoteCommand>,
+    commands: &mut mpsc::UnboundedReceiver<RemoteCommand>,
     shutdown: &CancellationToken,
 ) -> ConnectedLoopExit {
     loop {
@@ -470,18 +469,19 @@ async fn refresh_logs<C: RequestConnection>(
         return Ok(());
     };
     let after = (cursor > 0).then(|| cursor.saturating_sub(1));
-    let Some((mut lines, mut truncated)) = request_log_page(request, service_id, after).await?
+    let Some((mut lines, mut truncated, first_retained_seq)) =
+        request_log_page(request, service_id, after).await?
     else {
         store.write().services.shift_remove(service_id);
         return Ok(());
     };
 
-    if cursor > 0
-        && lines
-            .first()
-            .is_none_or(|line| line.seq > cursor.saturating_add(1))
-    {
-        let Some((tail, _)) = request_log_page(request, service_id, None).await? else {
+    let must_retail = cursor > 0
+        && first_retained_seq.is_some_and(|first| {
+            first > cursor.saturating_add(1) || (lines.is_empty() && first > cursor)
+        });
+    if must_retail {
+        let Some((tail, _, _)) = request_log_page(request, service_id, None).await? else {
             store.write().services.shift_remove(service_id);
             return Ok(());
         };
@@ -505,7 +505,7 @@ async fn refresh_logs<C: RequestConnection>(
             .services
             .get(service_id)
             .map_or(0, |entry| entry.next_log_seq);
-        let Some((next_lines, next_truncated)) =
+        let Some((next_lines, next_truncated, _)) =
             request_log_page(request, service_id, Some(next)).await?
         else {
             store.write().services.shift_remove(service_id);
@@ -525,7 +525,7 @@ async fn request_log_page<C: RequestConnection>(
     request: &mut C,
     service_id: &str,
     after: Option<u64>,
-) -> Result<Option<(Vec<LogLine>, bool)>, ControlError> {
+) -> Result<Option<(Vec<LogLine>, bool, Option<u64>)>, ControlError> {
     match request
         .request(Request::FollowLogs {
             service: service_id.to_string(),
@@ -534,7 +534,11 @@ async fn request_log_page<C: RequestConnection>(
         })
         .await?
     {
-        Response::Logs { lines, truncated } => Ok(Some((lines, truncated))),
+        Response::Logs {
+            lines,
+            truncated,
+            first_retained_seq,
+        } => Ok(Some((lines, truncated, first_retained_seq))),
         Response::Error {
             code: ErrorCode::UnknownService,
             ..
@@ -770,6 +774,7 @@ mod tests {
             working_dir: "/tmp".to_string(),
             config_path: "/tmp/micromux.yaml".to_string(),
             services: Vec::new(),
+            services_truncated: false,
             micromux_version: "test".to_string(),
             capabilities: None,
         }
@@ -820,7 +825,7 @@ mod tests {
 
     fn source_for(store: Arc<RwLock<MirrorStore>>) -> RemoteSource {
         let (changes, _) = broadcast::channel(8);
-        let (commands, _) = mpsc::channel(8);
+        let (commands, _) = mpsc::unbounded_channel();
         RemoteSource {
             store,
             changes,
@@ -836,10 +841,12 @@ mod tests {
             Response::Logs {
                 lines: vec![line(15, "first retained"), line(16, "incremental")],
                 truncated: false,
+                first_retained_seq: Some(15),
             },
             Response::Logs {
                 lines: vec![line(20, "tail"), line(21, "latest")],
                 truncated: false,
+                first_retained_seq: Some(20),
             },
         ]);
 
@@ -869,10 +876,12 @@ mod tests {
             Response::Logs {
                 lines: Vec::new(),
                 truncated: false,
+                first_retained_seq: Some(11),
             },
             Response::Logs {
                 lines: vec![line(11, "new line")],
                 truncated: false,
+                first_retained_seq: Some(11),
             },
         ]);
 
@@ -927,6 +936,7 @@ mod tests {
         let mut request = ScriptedConnection::new([Response::Logs {
             lines: vec![line(7, "frame two")],
             truncated: false,
+            first_retained_seq: Some(7),
         }]);
 
         refresh_logs(&mut request, &store, "svc").await?;

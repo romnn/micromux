@@ -6,10 +6,10 @@ pub struct Service {
     pub cached_lines: std::collections::VecDeque<(u64, String)>,
     pub cached_text: ratatui::text::Text<'static>,
     pub text_dirty: bool,
-    pub cached_wrapped_lines: u16,
+    pub cached_wrapped_lines: usize,
     pub cached_wrap: Option<(bool, u16)>,
     pub logs_dirty: bool,
-    pub healthcheck_cached_num_lines: u16,
+    pub healthcheck_cached_num_lines: usize,
     pub healthcheck_cached_text: String,
     pub healthcheck_dirty: bool,
 }
@@ -86,7 +86,16 @@ impl State {
             .max(crate::style::MIN_SIDEBAR_WIDTH);
     }
 
-    pub fn resize_right(&mut self) {
-        self.services_sidebar_width = self.services_sidebar_width.saturating_add(2);
+    pub fn resize_right(&mut self, max_width: u16) {
+        self.services_sidebar_width = self
+            .services_sidebar_width
+            .saturating_add(2)
+            .min(max_width.max(crate::style::MIN_SIDEBAR_WIDTH));
+    }
+
+    pub fn clamp_sidebar(&mut self, max_width: u16) {
+        self.services_sidebar_width = self
+            .services_sidebar_width
+            .min(max_width.max(crate::style::MIN_SIDEBAR_WIDTH));
     }
 }

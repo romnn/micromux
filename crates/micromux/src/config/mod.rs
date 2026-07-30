@@ -1,6 +1,7 @@
 //! Configuration parsing and types.
 //!
 //! This module provides:
+//!
 //! - [`from_str`]: parse a YAML configuration into a typed [`ConfigFile`].
 //! - [`find_config_file`]: locate a config file in a directory.
 //! - A set of configuration types (e.g. [`Service`], [`HealthCheck`]) and diagnostics-friendly
@@ -17,6 +18,53 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use yaml_spanned::{Spanned, Value};
+
+/// Maximum buffered size of one configuration file, bounding validation and reload memory.
+pub const MAX_CONFIG_FILE_BYTES: usize = 4 * 1024 * 1024;
+
+/// Read a configuration file without allowing an unexpectedly large file to pin memory.
+///
+/// # Errors
+///
+/// Returns an I/O error when the file cannot be read, exceeds [`MAX_CONFIG_FILE_BYTES`], or is not
+/// valid UTF-8.
+pub fn read_config_file(path: &Path) -> std::io::Result<String> {
+    use std::io::Read as _;
+
+    let file = std::fs::File::open(path)?;
+    let mut bytes = Vec::new();
+    file.take((MAX_CONFIG_FILE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    decode_config_bytes(bytes)
+}
+
+/// Asynchronously read a configuration file with the same bound as [`read_config_file`].
+///
+/// # Errors
+///
+/// Returns an I/O error when the file cannot be read, exceeds [`MAX_CONFIG_FILE_BYTES`], or is not
+/// valid UTF-8.
+pub async fn read_config_file_async(path: &Path) -> std::io::Result<String> {
+    use tokio::io::AsyncReadExt as _;
+
+    let file = tokio::fs::File::open(path).await?;
+    let mut bytes = Vec::new();
+    file.take((MAX_CONFIG_FILE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .await?;
+    decode_config_bytes(bytes)
+}
+
+fn decode_config_bytes(bytes: Vec<u8>) -> std::io::Result<String> {
+    if bytes.len() > MAX_CONFIG_FILE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("configuration exceeds the {MAX_CONFIG_FILE_BYTES} byte limit"),
+        ));
+    }
+    String::from_utf8(bytes)
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))
+}
 
 /// Parse a value into a typed, spanned value.
 ///
@@ -625,7 +673,19 @@ pub fn from_str<F: Copy + PartialEq>(
     strict_override: Option<bool>,
     diagnostics: &mut Vec<Diagnostic<F>>,
 ) -> Result<ConfigFile<F>, ConfigError> {
-    let value = yaml_spanned::from_str(raw_config).map_err(ConfigError::Yaml)?;
+    let mut documents = yaml_spanned::from_str_all(raw_config).map_err(ConfigError::Yaml)?;
+    if documents.len() != 1 {
+        return Err(ConfigError::InvalidValue {
+            message: "configuration must contain exactly one YAML document".to_string(),
+            span: 0..raw_config.len(),
+        });
+    }
+    let Some(value) = documents.pop() else {
+        return Err(ConfigError::InvalidValue {
+            message: "configuration must contain exactly one YAML document".to_string(),
+            span: 0..raw_config.len(),
+        });
+    };
     let effective_strict = strict_override.or(parse_strict(&value)?);
     let version = parse_version(&value, file_id, effective_strict, diagnostics)?;
     let config = match version {
@@ -954,6 +1014,36 @@ mod tests {
         "#};
         let instance: serde_json::Value = serde_yaml::from_str(yaml)?;
         assert!(compiled.validate(&instance).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn parser_rejects_trailing_yaml_documents() {
+        let yaml = indoc! {r#"
+            version: 1
+            services:
+              app:
+                command: ["true"]
+            ---
+            services: {}
+        "#};
+        let mut diagnostics = Vec::new();
+
+        let result = super::from_str(yaml, Path::new("."), 0usize, None, &mut diagnostics);
+
+        assert!(result.is_err_and(|err| { err.to_string().contains("exactly one YAML document") }));
+    }
+
+    #[test]
+    fn bounded_config_reader_rejects_oversized_files() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("micromux.yaml");
+        std::fs::write(&path, vec![b'x'; super::MAX_CONFIG_FILE_BYTES + 1])?;
+
+        let error =
+            super::read_config_file(&path).expect_err("oversized configuration should be rejected");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
         Ok(())
     }
 }

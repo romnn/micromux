@@ -90,6 +90,34 @@ fn spawn_shutdown_handler(shutdown: micromux::CancellationToken) {
     });
 }
 
+#[cfg(unix)]
+fn raise_file_descriptor_limit() {
+    use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
+
+    // A live run owns several PTY, cancellation, and log descriptors. macOS commonly starts at
+    // 256; its PTY readiness path uses kqueue, so raising the limit does not hit select's ceiling.
+    const TARGET: u64 = 4096;
+    let current = getrlimit(Resource::Nofile);
+    let desired = current
+        .maximum
+        .map_or(TARGET, |maximum| TARGET.min(maximum));
+    if current.current.is_none_or(|limit| limit >= desired) {
+        return;
+    }
+    if let Err(err) = setrlimit(
+        Resource::Nofile,
+        Rlimit {
+            current: Some(desired),
+            maximum: current.maximum,
+        },
+    ) {
+        eprintln!("warning: could not raise the open-file limit to {desired}: {err}");
+    }
+}
+
+#[cfg(not(unix))]
+fn raise_file_descriptor_limit() {}
+
 /// Derive an effective log level from the configured `--log` level and the `-v`/`-q` counts.
 ///
 /// `--log`/`RUST_LOG` take precedence; otherwise `-v`/`-q` adjust a `WARN` baseline.
@@ -139,7 +167,7 @@ async fn load_config(
         .parent()
         .ok_or_else(|| Error::Message("failed to get config file".to_string()))?;
 
-    let raw_config = tokio::fs::read_to_string(&config_path).await?;
+    let raw_config = micromux::read_config_file_async(&config_path).await?;
 
     let diagnostic_printer = DiagnosticsPrinter::new(color_choice);
     let file_id = diagnostic_printer.add_source_file(&config_path, raw_config.clone());
@@ -188,10 +216,12 @@ async fn run() -> Result<(), Error> {
             return ctl::run(action, options.config_path.as_deref()).await;
         }
         #[cfg(feature = "mcp")]
-        Some(options::Command::Mcp) => {
+        Some(options::Command::Mcp {
+            allow_session_start,
+        }) => {
             // Logs go to a file (never stdout — stdout is the JSON-RPC channel).
             let _log_guard = setup_logging(&options).ok();
-            return mcp::run().await;
+            return mcp::run(allow_session_start).await;
         }
         Some(options::Command::Serve) => {
             return run_headless(options).await;
@@ -213,31 +243,50 @@ async fn run() -> Result<(), Error> {
     let (runner, handles) = mux.clone().start(shutdown.clone());
 
     // Default-on control plane, opt out via `--no-control` or `control: { enabled: false }`.
+    let mut control_warning = None;
     if !options.no_control && config.config.control.enabled {
         let working_dir = std::env::current_dir()?;
         match control::resolve_config_path(options.config_path.as_deref(), &working_dir).await {
             Ok(config_path) => {
-                control::spawn(
+                match control::spawn(
                     &handles,
                     &config_path,
                     &working_dir,
                     config.config.name.clone(),
                     shutdown.clone(),
-                );
+                ) {
+                    control::SpawnStatus::Started => {}
+                    control::SpawnStatus::OwnedByOther => {
+                        control_warning = Some(
+                        "another micromux already owns this project; both copies may run services"
+                            .to_string(),
+                        );
+                    }
+                    control::SpawnStatus::Unavailable => {
+                        control_warning =
+                            Some("the control plane is unavailable for this session".to_string());
+                    }
+                }
             }
-            Err(err) => tracing::warn!(
-                ?err,
-                "control plane disabled: could not resolve config path"
-            ),
+            Err(err) => {
+                tracing::warn!(
+                    ?err,
+                    "control plane disabled: could not resolve config path"
+                );
+                control_warning =
+                    Some("the control plane is unavailable for this session".to_string());
+            }
         }
     }
 
     let input = handles.commands.clone();
+    let mut source =
+        micromux_tui::LocalSource::new(handles.reader.clone(), handles.commands.clone());
+    if let Some(warning) = control_warning {
+        source = source.with_notice(warning);
+    }
     let tui = micromux_tui::App::new(
-        micromux_tui::SessionSource::Local(micromux_tui::LocalSource::new(
-            handles.reader.clone(),
-            handles.commands.clone(),
-        )),
+        micromux_tui::SessionSource::Local(source),
         Some(input),
         shutdown.clone(),
         config.config.ui_config.pretty_json_logs && !options.no_pretty_json_logs,
@@ -290,14 +339,14 @@ async fn run_headless(options: options::Options) -> Result<(), Error> {
     let working_dir = std::env::current_dir()?;
     let config_path =
         control::resolve_config_path(options.config_path.as_deref(), &working_dir).await?;
-    let bound = control::spawn(
+    let status = control::spawn(
         &handles,
         &config_path,
         &working_dir,
         config.config.name.clone(),
         shutdown.clone(),
     );
-    if !bound {
+    if !matches!(status, control::SpawnStatus::Started) {
         // Another live session already owns this project (or there is no transport): a headless
         // session with no reachable control plane is useless, so don't even start the scheduler.
         return Err(Error::Message(
@@ -314,5 +363,6 @@ async fn run_headless(options: options::Options) -> Result<(), Error> {
 #[tokio::main]
 async fn main() -> color_eyre::Result<()> {
     color_eyre::install()?;
+    raise_file_descriptor_limit();
     Ok(run().await?)
 }

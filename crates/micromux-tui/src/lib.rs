@@ -262,6 +262,7 @@ impl App {
     /// # Errors
     ///
     /// Returns an error if:
+    ///
     /// - Receiving an input event fails.
     /// - The underlying terminal backend fails to draw.
     pub async fn run(mut self, mut terminal: DefaultTerminal) -> Result<(), Error> {
@@ -276,6 +277,8 @@ impl App {
         let area = terminal.size()?;
         self.terminal_cols = area.width;
         self.terminal_rows = area.height;
+        self.state
+            .clamp_sidebar(self.terminal_cols.saturating_sub(22));
         self.maybe_resize_pty();
 
         // Seed the view from the model before the first frame.
@@ -304,10 +307,11 @@ impl App {
                 } => Some(Wake::PendingInput),
             };
 
+            let mut needs_resync = false;
             match wake {
                 Some(Wake::Input(event)) => self.handle_input_event(event),
-                Some(Wake::Change(change)) => self.apply_change(&change),
-                Some(Wake::Resync) => self.resync(),
+                Some(Wake::Change(change)) => needs_resync |= self.apply_change(&change),
+                Some(Wake::Resync) => needs_resync = true,
                 Some(Wake::PendingInput) => self.flush_pending_pty_input(),
                 None => {
                     self.running = false;
@@ -322,13 +326,16 @@ impl App {
             }
             loop {
                 match self.changes.try_recv() {
-                    Ok(change) => self.apply_change(&change),
-                    Err(broadcast::error::TryRecvError::Lagged(_)) => self.resync(),
+                    Ok(change) => needs_resync |= self.apply_change(&change),
+                    Err(broadcast::error::TryRecvError::Lagged(_)) => needs_resync = true,
                     Err(
                         broadcast::error::TryRecvError::Empty
                         | broadcast::error::TryRecvError::Closed,
                     ) => break,
                 }
+            }
+            if needs_resync {
+                self.resync();
             }
             let frame_deadline = last_frame + FRAME_INTERVAL;
             if tokio::time::Instant::now() < frame_deadline {
@@ -342,7 +349,7 @@ impl App {
 
     /// Apply a single liveness notification by re-querying the model for the affected service. The
     /// broadcast carries only `{service_id, kind}`; the content lives in the model.
-    fn apply_change(&mut self, change: &SessionChange) {
+    fn apply_change(&mut self, change: &SessionChange) -> bool {
         match change.kind {
             ChangeKind::Status => {
                 if let Some(snapshot) = self.source.service(&change.service_id)
@@ -361,9 +368,10 @@ impl App {
                     service.healthcheck_dirty = true;
                 }
             }
-            ChangeKind::Roster | ChangeKind::Unknown => self.resync(),
+            ChangeKind::Roster | ChangeKind::Unknown => return true,
             ChangeKind::Events => {}
         }
+        false
     }
 
     /// Reconcile the roster while retaining render caches for services that still exist.
@@ -421,6 +429,7 @@ impl App {
             crossterm::event::Event::Resize(cols, rows) => {
                 self.terminal_cols = cols;
                 self.terminal_rows = rows;
+                self.state.clamp_sidebar(cols.saturating_sub(22));
                 self.maybe_resize_pty();
             }
             crossterm::event::Event::Key(key) if key.kind == KeyEventKind::Press => {
@@ -482,7 +491,9 @@ impl App {
 
             // Increase service sidebar width (resize to the right)
             KeyCode::Char('+' | 'l') | KeyCode::Right => {
-                self.state.resize_right();
+                // Keep enough room for a useful PTY after the sidebar and pane borders.
+                self.state
+                    .resize_right(self.terminal_cols.saturating_sub(22));
                 self.maybe_resize_pty();
             }
 
@@ -602,7 +613,10 @@ impl App {
 
     fn scroll_logs_up(&mut self, lines: u16) {
         self.log_view.follow_tail = false;
-        self.log_view.scroll_offset = self.log_view.scroll_offset.saturating_sub(lines);
+        self.log_view.scroll_offset = self
+            .log_view
+            .scroll_offset
+            .saturating_sub(usize::from(lines));
     }
 
     fn scroll_logs_down(&mut self, lines: u16) {
@@ -613,19 +627,21 @@ impl App {
         // Wrap-aware count persisted by the renderer, so scrolling reaches the true bottom
         // even when wrapping is enabled (the raw entry count would stop short).
         let num_lines = service.cached_wrapped_lines;
-        let viewport = self.log_viewport_height();
+        let viewport = usize::from(self.log_viewport_height());
         let max_off = num_lines.saturating_sub(viewport);
         self.log_view.scroll_offset = self
             .log_view
             .scroll_offset
-            .saturating_add(lines)
+            .saturating_add(usize::from(lines))
             .min(max_off);
     }
 
     fn scroll_healthchecks_up(&mut self, lines: u16) {
         self.healthcheck_view.follow_tail = false;
-        self.healthcheck_view.scroll_offset =
-            self.healthcheck_view.scroll_offset.saturating_sub(lines);
+        self.healthcheck_view.scroll_offset = self
+            .healthcheck_view
+            .scroll_offset
+            .saturating_sub(usize::from(lines));
     }
 
     fn scroll_healthchecks_down(&mut self, lines: u16) {
@@ -634,12 +650,12 @@ impl App {
             return;
         };
         let num_lines = service.healthcheck_cached_num_lines;
-        let viewport = self.log_viewport_height();
+        let viewport = usize::from(self.log_viewport_height());
         let max_off = num_lines.saturating_sub(viewport);
         self.healthcheck_view.scroll_offset = self
             .healthcheck_view
             .scroll_offset
-            .saturating_add(lines)
+            .saturating_add(usize::from(lines))
             .min(max_off);
     }
 
@@ -894,7 +910,10 @@ mod tests {
         let _ = commands_rx.try_recv()?;
         app.flush_pending_pty_input();
 
-        match commands_rx.try_recv()? {
+        let command = tokio::time::timeout(Duration::from_secs(1), commands_rx.recv())
+            .await?
+            .ok_or_else(|| eyre::eyre!("command channel closed"))?;
+        match command {
             Command::SendInput(service, bytes) => {
                 assert_eq!(service, "svc");
                 assert_eq!(bytes, b"firstsecond");
@@ -1075,7 +1094,10 @@ mod tests {
 
         app.restart_current_service();
 
-        match commands_rx.try_recv()? {
+        let command = tokio::time::timeout(Duration::from_secs(1), commands_rx.recv())
+            .await?
+            .ok_or_else(|| eyre::eyre!("lifecycle relay stopped"))?;
+        match command {
             micromux::Command::Restart { service, .. } => assert_eq!(service, "svc"),
             other => {
                 eyre::bail!("expected restart command, got {other:?}");
@@ -1138,7 +1160,10 @@ mod tests {
             });
         }
         app.handle_key_press(stop_key);
-        match commands_rx.try_recv()? {
+        let command = tokio::time::timeout(Duration::from_secs(1), commands_rx.recv())
+            .await?
+            .ok_or_else(|| eyre::eyre!("lifecycle relay stopped"))?;
+        match command {
             micromux::Command::StopDynamic { service, ack } => {
                 assert_eq!(service, "svc");
                 assert!(ack.is_none());

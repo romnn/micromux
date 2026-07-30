@@ -20,6 +20,15 @@ pub(crate) const DEFAULT_STOP_GRACE_PERIOD: Duration = Duration::from_secs(10);
 /// Longest graceful-stop window accepted for one service.
 pub(crate) const MAX_STOP_GRACE_PERIOD: Duration = Duration::from_mins(5);
 
+/// Whether a service id is safe for control selectors and filesystem-backed log names.
+#[must_use]
+pub fn service_id_is_valid(id: &str) -> bool {
+    (1..=64).contains(&id.len())
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
 /// The normalized, origin-independent definition of one supervised service.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ServiceSpec {

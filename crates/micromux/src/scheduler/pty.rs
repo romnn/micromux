@@ -44,7 +44,7 @@ use nix::{errno::Errno, sys::signal::Signal, unistd::Pid};
 
 #[cfg(unix)]
 use filedescriptor::{
-    AsRawFileDescriptor, FileDescriptor, POLLERR, POLLHUP, POLLIN, POLLOUT, Pipe, poll, pollfd,
+    AsRawFileDescriptor, FileDescriptor, POLLERR, POLLHUP, POLLIN, POLLOUT, Pipe, pollfd,
 };
 
 #[cfg(unix)]
@@ -94,16 +94,89 @@ pub(super) const HEALTH_TASK_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 /// How long termination waits inline before continuing lifecycle notification independently.
 const TERMINATION_EVENT_NOTIFY_TIMEOUT: Duration = Duration::from_millis(100);
 
-#[cfg(unix)]
-fn poll_error_is_interrupted(error: &filedescriptor::Error) -> bool {
-    // `filedescriptor` uses `poll(2)` on most Unix targets and `select(2)` on macOS, which wrap
-    // `EINTR` as `Error::Poll` and `Error::Io` respectively.
-    match error {
-        filedescriptor::Error::Poll(error) | filedescriptor::Error::Io(error) => {
-            error.kind() == io::ErrorKind::Interrupted
+#[cfg(all(unix, not(target_vendor = "apple")))]
+fn poll_descriptors(descriptors: &mut [pollfd], timeout: Option<Duration>) -> io::Result<usize> {
+    filedescriptor::poll(descriptors, timeout).map_err(|error| match error {
+        filedescriptor::Error::Poll(error) | filedescriptor::Error::Io(error) => error,
+        error => io::Error::other(error),
+    })
+}
+
+#[cfg(all(unix, target_vendor = "apple"))]
+fn poll_descriptors(descriptors: &mut [pollfd], timeout: Option<Duration>) -> io::Result<usize> {
+    use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue};
+
+    // filedescriptor emulates poll with select on macOS, inheriting FD_SETSIZE. kqueue keeps PTY
+    // readiness working after the CLI raises the process's descriptor limit.
+    let queue = Kqueue::new().map_err(io::Error::from)?;
+    let mut changes = Vec::with_capacity(descriptors.len() * 2);
+    for (index, descriptor) in descriptors.iter().enumerate() {
+        let identifier = usize::try_from(descriptor.fd)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid poll descriptor"))?;
+        let user_data = isize::try_from(index)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "too many descriptors"))?;
+        if descriptor.events & POLLIN != 0 {
+            changes.push(KEvent::new(
+                identifier,
+                EventFilter::EVFILT_READ,
+                EvFlags::EV_ADD | EvFlags::EV_ENABLE,
+                FilterFlag::empty(),
+                0,
+                user_data,
+            ));
         }
-        _ => false,
+        if descriptor.events & POLLOUT != 0 {
+            changes.push(KEvent::new(
+                identifier,
+                EventFilter::EVFILT_WRITE,
+                EvFlags::EV_ADD | EvFlags::EV_ENABLE,
+                FilterFlag::empty(),
+                0,
+                user_data,
+            ));
+        }
     }
+    let mut events = vec![
+        KEvent::new(
+            0,
+            EventFilter::EVFILT_READ,
+            EvFlags::empty(),
+            FilterFlag::empty(),
+            0,
+            0,
+        );
+        changes.len().max(1)
+    ];
+    let timeout = timeout.map(|duration| nix::libc::timespec {
+        tv_sec: duration
+            .as_secs()
+            .try_into()
+            .unwrap_or(nix::libc::time_t::MAX),
+        tv_nsec: duration.subsec_nanos().into(),
+    });
+    let count = queue
+        .kevent(&changes, &mut events, timeout)
+        .map_err(io::Error::from)?;
+    for event in events.into_iter().take(count) {
+        let Ok(index) = usize::try_from(event.udata()) else {
+            continue;
+        };
+        let Some(descriptor) = descriptors.get_mut(index) else {
+            continue;
+        };
+        match event.filter() {
+            Ok(EventFilter::EVFILT_READ) => descriptor.revents |= POLLIN,
+            Ok(EventFilter::EVFILT_WRITE) => descriptor.revents |= POLLOUT,
+            _ => descriptor.revents |= POLLERR,
+        }
+        if event.flags().intersects(EvFlags::EV_EOF) {
+            descriptor.revents |= POLLHUP;
+        }
+        if event.flags().intersects(EvFlags::EV_ERROR) {
+            descriptor.revents |= POLLERR;
+        }
+    }
+    Ok(count)
 }
 
 type SharedPtyMaster = Arc<Mutex<Option<Box<dyn portable_pty::MasterPty + Send>>>>;
@@ -371,7 +444,7 @@ impl PtyWriter {
                 },
             ];
 
-            match poll(&mut descriptors, timeout) {
+            match poll_descriptors(&mut descriptors, timeout) {
                 Ok(0) => return Err(Self::input_timeout()),
                 Ok(_) => {
                     let writer_events = descriptors
@@ -393,8 +466,8 @@ impl PtyWriter {
                         ));
                     }
                 }
-                Err(err) if poll_error_is_interrupted(&err) => {}
-                Err(err) => return Err(io::Error::other(err)),
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+                Err(err) => return Err(err),
             }
         }
     }
@@ -1059,10 +1132,10 @@ impl PollingPtyReader {
                 },
             ];
 
-            match poll(&mut fds, None) {
+            match poll_descriptors(&mut fds, None) {
                 Ok(_) => {}
-                Err(err) if poll_error_is_interrupted(&err) => continue,
-                Err(err) => return Err(io::Error::other(err)),
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                Err(err) => return Err(err),
             }
 
             let mut events = fds.iter().map(|fd| fd.revents);
@@ -1547,6 +1620,8 @@ struct TerminationTaskArgs {
     pty_shutdown: PtyShutdown,
     child: Box<dyn portable_pty::Child + Send + Sync>,
     health_task: Option<tokio::task::JoinHandle<()>>,
+    #[cfg(windows)]
+    process_job: win32job::Job,
 }
 
 #[derive(Clone, Copy)]
@@ -1782,7 +1857,11 @@ fn spawn_termination_task_with_timing(args: TerminationTaskArgs, timing: Termina
             killer,
             mut child,
             mut health_task,
+            #[cfg(windows)]
+            process_job,
         } = args;
+        #[cfg(windows)]
+        let _process_job = process_job;
 
         let mut target = TerminationTarget {
             killer,
@@ -1895,6 +1974,12 @@ pub(super) fn start_service_with_pty_size(
     let Some((prog, args)) = service.spec.command.split_first() else {
         return Err(Error::EmptyCommand);
     };
+    #[cfg(unix)]
+    let working_dir = service
+        .spawn_working_directory()
+        .map_err(|err| Error::operation("failed to resolve anchored working directory", err))?;
+    #[cfg(not(unix))]
+    let working_dir = service.spec.working_dir.clone();
 
     let env_vars = env_vars_for_service(service);
     let env_vars = {
@@ -1928,7 +2013,7 @@ pub(super) fn start_service_with_pty_size(
 
     let mut cmd = CommandBuilder::new(prog);
     cmd.args(args);
-    if let Some(dir) = &service.spec.working_dir {
+    if let Some(dir) = &working_dir {
         cmd.cwd(dir);
     }
     for (k, v) in &env_vars {
@@ -1949,6 +2034,18 @@ pub(super) fn start_service_with_pty_size(
     let process_group_leader = None;
 
     let mut child_guard = SpawnedChildGuard::new(child.clone_killer(), pid, process_group_leader);
+
+    #[cfg(windows)]
+    let process_job = {
+        let handle = child.as_raw_handle().ok_or_else(|| {
+            Error::operation(
+                "failed to contain service process",
+                "child did not expose a process handle",
+            )
+        })?;
+        crate::windows_job::attach_kill_on_close(handle as isize)
+            .map_err(|err| Error::operation("failed to contain service process", err))?
+    };
 
     let (reader, log_reader) = PtyOutputReader::new(pair.master.as_ref())?;
 
@@ -1982,7 +2079,7 @@ pub(super) fn start_service_with_pty_size(
 
     let health_task = service.spec.healthcheck.clone().map(|health_check| {
         let service_id = service_id.clone();
-        let working_dir = service.spec.working_dir.clone();
+        let working_dir = working_dir.clone();
         let environment: std::collections::HashMap<String, String> = service
             .spec
             .environment
@@ -2023,6 +2120,8 @@ pub(super) fn start_service_with_pty_size(
             pty_shutdown,
             child,
             health_task,
+            #[cfg(windows)]
+            process_job,
         },
         service.spec.stop_grace_period,
     );
@@ -2084,21 +2183,6 @@ mod tests {
             fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
                 Box::new(self.clone())
             }
-        }
-
-        #[test]
-        fn poll_eintr_is_retryable_for_native_poll_and_macos_select() {
-            let native_poll =
-                filedescriptor::Error::Poll(io::Error::from(io::ErrorKind::Interrupted));
-            let macos_select =
-                filedescriptor::Error::Io(io::Error::from(io::ErrorKind::Interrupted));
-            let fatal_poll = filedescriptor::Error::Poll(io::Error::other("fatal poll error"));
-            let unrelated = filedescriptor::Error::IllegalFdValue(-1);
-
-            assert!(poll_error_is_interrupted(&native_poll));
-            assert!(poll_error_is_interrupted(&macos_select));
-            assert!(!poll_error_is_interrupted(&fatal_poll));
-            assert!(!poll_error_is_interrupted(&unrelated));
         }
 
         struct ExitOnDropWriter {

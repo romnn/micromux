@@ -17,11 +17,10 @@ use serde::{Deserialize, Serialize};
 ///
 /// Bump the minor for additive changes (new optional/defaulted fields, new tools that reuse
 /// existing requests), and bump the major for incompatible request/response semantics.
-pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(3, 3);
+pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(3, 5);
 
 /// A typed control protocol version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
 pub struct ProtocolVersion {
     major: u16,
     minor: u16,
@@ -66,6 +65,13 @@ pub enum Request {
     Describe,
     /// List every service with its current snapshot.
     ListServices,
+    /// Return one service by stable id or human-readable name.
+    ///
+    /// Exact ids take precedence; duplicate display names resolve to the first service.
+    GetService {
+        /// Service id or display name.
+        service: ServiceID,
+    },
     /// Return recent log records for a service.
     GetLogs {
         /// Target service.
@@ -172,6 +178,29 @@ pub enum Request {
     Subscribe,
 }
 
+impl Request {
+    /// Whether a client may repeat the request after losing the connection before its response.
+    ///
+    /// Mutations are deliberately excluded even when they are usually idempotent: a lost
+    /// acknowledgement does not prove whether the scheduler accepted the first request.
+    #[must_use]
+    pub const fn is_retry_safe(&self) -> bool {
+        matches!(
+            self,
+            Self::Describe
+                | Self::ListServices
+                | Self::GetService { .. }
+                | Self::GetLogs { .. }
+                | Self::FollowLogs { .. }
+                | Self::ListLogRuns { .. }
+                | Self::GetHealth { .. }
+                | Self::GetHealthHistory { .. }
+                | Self::GetEvents { .. }
+                | Self::ReconcileConfig { dry_run: true }
+        )
+    }
+}
+
 /// A brief, identity-only view of a service for [`SessionInfo`].
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ServiceBrief {
@@ -205,6 +234,11 @@ pub struct SessionInfo {
     /// The services this session supervises.
     #[serde(default)]
     pub services: Vec<ServiceBrief>,
+    /// Whether the service index was shortened to fit the control frame.
+    ///
+    /// Use [`Request::GetService`] for targeted lookup when this is true.
+    #[serde(default)]
+    pub services_truncated: bool,
     /// The micromux version of the session binary.
     #[serde(default)]
     pub micromux_version: String,
@@ -292,6 +326,8 @@ pub enum Response {
     Description(SessionInfo),
     /// Reply to [`Request::ListServices`].
     Services(Vec<ServiceSnapshot>),
+    /// Reply to [`Request::GetService`].
+    Service(Box<ServiceSnapshot>),
     /// Reply to [`Request::GetLogs`].
     Logs {
         /// The recent log records.
@@ -299,6 +335,12 @@ pub enum Response {
         /// Whether the session had to drop older records to respect server response limits.
         #[serde(default)]
         truncated: bool,
+        /// First sequence still retained by the visible in-memory stream.
+        ///
+        /// Present only for visible-stream responses. A cursor whose next expected sequence is
+        /// below this value has crossed a retention gap and should resume here.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        first_retained_seq: Option<u64>,
     },
     /// Reply to [`Request::ListLogRuns`].
     LogRuns {
@@ -369,6 +411,7 @@ mod tests {
             working_dir: ".".to_string(),
             config_path: "/project/micromux.yaml".to_string(),
             services: Vec::new(),
+            services_truncated: false,
             micromux_version: env!("CARGO_PKG_VERSION").to_string(),
             capabilities: None,
         }
@@ -388,7 +431,7 @@ mod tests {
     fn protocol_version_uses_major_minor_shape_and_accepts_same_major() {
         assert_eq!(
             serde_json::to_value(PROTOCOL_VERSION).unwrap(),
-            json!({ "major": 3, "minor": 3 })
+            json!({ "major": 3, "minor": 5 })
         );
         assert_eq!(
             serde_json::from_value::<ProtocolVersion>(json!({ "major": 1, "minor": 0 })).unwrap(),
@@ -439,6 +482,7 @@ mod tests {
         assert_eq!(info.protocol_version, ProtocolVersion::new(3, 2));
         assert_eq!(info.name, "");
         assert!(info.services.is_empty());
+        assert!(!info.services_truncated);
         assert_eq!(info.micromux_version, "");
         assert!(info.capabilities.is_none());
     }
@@ -551,12 +595,44 @@ mod tests {
         .unwrap();
 
         match response {
-            Response::Logs { lines, truncated } => {
+            Response::Logs {
+                lines,
+                truncated,
+                first_retained_seq,
+            } => {
                 assert!(lines.is_empty());
                 assert!(!truncated);
+                assert_eq!(first_retained_seq, None);
             }
             other => panic!("unexpected response: {other:?}"),
         }
+    }
+
+    #[test]
+    fn protocol_version_ignores_additive_fields() {
+        let version = serde_json::from_value::<ProtocolVersion>(json!({
+            "major": 3,
+            "minor": 5,
+            "future_capability": true
+        }))
+        .unwrap();
+
+        assert_eq!(version, PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn only_observations_are_safe_to_retry_after_a_lost_response() {
+        assert!(Request::ListServices.is_retry_safe());
+        assert!(
+            Request::GetService {
+                service: "api".to_string(),
+            }
+            .is_retry_safe()
+        );
+        assert!(Request::ReconcileConfig { dry_run: true }.is_retry_safe());
+        assert!(!Request::RestartAll.is_retry_safe());
+        assert!(!Request::ReconcileConfig { dry_run: false }.is_retry_safe());
+        assert!(!Request::Shutdown.is_retry_safe());
     }
 
     #[test]

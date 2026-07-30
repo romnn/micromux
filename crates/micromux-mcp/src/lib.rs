@@ -18,6 +18,7 @@ mod tools;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use micromux::{Desired, Execution, Health, HealthAttempt, ServiceSnapshot};
@@ -55,7 +56,7 @@ use crate::tools::sessions::{
     remove_captured_stderr, spawn_detached_serve, start_failure_message, start_session_report,
 };
 #[cfg(unix)]
-use crate::tools::sessions::{STOP_CONFIRM_TIMEOUT, wait_until_stopped};
+use crate::tools::sessions::{ProcessExitWatch, STOP_CONFIRM_TIMEOUT};
 
 type ToolResult<T> = Result<Json<T>, ErrorData>;
 
@@ -80,6 +81,8 @@ const DIAGNOSE_LOG_SCAN: usize = 500;
 /// timeout.
 const WAIT_POLL_FLOOR: Duration = Duration::from_secs(1);
 const WAIT_LOG_POLL: Duration = Duration::from_millis(250);
+const MAX_SESSION_STARTS_PER_WINDOW: usize = 8;
+const SESSION_START_WINDOW: Duration = Duration::from_mins(1);
 
 const INSTRUCTIONS: &str = "Discover and control running micromux sessions. When no `session` is \
 given, tools target the current project's session. Use `find_service` to locate a service across \
@@ -109,6 +112,9 @@ human can run `micromux attach` to observe it. Use `stop_session` to stop it exp
 #[derive(Clone)]
 pub struct McpServer {
     cwd: PathBuf,
+    allow_session_start: bool,
+    session_start: Arc<tokio::sync::Semaphore>,
+    session_start_budget: Arc<tokio::sync::Semaphore>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -944,9 +950,10 @@ impl SessionConn {
     }
 
     async fn request(&mut self, request: Request) -> Result<Response, ToolError> {
+        let retry_safe = request.is_retry_safe();
         match self.client.request(request.clone()).await {
             Ok(response) => Ok(response),
-            Err(ControlError::Io(_) | ControlError::Closed) => {
+            Err(ControlError::Io(_) | ControlError::Closed) if retry_safe => {
                 self.client = Client::connect(&self.endpoint).await?;
                 Ok(self.client.request(request).await?)
             }
@@ -968,12 +975,44 @@ fn session_has_service(info: &SessionInfo, service: &str) -> bool {
         .any(|brief| brief.id == service || brief.name == service)
 }
 
-/// Whether retargeting `session=<this>` would resolve `service`, mirroring the session's id-keyed
-/// service lookup. Matches by id only (not name) so an enrichment suggestion is one where the retry
-/// actually succeeds — and so the selected session (which lacks the id, hence the `UnknownService`)
-/// is never suggested back to the caller.
-fn session_resolves_service_id(info: &SessionInfo, service: &str) -> bool {
-    info.services.iter().any(|brief| brief.id == service)
+fn matching_service(services: Vec<ServiceSnapshot>, selector: &str) -> Option<ServiceSnapshot> {
+    let index = services
+        .iter()
+        .position(|snapshot| snapshot.id == selector)
+        .or_else(|| {
+            services
+                .iter()
+                .position(|snapshot| snapshot.name == selector)
+        })?;
+    services.into_iter().nth(index)
+}
+
+async fn service_in_session(resolved: &select::Resolved, service: &str) -> Option<ServiceSnapshot> {
+    // Older peers do not understand the targeted request. Their unbounded description contained
+    // the complete service index, so only use the legacy roster request after that index matches.
+    if resolved.info.protocol_version.minor() >= 5 {
+        if !resolved.info.services_truncated && !session_has_service(&resolved.info, service) {
+            return None;
+        }
+        return send_request(
+            &resolved.endpoint,
+            Request::GetService {
+                service: service.to_string(),
+            },
+        )
+        .await
+        .ok()
+        .and_then(|response| convert::service(response).ok());
+    }
+
+    if !session_has_service(&resolved.info, service) {
+        return None;
+    }
+    send_request(&resolved.endpoint, Request::ListServices)
+        .await
+        .ok()
+        .and_then(|response| convert::services(response).ok())
+        .and_then(|services| matching_service(services, service))
 }
 
 /// Enrich a bare `UnknownService` error with the sibling sessions that *do* resolve the service, so
@@ -990,9 +1029,17 @@ async fn enrich_unknown_service(service: &str, mut err: ToolError) -> ToolError 
     let siblings = select::answering_sessions()
         .await
         .unwrap_or_default()
-        .into_iter()
-        .filter(|resolved| session_resolves_service_id(&resolved.info, service))
-        .collect::<Vec<_>>();
+        .into_iter();
+    let mut matching_siblings = Vec::new();
+    for resolved in siblings {
+        if service_in_session(&resolved, service)
+            .await
+            .is_some_and(|snapshot| snapshot.id == service)
+        {
+            matching_siblings.push(resolved);
+        }
+    }
+    let siblings = matching_siblings;
     if !siblings.is_empty() {
         let locations = siblings
             .iter()
@@ -1086,9 +1133,20 @@ impl McpServer {
     /// Create a new server, capturing the working directory used for `Current` session resolution.
     #[must_use]
     pub fn new() -> Self {
+        Self::with_session_start(false)
+    }
+
+    /// Create a server and explicitly configure whether agents may spawn detached sessions.
+    #[must_use]
+    pub fn with_session_start(allow_session_start: bool) -> Self {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         Self {
             cwd,
+            allow_session_start,
+            session_start: Arc::new(tokio::sync::Semaphore::new(1)),
+            session_start_budget: Arc::new(tokio::sync::Semaphore::new(
+                MAX_SESSION_STARTS_PER_WINDOW,
+            )),
             tool_router: Self::tool_router(),
         }
     }
@@ -1123,6 +1181,36 @@ impl McpServer {
     }
 
     async fn start_for_target(&self, target: PathBuf) -> Result<StartSessionResult, ErrorData> {
+        if !self.allow_session_start {
+            return Err(ErrorData::invalid_params(
+                "session startup is disabled; launch `micromux mcp --allow-session-start` to permit process spawning",
+                None,
+            ));
+        }
+        let _serial = Arc::clone(&self.session_start)
+            .try_acquire_owned()
+            .map_err(|_| {
+                ErrorData::invalid_params("another session-start request is in progress", None)
+            })?;
+        let budget = Arc::clone(&self.session_start_budget)
+            .try_acquire_owned()
+            .map_err(|_| {
+                ErrorData::invalid_params(
+                    "session-start rate limit reached; wait before spawning another session",
+                    None,
+                )
+            })?;
+        tokio::spawn(async move {
+            tokio::time::sleep(SESSION_START_WINDOW).await;
+            drop(budget);
+        });
+        self.start_for_target_unchecked(target).await
+    }
+
+    async fn start_for_target_unchecked(
+        &self,
+        target: PathBuf,
+    ) -> Result<StartSessionResult, ErrorData> {
         if !transport_supported() {
             return Err(error_data(ToolError::Unsupported));
         }
@@ -1391,17 +1479,9 @@ impl McpServer {
         // surfaced rather than masked as "no matches"; match by id or name for discovery.
         let sessions = select::answering_sessions().await.map_err(error_data)?;
         let mut matches = Vec::new();
-        for resolved in sessions
-            .into_iter()
-            .filter(|resolved| session_has_service(&resolved.info, &args.service))
-        {
-            let snapshot = match send_request(&resolved.endpoint, Request::ListServices).await {
-                Ok(response) => convert::services(response).ok().and_then(|services| {
-                    services
-                        .into_iter()
-                        .find(|snap| snap.id == args.service || snap.name == args.service)
-                }),
-                Err(_) => None,
+        for resolved in sessions {
+            let Some(snapshot) = service_in_session(&resolved, &args.service).await else {
+                continue;
             };
             let session_selector = session_selector(&resolved.info);
             let info = resolved.info;
@@ -1411,7 +1491,7 @@ impl McpServer {
                 pid: info.pid,
                 config_path: info.config_path,
                 working_dir: info.working_dir,
-                snapshot,
+                snapshot: Some(snapshot),
             });
         }
         Ok(Json(FindServiceResult {
@@ -2013,6 +2093,8 @@ impl McpServer {
         let resolved = select::resolve(&self.cwd, args.session)
             .await
             .map_err(error_data)?;
+        #[cfg(unix)]
+        let process_exit = ProcessExitWatch::new(resolved.info.pid);
         let response = send_request(&resolved.endpoint, Request::Shutdown)
             .await
             .map_err(error_data)?;
@@ -2022,7 +2104,7 @@ impl McpServer {
         // that detaches from the session's process group can still outlive it — this is not a hard
         // guarantee every port is freed.
         #[cfg(unix)]
-        let stopped = wait_until_stopped(resolved.info.pid, STOP_CONFIRM_TIMEOUT).await;
+        let stopped = process_exit.wait(STOP_CONFIRM_TIMEOUT).await;
         #[cfg(not(unix))]
         let stopped = true;
         let note = if stopped {
@@ -2085,7 +2167,12 @@ impl McpServer {
         // Cursor + gap are computed from the raw records (seq is per record), so `next_seq` advances
         // past filtered-out entries and following never re-fetches them.
         let next_seq = next_follow_cursor(&logs.lines, args.after_seq);
-        let gap = follow_gap(&logs.lines, args.after_seq, args.run_generation);
+        let gap = follow_gap(
+            &logs.lines,
+            logs.first_retained_seq,
+            args.after_seq,
+            args.run_generation,
+        );
         let entries = logproc::shape(&logs.lines, &filters.shape(args.filters.raw, None));
         Ok(Json(FollowLogsResult {
             service: args.service,
@@ -2591,7 +2678,8 @@ impl McpServer {
         description = "Ensure a service is ready by composing session startup, explicit enabling, \
         and the generation-aware health wait. Every action taken is reported. An already-healthy \
         service returns immediately with no actions; an exit or timeout includes bounded failure \
-        diagnosis. Retired dynamic services must be revived with replace_dynamic_service."
+        diagnosis. Starting a missing session requires the operator to enable session spawning. \
+        Retired dynamic services must be revived with replace_dynamic_service."
     )]
     async fn ensure_service_ready(
         &self,
@@ -2750,7 +2838,14 @@ impl ServerHandler for McpServer {
         info.server_info = Implementation::from_build_env();
         info.server_info.name = "micromux".to_string();
         info.server_info.version = env!("CARGO_PKG_VERSION").to_string();
-        info.instructions = Some(INSTRUCTIONS.to_string());
+        let mut instructions = INSTRUCTIONS.to_string();
+        if !self.allow_session_start {
+            instructions.push_str(
+                " This server does not permit process spawning: start_session is disabled unless \
+                 the operator launches `micromux mcp --allow-session-start`.",
+            );
+        }
+        info.instructions = Some(instructions);
         info
     }
 }
@@ -2879,8 +2974,10 @@ fn error_data(err: ToolError) -> ErrorData {
 /// # Errors
 ///
 /// Returns an error if the stdio transport fails to initialize or the service loop errors.
-pub async fn serve_stdio() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let server = McpServer::new();
+pub async fn serve_stdio(
+    allow_session_start: bool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let server = McpServer::with_session_start(allow_session_start);
     let service = server.serve(rmcp::transport::stdio()).await?;
     service.waiting().await?;
     Ok(())
@@ -2891,8 +2988,8 @@ mod tests {
     use super::{
         DynamicMutationResult, ExitVerdict, McpServer, MutationResult, RestartAndWaitResult,
         SessionMutationResult, SessionRef, StartDynamicAndWaitResult, StopSessionResult,
-        WaitForExitResult, WaitForExitStatus, WaitResult, classify_exit, parse_since_text,
-        session_has_service, session_resolves_service_id, session_selector,
+        WaitForExitResult, WaitForExitStatus, WaitResult, classify_exit, matching_service,
+        parse_since_text, session_has_service, session_selector,
     };
     use crate::tools::health::health_attempt_matches_snapshot;
     use crate::tools::logs::{
@@ -3730,6 +3827,7 @@ services:
                     name: (*name).to_string(),
                 })
                 .collect(),
+            services_truncated: false,
             micromux_version: env!("CARGO_PKG_VERSION").to_string(),
             capabilities: None,
         }
@@ -4205,8 +4303,45 @@ services:
         assert!(session_has_service(&info, "frontend"));
         assert!(session_has_service(&info, "web"));
         // Enrichment resolves by id only.
-        assert!(session_resolves_service_id(&info, "web"));
-        assert!(!session_resolves_service_id(&info, "frontend"));
+        let snapshot = ServiceSnapshot::initial(
+            "web".to_string(),
+            "frontend".to_string(),
+            Vec::new(),
+            None,
+            micromux::RestartPolicy::Never,
+            Vec::new(),
+            None,
+        );
+        assert!(
+            matching_service(vec![snapshot], "frontend")
+                .is_some_and(|snapshot| snapshot.id != "frontend")
+        );
+    }
+
+    #[test]
+    fn targeted_service_lookup_prefers_an_exact_id_over_an_earlier_name() {
+        let named = ServiceSnapshot::initial(
+            "api".to_string(),
+            "web".to_string(),
+            Vec::new(),
+            None,
+            micromux::RestartPolicy::Never,
+            Vec::new(),
+            None,
+        );
+        let exact = ServiceSnapshot::initial(
+            "web".to_string(),
+            "frontend".to_string(),
+            Vec::new(),
+            None,
+            micromux::RestartPolicy::Never,
+            Vec::new(),
+            None,
+        );
+
+        let matched = matching_service(vec![named, exact], "web");
+
+        assert_eq!(matched.map(|snapshot| snapshot.id), Some("web".to_string()));
     }
 
     #[test]
@@ -4315,11 +4450,12 @@ services:
             line: "newest retained".to_string(),
         }];
 
-        assert!(follow_gap(&lines, Some(10), None).is_some());
-        assert!(follow_gap(&lines, Some(14), None).is_none());
-        assert!(follow_gap(&[], Some(10), None).is_none());
-        assert!(follow_gap(&lines, None, None).is_none());
-        assert!(follow_gap(&lines, Some(10), Some(2)).is_none());
+        assert!(follow_gap(&lines, None, Some(10), None).is_some());
+        assert!(follow_gap(&lines, None, Some(14), None).is_none());
+        assert!(follow_gap(&[], None, Some(10), None).is_none());
+        assert!(follow_gap(&[], Some(15), Some(10), None).is_some());
+        assert!(follow_gap(&lines, None, None, None).is_none());
+        assert!(follow_gap(&lines, None, Some(10), Some(2)).is_none());
     }
 
     #[test]
@@ -4601,5 +4737,14 @@ services:
         assert!(merged.truncated);
         assert_eq!(merged.entries.len(), 1);
         assert_eq!(merged.next.get("api"), Some(&50));
+    }
+
+    #[tokio::test]
+    async fn session_start_is_disabled_by_default() {
+        let result = McpServer::new()
+            .start_for_target(std::path::PathBuf::from("."))
+            .await;
+
+        assert!(result.is_err());
     }
 }

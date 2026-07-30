@@ -64,6 +64,7 @@ pub(crate) fn truncate_wait_matches(
 
 pub(crate) fn follow_gap(
     lines: &[LogLine],
+    first_retained_seq: Option<u64>,
     after_seq: Option<u64>,
     run_generation: Option<u64>,
 ) -> Option<FollowGap> {
@@ -71,12 +72,12 @@ pub(crate) fn follow_gap(
         return None;
     }
     let after_seq = after_seq?;
-    let first = lines.first()?;
-    if first.seq > after_seq.saturating_add(1) {
+    let first_seq = first_retained_seq.or_else(|| lines.first().map(|line| line.seq))?;
+    if first_seq > after_seq.saturating_add(1) {
         Some(FollowGap {
             after_seq,
-            first_seq: first.seq,
-            lost_entries_at_least: first.seq.saturating_sub(after_seq).saturating_sub(1),
+            first_seq,
+            lost_entries_at_least: first_seq.saturating_sub(after_seq).saturating_sub(1),
         })
     } else {
         None
@@ -294,7 +295,7 @@ pub(crate) async fn follow_all_current_logs(
             .await?;
         let logs = convert::logs(response)?;
         let raw_next_seq = next_follow_cursor(&logs.lines, after_seq);
-        let gap = follow_gap(&logs.lines, after_seq, None);
+        let gap = follow_gap(&logs.lines, logs.first_retained_seq, after_seq, None);
         let mut entries = logproc::shape(&logs.lines, &filters.shape(raw, None));
         for entry in &mut entries {
             entry.service = Some(service.id.clone());

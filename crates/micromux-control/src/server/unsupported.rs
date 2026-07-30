@@ -13,6 +13,13 @@ pub(super) fn bind(_endpoint: &ControlEndpoint) -> Result<Option<EndpointGuard>,
     Err(ControlError::Unsupported)
 }
 
+pub(super) fn bind_project(
+    _endpoint: &ControlEndpoint,
+    _config_path: &crate::CanonicalConfigPath,
+) -> Result<Option<EndpointGuard>, ControlError> {
+    Err(ControlError::Unsupported)
+}
+
 pub(super) fn endpoint_owner_lock_held(_endpoint: &ControlEndpoint) -> Result<bool, ControlError> {
     Err(ControlError::Unsupported)
 }

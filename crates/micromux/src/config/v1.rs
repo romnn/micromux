@@ -53,6 +53,18 @@ const KNOWN_HEALTHCHECK_KEYS: &[&str] = &[
     "retries",
 ];
 
+const KNOWN_CONFIG_KEYS: &[&str] = &[
+    "version",
+    "name",
+    "strict",
+    "ui",
+    "control",
+    "restart",
+    "healthcheck",
+    "logs",
+    "services",
+];
+
 /// Warn (or, in strict mode, error) about mapping keys that the parser does not recognize.
 fn warn_unknown_keys<F: Copy>(
     mapping: &Mapping,
@@ -552,12 +564,7 @@ fn parse_dynamic_roots(
     roots
         .into_iter()
         .map(|(root, span)| {
-            let path = crate::env::resolve_path(config_dir, &root).map_err(|err| {
-                ConfigError::InvalidValue {
-                    message: format!("failed to resolve allowed working root `{root}`: {err}"),
-                    span: span.into(),
-                }
-            })?;
+            let path = crate::env::resolve_path(config_dir, &root);
             // With dynamic services disabled the roots are never consulted, so a root that no
             // longer exists on disk must not fail an otherwise valid config.
             if !enabled {
@@ -1107,6 +1114,14 @@ fn parse_services<F: Copy>(
                 .iter()
                 .map(|(name, service)| {
                     let name = parse::<String>(name)?;
+                    if !crate::spec::service_id_is_valid(&name) {
+                        return Err(ConfigError::InvalidValue {
+                            message: format!(
+                                "service id `{name}` must match [A-Za-z0-9._-]{{1,64}}"
+                            ),
+                            span: name.span.into(),
+                        });
+                    }
                     let service =
                         parse_service(service, &name, defaults, file_id, strict, diagnostics)?;
                     Ok::<_, ConfigError>((name, service))
@@ -1128,6 +1143,16 @@ pub fn parse_config<F: Copy + PartialEq>(
 ) -> Result<Config, ConfigError> {
     let strict_config = super::parse_strict(value)?;
     let strict = strict_override.or(strict_config).unwrap_or(false);
+    if let Some(mapping) = value.as_mapping() {
+        warn_unknown_keys(
+            mapping,
+            KNOWN_CONFIG_KEYS,
+            "top-level config",
+            file_id,
+            strict,
+            diagnostics,
+        );
+    }
     let name = parse_optional::<String>(value.get("name"))?.map(Spanned::into_inner);
     let ui_config = parse_ui_config(value, file_id, strict, diagnostics)?;
     let control = parse_control(value, config_dir, file_id, strict, diagnostics)?;
@@ -1855,6 +1880,44 @@ mod tests {
         let parsed = config::from_str(yaml, dir.path(), 0, None, &mut diagnostics)?;
 
         assert_eq!(parsed.config.control.dynamic_services.max_lifetime, None);
+        Ok(())
+    }
+
+    #[test]
+    fn configured_service_ids_use_the_control_plane_name_contract() {
+        let yaml = indoc! {r#"
+            version: 1
+            services:
+              "bad/name":
+                command: ["true"]
+        "#};
+        let mut diagnostics = Vec::new();
+
+        let result = config::from_str(yaml, Path::new("."), 0usize, None, &mut diagnostics);
+
+        assert!(
+            result
+                .is_err_and(|err| { err.to_string().contains("must match [A-Za-z0-9._-]{1,64}") })
+        );
+    }
+
+    #[test]
+    fn unknown_top_level_keys_are_diagnosed() -> eyre::Result<()> {
+        let yaml = indoc! {r#"
+            version: 1
+            workloads:
+              app:
+                command: ["true"]
+        "#};
+        let mut diagnostics = Vec::new();
+
+        let _ = config::from_str(yaml, Path::new("."), 0usize, None, &mut diagnostics)?;
+
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("unknown top-level config field `workloads`")
+        }));
         Ok(())
     }
 }

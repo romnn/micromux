@@ -14,6 +14,8 @@ pub struct LogsResult {
     pub lines: Vec<LogLine>,
     /// Whether server-side response limits dropped older content.
     pub truncated: bool,
+    /// First sequence still retained by the visible stream.
+    pub first_retained_seq: Option<u64>,
 }
 
 fn remote_error(code: ErrorCode, message: String) -> ToolError {
@@ -53,6 +55,19 @@ pub fn services(response: Response) -> Result<Vec<ServiceSnapshot>, ToolError> {
     }
 }
 
+/// Extract one service snapshot, mapping a remote error into a typed [`ToolError`].
+///
+/// # Errors
+///
+/// Returns a [`ToolError`] if the session replied with an error or an unexpected response.
+pub fn service(response: Response) -> Result<ServiceSnapshot, ToolError> {
+    match response {
+        Response::Service(service) => Ok(*service),
+        Response::Error { code, message } => Err(remote_error(code, message)),
+        other => Err(ToolError::Unexpected(format!("{other:?}"))),
+    }
+}
+
 /// Extract log lines.
 ///
 /// # Errors
@@ -60,7 +75,15 @@ pub fn services(response: Response) -> Result<Vec<ServiceSnapshot>, ToolError> {
 /// Returns a [`ToolError`] if the session replied with an error or an unexpected response.
 pub fn logs(response: Response) -> Result<LogsResult, ToolError> {
     match response {
-        Response::Logs { lines, truncated } => Ok(LogsResult { lines, truncated }),
+        Response::Logs {
+            lines,
+            truncated,
+            first_retained_seq,
+        } => Ok(LogsResult {
+            lines,
+            truncated,
+            first_retained_seq,
+        }),
         Response::Error { code, message } => Err(remote_error(code, message)),
         other => Err(ToolError::Unexpected(format!("{other:?}"))),
     }

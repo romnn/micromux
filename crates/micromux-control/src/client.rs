@@ -443,6 +443,7 @@ mod tests {
             working_dir: ".".to_string(),
             config_path: "/project/micromux.yaml".to_string(),
             services: Vec::new(),
+            services_truncated: false,
             micromux_version: env!("CARGO_PKG_VERSION").to_string(),
             capabilities: None,
         }

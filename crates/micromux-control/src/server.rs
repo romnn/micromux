@@ -98,6 +98,23 @@ pub fn bind(endpoint: &ControlEndpoint) -> Result<Option<EndpointGuard>, Control
     platform::bind(endpoint)
 }
 
+/// Bind a session endpoint and acquire the config-wide owner lock.
+///
+/// Unlike the endpoint-local lock, the owner lock lives in a fixed per-user directory under
+/// `/tmp`, so changing `XDG_RUNTIME_DIR` or `TMPDIR` cannot start another supervisor for the same
+/// config.
+///
+/// # Errors
+///
+/// Returns [`ControlError::Io`] if either lock or the socket cannot be created, or
+/// [`ControlError::Unsupported`] when this platform has no control transport.
+pub fn bind_project(
+    endpoint: &ControlEndpoint,
+    config_path: &CanonicalConfigPath,
+) -> Result<Option<EndpointGuard>, ControlError> {
+    platform::bind_project(endpoint, config_path)
+}
+
 /// Return whether a live owner currently holds the endpoint's lifetime lock.
 ///
 /// This is a read-only diagnostic/probing operation: unlike [`bind`], it never unlinks a socket or

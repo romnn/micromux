@@ -7,29 +7,29 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     prelude::*,
     style::{Color, Modifier, Style, Styled, palette::tailwind},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Scrollbar, Widget, Wrap},
+    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Widget, Wrap},
 };
 
-fn rendered_line_count(paragraph: &Paragraph<'_>, width: u16) -> u16 {
-    let height = paragraph.line_count(width);
-    u16::try_from(height).unwrap_or(u16::MAX)
+fn rendered_line_count(paragraph: &Paragraph<'_>, width: u16) -> usize {
+    paragraph.line_count(width)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        lease_phrase, log_view::LogView, rendered_line_count, service_detail_line, shell_join,
-        state_name,
+        lease_phrase,
+        log_view::{LogView, window_text},
+        rendered_line_count, service_detail_line, shell_join, state_name,
     };
     use ratatui::{
         buffer::Buffer,
         layout::Rect,
-        text::Text,
+        text::{Line, Text},
         widgets::{Paragraph, Wrap},
     };
     use similar_asserts::assert_eq;
 
-    fn wrapped_text_height(text: ratatui::text::Text, wrap_width: u16) -> u16 {
+    fn wrapped_text_height(text: ratatui::text::Text, wrap_width: u16) -> usize {
         let paragraph = Paragraph::new(text).wrap(Wrap { trim: false });
         rendered_line_count(&paragraph, wrap_width)
     }
@@ -40,14 +40,20 @@ mod tests {
         scrollbar_area: Rect,
         logs: &str,
         buf: &mut Buffer,
-    ) -> u16 {
+    ) -> usize {
         let text = Text::from(logs.to_string());
         let num_lines = if view.wrap {
             wrapped_text_height(text.clone(), log_area.width.saturating_sub(2))
         } else {
-            u16::try_from(text.height()).unwrap_or(u16::MAX)
+            text.height()
         };
-        view.render(log_area, scrollbar_area, num_lines, text, None, buf)
+        let area = Rect {
+            x: log_area.x,
+            y: log_area.y,
+            width: log_area.width.saturating_add(scrollbar_area.width),
+            height: log_area.height,
+        };
+        view.render(area, num_lines, text, "Logs", None, buf)
     }
 
     fn count_thumb(buf: &Buffer, area: Rect) -> usize {
@@ -356,6 +362,28 @@ mod tests {
     }
 
     #[test]
+    fn log_window_preserves_offsets_beyond_the_paragraph_scroll_limit() {
+        let line_count = usize::from(u16::MAX) + 100;
+        let text = Text::from(
+            (0..line_count)
+                .map(|index| Line::raw(index.to_string()))
+                .collect::<Vec<_>>(),
+        );
+
+        let (window, local_offset) = window_text(text, false, 80, line_count - 1);
+
+        assert_eq!(local_offset, u16::MAX);
+        assert_eq!(
+            window
+                .lines
+                .first()
+                .map(std::string::ToString::to_string)
+                .as_deref(),
+            Some("99")
+        );
+    }
+
+    #[test]
     fn healthcheck_text_matches_the_model_format() {
         use super::build_healthcheck_text;
         use micromux::{HealthAttempt, HealthLine, HealthResult, OutputStream};
@@ -627,12 +655,15 @@ impl Widget for &mut App {
             [main_right_area, Rect::default()]
         };
 
-        let header = self.attachment_header().unwrap_or_else(|| {
-            format!("micromux v{}", env!("CARGO_PKG_VERSION"))
-                .bold()
-                .fg(App::HEADER_COLOR)
-                .into_centered_line()
-        });
+        let header = self
+            .attachment_header()
+            .or_else(|| self.local_warning_header())
+            .unwrap_or_else(|| {
+                format!("micromux v{}", env!("CARGO_PKG_VERSION"))
+                    .bold()
+                    .fg(App::HEADER_COLOR)
+                    .into_centered_line()
+            });
         Paragraph::new(header).render(header_area, buf);
         self.render_services(services_area, buf);
         self.render_logs(logs_area, buf);
@@ -662,6 +693,20 @@ impl App {
             spans.extend([" — ".into(), notice.fg(tailwind::RED.c400)]);
         }
         Some(Line::from(spans).centered())
+    }
+
+    fn local_warning_header(&self) -> Option<Line<'static>> {
+        let notice = self.source.local_notice()?;
+        Some(
+            Line::from(vec![
+                format!("micromux v{}", env!("CARGO_PKG_VERSION"))
+                    .bold()
+                    .fg(App::HEADER_COLOR),
+                " — WARNING: ".fg(tailwind::RED.c400).bold(),
+                notice.to_string().fg(tailwind::RED.c400),
+            ])
+            .centered(),
+        )
     }
 
     fn render_services(&self, area: Rect, buf: &mut Buffer) {
@@ -763,24 +808,8 @@ impl App {
             }
         }
 
-        let [logs_area, scrollbar_area] = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Min(0),    // logs view
-                Constraint::Length(1), // scrollbar
-            ])
-            .spacing(0)
-            .areas(area);
-
-        let scrollbar_area = Rect {
-            x: scrollbar_area.x,
-            y: scrollbar_area.y.saturating_add(1),
-            width: scrollbar_area.width,
-            height: scrollbar_area.height.saturating_sub(2),
-        };
-
         let wrap = self.log_view.wrap;
-        let wrap_width = logs_area.width.saturating_sub(2);
+        let wrap_width = area.width.saturating_sub(3);
         if let Some(service) = self.state.current_service_mut()
             && (service.text_dirty || service.cached_wrap != Some((wrap, wrap_width)))
         {
@@ -792,10 +821,14 @@ impl App {
                 .join("\n");
             service.cached_text = joined.as_str().into_text().unwrap_or_else(|err| {
                 let escaped = strip_ansi_escapes::strip_str(&joined);
-                tracing::error!(?err, escaped, "failed to sanitize log line");
+                tracing::error!(
+                    ?err,
+                    input_bytes = joined.len(),
+                    "failed to sanitize log buffer"
+                );
                 escaped.into()
             });
-            let raw_num_lines = u16::try_from(service.cached_text.height()).unwrap_or(u16::MAX);
+            let raw_num_lines = service.cached_text.height();
             service.cached_wrapped_lines = if wrap {
                 let paragraph =
                     Paragraph::new(service.cached_text.clone()).wrap(Wrap { trim: false });
@@ -820,7 +853,7 @@ impl App {
         );
 
         self.log_view
-            .render(logs_area, scrollbar_area, num_lines, text, detail, buf);
+            .render(area, num_lines, text, "Logs", detail, buf);
     }
 
     fn render_healthchecks(&mut self, area: Rect, buf: &mut Buffer) {
@@ -856,32 +889,23 @@ impl App {
             .unwrap_or_default();
         let text = cached_text.as_str();
 
-        let [pane_area, scrollbar_area] = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Min(0), Constraint::Length(1)])
-            .spacing(0)
-            .areas(area);
-
-        let scrollbar_area = Rect {
-            x: scrollbar_area.x,
-            y: scrollbar_area.y.saturating_add(1),
-            width: scrollbar_area.width,
-            height: scrollbar_area.height.saturating_sub(2),
-        };
-
         let tui_text: ratatui::text::Text = text.into_text().unwrap_or_else(|err| {
             let escaped = strip_ansi_escapes::strip_str(text);
-            tracing::error!(?err, escaped, "failed to sanitize healthcheck output");
+            tracing::error!(
+                ?err,
+                input_bytes = text.len(),
+                "failed to sanitize healthcheck output"
+            );
             escaped.into()
         });
 
-        let raw_num_lines = u16::try_from(tui_text.height()).unwrap_or(u16::MAX);
-        let wrap_width = pane_area.width.saturating_sub(2);
-        let mut paragraph = Paragraph::new(tui_text);
+        let raw_num_lines = tui_text.height();
+        let wrap_width = area.width.saturating_sub(3);
+        let mut paragraph = Paragraph::new(tui_text.clone());
         if self.healthcheck_view.wrap {
             paragraph = paragraph.wrap(Wrap { trim: false });
         }
-        let num_lines: u16 = if self.healthcheck_view.wrap {
+        let num_lines = if self.healthcheck_view.wrap {
             rendered_line_count(&paragraph, wrap_width)
         } else {
             raw_num_lines
@@ -890,38 +914,8 @@ impl App {
             service.healthcheck_cached_num_lines = num_lines;
         }
 
-        let viewport_height = scrollbar_area.height;
-        let max_off = num_lines.saturating_sub(viewport_height);
-        if self.healthcheck_view.follow_tail {
-            self.healthcheck_view.scroll_offset = max_off;
-        } else {
-            self.healthcheck_view.scroll_offset = self.healthcheck_view.scroll_offset.min(max_off);
-        }
-
-        let content_length = (max_off as usize).saturating_add(1).max(1);
-        self.healthcheck_view.scrollbar_state = self
-            .healthcheck_view
-            .scrollbar_state
-            .content_length(content_length)
-            .viewport_content_length(viewport_height.into())
-            .position(self.healthcheck_view.scroll_offset as usize);
-
-        let paragraph = paragraph
-            .block(Block::default().borders(Borders::ALL).title("Healthcheck"))
-            .scroll((self.healthcheck_view.scroll_offset, 0));
-        Widget::render(&paragraph, pane_area, buf);
-
-        let scrollbar = Scrollbar::new(ratatui::widgets::ScrollbarOrientation::VerticalRight)
-            .begin_symbol(None)
-            .end_symbol(None)
-            .track_symbol(None)
-            .thumb_symbol("▐");
-        StatefulWidget::render(
-            scrollbar,
-            scrollbar_area,
-            buf,
-            &mut self.healthcheck_view.scrollbar_state,
-        );
+        self.healthcheck_view
+            .render(area, num_lines, tui_text, "Healthcheck", None, buf);
     }
 
     fn render_footer(&self, area: Rect, buf: &mut Buffer) {
@@ -1007,12 +1001,13 @@ impl App {
     /// # Errors
     ///
     /// Returns an error if:
+    ///
     /// - The terminal backend fails to initialize or restore.
     /// - The underlying event loop (`App::run`) fails.
     pub async fn render(self) -> Result<(), crate::Error> {
         use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
 
-        let terminal = ratatui::init();
+        let terminal = ratatui::try_init()?;
         let mut stdout = std::io::stdout();
         if let Err(err) = crossterm::execute!(stdout, EnableBracketedPaste) {
             ratatui::restore();
@@ -1032,7 +1027,7 @@ impl App {
 pub mod log_view {
     use ratatui::{
         buffer::Buffer,
-        layout::Rect,
+        layout::{Constraint, Direction, Layout, Rect},
         widgets::{
             Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarState, StatefulWidget, Widget,
             Wrap,
@@ -1041,13 +1036,13 @@ pub mod log_view {
 
     #[derive(Debug)]
     pub struct LogView {
-        /// How many lines down from the top we’ve scrolled
-        pub scroll_offset: u16,
-        /// If true, always keep the bottom of the log visible
+        /// Number of rendered rows scrolled from the top.
+        pub scroll_offset: usize,
+        /// Whether rendering keeps the bottom of the text visible.
         pub follow_tail: bool,
-        /// Wrap long lines
+        /// Whether long logical lines wrap across rendered rows.
         pub wrap: bool,
-        // Scrollbar state
+        /// Scrollbar state derived during rendering.
         pub scrollbar_state: ScrollbarState,
     }
 
@@ -1063,28 +1058,35 @@ pub mod log_view {
     }
 
     impl LogView {
-        /// Render the log view and return the wrap-aware rendered line count, so callers can
-        /// clamp keyboard scrolling consistently with the scrollbar/follow-tail behavior.
+        /// Render a scrollable text pane and return its wrap-aware rendered line count, so callers
+        /// can clamp keyboard scrolling consistently with the scrollbar/follow-tail behavior.
         ///
         /// `detail` is drawn into the bottom border as the selected service's identity line.
         pub fn render(
             &mut self,
-            log_area: Rect,
-            scrollbar_area: Rect,
-            num_lines: u16,
+            area: Rect,
+            num_lines: usize,
             text: ratatui::text::Text<'static>,
+            title: &'static str,
             detail: Option<ratatui::text::Line<'static>>,
             buf: &mut Buffer,
-        ) -> u16 {
+        ) -> usize {
+            let [log_area, scrollbar_area] = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Min(0), Constraint::Length(1)])
+                .spacing(0)
+                .areas(area);
+            let scrollbar_area = Rect {
+                x: scrollbar_area.x,
+                y: scrollbar_area.y.saturating_add(1),
+                width: scrollbar_area.width,
+                height: scrollbar_area.height.saturating_sub(2),
+            };
+
             Clear.render(log_area, buf);
             Clear.render(scrollbar_area, buf);
 
-            let mut paragraph = Paragraph::new(text);
-            if self.wrap {
-                paragraph = paragraph.wrap(Wrap { trim: false });
-            }
-
-            let viewport_height = scrollbar_area.height;
+            let viewport_height = usize::from(scrollbar_area.height);
             let max_off = num_lines.saturating_sub(viewport_height);
 
             if self.follow_tail {
@@ -1093,18 +1095,29 @@ pub mod log_view {
                 self.scroll_offset = self.scroll_offset.min(max_off);
             }
 
-            let content_length = (max_off as usize).saturating_add(1).max(1);
+            let content_length = max_off.saturating_add(1).max(1);
             self.scrollbar_state = self
                 .scrollbar_state
                 .content_length(content_length)
-                .viewport_content_length(viewport_height.into())
-                .position(self.scroll_offset as usize);
+                .viewport_content_length(viewport_height)
+                .position(self.scroll_offset);
 
-            let mut block = Block::default().borders(Borders::ALL).title("Logs");
+            let (text, paragraph_offset) = window_text(
+                text,
+                self.wrap,
+                log_area.width.saturating_sub(2),
+                self.scroll_offset,
+            );
+            let mut paragraph = Paragraph::new(text);
+            if self.wrap {
+                paragraph = paragraph.wrap(Wrap { trim: false });
+            }
+
+            let mut block = Block::default().borders(Borders::ALL).title(title);
             if let Some(detail) = detail {
                 block = block.title_bottom(detail);
             }
-            let paragraph = paragraph.block(block).scroll((self.scroll_offset, 0)); // scroll by lines then cols
+            let paragraph = paragraph.block(block).scroll((paragraph_offset, 0));
 
             Widget::render(&paragraph, log_area, buf);
 
@@ -1118,5 +1131,35 @@ pub mod log_view {
 
             num_lines
         }
+    }
+
+    pub(super) fn window_text(
+        mut text: ratatui::text::Text<'_>,
+        wrap: bool,
+        width: u16,
+        offset: usize,
+    ) -> (ratatui::text::Text<'_>, u16) {
+        let target = offset.saturating_sub(usize::from(u16::MAX));
+        let mut consumed = 0usize;
+        let mut drop_lines = 0usize;
+        for line in &text.lines {
+            let height = if wrap {
+                Paragraph::new(line.clone())
+                    .wrap(Wrap { trim: false })
+                    .line_count(width)
+            } else {
+                1
+            };
+            if consumed.saturating_add(height) > target {
+                break;
+            }
+            consumed = consumed.saturating_add(height);
+            drop_lines += 1;
+        }
+        if drop_lines > 0 {
+            text.lines.drain(..drop_lines);
+        }
+        let local_offset = offset.saturating_sub(consumed);
+        (text, u16::try_from(local_offset).unwrap_or(u16::MAX))
     }
 }

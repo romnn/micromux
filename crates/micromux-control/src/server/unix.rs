@@ -1,16 +1,19 @@
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use futures::{SinkExt, StreamExt};
 use micromux::{
     ChangeKind, CommandRejection, SchedulerStopped, ServiceCommandResult, ServiceSnapshot,
     SessionChange, SessionModelReader, trim_to_last_bytes,
 };
+use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
 use super::ControlServer;
-use crate::endpoint::ControlEndpoint;
+use crate::endpoint::{CanonicalConfigPath, ControlEndpoint, project_lock_path};
 use crate::protocol::{ErrorCode, PROTOCOL_VERSION, Request, Response, ServiceBrief, SessionInfo};
 use crate::{
     ControlError, Framing, IDLE_TIMEOUT, REQUEST_TIMEOUT, framed, read_message, write_message,
@@ -32,9 +35,15 @@ const LAG_REPLAY_SERVICE_KINDS: [ChangeKind; 4] = [
     ChangeKind::Health,
     ChangeKind::Events,
 ];
-/// Response byte budget for log/health payloads; oldest content beyond it is dropped so a chatty
-/// service can't blow the frame.
+/// Response byte budget below the framing limit, leaving room for protocol overhead.
 const RESPONSE_MAX_BYTES: usize = 512 * 1024;
+/// Maximum number of clients served concurrently by one session.
+const MAX_CONNECTIONS: usize = 64;
+/// Maximum number of filesystem threads that may remain blocked after their clients time out.
+const MAX_BLOCKING_LOG_READS: usize = 4;
+
+static BLOCKING_LOG_READS: LazyLock<Arc<Semaphore>> =
+    LazyLock::new(|| Arc::new(Semaphore::new(MAX_BLOCKING_LOG_READS)));
 
 /// A bound control endpoint plus the lifetime ownership lock. Dropping it unlinks the socket while
 /// the lock is still held, so a successor (which cannot acquire the lock until this process exits)
@@ -44,6 +53,8 @@ pub struct EndpointGuard {
     socket_path: PathBuf,
     // Held for the whole process lifetime; the OS releases the advisory lock on exit (incl. crash).
     _lock: std::fs::File,
+    // Kept under fixed per-user `/tmp`, independent of the endpoint's XDG/TMP runtime directory.
+    _project_lock: Option<std::fs::File>,
 }
 
 impl Drop for EndpointGuard {
@@ -56,7 +67,29 @@ impl Drop for EndpointGuard {
 
 pub(super) fn bind(endpoint: &ControlEndpoint) -> Result<Option<EndpointGuard>, ControlError> {
     match endpoint {
-        ControlEndpoint::Unix(path) => bind_unix(path),
+        ControlEndpoint::Unix(path) => bind_unix(path, None),
+        ControlEndpoint::WindowsNamedPipe(_) => Err(ControlError::Unsupported),
+    }
+}
+
+pub(super) fn bind_project(
+    endpoint: &ControlEndpoint,
+    config_path: &CanonicalConfigPath,
+) -> Result<Option<EndpointGuard>, ControlError> {
+    let lock_path = project_lock_path(config_path)?;
+    let project_lock = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(lock_path)?;
+    match fs2::FileExt::try_lock_exclusive(&project_lock) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
+        Err(err) => return Err(err.into()),
+    }
+    match endpoint {
+        ControlEndpoint::Unix(path) => bind_unix(path, Some(project_lock)),
         ControlEndpoint::WindowsNamedPipe(_) => Err(ControlError::Unsupported),
     }
 }
@@ -68,7 +101,10 @@ pub(super) fn endpoint_owner_lock_held(endpoint: &ControlEndpoint) -> Result<boo
     }
 }
 
-fn bind_unix(socket_path: &Path) -> Result<Option<EndpointGuard>, ControlError> {
+fn bind_unix(
+    socket_path: &Path,
+    project_lock: Option<std::fs::File>,
+) -> Result<Option<EndpointGuard>, ControlError> {
     use std::os::unix::fs::PermissionsExt;
 
     let lock_path = socket_path.with_extension("lock");
@@ -101,6 +137,7 @@ fn bind_unix(socket_path: &Path) -> Result<Option<EndpointGuard>, ControlError> 
         listener,
         socket_path: socket_path.to_path_buf(),
         _lock: lock_file,
+        _project_lock: project_lock,
     }))
 }
 
@@ -128,15 +165,21 @@ pub(super) async fn serve(
     guard: EndpointGuard,
     shutdown: CancellationToken,
 ) -> Result<(), ControlError> {
+    let connections = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     loop {
         tokio::select! {
             () = shutdown.cancelled() => break,
             accepted = guard.listener.accept() => {
                 match accepted {
                     Ok((stream, _addr)) => {
+                        let Ok(permit) = Arc::clone(&connections).try_acquire_owned() else {
+                            tracing::debug!("control: connection limit reached");
+                            continue;
+                        };
                         let server = Arc::clone(&server);
                         let shutdown = shutdown.clone();
                         tokio::spawn(async move {
+                            let _permit = permit;
                             handle_connection(server, stream, shutdown).await;
                         });
                     }
@@ -168,11 +211,8 @@ where
             Ok(Ok(Some(request))) => request,
             Ok(Err(err)) => {
                 tracing::debug!(?err, "control: rejecting bad request frame");
-                let _ = write_message(
-                    &mut conn,
-                    &Response::error(ErrorCode::BadRequest, err.to_string()),
-                )
-                .await;
+                let response = Response::error(ErrorCode::BadRequest, err.to_string());
+                let _ = write_response(&mut conn, &response, &shutdown).await;
                 return;
             }
             // Client disconnected (None) or idle timeout (Err): close the connection.
@@ -188,7 +228,7 @@ where
             // Acknowledge first, then cancel the shared session token: the accept loop, scheduler,
             // and TUI all observe it, so this stops the whole session (the same path as Ctrl-C).
             // Writing before cancelling ensures the client sees the ack before the endpoint vanishes.
-            let _ = write_message(&mut conn, &Response::ShuttingDown).await;
+            let _ = write_response(&mut conn, &Response::ShuttingDown, &shutdown).await;
             shutdown.cancel();
             return;
         }
@@ -206,10 +246,66 @@ where
                 }
             }
         };
-        if write_message(&mut conn, &response).await.is_err() {
+        if !write_response(&mut conn, &response, &shutdown).await {
             return;
         }
     }
+}
+
+async fn write_response<S>(
+    conn: &mut Framing<S>,
+    response: &Response,
+    shutdown: &CancellationToken,
+) -> bool
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let response = response_within_frame(response);
+    tokio::select! {
+        () = shutdown.cancelled() => false,
+        result = tokio::time::timeout(REQUEST_TIMEOUT, write_message(conn, response.as_ref())) => {
+            matches!(result, Ok(Ok(())))
+        }
+    }
+}
+
+fn response_within_frame(response: &Response) -> Cow<'_, Response> {
+    if encoded_len(response).is_some_and(|len| len <= RESPONSE_MAX_BYTES) {
+        return Cow::Borrowed(response);
+    }
+    if let Response::Description(info) = response
+        && let Some(info) = bounded_description(info)
+    {
+        return Cow::Owned(Response::Description(info));
+    }
+
+    Cow::Owned(Response::error(
+        ErrorCode::LimitExceeded,
+        "the response exceeds the control protocol frame budget",
+    ))
+}
+
+fn bounded_description(info: &SessionInfo) -> Option<SessionInfo> {
+    let mut info = info.clone();
+    let services = std::mem::take(&mut info.services);
+    info.services_truncated = true;
+    let mut low = 0;
+    let mut high = services.len();
+    while low < high {
+        let middle = low + (high - low).div_ceil(2);
+        info.services = services.get(..middle)?.to_vec();
+        if encoded_len(&Response::Description(info.clone()))
+            .is_some_and(|len| len <= RESPONSE_MAX_BYTES)
+        {
+            low = middle;
+        } else {
+            high = middle - 1;
+        }
+    }
+    info.services = services.get(..low)?.to_vec();
+    encoded_len(&Response::Description(info.clone()))
+        .is_some_and(|len| len <= RESPONSE_MAX_BYTES)
+        .then_some(info)
 }
 
 async fn stream_changes<S>(server: &ControlServer, conn: Framing<S>, shutdown: CancellationToken)
@@ -220,17 +316,17 @@ where
 
     let (mut sink, mut stream) = conn.split();
     let mut changes = server.reader.subscribe();
+    let idle = tokio::time::sleep(IDLE_TIMEOUT);
+    tokio::pin!(idle);
     'stream: loop {
         tokio::select! {
             () = shutdown.cancelled() => break,
+            () = &mut idle => break,
             incoming = stream.next() => {
-                // A subscription is one-directional from here: the client signals only via EOF
-                // (None) or a transport error (Some(Err)). Either way, stop — never spin on a
-                // persistent read error.
-                match incoming {
-                    None | Some(Err(_)) => break,
-                    Some(Ok(_)) => {}
-                }
+                // A subscription is one-directional after its initial request. EOF, a transport
+                // error, or another request all end the stream.
+                let _ = incoming;
+                break;
             }
             change = changes.recv() => {
                 match change {
@@ -238,9 +334,16 @@ where
                         let Ok(line) = serde_json::to_string(&Response::Change(change)) else {
                             continue;
                         };
-                        if sink.send(line).await.is_err() {
+                        let sent = tokio::select! {
+                            () = shutdown.cancelled() => false,
+                            result = tokio::time::timeout(REQUEST_TIMEOUT, sink.send(line)) => {
+                                matches!(result, Ok(Ok(())))
+                            }
+                        };
+                        if !sent {
                             break;
                         }
+                        idle.as_mut().reset(tokio::time::Instant::now() + IDLE_TIMEOUT);
                     }
                     Err(RecvError::Lagged(_)) => {
                         let snapshots = server.reader.services();
@@ -248,9 +351,16 @@ where
                             let Ok(line) = serde_json::to_string(&Response::Change(change)) else {
                                 continue;
                             };
-                            if sink.send(line).await.is_err() {
+                            let sent = tokio::select! {
+                                () = shutdown.cancelled() => false,
+                                result = tokio::time::timeout(REQUEST_TIMEOUT, sink.send(line)) => {
+                                    matches!(result, Ok(Ok(())))
+                                }
+                            };
+                            if !sent {
                                 break 'stream;
                             }
+                            idle.as_mut().reset(tokio::time::Instant::now() + IDLE_TIMEOUT);
                         }
                     }
                     Err(RecvError::Closed) => break,
@@ -282,22 +392,25 @@ async fn dispatch(server: &ControlServer, request: Request) -> Response {
     match request {
         Request::Describe => Response::Description(describe(server)),
         Request::ListServices => Response::Services(server.reader.services()),
+        Request::GetService { service } => {
+            let snapshots = server.reader.services();
+            snapshots
+                .iter()
+                .find(|snapshot| snapshot.id == service)
+                .or_else(|| snapshots.iter().find(|snapshot| snapshot.name == service))
+                .cloned()
+                .map_or_else(
+                    || unknown_service(&service),
+                    |snapshot| Response::Service(Box::new(snapshot)),
+                )
+        }
         Request::GetLogs {
             service,
             run_generation,
             tail,
         } => {
             let reader = server.reader.clone();
-            match tokio::task::spawn_blocking(move || {
-                get_logs(&reader, &service, run_generation, tail)
-            })
-            .await
-            {
-                Ok(response) => response,
-                Err(err) => {
-                    Response::error(ErrorCode::Internal, format!("log read task failed: {err}"))
-                }
-            }
+            run_blocking_log_read(move || get_logs(&reader, &service, run_generation, tail)).await
         }
         Request::FollowLogs {
             service,
@@ -305,16 +418,8 @@ async fn dispatch(server: &ControlServer, request: Request) -> Response {
             after,
         } => {
             let reader = server.reader.clone();
-            match tokio::task::spawn_blocking(move || {
-                follow_logs(&reader, &service, run_generation, after)
-            })
-            .await
-            {
-                Ok(response) => response,
-                Err(err) => {
-                    Response::error(ErrorCode::Internal, format!("log read task failed: {err}"))
-                }
-            }
+            run_blocking_log_read(move || follow_logs(&reader, &service, run_generation, after))
+                .await
         }
         Request::ListLogRuns { service } => {
             if server.reader.service(&service).is_none() {
@@ -381,6 +486,32 @@ async fn dispatch(server: &ControlServer, request: Request) -> Response {
     }
 }
 
+async fn run_blocking_log_read(read: impl FnOnce() -> Response + Send + 'static) -> Response {
+    let Ok(permit) = Arc::clone(&BLOCKING_LOG_READS).acquire_owned().await else {
+        return Response::error(ErrorCode::Internal, "the log reader is unavailable");
+    };
+    let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+    // Tokio waits for spawn_blocking tasks during runtime shutdown. A filesystem call cannot be
+    // cancelled, so use a bounded detached thread: a stalled mount can consume at most these slots,
+    // but cannot keep the supervisor process alive after shutdown.
+    let spawned = std::thread::Builder::new()
+        .name("micromux-log-read".to_string())
+        .spawn(move || {
+            let _permit = permit;
+            let _ = response_tx.send(read());
+        });
+    if let Err(err) = spawned {
+        return Response::error(
+            ErrorCode::Internal,
+            format!("failed to start log read thread: {err}"),
+        );
+    }
+    match response_rx.await {
+        Ok(response) => response,
+        Err(_) => Response::error(ErrorCode::Internal, "the log read thread stopped"),
+    }
+}
+
 async fn reconcile(server: &ControlServer, dry_run: bool) -> Response {
     acknowledge_reconcile(server.control.reconcile_config(dry_run).await)
 }
@@ -435,8 +566,12 @@ fn get_logs(
             .find(|run| run.run_generation == run_generation)
             .is_some_and(|run| run.line_count > lines.len());
     }
-    truncated |= bound_tail_response_lines(&mut lines);
-    Response::Logs { lines, truncated }
+    let first_retained_seq = run_generation
+        .is_none()
+        .then(|| reader.logs_since(service, 0).0)
+        .flatten();
+    truncated |= bound_tail_response_lines(&mut lines, first_retained_seq);
+    logs_response(lines, truncated, first_retained_seq)
 }
 
 fn follow_logs(
@@ -462,34 +597,36 @@ fn follow_logs(
         if let Some(cursor) = after {
             lines.retain(|line| line.seq > cursor);
         }
-        let (lines, truncated) = bound_follow_response_lines_page(lines);
-        return Response::Logs { lines, truncated };
+        let (lines, truncated) = bound_follow_response_lines_page(lines, None);
+        return logs_response(lines, truncated, None);
     }
 
     // The bounded visible stream: page forward from a cursor, else return its most recent tail.
     if let Some(cursor) = after {
-        let (_, lines) = reader.logs_since(service, cursor);
-        let (lines, truncated) = bound_follow_response_lines_page(lines);
-        return Response::Logs { lines, truncated };
+        let (first_retained_seq, lines) = reader.logs_since(service, cursor);
+        let (lines, truncated) = bound_follow_response_lines_page(lines, first_retained_seq);
+        return logs_response(lines, truncated, first_retained_seq);
     }
 
     let mut lines = reader.logs(service, None);
+    let first_retained_seq = lines.first().map(|line| line.seq);
     let mut truncated = false;
     if lines.len() > MAX_LOG_TAIL {
         let drop = lines.len() - MAX_LOG_TAIL;
         lines.drain(0..drop);
         truncated = true;
     }
-    truncated |= bound_tail_response_lines(&mut lines);
-    Response::Logs { lines, truncated }
+    truncated |= bound_tail_response_lines(&mut lines, first_retained_seq);
+    logs_response(lines, truncated, first_retained_seq)
 }
 
 fn bound_follow_response_lines_page(
     mut lines: Vec<micromux::LogLine>,
+    first_retained_seq: Option<u64>,
 ) -> (Vec<micromux::LogLine>, bool) {
     let capped = lines.len() > MAX_LOG_TAIL;
     lines.truncate(MAX_LOG_TAIL);
-    let truncated = capped || bound_follow_response_lines(&mut lines);
+    let truncated = capped || bound_follow_response_lines(&mut lines, first_retained_seq);
     (lines, truncated)
 }
 
@@ -533,6 +670,7 @@ fn describe(server: &ControlServer) -> SessionInfo {
         working_dir: server.identity.working_dir.clone(),
         config_path: server.identity.config_path.clone(),
         services,
+        services_truncated: false,
         micromux_version: server.identity.micromux_version.clone(),
         capabilities: Some(crate::SessionCapabilities { dynamic_services }),
     }
@@ -552,50 +690,152 @@ fn unknown_run(service: &str, run_generation: u64) -> Response {
     )
 }
 
-/// Drop oldest log lines until the payload fits the response byte budget.
-fn bound_tail_response_lines(lines: &mut Vec<micromux::LogLine>) -> bool {
-    let mut total: usize = lines.iter().map(|line| line.line.len()).sum();
-    let mut drop_count = 0;
-    for line in lines.iter() {
-        if total <= RESPONSE_MAX_BYTES || lines.len().saturating_sub(drop_count) <= 1 {
-            break;
-        }
-        total = total.saturating_sub(line.line.len());
-        drop_count += 1;
+fn logs_response(
+    lines: Vec<micromux::LogLine>,
+    truncated: bool,
+    first_retained_seq: Option<u64>,
+) -> Response {
+    Response::Logs {
+        lines,
+        truncated,
+        first_retained_seq,
     }
-    if drop_count > 0 {
-        lines.drain(0..drop_count);
-    }
-    let mut truncated = drop_count > 0;
-    if total > RESPONSE_MAX_BYTES
-        && let Some(line) = lines.first_mut()
-    {
-        line.line = trim_to_last_bytes(std::mem::take(&mut line.line), RESPONSE_MAX_BYTES);
-        truncated = true;
-    }
-    truncated
 }
 
-/// Keep the oldest contiguous log page after a cursor, bounded by response bytes.
-fn bound_follow_response_lines(lines: &mut Vec<micromux::LogLine>) -> bool {
-    let mut total = 0usize;
-    let mut keep = 0usize;
-    for line in lines.iter_mut() {
-        let line_len = line.line.len();
-        if keep == 0 && line_len > RESPONSE_MAX_BYTES {
-            line.line = trim_to_last_bytes(std::mem::take(&mut line.line), RESPONSE_MAX_BYTES);
-            keep = 1;
-            break;
-        }
-        if total.saturating_add(line_len) > RESPONSE_MAX_BYTES {
-            break;
-        }
-        total += line_len;
-        keep += 1;
+/// Drop the oldest records until the encoded response, including JSON escaping, fits.
+fn bound_tail_response_lines(
+    lines: &mut Vec<micromux::LogLine>,
+    first_retained_seq: Option<u64>,
+) -> bool {
+    if logs_fit(lines, true, first_retained_seq) {
+        return false;
     }
-    let truncated = keep < lines.len();
-    lines.truncate(keep);
-    truncated
+
+    let mut low = 0;
+    let mut high = lines.len();
+    while low < high {
+        let middle = low + (high - low) / 2;
+        if lines
+            .get(middle..)
+            .is_some_and(|lines| logs_fit(lines, true, first_retained_seq))
+        {
+            high = middle;
+        } else {
+            low = middle + 1;
+        }
+    }
+    if low == lines.len() {
+        let retained = lines
+            .last()
+            .cloned()
+            .and_then(|line| fit_single_log_line(line, true, first_retained_seq));
+        lines.clear();
+        lines.extend(retained);
+    } else {
+        lines.drain(..low);
+    }
+    true
+}
+
+/// Keep the oldest contiguous page whose encoded response fits.
+fn bound_follow_response_lines(
+    lines: &mut Vec<micromux::LogLine>,
+    first_retained_seq: Option<u64>,
+) -> bool {
+    if logs_fit(lines, true, first_retained_seq) {
+        return false;
+    }
+
+    let mut low = 0;
+    let mut high = lines.len();
+    while low < high {
+        let middle = low + (high - low).div_ceil(2);
+        if lines
+            .get(..middle)
+            .is_some_and(|lines| logs_fit(lines, true, first_retained_seq))
+        {
+            low = middle;
+        } else {
+            high = middle - 1;
+        }
+    }
+    if low == 0 {
+        let retained = lines
+            .first()
+            .cloned()
+            .and_then(|line| fit_single_log_line(line, false, first_retained_seq));
+        lines.clear();
+        lines.extend(retained);
+    } else {
+        lines.truncate(low);
+    }
+    true
+}
+
+fn fit_single_log_line(
+    mut line: micromux::LogLine,
+    keep_tail: bool,
+    first_retained_seq: Option<u64>,
+) -> Option<micromux::LogLine> {
+    let original = std::mem::take(&mut line.line);
+    let mut boundaries = if keep_tail {
+        original
+            .char_indices()
+            .map(|(index, _)| original.len().saturating_sub(index))
+            .collect::<Vec<_>>()
+    } else {
+        original
+            .char_indices()
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>()
+    };
+    boundaries.push(0);
+    boundaries.push(original.len());
+    boundaries.sort_unstable();
+    boundaries.dedup();
+
+    let mut low = 0usize;
+    let mut high = boundaries.len().saturating_sub(1);
+    while low < high {
+        let middle = low + (high - low).div_ceil(2);
+        let bytes = boundaries.get(middle).copied().unwrap_or_default();
+        line.line = if keep_tail {
+            original
+                .get(original.len().saturating_sub(bytes)..)
+                .unwrap_or_default()
+                .to_string()
+        } else {
+            original.get(..bytes).unwrap_or_default().to_string()
+        };
+        if logs_fit(std::slice::from_ref(&line), true, first_retained_seq) {
+            low = middle;
+        } else {
+            high = middle - 1;
+        }
+    }
+    let bytes = boundaries.get(low).copied().unwrap_or_default();
+    line.line = if keep_tail {
+        original
+            .get(original.len().saturating_sub(bytes)..)
+            .unwrap_or_default()
+            .to_string()
+    } else {
+        original.get(..bytes).unwrap_or_default().to_string()
+    };
+    logs_fit(std::slice::from_ref(&line), true, first_retained_seq).then_some(line)
+}
+
+fn logs_fit(lines: &[micromux::LogLine], truncated: bool, first_retained_seq: Option<u64>) -> bool {
+    encoded_len(&Response::Logs {
+        lines: lines.to_vec(),
+        truncated,
+        first_retained_seq,
+    })
+    .is_some_and(|len| len <= RESPONSE_MAX_BYTES)
+}
+
+fn encoded_len(value: &impl Serialize) -> Option<usize> {
+    serde_json::to_vec(value).ok().map(|encoded| encoded.len())
 }
 
 fn bound_health_attempt(attempt: &mut Option<micromux::HealthAttempt>) {
@@ -726,16 +966,22 @@ fn acknowledge_reconcile(result: Result<micromux::ReconcileResult, SchedulerStop
 
 #[cfg(test)]
 mod tests {
+    use color_eyre::eyre;
     use micromux::{
         ChangeKind, HealthAttempt, HealthLine, LogLine, OutputStream, RestartPolicy,
         ServiceSnapshot, SessionChange,
     };
     use similar_asserts::assert_eq;
 
+    use crate::{
+        CanonicalConfigPath, ControlEndpoint, ErrorCode, PROTOCOL_VERSION, Response, ServiceBrief,
+        SessionInfo,
+    };
+
     use super::{
-        MAX_LOG_TAIL, RESPONSE_MAX_BYTES, bound_follow_response_lines,
+        MAX_LOG_TAIL, RESPONSE_MAX_BYTES, bind_project, bound_follow_response_lines,
         bound_follow_response_lines_page, bound_health_history, bound_tail_response_lines,
-        health_attempt_bytes, lag_replay_changes,
+        encoded_len, health_attempt_bytes, lag_replay_changes, logs_fit, response_within_frame,
     };
 
     fn line(seq: u64, len: usize) -> LogLine {
@@ -829,6 +1075,56 @@ mod tests {
     }
 
     #[test]
+    fn oversized_unpageable_response_becomes_a_readable_limit_error() {
+        let response = Response::Services(vec![snapshot(&"\\\"".repeat(RESPONSE_MAX_BYTES))]);
+
+        let bounded = response_within_frame(&response);
+
+        assert!(matches!(
+            bounded.as_ref(),
+            Response::Error {
+                code: ErrorCode::LimitExceeded,
+                ..
+            }
+        ));
+        assert!(encoded_len(bounded.as_ref()).is_some_and(|len| len <= crate::MAX_FRAME_BYTES));
+    }
+
+    #[test]
+    fn oversized_description_keeps_identity_and_marks_its_service_index() {
+        let services = (0..8)
+            .map(|index| ServiceBrief {
+                id: format!("service-{index}"),
+                name: "x".repeat(100 * 1024),
+            })
+            .collect::<Vec<_>>();
+        let info = SessionInfo {
+            protocol_version: PROTOCOL_VERSION,
+            id: "session-id".to_string(),
+            pid: 42,
+            start_time: 7,
+            name: "session".to_string(),
+            working_dir: "/project".to_string(),
+            config_path: "/project/micromux.yaml".to_string(),
+            services,
+            services_truncated: false,
+            micromux_version: "test".to_string(),
+            capabilities: None,
+        };
+
+        let response = Response::Description(info.clone());
+        let bounded = response_within_frame(&response);
+        let Response::Description(bounded_info) = bounded.as_ref() else {
+            panic!("description should remain readable");
+        };
+
+        assert_eq!(bounded_info.id, info.id);
+        assert!(bounded_info.services_truncated);
+        assert!(bounded_info.services.len() < info.services.len());
+        assert!(encoded_len(bounded.as_ref()).is_some_and(|len| len <= RESPONSE_MAX_BYTES));
+    }
+
+    #[test]
     fn tail_bounding_keeps_the_newest_lines() {
         let mut lines = vec![
             line(0, 200 * 1024),
@@ -837,7 +1133,7 @@ mod tests {
             line(3, 200 * 1024),
         ];
 
-        assert!(bound_tail_response_lines(&mut lines));
+        assert!(bound_tail_response_lines(&mut lines, None));
 
         let seqs: Vec<u64> = lines.into_iter().map(|line| line.seq).collect();
         assert_eq!(seqs, vec![2, 3]);
@@ -852,7 +1148,7 @@ mod tests {
             line(3, 200 * 1024),
         ];
 
-        assert!(bound_follow_response_lines(&mut lines));
+        assert!(bound_follow_response_lines(&mut lines, None));
 
         let seqs: Vec<u64> = lines.into_iter().map(|line| line.seq).collect();
         assert_eq!(seqs, vec![0, 1]);
@@ -862,14 +1158,46 @@ mod tests {
     fn follow_bounding_trims_an_oversized_first_line_so_the_cursor_can_advance() {
         let mut lines = vec![line(7, RESPONSE_MAX_BYTES + 10), line(8, 1)];
 
-        assert!(bound_follow_response_lines(&mut lines));
+        assert!(bound_follow_response_lines(&mut lines, None));
 
         assert_eq!(lines.len(), 1);
         assert_eq!(lines.first().map(|line| line.seq), Some(7));
-        assert_eq!(
-            lines.first().map(|line| line.line.len()),
-            Some(RESPONSE_MAX_BYTES)
+        assert!(logs_fit(&lines, true, None));
+        assert!(
+            lines
+                .first()
+                .is_some_and(|line| !line.line.is_empty() && line.line.len() < RESPONSE_MAX_BYTES)
         );
+    }
+
+    #[test]
+    fn log_bounding_accounts_for_json_escape_expansion() {
+        let mut lines = vec![micromux::LogLine {
+            seq: 1,
+            run_generation: 1,
+            timestamp_unix_ms: 0,
+            line: "\0".repeat(RESPONSE_MAX_BYTES / 2),
+        }];
+
+        assert!(bound_follow_response_lines(&mut lines, None));
+        assert!(logs_fit(&lines, true, None));
+        assert_eq!(lines.first().map(|line| line.seq), Some(1));
+    }
+
+    #[tokio::test]
+    async fn project_lock_blocks_a_second_endpoint_for_the_same_config() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let config = directory.path().join("micromux.yaml");
+        std::fs::write(&config, "version: 1\nservices: {}\n")?;
+        let config = CanonicalConfigPath::new(config)?;
+        let first = ControlEndpoint::Unix(directory.path().join("first.sock"));
+        let second = ControlEndpoint::Unix(directory.path().join("second.sock"));
+
+        let first_guard = bind_project(&first, &config)?.ok_or_else(|| eyre::eyre!("lock busy"))?;
+        assert!(bind_project(&second, &config)?.is_none());
+        drop(first_guard);
+        assert!(bind_project(&second, &config)?.is_some());
+        Ok(())
     }
 
     #[test]
@@ -882,7 +1210,7 @@ mod tests {
             .map(|value| line(seq(value), 1))
             .collect::<Vec<_>>();
 
-        let (lines, truncated) = bound_follow_response_lines_page(lines);
+        let (lines, truncated) = bound_follow_response_lines_page(lines, None);
 
         assert!(truncated);
         assert_eq!(lines.len(), MAX_LOG_TAIL);

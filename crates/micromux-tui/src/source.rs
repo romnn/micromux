@@ -27,14 +27,34 @@ pub enum SessionSource {
 /// An in-process session model and its lifecycle command sender.
 pub struct LocalSource {
     reader: SessionModelReader,
-    commands: mpsc::Sender<Command>,
+    lifecycle: mpsc::UnboundedSender<Command>,
+    notice: Option<String>,
 }
 
 impl LocalSource {
     /// Construct a source for a session owned by this process.
     #[must_use]
     pub fn new(reader: SessionModelReader, commands: mpsc::Sender<Command>) -> Self {
-        Self { reader, commands }
+        let (lifecycle, mut queued) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Some(command) = queued.recv().await {
+                if commands.send(command).await.is_err() {
+                    break;
+                }
+            }
+        });
+        Self {
+            reader,
+            lifecycle,
+            notice: None,
+        }
+    }
+
+    /// Attach a persistent operator-visible warning to the local session header.
+    #[must_use]
+    pub fn with_notice(mut self, notice: impl Into<String>) -> Self {
+        self.notice = Some(notice.into());
+        self
     }
 }
 
@@ -77,7 +97,7 @@ impl SessionSource {
     pub(crate) fn restart(&self, id: ServiceID) {
         match self {
             Self::Local(source) => {
-                let _ = source.commands.try_send(Command::restart(id));
+                let _ = source.lifecycle.send(Command::restart(id));
             }
             Self::Remote(source) => source.restart(id),
         }
@@ -86,7 +106,7 @@ impl SessionSource {
     pub(crate) fn restart_all(&self) {
         match self {
             Self::Local(source) => {
-                let _ = source.commands.try_send(Command::restart_all());
+                let _ = source.lifecycle.send(Command::restart_all());
             }
             Self::Remote(source) => source.restart_all(),
         }
@@ -95,7 +115,7 @@ impl SessionSource {
     pub(crate) fn enable(&self, id: ServiceID) {
         match self {
             Self::Local(source) => {
-                let _ = source.commands.try_send(Command::enable(id));
+                let _ = source.lifecycle.send(Command::enable(id));
             }
             Self::Remote(source) => source.enable(id),
         }
@@ -104,7 +124,7 @@ impl SessionSource {
     pub(crate) fn disable(&self, id: ServiceID) {
         match self {
             Self::Local(source) => {
-                let _ = source.commands.try_send(Command::disable(id));
+                let _ = source.lifecycle.send(Command::disable(id));
             }
             Self::Remote(source) => source.disable(id),
         }
@@ -113,7 +133,7 @@ impl SessionSource {
     pub(crate) fn stop_dynamic(&self, id: ServiceID) {
         match self {
             Self::Local(source) => {
-                let _ = source.commands.try_send(Command::stop_dynamic(id));
+                let _ = source.lifecycle.send(Command::stop_dynamic(id));
             }
             Self::Remote(source) => source.stop_dynamic(id),
         }
@@ -129,6 +149,13 @@ impl SessionSource {
         match self {
             Self::Local(_) => None,
             Self::Remote(source) => Some(source.attachment_status()),
+        }
+    }
+
+    pub(crate) fn local_notice(&self) -> Option<&str> {
+        match self {
+            Self::Local(source) => source.notice.as_deref(),
+            Self::Remote(_) => None,
         }
     }
 }

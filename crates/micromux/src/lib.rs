@@ -31,6 +31,8 @@ mod spec;
 pub mod structured_log;
 #[cfg(test)]
 pub(crate) mod test_util;
+#[cfg(windows)]
+mod windows_job;
 
 use codespan_reporting::{diagnostic::Severity, files::SimpleFiles};
 use schemars::JsonSchema;
@@ -44,7 +46,7 @@ pub use tokio_util::sync::CancellationToken;
 
 pub use config::{
     ConfigError, ConfigFile, ControlConfig, DynamicServicesPolicy, config_file_names,
-    find_config_file, from_str,
+    find_config_file, from_str, read_config_file, read_config_file_async,
 };
 pub use diagnostics::{Printer, ToDiagnostics, render_to_string};
 pub use env::Error as EnvironmentError;
@@ -178,7 +180,7 @@ pub fn validate_config_file(
         .ok_or_else(|| Error::MissingConfigParent {
             path: config_path.clone(),
         })?;
-    let raw = std::fs::read_to_string(&config_path)?;
+    let raw = config::read_config_file(&config_path)?;
     let mut files = SimpleFiles::new();
     let file_id = files.add(config_path.display().to_string(), raw.clone());
     let mut source_diagnostics = Vec::new();
@@ -325,6 +327,11 @@ pub fn project_dir() -> Option<directories::ProjectDirs> {
     directories::ProjectDirs::from("com", "romnn", "micromux")
 }
 
+fn memory_retention_is_unbounded(retention: LogRetention) -> bool {
+    retention.memory.max_lines == LogLimit::Unbounded
+        || retention.memory.max_bytes == LogLimit::Unbounded
+}
+
 impl Micromux {
     /// Construct a new [`Micromux`] instance from a parsed [`ConfigFile`].
     ///
@@ -334,6 +341,19 @@ impl Micromux {
     /// (e.g. invalid environment interpolation, invalid port parsing, etc.).
     pub fn new(config_file: &config::ConfigFile<diagnostics::FileId>) -> Result<Self, Error> {
         let services = service_map_from_config(config_file)?;
+        let unbounded_services = services
+            .values()
+            .filter(|service| memory_retention_is_unbounded(service.log_retention))
+            .count();
+        let dynamic_default_unbounded =
+            memory_retention_is_unbounded(config_file.config.log_retention);
+        if unbounded_services > 0 || dynamic_default_unbounded {
+            tracing::warn!(
+                configured_services = unbounded_services,
+                dynamic_default = dynamic_default_unbounded,
+                "in-memory log retention is unbounded"
+            );
+        }
         let reload_config = config_file
             .config_path
             .clone()

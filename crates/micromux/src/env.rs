@@ -1,6 +1,9 @@
 use indexmap::IndexMap;
 use std::collections::HashMap;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
+
+const MAX_ENV_FILE_BYTES: usize = 4 * 1024 * 1024;
 
 /// Errors from loading and resolving service environment data.
 #[derive(Debug, thiserror::Error)]
@@ -35,14 +38,14 @@ pub enum Error {
         #[source]
         source: Box<Self>,
     },
-    /// Shell-style expansion failed for a configured path.
-    #[error("failed to expand path `{raw}`: {source}")]
-    ExpandPath {
-        /// Unexpanded configured path.
-        raw: String,
-        /// Underlying environment lookup error.
-        #[source]
-        source: shellexpand::LookupError<std::env::VarError>,
+    /// An environment file exceeded the supported size.
+    #[error(
+        "environment file {} exceeds the {MAX_ENV_FILE_BYTES} byte limit",
+        path.display()
+    )]
+    FileTooLarge {
+        /// Path of the oversized file.
+        path: PathBuf,
     },
 }
 
@@ -224,9 +227,23 @@ pub fn parse_dotenv(contents: &str) -> Result<EnvMap, Error> {
 pub fn load_env_files_sync(paths: &[PathBuf]) -> Result<EnvMap, Error> {
     let mut env = EnvMap::new();
     for path in paths {
-        let content = std::fs::read_to_string(path).map_err(|source| Error::ReadFile {
+        let file = std::fs::File::open(path).map_err(|source| Error::ReadFile {
             path: path.clone(),
             source,
+        })?;
+        let mut bytes = Vec::new();
+        file.take((MAX_ENV_FILE_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)
+            .map_err(|source| Error::ReadFile {
+                path: path.clone(),
+                source,
+            })?;
+        if bytes.len() > MAX_ENV_FILE_BYTES {
+            return Err(Error::FileTooLarge { path: path.clone() });
+        }
+        let content = String::from_utf8(bytes).map_err(|source| Error::ReadFile {
+            path: path.clone(),
+            source: std::io::Error::new(std::io::ErrorKind::InvalidData, source),
         })?;
         let parsed = parse_dotenv(&content).map_err(|source| Error::ParseFile {
             path: path.clone(),
@@ -260,18 +277,24 @@ pub fn expand_env_values_tracking(
     out
 }
 
-pub fn resolve_path(config_dir: &Path, raw: &str) -> Result<PathBuf, Error> {
-    let expanded = shellexpand::full(raw)
-        .map_err(|source| Error::ExpandPath {
-            raw: raw.to_string(),
-            source,
-        })?
-        .to_string();
+pub fn resolve_path(config_dir: &Path, raw: &str) -> PathBuf {
+    let base: HashMap<String, String> = std::env::vars().collect();
+    let mut missing = Vec::new();
+    let expanded = interpolate_tracking(&shellexpand::tilde(raw), &base, &mut missing);
+    if !missing.is_empty() {
+        missing.sort_unstable();
+        missing.dedup();
+        tracing::warn!(
+            path = raw,
+            missing = ?missing,
+            "path interpolation referenced unset variables"
+        );
+    }
     let path = PathBuf::from(expanded);
     if path.is_absolute() {
-        Ok(path)
+        path
     } else {
-        Ok(config_dir.join(path))
+        config_dir.join(path)
     }
 }
 
@@ -470,6 +493,29 @@ mod tests {
         let env = parse_dotenv("FOO=don't # comment\nPRICE=5\" # usd\n")?;
         assert_eq!(env.inner.get("FOO").map(String::as_str), Some("don't"));
         assert_eq!(env.inner.get("PRICE").map(String::as_str), Some("5\""));
+        Ok(())
+    }
+
+    #[test]
+    fn path_interpolation_matches_unset_value_interpolation() {
+        let variable = format!("MICROMUX_UNSET_PATH_TEST_{}", std::process::id());
+        let raw = format!("${{{variable}}}/service");
+
+        let resolved = resolve_path(Path::new("/project"), &raw);
+
+        assert_eq!(resolved, Path::new("/service"));
+    }
+
+    #[test]
+    fn env_file_reader_rejects_oversized_files() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join(".env");
+        std::fs::write(&path, vec![b'x'; MAX_ENV_FILE_BYTES + 1])?;
+
+        let error = load_env_files_sync(std::slice::from_ref(&path))
+            .expect_err("oversized env file should be rejected");
+
+        assert!(matches!(error, Error::FileTooLarge { path: actual } if actual == path));
         Ok(())
     }
 }

@@ -11,8 +11,18 @@ use std::sync::Arc;
 
 use micromux::{CancellationToken, Handles};
 use micromux_control::{
-    CanonicalConfigPath, ControlServer, SessionIdentity, bind, endpoint_for, runtime_dir,
+    CanonicalConfigPath, ControlServer, SessionIdentity, bind_project, endpoint_for, runtime_dir,
 };
+
+/// Outcome of attempting to start the local control plane.
+pub enum SpawnStatus {
+    /// The endpoint is owned and its accept loop is running.
+    Started,
+    /// Another supervisor owns the same canonical config.
+    OwnedByOther,
+    /// The platform, runtime directory, or endpoint setup prevented control startup.
+    Unavailable,
+}
 
 /// Resolve a human-readable session name: the config `name:` if set, else `basename(working_dir)`.
 fn session_name(configured: Option<String>, working_dir: &Path) -> String {
@@ -26,40 +36,38 @@ fn session_name(configured: Option<String>, working_dir: &Path) -> String {
 
 /// Bind the control endpoint (race-safe lifetime-lock dance) and spawn the accept loop.
 ///
-/// Control is *default on*; this is a no-op (returns `false`) when the runtime dir is unresolvable,
-/// the transport is unsupported on this platform, or another live session already owns the project's
-/// endpoint. In the TUI that is harmless — the binary is never half-working. The headless `serve`
-/// mode uses the return value to exit when it cannot own the endpoint (an unreachable headless
-/// session would be useless).
+/// Control is *default on*. The returned status distinguishes another owner from transport/setup
+/// failure so the TUI can show an accurate warning; headless `serve` rejects either failure because
+/// an unreachable session would be useless.
 pub fn spawn(
     handles: &Handles,
     config_path: &CanonicalConfigPath,
     working_dir: &Path,
     name: Option<String>,
     shutdown: CancellationToken,
-) -> bool {
+) -> SpawnStatus {
     if !micromux_control::transport_supported() {
         tracing::warn!("control plane disabled: unsupported platform");
-        return false;
+        return SpawnStatus::Unavailable;
     }
 
     let Some(runtime_dir) = runtime_dir() else {
         tracing::warn!("control plane disabled: no runtime directory could be resolved");
-        return false;
+        return SpawnStatus::Unavailable;
     };
 
     let endpoint = endpoint_for(&runtime_dir, config_path);
-    let guard = match bind(&endpoint) {
+    let guard = match bind_project(&endpoint, config_path) {
         Ok(Some(guard)) => guard,
         Ok(None) => {
             tracing::warn!(
                 "control plane disabled: another micromux already owns this project's endpoint"
             );
-            return false;
+            return SpawnStatus::OwnedByOther;
         }
         Err(err) => {
             tracing::warn!(?err, "control plane disabled");
-            return false;
+            return SpawnStatus::Unavailable;
         }
     };
 
@@ -77,7 +85,7 @@ pub fn spawn(
             tracing::warn!(?err, "control server exited with an error");
         }
     });
-    true
+    SpawnStatus::Started
 }
 
 /// Resolve the canonical config path the same way `load_config` does, for endpoint derivation.

@@ -123,7 +123,10 @@ fn print_health_attempt(attempt: &micromux::HealthAttempt) {
 fn print_response(response: &Response) -> Result<(), crate::Error> {
     match response {
         Response::Services(services) => print_services(services),
-        Response::Logs { lines, truncated } => {
+        Response::Service(service) => print_services(std::slice::from_ref(service.as_ref())),
+        Response::Logs {
+            lines, truncated, ..
+        } => {
             for line in lines {
                 println!("{}", line.line);
             }
@@ -167,6 +170,9 @@ fn print_response(response: &Response) -> Result<(), crate::Error> {
             println!("  services:");
             for service in &info.services {
                 println!("    - {} ({})", service.name, service.id);
+            }
+            if info.services_truncated {
+                println!("    … service index truncated by server limits");
             }
         }
         Response::Accepted { services } => {

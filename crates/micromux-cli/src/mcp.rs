@@ -7,8 +7,8 @@
 /// # Errors
 ///
 /// Returns an error if the stdio transport or the service loop fails.
-pub async fn run() -> Result<(), crate::Error> {
-    micromux_mcp::serve_stdio()
+pub async fn run(allow_session_start: bool) -> Result<(), crate::Error> {
+    micromux_mcp::serve_stdio(allow_session_start)
         .await
         .map_err(crate::Error::Mcp)?;
     Ok(())

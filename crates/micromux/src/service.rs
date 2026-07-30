@@ -6,6 +6,8 @@ use crate::{
     spec::{DependencySpec, HealthcheckSpec, ServiceOrigin, ServiceSpec},
 };
 use std::path::Path;
+#[cfg(unix)]
+use std::sync::Arc;
 
 /// Errors from materializing a runnable service definition.
 #[derive(Debug, thiserror::Error)]
@@ -21,6 +23,15 @@ pub enum Error {
         /// Underlying integer parse error.
         #[source]
         source: std::num::ParseIntError,
+    },
+    /// A configured working directory could not be opened or validated.
+    #[error("failed to access working directory {}: {source}", path.display())]
+    WorkingDirectory {
+        /// Resolved working-directory path.
+        path: std::path::PathBuf,
+        /// Underlying filesystem error.
+        #[source]
+        source: std::io::Error,
     },
 }
 
@@ -79,6 +90,34 @@ mod tests {
         }];
 
         let _service = Service::new("svc", &dir, cfg)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn working_directory_anchor_survives_path_replacement() -> eyre::Result<()> {
+        let dir = unique_tmp_dir("working-dir-anchor");
+        let working = dir.join("work");
+        fs::create_dir_all(&working)?;
+        fs::write(working.join("identity"), "original")?;
+        let mut cfg = service_config("svc", ("sh", &["-c", "true"]));
+        cfg.working_dir = Some(spanned_string(working.to_string_lossy().as_ref()));
+        let service = Service::new("svc", &dir, cfg)?;
+
+        fs::rename(&working, dir.join("old-work"))?;
+        fs::create_dir_all(&working)?;
+        fs::write(working.join("identity"), "replacement")?;
+
+        let anchored = service
+            .spawn_working_directory()?
+            .ok_or_else(|| eyre::eyre!("working directory was not anchored"))?;
+        assert_eq!(fs::read_to_string(anchored.join("identity"))?, "original");
+        let output = std::process::Command::new("sh")
+            .args(["-c", "cat identity"])
+            .current_dir(&anchored)
+            .output()?;
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8(output.stdout)?, "original");
         Ok(())
     }
 
@@ -319,6 +358,9 @@ pub struct Service {
     pub startup_mode: StartupMode,
     pub enable_color: bool,
     pub log_retention: LogRetention,
+    // Keeps each spawn tied to the directory that passed validation even if its path is replaced.
+    #[cfg(unix)]
+    working_directory: Option<Arc<std::fs::File>>,
 }
 
 impl Service {
@@ -327,15 +369,21 @@ impl Service {
         spec: ServiceSpec,
         origin: ServiceOrigin,
         log_retention: LogRetention,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, Error> {
+        #[cfg(unix)]
+        let working_directory = open_working_directory(spec.working_dir.as_deref())?;
+        #[cfg(not(unix))]
+        validate_working_directory(spec.working_dir.as_deref())?;
+        Ok(Self {
             id,
             spec,
             origin,
             startup_mode: StartupMode::Enabled,
             enable_color: true,
             log_retention,
-        }
+            #[cfg(unix)]
+            working_directory,
+        })
     }
 
     pub fn new(
@@ -346,15 +394,15 @@ impl Service {
         let (prog, args) = config.command;
         let id: ServiceID = id.into();
 
-        let working_dir = config
-            .working_dir
-            .as_ref()
-            .map(|dir| env::resolve_path(config_dir, dir.as_ref()))
-            .transpose()?;
+        let working_dir = resolve_working_directory(config_dir, config.working_dir.as_ref());
+        #[cfg(unix)]
+        let working_directory = open_working_directory(working_dir.as_deref())?;
+        #[cfg(not(unix))]
+        validate_working_directory(working_dir.as_deref())?;
 
         let mut env_files = Vec::new();
         for env_file in &config.env_file {
-            let path = env::resolve_path(config_dir, env_file.path.as_ref())?;
+            let path = env::resolve_path(config_dir, env_file.path.as_ref());
             // A missing optional file is skipped; a present one still
             // participates fully, including parse errors.
             if env_file.optional && !path.exists() {
@@ -451,6 +499,8 @@ impl Service {
             startup_mode: config.startup_mode,
             enable_color: config.color.as_deref().copied().unwrap_or(true),
             log_retention: config.log_retention,
+            #[cfg(unix)]
+            working_directory,
         })
     }
 
@@ -470,4 +520,113 @@ impl Service {
     pub fn display_name(&self) -> &str {
         self.spec.name.as_deref().unwrap_or(&self.id)
     }
+
+    #[cfg(unix)]
+    pub(crate) fn spawn_working_directory(&self) -> Result<Option<std::path::PathBuf>, Error> {
+        self.working_directory
+            .as_ref()
+            .map(|directory| {
+                #[cfg(target_vendor = "apple")]
+                {
+                    use std::ffi::OsString;
+                    use std::os::unix::ffi::OsStringExt as _;
+
+                    // macOS exposes `/dev/fd/N` as the directory itself but does not allow path
+                    // traversal below it, so recover the anchored vnode's current path.
+                    let path = rustix::fs::getpath(directory.as_ref()).map_err(|source| {
+                        Error::WorkingDirectory {
+                            path: self
+                                .spec
+                                .working_dir
+                                .clone()
+                                .unwrap_or_else(|| Path::new(".").to_path_buf()),
+                            source: source.into(),
+                        }
+                    })?;
+                    Ok(std::path::PathBuf::from(OsString::from_vec(
+                        path.into_bytes(),
+                    )))
+                }
+
+                #[cfg(not(target_vendor = "apple"))]
+                {
+                    use std::os::fd::AsRawFd as _;
+
+                    let fd = directory.as_raw_fd().to_string();
+                    #[cfg(target_os = "linux")]
+                    let base = "/proc/self/fd";
+                    #[cfg(not(target_os = "linux"))]
+                    let base = "/dev/fd";
+                    Ok(std::path::Path::new(base).join(fd))
+                }
+            })
+            .transpose()
+    }
+
+    pub(crate) fn replace_spec(&mut self, spec: ServiceSpec) -> Result<(), Error> {
+        #[cfg(unix)]
+        {
+            self.working_directory = open_working_directory(spec.working_dir.as_deref())?;
+        }
+        #[cfg(not(unix))]
+        validate_working_directory(spec.working_dir.as_deref())?;
+        self.spec = spec;
+        Ok(())
+    }
+}
+
+fn resolve_working_directory(
+    config_dir: &Path,
+    configured: Option<&yaml_spanned::Spanned<String>>,
+) -> Option<std::path::PathBuf> {
+    configured.map(|dir| env::resolve_path(config_dir, dir.as_ref()))
+}
+
+#[cfg(unix)]
+fn open_working_directory(path: Option<&Path>) -> Result<Option<Arc<std::fs::File>>, Error> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    let directory = std::fs::File::open(path).map_err(|source| Error::WorkingDirectory {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if !directory
+        .metadata()
+        .map_err(|source| Error::WorkingDirectory {
+            path: path.to_path_buf(),
+            source,
+        })?
+        .is_dir()
+    {
+        return Err(Error::WorkingDirectory {
+            path: path.to_path_buf(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::NotADirectory,
+                "path is not a directory",
+            ),
+        });
+    }
+    Ok(Some(Arc::new(directory)))
+}
+
+#[cfg(not(unix))]
+fn validate_working_directory(path: Option<&Path>) -> Result<(), Error> {
+    let Some(path) = path else {
+        return Ok(());
+    };
+    let metadata = std::fs::metadata(path).map_err(|source| Error::WorkingDirectory {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if !metadata.is_dir() {
+        return Err(Error::WorkingDirectory {
+            path: path.to_path_buf(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::NotADirectory,
+                "path is not a directory",
+            ),
+        });
+    }
+    Ok(())
 }
