@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Seek, SeekFrom};
+use std::io::{BufRead, BufReader, Read as _, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -14,6 +14,7 @@ use super::disk::{
 use super::{LogLine, LogRunSummary};
 
 pub(super) const RUN_LOG_OFFSET_CACHE: usize = 4096;
+const MAX_STABLE_SEGMENT_READ_ATTEMPTS: usize = 3;
 
 #[derive(Clone, Debug, Default)]
 pub(super) struct RunLogReadIndex {
@@ -287,22 +288,59 @@ pub(super) fn read_run_log_file(
     index: &mut RunLogReadIndex,
     disk_metadata: &SharedDiskRunMetadata,
 ) -> Option<Vec<LogLine>> {
-    let disk_metadata = disk_metadata.lock();
-    let Ok(file) = File::open(path) else {
-        return None;
-    };
-    let file_len = file.metadata().ok()?.len();
-    index.reset_for_segment(disk_metadata.segment_epoch);
-    index.reset_if_past_end(file_len);
-    let start_offset = start_offset_for_read(index, tail, after, file_len);
+    read_consistent_segment(path, index, disk_metadata, |index, file, readable_len| {
+        read_run_log_segment(path, file, readable_len, tail, after, limit, index)
+    })
+}
+
+fn read_consistent_segment<T>(
+    path: &Path,
+    index: &mut RunLogReadIndex,
+    disk_metadata: &SharedDiskRunMetadata,
+    mut read: impl FnMut(&mut RunLogReadIndex, File, u64) -> Option<T>,
+) -> Option<T> {
+    for _ in 0..MAX_STABLE_SEGMENT_READ_ATTEMPTS {
+        let (segment_epoch, file, readable_len) = {
+            let metadata = disk_metadata.lock();
+            let file = File::open(path).ok()?;
+            let readable_len = file.metadata().ok()?.len();
+            (metadata.segment_epoch, file, readable_len)
+        };
+        let mut candidate_index = index.clone();
+        candidate_index.reset_for_segment(segment_epoch);
+        let value = read(&mut candidate_index, file, readable_len)?;
+
+        // The writer holds `disk_metadata` across `write_all`, so `readable_len` cannot land inside
+        // a concurrently successful record. Read only that prefix, then reject it if an in-place
+        // rotation changed its epoch. This keeps long reads off the writer lock without publishing
+        // a mixed segment or partial append.
+        if disk_metadata.lock().segment_epoch == segment_epoch {
+            *index = candidate_index;
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn read_run_log_segment(
+    path: &Path,
+    mut file: File,
+    readable_len: u64,
+    tail: Option<usize>,
+    after: Option<u64>,
+    limit: Option<usize>,
+    index: &mut RunLogReadIndex,
+) -> Option<Vec<LogLine>> {
+    index.reset_if_past_end(readable_len);
+    let start_offset = start_offset_for_read(index, tail, after, readable_len);
     if start_offset == 0 {
         index.reset_scan();
     }
 
-    let mut reader = BufReader::new(file);
-    if reader.seek(SeekFrom::Start(start_offset)).is_err() {
+    if file.seek(SeekFrom::Start(start_offset)).is_err() {
         return None;
     }
+    let mut reader = BufReader::new(file.take(readable_len.saturating_sub(start_offset)));
 
     let mut offset = start_offset;
     let mut lines = VecDeque::new();
@@ -369,6 +407,123 @@ mod tests {
     use similar_asserts::assert_eq;
     use std::fs::{self, File, OpenOptions};
     use std::io::Write as _;
+
+    #[test]
+    fn run_log_read_releases_metadata_lock_and_retries_rotation() -> eyre::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("run.jsonl");
+        fs::write(&path, b"xx")?;
+        let metadata = std::sync::Arc::new(Mutex::new(DiskRunMetadata::default()));
+        let mut index = RunLogReadIndex::default();
+        let mut attempts = 0;
+
+        let value = read_consistent_segment(
+            &path,
+            &mut index,
+            &metadata,
+            |candidate, _file, readable_len| {
+                attempts += 1;
+                assert_eq!(readable_len, 2);
+                assert!(metadata.try_lock().is_some());
+                candidate.mark_scanned_to(u64::try_from(attempts).unwrap_or(u64::MAX));
+                if attempts == 1 {
+                    metadata.lock().segment_epoch = 1;
+                }
+                Some(attempts)
+            },
+        );
+
+        assert_eq!(value, Some(2));
+        assert_eq!(attempts, 2);
+        assert_eq!(index.segment_epoch, 1);
+        assert_eq!(index.scanned_to, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn run_log_read_does_not_advance_into_a_concurrent_append() -> eyre::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("run.jsonl");
+        let first = DiskLogRecord {
+            seq: 1,
+            run_generation: 1,
+            timestamp_unix_ms: 0,
+            op: DiskLogOp::Append,
+            line: "first".to_string(),
+        };
+        let second = DiskLogRecord {
+            seq: 2,
+            line: "second".to_string(),
+            ..first.clone()
+        };
+        let mut file = File::create(&path)?;
+        serde_json::to_writer(&mut file, &first)?;
+        file.write_all(b"\n")?;
+        file.flush()?;
+        let initial_len = file.metadata()?.len();
+        drop(file);
+
+        let mut second_encoded = serde_json::to_vec(&second)?;
+        second_encoded.push(b'\n');
+        let split = second_encoded.len() / 2;
+        assert!(serde_json::from_slice::<DiskLogRecord>(&second_encoded[..split]).is_err());
+
+        let metadata = std::sync::Arc::new(Mutex::new(DiskRunMetadata {
+            segment_epoch: 1,
+            line_count: 1,
+            first_seq: Some(1),
+            last_seq: Some(1),
+        }));
+        let mut index = RunLogReadIndex::default();
+
+        let first_page = read_consistent_segment(
+            &path,
+            &mut index,
+            &metadata,
+            |candidate, file, readable_len| {
+                assert_eq!(readable_len, initial_len);
+                // Recreate the writer's lock ordering while exposing half a record to the file.
+                Some((|| -> eyre::Result<Vec<LogLine>> {
+                    let mut metadata = metadata.lock();
+                    let mut append = OpenOptions::new().append(true).open(&path)?;
+                    append.write_all(&second_encoded[..split])?;
+                    append.flush()?;
+
+                    let lines = read_run_log_segment(
+                        &path,
+                        file,
+                        readable_len,
+                        None,
+                        None,
+                        None,
+                        candidate,
+                    )
+                    .ok_or_else(|| eyre::eyre!("stable run-log prefix was unreadable"))?;
+
+                    append.write_all(&second_encoded[split..])?;
+                    append.flush()?;
+                    metadata.line_count = 2;
+                    metadata.last_seq = Some(2);
+                    Ok(lines)
+                })())
+            },
+        )
+        .ok_or_else(|| eyre::eyre!("run-log snapshot was unavailable"))??;
+        // The first read commits only the stable cursor; the next one sees the completed append.
+        assert_eq!(
+            first_page.iter().map(|line| line.seq).collect::<Vec<_>>(),
+            vec![1]
+        );
+        assert_eq!(index.scanned_to, initial_len);
+
+        let second_page = read_run_log_file(&path, None, Some(1), None, &mut index, &metadata)
+            .ok_or_else(|| eyre::eyre!("completed append was unreadable"))?;
+        assert_eq!(
+            second_page.iter().map(|line| line.seq).collect::<Vec<_>>(),
+            vec![2]
+        );
+        Ok(())
+    }
 
     #[cfg(unix)]
     #[test]
