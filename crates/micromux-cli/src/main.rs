@@ -279,7 +279,7 @@ async fn run() -> Result<(), Error> {
         }
     }
 
-    let input = handles.commands.clone();
+    let input = handles.terminal.clone();
     let mut source =
         micromux_tui::LocalSource::new(handles.reader.clone(), handles.commands.clone());
     if let Some(warning) = control_warning {

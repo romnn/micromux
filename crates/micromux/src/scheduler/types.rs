@@ -257,13 +257,6 @@ pub enum Command {
         /// Optional reply channel for acknowledged commands.
         ack: Option<DynamicCommandAck>,
     },
-    /// Send a raw input payload to a service.
-    SendInput(ServiceID, Vec<u8>),
-    /// Send one bracketed paste to a service.
-    ///
-    /// The scheduler and PTY writer preserve it as one queue entry. The writer may split it into
-    /// bounded physical writes, but abandons only the remaining suffix after a write failure.
-    SendPaste(ServiceID, Vec<u8>),
     /// Resize all PTYs.
     ResizeAll {
         /// Terminal width in columns.

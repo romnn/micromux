@@ -40,20 +40,21 @@ impl std::fmt::Display for Input {
 #[derive(Debug)]
 pub struct InputHandler {
     /// Event sender channel.
-    _sender: mpsc::Sender<Input>,
+    sender: Option<mpsc::Sender<Input>>,
     /// Event receiver channel.
     receiver: mpsc::Receiver<Input>,
 }
 
 impl InputHandler {
-    /// Constructs a new instance of [`InputHandler`] and spawns a task to handle terminal events.
+    /// Constructs a dormant [`InputHandler`].
+    ///
+    /// The terminal reader starts on the first [`Self::next`] call, after terminal initialization
+    /// has succeeded. This keeps construction safe in diagnostics and tests without a TTY.
     #[must_use]
     pub fn new() -> Self {
         let (sender, receiver) = mpsc::channel(INPUT_QUEUE_CAPACITY);
-        let actor = EventTask::new(sender.clone());
-        tokio::spawn(async move { actor.run().await });
         Self {
-            _sender: sender,
+            sender: Some(sender),
             receiver,
         }
     }
@@ -63,6 +64,10 @@ impl InputHandler {
     /// This function blocks until an event is received.
     ///
     pub async fn next(&mut self) -> Option<Input> {
+        if let Some(sender) = self.sender.take() {
+            let actor = EventTask::new(sender);
+            tokio::spawn(async move { actor.run().await });
+        }
         self.receiver.recv().await
     }
 

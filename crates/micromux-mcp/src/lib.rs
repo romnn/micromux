@@ -84,6 +84,7 @@ const WAIT_LOG_POLL: Duration = Duration::from_millis(250);
 const MAX_SESSION_STARTS_PER_WINDOW: usize = 8;
 const SESSION_START_WINDOW: Duration = Duration::from_mins(1);
 const GREP_REGEX_SIZE_LIMIT: usize = 256 * 1024;
+const GREP_PATTERN_MAX_BYTES: usize = 64 * 1024;
 
 const INSTRUCTIONS: &str = "Discover and control running micromux sessions. When no `session` is \
 given, tools target the current project's session. Use `find_service` to locate a service across \
@@ -213,6 +214,7 @@ struct LogFilterArgs {
     raw: bool,
     /// Keep only entries matching this regex (applied after ANSI stripping).
     #[serde(default)]
+    #[schemars(length(max = 65536))]
     grep: Option<String>,
     /// Include this many neighboring entries before and after each grep match (like grep -C).
     /// Has no effect unless `grep` is set. Capped at 20.
@@ -772,6 +774,9 @@ struct DiagnoseResult {
     session: String,
     /// A copy-pasteable selector (`hash:<id>`) for the diagnosed session.
     session_selector: String,
+    /// Current disk-log read capacity, when advertised by the session.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    disk_log_reads: Option<micromux_control::DiskLogReadHealth>,
     services: Vec<ServiceDiagnosis>,
 }
 
@@ -2545,10 +2550,16 @@ impl McpServer {
             );
         }
         let session_selector = session_selector(&resolved.info);
+        let disk_log_reads = resolved
+            .info
+            .capabilities
+            .as_ref()
+            .and_then(|capabilities| capabilities.disk_log_reads);
         Ok(Json(DiagnoseResult {
             config_path: resolved.info.config_path,
             session: resolved.info.name,
             session_selector,
+            disk_log_reads,
             services: diagnoses,
         }))
     }
@@ -2855,6 +2866,12 @@ impl ServerHandler for McpServer {
 fn compile_grep(pattern: Option<&str>) -> Result<Option<Regex>, ErrorData> {
     pattern
         .map(|pattern| {
+            if pattern.len() > GREP_PATTERN_MAX_BYTES {
+                return Err(ErrorData::invalid_params(
+                    format!("grep regex exceeds the {GREP_PATTERN_MAX_BYTES}-byte input limit"),
+                    None,
+                ));
+            }
             RegexBuilder::new(pattern)
                 .size_limit(GREP_REGEX_SIZE_LIMIT)
                 .dfa_size_limit(GREP_REGEX_SIZE_LIMIT)
@@ -2991,10 +3008,10 @@ pub async fn serve_stdio(
 #[cfg(test)]
 mod tests {
     use super::{
-        DynamicMutationResult, ExitVerdict, McpServer, MutationResult, RestartAndWaitResult,
-        SessionMutationResult, SessionRef, StartDynamicAndWaitResult, StopSessionResult,
-        WaitForExitResult, WaitForExitStatus, WaitResult, classify_exit, compile_grep,
-        matching_service, parse_since_text, session_has_service, session_selector,
+        DynamicMutationResult, ExitVerdict, GREP_PATTERN_MAX_BYTES, McpServer, MutationResult,
+        RestartAndWaitResult, SessionMutationResult, SessionRef, StartDynamicAndWaitResult,
+        StopSessionResult, WaitForExitResult, WaitForExitStatus, WaitResult, classify_exit,
+        compile_grep, matching_service, parse_since_text, session_has_service, session_selector,
     };
     use crate::tools::health::health_attempt_matches_snapshot;
     use crate::tools::logs::{
@@ -3037,6 +3054,9 @@ mod tests {
     #[test]
     fn grep_regex_compilation_has_an_explicit_memory_bound() {
         assert!(compile_grep(Some("error|warn")).is_ok());
+
+        let oversized_input = "a".repeat(GREP_PATTERN_MAX_BYTES + 1);
+        assert!(compile_grep(Some(&oversized_input)).is_err());
 
         let oversized = "a?".repeat(100_000);
         assert!(compile_grep(Some(&oversized)).is_err());

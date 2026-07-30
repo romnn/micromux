@@ -87,6 +87,49 @@ impl SessionSource {
         }
     }
 
+    pub(crate) fn latest_event_seq(&self, id: &str) -> Option<u64> {
+        let Self::Local(source) = self else {
+            return None;
+        };
+        source
+            .reader
+            .events(id, None, Some(1))
+            .0
+            .pop()
+            .map(|event| event.seq)
+    }
+
+    /// Returns the advanced cursor and the newest input drop not already covered by `after`.
+    ///
+    /// A cursor may move backward when a removed service id is reused for a new model entry.
+    pub(crate) fn input_drop_notice_since(
+        &self,
+        id: &str,
+        after: Option<u64>,
+    ) -> (Option<u64>, Option<String>) {
+        let Self::Local(source) = self else {
+            return (after, None);
+        };
+        let latest = source
+            .reader
+            .events(id, None, Some(1))
+            .0
+            .pop()
+            .map(|event| event.seq);
+        if after.is_some_and(|after| latest.is_none_or(|latest| after > latest)) {
+            return (latest, None);
+        }
+
+        let events = source.reader.events(id, after, None).0;
+        let cursor = events.last().map(|event| event.seq).or(after);
+        let notice = events
+            .into_iter()
+            .rev()
+            .find(|event| event.kind == micromux::ServiceEventKind::InputDropped)
+            .map(|event| event.detail);
+        (cursor, notice)
+    }
+
     pub(crate) fn subscribe(&self) -> broadcast::Receiver<SessionChange> {
         match self {
             Self::Local(source) => source.reader.subscribe(),

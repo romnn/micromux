@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// Bump the minor for additive changes (new optional/defaulted fields, new tools that reuse
 /// existing requests), and bump the major for incompatible request/response semantics.
-pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(3, 7);
+pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(3, 8);
 
 pub(crate) const fn supports_versioned_subscriptions(version: ProtocolVersion) -> bool {
     version.major() == PROTOCOL_VERSION.major() && version.minor() >= 7
@@ -68,6 +68,9 @@ pub enum Request {
     /// Return session identity and metadata.
     Describe,
     /// List every service with its current snapshot.
+    ///
+    /// This response is not paged. A roster that exceeds the protocol frame budget returns
+    /// [`ErrorCode::LimitExceeded`].
     ListServices,
     /// Return one service by stable id or human-readable name.
     ///
@@ -98,6 +101,9 @@ pub enum Request {
         after: Option<u64>,
     },
     /// Return summaries of retained log runs for a service.
+    ///
+    /// This response is not paged. A run index that exceeds the protocol frame budget returns
+    /// [`ErrorCode::LimitExceeded`].
     ListLogRuns {
         /// Target service.
         service: ServiceID,
@@ -262,6 +268,27 @@ pub struct SessionCapabilities {
     /// Dynamic-service limits, or `None` when runtime creation is not permitted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dynamic_services: Option<DynamicServicesCaps>,
+    /// Capacity and health of the bounded disk-log read pool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_log_reads: Option<DiskLogReadHealth>,
+}
+
+/// Current capacity, occupancy, and timeout history of the disk-log read pool.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, JsonSchema)]
+pub struct DiskLogReadHealth {
+    /// Whether the worker pool started successfully.
+    pub available: bool,
+    /// Worker threads owned by the pool.
+    pub workers: usize,
+    /// Worker threads currently executing a filesystem read.
+    pub active: usize,
+    /// Maximum reads that may wait for a worker.
+    pub queue_capacity: usize,
+    /// Reads currently waiting for a worker.
+    pub queued: usize,
+    /// Requests that have exceeded the read deadline since this session started.
+    #[serde(default)]
+    pub timed_out_requests: usize,
 }
 
 /// Dynamic-service limits and current usage advertised by a session.
@@ -442,7 +469,7 @@ mod tests {
     fn protocol_version_uses_major_minor_shape_and_accepts_same_major() {
         assert_eq!(
             serde_json::to_value(PROTOCOL_VERSION).unwrap(),
-            json!({ "major": 3, "minor": 7 })
+            json!({ "major": 3, "minor": 8 })
         );
         assert_eq!(
             serde_json::from_value::<ProtocolVersion>(json!({ "major": 1, "minor": 0 })).unwrap(),
@@ -503,6 +530,20 @@ mod tests {
     }
 
     #[test]
+    fn disk_log_read_health_accepts_missing_timeout_history() {
+        let health = serde_json::from_value::<DiskLogReadHealth>(json!({
+            "available": true,
+            "workers": 4,
+            "active": 1,
+            "queue_capacity": 4,
+            "queued": 2
+        }))
+        .unwrap();
+
+        assert_eq!(health.timed_out_requests, 0);
+    }
+
+    #[test]
     fn dynamic_service_ack_round_trips_and_accepts_missing_additive_fields() {
         let ack = DynamicServiceAck {
             service: "debug".to_string(),
@@ -546,10 +587,10 @@ mod tests {
     fn reconcile_request_and_receipt_round_trip() {
         let request = Request::ReconcileConfig { dry_run: true };
         let encoded = serde_json::to_value(&request).unwrap();
-        assert!(matches!(
+        assert_matches!(
             serde_json::from_value::<Request>(encoded).unwrap(),
             Request::ReconcileConfig { dry_run: true }
-        ));
+        );
 
         let receipt = micromux::ReconcileReceipt {
             config_path: "/project/micromux.yaml".to_string(),
@@ -589,10 +630,10 @@ mod tests {
             service: "api".to_string(),
         };
         let encoded = serde_json::to_value(&request)?;
-        assert!(matches!(
+        assert_matches!(
             serde_json::from_value::<Request>(encoded)?,
             Request::GetHealthHistory { service } if service == "api"
-        ));
+        );
 
         let response = Response::HealthHistory {
             attempts: vec![HealthAttempt {
@@ -642,7 +683,7 @@ mod tests {
     fn protocol_version_ignores_additive_fields() {
         let version = serde_json::from_value::<ProtocolVersion>(json!({
             "major": 3,
-            "minor": 7,
+            "minor": 8,
             "future_capability": true
         }))
         .unwrap();

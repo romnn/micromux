@@ -1,6 +1,6 @@
 use super::{
-    LogUpdateKind, MAX_PTY_INPUT_BATCH_BYTES, MAX_PTY_PASTE_BYTES, OutputStream, ProcessEvent,
-    RunId, ServiceID,
+    LogUpdateKind, OutputStream, ProcessEvent, RunId, ServiceID,
+    input::{InputPermit, PreparedPtyInput, PtyInputKind},
 };
 use crate::{health_check, model::RunSink, service::Service};
 use parking_lot::Mutex;
@@ -230,6 +230,14 @@ fn poll_error_is_retryable(error: &io::Error) -> bool {
 type SharedPtyMaster = Arc<Mutex<Option<Box<dyn portable_pty::MasterPty + Send>>>>;
 type SharedPtyWriteQueue = Arc<Mutex<Option<std_mpsc::SyncSender<PtyWrite>>>>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub(super) enum PtyInputDrop {
+    #[error("the input queue is full")]
+    QueueFull,
+    #[error("the PTY writer has stopped")]
+    WriterStopped,
+}
+
 struct PtyWriter {
     service_id: ServiceID,
     writer: Box<dyn Write + Send>,
@@ -244,8 +252,11 @@ struct PtyWriter {
 
 #[derive(Debug)]
 enum PtyWrite {
-    Input(Vec<u8>),
-    Paste(Vec<u8>),
+    Input {
+        kind: PtyInputKind,
+        data: Vec<u8>,
+        permit: InputPermit,
+    },
     TerminalResponse(Vec<u8>),
 }
 
@@ -269,6 +280,16 @@ pub(super) struct StartedPty {
     pub(super) pid: Option<u32>,
     pub(super) handles: PtyHandles,
     pub(super) log_reader: LogReaderHandle,
+}
+
+pub(super) struct StartServiceParams<'a> {
+    pub(super) service: &'a Service,
+    pub(super) run_id: RunId,
+    pub(super) sink: RunSink,
+    pub(super) events_tx: &'a mpsc::Sender<ProcessEvent>,
+    pub(super) shutdown: &'a CancellationToken,
+    pub(super) terminate: &'a CancellationToken,
+    pub(super) pty_size: portable_pty::PtySize,
 }
 
 impl PtyHandles {
@@ -329,48 +350,17 @@ impl PtyHandles {
         ))
     }
 
-    pub(super) fn write_input(&self, service_id: &ServiceID, data: &[u8]) {
-        let input_len = data.len();
-        if input_len > MAX_PTY_INPUT_BATCH_BYTES {
-            tracing::warn!(
-                service_id,
-                input_len,
-                batch_limit_bytes = MAX_PTY_INPUT_BATCH_BYTES,
-                "pty input batch is too large; dropping it atomically"
-            );
-            return;
-        }
-        self.enqueue_input(service_id, PtyWrite::Input(data.to_vec()), input_len);
-    }
-
-    pub(super) fn write_paste(&self, service_id: &ServiceID, data: Vec<u8>) {
-        let input_len = data.len();
-        if input_len > MAX_PTY_PASTE_BYTES {
-            tracing::warn!(
-                service_id,
-                input_len,
-                paste_limit_bytes = MAX_PTY_PASTE_BYTES,
-                "pty paste is too large; dropping it atomically"
-            );
-            return;
-        }
-        self.enqueue_input(service_id, PtyWrite::Paste(data), input_len);
-    }
-
-    fn enqueue_input(&self, service_id: &ServiceID, input: PtyWrite, input_len: usize) {
+    pub(super) fn write_input(&self, input: PreparedPtyInput) -> Result<(), PtyInputDrop> {
+        let (data, kind, permit) = input.into_parts();
+        let input = PtyWrite::Input { kind, data, permit };
         let write_queue = self.write_queue.lock();
         let Some(write_queue) = write_queue.as_ref() else {
-            return;
+            return Err(PtyInputDrop::WriterStopped);
         };
         match write_queue.try_send(input) {
-            Ok(()) | Err(std_mpsc::TrySendError::Disconnected(_)) => {}
-            Err(std_mpsc::TrySendError::Full(_)) => {
-                tracing::warn!(
-                    service_id,
-                    input_len,
-                    "pty input queue is full; dropping input batch atomically"
-                );
-            }
+            Ok(()) => Ok(()),
+            Err(std_mpsc::TrySendError::Disconnected(_)) => Err(PtyInputDrop::WriterStopped),
+            Err(std_mpsc::TrySendError::Full(_)) => Err(PtyInputDrop::QueueFull),
         }
     }
 
@@ -398,33 +388,23 @@ impl PtyWriter {
                 break;
             }
             match message {
-                PtyWrite::Input(data) => {
-                    if let Err(err) = self.write_input(&data)
+                PtyWrite::Input { kind, data, permit } => {
+                    let result = self.write_input(&data);
+                    if let Err(err) = result
                         && !self.cancellation.is_cancelled()
                     {
                         tracing::warn!(
                             ?err,
                             service_id = self.service_id,
-                            "failed to write to pty"
+                            input_kind = kind.as_str(),
+                            input_len = data.len(),
+                            "failed to write complete pty input; dropping its suffix"
                         );
                     }
-                }
-                PtyWrite::Paste(data) => {
-                    for (chunk_index, chunk) in data.chunks(MAX_PTY_INPUT_BATCH_BYTES).enumerate() {
-                        if let Err(err) = self.write_input(chunk) {
-                            if !self.cancellation.is_cancelled() {
-                                let attempted_bytes =
-                                    chunk_index.saturating_mul(MAX_PTY_INPUT_BATCH_BYTES);
-                                tracing::warn!(
-                                    ?err,
-                                    service_id = self.service_id,
-                                    remaining_bytes = data.len().saturating_sub(attempted_bytes),
-                                    "failed to write complete paste to pty; dropping its suffix"
-                                );
-                            }
-                            break;
-                        }
-                    }
+                    // Keep the reservation until the payload allocation is gone, so the global
+                    // budget never undercounts live input bytes.
+                    drop(data);
+                    drop(permit);
                 }
                 PtyWrite::TerminalResponse(data) => {
                     let _ = self.write_terminal_response(&data);
@@ -2056,16 +2036,19 @@ fn spawn_termination_task_with_timing(args: TerminationTaskArgs, timing: Termina
     reason = "process startup wires PTY, reader, waiter, and ownership guards in one fallible path"
 )]
 pub(super) fn start_service_with_pty_size(
-    service: &Service,
-    run_id: RunId,
-    sink: RunSink,
-    events_tx: &mpsc::Sender<ProcessEvent>,
-    shutdown: &CancellationToken,
-    terminate: &CancellationToken,
-    pty_size: portable_pty::PtySize,
+    params: StartServiceParams<'_>,
 ) -> Result<StartedPty, Error> {
     use portable_pty::{CommandBuilder, PtySize};
 
+    let StartServiceParams {
+        service,
+        run_id,
+        sink,
+        events_tx,
+        shutdown,
+        terminate,
+        pty_size,
+    } = params;
     let service_id = service.id.clone();
     let Some((prog, args)) = service.spec.command.split_first() else {
         return Err(Error::EmptyCommand);
@@ -2263,6 +2246,8 @@ mod tests {
     #[cfg(unix)]
     mod unix {
         use super::*;
+        use crate::scheduler::input::{InputBudget, PtyInputPrepareError};
+        use crate::{MAX_PTY_INPUT_BATCH_BYTES, MAX_PTY_PASTE_BYTES};
         use color_eyre::eyre::{self, OptionExt as _};
         use similar_asserts::assert_eq;
         use std::fs;
@@ -2407,13 +2392,13 @@ mod tests {
             assert_eq!(calls.load(Ordering::Relaxed), 1);
             target.force_kill();
             assert_eq!(calls.load(Ordering::Relaxed), 2);
-            assert!(matches!(
+            assert_matches!(
                 events_rx.recv().await,
                 Some(ProcessEvent::Killed {
                     service_id: killed_service_id,
                     run_id: killed_run_id,
                 }) if killed_service_id == service_id && killed_run_id == run_id
-            ));
+            );
         }
 
         #[tokio::test]
@@ -2441,20 +2426,20 @@ mod tests {
             assert!(started.kill_deadline.is_some());
             assert_eq!(calls.load(Ordering::Relaxed), 1);
             assert!(started.pending_notification.is_some());
-            assert!(matches!(
+            assert_matches!(
                 events_rx.recv().await,
                 Some(ProcessEvent::Killed { service_id, .. }) if service_id == "occupied"
-            ));
+            );
             if let Some(notification) = started.pending_notification.take() {
                 assert!(notification.await.is_ok());
             }
-            assert!(matches!(
+            assert_matches!(
                 events_rx.recv().await,
                 Some(ProcessEvent::Killed {
                     service_id,
                     run_id,
                 }) if service_id == "svc" && run_id == RunId::new(7)
-            ));
+            );
         }
 
         #[test]
@@ -2472,7 +2457,7 @@ mod tests {
         }
 
         #[test]
-        fn paste_occupies_one_atomic_writer_queue_entry() {
+        fn paste_occupies_one_atomic_writer_queue_entry() -> eyre::Result<()> {
             let (write_queue, queued) = std_mpsc::sync_channel(1);
             let handles = PtyHandles {
                 master: Arc::new(Mutex::new(None)),
@@ -2480,17 +2465,79 @@ mod tests {
                 size: Arc::new(AtomicU32::new(0)),
             };
             let paste = vec![b'x'; MAX_PTY_INPUT_BATCH_BYTES + 17];
+            let budget = InputBudget::shared_with_limit(MAX_PTY_PASTE_BYTES);
+            let input = PreparedPtyInput::prepare(
+                &budget,
+                "svc".to_string(),
+                paste.clone(),
+                PtyInputKind::Paste,
+            )?;
 
-            handles.write_paste(&"svc".to_string(), paste.clone());
+            handles.write_input(input)?;
 
             match queued.try_recv() {
-                Ok(PtyWrite::Paste(queued)) => assert_eq!(queued, paste),
-                Ok(PtyWrite::Input(_) | PtyWrite::TerminalResponse(_)) => {
+                Ok(PtyWrite::Input {
+                    kind: PtyInputKind::Paste,
+                    data,
+                    ..
+                }) => assert_eq!(data, paste),
+                Ok(PtyWrite::Input { .. } | PtyWrite::TerminalResponse(_)) => {
                     panic!("paste was split into another queue entry")
                 }
                 Err(err) => panic!("paste was not queued: {err}"),
             }
             assert_matches!(queued.try_recv(), Err(std_mpsc::TryRecvError::Empty));
+            Ok(())
+        }
+
+        #[test]
+        fn input_byte_budget_is_shared_across_service_queues() -> eyre::Result<()> {
+            let input_budget = InputBudget::shared_with_limit(2 * MAX_PTY_PASTE_BYTES);
+            let (first_queue, first_queued) = std_mpsc::sync_channel(2);
+            let first = PtyHandles {
+                master: Arc::new(Mutex::new(None)),
+                write_queue: Arc::new(Mutex::new(Some(first_queue))),
+                size: Arc::new(AtomicU32::new(0)),
+            };
+            let (second_queue, second_queued) = std_mpsc::sync_channel(2);
+            let second = PtyHandles {
+                master: Arc::new(Mutex::new(None)),
+                write_queue: Arc::new(Mutex::new(Some(second_queue))),
+                size: Arc::new(AtomicU32::new(0)),
+            };
+            let paste = vec![b'x'; MAX_PTY_PASTE_BYTES];
+
+            first.write_input(PreparedPtyInput::prepare(
+                &input_budget,
+                "first".to_string(),
+                paste.clone(),
+                PtyInputKind::Paste,
+            )?)?;
+            second.write_input(PreparedPtyInput::prepare(
+                &input_budget,
+                "second".to_string(),
+                paste.clone(),
+                PtyInputKind::Paste,
+            )?)?;
+            assert_matches!(
+                PreparedPtyInput::prepare(
+                    &input_budget,
+                    "first".to_string(),
+                    paste.clone(),
+                    PtyInputKind::Paste,
+                ),
+                Err(PtyInputPrepareError::BudgetExhausted { .. })
+            );
+
+            drop(second_queued.recv()?);
+            first.write_input(PreparedPtyInput::prepare(
+                &input_budget,
+                "first".to_string(),
+                paste,
+                PtyInputKind::Paste,
+            )?)?;
+            drop(first_queued);
+            Ok(())
         }
 
         #[cfg(target_vendor = "apple")]
@@ -2589,7 +2636,8 @@ mod tests {
         }
 
         #[test]
-        fn pty_input_enqueue_does_not_wait_for_slave_backpressure() -> eyre::Result<()> {
+        fn active_pty_input_retains_its_global_budget_without_blocking_enqueue() -> eyre::Result<()>
+        {
             let fixture_dir = tempfile::tempdir()?;
             let ready_file = fixture_dir.path().join("ready");
             let pair = portable_pty::native_pty_system()
@@ -2606,11 +2654,17 @@ mod tests {
                 .master
                 .take_writer()
                 .map_err(|err| eyre::eyre!("failed to take test PTY writer: {err}"))?;
+            let (would_block_tx, would_block_rx) = std::sync::mpsc::channel();
+            let writer = ExitOnDropWriter {
+                writer: Some(writer),
+                exited: None,
+                would_block: Some(would_block_tx),
+            };
             let log_reader = LogReaderHandle::test_dummy();
             let (handles, shutdown) = PtyHandles::new(
                 "svc".to_string(),
                 pair.master,
-                writer,
+                Box::new(writer),
                 Arc::new(AtomicU32::new(0)),
                 &log_reader,
             )?;
@@ -2628,8 +2682,26 @@ mod tests {
             // Enqueuing is the scheduler-facing operation. It must return well before the writer
             // worker reaches its backpressure deadline.
             let started_at = Instant::now();
-            handles.write_input(&"svc".to_string(), &vec![b'x'; MAX_PTY_INPUT_BATCH_BYTES]);
+            let budget = InputBudget::shared_with_limit(MAX_PTY_INPUT_BATCH_BYTES);
+            handles.write_input(PreparedPtyInput::prepare(
+                &budget,
+                "svc".to_string(),
+                vec![b'x'; MAX_PTY_INPUT_BATCH_BYTES],
+                PtyInputKind::Input,
+            )?)?;
             let enqueue_elapsed = started_at.elapsed();
+            would_block_rx
+                .recv_timeout(Duration::from_secs(3))
+                .map_err(|err| eyre::eyre!("PTY writer did not reach backpressure: {err}"))?;
+            assert_matches!(
+                PreparedPtyInput::prepare(
+                    &budget,
+                    "svc".to_string(),
+                    vec![b'y'],
+                    PtyInputKind::Input,
+                ),
+                Err(PtyInputPrepareError::BudgetExhausted { .. })
+            );
 
             shutdown.close();
             let _ = child.kill();
@@ -2687,7 +2759,13 @@ mod tests {
                 }
 
                 let input = vec![b'x'; INPUT_LEN];
-                handles.write_input(&"svc".to_string(), &input);
+                let budget = InputBudget::shared_with_limit(INPUT_LEN);
+                handles.write_input(PreparedPtyInput::prepare(
+                    &budget,
+                    "svc".to_string(),
+                    input,
+                    PtyInputKind::Input,
+                )?)?;
 
                 // Raw-mode queues are much smaller than this paste.
                 //
@@ -2964,7 +3042,7 @@ mod tests {
             let killed = tokio::time::timeout(Duration::from_secs(1), events_rx.recv())
                 .await?
                 .ok_or_eyre("termination task ended without a killed event")?;
-            assert!(matches!(killed, ProcessEvent::Killed { .. }));
+            assert_matches!(killed, ProcessEvent::Killed { .. });
 
             // The fake child ignores both kill requests and finishes only when PTY shutdown drops
             // its writer.
@@ -2973,7 +3051,7 @@ mod tests {
             let exited = tokio::time::timeout(Duration::from_secs(1), events_rx.recv())
                 .await?
                 .ok_or_eyre("termination task ended without an exit event")?;
-            assert!(matches!(exited, ProcessEvent::Exited { exit_code: 0, .. }));
+            assert_matches!(exited, ProcessEvent::Exited { exit_code: 0, .. });
             assert_eq!(kill_calls.load(Ordering::Relaxed), 2);
             assert!(handles.write_queue.lock().is_none());
             assert!(handles.master.lock().is_none());

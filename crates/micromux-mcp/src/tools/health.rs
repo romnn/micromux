@@ -248,6 +248,9 @@ fn classify_connect_result(result: io::Result<()>) -> PortProbe {
 
 async fn probe_port(port: u16) -> PortProbe {
     let address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, port);
+    // Connecting avoids stealing the advertised port, but the listener observes a real connection
+    // that closes without application traffic. Only refusal proves availability; permission,
+    // routing, and resource errors remain unattributed.
     match tokio::time::timeout(PORT_PROBE_BUDGET, tokio::net::TcpStream::connect(address)).await {
         Ok(result) => classify_connect_result(result.map(|_| ())),
         Err(_) => PortProbe::Unknown,

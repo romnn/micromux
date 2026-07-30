@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -35,6 +35,7 @@ pub(super) struct DiskLogRecord {
 #[derive(Clone, Copy, Debug, Default)]
 pub(super) struct DiskRunMetadata {
     pub(super) segment_epoch: u64,
+    pub(super) readable_len: u64,
     pub(super) line_count: usize,
     pub(super) first_seq: Option<u64>,
     pub(super) last_seq: Option<u64>,
@@ -43,12 +44,14 @@ pub(super) struct DiskRunMetadata {
 impl DiskRunMetadata {
     fn begin_segment(&mut self) {
         self.segment_epoch = self.segment_epoch.saturating_add(1);
+        self.readable_len = 0;
         self.line_count = 0;
         self.first_seq = None;
         self.last_seq = None;
     }
 
-    fn observe(&mut self, op: DiskLogOp, seq: u64) {
+    fn observe(&mut self, op: DiskLogOp, seq: u64, readable_len: u64) {
+        self.readable_len = readable_len;
         match op {
             DiskLogOp::Append => {
                 self.line_count = self.line_count.saturating_add(1);
@@ -261,12 +264,13 @@ impl Drop for DiskLogWorker {
 }
 
 trait RecordFile: Write {
-    fn truncate(&mut self, len: u64) -> io::Result<()>;
+    fn rollback_to(&mut self, len: u64) -> io::Result<()>;
 }
 
 impl RecordFile for File {
-    fn truncate(&mut self, len: u64) -> io::Result<()> {
-        self.set_len(len)
+    fn rollback_to(&mut self, len: u64) -> io::Result<()> {
+        self.set_len(len)?;
+        self.seek(SeekFrom::Start(len)).map(|_| ())
     }
 }
 
@@ -281,7 +285,7 @@ impl<W: RecordFile> DiskFileWriter<W> {
         if let Err(write_error) = self.writer.write_all(encoded) {
             // A short regular-file write may expose half a JSON line. Restore the last complete
             // record boundary before disabling this writer so a later reopen can append safely.
-            if let Err(truncate_error) = self.writer.truncate(record_offset) {
+            if let Err(truncate_error) = self.writer.rollback_to(record_offset) {
                 return Err(io::Error::new(
                     truncate_error.kind(),
                     format!(
@@ -350,7 +354,6 @@ fn write_disk_record_with_limit(
     record: &DiskLogRecord,
     max_bytes: u64,
 ) {
-    let mut metadata = metadata.lock();
     if !writers.contains_key(path) {
         let Some(writer) = open_disk_log_writer(path, false) else {
             return;
@@ -359,7 +362,9 @@ fn write_disk_record_with_limit(
     }
 
     let mut retained = record.clone();
-    if matches!(retained.op, DiskLogOp::ReplaceLast) && metadata.last_seq != Some(retained.seq) {
+    if matches!(retained.op, DiskLogOp::ReplaceLast)
+        && metadata.lock().last_seq != Some(retained.seq)
+    {
         retained.op = DiskLogOp::Append;
     }
     let Ok(mut encoded) = serde_json::to_vec(&retained) else {
@@ -372,6 +377,10 @@ fn write_disk_record_with_limit(
         writer.bytes_written > 0 && writer.bytes_written.saturating_add(record_bytes) > max_bytes
     });
     if rotates {
+        // Rotation changes the file identity visible to readers, so publish its epoch while the
+        // truncating open is protected. Ordinary appends publish only their completed prefix and
+        // do not hold this lock across I/O.
+        let mut metadata = metadata.lock();
         writers.remove(path);
         let Some(writer) = open_disk_log_writer(path, true) else {
             return;
@@ -395,10 +404,16 @@ fn write_disk_record_with_limit(
         return;
     };
     if let Err(err) = writer.write_record(&encoded) {
-        tracing::warn!(?err, path = %path.display(), "disabling disk run log writer after write failure");
+        tracing::warn!(
+            ?err,
+            path = %path.display(),
+            "disabling disk run log writer after write failure"
+        );
         writers.remove(path);
     } else {
-        metadata.observe(retained.op, retained.seq);
+        metadata
+            .lock()
+            .observe(retained.op, retained.seq, writer.bytes_written);
     }
 }
 
@@ -444,29 +459,37 @@ fn run_disk_log_worker(rx: mpsc::Receiver<DiskLogCommand>) {
 
 #[cfg(test)]
 mod tests {
+    use std::assert_matches;
+
     use super::*;
     use color_eyre::eyre;
     use similar_asserts::assert_eq;
+    use std::io::Read as _;
     use std::time::Instant;
 
     struct PartialWriteFailure {
         bytes: Vec<u8>,
+        cursor: usize,
         fail_at: usize,
     }
 
     impl Write for PartialWriteFailure {
         fn write(&mut self, data: &[u8]) -> io::Result<usize> {
-            if self.bytes.len() >= self.fail_at {
+            if self.cursor >= self.fail_at {
                 return Err(io::Error::new(
                     io::ErrorKind::StorageFull,
                     "injected partial write failure",
                 ));
             }
-            let written = data
-                .len()
-                .min(self.fail_at.saturating_sub(self.bytes.len()));
-            self.bytes
-                .extend_from_slice(data.get(..written).unwrap_or_default());
+            let written = data.len().min(self.fail_at.saturating_sub(self.cursor));
+            let end = self.cursor.saturating_add(written);
+            self.bytes.resize(end, 0);
+            if let (Some(target), Some(source)) =
+                (self.bytes.get_mut(self.cursor..end), data.get(..written))
+            {
+                target.copy_from_slice(source);
+            }
+            self.cursor = end;
             Ok(written)
         }
 
@@ -476,9 +499,9 @@ mod tests {
     }
 
     impl RecordFile for PartialWriteFailure {
-        fn truncate(&mut self, len: u64) -> io::Result<()> {
-            self.bytes
-                .truncate(usize::try_from(len).unwrap_or(usize::MAX));
+        fn rollback_to(&mut self, len: u64) -> io::Result<()> {
+            self.cursor = usize::try_from(len).unwrap_or(usize::MAX);
+            self.bytes.truncate(self.cursor);
             Ok(())
         }
     }
@@ -527,6 +550,7 @@ mod tests {
             writer: PartialWriteFailure {
                 fail_at: prefix.len() + 4,
                 bytes: prefix.clone(),
+                cursor: prefix.len(),
             },
             bytes_written: record_offset,
         };
@@ -540,6 +564,28 @@ mod tests {
         writer.writer.fail_at = usize::MAX;
         writer.write_record(b"{\"seq\":3}\n")?;
         assert_eq!(writer.writer.bytes, b"{\"seq\":1}\n{\"seq\":3}\n");
+        Ok(())
+    }
+
+    #[test]
+    fn file_rollback_rewinds_before_a_reused_writer_appends() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("rollback");
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(path)?;
+        file.write_all(b"prefix-partial")?;
+
+        RecordFile::rollback_to(&mut file, 6)?;
+        file.write_all(b"-next")?;
+        file.seek(SeekFrom::Start(0))?;
+        let mut contents = Vec::new();
+        file.read_to_end(&mut contents)?;
+
+        assert_eq!(contents, b"prefix-next");
         Ok(())
     }
 
@@ -633,7 +679,7 @@ mod tests {
         let contents = fs::read_to_string(path)?;
         let retained: DiskLogRecord = serde_json::from_str(contents.trim())?;
 
-        assert!(matches!(retained.op, DiskLogOp::Append));
+        assert_matches!(retained.op, DiskLogOp::Append);
         assert_eq!(retained.line, "current frame");
         Ok(())
     }
@@ -668,10 +714,10 @@ mod tests {
             .map(serde_json::from_str::<DiskLogRecord>)
             .collect::<Result<Vec<_>, _>>()?;
 
-        assert!(matches!(
+        assert_matches!(
             records.get(1).map(|record| record.op),
             Some(DiskLogOp::Append)
-        ));
+        );
         assert_eq!(metadata.lock().line_count, 2);
         Ok(())
     }

@@ -38,8 +38,8 @@ pub use endpoint::{
 };
 pub use micromux::{DynamicServiceAck, ReconcileAction, ReconcileActionKind, ReconcileReceipt};
 pub use protocol::{
-    DynamicServicesCaps, ErrorCode, PROTOCOL_VERSION, ProtocolVersion, Request, Response,
-    ServiceBrief, SessionCapabilities, SessionInfo,
+    DiskLogReadHealth, DynamicServicesCaps, ErrorCode, PROTOCOL_VERSION, ProtocolVersion, Request,
+    Response, ServiceBrief, SessionCapabilities, SessionInfo,
 };
 pub use select::{
     AmbiguousSelection, ProbeReport, ResolvedSession, RuntimeDirDetail, SelectError,
@@ -155,6 +155,8 @@ where
 
 #[cfg(all(test, unix))]
 mod tests {
+    use std::assert_matches;
+
     use super::{ControlError, MAX_FRAME_BYTES, framed, write_message};
 
     #[tokio::test]
@@ -163,9 +165,9 @@ mod tests {
         let mut conn = framed(stream);
         let oversized = "x".repeat(MAX_FRAME_BYTES);
 
-        assert!(matches!(
+        assert_matches!(
             write_message(&mut conn, &oversized).await,
             Err(ControlError::FrameTooLarge)
-        ));
+        );
     }
 }

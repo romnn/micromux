@@ -301,18 +301,13 @@ fn read_consistent_segment<T>(
 ) -> Result<Option<T>, LogRunReadError> {
     let mut candidate_index = std::mem::take(index);
     for _ in 0..MAX_STABLE_SEGMENT_READ_ATTEMPTS {
-        let (segment_epoch, file, readable_len) = {
+        let (segment_epoch, readable_len) = {
             let metadata = disk_metadata.lock();
-            let Ok(file) = File::open(path) else {
-                *index = candidate_index;
-                return Ok(None);
-            };
-            let Ok(file_metadata) = file.metadata() else {
-                *index = candidate_index;
-                return Ok(None);
-            };
-            let readable_len = file_metadata.len();
-            (metadata.segment_epoch, file, readable_len)
+            (metadata.segment_epoch, metadata.readable_len)
+        };
+        let Ok(file) = File::open(path) else {
+            *index = candidate_index;
+            return Ok(None);
         };
         candidate_index.reset_for_segment(segment_epoch);
         let Some(value) = read(&mut candidate_index, file, readable_len) else {
@@ -321,10 +316,10 @@ fn read_consistent_segment<T>(
             return Ok(None);
         };
 
-        // The writer holds `disk_metadata` across `write_all`, so `readable_len` cannot land inside
-        // a concurrently successful record. Read only that prefix, then reject it if an in-place
-        // rotation changed its epoch. This keeps long reads off the writer lock without publishing
-        // a mixed segment or partial append.
+        // Writers publish `readable_len` only after a complete record reaches the file. Read that
+        // immutable prefix, then reject it if an in-place rotation changed its epoch. This keeps
+        // both the append syscall and long reads off the metadata lock without exposing partial
+        // records or mixed segments.
         let current_epoch = disk_metadata.lock().segment_epoch;
         if current_epoch == segment_epoch {
             *index = candidate_index;
@@ -428,7 +423,10 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("run.jsonl");
         fs::write(&path, b"xx")?;
-        let metadata = std::sync::Arc::new(Mutex::new(DiskRunMetadata::default()));
+        let metadata = std::sync::Arc::new(Mutex::new(DiskRunMetadata {
+            readable_len: 2,
+            ..DiskRunMetadata::default()
+        }));
         let mut index = RunLogReadIndex::default();
         let mut attempts = 0;
 
@@ -517,6 +515,7 @@ mod tests {
 
         let metadata = std::sync::Arc::new(Mutex::new(DiskRunMetadata {
             segment_epoch: 1,
+            readable_len: initial_len,
             line_count: 1,
             first_seq: Some(1),
             last_seq: Some(1),
@@ -529,9 +528,8 @@ mod tests {
             &metadata,
             |candidate, file, readable_len| {
                 assert_eq!(readable_len, initial_len);
-                // Recreate the writer's lock ordering while exposing half a record to the file.
+                // Expose half a record without publishing it as part of the readable prefix.
                 Some((|| -> eyre::Result<Vec<LogLine>> {
-                    let mut metadata = metadata.lock();
                     let mut append = OpenOptions::new().append(true).open(&path)?;
                     append.write_all(&second_encoded[..split])?;
                     append.flush()?;
@@ -549,6 +547,9 @@ mod tests {
 
                     append.write_all(&second_encoded[split..])?;
                     append.flush()?;
+                    let mut metadata = metadata.lock();
+                    metadata.readable_len = initial_len
+                        .saturating_add(u64::try_from(second_encoded.len()).unwrap_or(u64::MAX));
                     metadata.line_count = 2;
                     metadata.last_seq = Some(2);
                     Ok(lines)
@@ -622,6 +623,7 @@ mod tests {
         let path = dir.path().join("run.jsonl");
         let metadata = std::sync::Arc::new(Mutex::new(DiskRunMetadata {
             segment_epoch: 1,
+            readable_len: 0,
             line_count: 1,
             first_seq: Some(1),
             last_seq: Some(1),
@@ -636,6 +638,7 @@ mod tests {
         let mut file = File::create(&path)?;
         serde_json::to_writer(&mut file, &first)?;
         file.write_all(b"\n")?;
+        metadata.lock().readable_len = file.metadata()?.len();
         drop(file);
 
         let mut index = RunLogReadIndex::default();
@@ -652,10 +655,12 @@ mod tests {
         let mut file = File::create(&path)?;
         serde_json::to_writer(&mut file, &second)?;
         file.write_all(b"\n")?;
+        let rotated_len = file.metadata()?.len();
         drop(file);
         {
             let mut metadata = metadata.lock();
             metadata.segment_epoch = 2;
+            metadata.readable_len = rotated_len;
             metadata.first_seq = Some(2);
             metadata.last_seq = Some(2);
         }

@@ -38,6 +38,12 @@ pub(crate) use types::Event;
 pub use types::{Command, MAX_PTY_INPUT_BATCH_BYTES, MAX_PTY_PASTE_BYTES, OutputStream, ServiceID};
 pub(crate) use types::{LogUpdateKind, ProcessEvent, RunId, State};
 
+#[path = "scheduler/input.rs"]
+mod input;
+pub use input::{
+    PreparedPtyInput, PtyInputKind, PtyInputPrepareError, PtyInputSendError, TerminalControl,
+};
+
 #[path = "scheduler/control.rs"]
 mod control;
 pub(crate) use control::CommandAck;
@@ -947,6 +953,123 @@ impl SchedulerRuntime {
             .map_or(0, ServiceRuntime::run_generation);
         self.writer
             .append_event(service_id, service_event(generation, kind, detail));
+    }
+
+    fn running_pty(&self, service_id: &ServiceID) -> Result<&pty::PtyHandles, pty::PtyInputDrop> {
+        self.services
+            .get(service_id)
+            .and_then(|runtime| runtime.running.as_ref())
+            .map(|running| &running.pty)
+            .ok_or(pty::PtyInputDrop::WriterStopped)
+    }
+
+    fn report_input_drop(
+        &self,
+        service_id: &ServiceID,
+        input_kind: &str,
+        result: Result<(), pty::PtyInputDrop>,
+    ) {
+        if let Err(err) = result {
+            tracing::warn!(
+                service_id,
+                input_kind,
+                error = %err,
+                "terminal input was discarded before reaching the service"
+            );
+            self.append_event(
+                service_id,
+                ServiceEventKind::InputDropped,
+                format!("terminal {input_kind} discarded: {err}"),
+            );
+        }
+    }
+
+    async fn run(
+        &mut self,
+        services: &mut ServiceMap,
+        commands_rx: &mut mpsc::Receiver<Command>,
+        pty_input_rx: &mut mpsc::Receiver<PreparedPtyInput>,
+        events_rx: &mut mpsc::Receiver<ProcessEvent>,
+    ) {
+        tracing::debug!("started initial scheduling pass");
+        self.schedule_pass(services, events_rx).await;
+        tracing::debug!("completed initial scheduling pass");
+
+        let mut pty_input_closed = false;
+        loop {
+            tracing::debug!("waiting for scheduling event");
+            // Snapshot time-based work before selecting. Without explicit timer arms, restart
+            // backoffs, lease expiry, and capped reader drains would wait for an unrelated event.
+            let next_backoff = self.next_backoff();
+            let next_expiry = self.next_expiry();
+            let next_drain_deadline = self.next_drain_deadline();
+            let needs_schedule = tokio::select! {
+                () = self.shutdown.cancelled() => {
+                    tracing::debug!("exiting scheduler");
+                    break;
+                }
+                command = commands_rx.recv() => {
+                    let Some(command) = command else {
+                        break;
+                    };
+                    self.handle_command(services, events_rx, command).await
+                }
+                input = async {
+                    if pty_input_closed {
+                        std::future::pending().await
+                    } else {
+                        pty_input_rx.recv().await
+                    }
+                } => {
+                    let Some(input) = input else {
+                        pty_input_closed = true;
+                        continue;
+                    };
+                    let service_id = input.service_id().to_string();
+                    let input_kind = input.kind().as_str();
+                    let result = self
+                        .running_pty(&service_id)
+                        .and_then(|pty| pty.write_input(input));
+                    self.report_input_drop(&service_id, input_kind, result);
+                    false
+                }
+                event = events_rx.recv() => {
+                    let Some(event) = event else {
+                        break;
+                    };
+                    self.handle_event(services, &event)
+                }
+                () = async {
+                    match next_backoff {
+                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                } => true,
+                () = async {
+                    match next_expiry {
+                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                } => self.expire_due(services),
+                () = async {
+                    match next_drain_deadline {
+                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {
+                    self.cancel_due_drains();
+                    false
+                }
+            };
+
+            // Retirement can become evictable only after later process/log-reader events arrive,
+            // so enforce the bounded tombstone roster after every scheduler wake rather than only
+            // on insertion.
+            self.evict_retired(services);
+            if needs_schedule {
+                self.schedule_pass(services, events_rx).await;
+            }
+        }
     }
 
     fn require_dynamic_enabled(&self) -> Result<(), CommandRejection> {
@@ -2235,22 +2358,6 @@ impl SchedulerRuntime {
                 Self::reply_dynamic(ack, result);
                 true
             }
-            Command::SendInput(service_id, data) => {
-                if let Some(runtime) = self.services.get(&service_id)
-                    && let Some(running) = &runtime.running
-                {
-                    running.pty.write_input(&service_id, &data);
-                }
-                false
-            }
-            Command::SendPaste(service_id, data) => {
-                if let Some(runtime) = self.services.get(&service_id)
-                    && let Some(running) = &runtime.running
-                {
-                    running.pty.write_paste(&service_id, data);
-                }
-                false
-            }
             Command::ResizeAll { cols, rows } => {
                 self.current_pty_size = portable_pty::PtySize {
                     rows,
@@ -2472,6 +2579,7 @@ pub(crate) struct SchedulerInput {
     pub(crate) services: ServiceMap,
     pub(crate) reload_config: Option<ReloadConfig>,
     pub(crate) commands_rx: mpsc::Receiver<Command>,
+    pub(crate) pty_input_rx: mpsc::Receiver<PreparedPtyInput>,
     pub(crate) events_rx: mpsc::Receiver<ProcessEvent>,
     pub(crate) events_tx: mpsc::Sender<ProcessEvent>,
     #[cfg(test)]
@@ -2488,6 +2596,7 @@ pub(crate) async fn scheduler(input: SchedulerInput) -> Result<(), crate::graph:
         mut services,
         reload_config,
         mut commands_rx,
+        mut pty_input_rx,
         mut events_rx,
         events_tx,
         #[cfg(test)]
@@ -2522,67 +2631,13 @@ pub(crate) async fn scheduler(input: SchedulerInput) -> Result<(), crate::graph:
         },
     );
 
-    // Initial scheduling pass
-    tracing::debug!("started initial scheduling pass");
-    rt.schedule_pass(&mut services, &mut events_rx).await;
-    tracing::debug!("completed initial scheduling pass");
-
-    // Whenever an event comes in, try to (re)start any services whose deps are now healthy
-    loop {
-        tracing::debug!("waiting for scheduling event");
-        // Snapshot time-based work before selecting. Without explicit timer arms, restart
-        // backoffs, lease expiry, and capped reader drains would wait for an unrelated event.
-        let next_backoff = rt.next_backoff();
-        let next_expiry = rt.next_expiry();
-        let next_drain_deadline = rt.next_drain_deadline();
-        let needs_schedule = tokio::select! {
-            () = shutdown.cancelled() => {
-                tracing::debug!("exiting scheduler");
-                break;
-            }
-            command = commands_rx.recv() => {
-                let Some(command) = command else {
-                    break;
-                };
-                rt.handle_command(&mut services, &mut events_rx, command).await
-            }
-            event = events_rx.recv() => {
-                let Some(event) = event else {
-                    break;
-                };
-                rt.handle_event(&services, &event)
-            }
-            () = async {
-                match next_backoff {
-                    Some(deadline) => tokio::time::sleep_until(deadline).await,
-                    None => std::future::pending::<()>().await,
-                }
-            } => true,
-            () = async {
-                match next_expiry {
-                    Some(deadline) => tokio::time::sleep_until(deadline).await,
-                    None => std::future::pending::<()>().await,
-                }
-            } => rt.expire_due(&services),
-            () = async {
-                match next_drain_deadline {
-                    Some(deadline) => tokio::time::sleep_until(deadline).await,
-                    None => std::future::pending::<()>().await,
-                }
-            } => {
-                rt.cancel_due_drains();
-                false
-            }
-        };
-
-        // Retirement can become evictable only after later process/log-reader events arrive, so
-        // enforce the bounded tombstone roster after every scheduler wake rather than only on
-        // insertion.
-        rt.evict_retired(&mut services);
-        if needs_schedule {
-            rt.schedule_pass(&mut services, &mut events_rx).await;
-        }
-    }
+    rt.run(
+        &mut services,
+        &mut commands_rx,
+        &mut pty_input_rx,
+        &mut events_rx,
+    )
+    .await;
 
     rt.cancel_all_running();
     rt.drain_on_shutdown(&services, &mut events_rx).await;

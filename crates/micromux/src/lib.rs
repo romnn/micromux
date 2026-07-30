@@ -61,9 +61,10 @@ pub use model::{
 };
 pub use scheduler::{
     Command, CommandRejection, DynamicServiceAck, DynamicServiceResult, MAX_PTY_INPUT_BATCH_BYTES,
-    MAX_PTY_PASTE_BYTES, OutputStream, ReconcileAction, ReconcileActionKind, ReconcileReceipt,
-    ReconcileResult, SchedulerStopped, ServiceCommandAck, ServiceCommandResult, ServiceControl,
-    ServiceID,
+    MAX_PTY_PASTE_BYTES, OutputStream, PreparedPtyInput, PtyInputKind, PtyInputPrepareError,
+    PtyInputSendError, ReconcileAction, ReconcileActionKind, ReconcileReceipt, ReconcileResult,
+    SchedulerStopped, ServiceCommandAck, ServiceCommandResult, ServiceControl, ServiceID,
+    TerminalControl,
 };
 pub use service::{Error as ServiceError, RestartPolicy};
 pub use spec::{
@@ -296,14 +297,15 @@ pub struct Micromux {
 /// Capability handles returned by [`Micromux::start`].
 ///
 /// The model writer never escapes the core, so the only handles an adapter can hold are the read
-/// capability and a command sender. The policy-enforcing [`ServiceControl`] port (no input
-/// forwarding) is derived from [`Handles::service_control`] for untrusted adapters; the trusted
-/// in-process TUI keeps the full [`Handles::commands`] sender.
+/// capability and narrow command capabilities. The policy-enforcing [`ServiceControl`] port has no
+/// input forwarding; the trusted in-process TUI also receives [`Handles::terminal`].
 pub struct Handles {
     /// Read capability over the session model: query + `subscribe`.
     pub reader: SessionModelReader,
-    /// Full trusted in-process command sender for the TUI/CLI.
+    /// Full trusted in-process lifecycle command sender for the TUI/CLI.
     pub commands: mpsc::Sender<Command>,
+    /// Bounded PTY-input and resize capability for the in-process TUI.
+    pub terminal: TerminalControl,
     /// Dynamic-service limits latched when the session started.
     pub dynamic_services: DynamicServicesPolicy,
 }
@@ -312,7 +314,7 @@ impl Handles {
     /// A narrow, untrusted command port for adapters such as the control server and MCP.
     ///
     /// It exposes acknowledged lifecycle operations, including policy-checked dynamic-service
-    /// mutations, but cannot express `SendInput` or `ResizeAll`.
+    /// mutations, but cannot forward PTY input or resize terminals.
     #[must_use]
     pub fn service_control(&self) -> ServiceControl {
         ServiceControl::new(self.commands.clone())
@@ -393,9 +395,11 @@ impl Micromux {
     ) -> (impl Future<Output = Result<(), Error>> + 'static, Handles) {
         let (reader, writer) = model::new(initial_model_entries(&self.services));
         let (commands_tx, commands_rx) = mpsc::channel(1024);
+        let (terminal, pty_input_rx) = TerminalControl::channel(commands_tx.clone());
         let handles = Handles {
             reader,
             commands: commands_tx,
+            terminal,
             dynamic_services: self.dynamic_policy.clone(),
         };
 
@@ -407,6 +411,7 @@ impl Micromux {
                 services: self.services.clone(),
                 reload_config: self.reload_config.clone(),
                 commands_rx,
+                pty_input_rx,
                 events_rx,
                 events_tx,
                 #[cfg(test)]

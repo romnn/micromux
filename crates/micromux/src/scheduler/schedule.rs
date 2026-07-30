@@ -330,15 +330,15 @@ fn start_service_if_ready(
     }
     let sink = ctx.writer.run_sink(service_id, run_id.get());
 
-    let result = pty::start_service_with_pty_size(
+    let result = pty::start_service_with_pty_size(pty::StartServiceParams {
         service,
         run_id,
         sink,
-        ctx.events_tx,
-        ctx.shutdown,
-        &terminate,
-        ctx.current_pty_size,
-    );
+        events_tx: ctx.events_tx,
+        shutdown: ctx.shutdown,
+        terminate: &terminate,
+        pty_size: ctx.current_pty_size,
+    });
     finish_service_start(
         ctx,
         service_id,

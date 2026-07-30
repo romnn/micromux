@@ -3,8 +3,8 @@
 //! The server holds two model capabilities — a [`SessionModelReader`] (queries + `subscribe`) and a
 //! [`ServiceControl`] (mutations) — plus the session's shutdown token (passed to `serve`), which a
 //! `Request::Shutdown` cancels to stop the whole session. It has no model writer, so a request
-//! becomes a write only after the scheduler processes it, and no input port, so `SendInput`/
-//! `ResizeAll` are not expressible.
+//! becomes a write only after the scheduler processes it, and no terminal port, so PTY input and
+//! resize requests are not expressible.
 
 #[cfg(not(unix))]
 #[path = "server/unsupported.rs"]

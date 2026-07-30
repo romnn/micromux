@@ -730,7 +730,7 @@ impl App {
             status.session.name.bold(),
             format!(" ({})", status.session.config_path).into(),
         ]);
-        if let Some(notice) = self.runtime_notice.clone().or(status.notice) {
+        if let Some(notice) = status.notice.or_else(|| self.input_notice.clone()) {
             spans.extend([" — ".into(), notice.fg(tailwind::RED.c400)]);
         }
         Some(Line::from(spans).centered())
@@ -738,9 +738,9 @@ impl App {
 
     fn local_warning_header(&self) -> Option<Line<'static>> {
         let notice = self
-            .runtime_notice
-            .as_deref()
-            .or_else(|| self.source.local_notice())?;
+            .source
+            .local_notice()
+            .or(self.input_notice.as_deref())?;
         Some(
             Line::from(vec![
                 format!("micromux v{}", env!("CARGO_PKG_VERSION"))

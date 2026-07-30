@@ -22,10 +22,12 @@ async fn run_test_scheduler(
     shutdown: CancellationToken,
 ) -> Result<(), crate::GraphError> {
     let (_reader, writer) = crate::model::new(crate::initial_model_entries(services));
+    let (_pty_input_tx, pty_input_rx) = mpsc::channel(1);
     scheduler(SchedulerInput {
         services: services.clone(),
         reload_config: None,
         commands_rx,
+        pty_input_rx,
         events_rx,
         events_tx,
         test_events_tx: Some(test_events_tx),
@@ -43,9 +45,38 @@ struct Harness {
     reader: crate::model::SessionModelReader,
     control: ServiceControl,
     commands: mpsc::Sender<Command>,
+    terminal: TerminalControl,
     shutdown: CancellationToken,
     handle: tokio::task::JoinHandle<Result<(), crate::GraphError>>,
 }
+
+#[cfg(unix)]
+fn raise_test_file_descriptor_limit() {
+    use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
+
+    static RAISE: std::sync::Once = std::sync::Once::new();
+    RAISE.call_once(|| {
+        // The production binary raises this before starting the scheduler. Mirror that environment
+        // so concurrent PTY-heavy tests exercise supervision rather than the shell's soft limit.
+        const TARGET: u64 = 4096;
+        let current = getrlimit(Resource::Nofile);
+        let desired = current
+            .maximum
+            .map_or(TARGET, |maximum| TARGET.min(maximum));
+        if current.current.is_some_and(|limit| limit < desired) {
+            let _ = setrlimit(
+                Resource::Nofile,
+                Rlimit {
+                    current: Some(desired),
+                    maximum: current.maximum,
+                },
+            );
+        }
+    });
+}
+
+#[cfg(not(unix))]
+fn raise_test_file_descriptor_limit() {}
 
 fn spawn_harness(services: ServiceMap, reload_config: Option<ReloadConfig>) -> Harness {
     spawn_harness_with_policy(
@@ -62,10 +93,12 @@ fn spawn_harness_with_policy(
     config_dir: PathBuf,
     dynamic_policy: DynamicServicesPolicy,
 ) -> Harness {
+    raise_test_file_descriptor_limit();
     let (commands_tx, commands_rx) = mpsc::channel(64);
     let (events_tx, events_rx) = mpsc::channel(256);
     let (reader, writer) = crate::model::new(crate::initial_model_entries(&services));
     let control = ServiceControl::new(commands_tx.clone());
+    let (terminal, pty_input_rx) = TerminalControl::channel(commands_tx.clone());
     let shutdown = CancellationToken::new();
     let handle = tokio::spawn({
         let shutdown = shutdown.clone();
@@ -74,6 +107,7 @@ fn spawn_harness_with_policy(
                 services,
                 reload_config,
                 commands_rx,
+                pty_input_rx,
                 events_rx,
                 events_tx,
                 test_events_tx: None,
@@ -90,6 +124,7 @@ fn spawn_harness_with_policy(
         reader,
         control,
         commands: commands_tx,
+        terminal,
         shutdown,
         handle,
     }
@@ -3624,11 +3659,53 @@ async fn send_input_reaches_process() -> eyre::Result<()> {
         snapshot.execution == Execution::Running
     })
     .await?;
-    harness
-        .commands
-        .send(Command::SendInput("svc".to_string(), b"hello\r".to_vec()))
-        .await?;
+    let input = harness
+        .terminal
+        .prepare_input("svc".to_string(), b"hello\r".to_vec())?;
+    harness.terminal.try_send(input)?;
     wait_for_log(&harness.reader, "svc", "got:hello").await?;
+
+    harness.shutdown.cancel();
+    harness.handle.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn dropped_paste_emits_an_operator_visible_event() -> eyre::Result<()> {
+    let config_dir = Path::new(".");
+    let mut services = ServiceMap::new();
+    let mut config = service_config("svc", ("sh", &["-c", "sleep 60"]));
+    config.startup_mode = StartupMode::Disabled;
+    services.insert("svc".to_string(), Service::new("svc", config_dir, config)?);
+    let harness = spawn_harness(services, None);
+
+    let paste = harness
+        .terminal
+        .prepare_paste("svc".to_string(), vec![b'x'])?;
+    harness.terminal.try_send(paste)?;
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if harness
+                .reader
+                .events("svc", None, Some(1))
+                .0
+                .last()
+                .is_some_and(|event| event.kind == ServiceEventKind::InputDropped)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    assert!(
+        harness
+            .reader
+            .logs("svc", None)
+            .iter()
+            .any(|line| line.line.contains("terminal paste discarded"))
+    );
 
     harness.shutdown.cancel();
     harness.handle.await??;
@@ -3735,10 +3812,10 @@ async fn resize_all_changes_stty_size_for_new_service() -> eyre::Result<()> {
         })
         .await?;
     wait_for_log(&harness.reader, "app", "40 100").await?;
-    harness
-        .commands
-        .send(Command::SendInput("app".to_string(), b"go\r".to_vec()))
-        .await?;
+    let input = harness
+        .terminal
+        .prepare_input("app".to_string(), b"go\r".to_vec())?;
+    harness.terminal.try_send(input)?;
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {

@@ -1,16 +1,20 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, mpsc};
+use std::time::Duration;
 
-use crate::{ErrorCode, Response};
+use crate::{DiskLogReadHealth, ErrorCode, Response};
 
 const WORKER_COUNT: usize = 4;
 const QUEUE_CAPACITY: usize = 4;
+/// Disk-read deadline, leaving the connection timeout time to encode a typed busy response.
+const READ_TIMEOUT: Duration = Duration::from_secs(8);
 
 type Read = Box<dyn FnOnce() -> Response + Send + 'static>;
 
 struct Job {
     read: Read,
     response: tokio::sync::oneshot::Sender<Response>,
+    queue_permit: QueuePermit,
 }
 
 /// Keeps uncancellable filesystem reads off Tokio workers while bounding blocked threads and queued
@@ -24,16 +28,36 @@ struct BlockingLogReadPool {
     health: Arc<PoolHealth>,
     worker_count: usize,
     queue_capacity: usize,
+    read_timeout: Duration,
 }
 
 #[derive(Default)]
 struct PoolHealth {
     active: AtomicUsize,
     queued: AtomicUsize,
+    timed_out_requests: AtomicUsize,
+}
+
+struct QueuePermit {
+    health: Arc<PoolHealth>,
+}
+
+impl Drop for QueuePermit {
+    fn drop(&mut self) {
+        self.health.queued.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 impl BlockingLogReadPool {
     fn new(worker_count: usize, queue_capacity: usize) -> std::io::Result<Self> {
+        Self::with_timeout(worker_count, queue_capacity, READ_TIMEOUT)
+    }
+
+    fn with_timeout(
+        worker_count: usize,
+        queue_capacity: usize,
+        read_timeout: Duration,
+    ) -> std::io::Result<Self> {
         let (jobs, receiver) = mpsc::sync_channel::<Job>(queue_capacity);
         let receiver = Arc::new(Mutex::new(receiver));
         let health = Arc::new(PoolHealth::default());
@@ -49,50 +73,88 @@ impl BlockingLogReadPool {
             health,
             worker_count,
             queue_capacity,
+            read_timeout,
         })
     }
 
     async fn run(&self, read: impl FnOnce() -> Response + Send + 'static) -> Response {
         let (response, wait) = tokio::sync::oneshot::channel();
-        self.health.queued.fetch_add(1, Ordering::Relaxed);
+        let Some(queue_permit) = self.reserve_queue_slot() else {
+            return self.saturated_response();
+        };
         match self.jobs.try_send(Job {
             read: Box::new(read),
             response,
+            queue_permit,
         }) {
             Ok(()) => {}
-            Err(mpsc::TrySendError::Full(_)) => {
-                self.health.queued.fetch_sub(1, Ordering::Relaxed);
-                let (active, queued) = self.health();
-                tracing::warn!(
-                    active,
-                    queued,
-                    workers = self.worker_count,
-                    queue_capacity = self.queue_capacity,
-                    "disk log reader pool is saturated"
-                );
-                return Response::error(
-                    ErrorCode::LimitExceeded,
-                    format!(
-                        "the disk log reader is busy ({active}/{} workers active, {queued}/{} jobs \
-                         queued); retry the request",
-                        self.worker_count, self.queue_capacity
-                    ),
-                );
-            }
+            Err(mpsc::TrySendError::Full(_)) => return self.saturated_response(),
             Err(mpsc::TrySendError::Disconnected(_)) => {
-                self.health.queued.fetch_sub(1, Ordering::Relaxed);
                 return Response::error(ErrorCode::Internal, "the disk log reader is unavailable");
             }
         }
-        wait.await
-            .unwrap_or_else(|_| Response::error(ErrorCode::Internal, "the disk log reader stopped"))
+        match tokio::time::timeout(self.read_timeout, wait).await {
+            Ok(Ok(response)) => response,
+            Ok(Err(_)) => Response::error(
+                ErrorCode::Internal,
+                "the disk log reader stopped unexpectedly",
+            ),
+            Err(_) => {
+                self.health
+                    .timed_out_requests
+                    .fetch_add(1, Ordering::Relaxed);
+                Response::error(
+                    ErrorCode::Busy,
+                    format!(
+                        "the disk log read exceeded {:.1}s; retry the request",
+                        self.read_timeout.as_secs_f64()
+                    ),
+                )
+            }
+        }
     }
 
-    fn health(&self) -> (usize, usize) {
-        (
-            self.health.active.load(Ordering::Relaxed),
-            self.health.queued.load(Ordering::Relaxed),
+    fn reserve_queue_slot(&self) -> Option<QueuePermit> {
+        self.health
+            .queued
+            .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |queued| {
+                (queued < self.queue_capacity).then_some(queued + 1)
+            })
+            .ok()
+            .map(|_| QueuePermit {
+                health: Arc::clone(&self.health),
+            })
+    }
+
+    fn saturated_response(&self) -> Response {
+        let health = self.health();
+        tracing::warn!(
+            active = health.active,
+            queued = health.queued,
+            timed_out_requests = health.timed_out_requests,
+            workers = health.workers,
+            queue_capacity = health.queue_capacity,
+            "disk log reader pool is saturated"
+        );
+        Response::error(
+            ErrorCode::Busy,
+            format!(
+                "the disk log reader is busy ({}/{} workers active, {}/{} jobs queued); retry the \
+                 request",
+                health.active, health.workers, health.queued, health.queue_capacity
+            ),
         )
+    }
+
+    fn health(&self) -> DiskLogReadHealth {
+        DiskLogReadHealth {
+            available: true,
+            workers: self.worker_count,
+            active: self.health.active.load(Ordering::Relaxed),
+            queue_capacity: self.queue_capacity,
+            queued: self.health.queued.load(Ordering::Relaxed),
+            timed_out_requests: self.health.timed_out_requests.load(Ordering::Relaxed),
+        }
     }
 }
 
@@ -105,17 +167,22 @@ fn worker(receiver: &Mutex<mpsc::Receiver<Job>>, health: &PoolHealth) {
         let Ok(job) = job else {
             return;
         };
-        health.queued.fetch_sub(1, Ordering::Relaxed);
-        if job.response.is_closed() {
+        let Job {
+            read,
+            response,
+            queue_permit,
+        } = job;
+        drop(queue_permit);
+        if response.is_closed() {
             continue;
         }
         health.active.fetch_add(1, Ordering::Relaxed);
-        let response = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job.read))
-            .unwrap_or_else(|_| {
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(read)).unwrap_or_else(|_| {
                 Response::error(ErrorCode::Internal, "the disk log reader panicked")
             });
         health.active.fetch_sub(1, Ordering::Relaxed);
-        let _ = job.response.send(response);
+        let _ = response.send(result);
     }
 }
 
@@ -130,6 +197,13 @@ pub(super) async fn run(read: impl FnOnce() -> Response + Send + 'static) -> Res
             ErrorCode::Internal,
             format!("failed to start disk log readers: {err}"),
         ),
+    }
+}
+
+pub(super) fn health() -> DiskLogReadHealth {
+    match &*DISK_LOG_READS {
+        Ok(pool) => pool.health(),
+        Err(_) => DiskLogReadHealth::default(),
     }
 }
 
@@ -189,7 +263,7 @@ mod tests {
             async move { pool.run(|| Response::ShuttingDown).await }
         });
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            while pool.health() != (1, 1) {
+            while (pool.health().active, pool.health().queued) != (1, 1) {
                 tokio::task::yield_now().await;
             }
         })
@@ -200,7 +274,7 @@ mod tests {
         assert_matches!(
             rejected,
             Response::Error {
-                code: ErrorCode::LimitExceeded,
+                code: ErrorCode::Busy,
                 message,
             } if message.contains("1/1 workers active") && message.contains("1/1 jobs queued")
         );
@@ -241,7 +315,7 @@ mod tests {
             }
         });
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            while pool.health() != (1, 1) {
+            while (pool.health().active, pool.health().queued) != (1, 1) {
                 tokio::task::yield_now().await;
             }
         })
@@ -252,7 +326,7 @@ mod tests {
         release.send(())?;
         assert_matches!(first.await?, Response::ShuttingDown);
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            while pool.health() != (0, 0) {
+            while (pool.health().active, pool.health().queued) != (0, 0) {
                 tokio::task::yield_now().await;
             }
         })
@@ -266,6 +340,41 @@ mod tests {
 
         assert_matches!(response, Response::ShuttingDown);
         assert_eq!(stale_executions.load(Ordering::Relaxed), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stalled_read_times_out_without_replacing_its_worker() -> eyre::Result<()> {
+        let timeout = Duration::from_millis(30);
+        let pool = Arc::new(BlockingLogReadPool::with_timeout(1, 1, timeout)?);
+        let (started, started_rx) = mpsc::channel();
+        let (release, release_rx) = mpsc::channel();
+        let request = tokio::spawn({
+            let pool = Arc::clone(&pool);
+            async move {
+                pool.run(move || {
+                    let _ = started.send(());
+                    let _ = release_rx.recv();
+                    Response::ShuttingDown
+                })
+                .await
+            }
+        });
+        tokio::task::spawn_blocking(move || started_rx.recv()).await??;
+        let response = request.await?;
+
+        assert_matches!(
+            response,
+            Response::Error {
+                code: ErrorCode::Busy,
+                message,
+            } if message.contains("exceeded")
+        );
+        let health = pool.health();
+        assert_eq!(health.active, 1);
+        assert_eq!(health.workers, 1);
+        assert_eq!(health.timed_out_requests, 1);
+        release.send(())?;
         Ok(())
     }
 }

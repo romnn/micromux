@@ -489,6 +489,7 @@ impl ServiceEvent {
             | ServiceEventKind::BackoffScheduled
             | ServiceEventKind::DependencyBlocked
             | ServiceEventKind::DependencyReady
+            | ServiceEventKind::InputDropped
             | ServiceEventKind::Replaced
             | ServiceEventKind::Retired => Some(banner_line(&self.detail)),
             ServiceEventKind::ConfigReloaded
@@ -551,6 +552,8 @@ pub enum ServiceEventKind {
     DependencyBlocked,
     /// Previously blocking dependencies became ready.
     DependencyReady,
+    /// Terminal input was discarded before reaching the service.
+    InputDropped,
     /// A service was created or added to the live roster.
     Created,
     /// A dynamic service was replaced or revived.
@@ -1048,6 +1051,9 @@ impl SessionModelReader {
             Target::Disk(source) => {
                 self.inner.flush_disk();
                 let Some(lines) = ({
+                    // A run owns one mutable offset cache. Serializing its readers prevents an
+                    // older scan from overwriting a newer cursor; different runs remain
+                    // independent.
                     let mut index = source.index.lock();
                     read_run_log_file(
                         &source.path,

@@ -8,6 +8,10 @@ pub(crate) enum Error {
 
 /// Attach a process to a kill-on-close job so dropping the job terminates remaining descendants.
 ///
+/// Assignment contains descendants created afterward. `portable-pty` exposes the process only
+/// after `CreateProcessW` has resumed it, so a descendant created before this call can escape the
+/// job; closing that window requires a suspended-spawn API from the PTY backend.
+///
 /// # Errors
 ///
 /// Returns an error when the job cannot be created or the process cannot be assigned to it.
