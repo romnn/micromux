@@ -17,9 +17,13 @@ mod log_reads;
 
 use super::ControlServer;
 use crate::endpoint::{CanonicalConfigPath, ControlEndpoint, project_lock_path};
-use crate::protocol::{ErrorCode, PROTOCOL_VERSION, Request, Response, ServiceBrief, SessionInfo};
+use crate::protocol::{
+    ErrorCode, PROTOCOL_VERSION, Request, Response, ServiceBrief, SessionInfo,
+    supports_versioned_subscriptions,
+};
 use crate::{
-    ControlError, Framing, IDLE_TIMEOUT, REQUEST_TIMEOUT, framed, read_message, write_message,
+    ControlError, Framing, IDLE_TIMEOUT, REQUEST_TIMEOUT, SUBSCRIPTION_HEARTBEAT_INTERVAL, framed,
+    read_message, write_message,
 };
 
 /// Default number of recent log lines returned when a client does not specify `tail`.
@@ -42,6 +46,10 @@ const LAG_REPLAY_SERVICE_KINDS: [ChangeKind; 4] = [
 const RESPONSE_MAX_BYTES: usize = 512 * 1024;
 /// Maximum number of clients served concurrently by one session.
 const MAX_CONNECTIONS: usize = 64;
+/// Complete frames a subscription peer may send before the server treats it as abusive.
+const MAX_UNSOLICITED_SUBSCRIPTION_FRAMES: usize = 32;
+/// A stalled subscriber must release its connection permit promptly.
+const SUBSCRIPTION_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 /// A bound control endpoint plus the lifetime ownership lock. Dropping it unlinks the socket while
 /// the lock is still held, so a successor (which cannot acquire the lock until this process exits)
 /// never has its fresh socket removed.
@@ -222,9 +230,18 @@ where
             Ok(Ok(None)) | Err(_) => return,
         };
 
-        if matches!(request, Request::Subscribe) {
-            stream_changes(&server, conn, shutdown).await;
-            return;
+        match request {
+            Request::Subscribe => {
+                stream_changes(&server, conn, shutdown, None).await;
+                return;
+            }
+            Request::SubscribeWithVersion { protocol_version } => {
+                let heartbeat = supports_versioned_subscriptions(protocol_version)
+                    .then_some(SUBSCRIPTION_HEARTBEAT_INTERVAL);
+                stream_changes(&server, conn, shutdown, heartbeat).await;
+                return;
+            }
+            _ => {}
         }
 
         if matches!(request, Request::Shutdown) {
@@ -311,18 +328,11 @@ fn bounded_description(info: &SessionInfo) -> Option<SessionInfo> {
         .then_some(info)
 }
 
-async fn stream_changes<S>(server: &ControlServer, conn: Framing<S>, shutdown: CancellationToken)
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send,
-{
-    stream_changes_with_heartbeat(server, conn, shutdown, IDLE_TIMEOUT).await;
-}
-
-async fn stream_changes_with_heartbeat<S>(
+async fn stream_changes<S>(
     server: &ControlServer,
     conn: Framing<S>,
     shutdown: CancellationToken,
-    heartbeat_interval: std::time::Duration,
+    heartbeat_interval: Option<std::time::Duration>,
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
@@ -330,12 +340,17 @@ async fn stream_changes_with_heartbeat<S>(
 
     let (mut sink, mut stream) = conn.split();
     let mut changes = server.reader.subscribe();
-    let heartbeat = tokio::time::sleep(heartbeat_interval);
-    tokio::pin!(heartbeat);
+    let mut heartbeat = heartbeat_interval.map(|interval| Box::pin(tokio::time::sleep(interval)));
+    let mut unsolicited_frames = 0usize;
     'stream: loop {
         tokio::select! {
             () = shutdown.cancelled() => break,
-            () = &mut heartbeat => {
+            () = async {
+                match heartbeat.as_mut() {
+                    Some(timer) => timer.as_mut().await,
+                    None => std::future::pending().await,
+                }
+            } => {
                 let change = SessionChange {
                     service_id: SessionChange::SESSION_WIDE.to_string(),
                     kind: ChangeKind::Heartbeat,
@@ -343,7 +358,11 @@ async fn stream_changes_with_heartbeat<S>(
                 if !send_stream_change(&mut sink, change, &shutdown).await {
                     break;
                 }
-                heartbeat.as_mut().reset(tokio::time::Instant::now() + heartbeat_interval);
+                if let (Some(timer), Some(interval)) =
+                    (heartbeat.as_mut(), heartbeat_interval)
+                {
+                    timer.as_mut().reset(tokio::time::Instant::now() + interval);
+                }
             }
             incoming = stream.next() => {
                 match incoming {
@@ -351,7 +370,12 @@ async fn stream_changes_with_heartbeat<S>(
                     // Subscription clients have no request/response exchange after subscribing.
                     // Ignore complete frames so a forward-compatible keepalive cannot tear down
                     // an otherwise healthy stream.
-                    Some(Ok(_)) => {}
+                    Some(Ok(_)) => {
+                        unsolicited_frames = unsolicited_frames.saturating_add(1);
+                        if unsolicited_frames > MAX_UNSOLICITED_SUBSCRIPTION_FRAMES {
+                            break;
+                        }
+                    }
                 }
             }
             change = changes.recv() => {
@@ -360,7 +384,11 @@ async fn stream_changes_with_heartbeat<S>(
                         if !send_stream_change(&mut sink, change, &shutdown).await {
                             break;
                         }
-                        heartbeat.as_mut().reset(tokio::time::Instant::now() + heartbeat_interval);
+                        if let (Some(timer), Some(interval)) =
+                            (heartbeat.as_mut(), heartbeat_interval)
+                        {
+                            timer.as_mut().reset(tokio::time::Instant::now() + interval);
+                        }
                     }
                     Err(RecvError::Lagged(_)) => {
                         let snapshots = server.reader.services();
@@ -369,7 +397,11 @@ async fn stream_changes_with_heartbeat<S>(
                                 break 'stream;
                             }
                         }
-                        heartbeat.as_mut().reset(tokio::time::Instant::now() + heartbeat_interval);
+                        if let (Some(timer), Some(interval)) =
+                            (heartbeat.as_mut(), heartbeat_interval)
+                        {
+                            timer.as_mut().reset(tokio::time::Instant::now() + interval);
+                        }
                     }
                     Err(RecvError::Closed) => break,
                 }
@@ -391,7 +423,7 @@ where
     };
     tokio::select! {
         () = shutdown.cancelled() => false,
-        result = tokio::time::timeout(REQUEST_TIMEOUT, sink.send(line)) => {
+        result = tokio::time::timeout(SUBSCRIPTION_WRITE_TIMEOUT, sink.send(line)) => {
             matches!(result, Ok(Ok(())))
         }
     }
@@ -505,7 +537,7 @@ async fn dispatch(server: &ControlServer, request: Request) -> Response {
         }
         Request::ReconcileConfig { dry_run } => reconcile(server, dry_run).await,
         // Subscribe is intercepted before dispatch; reaching here is a protocol misuse.
-        Request::Subscribe => Response::error(
+        Request::Subscribe | Request::SubscribeWithVersion { .. } => Response::error(
             ErrorCode::BadRequest,
             "subscribe must be the only request on a connection",
         ),
@@ -562,8 +594,12 @@ fn get_logs(
     let mut truncated = false;
     let mut lines = match run_generation {
         Some(run_generation) => {
-            let Some(run) = reader.run_log(service, run_generation, Some(tail)) else {
-                return unknown_run(service, run_generation);
+            let run = match reader.try_run_log(service, run_generation, Some(tail)) {
+                Ok(Some(run)) => run,
+                Ok(None) => return unknown_run(service, run_generation),
+                Err(err) => {
+                    return Response::error(ErrorCode::LimitExceeded, err.to_string());
+                }
             };
             run.lines
         }
@@ -601,10 +637,17 @@ fn follow_logs(
     // is omitted — keeping the oldest contiguous page, so a run longer than MAX_LOG_TAIL is fully
     // reachable by following `next_seq` rather than being pinned to its tail.
     if let Some(run_generation) = run_generation {
-        let Some(run) =
-            reader.run_log_after(service, run_generation, after, Some(MAX_LOG_TAIL + 1))
-        else {
-            return unknown_run(service, run_generation);
+        let run = match reader.try_run_log_after(
+            service,
+            run_generation,
+            after,
+            Some(MAX_LOG_TAIL + 1),
+        ) {
+            Ok(Some(run)) => run,
+            Ok(None) => return unknown_run(service, run_generation),
+            Err(err) => {
+                return Response::error(ErrorCode::LimitExceeded, err.to_string());
+            }
         };
         let mut lines = run.lines;
         if let Some(cursor) = after {
@@ -979,6 +1022,8 @@ fn acknowledge_reconcile(result: Result<micromux::ReconcileResult, SchedulerStop
 
 #[cfg(test)]
 mod tests {
+    use std::assert_matches;
+
     use color_eyre::eyre;
     use micromux::{
         ChangeKind, HealthAttempt, HealthLine, LogLine, OutputStream, RestartPolicy,
@@ -992,10 +1037,10 @@ mod tests {
     };
 
     use super::{
-        MAX_LOG_TAIL, RESPONSE_MAX_BYTES, bind_project, bound_follow_response_lines,
-        bound_follow_response_lines_page, bound_health_history, bound_tail_response_lines,
-        encoded_len, health_attempt_bytes, lag_replay_changes, logs_fit, project_lock_path,
-        response_within_frame, stream_changes_with_heartbeat,
+        MAX_LOG_TAIL, MAX_UNSOLICITED_SUBSCRIPTION_FRAMES, RESPONSE_MAX_BYTES, bind_project,
+        bound_follow_response_lines, bound_follow_response_lines_page, bound_health_history,
+        bound_tail_response_lines, encoded_len, health_attempt_bytes, lag_replay_changes, logs_fit,
+        project_lock_path, response_within_frame, stream_changes,
     };
 
     fn line(seq: u64, len: usize) -> LogLine {
@@ -1229,8 +1274,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn subscription_ignores_client_frames_and_stays_open_until_shutdown() -> eyre::Result<()>
-    {
+    async fn subscription_heartbeats_and_bounds_unsolicited_client_frames() -> eyre::Result<()> {
         use std::sync::Arc;
         use std::time::Duration;
 
@@ -1252,15 +1296,16 @@ mod tests {
         ));
         let (server_io, client_io) = tokio::io::duplex(4096);
         let shutdown = micromux::CancellationToken::new();
+        let heartbeat_interval = Duration::from_millis(100);
         let task = tokio::spawn({
             let server = Arc::clone(&server);
             let shutdown = shutdown.clone();
             async move {
-                stream_changes_with_heartbeat(
+                stream_changes(
                     &server,
                     crate::framed(server_io),
                     shutdown,
-                    Duration::from_millis(10),
+                    Some(heartbeat_interval),
                 )
                 .await;
             }
@@ -1274,17 +1319,64 @@ mod tests {
         )
         .await??
         .ok_or_else(|| eyre::eyre!("subscription closed before its heartbeat"))?;
-        assert!(matches!(
+        assert_matches!(
             response,
             Response::Change(SessionChange {
                 service_id,
                 kind: ChangeKind::Heartbeat,
             }) if service_id == SessionChange::SESSION_WIDE
-        ));
+        );
         assert!(!task.is_finished());
 
-        shutdown.cancel();
+        // A heartbeat must not replenish the lifetime allowance for unsolicited client frames.
+        let first_batch = MAX_UNSOLICITED_SUBSCRIPTION_FRAMES / 2;
+        for _ in 0..first_batch {
+            crate::write_message(&mut client, &Request::Describe).await?;
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let response = tokio::time::timeout(
+            Duration::from_secs(1),
+            crate::read_message::<_, Response>(&mut client),
+        )
+        .await??
+        .ok_or_else(|| eyre::eyre!("subscription closed before its second heartbeat"))?;
+        assert_matches!(
+            response,
+            Response::Change(SessionChange {
+                kind: ChangeKind::Heartbeat,
+                ..
+            })
+        );
+
+        let mut sent_frames = first_batch;
+        for _ in first_batch..=MAX_UNSOLICITED_SUBSCRIPTION_FRAMES {
+            match crate::write_message(&mut client, &Request::Describe).await {
+                Ok(()) => sent_frames = sent_frames.saturating_add(1),
+                // The peer may observe the close while its first over-budget frame is in flight.
+                Err(_) if sent_frames >= MAX_UNSOLICITED_SUBSCRIPTION_FRAMES => break,
+                Err(err) => return Err(err.into()),
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
         tokio::time::timeout(Duration::from_secs(1), task).await??;
+
+        let (server_io, client_io) = tokio::io::duplex(4096);
+        let legacy_task = tokio::spawn({
+            let server = Arc::clone(&server);
+            let shutdown = shutdown.clone();
+            async move {
+                stream_changes(&server, crate::framed(server_io), shutdown, None).await;
+            }
+        });
+        let mut legacy_client = crate::framed(client_io);
+        let legacy_read = tokio::time::timeout(
+            Duration::from_millis(30),
+            crate::read_message::<_, Response>(&mut legacy_client),
+        )
+        .await;
+        assert_matches!(legacy_read, Err(_));
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(1), legacy_task).await??;
         Ok(())
     }
 

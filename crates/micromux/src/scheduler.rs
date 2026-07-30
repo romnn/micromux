@@ -35,7 +35,7 @@ const IDEMPOTENCY_WINDOW: usize = 64;
 mod types;
 #[cfg(test)]
 pub(crate) use types::Event;
-pub use types::{Command, MAX_PTY_INPUT_BATCH_BYTES, OutputStream, ServiceID};
+pub use types::{Command, MAX_PTY_INPUT_BATCH_BYTES, MAX_PTY_PASTE_BYTES, OutputStream, ServiceID};
 pub(crate) use types::{LogUpdateKind, ProcessEvent, RunId, State};
 
 #[path = "scheduler/control.rs"]
@@ -2053,6 +2053,8 @@ impl SchedulerRuntime {
                 "the service is disabled; enable it before restarting".to_string(),
             ));
         }
+        // `DynamicServicesPolicy` is session-latched, so config reload cannot narrow a dynamic
+        // service's accepted working roots between its creation and a later restart.
         self.reload_services(services, events_rx).await?;
         let runtime = self
             .services
@@ -2238,6 +2240,14 @@ impl SchedulerRuntime {
                     && let Some(running) = &runtime.running
                 {
                     running.pty.write_input(&service_id, &data);
+                }
+                false
+            }
+            Command::SendPaste(service_id, data) => {
+                if let Some(runtime) = self.services.get(&service_id)
+                    && let Some(running) = &runtime.running
+                {
+                    running.pty.write_paste(&service_id, data);
                 }
                 false
             }

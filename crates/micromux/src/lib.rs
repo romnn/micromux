@@ -55,14 +55,15 @@ pub use health_check::Health;
 pub use model::{
     ChangeKind, Desired, DiskLogRetention, DynamicServiceInfo, EVENT_HISTORY, Execution,
     HealthAttempt, HealthLine, HealthResult, HealthcheckConfig, LogLimit, LogLine, LogRetention,
-    LogRun, LogRunSummary, MemoryLogRetention, OriginKind, RestartState, RetiredReason,
-    ServiceEvent, ServiceEventKind, ServiceSnapshot, SessionChange, SessionModelReader,
-    trim_to_last_bytes,
+    LogRun, LogRunReadError, LogRunSummary, MemoryLogRetention, OriginKind, RestartState,
+    RetiredReason, ServiceEvent, ServiceEventKind, ServiceSnapshot, SessionChange,
+    SessionModelReader, trim_to_last_bytes,
 };
 pub use scheduler::{
     Command, CommandRejection, DynamicServiceAck, DynamicServiceResult, MAX_PTY_INPUT_BATCH_BYTES,
-    OutputStream, ReconcileAction, ReconcileActionKind, ReconcileReceipt, ReconcileResult,
-    SchedulerStopped, ServiceCommandAck, ServiceCommandResult, ServiceControl, ServiceID,
+    MAX_PTY_PASTE_BYTES, OutputStream, ReconcileAction, ReconcileActionKind, ReconcileReceipt,
+    ReconcileResult, SchedulerStopped, ServiceCommandAck, ServiceCommandResult, ServiceControl,
+    ServiceID,
 };
 pub use service::{Error as ServiceError, RestartPolicy};
 pub use spec::{

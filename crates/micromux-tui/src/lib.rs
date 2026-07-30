@@ -24,7 +24,7 @@ pub use remote::RemoteSource;
 pub use source::{LocalSource, SessionSource};
 
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
-const PENDING_PTY_INPUT_MAX_BYTES: usize = 1024 * 1024;
+const PENDING_PTY_INPUT_MAX_BYTES: usize = micromux::MAX_PTY_PASTE_BYTES;
 const PENDING_PTY_INPUT_RETRY: Duration = Duration::from_millis(5);
 
 /// Errors from running or rendering the terminal interface.
@@ -43,8 +43,9 @@ pub struct App {
     /// Running state of the TUI application.
     running: bool,
     input: Option<mpsc::Sender<Command>>,
-    pending_pty_input: VecDeque<(String, Vec<u8>)>,
+    pending_pty_input: VecDeque<PendingPtyInput>,
     pending_pty_input_bytes: usize,
+    runtime_notice: Option<String>,
     shutdown: micromux::CancellationToken,
     /// Synchronous session data and lifecycle commands.
     source: SessionSource,
@@ -77,6 +78,26 @@ enum Focus {
     Healthcheck,
 }
 
+enum PendingPtyInput {
+    Input { service_id: String, data: Vec<u8> },
+    Paste { service_id: String, data: Vec<u8> },
+}
+
+impl PendingPtyInput {
+    fn len(&self) -> usize {
+        match self {
+            Self::Input { data, .. } | Self::Paste { data, .. } => data.len(),
+        }
+    }
+
+    fn into_command(self) -> Command {
+        match self {
+            Self::Input { service_id, data } => Command::SendInput(service_id, data),
+            Self::Paste { service_id, data } => Command::SendPaste(service_id, data),
+        }
+    }
+}
+
 impl App {
     /// Construct a new [`App`] over a synchronous session source.
     #[must_use]
@@ -99,6 +120,7 @@ impl App {
             input,
             pending_pty_input: VecDeque::new(),
             pending_pty_input_bytes: 0,
+            runtime_notice: None,
             shutdown,
             source,
             changes,
@@ -188,6 +210,10 @@ impl App {
     }
 
     fn enqueue_pty_input(&mut self, service_id: String, bytes: Vec<u8>) {
+        debug_assert!(
+            bytes.len() <= micromux::MAX_PTY_INPUT_BATCH_BYTES,
+            "keystroke input must fit one PTY batch"
+        );
         let Some(input) = self.input.clone() else {
             return;
         };
@@ -213,27 +239,33 @@ impl App {
         if bytes.is_empty() {
             return;
         }
+        if bytes.len() > micromux::MAX_PTY_PASTE_BYTES {
+            self.runtime_notice = Some(format!(
+                "paste discarded: input exceeds the {} MiB limit",
+                micromux::MAX_PTY_PASTE_BYTES / (1024 * 1024)
+            ));
+            tracing::warn!(
+                input_bytes = bytes.len(),
+                paste_limit_bytes = micromux::MAX_PTY_PASTE_BYTES,
+                "PTY paste exceeds the input limit; discarding it"
+            );
+            return;
+        }
         let Some(input) = self.input.clone() else {
             return;
         };
-        let chunk_count = bytes.len().div_ceil(micromux::MAX_PTY_INPUT_BATCH_BYTES);
         if self.pending_pty_input.is_empty() {
-            match input.try_reserve_many(chunk_count) {
-                Ok(permits) => {
-                    for (permit, chunk) in permits.zip(
-                        bytes
-                            .chunks(micromux::MAX_PTY_INPUT_BATCH_BYTES)
-                            .map(<[u8]>::to_vec),
-                    ) {
-                        permit.send(Command::SendInput(service_id.to_string(), chunk));
-                    }
-                    return;
-                }
-                Err(mpsc::error::TrySendError::Closed(())) => {
+            match input.try_send(Command::SendPaste(service_id.to_string(), bytes.to_vec())) {
+                Ok(()) => return,
+                Err(mpsc::error::TrySendError::Closed(_)) => {
                     tracing::warn!("PTY input channel closed; discarding pasted terminal input");
                     return;
                 }
-                Err(mpsc::error::TrySendError::Full(())) => {}
+                Err(mpsc::error::TrySendError::Full(Command::SendPaste(_, _))) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    tracing::warn!("unexpected command returned from PTY paste queue");
+                    return;
+                }
             }
         }
         self.push_pending_pty_paste(service_id, bytes);
@@ -248,11 +280,26 @@ impl App {
             return;
         }
         self.pending_pty_input_bytes = self.pending_pty_input_bytes.saturating_add(bytes.len());
-        self.push_pending_pty_batch(service_id, bytes);
+        if let Some(PendingPtyInput::Input {
+            service_id: queued_service,
+            data: queued,
+        }) = self.pending_pty_input.back_mut()
+            && queued_service == &service_id
+            && queued.len().saturating_add(bytes.len()) <= micromux::MAX_PTY_INPUT_BATCH_BYTES
+        {
+            queued.extend(bytes);
+        } else {
+            self.pending_pty_input.push_back(PendingPtyInput::Input {
+                service_id,
+                data: bytes,
+            });
+        }
     }
 
     fn push_pending_pty_paste(&mut self, service_id: &str, bytes: &[u8]) {
         if self.pending_pty_input_bytes.saturating_add(bytes.len()) > PENDING_PTY_INPUT_MAX_BYTES {
+            self.runtime_notice =
+                Some("paste discarded: terminal input backlog is full".to_string());
             tracing::warn!(
                 queue_limit_bytes = PENDING_PTY_INPUT_MAX_BYTES,
                 "PTY input backlog cannot hold the complete paste; discarding it atomically"
@@ -260,20 +307,10 @@ impl App {
             return;
         }
         self.pending_pty_input_bytes = self.pending_pty_input_bytes.saturating_add(bytes.len());
-        for chunk in bytes.chunks(micromux::MAX_PTY_INPUT_BATCH_BYTES) {
-            self.push_pending_pty_batch(service_id.to_string(), chunk.to_vec());
-        }
-    }
-
-    fn push_pending_pty_batch(&mut self, service_id: String, bytes: Vec<u8>) {
-        if let Some((queued_service, queued)) = self.pending_pty_input.back_mut()
-            && queued_service == &service_id
-            && queued.len().saturating_add(bytes.len()) <= micromux::MAX_PTY_INPUT_BATCH_BYTES
-        {
-            queued.extend(bytes);
-        } else {
-            self.pending_pty_input.push_back((service_id, bytes));
-        }
+        self.pending_pty_input.push_back(PendingPtyInput::Paste {
+            service_id: service_id.to_string(),
+            data: bytes.to_vec(),
+        });
     }
 
     fn flush_pending_pty_input(&mut self) {
@@ -282,15 +319,21 @@ impl App {
             self.pending_pty_input_bytes = 0;
             return;
         };
-        while let Some((service_id, bytes)) = self.pending_pty_input.pop_front() {
-            let bytes_len = bytes.len();
-            match input.try_send(Command::SendInput(service_id, bytes)) {
+        while let Some(pending) = self.pending_pty_input.pop_front() {
+            let bytes_len = pending.len();
+            match input.try_send(pending.into_command()) {
                 Ok(()) => {
                     self.pending_pty_input_bytes =
                         self.pending_pty_input_bytes.saturating_sub(bytes_len);
                 }
-                Err(mpsc::error::TrySendError::Full(Command::SendInput(service_id, bytes))) => {
-                    self.pending_pty_input.push_front((service_id, bytes));
+                Err(mpsc::error::TrySendError::Full(Command::SendInput(service_id, data))) => {
+                    self.pending_pty_input
+                        .push_front(PendingPtyInput::Input { service_id, data });
+                    break;
+                }
+                Err(mpsc::error::TrySendError::Full(Command::SendPaste(service_id, data))) => {
+                    self.pending_pty_input
+                        .push_front(PendingPtyInput::Paste { service_id, data });
                     break;
                 }
                 Err(mpsc::error::TrySendError::Closed(_)) => {
@@ -497,6 +540,8 @@ impl App {
     fn handle_key_press(&mut self, key: crossterm::event::KeyEvent) {
         use crossterm::event::{KeyCode, KeyModifiers};
 
+        // PTY mode forwards Ctrl-C to the selected process; command mode reserves the same chord
+        // for leaving the TUI.
         if self.pty_input_mode {
             self.handle_key_press_pty_input_mode(key);
             return;
@@ -683,7 +728,7 @@ impl App {
         };
         // Wrap-aware count persisted by the renderer, so scrolling reaches the true bottom
         // even when wrapping is enabled (the raw entry count would stop short).
-        let num_lines = service.cached_wrapped_lines;
+        let num_lines = service.cached_line_index.total_lines();
         let viewport = usize::from(self.log_viewport_height());
         let max_off = num_lines.saturating_sub(viewport);
         self.log_view.scroll_offset = self
@@ -706,7 +751,7 @@ impl App {
         let Some(service) = self.state.current_service() else {
             return;
         };
-        let num_lines = service.healthcheck_cached_num_lines;
+        let num_lines = service.healthcheck_cached_line_index.total_lines();
         let viewport = usize::from(self.log_viewport_height());
         let max_off = num_lines.saturating_sub(viewport);
         self.healthcheck_view.scroll_offset = self
@@ -832,6 +877,9 @@ fn key_event_to_bytes(
 
 #[cfg(test)]
 mod tests {
+    use std::assert_matches;
+    use std::path::Path;
+
     use super::*;
     use codespan_reporting::diagnostic::Diagnostic;
     use color_eyre::eyre;
@@ -839,7 +887,6 @@ mod tests {
     use indoc::indoc;
     use ratatui::widgets::Widget as _;
     use similar_asserts::assert_eq;
-    use std::path::Path;
     use tokio::sync::mpsc;
 
     fn tab_press() -> crate::event::Input {
@@ -1071,7 +1118,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bracketed_paste_is_inert_in_command_mode_and_chunked_in_input_mode() -> eyre::Result<()>
+    async fn bracketed_paste_is_inert_in_command_mode_and_atomic_in_input_mode() -> eyre::Result<()>
     {
         let yaml = "version: 1\nservices:\n  svc:\n    command: [\"true\"]\n";
         let mut diagnostics: Vec<Diagnostic<usize>> = Vec::new();
@@ -1089,32 +1136,26 @@ mod tests {
 
         app.handle_crossterm_event(&crossterm::event::Event::Paste("Rq".to_string()));
         assert!(app.running);
-        assert!(matches!(
+        assert_matches!(
             commands_rx.try_recv(),
             Err(mpsc::error::TryRecvError::Empty)
-        ));
+        );
 
         app.pty_input_mode = true;
         let paste = "x".repeat(micromux::MAX_PTY_INPUT_BATCH_BYTES + 17);
         app.handle_crossterm_event(&crossterm::event::Event::Paste(paste.clone()));
-        let mut delivered = Vec::new();
-        for expected_len in [micromux::MAX_PTY_INPUT_BATCH_BYTES, 17] {
-            match commands_rx.try_recv()? {
-                Command::SendInput(service, bytes) => {
-                    assert_eq!(service, "svc");
-                    assert_eq!(bytes.len(), expected_len);
-                    delivered.extend(bytes);
-                }
-                other => eyre::bail!("expected a pasted PTY input batch, got {other:?}"),
+        match commands_rx.try_recv()? {
+            Command::SendPaste(service, bytes) => {
+                assert_eq!(service, "svc");
+                assert_eq!(bytes, paste.as_bytes());
             }
+            other => eyre::bail!("expected one logical PTY paste, got {other:?}"),
         }
-        assert_eq!(delivered, paste.as_bytes());
         Ok(())
     }
 
     #[tokio::test]
-    async fn bracketed_paste_backlogs_every_chunk_when_the_command_channel_is_full()
-    -> eyre::Result<()> {
+    async fn bracketed_paste_stays_atomic_when_the_command_channel_is_full() -> eyre::Result<()> {
         let yaml = "version: 1\nservices:\n  svc:\n    command: [\"true\"]\n";
         let mut diagnostics: Vec<Diagnostic<usize>> = Vec::new();
         let parsed = micromux::from_str(yaml, Path::new("."), 0, None, &mut diagnostics)
@@ -1134,21 +1175,67 @@ mod tests {
         app.enqueue_pty_paste("svc", &paste);
 
         assert_eq!(app.pending_pty_input_bytes, paste.len());
-        assert_eq!(app.pending_pty_input.len(), 2);
+        assert_eq!(app.pending_pty_input.len(), 1);
         let _ = commands_rx.try_recv()?;
-        let mut delivered = Vec::new();
-        while !app.pending_pty_input.is_empty() {
-            app.flush_pending_pty_input();
-            match commands_rx.try_recv()? {
-                Command::SendInput(service, bytes) => {
-                    assert_eq!(service, "svc");
-                    delivered.extend(bytes);
-                }
-                other => eyre::bail!("expected a pasted PTY input batch, got {other:?}"),
+        app.flush_pending_pty_input();
+        match commands_rx.try_recv()? {
+            Command::SendPaste(service, bytes) => {
+                assert_eq!(service, "svc");
+                assert_eq!(bytes, paste);
             }
+            other => eyre::bail!("expected one queued PTY paste, got {other:?}"),
         }
-        assert_eq!(delivered, paste);
         assert_eq!(app.pending_pty_input_bytes, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn oversized_paste_is_discarded_with_an_operator_notice() -> eyre::Result<()> {
+        let yaml = "version: 1\nservices:\n  svc:\n    command: [\"true\"]\n";
+        let mut diagnostics = Vec::new();
+        let parsed = micromux::from_str(yaml, Path::new("."), 0usize, None, &mut diagnostics)?;
+        let mux = std::sync::Arc::new(micromux::Micromux::new(&parsed)?);
+        let (_runner, handles) = mux.start(micromux::CancellationToken::new());
+        let (commands_tx, mut commands_rx) = mpsc::channel(1);
+        let mut app = App::new(
+            SessionSource::Local(LocalSource::new(handles.reader, commands_tx.clone())),
+            Some(commands_tx),
+            micromux::CancellationToken::new(),
+            true,
+        );
+        let paste = vec![b'x'; micromux::MAX_PTY_PASTE_BYTES + 1];
+
+        app.enqueue_pty_paste("svc", &paste);
+
+        assert_matches!(
+            commands_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        );
+        assert!(
+            app.runtime_notice
+                .as_deref()
+                .is_some_and(|notice| notice.contains("paste discarded"))
+        );
+        let area = ratatui::layout::Rect::new(0, 0, 160, 24);
+        let mut buffer = ratatui::buffer::Buffer::empty(area);
+        (&mut app).render(area, &mut buffer);
+        let rendered = buffer
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(rendered.contains("paste discarded"));
+
+        app.push_pending_pty_input("svc".to_string(), vec![b'y']);
+        let paste = vec![b'x'; micromux::MAX_PTY_PASTE_BYTES];
+        app.enqueue_pty_paste("svc", &paste);
+
+        assert_eq!(app.pending_pty_input.len(), 1);
+        assert!(
+            app.runtime_notice
+                .as_deref()
+                .is_some_and(|notice| notice.contains("backlog is full"))
+        );
         Ok(())
     }
 

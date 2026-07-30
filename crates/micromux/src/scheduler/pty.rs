@@ -1,5 +1,6 @@
 use super::{
-    LogUpdateKind, MAX_PTY_INPUT_BATCH_BYTES, OutputStream, ProcessEvent, RunId, ServiceID,
+    LogUpdateKind, MAX_PTY_INPUT_BATCH_BYTES, MAX_PTY_PASTE_BYTES, OutputStream, ProcessEvent,
+    RunId, ServiceID,
 };
 use crate::{health_check, model::RunSink, service::Service};
 use parking_lot::Mutex;
@@ -241,8 +242,10 @@ struct PtyWriter {
     poller: PtyPoller,
 }
 
+#[derive(Debug)]
 enum PtyWrite {
     Input(Vec<u8>),
+    Paste(Vec<u8>),
     TerminalResponse(Vec<u8>),
 }
 
@@ -337,11 +340,29 @@ impl PtyHandles {
             );
             return;
         }
+        self.enqueue_input(service_id, PtyWrite::Input(data.to_vec()), input_len);
+    }
+
+    pub(super) fn write_paste(&self, service_id: &ServiceID, data: Vec<u8>) {
+        let input_len = data.len();
+        if input_len > MAX_PTY_PASTE_BYTES {
+            tracing::warn!(
+                service_id,
+                input_len,
+                paste_limit_bytes = MAX_PTY_PASTE_BYTES,
+                "pty paste is too large; dropping it atomically"
+            );
+            return;
+        }
+        self.enqueue_input(service_id, PtyWrite::Paste(data), input_len);
+    }
+
+    fn enqueue_input(&self, service_id: &ServiceID, input: PtyWrite, input_len: usize) {
         let write_queue = self.write_queue.lock();
         let Some(write_queue) = write_queue.as_ref() else {
             return;
         };
-        match write_queue.try_send(PtyWrite::Input(data.to_vec())) {
+        match write_queue.try_send(input) {
             Ok(()) | Err(std_mpsc::TrySendError::Disconnected(_)) => {}
             Err(std_mpsc::TrySendError::Full(_)) => {
                 tracing::warn!(
@@ -386,6 +407,23 @@ impl PtyWriter {
                             service_id = self.service_id,
                             "failed to write to pty"
                         );
+                    }
+                }
+                PtyWrite::Paste(data) => {
+                    for (chunk_index, chunk) in data.chunks(MAX_PTY_INPUT_BATCH_BYTES).enumerate() {
+                        if let Err(err) = self.write_input(chunk) {
+                            if !self.cancellation.is_cancelled() {
+                                let attempted_bytes =
+                                    chunk_index.saturating_mul(MAX_PTY_INPUT_BATCH_BYTES);
+                                tracing::warn!(
+                                    ?err,
+                                    service_id = self.service_id,
+                                    remaining_bytes = data.len().saturating_sub(attempted_bytes),
+                                    "failed to write complete paste to pty; dropping its suffix"
+                                );
+                            }
+                            break;
+                        }
                     }
                 }
                 PtyWrite::TerminalResponse(data) => {
@@ -2194,6 +2232,8 @@ pub(super) fn start_service_with_pty_size(
 
 #[cfg(test)]
 mod tests {
+    use std::assert_matches;
+
     use super::*;
     use similar_asserts::assert_eq;
 
@@ -2211,13 +2251,13 @@ mod tests {
             };
         }
 
-        assert!(matches!(
+        assert_matches!(
             events_rx.blocking_recv(),
             Some(ProcessEvent::LogReaderFinished {
                 service_id: finished_service_id,
                 run_id: finished_run_id,
             }) if finished_service_id == service_id && finished_run_id == run_id
-        ));
+        );
     }
 
     #[cfg(unix)]
@@ -2429,6 +2469,28 @@ mod tests {
                 bounded_line_split(&vec![0x80; PTY_LOG_LINE_MAX_BYTES + 1]),
                 PTY_LOG_LINE_MAX_BYTES
             );
+        }
+
+        #[test]
+        fn paste_occupies_one_atomic_writer_queue_entry() {
+            let (write_queue, queued) = std_mpsc::sync_channel(1);
+            let handles = PtyHandles {
+                master: Arc::new(Mutex::new(None)),
+                write_queue: Arc::new(Mutex::new(Some(write_queue))),
+                size: Arc::new(AtomicU32::new(0)),
+            };
+            let paste = vec![b'x'; MAX_PTY_INPUT_BATCH_BYTES + 17];
+
+            handles.write_paste(&"svc".to_string(), paste.clone());
+
+            match queued.try_recv() {
+                Ok(PtyWrite::Paste(queued)) => assert_eq!(queued, paste),
+                Ok(PtyWrite::Input(_) | PtyWrite::TerminalResponse(_)) => {
+                    panic!("paste was split into another queue entry")
+                }
+                Err(err) => panic!("paste was not queued: {err}"),
+            }
+            assert_matches!(queued.try_recv(), Err(std_mpsc::TryRecvError::Empty));
         }
 
         #[cfg(target_vendor = "apple")]

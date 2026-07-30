@@ -666,6 +666,30 @@ fn parse_strict(value: &yaml_spanned::Spanned<Value>) -> Result<Option<bool>, Co
     Ok(parse_optional::<bool>(value.get("strict"))?.map(Spanned::into_inner))
 }
 
+fn document_separator_span(raw_config: &str, second_document_start: usize) -> Span {
+    let mut offset = 0;
+    let mut separator = None;
+    for line in raw_config.split_inclusive('\n') {
+        if offset > second_document_start {
+            break;
+        }
+        let content = line.trim_start();
+        let leading = line.len().saturating_sub(content.len());
+        if content
+            .strip_prefix("---")
+            .is_some_and(|suffix| suffix.trim().is_empty() || suffix.trim_start().starts_with('#'))
+        {
+            let start = offset.saturating_add(leading);
+            separator = Some(start..start.saturating_add(3).min(raw_config.len()));
+        }
+        offset = offset.saturating_add(line.len());
+    }
+    separator.unwrap_or_else(|| {
+        let start = second_document_start.min(raw_config.len());
+        start..start.saturating_add(1).min(raw_config.len())
+    })
+}
+
 /// Parse a micromux configuration from a YAML string.
 ///
 /// # Errors
@@ -681,9 +705,15 @@ pub fn from_str<F: Copy + PartialEq>(
 ) -> Result<ConfigFile<F>, ConfigError> {
     let mut documents = yaml_spanned::from_str_all(raw_config).map_err(ConfigError::Yaml)?;
     if documents.len() > 1 {
+        let second_document_start = documents.get(1).map_or(0, |document| {
+            let span: Span = document.span.into();
+            span.start
+        });
         return Err(ConfigError::InvalidValue {
-            message: "configuration must contain exactly one YAML document".to_string(),
-            span: 0..raw_config.len(),
+            message: "configuration contains a second YAML document; remove the trailing document \
+                      separator"
+                .to_string(),
+            span: document_separator_span(raw_config, second_document_start),
         });
     }
     let value = documents
@@ -1021,20 +1051,28 @@ mod tests {
     }
 
     #[test]
-    fn parser_rejects_trailing_yaml_documents() {
-        let yaml = indoc! {r#"
-            version: 1
-            services:
-              app:
-                command: ["true"]
-            ---
-            services: {}
-        "#};
-        let mut diagnostics = Vec::new();
+    fn parser_points_at_the_trailing_yaml_document_separator() {
+        for yaml in [
+            indoc! {r#"
+                version: 1
+                services:
+                  app:
+                    command: ["true"]
+                ---
+                services: {}
+            "#},
+            "version: 1\nservices: {}\n---\n",
+        ] {
+            let mut diagnostics = Vec::new();
 
-        let result = super::from_str(yaml, Path::new("."), 0usize, None, &mut diagnostics);
+            let result = super::from_str(yaml, Path::new("."), 0usize, None, &mut diagnostics);
 
-        assert!(result.is_err_and(|err| { err.to_string().contains("exactly one YAML document") }));
+            let Err(super::ConfigError::InvalidValue { message, span }) = result else {
+                panic!("trailing YAML document was accepted");
+            };
+            assert!(message.contains("remove the trailing document separator"));
+            assert_eq!(yaml.get(span), Some("---"));
+        }
     }
 
     #[test]

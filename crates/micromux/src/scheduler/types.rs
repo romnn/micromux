@@ -9,6 +9,8 @@ pub type ServiceID = String;
 
 /// Largest raw PTY input payload accepted as one all-or-nothing write batch.
 pub const MAX_PTY_INPUT_BATCH_BYTES: usize = 64 * 1024;
+/// Largest bracketed paste accepted as one logical PTY write.
+pub const MAX_PTY_PASTE_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct RunId(u64);
@@ -257,6 +259,11 @@ pub enum Command {
     },
     /// Send a raw input payload to a service.
     SendInput(ServiceID, Vec<u8>),
+    /// Send one bracketed paste to a service.
+    ///
+    /// The scheduler and PTY writer preserve it as one queue entry. The writer may split it into
+    /// bounded physical writes, but abandons only the remaining suffix after a write failure.
+    SendPaste(ServiceID, Vec<u8>),
     /// Resize all PTYs.
     ResizeAll {
         /// Terminal width in columns.

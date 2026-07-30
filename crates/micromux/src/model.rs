@@ -401,6 +401,14 @@ pub struct LogRun {
     pub lines: Vec<LogLine>,
 }
 
+/// A transient failure while reading one retained run log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum LogRunReadError {
+    /// The run rotated repeatedly before a stable file segment could be observed.
+    #[error("run log is rotating; retry the read")]
+    Rotating,
+}
+
 /// One healthcheck output line.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct HealthLine {
@@ -1014,27 +1022,32 @@ impl SessionModelReader {
         tail: Option<usize>,
         after: Option<u64>,
         limit: Option<usize>,
-    ) -> Option<LogRun> {
+    ) -> Result<Option<LogRun>, LogRunReadError> {
         enum Target {
             Disk(RunLogSource),
             Synthetic(LogRun),
         }
 
         let target = {
-            let entry = self.inner.service_entry(id)?;
+            let Some(entry) = self.inner.service_entry(id) else {
+                return Ok(None);
+            };
             let entry = entry.read();
             if let Some(source) = entry.run_log_source(run_generation) {
                 Target::Disk(source)
             } else {
-                Target::Synthetic(entry.synthetic_empty_run(run_generation)?)
+                let Some(run) = entry.synthetic_empty_run(run_generation) else {
+                    return Ok(None);
+                };
+                Target::Synthetic(run)
             }
         };
 
         match target {
-            Target::Synthetic(run) => Some(run),
+            Target::Synthetic(run) => Ok(Some(run)),
             Target::Disk(source) => {
                 self.inner.flush_disk();
-                let lines = {
+                let Some(lines) = ({
                     let mut index = source.index.lock();
                     read_run_log_file(
                         &source.path,
@@ -1044,17 +1057,25 @@ impl SessionModelReader {
                         &mut index,
                         &source.disk_metadata,
                     )?
+                }) else {
+                    return Ok(None);
                 };
                 let current = {
-                    let entry = self.inner.service_entry(id)?;
+                    let Some(entry) = self.inner.service_entry(id) else {
+                        return Ok(None);
+                    };
                     let entry = entry.read();
-                    entry.is_current_run_path(run_generation, &source.path)?
+                    let Some(current) = entry.is_current_run_path(run_generation, &source.path)
+                    else {
+                        return Ok(None);
+                    };
+                    current
                 };
-                Some(LogRun {
+                Ok(Some(LogRun {
                     run_generation,
                     current,
                     lines,
-                })
+                }))
             }
         }
     }
@@ -1127,12 +1148,33 @@ impl SessionModelReader {
     }
 
     /// The retained logs for one run of a service.
+    ///
+    /// Returns `None` when the run is absent or rotates too frequently to observe a stable page.
+    /// Use [`Self::try_run_log`] to distinguish those cases.
     #[must_use]
     pub fn run_log(&self, id: &str, run_generation: u64, tail: Option<usize>) -> Option<LogRun> {
+        self.try_run_log(id, run_generation, tail).ok().flatten()
+    }
+
+    /// Tries to read retained logs for one run of a service.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LogRunReadError::Rotating`] when the disk segment changes too frequently to read a
+    /// stable page. Callers may retry without changing the cursor.
+    pub fn try_run_log(
+        &self,
+        id: &str,
+        run_generation: u64,
+        tail: Option<usize>,
+    ) -> Result<Option<LogRun>, LogRunReadError> {
         self.read_run_log(id, run_generation, tail, None, None)
     }
 
     /// The retained logs for one run, strictly after a monotonic cursor.
+    ///
+    /// Returns `None` when the run is absent or rotates too frequently to observe a stable page.
+    /// Use [`Self::try_run_log_after`] to distinguish those cases.
     #[must_use]
     pub fn run_log_after(
         &self,
@@ -1141,6 +1183,24 @@ impl SessionModelReader {
         after: Option<u64>,
         limit: Option<usize>,
     ) -> Option<LogRun> {
+        self.try_run_log_after(id, run_generation, after, limit)
+            .ok()
+            .flatten()
+    }
+
+    /// Tries to read retained run logs strictly after a monotonic cursor.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LogRunReadError::Rotating`] when the disk segment changes too frequently to read a
+    /// stable page. Callers may retry with the same cursor.
+    pub fn try_run_log_after(
+        &self,
+        id: &str,
+        run_generation: u64,
+        after: Option<u64>,
+        limit: Option<usize>,
+    ) -> Result<Option<LogRun>, LogRunReadError> {
         self.read_run_log(id, run_generation, None, after, limit)
     }
 

@@ -9,7 +9,10 @@ use futures::future;
 
 use crate::ControlError;
 use crate::endpoint::ControlEndpoint;
-use crate::protocol::{PROTOCOL_VERSION, ProtocolVersion, Request, Response, SessionInfo};
+use crate::protocol::{
+    PROTOCOL_VERSION, ProtocolVersion, Request, Response, SessionInfo,
+    supports_versioned_subscriptions,
+};
 #[cfg(unix)]
 use crate::{PROBE_TIMEOUT, REQUEST_TIMEOUT, read_message, write_message};
 
@@ -23,6 +26,8 @@ pub struct Client {
 pub struct Subscription {
     #[cfg(unix)]
     conn: crate::Framing<tokio::net::UnixStream>,
+    #[cfg(unix)]
+    read_timeout: Option<std::time::Duration>,
 }
 
 /// Probe result for one concrete endpoint.
@@ -154,6 +159,35 @@ impl Client {
     ///
     /// Returns a transport/protocol error if the endpoint cannot be reached or rejects the
     /// subscription.
+    pub async fn subscribe(endpoint: &ControlEndpoint) -> Result<Subscription, ControlError> {
+        Self::subscribe_request(endpoint, Request::Subscribe, None).await
+    }
+
+    /// Subscribe using capabilities supported by a previously described peer.
+    ///
+    /// Clients retain the legacy request for pre-3.7 peers, which avoids sending an enum variant
+    /// that an older server cannot deserialize.
+    ///
+    /// # Errors
+    ///
+    /// Returns a transport/protocol error if the endpoint cannot be reached or rejects the
+    /// subscription.
+    pub async fn subscribe_for_version(
+        endpoint: &ControlEndpoint,
+        peer: ProtocolVersion,
+    ) -> Result<Subscription, ControlError> {
+        let version_aware = supports_versioned_subscriptions(peer);
+        let request = if version_aware {
+            Request::SubscribeWithVersion {
+                protocol_version: PROTOCOL_VERSION,
+            }
+        } else {
+            Request::Subscribe
+        };
+        let read_timeout = version_aware.then_some(crate::SUBSCRIPTION_READ_TIMEOUT);
+        Self::subscribe_request(endpoint, request, read_timeout).await
+    }
+
     #[cfg_attr(
         not(unix),
         expect(
@@ -161,7 +195,11 @@ impl Client {
             reason = "Unix has the async transport implementation; unsupported platforms keep the same API shape"
         )
     )]
-    pub async fn subscribe(endpoint: &ControlEndpoint) -> Result<Subscription, ControlError> {
+    async fn subscribe_request(
+        endpoint: &ControlEndpoint,
+        request: Request,
+        read_timeout: Option<std::time::Duration>,
+    ) -> Result<Subscription, ControlError> {
         #[cfg(unix)]
         {
             let ControlEndpoint::Unix(path) = endpoint else {
@@ -172,13 +210,13 @@ impl Client {
                     .await
                     .map_err(|_| ControlError::Timeout)??;
             let mut conn = crate::framed(stream);
-            write_message(&mut conn, &Request::Subscribe).await?;
-            Ok(Subscription { conn })
+            write_message(&mut conn, &request).await?;
+            Ok(Subscription { conn, read_timeout })
         }
 
         #[cfg(not(unix))]
         {
-            let _ = endpoint;
+            let _ = (endpoint, request, read_timeout);
             Err(ControlError::Unsupported)
         }
     }
@@ -232,7 +270,8 @@ impl Subscription {
     ///
     /// # Errors
     ///
-    /// Returns a transport/protocol error if the stream is malformed.
+    /// Returns [`ControlError::Timeout`] when a version-aware subscription receives no frame before
+    /// its liveness deadline, or a transport/protocol error if the stream is malformed.
     #[cfg_attr(
         not(unix),
         expect(
@@ -243,7 +282,14 @@ impl Subscription {
     pub async fn recv(&mut self) -> Result<Option<micromux::SessionChange>, ControlError> {
         #[cfg(unix)]
         {
-            match read_message::<_, Response>(&mut self.conn).await? {
+            let response = if let Some(timeout) = self.read_timeout {
+                tokio::time::timeout(timeout, read_message::<_, Response>(&mut self.conn))
+                    .await
+                    .map_err(|_| ControlError::Timeout)??
+            } else {
+                read_message::<_, Response>(&mut self.conn).await?
+            };
+            match response {
                 Some(Response::Change(change)) => Ok(Some(change)),
                 Some(Response::Error { code, message }) => Err(ControlError::Unexpected(format!(
                     "subscription error {code:?}: {message}"

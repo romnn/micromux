@@ -6,14 +6,20 @@ pub(crate) struct PortOwner {
     pub(crate) command: String,
 }
 
+// MCP may inherit a project-controlled PATH, so attribution executes only known absolute
+// candidates.
 #[cfg(target_os = "macos")]
-const LSOF_PATH: &str = "/usr/sbin/lsof";
+const LSOF_PATHS: [&str; 4] = [
+    "/usr/sbin/lsof",
+    "/usr/bin/lsof",
+    "/opt/homebrew/bin/lsof",
+    "/usr/local/bin/lsof",
+];
 
 /// Whether a `/proc/net/tcp{,6}` hex local address is loopback or unspecified (wildcard).
 ///
-/// The bind probe that triggers this lookup targets `127.0.0.1`, so only a loopback or
-/// wildcard listener can actually be the holder; naming a listener bound to some other
-/// interface would be a wrong claim.
+/// The diagnostic connection probe targets `127.0.0.1`, so only a loopback or wildcard listener
+/// can actually be the holder; naming a listener bound to some other interface would be wrong.
 #[cfg(target_os = "linux")]
 fn is_loopback_or_unspecified(addr_hex: &str) -> bool {
     let upper = addr_hex.to_ascii_uppercase();
@@ -104,11 +110,18 @@ pub(crate) fn listening_owner(port: u16) -> Option<PortOwner> {
 }
 
 #[cfg(target_os = "macos")]
+fn lsof_path() -> Option<&'static str> {
+    LSOF_PATHS
+        .into_iter()
+        .find(|candidate| std::path::Path::new(candidate).is_file())
+}
+
+#[cfg(target_os = "macos")]
 pub(crate) fn listening_owner(port: u16) -> Option<PortOwner> {
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
 
-    let mut child = Command::new(LSOF_PATH)
+    let mut child = Command::new(lsof_path()?)
         .args(["-nP", &format!("-iTCP:{port}"), "-sTCP:LISTEN", "-Fpc"])
         .stdin(Stdio::null())
         .stderr(Stdio::null())
@@ -195,13 +208,14 @@ mod tests {
 
 #[cfg(all(test, target_os = "macos"))]
 mod macos_tests {
-    use super::LSOF_PATH;
+    use super::LSOF_PATHS;
     use similar_asserts::assert_eq;
     use std::path::Path;
 
     #[test]
-    fn lsof_uses_the_system_absolute_path() {
-        assert!(Path::new(LSOF_PATH).is_absolute());
-        assert_eq!(LSOF_PATH, "/usr/sbin/lsof");
+    fn lsof_candidates_are_absolute_and_prefer_the_system_location() {
+        assert!(LSOF_PATHS.iter().all(|path| Path::new(path).is_absolute()));
+        assert_eq!(LSOF_PATHS.first(), Some(&"/usr/sbin/lsof"));
+        assert!(LSOF_PATHS.contains(&"/opt/homebrew/bin/lsof"));
     }
 }

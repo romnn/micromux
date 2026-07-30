@@ -358,7 +358,8 @@ async fn subscribe_without_sync_gap(
     // The second sync catches changes that preceded subscription; changes during that sync stay
     // queued for the connected loop, so the handoff cannot lose a transition.
     full_sync(request, store).await?;
-    let subscription = Client::subscribe(endpoint).await?;
+    let peer_version = store.read().session.protocol_version;
+    let subscription = Client::subscribe_for_version(endpoint, peer_version).await?;
     let service_ids = full_sync(request, store).await?;
     Ok((subscription, service_ids))
 }

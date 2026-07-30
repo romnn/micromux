@@ -7,31 +7,27 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     prelude::*,
     style::{Color, Modifier, Style, Styled, palette::tailwind},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Widget, Wrap},
+    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Widget},
 };
-
-fn rendered_line_count(paragraph: &Paragraph<'_>, width: u16) -> usize {
-    paragraph.line_count(width)
-}
 
 #[cfg(test)]
 mod tests {
     use super::{
         lease_phrase,
-        log_view::{LogView, window_text},
-        rendered_line_count, service_detail_line, shell_join, state_name,
+        log_view::{LogView, RenderedLineIndex, window_text},
+        service_detail_line, shell_join, state_name,
     };
     use ratatui::{
         buffer::Buffer,
         layout::Rect,
         text::{Line, Span, Text},
-        widgets::{Paragraph, Wrap},
     };
     use similar_asserts::assert_eq;
 
-    fn wrapped_text_height(text: ratatui::text::Text, wrap_width: u16) -> usize {
-        let paragraph = Paragraph::new(text).wrap(Wrap { trim: false });
-        rendered_line_count(&paragraph, wrap_width)
+    fn wrapped_text_height(text: &ratatui::text::Text, wrap_width: u16) -> usize {
+        let mut index = RenderedLineIndex::default();
+        index.rebuild(text, true, wrap_width);
+        index.total_lines()
     }
 
     fn render_logs(
@@ -42,18 +38,15 @@ mod tests {
         buf: &mut Buffer,
     ) -> usize {
         let text = Text::from(logs.to_string());
-        let num_lines = if view.wrap {
-            wrapped_text_height(text.clone(), log_area.width.saturating_sub(2))
-        } else {
-            text.height()
-        };
+        let mut index = RenderedLineIndex::default();
+        index.rebuild(&text, view.wrap, log_area.width.saturating_sub(2));
         let area = Rect {
             x: log_area.x,
             y: log_area.y,
             width: log_area.width.saturating_add(scrollbar_area.width),
             height: log_area.height,
         };
-        view.render(area, num_lines, &text, "Logs", None, buf)
+        view.render(area, &index, &text, "Logs", None, buf)
     }
 
     fn count_thumb(buf: &Buffer, area: Rect) -> usize {
@@ -85,9 +78,9 @@ mod tests {
     #[test]
     fn wrapped_text_height_matches_expected_rows() {
         let text: ratatui::text::Text = "abcdefghij".into();
-        assert_eq!(wrapped_text_height(text.clone(), 4), 3);
-        assert_eq!(wrapped_text_height(text.clone(), 5), 2);
-        assert_eq!(wrapped_text_height(text, 10), 1);
+        assert_eq!(wrapped_text_height(&text, 4), 3);
+        assert_eq!(wrapped_text_height(&text, 5), 2);
+        assert_eq!(wrapped_text_height(&text, 10), 1);
     }
 
     #[test]
@@ -196,13 +189,13 @@ mod tests {
     #[test]
     fn wrapped_text_height_uses_word_boundaries() {
         let text: ratatui::text::Text = "aaaaaa aaaaaa aaaaaa".into();
-        assert_eq!(wrapped_text_height(text, 10), 3);
+        assert_eq!(wrapped_text_height(&text, 10), 3);
     }
 
     #[test]
     fn wrapped_text_height_matches_zero_width_paragraph() {
         let text: ratatui::text::Text = "abcdefghij".into();
-        assert_eq!(wrapped_text_height(text, 0), 0);
+        assert_eq!(wrapped_text_height(&text, 0), 0);
     }
 
     #[test]
@@ -362,7 +355,7 @@ mod tests {
     }
 
     #[test]
-    fn log_window_preserves_offsets_beyond_the_paragraph_scroll_limit() {
+    fn log_window_avoids_the_paragraph_scroll_limit_for_many_logical_lines() {
         let line_count = usize::from(u16::MAX) + 100;
         let text = Text::from(
             (0..line_count)
@@ -370,16 +363,19 @@ mod tests {
                 .collect::<Vec<_>>(),
         );
 
-        let (window, local_offset) = window_text(&text, false, 80, line_count - 1);
+        let mut index = RenderedLineIndex::default();
+        index.rebuild(&text, false, 80);
+        let (window, local_offset) = window_text(&text, &index, line_count - 1, 1);
+        let expected = line_count.saturating_sub(1).to_string();
 
-        assert_eq!(local_offset, u16::MAX);
+        assert_eq!(local_offset, 0);
         assert_eq!(
             window
                 .lines
                 .first()
                 .map(std::string::ToString::to_string)
                 .as_deref(),
-            Some("99")
+            Some(expected.as_str())
         );
     }
 
@@ -392,7 +388,9 @@ mod tests {
             .and_then(|line| line.spans.first())
             .map(|span| span.content.as_ptr());
 
-        let (window, _) = window_text(&text, false, 80, 0);
+        let mut index = RenderedLineIndex::default();
+        index.rebuild(&text, false, 80);
+        let (window, _) = window_text(&text, &index, 0, 1);
         let borrowed = window
             .lines
             .first()
@@ -400,6 +398,30 @@ mod tests {
             .map(|span| span.content.as_ptr());
 
         assert_eq!(borrowed, original);
+    }
+
+    #[test]
+    fn log_window_borrows_only_the_visible_source_lines() {
+        let text = Text::from(
+            (0..1_000)
+                .map(|index| Line::raw(index.to_string()))
+                .collect::<Vec<_>>(),
+        );
+        let mut index = RenderedLineIndex::default();
+        index.rebuild(&text, false, 80);
+
+        let (window, local_offset) = window_text(&text, &index, 900, 10);
+
+        assert_eq!(local_offset, 0);
+        assert_eq!(window.lines.len(), 10);
+        assert_eq!(
+            window.lines.first().map(Line::to_string).as_deref(),
+            Some("900")
+        );
+        assert_eq!(
+            window.lines.last().map(Line::to_string).as_deref(),
+            Some("909")
+        );
     }
 
     #[test]
@@ -708,14 +730,17 @@ impl App {
             status.session.name.bold(),
             format!(" ({})", status.session.config_path).into(),
         ]);
-        if let Some(notice) = status.notice {
+        if let Some(notice) = self.runtime_notice.clone().or(status.notice) {
             spans.extend([" — ".into(), notice.fg(tailwind::RED.c400)]);
         }
         Some(Line::from(spans).centered())
     }
 
     fn local_warning_header(&self) -> Option<Line<'static>> {
-        let notice = self.source.local_notice()?;
+        let notice = self
+            .runtime_notice
+            .as_deref()
+            .or_else(|| self.source.local_notice())?;
         Some(
             Line::from(vec![
                 format!("micromux v{}", env!("CARGO_PKG_VERSION"))
@@ -847,14 +872,9 @@ impl App {
                 );
                 escaped.into()
             });
-            let raw_num_lines = service.cached_text.height();
-            service.cached_wrapped_lines = if wrap {
-                let paragraph =
-                    Paragraph::new(service.cached_text.clone()).wrap(Wrap { trim: false });
-                rendered_line_count(&paragraph, wrap_width)
-            } else {
-                raw_num_lines
-            };
+            service
+                .cached_line_index
+                .rebuild(&service.cached_text, wrap, wrap_width);
             service.cached_wrap = Some((wrap, wrap_width));
             service.text_dirty = false;
         }
@@ -862,17 +882,22 @@ impl App {
         let Some(current_service) = self.state.current_service() else {
             return;
         };
-        let num_lines = current_service.cached_wrapped_lines;
         let text = &current_service.cached_text;
         let detail = service_detail_line(&current_service.snapshot, now_unix_ms());
         tracing::trace!(
             service_id = current_service.snapshot.id,
-            num_lines,
+            num_lines = current_service.cached_line_index.total_lines(),
             "collected logs"
         );
 
-        self.log_view
-            .render(area, num_lines, text, "Logs", detail, buf);
+        self.log_view.render(
+            area,
+            &current_service.cached_line_index,
+            text,
+            "Logs",
+            detail,
+            buf,
+        );
     }
 
     fn render_healthchecks(&mut self, area: Rect, buf: &mut Buffer) {
@@ -915,15 +940,11 @@ impl App {
         if let Some(service) = self.state.current_service_mut()
             && service.healthcheck_cached_wrap != Some((wrap, wrap_width))
         {
-            let num_lines = if wrap {
-                let paragraph =
-                    Paragraph::new(log_view::borrow_text(&service.healthcheck_cached_text))
-                        .wrap(Wrap { trim: false });
-                rendered_line_count(&paragraph, wrap_width)
-            } else {
-                service.healthcheck_cached_text.height()
-            };
-            service.healthcheck_cached_num_lines = num_lines;
+            service.healthcheck_cached_line_index.rebuild(
+                &service.healthcheck_cached_text,
+                wrap,
+                wrap_width,
+            );
             service.healthcheck_cached_wrap = Some((wrap, wrap_width));
         }
 
@@ -932,7 +953,7 @@ impl App {
         };
         self.healthcheck_view.render(
             area,
-            service.healthcheck_cached_num_lines,
+            &service.healthcheck_cached_line_index,
             &service.healthcheck_cached_text,
             "Healthcheck",
             None,
@@ -1056,6 +1077,65 @@ pub mod log_view {
         },
     };
 
+    /// Maps logical text lines to their first rendered row for one wrap configuration.
+    #[derive(Debug, Default)]
+    pub struct RenderedLineIndex {
+        starts: Vec<usize>,
+        total_lines: usize,
+    }
+
+    impl RenderedLineIndex {
+        /// Rebuild the row index after the text or wrap configuration changes.
+        pub(crate) fn rebuild(&mut self, text: &ratatui::text::Text<'_>, wrap: bool, width: u16) {
+            self.starts.clear();
+            self.starts.reserve(text.lines.len());
+            let mut rendered = 0usize;
+            for line in &text.lines {
+                self.starts.push(rendered);
+                let height = if wrap {
+                    Paragraph::new(borrow_line(line))
+                        .wrap(Wrap { trim: false })
+                        .line_count(width)
+                } else {
+                    1
+                };
+                rendered = rendered.saturating_add(height);
+            }
+            self.total_lines = rendered;
+        }
+
+        /// Total rendered rows covered by this index.
+        #[must_use]
+        pub(crate) fn total_lines(&self) -> usize {
+            self.total_lines
+        }
+
+        fn source_window(
+            &self,
+            offset: usize,
+            viewport_height: usize,
+        ) -> (std::ops::Range<usize>, u16) {
+            if self.starts.is_empty() {
+                return (0..0, 0);
+            }
+            let start = self
+                .starts
+                .partition_point(|line_start| *line_start <= offset)
+                .saturating_sub(1);
+            let consumed = self.starts.get(start).copied().unwrap_or_default();
+            let end_row = offset.saturating_add(viewport_height.max(1));
+            let end = self
+                .starts
+                .partition_point(|line_start| *line_start < end_row)
+                .max(start.saturating_add(1))
+                .min(self.starts.len());
+            (
+                start..end,
+                u16::try_from(offset.saturating_sub(consumed)).unwrap_or(u16::MAX),
+            )
+        }
+    }
+
     #[derive(Debug)]
     pub struct LogView {
         /// Number of rendered rows scrolled from the top.
@@ -1083,16 +1163,18 @@ pub mod log_view {
         /// Render a scrollable text pane and return its wrap-aware rendered line count, so callers
         /// can clamp keyboard scrolling consistently with the scrollbar/follow-tail behavior.
         ///
+        /// `line_index` must describe `text` under this view's current wrap configuration.
         /// `detail` is drawn into the bottom border as the selected service's identity line.
         pub fn render(
             &mut self,
             area: Rect,
-            num_lines: usize,
+            line_index: &RenderedLineIndex,
             text: &ratatui::text::Text<'_>,
             title: &'static str,
             detail: Option<ratatui::text::Line<'static>>,
             buf: &mut Buffer,
         ) -> usize {
+            let num_lines = line_index.total_lines();
             let [log_area, scrollbar_area] = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([Constraint::Min(0), Constraint::Length(1)])
@@ -1124,12 +1206,8 @@ pub mod log_view {
                 .viewport_content_length(viewport_height)
                 .position(self.scroll_offset);
 
-            let (text, paragraph_offset) = window_text(
-                text,
-                self.wrap,
-                log_area.width.saturating_sub(2),
-                self.scroll_offset,
-            );
+            let (text, paragraph_offset) =
+                window_text(text, line_index, self.scroll_offset, viewport_height);
             let mut paragraph = Paragraph::new(text);
             if self.wrap {
                 paragraph = paragraph.wrap(Wrap { trim: false });
@@ -1157,49 +1235,26 @@ pub mod log_view {
 
     pub(super) fn window_text<'a>(
         text: &'a ratatui::text::Text<'_>,
-        wrap: bool,
-        width: u16,
+        line_index: &RenderedLineIndex,
         offset: usize,
+        viewport_height: usize,
     ) -> (ratatui::text::Text<'a>, u16) {
-        let target = offset.saturating_sub(usize::from(u16::MAX));
-        let mut consumed = 0usize;
-        let mut drop_lines = 0usize;
-        for line in &text.lines {
-            let height = if wrap {
-                Paragraph::new(borrow_line(line))
-                    .wrap(Wrap { trim: false })
-                    .line_count(width)
-            } else {
-                1
-            };
-            if consumed.saturating_add(height) > target {
-                break;
-            }
-            consumed = consumed.saturating_add(height);
-            drop_lines += 1;
-        }
-        let local_offset = offset.saturating_sub(consumed);
-        (
-            borrow_text_from(text, drop_lines),
-            u16::try_from(local_offset).unwrap_or(u16::MAX),
-        )
+        let (source_lines, local_offset) = line_index.source_window(offset, viewport_height);
+        (borrow_text_range(text, source_lines), local_offset)
     }
 
-    pub(super) fn borrow_text<'a>(text: &'a ratatui::text::Text<'_>) -> ratatui::text::Text<'a> {
-        borrow_text_from(text, 0)
-    }
-
-    fn borrow_text_from<'a>(
+    fn borrow_text_range<'a>(
         text: &'a ratatui::text::Text<'_>,
-        skip_lines: usize,
+        source_lines: std::ops::Range<usize>,
     ) -> ratatui::text::Text<'a> {
         ratatui::text::Text {
             alignment: text.alignment,
             style: text.style,
             lines: text
                 .lines
+                .get(source_lines)
+                .unwrap_or_default()
                 .iter()
-                .skip(skip_lines)
                 .map(borrow_line)
                 .collect(),
         }

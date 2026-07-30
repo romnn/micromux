@@ -11,7 +11,7 @@ use crate::scheduler::ServiceID;
 use super::disk::{
     DiskLogOp, DiskLogRecord, DiskLogWriter, DiskRunMetadata, SharedDiskRunMetadata,
 };
-use super::{LogLine, LogRunSummary};
+use super::{LogLine, LogRunReadError, LogRunSummary};
 
 pub(super) const RUN_LOG_OFFSET_CACHE: usize = 4096;
 const MAX_STABLE_SEGMENT_READ_ATTEMPTS: usize = 3;
@@ -287,7 +287,7 @@ pub(super) fn read_run_log_file(
     limit: Option<usize>,
     index: &mut RunLogReadIndex,
     disk_metadata: &SharedDiskRunMetadata,
-) -> Option<Vec<LogLine>> {
+) -> Result<Option<Vec<LogLine>>, LogRunReadError> {
     read_consistent_segment(path, index, disk_metadata, |index, file, readable_len| {
         read_run_log_segment(path, file, readable_len, tail, after, limit, index)
     })
@@ -298,28 +298,43 @@ fn read_consistent_segment<T>(
     index: &mut RunLogReadIndex,
     disk_metadata: &SharedDiskRunMetadata,
     mut read: impl FnMut(&mut RunLogReadIndex, File, u64) -> Option<T>,
-) -> Option<T> {
+) -> Result<Option<T>, LogRunReadError> {
+    let mut candidate_index = std::mem::take(index);
     for _ in 0..MAX_STABLE_SEGMENT_READ_ATTEMPTS {
         let (segment_epoch, file, readable_len) = {
             let metadata = disk_metadata.lock();
-            let file = File::open(path).ok()?;
-            let readable_len = file.metadata().ok()?.len();
+            let Ok(file) = File::open(path) else {
+                *index = candidate_index;
+                return Ok(None);
+            };
+            let Ok(file_metadata) = file.metadata() else {
+                *index = candidate_index;
+                return Ok(None);
+            };
+            let readable_len = file_metadata.len();
             (metadata.segment_epoch, file, readable_len)
         };
-        let mut candidate_index = index.clone();
         candidate_index.reset_for_segment(segment_epoch);
-        let value = read(&mut candidate_index, file, readable_len)?;
+        let Some(value) = read(&mut candidate_index, file, readable_len) else {
+            candidate_index.reset_scan();
+            *index = candidate_index;
+            return Ok(None);
+        };
 
         // The writer holds `disk_metadata` across `write_all`, so `readable_len` cannot land inside
         // a concurrently successful record. Read only that prefix, then reject it if an in-place
         // rotation changed its epoch. This keeps long reads off the writer lock without publishing
         // a mixed segment or partial append.
-        if disk_metadata.lock().segment_epoch == segment_epoch {
+        let current_epoch = disk_metadata.lock().segment_epoch;
+        if current_epoch == segment_epoch {
             *index = candidate_index;
-            return Some(value);
+            return Ok(Some(value));
         }
+        // Reuse the allocation while discarding offsets collected from the rejected segment.
+        candidate_index.reset_for_segment(current_epoch);
     }
-    None
+    *index = candidate_index;
+    Err(LogRunReadError::Rotating)
 }
 
 fn read_run_log_segment(
@@ -431,12 +446,44 @@ mod tests {
                 }
                 Some(attempts)
             },
-        );
+        )?;
 
         assert_eq!(value, Some(2));
         assert_eq!(attempts, 2);
         assert_eq!(index.segment_epoch, 1);
         assert_eq!(index.scanned_to, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn repeated_rotation_returns_a_retryable_error_and_resets_the_stale_index() -> eyre::Result<()>
+    {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("run.jsonl");
+        fs::write(&path, b"xx")?;
+        let metadata = std::sync::Arc::new(Mutex::new(DiskRunMetadata::default()));
+        let mut index = RunLogReadIndex::default();
+        for seq in 1..=32 {
+            index.observe_append(seq, seq);
+        }
+        let initial_capacity = index.append_offsets.capacity();
+        let mut attempts = 0;
+
+        let result = read_consistent_segment(
+            &path,
+            &mut index,
+            &metadata,
+            |_candidate, _file, _readable_len| {
+                attempts += 1;
+                metadata.lock().segment_epoch = u64::try_from(attempts).unwrap_or(u64::MAX);
+                Some(())
+            },
+        );
+
+        assert_eq!(result, Err(LogRunReadError::Rotating));
+        assert_eq!(attempts, MAX_STABLE_SEGMENT_READ_ATTEMPTS);
+        assert!(index.append_offsets.is_empty());
+        assert!(index.append_offsets.capacity() >= initial_capacity);
         Ok(())
     }
 
@@ -507,7 +554,7 @@ mod tests {
                     Ok(lines)
                 })())
             },
-        )
+        )?
         .ok_or_else(|| eyre::eyre!("run-log snapshot was unavailable"))??;
         // The first read commits only the stable cursor; the next one sees the completed append.
         assert_eq!(
@@ -516,7 +563,7 @@ mod tests {
         );
         assert_eq!(index.scanned_to, initial_len);
 
-        let second_page = read_run_log_file(&path, None, Some(1), None, &mut index, &metadata)
+        let second_page = read_run_log_file(&path, None, Some(1), None, &mut index, &metadata)?
             .ok_or_else(|| eyre::eyre!("completed append was unreadable"))?;
         assert_eq!(
             second_page.iter().map(|line| line.seq).collect::<Vec<_>>(),
@@ -592,7 +639,7 @@ mod tests {
         drop(file);
 
         let mut index = RunLogReadIndex::default();
-        let initial = read_run_log_file(&path, None, None, None, &mut index, &metadata)
+        let initial = read_run_log_file(&path, None, None, None, &mut index, &metadata)?
             .ok_or_else(|| eyre::eyre!("initial run log was unreadable"))?;
         let old_scanned_to = index.scanned_to;
         assert_eq!(initial.len(), 1);
@@ -613,7 +660,7 @@ mod tests {
             metadata.last_seq = Some(2);
         }
 
-        let after_rotation = read_run_log_file(&path, None, Some(1), None, &mut index, &metadata)
+        let after_rotation = read_run_log_file(&path, None, Some(1), None, &mut index, &metadata)?
             .ok_or_else(|| eyre::eyre!("rotated run log was unreadable"))?;
 
         assert_eq!(after_rotation.first().map(|line| line.seq), Some(2));

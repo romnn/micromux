@@ -1114,25 +1114,51 @@ fn parse_services<F: Copy>(
                     expected: vec![Kind::Mapping],
                     span: value.span().into(),
                 })?;
+            let entries = services
+                .iter()
+                .map(|(name, service)| Ok((parse::<String>(name)?, service)))
+                .collect::<Result<Vec<_>, ConfigError>>()?;
             let mut parsed = IndexMap::new();
-            for (name, service) in services {
-                let name = parse::<String>(name)?;
+            let mut invalid = IndexMap::new();
+            for (name, service) in entries {
                 if !crate::spec::service_id_is_valid(&name) {
                     diagnostics.push(
                         Diagnostic::warning_or_error(strict)
                             .with_message(format!(
-                                "service id `{name}` must match [A-Za-z0-9._-]{{1,64}}"
+                                "service id `{name}` must match [A-Za-z0-9._-]{{1,64}}; the service \
+                                 will not start"
                             ))
                             .with_labels(vec![
                                 Label::primary(file_id, name.span)
                                     .with_message("invalid service id"),
                             ]),
                     );
+                    invalid.insert(name.to_string(), name.span);
                     continue;
                 }
                 let service =
                     parse_service(service, &name, defaults, file_id, strict, diagnostics)?;
                 parsed.insert(name, service);
+            }
+            for (service_id, service) in &parsed {
+                for dependency in &service.depends_on {
+                    let Some(invalid_span) = invalid.get(dependency.name.as_str()) else {
+                        continue;
+                    };
+                    diagnostics.push(
+                        Diagnostic::error()
+                            .with_message(format!(
+                                "service `{service_id}` depends on invalid service id `{}`",
+                                dependency.name
+                            ))
+                            .with_labels(vec![
+                                Label::primary(file_id, dependency.name.span)
+                                    .with_message("dependency cannot be started"),
+                                Label::secondary(file_id, *invalid_span)
+                                    .with_message("invalid service is defined here"),
+                            ]),
+                    );
+                }
             }
             Ok(parsed)
         }
@@ -1899,6 +1925,7 @@ mod tests {
                 command: ["true"]
               valid:
                 command: ["true"]
+                depends_on: ["bad/name"]
         "#};
         let mut diagnostics = Vec::new();
 
@@ -1921,6 +1948,27 @@ mod tests {
         assert!(invalid.iter().all(|diagnostic| {
             diagnostic.severity == codespan_reporting::diagnostic::Severity::Warning
         }));
+        let invalid_dependency = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.message.contains("depends on invalid service id"))
+            .ok_or_else(|| eyre::eyre!("missing cross-linked dependency diagnostic"))?;
+        assert_eq!(
+            invalid_dependency.severity,
+            codespan_reporting::diagnostic::Severity::Error
+        );
+        assert_eq!(invalid_dependency.labels.len(), 2);
+        assert!(
+            invalid_dependency
+                .labels
+                .iter()
+                .any(|label| label.message == "dependency cannot be started")
+        );
+        assert!(
+            invalid_dependency
+                .labels
+                .iter()
+                .any(|label| label.message == "invalid service is defined here")
+        );
 
         let mut strict_diagnostics = Vec::new();
         let _ = config::from_str(

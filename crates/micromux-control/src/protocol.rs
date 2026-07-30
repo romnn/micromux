@@ -17,7 +17,11 @@ use serde::{Deserialize, Serialize};
 ///
 /// Bump the minor for additive changes (new optional/defaulted fields, new tools that reuse
 /// existing requests), and bump the major for incompatible request/response semantics.
-pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(3, 6);
+pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(3, 7);
+
+pub(crate) const fn supports_versioned_subscriptions(version: ProtocolVersion) -> bool {
+    version.major() == PROTOCOL_VERSION.major() && version.minor() >= 7
+}
 
 /// A typed control protocol version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -176,6 +180,11 @@ pub enum Request {
     Shutdown,
     /// Stream [`SessionChange`] notifications until the client disconnects.
     Subscribe,
+    /// Stream change notifications and negotiate additive subscription behavior.
+    SubscribeWithVersion {
+        /// Protocol version spoken by the subscribing client.
+        protocol_version: ProtocolVersion,
+    },
 }
 
 impl Request {
@@ -397,6 +406,8 @@ impl Response {
 
 #[cfg(test)]
 mod tests {
+    use std::assert_matches;
+
     use super::*;
     use serde_json::json;
     use similar_asserts::assert_eq;
@@ -431,7 +442,7 @@ mod tests {
     fn protocol_version_uses_major_minor_shape_and_accepts_same_major() {
         assert_eq!(
             serde_json::to_value(PROTOCOL_VERSION).unwrap(),
-            json!({ "major": 3, "minor": 6 })
+            json!({ "major": 3, "minor": 7 })
         );
         assert_eq!(
             serde_json::from_value::<ProtocolVersion>(json!({ "major": 1, "minor": 0 })).unwrap(),
@@ -440,6 +451,10 @@ mod tests {
 
         assert!(PROTOCOL_VERSION.is_compatible_with(ProtocolVersion::new(3, 9)));
         assert!(!PROTOCOL_VERSION.is_compatible_with(ProtocolVersion::new(2, 9)));
+        assert!(!supports_versioned_subscriptions(ProtocolVersion::new(
+            3, 6
+        )));
+        assert!(supports_versioned_subscriptions(ProtocolVersion::new(3, 7)));
     }
 
     #[test]
@@ -554,6 +569,21 @@ mod tests {
     }
 
     #[test]
+    fn versioned_subscription_carries_the_client_protocol() {
+        let request = Request::SubscribeWithVersion {
+            protocol_version: PROTOCOL_VERSION,
+        };
+
+        let encoded = serde_json::to_value(&request).unwrap();
+
+        assert_matches!(
+            serde_json::from_value::<Request>(encoded).unwrap(),
+            Request::SubscribeWithVersion { protocol_version }
+                if protocol_version == PROTOCOL_VERSION
+        );
+    }
+
+    #[test]
     fn health_history_request_and_response_round_trip() -> serde_json::Result<()> {
         let request = Request::GetHealthHistory {
             service: "api".to_string(),
@@ -612,7 +642,7 @@ mod tests {
     fn protocol_version_ignores_additive_fields() {
         let version = serde_json::from_value::<ProtocolVersion>(json!({
             "major": 3,
-            "minor": 6,
+            "minor": 7,
             "future_capability": true
         }))
         .unwrap();

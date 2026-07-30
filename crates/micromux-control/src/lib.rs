@@ -66,8 +66,14 @@ pub const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// How long a request/response connection may sit idle before it is closed.
 ///
-/// Subscriptions use this interval for heartbeat notifications instead.
+/// Version-aware subscriptions use a shorter heartbeat interval instead.
 pub const IDLE_TIMEOUT: Duration = Duration::from_mins(5);
+
+/// How often compatible subscription peers exchange a liveness notification while idle.
+pub const SUBSCRIPTION_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+
+/// How long a version-aware client waits without a subscription frame before reconnecting.
+pub const SUBSCRIPTION_READ_TIMEOUT: Duration = Duration::from_secs(75);
 
 /// Errors produced by the control plane.
 #[derive(thiserror::Error, Debug)]

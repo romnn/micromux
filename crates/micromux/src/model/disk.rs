@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufWriter, Write};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -260,9 +260,43 @@ impl Drop for DiskLogWorker {
     }
 }
 
-struct DiskFileWriter {
-    writer: BufWriter<File>,
+trait RecordFile: Write {
+    fn truncate(&mut self, len: u64) -> io::Result<()>;
+}
+
+impl RecordFile for File {
+    fn truncate(&mut self, len: u64) -> io::Result<()> {
+        self.set_len(len)
+    }
+}
+
+struct DiskFileWriter<W = File> {
+    writer: W,
     bytes_written: u64,
+}
+
+impl<W: RecordFile> DiskFileWriter<W> {
+    fn write_record(&mut self, encoded: &[u8]) -> io::Result<()> {
+        let record_offset = self.bytes_written;
+        if let Err(write_error) = self.writer.write_all(encoded) {
+            // A short regular-file write may expose half a JSON line. Restore the last complete
+            // record boundary before disabling this writer so a later reopen can append safely.
+            if let Err(truncate_error) = self.writer.truncate(record_offset) {
+                return Err(io::Error::new(
+                    truncate_error.kind(),
+                    format!(
+                        "write failed ({write_error}); rollback to byte {record_offset} failed: \
+                         {truncate_error}"
+                    ),
+                ));
+            }
+            return Err(write_error);
+        }
+        self.bytes_written = self
+            .bytes_written
+            .saturating_add(u64::try_from(encoded.len()).unwrap_or(u64::MAX));
+        Ok(())
+    }
 }
 
 fn open_disk_log_writer(path: &Path, truncate: bool) -> Option<DiskFileWriter> {
@@ -289,7 +323,7 @@ fn open_disk_log_writer(path: &Path, truncate: bool) -> Option<DiskFileWriter> {
                 file.metadata().map_or(0, |metadata| metadata.len())
             };
             Some(DiskFileWriter {
-                writer: BufWriter::new(file),
+                writer: file,
                 bytes_written,
             })
         }
@@ -333,7 +367,7 @@ fn write_disk_record_with_limit(
         return;
     };
     encoded.push(b'\n');
-    let mut record_bytes = u64::try_from(encoded.len()).unwrap_or(u64::MAX);
+    let record_bytes = u64::try_from(encoded.len()).unwrap_or(u64::MAX);
     let rotates = writers.get(path).is_some_and(|writer| {
         writer.bytes_written > 0 && writer.bytes_written.saturating_add(record_bytes) > max_bytes
     });
@@ -354,19 +388,16 @@ fn write_disk_record_with_limit(
             };
             encoded = reencoded;
             encoded.push(b'\n');
-            record_bytes = u64::try_from(encoded.len()).unwrap_or(u64::MAX);
         }
     }
 
     let Some(writer) = writers.get_mut(path) else {
         return;
     };
-    let result = writer.writer.write_all(&encoded);
-    if let Err(err) = result {
+    if let Err(err) = writer.write_record(&encoded) {
         tracing::warn!(?err, path = %path.display(), "disabling disk run log writer after write failure");
         writers.remove(path);
     } else {
-        writer.bytes_written = writer.bytes_written.saturating_add(record_bytes);
         metadata.observe(retained.op, retained.seq);
     }
 }
@@ -418,6 +449,40 @@ mod tests {
     use similar_asserts::assert_eq;
     use std::time::Instant;
 
+    struct PartialWriteFailure {
+        bytes: Vec<u8>,
+        fail_at: usize,
+    }
+
+    impl Write for PartialWriteFailure {
+        fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+            if self.bytes.len() >= self.fail_at {
+                return Err(io::Error::new(
+                    io::ErrorKind::StorageFull,
+                    "injected partial write failure",
+                ));
+            }
+            let written = data
+                .len()
+                .min(self.fail_at.saturating_sub(self.bytes.len()));
+            self.bytes
+                .extend_from_slice(data.get(..written).unwrap_or_default());
+            Ok(written)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl RecordFile for PartialWriteFailure {
+        fn truncate(&mut self, len: u64) -> io::Result<()> {
+            self.bytes
+                .truncate(usize::try_from(len).unwrap_or(usize::MAX));
+            Ok(())
+        }
+    }
+
     #[test]
     fn disk_flush_returns_when_worker_does_not_ack() {
         let (tx, _rx) = mpsc::channel();
@@ -452,6 +517,30 @@ mod tests {
         assert!(budget.try_reserve(1).is_none());
         drop(permit);
         assert!(budget.try_reserve(1).is_some());
+    }
+
+    #[test]
+    fn partial_record_write_rolls_back_to_the_previous_boundary() -> eyre::Result<()> {
+        let prefix = b"{\"seq\":1}\n".to_vec();
+        let record_offset = u64::try_from(prefix.len()).unwrap_or(u64::MAX);
+        let mut writer = DiskFileWriter {
+            writer: PartialWriteFailure {
+                fail_at: prefix.len() + 4,
+                bytes: prefix.clone(),
+            },
+            bytes_written: record_offset,
+        };
+
+        let result = writer.write_record(b"{\"seq\":2}\n");
+
+        assert!(result.is_err());
+        assert_eq!(writer.writer.bytes, prefix);
+        assert_eq!(writer.bytes_written, record_offset);
+
+        writer.writer.fail_at = usize::MAX;
+        writer.write_record(b"{\"seq\":3}\n")?;
+        assert_eq!(writer.writer.bytes, b"{\"seq\":1}\n{\"seq\":3}\n");
+        Ok(())
     }
 
     #[test]
