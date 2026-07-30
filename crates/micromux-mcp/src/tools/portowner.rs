@@ -6,6 +6,9 @@ pub(crate) struct PortOwner {
     pub(crate) command: String,
 }
 
+#[cfg(target_os = "macos")]
+const LSOF_PATH: &str = "/usr/sbin/lsof";
+
 /// Whether a `/proc/net/tcp{,6}` hex local address is loopback or unspecified (wildcard).
 ///
 /// The bind probe that triggers this lookup targets `127.0.0.1`, so only a loopback or
@@ -105,7 +108,7 @@ pub(crate) fn listening_owner(port: u16) -> Option<PortOwner> {
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
 
-    let mut child = Command::new("lsof")
+    let mut child = Command::new(LSOF_PATH)
         .args(["-nP", &format!("-iTCP:{port}"), "-sTCP:LISTEN", "-Fpc"])
         .stdin(Stdio::null())
         .stderr(Stdio::null())
@@ -187,5 +190,18 @@ mod tests {
         assert_eq!(owner.pid, std::process::id());
         assert!(!owner.command.is_empty());
         Ok(())
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod macos_tests {
+    use super::LSOF_PATH;
+    use similar_asserts::assert_eq;
+    use std::path::Path;
+
+    #[test]
+    fn lsof_uses_the_system_absolute_path() {
+        assert!(Path::new(LSOF_PATH).is_absolute());
+        assert_eq!(LSOF_PATH, "/usr/sbin/lsof");
     }
 }

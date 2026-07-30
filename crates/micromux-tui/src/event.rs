@@ -3,6 +3,8 @@ use futures::StreamExt;
 use ratatui::crossterm::event::Event as CrosstermEvent;
 use tokio::sync::mpsc;
 
+const INPUT_QUEUE_CAPACITY: usize = 1024;
+
 /// Representation of all possible input events.
 ///
 /// The TUI redraws on each of these and on every model [`micromux::SessionChange`], so there is no
@@ -38,16 +40,16 @@ impl std::fmt::Display for Input {
 #[derive(Debug)]
 pub struct InputHandler {
     /// Event sender channel.
-    _sender: mpsc::UnboundedSender<Input>,
+    _sender: mpsc::Sender<Input>,
     /// Event receiver channel.
-    receiver: mpsc::UnboundedReceiver<Input>,
+    receiver: mpsc::Receiver<Input>,
 }
 
 impl InputHandler {
     /// Constructs a new instance of [`InputHandler`] and spawns a task to handle terminal events.
     #[must_use]
     pub fn new() -> Self {
-        let (sender, receiver) = mpsc::unbounded_channel();
+        let (sender, receiver) = mpsc::channel(INPUT_QUEUE_CAPACITY);
         let actor = EventTask::new(sender.clone());
         tokio::spawn(async move { actor.run().await });
         Self {
@@ -73,12 +75,12 @@ impl InputHandler {
 /// Task that forwards terminal events until the receiver is dropped.
 struct EventTask {
     /// Event sender channel.
-    sender: mpsc::UnboundedSender<Input>,
+    sender: mpsc::Sender<Input>,
 }
 
 impl EventTask {
     /// Constructs a new instance of [`EventTask`].
-    fn new(sender: mpsc::UnboundedSender<Input>) -> Self {
+    fn new(sender: mpsc::Sender<Input>) -> Self {
         Self { sender }
     }
 
@@ -89,7 +91,11 @@ impl EventTask {
             tokio::select! {
               () = self.sender.closed() => break,
               event = reader.next() => match event {
-                Some(Ok(event)) => self.send(Input::Event(event)),
+                Some(Ok(event)) => {
+                    if !self.send(Input::Event(event)).await {
+                        break;
+                    }
+                }
                 Some(Err(_)) => {}
                 None => break,
               },
@@ -98,15 +104,47 @@ impl EventTask {
     }
 
     /// Sends an event to the receiver.
-    fn send(&self, event: Input) {
-        // Ignores the result because shutting down the app drops the receiver, which causes the send
-        // operation to fail. This is expected behavior and should not panic.
-        let _ = self.sender.send(event);
+    async fn send(&self, event: Input) -> bool {
+        self.sender.send(event).await.is_ok()
     }
 }
 
 impl Default for InputHandler {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use color_eyre::eyre;
+    use similar_asserts::assert_eq;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn bounded_event_queue_applies_backpressure() -> eyre::Result<()> {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let task = EventTask::new(sender);
+        assert!(task.send(Input::Event(CrosstermEvent::FocusGained)).await);
+
+        let mut blocked =
+            tokio::spawn(async move { task.send(Input::Event(CrosstermEvent::FocusLost)).await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut blocked)
+                .await
+                .is_err()
+        );
+
+        assert_eq!(
+            receiver.recv().await,
+            Some(Input::Event(CrosstermEvent::FocusGained))
+        );
+        assert!(blocked.await?);
+        assert_eq!(
+            receiver.recv().await,
+            Some(Input::Event(CrosstermEvent::FocusLost))
+        );
+        Ok(())
     }
 }

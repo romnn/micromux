@@ -60,9 +60,9 @@ pub use model::{
     trim_to_last_bytes,
 };
 pub use scheduler::{
-    Command, CommandRejection, DynamicServiceAck, DynamicServiceResult, OutputStream,
-    ReconcileAction, ReconcileActionKind, ReconcileReceipt, ReconcileResult, SchedulerStopped,
-    ServiceCommandAck, ServiceCommandResult, ServiceControl, ServiceID,
+    Command, CommandRejection, DynamicServiceAck, DynamicServiceResult, MAX_PTY_INPUT_BATCH_BYTES,
+    OutputStream, ReconcileAction, ReconcileActionKind, ReconcileReceipt, ReconcileResult,
+    SchedulerStopped, ServiceCommandAck, ServiceCommandResult, ServiceControl, ServiceID,
 };
 pub use service::{Error as ServiceError, RestartPolicy};
 pub use spec::{
@@ -364,11 +364,18 @@ impl Micromux {
 
         graph::ServiceGraph::new(&services)?;
 
+        let mut dynamic_policy = config_file.config.control.dynamic_services.clone();
+        for root in &mut dynamic_policy.allowed_working_roots {
+            if root.is_relative() {
+                *root = config_file.config_dir.join(&*root);
+            }
+        }
+
         Ok(Self {
             services,
             reload_config,
             config_dir: config_file.config_dir.clone(),
-            dynamic_policy: config_file.config.control.dynamic_services.clone(),
+            dynamic_policy,
             default_log_retention: config_file.config.log_retention,
         })
     }
@@ -448,6 +455,24 @@ mod tests {
         assert_eq!(snapshot.desired, Desired::Disabled);
         assert_eq!(snapshot.execution, Execution::Pending);
         assert_eq!(snapshot.run_generation, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn programmatic_dynamic_policy_defaults_resolve_from_the_config_directory() -> eyre::Result<()>
+    {
+        let directory = tempfile::tempdir()?;
+        let raw = "version: 1\nservices: {}\n";
+        let mut diagnostics = Vec::new();
+        let mut config = from_str(raw, directory.path(), 0usize, None, &mut diagnostics)?;
+        config.config.control.dynamic_services = DynamicServicesPolicy::default();
+
+        let mux = Micromux::new(&config)?;
+
+        assert_eq!(
+            mux.dynamic_policy.allowed_working_roots,
+            vec![directory.path().join(".")]
+        );
         Ok(())
     }
 

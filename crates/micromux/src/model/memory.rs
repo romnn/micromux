@@ -118,12 +118,16 @@ impl MemoryLogBuffer {
     }
 
     pub(super) fn lines_since(&self, after: u64) -> (Option<u64>, Vec<LogLine>) {
-        let first_retained_seq = self.entries.front().map(|line| line.seq);
+        let first_retained_seq = self.first_retained_seq();
         let start = self.entries.partition_point(|line| line.seq <= after);
         (
             first_retained_seq,
             self.entries.iter().skip(start).cloned().collect(),
         )
+    }
+
+    pub(super) fn first_retained_seq(&self) -> Option<u64> {
+        self.entries.front().map(|line| line.seq)
     }
 }
 

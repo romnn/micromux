@@ -26,7 +26,7 @@ use micromux_control::{
     Client, ControlEndpoint, ControlError, ErrorCode, Request, Response, SessionInfo, endpoint_for,
     runtime_dir_statuses, transport_supported, usable_runtime_dirs,
 };
-use regex::Regex;
+use regex::{Regex, RegexBuilder};
 use rmcp::{
     ErrorData, ServerHandler, ServiceExt,
     handler::server::{
@@ -83,6 +83,7 @@ const WAIT_POLL_FLOOR: Duration = Duration::from_secs(1);
 const WAIT_LOG_POLL: Duration = Duration::from_millis(250);
 const MAX_SESSION_STARTS_PER_WINDOW: usize = 8;
 const SESSION_START_WINDOW: Duration = Duration::from_mins(1);
+const GREP_REGEX_SIZE_LIMIT: usize = 256 * 1024;
 
 const INSTRUCTIONS: &str = "Discover and control running micromux sessions. When no `session` is \
 given, tools target the current project's session. Use `find_service` to locate a service across \
@@ -2854,9 +2855,13 @@ impl ServerHandler for McpServer {
 fn compile_grep(pattern: Option<&str>) -> Result<Option<Regex>, ErrorData> {
     pattern
         .map(|pattern| {
-            Regex::new(pattern).map_err(|err| {
-                ErrorData::invalid_params(format!("invalid grep regex: {err}"), None)
-            })
+            RegexBuilder::new(pattern)
+                .size_limit(GREP_REGEX_SIZE_LIMIT)
+                .dfa_size_limit(GREP_REGEX_SIZE_LIMIT)
+                .build()
+                .map_err(|err| {
+                    ErrorData::invalid_params(format!("invalid grep regex: {err}"), None)
+                })
         })
         .transpose()
 }
@@ -2988,8 +2993,8 @@ mod tests {
     use super::{
         DynamicMutationResult, ExitVerdict, McpServer, MutationResult, RestartAndWaitResult,
         SessionMutationResult, SessionRef, StartDynamicAndWaitResult, StopSessionResult,
-        WaitForExitResult, WaitForExitStatus, WaitResult, classify_exit, matching_service,
-        parse_since_text, session_has_service, session_selector,
+        WaitForExitResult, WaitForExitStatus, WaitResult, classify_exit, compile_grep,
+        matching_service, parse_since_text, session_has_service, session_selector,
     };
     use crate::tools::health::health_attempt_matches_snapshot;
     use crate::tools::logs::{
@@ -3027,6 +3032,14 @@ mod tests {
         shutdown: micromux::CancellationToken,
         runner: Option<tokio::task::JoinHandle<Result<(), micromux::Error>>>,
         server: Option<tokio::task::JoinHandle<Result<(), micromux_control::ControlError>>>,
+    }
+
+    #[test]
+    fn grep_regex_compilation_has_an_explicit_memory_bound() {
+        assert!(compile_grep(Some("error|warn")).is_ok());
+
+        let oversized = "a?".repeat(100_000);
+        assert!(compile_grep(Some(&oversized)).is_err());
     }
 
     #[cfg(unix)]

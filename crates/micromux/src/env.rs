@@ -47,6 +47,14 @@ pub enum Error {
         /// Path of the oversized file.
         path: PathBuf,
     },
+    /// A configured path references environment variables that are not set.
+    #[error("path `{path}` references unset environment variables: {variables:?}")]
+    UnsetPathVariables {
+        /// Unexpanded configured path.
+        path: String,
+        /// Missing variable names, sorted and deduplicated.
+        variables: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -277,24 +285,23 @@ pub fn expand_env_values_tracking(
     out
 }
 
-pub fn resolve_path(config_dir: &Path, raw: &str) -> PathBuf {
+pub fn resolve_path(config_dir: &Path, raw: &str) -> Result<PathBuf, Error> {
     let base: HashMap<String, String> = std::env::vars().collect();
     let mut missing = Vec::new();
     let expanded = interpolate_tracking(&shellexpand::tilde(raw), &base, &mut missing);
     if !missing.is_empty() {
         missing.sort_unstable();
         missing.dedup();
-        tracing::warn!(
-            path = raw,
-            missing = ?missing,
-            "path interpolation referenced unset variables"
-        );
+        return Err(Error::UnsetPathVariables {
+            path: raw.to_string(),
+            variables: missing,
+        });
     }
     let path = PathBuf::from(expanded);
     if path.is_absolute() {
-        path
+        Ok(path)
     } else {
-        config_dir.join(path)
+        Ok(config_dir.join(path))
     }
 }
 
@@ -497,13 +504,20 @@ mod tests {
     }
 
     #[test]
-    fn path_interpolation_matches_unset_value_interpolation() {
+    fn path_interpolation_rejects_unset_variables() {
         let variable = format!("MICROMUX_UNSET_PATH_TEST_{}", std::process::id());
         let raw = format!("${{{variable}}}/service");
 
-        let resolved = resolve_path(Path::new("/project"), &raw);
+        let error = resolve_path(Path::new("/project"), &raw)
+            .expect_err("unset variables must not widen a configured path");
 
-        assert_eq!(resolved, Path::new("/service"));
+        assert!(matches!(
+            error,
+            Error::UnsetPathVariables {
+                path,
+                variables,
+            } if path == raw && variables == vec![variable]
+        ));
     }
 
     #[test]

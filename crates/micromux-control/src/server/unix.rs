@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 
 use futures::{SinkExt, StreamExt};
 use micromux::{
@@ -11,6 +11,9 @@ use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
+
+#[path = "unix/log_reads.rs"]
+mod log_reads;
 
 use super::ControlServer;
 use crate::endpoint::{CanonicalConfigPath, ControlEndpoint, project_lock_path};
@@ -39,12 +42,6 @@ const LAG_REPLAY_SERVICE_KINDS: [ChangeKind; 4] = [
 const RESPONSE_MAX_BYTES: usize = 512 * 1024;
 /// Maximum number of clients served concurrently by one session.
 const MAX_CONNECTIONS: usize = 64;
-/// Maximum number of filesystem threads that may remain blocked after their clients time out.
-const MAX_BLOCKING_LOG_READS: usize = 4;
-
-static BLOCKING_LOG_READS: LazyLock<Arc<Semaphore>> =
-    LazyLock::new(|| Arc::new(Semaphore::new(MAX_BLOCKING_LOG_READS)));
-
 /// A bound control endpoint plus the lifetime ownership lock. Dropping it unlinks the socket while
 /// the lock is still held, so a successor (which cannot acquire the lock until this process exits)
 /// never has its fresh socket removed.
@@ -76,13 +73,17 @@ pub(super) fn bind_project(
     endpoint: &ControlEndpoint,
     config_path: &CanonicalConfigPath,
 ) -> Result<Option<EndpointGuard>, ControlError> {
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+
     let lock_path = project_lock_path(config_path)?;
     let project_lock = std::fs::OpenOptions::new()
         .create(true)
         .read(true)
         .write(true)
         .truncate(false)
-        .open(lock_path)?;
+        .mode(0o600)
+        .open(&lock_path)?;
+    project_lock.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     match fs2::FileExt::try_lock_exclusive(&project_lock) {
         Ok(()) => {}
         Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
@@ -105,7 +106,7 @@ fn bind_unix(
     socket_path: &Path,
     project_lock: Option<std::fs::File>,
 ) -> Result<Option<EndpointGuard>, ControlError> {
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 
     let lock_path = socket_path.with_extension("lock");
     let lock_file = std::fs::OpenOptions::new()
@@ -113,7 +114,9 @@ fn bind_unix(
         .read(true)
         .write(true)
         .truncate(false)
+        .mode(0o600)
         .open(&lock_path)?;
+    lock_file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
 
     // The lifetime-held lock is the authoritative ownership signal — more robust than connect-probing
     // a possibly-wedged listener. "lock acquirable" ⇔ "no live owner".
@@ -312,60 +315,84 @@ async fn stream_changes<S>(server: &ControlServer, conn: Framing<S>, shutdown: C
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
+    stream_changes_with_heartbeat(server, conn, shutdown, IDLE_TIMEOUT).await;
+}
+
+async fn stream_changes_with_heartbeat<S>(
+    server: &ControlServer,
+    conn: Framing<S>,
+    shutdown: CancellationToken,
+    heartbeat_interval: std::time::Duration,
+) where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
     use tokio::sync::broadcast::error::RecvError;
 
     let (mut sink, mut stream) = conn.split();
     let mut changes = server.reader.subscribe();
-    let idle = tokio::time::sleep(IDLE_TIMEOUT);
-    tokio::pin!(idle);
+    let heartbeat = tokio::time::sleep(heartbeat_interval);
+    tokio::pin!(heartbeat);
     'stream: loop {
         tokio::select! {
             () = shutdown.cancelled() => break,
-            () = &mut idle => break,
+            () = &mut heartbeat => {
+                let change = SessionChange {
+                    service_id: SessionChange::SESSION_WIDE.to_string(),
+                    kind: ChangeKind::Heartbeat,
+                };
+                if !send_stream_change(&mut sink, change, &shutdown).await {
+                    break;
+                }
+                heartbeat.as_mut().reset(tokio::time::Instant::now() + heartbeat_interval);
+            }
             incoming = stream.next() => {
-                // A subscription is one-directional after its initial request. EOF, a transport
-                // error, or another request all end the stream.
-                let _ = incoming;
-                break;
+                match incoming {
+                    None | Some(Err(_)) => break,
+                    // Subscription clients have no request/response exchange after subscribing.
+                    // Ignore complete frames so a forward-compatible keepalive cannot tear down
+                    // an otherwise healthy stream.
+                    Some(Ok(_)) => {}
+                }
             }
             change = changes.recv() => {
                 match change {
                     Ok(change) => {
-                        let Ok(line) = serde_json::to_string(&Response::Change(change)) else {
-                            continue;
-                        };
-                        let sent = tokio::select! {
-                            () = shutdown.cancelled() => false,
-                            result = tokio::time::timeout(REQUEST_TIMEOUT, sink.send(line)) => {
-                                matches!(result, Ok(Ok(())))
-                            }
-                        };
-                        if !sent {
+                        if !send_stream_change(&mut sink, change, &shutdown).await {
                             break;
                         }
-                        idle.as_mut().reset(tokio::time::Instant::now() + IDLE_TIMEOUT);
+                        heartbeat.as_mut().reset(tokio::time::Instant::now() + heartbeat_interval);
                     }
                     Err(RecvError::Lagged(_)) => {
                         let snapshots = server.reader.services();
                         for change in lag_replay_changes(&snapshots) {
-                            let Ok(line) = serde_json::to_string(&Response::Change(change)) else {
-                                continue;
-                            };
-                            let sent = tokio::select! {
-                                () = shutdown.cancelled() => false,
-                                result = tokio::time::timeout(REQUEST_TIMEOUT, sink.send(line)) => {
-                                    matches!(result, Ok(Ok(())))
-                                }
-                            };
-                            if !sent {
+                            if !send_stream_change(&mut sink, change, &shutdown).await {
                                 break 'stream;
                             }
-                            idle.as_mut().reset(tokio::time::Instant::now() + IDLE_TIMEOUT);
                         }
+                        heartbeat.as_mut().reset(tokio::time::Instant::now() + heartbeat_interval);
                     }
                     Err(RecvError::Closed) => break,
                 }
             }
+        }
+    }
+}
+
+async fn send_stream_change<S>(
+    sink: &mut futures::stream::SplitSink<Framing<S>, String>,
+    change: SessionChange,
+    shutdown: &CancellationToken,
+) -> bool
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let Ok(line) = serde_json::to_string(&Response::Change(change)) else {
+        return false;
+    };
+    tokio::select! {
+        () = shutdown.cancelled() => false,
+        result = tokio::time::timeout(REQUEST_TIMEOUT, sink.send(line)) => {
+            matches!(result, Ok(Ok(())))
         }
     }
 }
@@ -409,25 +436,28 @@ async fn dispatch(server: &ControlServer, request: Request) -> Response {
             run_generation,
             tail,
         } => {
-            let reader = server.reader.clone();
-            run_blocking_log_read(move || get_logs(&reader, &service, run_generation, tail)).await
+            if run_generation.is_none() {
+                get_logs(&server.reader, &service, None, tail)
+            } else {
+                let reader = server.reader.clone();
+                log_reads::run(move || get_logs(&reader, &service, run_generation, tail)).await
+            }
         }
         Request::FollowLogs {
             service,
             run_generation,
             after,
         } => {
-            let reader = server.reader.clone();
-            run_blocking_log_read(move || follow_logs(&reader, &service, run_generation, after))
-                .await
+            if run_generation.is_none() {
+                follow_logs(&server.reader, &service, None, after)
+            } else {
+                let reader = server.reader.clone();
+                log_reads::run(move || follow_logs(&reader, &service, run_generation, after)).await
+            }
         }
         Request::ListLogRuns { service } => {
-            if server.reader.service(&service).is_none() {
-                return unknown_service(&service);
-            }
-            Response::LogRuns {
-                runs: server.reader.log_runs(&service),
-            }
+            let reader = server.reader.clone();
+            log_reads::run(move || list_log_runs(&reader, &service)).await
         }
         Request::GetHealth { service } => {
             if server.reader.service(&service).is_none() {
@@ -486,32 +516,6 @@ async fn dispatch(server: &ControlServer, request: Request) -> Response {
     }
 }
 
-async fn run_blocking_log_read(read: impl FnOnce() -> Response + Send + 'static) -> Response {
-    let Ok(permit) = Arc::clone(&BLOCKING_LOG_READS).acquire_owned().await else {
-        return Response::error(ErrorCode::Internal, "the log reader is unavailable");
-    };
-    let (response_tx, response_rx) = tokio::sync::oneshot::channel();
-    // Tokio waits for spawn_blocking tasks during runtime shutdown. A filesystem call cannot be
-    // cancelled, so use a bounded detached thread: a stalled mount can consume at most these slots,
-    // but cannot keep the supervisor process alive after shutdown.
-    let spawned = std::thread::Builder::new()
-        .name("micromux-log-read".to_string())
-        .spawn(move || {
-            let _permit = permit;
-            let _ = response_tx.send(read());
-        });
-    if let Err(err) = spawned {
-        return Response::error(
-            ErrorCode::Internal,
-            format!("failed to start log read thread: {err}"),
-        );
-    }
-    match response_rx.await {
-        Ok(response) => response,
-        Err(_) => Response::error(ErrorCode::Internal, "the log read thread stopped"),
-    }
-}
-
 async fn reconcile(server: &ControlServer, dry_run: bool) -> Response {
     acknowledge_reconcile(server.control.reconcile_config(dry_run).await)
 }
@@ -529,6 +533,15 @@ fn get_events(
     let (events, truncated) =
         reader.events(service, after, Some(requested_tail.min(MAX_EVENT_TAIL)));
     Response::Events { events, truncated }
+}
+
+fn list_log_runs(reader: &SessionModelReader, service: &str) -> Response {
+    if reader.service(service).is_none() {
+        return unknown_service(service);
+    }
+    Response::LogRuns {
+        runs: reader.log_runs(service),
+    }
 }
 
 fn get_logs(
@@ -568,7 +581,7 @@ fn get_logs(
     }
     let first_retained_seq = run_generation
         .is_none()
-        .then(|| reader.logs_since(service, 0).0)
+        .then(|| reader.first_retained_log_seq(service))
         .flatten();
     truncated |= bound_tail_response_lines(&mut lines, first_retained_seq);
     logs_response(lines, truncated, first_retained_seq)
@@ -974,14 +987,15 @@ mod tests {
     use similar_asserts::assert_eq;
 
     use crate::{
-        CanonicalConfigPath, ControlEndpoint, ErrorCode, PROTOCOL_VERSION, Response, ServiceBrief,
-        SessionInfo,
+        CanonicalConfigPath, ControlEndpoint, ControlServer, ErrorCode, PROTOCOL_VERSION, Request,
+        Response, ServiceBrief, SessionIdentity, SessionInfo,
     };
 
     use super::{
         MAX_LOG_TAIL, RESPONSE_MAX_BYTES, bind_project, bound_follow_response_lines,
         bound_follow_response_lines_page, bound_health_history, bound_tail_response_lines,
-        encoded_len, health_attempt_bytes, lag_replay_changes, logs_fit, response_within_frame,
+        encoded_len, health_attempt_bytes, lag_replay_changes, logs_fit, project_lock_path,
+        response_within_frame, stream_changes_with_heartbeat,
     };
 
     fn line(seq: u64, len: usize) -> LogLine {
@@ -1186,6 +1200,8 @@ mod tests {
 
     #[tokio::test]
     async fn project_lock_blocks_a_second_endpoint_for_the_same_config() -> eyre::Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+
         let directory = tempfile::tempdir()?;
         let config = directory.path().join("micromux.yaml");
         std::fs::write(&config, "version: 1\nservices: {}\n")?;
@@ -1194,9 +1210,81 @@ mod tests {
         let second = ControlEndpoint::Unix(directory.path().join("second.sock"));
 
         let first_guard = bind_project(&first, &config)?.ok_or_else(|| eyre::eyre!("lock busy"))?;
+        let ControlEndpoint::Unix(first_path) = &first else {
+            eyre::bail!("test endpoint was not Unix");
+        };
+        for lock_path in [
+            first_path.with_extension("lock"),
+            project_lock_path(&config)?,
+        ] {
+            assert_eq!(
+                std::fs::metadata(lock_path)?.permissions().mode() & 0o777,
+                0o600
+            );
+        }
         assert!(bind_project(&second, &config)?.is_none());
         drop(first_guard);
         assert!(bind_project(&second, &config)?.is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn subscription_ignores_client_frames_and_stays_open_until_shutdown() -> eyre::Result<()>
+    {
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let directory = tempfile::tempdir()?;
+        let yaml = "version: 1\nservices: {}\n";
+        let config_path = directory.path().join("micromux.yaml");
+        std::fs::write(&config_path, yaml)?;
+        let config_path = CanonicalConfigPath::new(config_path)?;
+        let mut diagnostics = Vec::new();
+        let config = micromux::from_str(yaml, directory.path(), 0usize, None, &mut diagnostics)?;
+        let mux = Arc::new(micromux::Micromux::new(&config)?);
+        let (_runner, handles) = mux.start(micromux::CancellationToken::new());
+        let control = handles.service_control();
+        let server = Arc::new(ControlServer::new(
+            handles.reader,
+            control,
+            SessionIdentity::new("test".to_string(), directory.path(), &config_path),
+            handles.dynamic_services,
+        ));
+        let (server_io, client_io) = tokio::io::duplex(4096);
+        let shutdown = micromux::CancellationToken::new();
+        let task = tokio::spawn({
+            let server = Arc::clone(&server);
+            let shutdown = shutdown.clone();
+            async move {
+                stream_changes_with_heartbeat(
+                    &server,
+                    crate::framed(server_io),
+                    shutdown,
+                    Duration::from_millis(10),
+                )
+                .await;
+            }
+        });
+        let mut client = crate::framed(client_io);
+
+        crate::write_message(&mut client, &Request::Describe).await?;
+        let response = tokio::time::timeout(
+            Duration::from_secs(1),
+            crate::read_message::<_, Response>(&mut client),
+        )
+        .await??
+        .ok_or_else(|| eyre::eyre!("subscription closed before its heartbeat"))?;
+        assert!(matches!(
+            response,
+            Response::Change(SessionChange {
+                service_id,
+                kind: ChangeKind::Heartbeat,
+            }) if service_id == SessionChange::SESSION_WIDE
+        ));
+        assert!(!task.is_finished());
+
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(1), task).await??;
         Ok(())
     }
 

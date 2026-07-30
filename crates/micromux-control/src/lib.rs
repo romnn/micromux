@@ -64,7 +64,9 @@ pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// a slow probe should not stall selection. Timed-out endpoints are reported, never pruned.
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// How long a server connection may sit idle (no request) before it is closed.
+/// How long a request/response connection may sit idle before it is closed.
+///
+/// Subscriptions use this interval for heartbeat notifications instead.
 pub const IDLE_TIMEOUT: Duration = Duration::from_mins(5);
 
 /// Errors produced by the control plane.

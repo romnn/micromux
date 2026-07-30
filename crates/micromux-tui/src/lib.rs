@@ -24,7 +24,7 @@ pub use remote::RemoteSource;
 pub use source::{LocalSource, SessionSource};
 
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
-const PENDING_PTY_INPUT_MAX_BYTES: usize = 64 * 1024;
+const PENDING_PTY_INPUT_MAX_BYTES: usize = 1024 * 1024;
 const PENDING_PTY_INPUT_RETRY: Duration = Duration::from_millis(5);
 
 /// Errors from running or rendering the terminal interface.
@@ -209,6 +209,36 @@ impl App {
         }
     }
 
+    fn enqueue_pty_paste(&mut self, service_id: &str, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        let Some(input) = self.input.clone() else {
+            return;
+        };
+        let chunk_count = bytes.len().div_ceil(micromux::MAX_PTY_INPUT_BATCH_BYTES);
+        if self.pending_pty_input.is_empty() {
+            match input.try_reserve_many(chunk_count) {
+                Ok(permits) => {
+                    for (permit, chunk) in permits.zip(
+                        bytes
+                            .chunks(micromux::MAX_PTY_INPUT_BATCH_BYTES)
+                            .map(<[u8]>::to_vec),
+                    ) {
+                        permit.send(Command::SendInput(service_id.to_string(), chunk));
+                    }
+                    return;
+                }
+                Err(mpsc::error::TrySendError::Closed(())) => {
+                    tracing::warn!("PTY input channel closed; discarding pasted terminal input");
+                    return;
+                }
+                Err(mpsc::error::TrySendError::Full(())) => {}
+            }
+        }
+        self.push_pending_pty_paste(service_id, bytes);
+    }
+
     fn push_pending_pty_input(&mut self, service_id: String, bytes: Vec<u8>) {
         if self.pending_pty_input_bytes.saturating_add(bytes.len()) > PENDING_PTY_INPUT_MAX_BYTES {
             tracing::warn!(
@@ -218,8 +248,27 @@ impl App {
             return;
         }
         self.pending_pty_input_bytes = self.pending_pty_input_bytes.saturating_add(bytes.len());
+        self.push_pending_pty_batch(service_id, bytes);
+    }
+
+    fn push_pending_pty_paste(&mut self, service_id: &str, bytes: &[u8]) {
+        if self.pending_pty_input_bytes.saturating_add(bytes.len()) > PENDING_PTY_INPUT_MAX_BYTES {
+            tracing::warn!(
+                queue_limit_bytes = PENDING_PTY_INPUT_MAX_BYTES,
+                "PTY input backlog cannot hold the complete paste; discarding it atomically"
+            );
+            return;
+        }
+        self.pending_pty_input_bytes = self.pending_pty_input_bytes.saturating_add(bytes.len());
+        for chunk in bytes.chunks(micromux::MAX_PTY_INPUT_BATCH_BYTES) {
+            self.push_pending_pty_batch(service_id.to_string(), chunk.to_vec());
+        }
+    }
+
+    fn push_pending_pty_batch(&mut self, service_id: String, bytes: Vec<u8>) {
         if let Some((queued_service, queued)) = self.pending_pty_input.back_mut()
             && queued_service == &service_id
+            && queued.len().saturating_add(bytes.len()) <= micromux::MAX_PTY_INPUT_BATCH_BYTES
         {
             queued.extend(bytes);
         } else {
@@ -369,7 +418,7 @@ impl App {
                 }
             }
             ChangeKind::Roster | ChangeKind::Unknown => return true,
-            ChangeKind::Events => {}
+            ChangeKind::Events | ChangeKind::Heartbeat => {}
         }
         false
     }
@@ -438,7 +487,7 @@ impl App {
             crossterm::event::Event::Paste(ref text) if self.pty_input_mode => {
                 if let Some(service) = self.state.current_service() {
                     let service_id = service.snapshot.id.clone();
-                    self.enqueue_pty_input(service_id, text.as_bytes().to_vec());
+                    self.enqueue_pty_paste(&service_id, text.as_bytes());
                 }
             }
             _ => {}
@@ -446,16 +495,24 @@ impl App {
     }
 
     fn handle_key_press(&mut self, key: crossterm::event::KeyEvent) {
-        use crossterm::event::KeyCode;
+        use crossterm::event::{KeyCode, KeyModifiers};
 
         if self.pty_input_mode {
             self.handle_key_press_pty_input_mode(key);
             return;
         }
 
+        if key.code == KeyCode::Char('c') && key.modifiers == KeyModifiers::CONTROL {
+            self.exit();
+            return;
+        }
+        if key.modifiers != KeyModifiers::NONE && key.modifiers != KeyModifiers::SHIFT {
+            return;
+        }
+
         match key.code {
             // Quit
-            KeyCode::Char('q') => self.exit(),
+            KeyCode::Char('q') if key.modifiers == KeyModifiers::NONE => self.exit(),
 
             // Toggle focus
             KeyCode::Tab => self.toggle_focus(),
@@ -834,6 +891,95 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn command_mode_quit_requires_plain_q_or_ctrl_c() -> eyre::Result<()> {
+        let mut diagnostics = Vec::new();
+        let parsed = micromux::from_str(
+            "version: 1\nservices: {}\n",
+            Path::new("."),
+            0usize,
+            None,
+            &mut diagnostics,
+        )?;
+        let mux = std::sync::Arc::new(micromux::Micromux::new(&parsed)?);
+        let shutdown = micromux::CancellationToken::new();
+        let (_runner, handles) = mux.start(shutdown.clone());
+        let mut app = App::new(
+            SessionSource::Local(LocalSource::new(handles.reader, handles.commands.clone())),
+            Some(handles.commands),
+            shutdown.clone(),
+            true,
+        );
+        let key = |code, modifiers| KeyEvent {
+            code,
+            modifiers,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        };
+
+        app.handle_key_press(key(KeyCode::Char('q'), KeyModifiers::ALT));
+        assert!(app.running);
+        assert!(!shutdown.is_cancelled());
+
+        app.handle_key_press(key(KeyCode::Char('H'), KeyModifiers::SHIFT));
+        assert!(app.show_healthcheck_pane);
+
+        app.handle_key_press(key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(!app.running);
+        assert!(shutdown.is_cancelled());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn healthcheck_text_is_parsed_once_until_the_model_marks_it_dirty() -> eyre::Result<()> {
+        let yaml = indoc! {r#"
+            version: 1
+            services:
+              svc:
+                command: ["true"]
+                healthcheck:
+                  test: ["true"]
+        "#};
+        let mut diagnostics = Vec::new();
+        let parsed = micromux::from_str(yaml, Path::new("."), 0usize, None, &mut diagnostics)?;
+        let mux = std::sync::Arc::new(micromux::Micromux::new(&parsed)?);
+        let (_runner, handles) = mux.start(micromux::CancellationToken::new());
+        let mut app = App::new(
+            SessionSource::Local(LocalSource::new(handles.reader, handles.commands.clone())),
+            Some(handles.commands),
+            micromux::CancellationToken::new(),
+            true,
+        );
+        app.show_healthcheck_pane = true;
+        let area = ratatui::layout::Rect::new(0, 0, 120, 30);
+        let mut buffer = ratatui::buffer::Buffer::empty(area);
+
+        (&mut app).render(area, &mut buffer);
+        let cached_pointer = app
+            .state
+            .current_service()
+            .and_then(|service| service.healthcheck_cached_text.lines.first())
+            .and_then(|line| line.spans.first())
+            .map(|span| span.content.as_ptr())
+            .ok_or_else(|| eyre::eyre!("healthcheck cache was empty"))?;
+        (&mut app).render(area, &mut buffer);
+        let reused_pointer = app
+            .state
+            .current_service()
+            .and_then(|service| service.healthcheck_cached_text.lines.first())
+            .and_then(|line| line.spans.first())
+            .map(|span| span.content.as_ptr())
+            .ok_or_else(|| eyre::eyre!("healthcheck cache was empty"))?;
+
+        assert_eq!(reused_pointer, cached_pointer);
+        assert!(
+            app.state
+                .current_service()
+                .is_some_and(|service| !service.healthcheck_dirty)
+        );
+        Ok(())
+    }
+
     #[test]
     fn special_keys_encode_as_expected() {
         assert_eq!(
@@ -925,7 +1071,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bracketed_paste_is_inert_in_command_mode_and_atomic_in_input_mode() -> eyre::Result<()>
+    async fn bracketed_paste_is_inert_in_command_mode_and_chunked_in_input_mode() -> eyre::Result<()>
     {
         let yaml = "version: 1\nservices:\n  svc:\n    command: [\"true\"]\n";
         let mut diagnostics: Vec<Diagnostic<usize>> = Vec::new();
@@ -949,14 +1095,60 @@ mod tests {
         ));
 
         app.pty_input_mode = true;
-        app.handle_crossterm_event(&crossterm::event::Event::Paste("echo pasted\n".to_string()));
-        match commands_rx.try_recv()? {
-            Command::SendInput(service, bytes) => {
-                assert_eq!(service, "svc");
-                assert_eq!(bytes, b"echo pasted\n");
+        let paste = "x".repeat(micromux::MAX_PTY_INPUT_BATCH_BYTES + 17);
+        app.handle_crossterm_event(&crossterm::event::Event::Paste(paste.clone()));
+        let mut delivered = Vec::new();
+        for expected_len in [micromux::MAX_PTY_INPUT_BATCH_BYTES, 17] {
+            match commands_rx.try_recv()? {
+                Command::SendInput(service, bytes) => {
+                    assert_eq!(service, "svc");
+                    assert_eq!(bytes.len(), expected_len);
+                    delivered.extend(bytes);
+                }
+                other => eyre::bail!("expected a pasted PTY input batch, got {other:?}"),
             }
-            other => eyre::bail!("expected one pasted PTY input batch, got {other:?}"),
         }
+        assert_eq!(delivered, paste.as_bytes());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bracketed_paste_backlogs_every_chunk_when_the_command_channel_is_full()
+    -> eyre::Result<()> {
+        let yaml = "version: 1\nservices:\n  svc:\n    command: [\"true\"]\n";
+        let mut diagnostics: Vec<Diagnostic<usize>> = Vec::new();
+        let parsed = micromux::from_str(yaml, Path::new("."), 0, None, &mut diagnostics)
+            .map_err(|err| eyre::eyre!(err.to_string()))?;
+        let mux = std::sync::Arc::new(micromux::Micromux::new(&parsed)?);
+        let (_runner, handles) = mux.start(micromux::CancellationToken::new());
+        let (commands_tx, mut commands_rx) = mpsc::channel(1);
+        commands_tx.try_send(Command::ResizeAll { cols: 1, rows: 1 })?;
+        let mut app = App::new(
+            SessionSource::Local(LocalSource::new(handles.reader, commands_tx.clone())),
+            Some(commands_tx),
+            micromux::CancellationToken::new(),
+            true,
+        );
+        let paste = vec![b'x'; micromux::MAX_PTY_INPUT_BATCH_BYTES + 17];
+
+        app.enqueue_pty_paste("svc", &paste);
+
+        assert_eq!(app.pending_pty_input_bytes, paste.len());
+        assert_eq!(app.pending_pty_input.len(), 2);
+        let _ = commands_rx.try_recv()?;
+        let mut delivered = Vec::new();
+        while !app.pending_pty_input.is_empty() {
+            app.flush_pending_pty_input();
+            match commands_rx.try_recv()? {
+                Command::SendInput(service, bytes) => {
+                    assert_eq!(service, "svc");
+                    delivered.extend(bytes);
+                }
+                other => eyre::bail!("expected a pasted PTY input batch, got {other:?}"),
+            }
+        }
+        assert_eq!(delivered, paste);
+        assert_eq!(app.pending_pty_input_bytes, 0);
         Ok(())
     }
 

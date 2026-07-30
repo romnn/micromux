@@ -564,7 +564,12 @@ fn parse_dynamic_roots(
     roots
         .into_iter()
         .map(|(root, span)| {
-            let path = crate::env::resolve_path(config_dir, &root);
+            let path = crate::env::resolve_path(config_dir, &root).map_err(|err| {
+                ConfigError::InvalidValue {
+                    message: err.to_string(),
+                    span: span.into(),
+                }
+            })?;
             // With dynamic services disabled the roots are never consulted, so a root that no
             // longer exists on disk must not fail an otherwise valid config.
             if !enabled {
@@ -1109,27 +1114,27 @@ fn parse_services<F: Copy>(
                     expected: vec![Kind::Mapping],
                     span: value.span().into(),
                 })?;
-
-            let services = services
-                .iter()
-                .map(|(name, service)| {
-                    let name = parse::<String>(name)?;
-                    if !crate::spec::service_id_is_valid(&name) {
-                        return Err(ConfigError::InvalidValue {
-                            message: format!(
+            let mut parsed = IndexMap::new();
+            for (name, service) in services {
+                let name = parse::<String>(name)?;
+                if !crate::spec::service_id_is_valid(&name) {
+                    diagnostics.push(
+                        Diagnostic::warning_or_error(strict)
+                            .with_message(format!(
                                 "service id `{name}` must match [A-Za-z0-9._-]{{1,64}}"
-                            ),
-                            span: name.span.into(),
-                        });
-                    }
-                    let service =
-                        parse_service(service, &name, defaults, file_id, strict, diagnostics)?;
-                    Ok::<_, ConfigError>((name, service))
-                })
-                .collect::<Result<Vec<(Spanned<String>, Service)>, _>>()?
-                .into_iter()
-                .collect::<IndexMap<Spanned<String>, Service>>();
-            Ok(services)
+                            ))
+                            .with_labels(vec![
+                                Label::primary(file_id, name.span)
+                                    .with_message("invalid service id"),
+                            ]),
+                    );
+                    continue;
+                }
+                let service =
+                    parse_service(service, &name, defaults, file_id, strict, diagnostics)?;
+                parsed.insert(name, service);
+            }
+            Ok(parsed)
         }
     }
 }
@@ -1884,21 +1889,75 @@ mod tests {
     }
 
     #[test]
-    fn configured_service_ids_use_the_control_plane_name_contract() {
+    fn configured_service_ids_use_collected_strict_aware_diagnostics() -> eyre::Result<()> {
         let yaml = indoc! {r#"
             version: 1
             services:
               "bad/name":
                 command: ["true"]
+              "also bad":
+                command: ["true"]
+              valid:
+                command: ["true"]
         "#};
         let mut diagnostics = Vec::new();
 
-        let result = config::from_str(yaml, Path::new("."), 0usize, None, &mut diagnostics);
+        let parsed = config::from_str(yaml, Path::new("."), 0usize, None, &mut diagnostics)?;
 
-        assert!(
-            result
-                .is_err_and(|err| { err.to_string().contains("must match [A-Za-z0-9._-]{1,64}") })
+        assert_eq!(
+            parsed
+                .config
+                .services
+                .keys()
+                .map(|name| name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["valid"]
         );
+        let invalid = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.message.contains("must match"))
+            .collect::<Vec<_>>();
+        assert_eq!(invalid.len(), 2);
+        assert!(invalid.iter().all(|diagnostic| {
+            diagnostic.severity == codespan_reporting::diagnostic::Severity::Warning
+        }));
+
+        let mut strict_diagnostics = Vec::new();
+        let _ = config::from_str(
+            yaml,
+            Path::new("."),
+            0usize,
+            Some(true),
+            &mut strict_diagnostics,
+        )?;
+        assert_eq!(
+            strict_diagnostics
+                .iter()
+                .filter(|diagnostic| {
+                    diagnostic.message.contains("must match")
+                        && diagnostic.severity == codespan_reporting::diagnostic::Severity::Error
+                })
+                .count(),
+            2
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn dynamic_working_roots_reject_unset_variables() {
+        let variable = format!("MICROMUX_UNSET_DYNAMIC_ROOT_{}", std::process::id());
+        let yaml = format!(
+            "version: 1\ncontrol:\n  dynamic_services:\n    enabled: true\n    \
+             allowed_working_roots: [\"${{{variable}}}/sandbox\"]\nservices: {{}}\n"
+        );
+        let mut diagnostics = Vec::new();
+
+        let result = config::from_str(&yaml, Path::new("/project"), 0usize, None, &mut diagnostics);
+
+        assert!(result.is_err_and(|err| {
+            err.to_string().contains("unset environment variables")
+                && err.to_string().contains(&variable)
+        }));
     }
 
     #[test]

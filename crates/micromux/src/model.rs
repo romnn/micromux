@@ -570,6 +570,8 @@ pub enum ChangeKind {
     Roster,
     /// Lifecycle timeline history changed.
     Events,
+    /// Subscription keepalive; no model content changed.
+    Heartbeat,
     /// A newer peer sent a change kind this binary does not know yet.
     #[serde(other)]
     Unknown,
@@ -579,8 +581,7 @@ pub enum ChangeKind {
 /// be the carrier of content — subscribers re-query the model.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SessionChange {
-    /// The service that changed, or [`SessionChange::SESSION_WIDE`] for a synthesized session-wide
-    /// roster invalidation.
+    /// The service that changed, or [`SessionChange::SESSION_WIDE`] for a session-wide notification.
     pub service_id: ServiceID,
     /// What changed.
     pub kind: ChangeKind,
@@ -589,9 +590,9 @@ pub struct SessionChange {
 impl SessionChange {
     /// `service_id` marker for a change not scoped to one service.
     ///
-    /// Only synthesized notifications carry it (the control server's replay after broadcast loss);
-    /// the model itself always publishes real service ids. Consumers waiting on a specific service
-    /// should treat a session-wide change as touching that service too.
+    /// Only control-server notifications carry it; the model itself always publishes real service
+    /// ids. Consumers waiting on a specific service should treat session-wide content changes as
+    /// touching that service too.
     pub const SESSION_WIDE: &'static str = "*";
 }
 
@@ -923,6 +924,10 @@ impl ServiceEntry {
         self.visible.lines_since(after)
     }
 
+    fn first_visible_log_seq(&self) -> Option<u64> {
+        self.visible.first_retained_seq()
+    }
+
     fn reconfigure_log_retention(&mut self, log_retention: LogRetention) {
         let log_retention = LogRetention {
             disk: DiskLogRetention {
@@ -1099,6 +1104,16 @@ impl SessionModelReader {
             .map_or((None, Vec::new()), |entry| {
                 entry.read().visible_lines_since(after)
             })
+    }
+
+    /// The first sequence retained by a service's visible log stream.
+    ///
+    /// This reads only the buffer marker and does not clone retained log lines.
+    #[must_use]
+    pub fn first_retained_log_seq(&self, id: &str) -> Option<u64> {
+        self.inner
+            .service_entry(id)
+            .and_then(|entry| entry.read().first_visible_log_seq())
     }
 
     /// Summaries of retained log runs for a service, oldest retained run first.
@@ -1883,6 +1898,7 @@ mod tests {
 
         let (first, lines) = reader.logs_since(&id, 0);
         assert_eq!(first, Some(1));
+        assert_eq!(reader.first_retained_log_seq(&id), Some(1));
         assert_eq!(
             lines
                 .iter()
@@ -1937,6 +1953,7 @@ mod tests {
         );
         let (first, lines) = reader.logs_since(&id, 0);
         assert_eq!(first, Some(3));
+        assert_eq!(reader.first_retained_log_seq(&id), Some(3));
         assert_eq!(
             lines
                 .iter()
@@ -1948,6 +1965,7 @@ mod tests {
         writer.clear_logs(&id);
         let (first, lines) = reader.logs_since(&id, 0);
         assert_eq!(first, None);
+        assert_eq!(reader.first_retained_log_seq(&id), None);
         assert!(lines.is_empty());
     }
 

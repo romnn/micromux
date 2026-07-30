@@ -7,6 +7,9 @@ use crate::{DynamicServiceParams, Lease};
 /// Unique identifier for a service.
 pub type ServiceID = String;
 
+/// Largest raw PTY input payload accepted as one all-or-nothing write batch.
+pub const MAX_PTY_INPUT_BATCH_BYTES: usize = 64 * 1024;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct RunId(u64);
 

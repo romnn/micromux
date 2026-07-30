@@ -10,7 +10,8 @@ pub struct Service {
     pub cached_wrap: Option<(bool, u16)>,
     pub logs_dirty: bool,
     pub healthcheck_cached_num_lines: usize,
-    pub healthcheck_cached_text: String,
+    pub healthcheck_cached_text: ratatui::text::Text<'static>,
+    pub healthcheck_cached_wrap: Option<(bool, u16)>,
     pub healthcheck_dirty: bool,
 }
 
@@ -25,7 +26,8 @@ impl Service {
             cached_wrap: None,
             logs_dirty: true,
             healthcheck_cached_num_lines: 0,
-            healthcheck_cached_text: String::new(),
+            healthcheck_cached_text: ratatui::text::Text::default(),
+            healthcheck_cached_wrap: None,
             healthcheck_dirty: true,
         }
     }
@@ -80,22 +82,51 @@ impl State {
     }
 
     pub fn resize_left(&mut self) {
-        self.services_sidebar_width = self
+        let minimum = self
             .services_sidebar_width
-            .saturating_sub(2)
-            .max(crate::style::MIN_SIDEBAR_WIDTH);
+            .min(crate::style::MIN_SIDEBAR_WIDTH);
+        self.services_sidebar_width = self.services_sidebar_width.saturating_sub(2).max(minimum);
     }
 
     pub fn resize_right(&mut self, max_width: u16) {
+        if max_width < crate::style::MIN_SIDEBAR_WIDTH {
+            self.services_sidebar_width =
+                self.services_sidebar_width.saturating_add(2).min(max_width);
+            return;
+        }
         self.services_sidebar_width = self
             .services_sidebar_width
             .saturating_add(2)
-            .min(max_width.max(crate::style::MIN_SIDEBAR_WIDTH));
+            .clamp(crate::style::MIN_SIDEBAR_WIDTH, max_width);
     }
 
     pub fn clamp_sidebar(&mut self, max_width: u16) {
-        self.services_sidebar_width = self
-            .services_sidebar_width
-            .min(max_width.max(crate::style::MIN_SIDEBAR_WIDTH));
+        self.services_sidebar_width = if max_width < crate::style::MIN_SIDEBAR_WIDTH {
+            self.services_sidebar_width.min(max_width)
+        } else {
+            self.services_sidebar_width
+                .clamp(crate::style::MIN_SIDEBAR_WIDTH, max_width)
+        };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::State;
+    use similar_asserts::assert_eq;
+
+    #[test]
+    fn sidebar_never_exceeds_a_narrow_terminal() {
+        let mut state = State::default();
+
+        state.clamp_sidebar(5);
+        assert_eq!(state.services_sidebar_width, 5);
+        state.resize_right(5);
+        assert_eq!(state.services_sidebar_width, 5);
+        state.resize_left();
+        assert_eq!(state.services_sidebar_width, 5);
+        state.services_sidebar_width = 3;
+        state.resize_right(5);
+        assert_eq!(state.services_sidebar_width, 5);
     }
 }

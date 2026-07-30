@@ -389,7 +389,7 @@ async fn refresh_and_forward<C: RequestConnection>(
         ChangeKind::Status | ChangeKind::Roster | ChangeKind::Unknown => {
             refresh_roster(request, store).await?;
         }
-        ChangeKind::Events => {}
+        ChangeKind::Events | ChangeKind::Heartbeat => {}
     }
     publish(changes, change);
     Ok(())
@@ -979,6 +979,26 @@ mod tests {
             Some(2)
         );
         assert_eq!(store.read().services["svc"].logs.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn subscription_heartbeat_does_not_refresh_the_mirror() -> eyre::Result<()> {
+        let store = store_with(entry_with_log(1, "line"));
+        let mut request = ScriptedConnection::new([]);
+        let (changes, _) = broadcast::channel(8);
+        let mut received = changes.subscribe();
+        let heartbeat = SessionChange {
+            service_id: SessionChange::SESSION_WIDE.to_string(),
+            kind: ChangeKind::Heartbeat,
+        };
+
+        refresh_and_forward(&mut request, &store, &changes, heartbeat).await?;
+
+        assert!(request.requests.is_empty());
+        let forwarded = received.recv().await?;
+        assert_eq!(forwarded.service_id, SessionChange::SESSION_WIDE);
+        assert_eq!(forwarded.kind, ChangeKind::Heartbeat);
         Ok(())
     }
 

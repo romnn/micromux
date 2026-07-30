@@ -35,7 +35,7 @@ const IDEMPOTENCY_WINDOW: usize = 64;
 mod types;
 #[cfg(test)]
 pub(crate) use types::Event;
-pub use types::{Command, OutputStream, ServiceID};
+pub use types::{Command, MAX_PTY_INPUT_BATCH_BYTES, OutputStream, ServiceID};
 pub(crate) use types::{LogUpdateKind, ProcessEvent, RunId, State};
 
 #[path = "scheduler/control.rs"]

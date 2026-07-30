@@ -238,21 +238,18 @@ enum PortProbe {
     Unknown,
 }
 
-fn classify_bind_result(result: io::Result<tokio::net::TcpListener>) -> PortProbe {
+fn classify_connect_result(result: io::Result<()>) -> PortProbe {
     match result {
-        Ok(listener) => {
-            drop(listener);
-            PortProbe::Available
-        }
-        Err(error) if error.kind() == io::ErrorKind::AddrInUse => PortProbe::Held,
+        Ok(()) => PortProbe::Held,
+        Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => PortProbe::Available,
         Err(_) => PortProbe::Unknown,
     }
 }
 
 async fn probe_port(port: u16) -> PortProbe {
     let address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, port);
-    match tokio::time::timeout(PORT_PROBE_BUDGET, tokio::net::TcpListener::bind(address)).await {
-        Ok(result) => classify_bind_result(result),
+    match tokio::time::timeout(PORT_PROBE_BUDGET, tokio::net::TcpStream::connect(address)).await {
+        Ok(result) => classify_connect_result(result.map(|_| ())),
         Err(_) => PortProbe::Unknown,
     }
 }
@@ -465,7 +462,10 @@ pub(crate) async fn wait_for_snapshot<V>(
                         Ok(Some(change))
                             if (change.service_id == service
                                 || change.service_id == SessionChange::SESSION_WIDE)
-                                && change.kind != ChangeKind::Logs =>
+                                && !matches!(
+                                    change.kind,
+                                    ChangeKind::Logs | ChangeKind::Heartbeat
+                                ) =>
                         {
                             return true;
                         }
@@ -816,8 +816,11 @@ mod tests {
     }
 
     #[test]
-    fn non_address_in_use_probe_errors_do_not_emit_signals() {
+    fn port_probe_classifies_refusal_without_binding_the_port() {
+        let refused = io::Error::new(io::ErrorKind::ConnectionRefused, "refused");
+        assert_eq!(classify_connect_result(Err(refused)), PortProbe::Available);
         let error = io::Error::new(io::ErrorKind::PermissionDenied, "denied");
-        assert_eq!(classify_bind_result(Err(error)), PortProbe::Unknown);
+        assert_eq!(classify_connect_result(Err(error)), PortProbe::Unknown);
+        assert_eq!(classify_connect_result(Ok(())), PortProbe::Held);
     }
 }

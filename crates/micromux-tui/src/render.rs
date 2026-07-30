@@ -24,7 +24,7 @@ mod tests {
     use ratatui::{
         buffer::Buffer,
         layout::Rect,
-        text::{Line, Text},
+        text::{Line, Span, Text},
         widgets::{Paragraph, Wrap},
     };
     use similar_asserts::assert_eq;
@@ -53,7 +53,7 @@ mod tests {
             width: log_area.width.saturating_add(scrollbar_area.width),
             height: log_area.height,
         };
-        view.render(area, num_lines, text, "Logs", None, buf)
+        view.render(area, num_lines, &text, "Logs", None, buf)
     }
 
     fn count_thumb(buf: &Buffer, area: Rect) -> usize {
@@ -370,7 +370,7 @@ mod tests {
                 .collect::<Vec<_>>(),
         );
 
-        let (window, local_offset) = window_text(text, false, 80, line_count - 1);
+        let (window, local_offset) = window_text(&text, false, 80, line_count - 1);
 
         assert_eq!(local_offset, u16::MAX);
         assert_eq!(
@@ -381,6 +381,25 @@ mod tests {
                 .as_deref(),
             Some("99")
         );
+    }
+
+    #[test]
+    fn log_window_borrows_cached_span_content() {
+        let text = Text::from(Line::from(Span::raw("cached".to_string())));
+        let original = text
+            .lines
+            .first()
+            .and_then(|line| line.spans.first())
+            .map(|span| span.content.as_ptr());
+
+        let (window, _) = window_text(&text, false, 80, 0);
+        let borrowed = window
+            .lines
+            .first()
+            .and_then(|line| line.spans.first())
+            .map(|span| span.content.as_ptr());
+
+        assert_eq!(borrowed, original);
     }
 
     #[test]
@@ -844,7 +863,7 @@ impl App {
             return;
         };
         let num_lines = current_service.cached_wrapped_lines;
-        let text = current_service.cached_text.clone();
+        let text = &current_service.cached_text;
         let detail = service_detail_line(&current_service.snapshot, now_unix_ms());
         tracing::trace!(
             service_id = current_service.snapshot.id,
@@ -877,45 +896,48 @@ impl App {
             let attempts = self.source.healthchecks(&current_id);
             let out = build_healthcheck_text(configured, &attempts);
             if let Some(service) = self.state.current_service_mut() {
-                service.healthcheck_cached_text = out;
+                service.healthcheck_cached_text = out.as_str().into_text().unwrap_or_else(|err| {
+                    let escaped = strip_ansi_escapes::strip_str(&out);
+                    tracing::error!(
+                        ?err,
+                        input_bytes = out.len(),
+                        "failed to sanitize healthcheck output"
+                    );
+                    escaped.into()
+                });
+                service.healthcheck_cached_wrap = None;
                 service.healthcheck_dirty = false;
             }
         }
 
-        let cached_text = self
-            .state
-            .current_service()
-            .map(|service| service.healthcheck_cached_text.clone())
-            .unwrap_or_default();
-        let text = cached_text.as_str();
-
-        let tui_text: ratatui::text::Text = text.into_text().unwrap_or_else(|err| {
-            let escaped = strip_ansi_escapes::strip_str(text);
-            tracing::error!(
-                ?err,
-                input_bytes = text.len(),
-                "failed to sanitize healthcheck output"
-            );
-            escaped.into()
-        });
-
-        let raw_num_lines = tui_text.height();
+        let wrap = self.healthcheck_view.wrap;
         let wrap_width = area.width.saturating_sub(3);
-        let mut paragraph = Paragraph::new(tui_text.clone());
-        if self.healthcheck_view.wrap {
-            paragraph = paragraph.wrap(Wrap { trim: false });
-        }
-        let num_lines = if self.healthcheck_view.wrap {
-            rendered_line_count(&paragraph, wrap_width)
-        } else {
-            raw_num_lines
-        };
-        if let Some(service) = self.state.current_service_mut() {
+        if let Some(service) = self.state.current_service_mut()
+            && service.healthcheck_cached_wrap != Some((wrap, wrap_width))
+        {
+            let num_lines = if wrap {
+                let paragraph =
+                    Paragraph::new(log_view::borrow_text(&service.healthcheck_cached_text))
+                        .wrap(Wrap { trim: false });
+                rendered_line_count(&paragraph, wrap_width)
+            } else {
+                service.healthcheck_cached_text.height()
+            };
             service.healthcheck_cached_num_lines = num_lines;
+            service.healthcheck_cached_wrap = Some((wrap, wrap_width));
         }
 
-        self.healthcheck_view
-            .render(area, num_lines, tui_text, "Healthcheck", None, buf);
+        let Some(service) = self.state.current_service() else {
+            return;
+        };
+        self.healthcheck_view.render(
+            area,
+            service.healthcheck_cached_num_lines,
+            &service.healthcheck_cached_text,
+            "Healthcheck",
+            None,
+            buf,
+        );
     }
 
     fn render_footer(&self, area: Rect, buf: &mut Buffer) {
@@ -1066,7 +1088,7 @@ pub mod log_view {
             &mut self,
             area: Rect,
             num_lines: usize,
-            text: ratatui::text::Text<'static>,
+            text: &ratatui::text::Text<'_>,
             title: &'static str,
             detail: Option<ratatui::text::Line<'static>>,
             buf: &mut Buffer,
@@ -1133,18 +1155,18 @@ pub mod log_view {
         }
     }
 
-    pub(super) fn window_text(
-        mut text: ratatui::text::Text<'_>,
+    pub(super) fn window_text<'a>(
+        text: &'a ratatui::text::Text<'_>,
         wrap: bool,
         width: u16,
         offset: usize,
-    ) -> (ratatui::text::Text<'_>, u16) {
+    ) -> (ratatui::text::Text<'a>, u16) {
         let target = offset.saturating_sub(usize::from(u16::MAX));
         let mut consumed = 0usize;
         let mut drop_lines = 0usize;
         for line in &text.lines {
             let height = if wrap {
-                Paragraph::new(line.clone())
+                Paragraph::new(borrow_line(line))
                     .wrap(Wrap { trim: false })
                     .line_count(width)
             } else {
@@ -1156,10 +1178,42 @@ pub mod log_view {
             consumed = consumed.saturating_add(height);
             drop_lines += 1;
         }
-        if drop_lines > 0 {
-            text.lines.drain(..drop_lines);
-        }
         let local_offset = offset.saturating_sub(consumed);
-        (text, u16::try_from(local_offset).unwrap_or(u16::MAX))
+        (
+            borrow_text_from(text, drop_lines),
+            u16::try_from(local_offset).unwrap_or(u16::MAX),
+        )
+    }
+
+    pub(super) fn borrow_text<'a>(text: &'a ratatui::text::Text<'_>) -> ratatui::text::Text<'a> {
+        borrow_text_from(text, 0)
+    }
+
+    fn borrow_text_from<'a>(
+        text: &'a ratatui::text::Text<'_>,
+        skip_lines: usize,
+    ) -> ratatui::text::Text<'a> {
+        ratatui::text::Text {
+            alignment: text.alignment,
+            style: text.style,
+            lines: text
+                .lines
+                .iter()
+                .skip(skip_lines)
+                .map(borrow_line)
+                .collect(),
+        }
+    }
+
+    fn borrow_line<'a>(line: &'a ratatui::text::Line<'_>) -> ratatui::text::Line<'a> {
+        ratatui::text::Line {
+            style: line.style,
+            alignment: line.alignment,
+            spans: line
+                .spans
+                .iter()
+                .map(|span| ratatui::text::Span::styled(span.content.as_ref(), span.style))
+                .collect(),
+        }
     }
 }

@@ -197,11 +197,17 @@ pub struct ControlConfig {
 }
 
 /// Limits applied atomically by the scheduler to runtime-created services.
+///
+/// The policy is resolved against the config directory and latched when a [`crate::Micromux`]
+/// session is constructed. Config reloads reconcile configured services but do not mutate this
+/// session capability.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DynamicServicesPolicy {
     /// Whether runtime creation and replacement are permitted.
     pub enabled: bool,
-    /// Canonical working-directory roots dynamic services may use.
+    /// Working-directory roots dynamic services may use.
+    ///
+    /// Policy checks canonicalize each root and candidate before comparison.
     pub allowed_working_roots: Vec<PathBuf>,
     /// Maximum number of non-retired dynamic services.
     pub max_services: usize,
@@ -674,18 +680,15 @@ pub fn from_str<F: Copy + PartialEq>(
     diagnostics: &mut Vec<Diagnostic<F>>,
 ) -> Result<ConfigFile<F>, ConfigError> {
     let mut documents = yaml_spanned::from_str_all(raw_config).map_err(ConfigError::Yaml)?;
-    if documents.len() != 1 {
+    if documents.len() > 1 {
         return Err(ConfigError::InvalidValue {
             message: "configuration must contain exactly one YAML document".to_string(),
             span: 0..raw_config.len(),
         });
     }
-    let Some(value) = documents.pop() else {
-        return Err(ConfigError::InvalidValue {
-            message: "configuration must contain exactly one YAML document".to_string(),
-            span: 0..raw_config.len(),
-        });
-    };
+    let value = documents
+        .pop()
+        .unwrap_or_else(|| Spanned::new(yaml_spanned::spanned::Span::default(), Value::Null));
     let effective_strict = strict_override.or(parse_strict(&value)?);
     let version = parse_version(&value, file_id, effective_strict, diagnostics)?;
     let config = match version {
@@ -1032,6 +1035,23 @@ mod tests {
         let result = super::from_str(yaml, Path::new("."), 0usize, None, &mut diagnostics);
 
         assert!(result.is_err_and(|err| { err.to_string().contains("exactly one YAML document") }));
+    }
+
+    #[test]
+    fn empty_and_comment_only_configs_report_no_services() -> eyre::Result<()> {
+        for yaml in ["", "# no services yet\n"] {
+            let mut diagnostics = Vec::new();
+
+            let parsed = super::from_str(yaml, Path::new("."), 0usize, None, &mut diagnostics)?;
+
+            assert!(parsed.config.services.is_empty());
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.message == "no services defined")
+            );
+        }
+        Ok(())
     }
 
     #[test]

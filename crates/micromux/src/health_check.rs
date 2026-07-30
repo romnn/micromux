@@ -569,6 +569,8 @@ pub async fn run_loop(health_check: crate::HealthcheckSpec, params: RunLoopParam
     let mut attempt = 0;
     let mut unhealthy = false;
     let mut attempt_id: u64 = 0;
+    // Run one probe at a time so a slow command cannot accumulate overlapping descendants.
+    // `HealthcheckSpec::retries` documents the resulting worst-case transition latency.
     loop {
         attempt_id = attempt_id.wrapping_add(1);
 

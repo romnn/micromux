@@ -150,6 +150,9 @@ pub struct HealthcheckSpec {
     #[schemars(with = "String")]
     pub timeout: Duration,
     /// Consecutive failures required before the service becomes unhealthy.
+    ///
+    /// Probe attempts never overlap. A failing transition may therefore take up to
+    /// `retries * timeout + (retries - 1) * interval` after the first attempt begins.
     #[serde(default = "default_healthcheck_retries")]
     pub retries: usize,
 }

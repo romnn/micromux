@@ -1,4 +1,6 @@
-use super::{LogUpdateKind, OutputStream, ProcessEvent, RunId, ServiceID};
+use super::{
+    LogUpdateKind, MAX_PTY_INPUT_BATCH_BYTES, OutputStream, ProcessEvent, RunId, ServiceID,
+};
 use crate::{health_check, model::RunSink, service::Service};
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -81,8 +83,6 @@ const PTY_INPUT_WRITE_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Bounds queued write batches when a service stops consuming input.
 const PTY_WRITE_QUEUE_CAPACITY: usize = 64;
-/// Bounds one atomic input batch, making the queue's count limit a memory limit too.
-const PTY_WRITE_BATCH_MAX_BYTES: usize = 64 * 1024;
 
 /// How long output may drain after escalation before the PTY is closed.
 ///
@@ -95,88 +95,135 @@ pub(super) const HEALTH_TASK_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 const TERMINATION_EVENT_NOTIFY_TIMEOUT: Duration = Duration::from_millis(100);
 
 #[cfg(all(unix, not(target_vendor = "apple")))]
-fn poll_descriptors(descriptors: &mut [pollfd], timeout: Option<Duration>) -> io::Result<usize> {
-    filedescriptor::poll(descriptors, timeout).map_err(|error| match error {
-        filedescriptor::Error::Poll(error) | filedescriptor::Error::Io(error) => error,
-        error => io::Error::other(error),
-    })
+struct PtyPoller;
+
+#[cfg(all(unix, target_vendor = "apple"))]
+struct PtyPoller {
+    queue: nix::sys::event::Kqueue,
+}
+
+#[cfg(all(unix, not(target_vendor = "apple")))]
+impl PtyPoller {
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "the Apple poller allocates a kqueue; one constructor keeps its callers portable"
+    )]
+    fn new() -> io::Result<Self> {
+        Ok(Self)
+    }
+
+    #[expect(
+        clippy::unused_self,
+        reason = "the Apple backend reuses instance state; one instance API keeps callers target-independent"
+    )]
+    fn poll(&self, descriptors: &mut [pollfd], timeout: Option<Duration>) -> io::Result<usize> {
+        filedescriptor::poll(descriptors, timeout).map_err(|error| match error {
+            filedescriptor::Error::Poll(error) | filedescriptor::Error::Io(error) => error,
+            error => io::Error::other(error),
+        })
+    }
 }
 
 #[cfg(all(unix, target_vendor = "apple"))]
-fn poll_descriptors(descriptors: &mut [pollfd], timeout: Option<Duration>) -> io::Result<usize> {
-    use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue};
+impl PtyPoller {
+    fn new() -> io::Result<Self> {
+        // filedescriptor emulates poll with select on macOS, inheriting FD_SETSIZE. A persistent
+        // kqueue keeps readiness working above that ceiling without allocating a descriptor on
+        // every wait.
+        Ok(Self {
+            queue: nix::sys::event::Kqueue::new().map_err(io::Error::from)?,
+        })
+    }
 
-    // filedescriptor emulates poll with select on macOS, inheriting FD_SETSIZE. kqueue keeps PTY
-    // readiness working after the CLI raises the process's descriptor limit.
-    let queue = Kqueue::new().map_err(io::Error::from)?;
-    let mut changes = Vec::with_capacity(descriptors.len() * 2);
-    for (index, descriptor) in descriptors.iter().enumerate() {
-        let identifier = usize::try_from(descriptor.fd)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid poll descriptor"))?;
-        let user_data = isize::try_from(index)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "too many descriptors"))?;
-        if descriptor.events & POLLIN != 0 {
-            changes.push(KEvent::new(
-                identifier,
+    fn poll(&self, descriptors: &mut [pollfd], timeout: Option<Duration>) -> io::Result<usize> {
+        use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent};
+
+        let mut changes = Vec::with_capacity(descriptors.len() * 2);
+        for (index, descriptor) in descriptors.iter().enumerate() {
+            let identifier = usize::try_from(descriptor.fd).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "invalid poll descriptor")
+            })?;
+            let user_data = isize::try_from(index)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "too many descriptors"))?;
+            if descriptor.events & POLLIN != 0 {
+                changes.push(KEvent::new(
+                    identifier,
+                    EventFilter::EVFILT_READ,
+                    EvFlags::EV_ADD | EvFlags::EV_ENABLE,
+                    FilterFlag::empty(),
+                    0,
+                    user_data,
+                ));
+            }
+            if descriptor.events & POLLOUT != 0 {
+                changes.push(KEvent::new(
+                    identifier,
+                    EventFilter::EVFILT_WRITE,
+                    EvFlags::EV_ADD | EvFlags::EV_ENABLE,
+                    FilterFlag::empty(),
+                    0,
+                    user_data,
+                ));
+            }
+        }
+        let mut events = vec![
+            KEvent::new(
+                0,
                 EventFilter::EVFILT_READ,
-                EvFlags::EV_ADD | EvFlags::EV_ENABLE,
+                EvFlags::empty(),
                 FilterFlag::empty(),
                 0,
-                user_data,
-            ));
-        }
-        if descriptor.events & POLLOUT != 0 {
-            changes.push(KEvent::new(
-                identifier,
-                EventFilter::EVFILT_WRITE,
-                EvFlags::EV_ADD | EvFlags::EV_ENABLE,
-                FilterFlag::empty(),
                 0,
-                user_data,
-            ));
+            );
+            changes.len().max(1)
+        ];
+        let timeout = timeout.map(|duration| nix::libc::timespec {
+            tv_sec: duration
+                .as_secs()
+                .try_into()
+                .unwrap_or(nix::libc::time_t::MAX),
+            tv_nsec: duration.subsec_nanos().into(),
+        });
+        let count = self
+            .queue
+            .kevent(&changes, &mut events, timeout)
+            .map_err(io::Error::from)?;
+        for event in events.into_iter().take(count) {
+            let Ok(index) = usize::try_from(event.udata()) else {
+                continue;
+            };
+            let Some(descriptor) = descriptors.get_mut(index) else {
+                continue;
+            };
+            match event.filter() {
+                Ok(EventFilter::EVFILT_READ) => descriptor.revents |= POLLIN,
+                Ok(EventFilter::EVFILT_WRITE) => descriptor.revents |= POLLOUT,
+                _ => descriptor.revents |= POLLERR,
+            }
+            if event.flags().intersects(EvFlags::EV_EOF) {
+                descriptor.revents |= POLLHUP;
+            }
+            if event.flags().intersects(EvFlags::EV_ERROR) {
+                descriptor.revents |= POLLERR;
+            }
         }
+        Ok(count)
     }
-    let mut events = vec![
-        KEvent::new(
-            0,
-            EventFilter::EVFILT_READ,
-            EvFlags::empty(),
-            FilterFlag::empty(),
-            0,
-            0,
-        );
-        changes.len().max(1)
-    ];
-    let timeout = timeout.map(|duration| nix::libc::timespec {
-        tv_sec: duration
-            .as_secs()
-            .try_into()
-            .unwrap_or(nix::libc::time_t::MAX),
-        tv_nsec: duration.subsec_nanos().into(),
-    });
-    let count = queue
-        .kevent(&changes, &mut events, timeout)
-        .map_err(io::Error::from)?;
-    for event in events.into_iter().take(count) {
-        let Ok(index) = usize::try_from(event.udata()) else {
-            continue;
-        };
-        let Some(descriptor) = descriptors.get_mut(index) else {
-            continue;
-        };
-        match event.filter() {
-            Ok(EventFilter::EVFILT_READ) => descriptor.revents |= POLLIN,
-            Ok(EventFilter::EVFILT_WRITE) => descriptor.revents |= POLLOUT,
-            _ => descriptor.revents |= POLLERR,
-        }
-        if event.flags().intersects(EvFlags::EV_EOF) {
-            descriptor.revents |= POLLHUP;
-        }
-        if event.flags().intersects(EvFlags::EV_ERROR) {
-            descriptor.revents |= POLLERR;
-        }
+
+    #[cfg(test)]
+    fn raw_fd(&self) -> RawFd {
+        use std::os::fd::{AsFd as _, AsRawFd as _};
+
+        self.queue.as_fd().as_raw_fd()
     }
-    Ok(count)
+}
+
+#[cfg(unix)]
+fn poll_error_is_retryable(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+    )
 }
 
 type SharedPtyMaster = Arc<Mutex<Option<Box<dyn portable_pty::MasterPty + Send>>>>;
@@ -190,6 +237,8 @@ struct PtyWriter {
     poll_write: FileDescriptor,
     #[cfg(unix)]
     cancel_read: FileDescriptor,
+    #[cfg(unix)]
+    poller: PtyPoller,
 }
 
 enum PtyWrite {
@@ -237,6 +286,9 @@ impl PtyHandles {
         #[cfg(unix)]
         let poll_write = configure_nonblocking_pty(master.as_ref())?;
         #[cfg(unix)]
+        let poller =
+            PtyPoller::new().map_err(|err| Error::operation("failed to create pty poller", err))?;
+        #[cfg(unix)]
         let (cancel_read, writer_cancellation) = PtyCancellation::pipe()?;
         #[cfg(not(unix))]
         let writer_cancellation = PtyCancellation::new();
@@ -253,6 +305,8 @@ impl PtyHandles {
                 poll_write,
                 #[cfg(unix)]
                 cancel_read,
+                #[cfg(unix)]
+                poller,
             },
             writer_rx,
         );
@@ -274,11 +328,11 @@ impl PtyHandles {
 
     pub(super) fn write_input(&self, service_id: &ServiceID, data: &[u8]) {
         let input_len = data.len();
-        if input_len > PTY_WRITE_BATCH_MAX_BYTES {
+        if input_len > MAX_PTY_INPUT_BATCH_BYTES {
             tracing::warn!(
                 service_id,
                 input_len,
-                batch_limit_bytes = PTY_WRITE_BATCH_MAX_BYTES,
+                batch_limit_bytes = MAX_PTY_INPUT_BATCH_BYTES,
                 "pty input batch is too large; dropping it atomically"
             );
             return;
@@ -444,7 +498,7 @@ impl PtyWriter {
                 },
             ];
 
-            match poll_descriptors(&mut descriptors, timeout) {
+            match self.poller.poll(&mut descriptors, timeout) {
                 Ok(0) => return Err(Self::input_timeout()),
                 Ok(_) => {
                     let writer_events = descriptors
@@ -466,7 +520,7 @@ impl PtyWriter {
                         ));
                     }
                 }
-                Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+                Err(err) if poll_error_is_retryable(&err) => {}
                 Err(err) => return Err(err),
             }
         }
@@ -1052,6 +1106,7 @@ struct PollingPtyReader {
     poll_read: FileDescriptor,
     cancel_read: FileDescriptor,
     cancelled: Arc<AtomicBool>,
+    poller: PtyPoller,
 }
 
 #[cfg(unix)]
@@ -1106,11 +1161,14 @@ impl PollingPtyReader {
         let reader = master
             .try_clone_reader()
             .map_err(|err| Error::operation("failed to clone pty reader", err))?;
+        let poller =
+            PtyPoller::new().map_err(|err| Error::operation("failed to create pty poller", err))?;
         Ok(Self {
             reader,
             poll_read,
             cancel_read,
             cancelled,
+            poller,
         })
     }
 
@@ -1132,9 +1190,9 @@ impl PollingPtyReader {
                 },
             ];
 
-            match poll_descriptors(&mut fds, None) {
+            match self.poller.poll(&mut fds, None) {
                 Ok(_) => {}
-                Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                Err(err) if poll_error_is_retryable(&err) => continue,
                 Err(err) => return Err(err),
             }
 
@@ -2373,6 +2431,37 @@ mod tests {
             );
         }
 
+        #[cfg(target_vendor = "apple")]
+        #[test]
+        fn apple_poller_reuses_one_kqueue_across_waits() -> eyre::Result<()> {
+            let poller = PtyPoller::new()?;
+            let queue_fd = poller.raw_fd();
+            let mut pipe = Pipe::new()?;
+            pipe.write.write_all(b"x")?;
+            let mut descriptors = [pollfd {
+                fd: pipe.read.as_raw_fd(),
+                events: POLLIN,
+                revents: 0,
+            }];
+
+            for _ in 0..2 {
+                let descriptor = descriptors
+                    .first_mut()
+                    .ok_or_eyre("test descriptor is missing")?;
+                descriptor.revents = 0;
+                assert_eq!(
+                    poller.poll(&mut descriptors, Some(Duration::from_secs(1)))?,
+                    1
+                );
+                let descriptor = descriptors
+                    .first()
+                    .ok_or_eyre("test descriptor is missing")?;
+                assert_ne!(descriptor.revents & POLLIN, 0);
+                assert_eq!(poller.raw_fd(), queue_fd);
+            }
+            Ok(())
+        }
+
         #[test]
         fn pty_input_write_times_out_when_the_slave_queue_is_full() -> eyre::Result<()> {
             let fixture_dir = tempfile::tempdir()?;
@@ -2399,6 +2488,7 @@ mod tests {
                 cancellation,
                 poll_write,
                 cancel_read,
+                poller: PtyPoller::new()?,
             };
 
             let ready_deadline = Instant::now() + Duration::from_secs(3);
@@ -2476,7 +2566,7 @@ mod tests {
             // Enqueuing is the scheduler-facing operation. It must return well before the writer
             // worker reaches its backpressure deadline.
             let started_at = Instant::now();
-            handles.write_input(&"svc".to_string(), &vec![b'x'; PTY_WRITE_BATCH_MAX_BYTES]);
+            handles.write_input(&"svc".to_string(), &vec![b'x'; MAX_PTY_INPUT_BATCH_BYTES]);
             let enqueue_elapsed = started_at.elapsed();
 
             shutdown.close();

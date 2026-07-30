@@ -93,6 +93,34 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn unset_variables_are_rejected_in_service_paths() -> eyre::Result<()> {
+        let directory = unique_tmp_dir("unset-service-path");
+        fs::create_dir_all(&directory)?;
+        let variable = format!("MICROMUX_UNSET_SERVICE_PATH_{}", std::process::id());
+        let unresolved = format!("${{{variable}}}/service");
+
+        let mut working_dir = service_config("svc", ("sh", &["-c", "true"]));
+        working_dir.working_dir = Some(spanned_string(&unresolved));
+        assert!(matches!(
+            Service::new("svc", &directory, working_dir),
+            Err(Error::Environment(env::Error::UnsetPathVariables { variables, .. }))
+                if variables == vec![variable.clone()]
+        ));
+
+        let mut env_file = service_config("svc", ("sh", &["-c", "true"]));
+        env_file.env_file = vec![config::EnvFile {
+            path: spanned_string(&unresolved),
+            optional: true,
+        }];
+        assert!(matches!(
+            Service::new("svc", &directory, env_file),
+            Err(Error::Environment(env::Error::UnsetPathVariables { variables, .. }))
+                if variables == vec![variable]
+        ));
+        Ok(())
+    }
+
     #[cfg(unix)]
     #[test]
     fn working_directory_anchor_survives_path_replacement() -> eyre::Result<()> {
@@ -394,7 +422,7 @@ impl Service {
         let (prog, args) = config.command;
         let id: ServiceID = id.into();
 
-        let working_dir = resolve_working_directory(config_dir, config.working_dir.as_ref());
+        let working_dir = resolve_working_directory(config_dir, config.working_dir.as_ref())?;
         #[cfg(unix)]
         let working_directory = open_working_directory(working_dir.as_deref())?;
         #[cfg(not(unix))]
@@ -402,7 +430,7 @@ impl Service {
 
         let mut env_files = Vec::new();
         for env_file in &config.env_file {
-            let path = env::resolve_path(config_dir, env_file.path.as_ref());
+            let path = env::resolve_path(config_dir, env_file.path.as_ref())?;
             // A missing optional file is skipped; a present one still
             // participates fully, including parse errors.
             if env_file.optional && !path.exists() {
@@ -578,8 +606,10 @@ impl Service {
 fn resolve_working_directory(
     config_dir: &Path,
     configured: Option<&yaml_spanned::Spanned<String>>,
-) -> Option<std::path::PathBuf> {
-    configured.map(|dir| env::resolve_path(config_dir, dir.as_ref()))
+) -> Result<Option<std::path::PathBuf>, env::Error> {
+    configured
+        .map(|dir| env::resolve_path(config_dir, dir.as_ref()))
+        .transpose()
 }
 
 #[cfg(unix)]
