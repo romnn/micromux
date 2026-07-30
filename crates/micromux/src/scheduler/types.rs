@@ -38,7 +38,7 @@ pub(crate) enum State {
     Killed,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) enum ProcessEvent {
     Killed {
         service_id: ServiceID,

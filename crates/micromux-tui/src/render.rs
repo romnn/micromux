@@ -1010,12 +1010,22 @@ impl App {
     /// - The terminal backend fails to initialize or restore.
     /// - The underlying event loop (`App::run`) fails.
     pub async fn render(self) -> Result<(), crate::Error> {
+        use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
+
         let terminal = ratatui::init();
+        let mut stdout = std::io::stdout();
+        if let Err(err) = crossterm::execute!(stdout, EnableBracketedPaste) {
+            ratatui::restore();
+            return Err(err.into());
+        }
         // Always restore the terminal, even when the event loop returns an error, so a failure
         // never leaves the user's shell stuck in raw mode / the alternate screen.
         let result = self.run(terminal).await;
+        let disable_paste = crossterm::execute!(stdout, DisableBracketedPaste);
         ratatui::restore();
-        result
+        result?;
+        disable_paste?;
+        Ok(())
     }
 }
 

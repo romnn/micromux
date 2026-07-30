@@ -271,6 +271,7 @@ pub(crate) fn initial_model_entries(services: &ServiceMap) -> Vec<(ServiceSnapsh
                 service.argv(),
                 service.working_dir_display(),
             );
+            snapshot.stop_grace_period = service.spec.stop_grace_period;
             snapshot.desired = match service.startup_mode {
                 service::StartupMode::Enabled => Desired::Enabled,
                 service::StartupMode::Disabled => Desired::Disabled,

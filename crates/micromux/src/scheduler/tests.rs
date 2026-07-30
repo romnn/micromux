@@ -95,6 +95,57 @@ fn spawn_harness_with_policy(
     }
 }
 
+#[tokio::test]
+async fn config_reload_wait_keeps_draining_process_events() -> eyre::Result<()> {
+    let services = ServiceMap::default();
+    let (_reader, writer) = crate::model::new(crate::initial_model_entries(&services));
+    let (events_tx, mut events_rx) = mpsc::channel(1);
+    let (test_events_tx, _test_events_rx) = mpsc::channel(1);
+    let mut runtime = SchedulerRuntime::new(
+        &services,
+        SchedulerResources {
+            reload_config: None,
+            events_tx: events_tx.clone(),
+            test_events: TestEventSink::new(test_events_tx),
+            writer,
+            shutdown: CancellationToken::new(),
+            config_dir: PathBuf::new(),
+            dynamic_policy: DynamicServicesPolicy::default(),
+            default_log_retention: LogRetention::default(),
+        },
+    );
+    events_tx
+        .send(ProcessEvent::Killed {
+            service_id: "first".to_string(),
+            run_id: RunId::new(1),
+        })
+        .await
+        .map_err(|_| eyre::eyre!("failed to fill the process-event channel"))?;
+
+    let send_during_load = events_tx.clone();
+    let load = async move {
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            send_during_load.send(ProcessEvent::Killed {
+                service_id: "second".to_string(),
+                run_id: RunId::new(1),
+            }),
+        )
+        .await
+        .map_err(|_| "scheduler did not drain process events during config reload".to_string())?
+        .map_err(|_| "process-event channel closed during config reload".to_string())?;
+        Ok(ServiceMap::default())
+    };
+
+    let loaded = runtime
+        .await_loaded_services(&services, &mut events_rx, load)
+        .await
+        .map_err(|err| eyre::eyre!(err))?;
+
+    assert!(loaded.is_empty());
+    Ok(())
+}
+
 fn dynamic_params(id: &str, command: &[&str]) -> DynamicServiceParams {
     DynamicServiceParams {
         service: id.to_string(),
@@ -2107,6 +2158,59 @@ async fn healthcheck_inherits_environment() -> eyre::Result<()> {
 }
 
 #[tokio::test]
+async fn service_exit_stops_and_reaps_its_active_healthcheck() -> eyre::Result<()> {
+    use nix::errno::Errno;
+    use nix::sys::signal::kill;
+    use nix::unistd::Pid;
+
+    let dir = unique_tmp_dir("healthcheck-run-owner");
+    fs::create_dir_all(&dir)?;
+    let pid_path = dir.join("probe.pid");
+    let probe = format!("echo $$ > {}; sleep 60", pid_path.to_string_lossy());
+    let mut cfg = service_config("svc", ("sh", &["-c", "sleep 0.3"]));
+    cfg.healthcheck = Some(config::HealthCheck {
+        test: (
+            spanned_string("sh"),
+            vec![spanned_string("-c"), spanned_string(&probe)],
+        ),
+        start_delay: None,
+        interval: Some(Spanned {
+            span: yaml_spanned::spanned::Span::default(),
+            inner: Duration::from_mins(1),
+        }),
+        timeout: Some(Spanned {
+            span: yaml_spanned::spanned::Span::default(),
+            inner: Duration::from_mins(1),
+        }),
+        retries: Some(Spanned {
+            span: yaml_spanned::spanned::Span::default(),
+            inner: 1,
+        }),
+    });
+    let mut services = ServiceMap::new();
+    services.insert("svc".to_string(), Service::new("svc", &dir, cfg)?);
+    let harness = spawn_harness(services, None);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while !pid_path.exists() {
+        if tokio::time::Instant::now() >= deadline {
+            eyre::bail!("healthcheck did not write its pid");
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let pid = fs::read_to_string(&pid_path)?.trim().parse::<i32>()?;
+
+    wait_until(&harness.reader, "svc", |snapshot| {
+        snapshot.execution == Execution::Exited
+    })
+    .await?;
+    assert!(matches!(kill(Pid::from_raw(pid), None), Err(Errno::ESRCH)));
+
+    harness.shutdown.cancel();
+    harness.handle.await??;
+    Ok(())
+}
+
+#[tokio::test]
 async fn healthcheck_inherits_working_dir() -> eyre::Result<()> {
     let dir = unique_tmp_dir("healthcheck-cwd");
     std::fs::create_dir_all(&dir)?;
@@ -2261,14 +2365,12 @@ async fn shutdown_drains_running_service() -> eyre::Result<()> {
 
     let config_dir = Path::new(".");
     let mut services: ServiceMap = ServiceMap::new();
-    services.insert(
-        "svc".to_string(),
-        Service::new(
-            "svc",
-            config_dir,
-            service_config("svc", ("sh", &["-c", &command])),
-        )?,
-    );
+    let mut cfg = service_config("svc", ("sh", &["-c", &command]));
+    cfg.stop_grace_period = yaml_spanned::Spanned {
+        span: yaml_spanned::spanned::Span::default(),
+        inner: Duration::from_millis(100),
+    };
+    services.insert("svc".to_string(), Service::new("svc", config_dir, cfg)?);
 
     let shutdown = CancellationToken::new();
     let (test_events_tx, test_events_rx) = mpsc::channel(64);
@@ -2481,6 +2583,10 @@ mod escaped_session {
         ];
         // Ignoring `SIGTERM` forces the fixture through escalation before the parent can be reaped.
         let mut cfg = service_config("svc", ("sh", &command_args));
+        cfg.stop_grace_period = yaml_spanned::Spanned {
+            span: yaml_spanned::spanned::Span::default(),
+            inner: Duration::from_millis(750),
+        };
         cfg.environment
             .insert(spanned_string(HELPER_MODE), spanned_string("parent"));
         cfg.environment.insert(

@@ -49,17 +49,41 @@ fn spawn_shutdown_handler(shutdown: micromux::CancellationToken) {
         #[cfg(unix)]
         let terminate = async {
             use tokio::signal::unix::{SignalKind, signal};
-            if let Ok(mut sigterm) = signal(SignalKind::terminate()) {
-                sigterm.recv().await;
+            match signal(SignalKind::terminate()) {
+                Ok(mut sigterm) => {
+                    sigterm.recv().await;
+                }
+                Err(err) => {
+                    tracing::warn!(?err, "failed to install SIGTERM handler");
+                    std::future::pending::<()>().await;
+                }
             }
         };
 
         #[cfg(not(unix))]
         let terminate = std::future::pending::<()>();
 
+        #[cfg(unix)]
+        let hangup = async {
+            use tokio::signal::unix::{SignalKind, signal};
+            match signal(SignalKind::hangup()) {
+                Ok(mut sighup) => {
+                    sighup.recv().await;
+                }
+                Err(err) => {
+                    tracing::warn!(?err, "failed to install SIGHUP handler");
+                    std::future::pending::<()>().await;
+                }
+            }
+        };
+
+        #[cfg(not(unix))]
+        let hangup = std::future::pending::<()>();
+
         tokio::select! {
             () = ctrl_c => {},
             () = terminate => {},
+            () = hangup => {},
         }
 
         shutdown.cancel();

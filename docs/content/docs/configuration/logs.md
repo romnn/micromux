@@ -8,11 +8,11 @@ weight: 5
 micromux captures each service's output two ways at once:
 
 - an **in-memory tail** — bounded and fast, backing the TUI and the default log stream;
-- **disk-backed run logs** — the full output of recent runs, retained so you can inspect crash output *after* a restart.
+- **disk-backed run logs** — the newest 64 MiB segment of recent runs, retained so you can inspect crash output *after* a restart.
 
 ```yaml
 logs:
-  retained_runs: 5        # full disk-backed runs kept, including the current one
+  retained_runs: 5        # bounded disk-backed runs kept, including the current one
   memory:
     max_lines: 1000
     max_bytes: 67108864   # 64 MiB
@@ -26,7 +26,7 @@ services:
 
 ## Retained runs
 
-`retained_runs` (aliases: `runs`, `history`; default `5`) is how many full service **runs** are kept on disk, counting the current run. Each restart starts a new run; when the count is exceeded the oldest run is dropped. This is what lets an agent read the logs of the run that crashed even though the service has since restarted. Disk run logs hold the full output and rotate only by run count.
+`retained_runs` (aliases: `runs`, `history`; default `5`) is how many service **runs** are kept on disk, counting the current run. Each restart starts a new run; when the count is exceeded the oldest run is dropped. This is what lets an agent read the logs of the run that crashed even though the service has since restarted. A run file rotates in place at 64 MiB, preserving its newest segment so a single long-lived or noisy process cannot consume disk without limit.
 
 List the retained runs and read a specific one with the control plane:
 

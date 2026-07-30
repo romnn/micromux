@@ -22,6 +22,21 @@ pub fn trim_to_last_bytes(line: String, max_bytes: usize) -> String {
     line.split_off(start)
 }
 
+/// Trim a string to its first `max_bytes`, respecting UTF-8 character boundaries.
+#[must_use]
+pub(crate) fn truncate_to_first_bytes(mut line: String, max_bytes: usize) -> String {
+    if line.len() <= max_bytes {
+        return line;
+    }
+    let end = line
+        .char_indices()
+        .map(|(idx, _)| idx)
+        .take_while(|idx| *idx <= max_bytes)
+        .last()
+        .unwrap_or(0);
+    line.truncate(end);
+    line
+}
 pub(super) struct MemoryLogBuffer {
     pub(super) entries: VecDeque<LogLine>,
     pub(super) current_bytes: usize,
@@ -74,8 +89,6 @@ impl MemoryLogBuffer {
             if let Some(old) = self.entries.pop_back() {
                 self.current_bytes = self.current_bytes.saturating_sub(old.line.len());
             }
-            self.push(line);
-        } else {
             self.push(line);
         }
     }
@@ -130,7 +143,7 @@ mod tests {
     }
 
     #[test]
-    fn replace_last_falls_back_to_append_when_target_was_evicted() {
+    fn replace_last_ignores_a_target_that_was_evicted() {
         let mut buffer = MemoryLogBuffer::new(MemoryLogRetention {
             max_lines: LogLimit::Unbounded,
             max_bytes: LogLimit::Unbounded,
@@ -147,7 +160,7 @@ mod tests {
                 .into_iter()
                 .map(|line| line.line)
                 .collect::<Vec<_>>(),
-            vec!["frame two".to_string()]
+            Vec::<String>::new()
         );
     }
 }

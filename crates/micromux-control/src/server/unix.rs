@@ -467,13 +467,13 @@ fn follow_logs(
     }
 
     // The bounded visible stream: page forward from a cursor, else return its most recent tail.
-    let mut lines = reader.logs(service, None);
     if let Some(cursor) = after {
-        lines.retain(|line| line.seq > cursor);
+        let (_, lines) = reader.logs_since(service, cursor);
         let (lines, truncated) = bound_follow_response_lines_page(lines);
         return Response::Logs { lines, truncated };
     }
 
+    let mut lines = reader.logs(service, None);
     let mut truncated = false;
     if lines.len() > MAX_LOG_TAIL {
         let drop = lines.len() - MAX_LOG_TAIL;

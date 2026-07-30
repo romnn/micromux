@@ -39,6 +39,7 @@ Every key in `micromux.yaml`. The machine-readable source of truth is [`micromux
 | `healthcheck` | object | A [probe]({{< relref "healthchecks.md" >}}) with `test` plus timing. |
 | `ports` | array | Ports the service uses (metadata; not bound by micromux). |
 | `restart` | string | [Restart policy]({{< relref "restart-policies.md" >}}) for this service. |
+| `stop_grace_period` | duration | Time between graceful termination and force-kill. Defaults to `10s`; must be greater than zero and no longer than `5m`. |
 | `logs` | object | [Log retention]({{< relref "logs.md" >}}) for this service. |
 | `color` | bool | Force color handling for this service. |
 

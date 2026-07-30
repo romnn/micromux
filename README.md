@@ -164,9 +164,10 @@ ui:
   pretty_json_logs: false
 ```
 
-Retain full disk-backed logs for recent runs so agents can inspect crash output after restarts.
-The in-memory TUI/default log stream stays bounded and fast; disk run logs are unbounded and rotate
-by run count. `get_logs` returns a bounded tail; use `follow_logs` with a retained
+Retain bounded disk-backed logs for recent runs so agents can inspect crash output after restarts.
+The in-memory TUI/default log stream stays bounded and fast; each disk run log preserves its newest
+64 MiB segment and old runs rotate by run count. `get_logs` returns a bounded tail; use
+`follow_logs` with a retained
 `run_generation` and `next_seq` to page through larger run logs. Service-level `logs` overrides
 inherit unspecified fields from the global block:
 
@@ -188,7 +189,9 @@ services:
 
 `restart` and healthcheck timing (`start_delay`, `interval`, `timeout`, `retries`) can also be
 set globally and overridden per service. A global `healthcheck` block only supplies timing defaults;
-each service still opts in by defining `healthcheck.test`.
+each service still opts in by defining `healthcheck.test`. Services get 10 seconds to stop
+gracefully by default; set `stop_grace_period` on a service to change its termination grace, up to
+five minutes.
 
 The control plane is **on by default**; opt out with `--no-control` or `control: { enabled: false }`. Dogfood it from the shell without an agent:
 

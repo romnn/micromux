@@ -12,6 +12,9 @@ mod source;
 mod state;
 mod style;
 
+use std::collections::VecDeque;
+use std::time::Duration;
+
 use micromux::{ChangeKind, Command, SessionChange};
 use ratatui::DefaultTerminal;
 use tokio::sync::broadcast;
@@ -19,6 +22,10 @@ use tokio::sync::mpsc;
 
 pub use remote::RemoteSource;
 pub use source::{LocalSource, SessionSource};
+
+const FRAME_INTERVAL: Duration = Duration::from_millis(16);
+const PENDING_PTY_INPUT_MAX_BYTES: usize = 64 * 1024;
+const PENDING_PTY_INPUT_RETRY: Duration = Duration::from_millis(5);
 
 /// Errors from running or rendering the terminal interface.
 #[derive(Debug, thiserror::Error)]
@@ -36,6 +43,8 @@ pub struct App {
     /// Running state of the TUI application.
     running: bool,
     input: Option<mpsc::Sender<Command>>,
+    pending_pty_input: VecDeque<(String, Vec<u8>)>,
+    pending_pty_input_bytes: usize,
     shutdown: micromux::CancellationToken,
     /// Synchronous session data and lifecycle commands.
     source: SessionSource,
@@ -88,6 +97,8 @@ impl App {
         Self {
             running: true,
             input,
+            pending_pty_input: VecDeque::new(),
+            pending_pty_input_bytes: 0,
             shutdown,
             source,
             changes,
@@ -176,6 +187,76 @@ impl App {
         }
     }
 
+    fn enqueue_pty_input(&mut self, service_id: String, bytes: Vec<u8>) {
+        let Some(input) = self.input.clone() else {
+            return;
+        };
+        if self.pending_pty_input.is_empty() {
+            match input.try_send(Command::SendInput(service_id, bytes)) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(Command::SendInput(service_id, bytes))) => {
+                    self.push_pending_pty_input(service_id, bytes);
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    tracing::warn!("PTY input channel closed; discarding terminal input");
+                }
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    tracing::warn!("unexpected command returned from PTY input queue");
+                }
+            }
+        } else {
+            self.push_pending_pty_input(service_id, bytes);
+        }
+    }
+
+    fn push_pending_pty_input(&mut self, service_id: String, bytes: Vec<u8>) {
+        if self.pending_pty_input_bytes.saturating_add(bytes.len()) > PENDING_PTY_INPUT_MAX_BYTES {
+            tracing::warn!(
+                queue_limit_bytes = PENDING_PTY_INPUT_MAX_BYTES,
+                "PTY input backlog is full; discarding terminal input"
+            );
+            return;
+        }
+        self.pending_pty_input_bytes = self.pending_pty_input_bytes.saturating_add(bytes.len());
+        if let Some((queued_service, queued)) = self.pending_pty_input.back_mut()
+            && queued_service == &service_id
+        {
+            queued.extend(bytes);
+        } else {
+            self.pending_pty_input.push_back((service_id, bytes));
+        }
+    }
+
+    fn flush_pending_pty_input(&mut self) {
+        let Some(input) = &self.input else {
+            self.pending_pty_input.clear();
+            self.pending_pty_input_bytes = 0;
+            return;
+        };
+        while let Some((service_id, bytes)) = self.pending_pty_input.pop_front() {
+            let bytes_len = bytes.len();
+            match input.try_send(Command::SendInput(service_id, bytes)) {
+                Ok(()) => {
+                    self.pending_pty_input_bytes =
+                        self.pending_pty_input_bytes.saturating_sub(bytes_len);
+                }
+                Err(mpsc::error::TrySendError::Full(Command::SendInput(service_id, bytes))) => {
+                    self.pending_pty_input.push_front((service_id, bytes));
+                    break;
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    tracing::warn!("PTY input channel closed; discarding queued terminal input");
+                    self.pending_pty_input.clear();
+                    self.pending_pty_input_bytes = 0;
+                    break;
+                }
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    tracing::warn!("unexpected command returned from PTY input queue");
+                }
+            }
+        }
+    }
+
     /// Run the TUI event loop.
     ///
     /// # Errors
@@ -189,6 +270,7 @@ impl App {
             Change(SessionChange),
             /// The change broadcast lagged (or this is the initial draw): re-read everything.
             Resync,
+            PendingInput,
         }
 
         let area = terminal.size()?;
@@ -199,8 +281,10 @@ impl App {
         // Seed the view from the model before the first frame.
         self.resync();
         terminal.draw(|frame| frame.render_widget(&mut self, frame.area()))?;
+        let mut last_frame = tokio::time::Instant::now();
 
         while self.is_running() {
+            let retry_pending_input = !self.pending_pty_input.is_empty();
             let wake = tokio::select! {
                 () = self.shutdown.cancelled() => None,
                 input = self.input_event_handler.next() => {
@@ -211,16 +295,30 @@ impl App {
                     Err(broadcast::error::RecvError::Lagged(_)) => Some(Wake::Resync),
                     Err(broadcast::error::RecvError::Closed) => None,
                 },
+                () = async {
+                    if retry_pending_input {
+                        tokio::time::sleep(PENDING_PTY_INPUT_RETRY).await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                } => Some(Wake::PendingInput),
             };
 
             match wake {
                 Some(Wake::Input(event)) => self.handle_input_event(event),
                 Some(Wake::Change(change)) => self.apply_change(&change),
                 Some(Wake::Resync) => self.resync(),
+                Some(Wake::PendingInput) => self.flush_pending_pty_input(),
                 None => {
                     self.running = false;
                     continue;
                 }
+            }
+            while self.running {
+                let Some(event) = self.input_event_handler.try_next() else {
+                    break;
+                };
+                self.handle_input_event(event);
             }
             loop {
                 match self.changes.try_recv() {
@@ -232,7 +330,12 @@ impl App {
                     ) => break,
                 }
             }
+            let frame_deadline = last_frame + FRAME_INTERVAL;
+            if tokio::time::Instant::now() < frame_deadline {
+                tokio::time::sleep_until(frame_deadline).await;
+            }
             terminal.draw(|frame| frame.render_widget(&mut self, frame.area()))?;
+            last_frame = tokio::time::Instant::now();
         }
         Ok(())
     }
@@ -323,6 +426,12 @@ impl App {
             crossterm::event::Event::Key(key) if key.kind == KeyEventKind::Press => {
                 self.handle_key_press(key);
             }
+            crossterm::event::Event::Paste(ref text) if self.pty_input_mode => {
+                if let Some(service) = self.state.current_service() {
+                    let service_id = service.snapshot.id.clone();
+                    self.enqueue_pty_input(service_id, text.as_bytes().to_vec());
+                }
+            }
             _ => {}
         }
     }
@@ -398,9 +507,7 @@ impl App {
                     && let Some(service) = self.state.current_service()
                 {
                     let service_id = service.snapshot.id.clone();
-                    if let Some(input) = &self.input {
-                        let _ = input.try_send(Command::SendInput(service_id, bytes));
-                    }
+                    self.enqueue_pty_input(service_id, bytes);
                 }
             }
         }
@@ -761,6 +868,77 @@ mod tests {
             key_event_to_bytes(KeyCode::Char('x'), KeyModifiers::ALT),
             Some(vec![0x1b, b'x'])
         );
+    }
+
+    #[tokio::test]
+    async fn pty_input_waits_in_a_bounded_backlog_when_the_command_channel_is_full()
+    -> eyre::Result<()> {
+        let yaml = "version: 1\nservices:\n  svc:\n    command: [\"true\"]\n";
+        let mut diagnostics: Vec<Diagnostic<usize>> = Vec::new();
+        let parsed = micromux::from_str(yaml, Path::new("."), 0, None, &mut diagnostics)
+            .map_err(|err| eyre::eyre!(err.to_string()))?;
+        let mux = std::sync::Arc::new(micromux::Micromux::new(&parsed)?);
+        let (_runner, handles) = mux.start(micromux::CancellationToken::new());
+        let (commands_tx, mut commands_rx) = mpsc::channel(1);
+        commands_tx.try_send(Command::ResizeAll { cols: 1, rows: 1 })?;
+        let mut app = App::new(
+            SessionSource::Local(LocalSource::new(handles.reader, commands_tx.clone())),
+            Some(commands_tx),
+            micromux::CancellationToken::new(),
+            true,
+        );
+
+        app.enqueue_pty_input("svc".to_string(), b"first".to_vec());
+        app.enqueue_pty_input("svc".to_string(), b"second".to_vec());
+        assert_eq!(app.pending_pty_input_bytes, 11);
+        let _ = commands_rx.try_recv()?;
+        app.flush_pending_pty_input();
+
+        match commands_rx.try_recv()? {
+            Command::SendInput(service, bytes) => {
+                assert_eq!(service, "svc");
+                assert_eq!(bytes, b"firstsecond");
+            }
+            other => eyre::bail!("expected queued PTY input, got {other:?}"),
+        }
+        assert_eq!(app.pending_pty_input_bytes, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bracketed_paste_is_inert_in_command_mode_and_atomic_in_input_mode() -> eyre::Result<()>
+    {
+        let yaml = "version: 1\nservices:\n  svc:\n    command: [\"true\"]\n";
+        let mut diagnostics: Vec<Diagnostic<usize>> = Vec::new();
+        let parsed = micromux::from_str(yaml, Path::new("."), 0, None, &mut diagnostics)
+            .map_err(|err| eyre::eyre!(err.to_string()))?;
+        let mux = std::sync::Arc::new(micromux::Micromux::new(&parsed)?);
+        let (_runner, handles) = mux.start(micromux::CancellationToken::new());
+        let (commands_tx, mut commands_rx) = mpsc::channel(4);
+        let mut app = App::new(
+            SessionSource::Local(LocalSource::new(handles.reader, commands_tx.clone())),
+            Some(commands_tx),
+            micromux::CancellationToken::new(),
+            true,
+        );
+
+        app.handle_crossterm_event(&crossterm::event::Event::Paste("Rq".to_string()));
+        assert!(app.running);
+        assert!(matches!(
+            commands_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+
+        app.pty_input_mode = true;
+        app.handle_crossterm_event(&crossterm::event::Event::Paste("echo pasted\n".to_string()));
+        match commands_rx.try_recv()? {
+            Command::SendInput(service, bytes) => {
+                assert_eq!(service, "svc");
+                assert_eq!(bytes, b"echo pasted\n");
+            }
+            other => eyre::bail!("expected one pasted PTY input batch, got {other:?}"),
+        }
+        Ok(())
     }
 
     #[tokio::test]

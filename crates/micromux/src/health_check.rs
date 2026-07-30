@@ -4,7 +4,7 @@ use crate::{
 };
 use itertools::Itertools;
 use std::process::Stdio;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -217,7 +217,8 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn successful_probe_does_not_wait_for_background_stdout_holder() -> eyre::Result<()> {
+    async fn successful_probe_kills_its_background_process_group_before_reaping() -> eyre::Result<()>
+    {
         use nix::errno::Errno;
         use nix::sys::signal::kill;
         use nix::unistd::Pid;
@@ -279,22 +280,66 @@ mod tests {
         loop {
             match kill(Pid::from_raw(pid), None) {
                 Err(Errno::ESRCH) => break,
-                other if tokio::time::Instant::now() < deadline => {
-                    if !matches!(other, Ok(())) {
-                        eyre::bail!(
-                            "unexpected signal probe result for background process: {other:?}"
-                        );
-                    }
+                Ok(()) if tokio::time::Instant::now() < deadline => {
                     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                 }
                 other => {
-                    eyre::bail!(
-                        "expected background healthcheck process to be gone, got {other:?}"
-                    );
+                    eyre::bail!("background probe process survived group cleanup: {other:?}");
                 }
             }
         }
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn probe_output_lines_are_bounded_before_model_ingress() -> eyre::Result<()> {
+        use tokio::io::AsyncWriteExt as _;
+
+        let (reader, mut writer) = tokio::io::duplex(crate::model::MODEL_STRING_MAX_BYTES * 2);
+        let write = tokio::spawn(async move {
+            writer
+                .write_all(&vec![b'x'; crate::model::MODEL_STRING_MAX_BYTES * 2])
+                .await?;
+            writer.write_all(b"\nnext\n").await
+        });
+        let mut reader = BufReader::new(reader);
+        let mut buffer = Vec::new();
+
+        let first = read_bounded_line(&mut reader, &mut buffer)
+            .await?
+            .ok_or_else(|| eyre::eyre!("missing oversized line"))?;
+        let second = read_bounded_line(&mut reader, &mut buffer)
+            .await?
+            .ok_or_else(|| eyre::eyre!("missing following line"))?;
+        write.await??;
+
+        assert_eq!(first.len(), crate::model::MODEL_STRING_MAX_BYTES);
+        assert_eq!(second, "next");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn probe_output_limit_preserves_utf8_boundaries() -> eyre::Result<()> {
+        use tokio::io::AsyncWriteExt as _;
+
+        let (reader, mut writer) = tokio::io::duplex(crate::model::MODEL_STRING_MAX_BYTES * 2);
+        let write = tokio::spawn(async move {
+            writer
+                .write_all(&vec![b'x'; crate::model::MODEL_STRING_MAX_BYTES - 1])
+                .await?;
+            writer.write_all("é trailing\n".as_bytes()).await
+        });
+        let mut reader = BufReader::new(reader);
+        let mut buffer = Vec::new();
+
+        let line = read_bounded_line(&mut reader, &mut buffer)
+            .await?
+            .ok_or_else(|| eyre::eyre!("missing oversized UTF-8 line"))?;
+        write.await??;
+
+        assert_eq!(line.len(), crate::model::MODEL_STRING_MAX_BYTES - 1);
+        assert!(!line.contains('\u{fffd}'));
         Ok(())
     }
 
@@ -467,26 +512,37 @@ async fn record_probe_failure(
     attempt: &mut usize,
     max_retries: usize,
     unhealthy: &mut bool,
-) {
+) -> bool {
     log_probe_error(source, &params.service_id, *attempt, max_retries);
 
     // Mark unhealthy once on the failing transition, then keep probing so the service can
     // recover back to healthy (and unblock `condition: healthy` dependents) instead of giving
     // up permanently.
     if *unhealthy {
-        return;
+        return true;
     }
 
     *attempt = attempt.saturating_add(1);
     if *attempt >= max_retries {
         *unhealthy = true;
-        let _ = params
-            .events_tx
-            .send(ProcessEvent::Unhealthy {
+        return send_event(
+            params,
+            ProcessEvent::Unhealthy {
                 service_id: params.service_id.clone(),
                 run_id: params.run_id,
-            })
-            .await;
+            },
+        )
+        .await;
+    }
+    true
+}
+
+async fn send_event(params: &RunLoopParams, event: ProcessEvent) -> bool {
+    tokio::select! {
+        biased;
+        () = params.shutdown.cancelled() => false,
+        () = params.terminate.cancelled() => false,
+        result = params.events_tx.send(event) => result.is_ok(),
     }
 }
 
@@ -531,25 +587,32 @@ pub async fn run_loop(health_check: crate::HealthcheckSpec, params: RunLoopParam
         match res {
             Ok(Outcome::Cancelled) => return,
             Ok(Outcome::Healthy) => {
-                let _ = params
-                    .events_tx
-                    .send(ProcessEvent::Healthy {
+                if !send_event(
+                    &params,
+                    ProcessEvent::Healthy {
                         service_id: params.service_id.clone(),
                         run_id: params.run_id,
-                    })
-                    .await;
+                    },
+                )
+                .await
+                {
+                    return;
+                }
                 attempt = 0;
                 unhealthy = false;
             }
             Err(err) => {
-                record_probe_failure(
+                if !record_probe_failure(
                     &params,
                     &err.source,
                     &mut attempt,
                     max_retries,
                     &mut unhealthy,
                 )
-                .await;
+                .await
+                {
+                    return;
+                }
             }
         }
 
@@ -571,14 +634,16 @@ fn emit_spawn_failed(sink: &RunSink, attempt: u64, source: &std::io::Error) {
 }
 
 fn spawn_output_task(
-    mut lines: tokio::io::Lines<BufReader<impl tokio::io::AsyncRead + Unpin + Send + 'static>>,
+    reader: impl AsyncRead + Unpin + Send + 'static,
     attempt: u64,
     stream: OutputStream,
     sink: RunSink,
 ) -> tokio::task::JoinHandle<()> {
     tokio::task::spawn(async move {
+        let mut reader = BufReader::new(reader);
+        let mut line = Vec::new();
         loop {
-            match lines.next_line().await {
+            match read_bounded_line(&mut reader, &mut line).await {
                 Ok(Some(line)) => {
                     sink.append_health_line(attempt, stream, line);
                 }
@@ -589,6 +654,48 @@ fn spawn_output_task(
             }
         }
     })
+}
+
+async fn read_bounded_line<R: AsyncRead + Unpin>(
+    reader: &mut BufReader<R>,
+    line: &mut Vec<u8>,
+) -> std::io::Result<Option<String>> {
+    line.clear();
+    let mut saw_input = false;
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            if !saw_input {
+                return Ok(None);
+            }
+            break;
+        }
+        saw_input = true;
+        let end = available
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(available.len(), |idx| idx + 1);
+        let capture_limit = crate::model::MODEL_STRING_MAX_BYTES.saturating_add(3);
+        let remaining = capture_limit.saturating_sub(line.len());
+        if let Some(chunk) = available.get(..end.min(remaining)) {
+            line.extend_from_slice(chunk);
+        }
+        let finished = available.get(end.saturating_sub(1)) == Some(&b'\n');
+        reader.consume(end);
+        if finished {
+            break;
+        }
+    }
+    if line.last() == Some(&b'\n') {
+        line.pop();
+    }
+    if line.last() == Some(&b'\r') {
+        line.pop();
+    }
+    Ok(Some(crate::model::truncate_to_first_bytes(
+        String::from_utf8_lossy(line).into_owned(),
+        crate::model::MODEL_STRING_MAX_BYTES,
+    )))
 }
 
 #[derive(Default)]
@@ -664,50 +771,73 @@ struct Running {
     attempt: u64,
     command: String,
     output_readers: OutputReaders,
-    wait_handle: tokio::task::JoinHandle<Result<std::process::ExitStatus, std::io::Error>>,
-    kill_token: CancellationToken,
-    #[cfg(unix)]
-    child_pid: Option<i32>,
+    process: tokio::process::Child,
 }
 
-fn spawn_wait_task(
-    mut child: tokio::process::Child,
-    kill_token: &CancellationToken,
-) -> tokio::task::JoinHandle<Result<std::process::ExitStatus, std::io::Error>> {
-    let poll = std::time::Duration::from_millis(25);
-    let kill_token_child = kill_token.clone();
-    tokio::task::spawn(async move {
-        loop {
-            match child.try_wait() {
-                Ok(Some(status)) => return Ok(status),
-                Ok(None) => {}
-                Err(err) => return Err(err),
-            }
-
-            tokio::select! {
-                () = kill_token_child.cancelled() => {
-                    #[cfg(unix)]
-                    if let Some(pid) = child.id() {
-                        let pid = i32::try_from(pid).unwrap_or(i32::MAX);
-                        let pid = nix::unistd::Pid::from_raw(pid);
-                        let _ = nix::sys::signal::killpg(pid, nix::sys::signal::Signal::SIGKILL);
-                    }
-                    let _ = child.kill().await;
-                    return child.wait().await;
-                }
-                () = tokio::time::sleep(poll) => {}
-            }
+#[cfg(unix)]
+fn child_exit_is_pending(pid: i32) -> std::io::Result<bool> {
+    let pid = rustix::process::Pid::from_raw(pid)
+        .ok_or_else(|| std::io::Error::other("healthcheck pid must be positive"))?;
+    loop {
+        match rustix::process::waitid(
+            rustix::process::WaitId::Pid(pid),
+            rustix::process::WaitIdOptions::EXITED
+                | rustix::process::WaitIdOptions::NOWAIT
+                | rustix::process::WaitIdOptions::NOHANG,
+        ) {
+            Ok(status) => return Ok(status.is_some()),
+            Err(rustix::io::Errno::INTR) => {}
+            Err(err) => return Err(err.into()),
         }
-    })
+    }
+}
+
+#[cfg(unix)]
+async fn wait_for_exit_without_reaping(pid: i32) -> std::io::Result<()> {
+    let mut child_signal =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::child()).ok();
+    loop {
+        if child_exit_is_pending(pid)? {
+            return Ok(());
+        }
+        if let Some(signal) = child_signal.as_mut() {
+            if signal.recv().await.is_none() {
+                child_signal = None;
+            }
+        } else {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn wait_for_probe_status(
+    process: &mut tokio::process::Child,
+) -> Result<std::process::ExitStatus, std::io::Error> {
+    let Some(pid) = process.id().and_then(|pid| i32::try_from(pid).ok()) else {
+        return process.wait().await;
+    };
+    wait_for_exit_without_reaping(pid).await?;
+    kill_process_group(pid);
+    process.wait().await
+}
+
+#[cfg(not(unix))]
+async fn wait_for_probe_status(
+    process: &mut tokio::process::Child,
+) -> Result<std::process::ExitStatus, std::io::Error> {
+    process.wait().await
 }
 
 async fn select_completion(
     timeout: Option<std::time::Duration>,
     shutdown: &CancellationToken,
     terminate: &CancellationToken,
-    wait_handle: &mut tokio::task::JoinHandle<Result<std::process::ExitStatus, std::io::Error>>,
+    process: &mut tokio::process::Child,
 ) -> Completion {
     tokio::select! {
+        biased;
+        status = wait_for_probe_status(process) => Completion::Status(status),
         () = shutdown.cancelled() => Completion::Shutdown,
         () = terminate.cancelled() => Completion::Shutdown,
         () = async {
@@ -717,33 +847,33 @@ async fn select_completion(
                 futures::future::pending::<()>().await;
             }
         } => Completion::Timeout,
-        res = wait_handle => Completion::Status(res.unwrap_or_else(|err| Err(std::io::Error::other(err.to_string())))),
     }
 }
 
 async fn cleanup_after_cancel(running: &mut Running) {
-    running.kill_token.cancel();
     #[cfg(unix)]
-    if let Some(pid) = running.child_pid {
+    if let Some(pid) = running.process.id().and_then(|pid| i32::try_from(pid).ok()) {
+        // The owned child has not been waited yet, so its PID and process-group id cannot be
+        // recycled before this signal.
         kill_process_group(pid);
     }
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(1), &mut running.wait_handle).await;
-    running.output_readers.abort_and_join().await;
+    let already_exited = running.process.try_wait().ok().flatten().is_some();
+    if !already_exited {
+        let _ = running.process.start_kill();
+        let _ =
+            tokio::time::timeout(std::time::Duration::from_secs(1), running.process.wait()).await;
+    }
+    if !running.output_readers.drain(OUTPUT_DRAIN_TIMEOUT).await {
+        running.output_readers.abort_and_join().await;
+    }
 }
 
 async fn finish_with_exit(running: &mut Running, success: bool, exit_code: i32) {
     let drained = running.output_readers.drain(OUTPUT_DRAIN_TIMEOUT).await;
 
-    #[cfg(unix)]
-    if !drained && let Some(pid) = running.child_pid {
-        kill_reaped_probe_group(pid);
-        running.output_readers.abort_and_join().await;
-    }
-
-    #[cfg(not(unix))]
     if !drained {
-        // Windows has no process-group kill path here; still abort the reader tasks so a
-        // descendant that inherited the pipe cannot block the healthcheck loop.
+        // A descendant may create another process group while retaining an output pipe. Abort the
+        // readers after the owned group is gone instead of signaling a post-reap numeric id.
         running.output_readers.abort_and_join().await;
     }
 
@@ -757,12 +887,6 @@ fn kill_process_group(pid: i32) {
     let pid = nix::unistd::Pid::from_raw(pid);
     let _ = nix::sys::signal::killpg(pid, nix::sys::signal::Signal::SIGKILL);
     let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
-}
-
-#[cfg(unix)]
-fn kill_reaped_probe_group(pid: i32) {
-    let pid = nix::unistd::Pid::from_raw(pid);
-    let _ = nix::sys::signal::killpg(pid, nix::sys::signal::Signal::SIGKILL);
 }
 
 #[expect(
@@ -793,6 +917,7 @@ async fn run(
     let mut cmd = Command::new(prog);
     cmd.args(args)
         .envs(params.environment.iter())
+        .kill_on_drop(true)
         .stderr(Stdio::piped())
         .stdout(Stdio::piped());
     #[cfg(unix)]
@@ -814,7 +939,7 @@ async fn run(
     let mut output_readers = OutputReaders::default();
     if let Some(stderr) = process.stderr.take() {
         output_readers.set_stderr(spawn_output_task(
-            BufReader::new(stderr).lines(),
+            stderr,
             attempt,
             OutputStream::Stderr,
             params.sink.clone(),
@@ -823,37 +948,25 @@ async fn run(
 
     if let Some(stdout) = process.stdout.take() {
         output_readers.set_stdout(spawn_output_task(
-            BufReader::new(stdout).lines(),
+            stdout,
             attempt,
             OutputStream::Stdout,
             params.sink.clone(),
         ));
     }
 
-    #[cfg(unix)]
-    let child_pid = process.id().and_then(|pid| i32::try_from(pid).ok());
-    let kill_token = CancellationToken::new();
-    let mut wait_handle = spawn_wait_task(process, &kill_token);
     // Always bound the probe so a hung command cannot block the loop (and dependents) forever.
     let timeout = Some(health_check.timeout);
 
-    let completion = select_completion(
-        timeout,
-        &params.shutdown,
-        &params.terminate,
-        &mut wait_handle,
-    )
-    .await;
+    let completion =
+        select_completion(timeout, &params.shutdown, &params.terminate, &mut process).await;
 
     let mut running = Running {
         sink: params.sink,
         attempt,
         command,
         output_readers,
-        wait_handle,
-        kill_token,
-        #[cfg(unix)]
-        child_pid,
+        process,
     };
 
     match completion {

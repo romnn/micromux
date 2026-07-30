@@ -298,6 +298,8 @@ pub struct Service {
     pub restart: Option<RestartPolicy>,
     /// Effective restart policy after applying the global default.
     pub restart_policy: RestartPolicy,
+    /// Time allowed for graceful termination before forced termination.
+    pub stop_grace_period: Spanned<Duration>,
     /// Whether this service should be rendered in color.
     pub color: Option<Spanned<bool>>,
     /// Effective log retention after applying global defaults and this service's overrides.

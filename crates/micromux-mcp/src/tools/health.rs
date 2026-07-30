@@ -122,7 +122,7 @@ pub(crate) fn diagnosis_hint(
     match snapshot.execution {
         Execution::Exited => {
             if error_log_tail.is_empty() {
-                "service exited; inspect get_logs for the full retained run".to_string()
+                "service exited; inspect get_logs for the retained run".to_string()
             } else {
                 "service exited; error_log_tail contains likely cause lines".to_string()
             }
@@ -169,7 +169,7 @@ fn exit_signal(snapshot: &ServiceSnapshot) -> Option<Signal> {
     Some(Signal {
         kind: SignalKind::ExitSignal,
         detail: format!("last run exited with status {exit_code}{meaning}"),
-        next_probe: "inspect error_log_tail and the full retained run with get_logs",
+        next_probe: "inspect error_log_tail and the retained run with get_logs",
     })
 }
 

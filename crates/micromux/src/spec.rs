@@ -15,9 +15,13 @@ use crate::service::RestartPolicy;
 const DEFAULT_HEALTHCHECK_INTERVAL: Duration = Duration::from_secs(30);
 /// Default probe timeout when none is configured (matches Docker Compose).
 const DEFAULT_HEALTHCHECK_TIMEOUT: Duration = Duration::from_secs(30);
+/// Default graceful-stop window when none is configured (matches Docker Compose).
+pub(crate) const DEFAULT_STOP_GRACE_PERIOD: Duration = Duration::from_secs(10);
+/// Longest graceful-stop window accepted for one service.
+pub(crate) const MAX_STOP_GRACE_PERIOD: Duration = Duration::from_mins(5);
 
 /// The normalized, origin-independent definition of one supervised service.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ServiceSpec {
     /// Optional display name. The service id is used when this is absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -43,20 +47,54 @@ pub struct ServiceSpec {
     /// Automatic restart behavior.
     #[serde(default)]
     pub restart: RestartPolicy,
+    /// Time allowed for graceful termination before the process is force-killed.
+    ///
+    /// Values must be greater than zero and no longer than five minutes.
+    #[serde(with = "duration", default = "default_stop_grace_period")]
+    #[schemars(with = "String")]
+    pub stop_grace_period: Duration,
+}
+
+impl Default for ServiceSpec {
+    fn default() -> Self {
+        Self {
+            name: None,
+            command: Vec::new(),
+            working_dir: None,
+            environment: IndexMap::new(),
+            depends_on: Vec::new(),
+            healthcheck: None,
+            ports: Vec::new(),
+            restart: RestartPolicy::default(),
+            stop_grace_period: DEFAULT_STOP_GRACE_PERIOD,
+        }
+    }
 }
 
 impl ServiceSpec {
-    /// Normalize commands for the platform and floor healthcheck retries to one attempt.
+    /// Normalize commands for the platform and validate timing invariants.
     ///
     /// # Errors
     ///
-    /// Returns [`SpecError::EmptyCommand`] when either the service command or its healthcheck
-    /// contains no executable command.
+    /// Returns an error when either command is empty, a recurring duration is zero, or the graceful
+    /// stop window is outside the supported range.
     pub fn normalize(&mut self) -> Result<(), SpecError> {
         self.command = normalize_command(&self.command)?;
+        if self.stop_grace_period.is_zero() {
+            return Err(SpecError::ZeroStopGracePeriod);
+        }
+        if self.stop_grace_period > MAX_STOP_GRACE_PERIOD {
+            return Err(SpecError::StopGracePeriodTooLong);
+        }
         if let Some(healthcheck) = &mut self.healthcheck {
             healthcheck.test = normalize_command(&healthcheck.test)?;
             healthcheck.retries = healthcheck.retries.max(1);
+            if healthcheck.interval.is_zero() {
+                return Err(SpecError::ZeroHealthcheckInterval);
+            }
+            if healthcheck.timeout.is_zero() {
+                return Err(SpecError::ZeroHealthcheckTimeout);
+            }
         }
         Ok(())
     }
@@ -119,6 +157,10 @@ fn default_healthcheck_timeout() -> Duration {
 
 fn default_healthcheck_retries() -> usize {
     1
+}
+
+pub(crate) fn default_stop_grace_period() -> Duration {
+    DEFAULT_STOP_GRACE_PERIOD
 }
 
 impl Default for HealthcheckSpec {
@@ -297,6 +339,14 @@ pub struct PartialServiceSpec {
     /// Restart-policy replacement.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub restart: Option<RestartPolicy>,
+    /// Graceful-stop window replacement.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "duration::option"
+    )]
+    #[schemars(with = "Option<String>")]
+    pub stop_grace_period: Option<Duration>,
 }
 
 impl PartialServiceSpec {
@@ -333,6 +383,9 @@ impl PartialServiceSpec {
         if let Some(restart) = self.restart {
             base.restart = restart;
         }
+        if let Some(stop_grace_period) = self.stop_grace_period {
+            base.stop_grace_period = stop_grace_period;
+        }
         base
     }
 }
@@ -368,6 +421,18 @@ pub enum SpecError {
     /// The command has no executable component.
     #[error("command is empty")]
     EmptyCommand,
+    /// A zero interval would run probes continuously.
+    #[error("healthcheck interval must be greater than zero")]
+    ZeroHealthcheckInterval,
+    /// A zero timeout would immediately kill every probe.
+    #[error("healthcheck timeout must be greater than zero")]
+    ZeroHealthcheckTimeout,
+    /// A zero stop grace would skip graceful termination.
+    #[error("stop grace period must be greater than zero")]
+    ZeroStopGracePeriod,
+    /// An excessive stop grace would make supervisor shutdown unreasonably long.
+    #[error("stop grace period must not exceed 5m")]
+    StopGracePeriodTooLong,
 }
 
 /// Lower a plain argv or Compose-style `CMD`/`CMD-SHELL` form for the current platform.
@@ -513,6 +578,58 @@ mod tests {
             Some(1)
         );
         Ok(())
+    }
+
+    #[test]
+    fn normalization_rejects_zero_action_durations() {
+        let healthcheck = HealthcheckSpec {
+            test: vec!["true".to_string()],
+            ..HealthcheckSpec::default()
+        };
+        let cases = [
+            (
+                ServiceSpec {
+                    command: vec!["true".to_string()],
+                    healthcheck: Some(HealthcheckSpec {
+                        interval: Duration::ZERO,
+                        ..healthcheck.clone()
+                    }),
+                    ..ServiceSpec::default()
+                },
+                SpecError::ZeroHealthcheckInterval,
+            ),
+            (
+                ServiceSpec {
+                    command: vec!["true".to_string()],
+                    healthcheck: Some(HealthcheckSpec {
+                        timeout: Duration::ZERO,
+                        ..healthcheck
+                    }),
+                    ..ServiceSpec::default()
+                },
+                SpecError::ZeroHealthcheckTimeout,
+            ),
+            (
+                ServiceSpec {
+                    command: vec!["true".to_string()],
+                    stop_grace_period: Duration::ZERO,
+                    ..ServiceSpec::default()
+                },
+                SpecError::ZeroStopGracePeriod,
+            ),
+            (
+                ServiceSpec {
+                    command: vec!["true".to_string()],
+                    stop_grace_period: MAX_STOP_GRACE_PERIOD + Duration::from_secs(1),
+                    ..ServiceSpec::default()
+                },
+                SpecError::StopGracePeriodTooLong,
+            ),
+        ];
+
+        for (mut spec, expected) in cases {
+            assert_eq!(spec.normalize(), Err(expected));
+        }
     }
 
     #[test]

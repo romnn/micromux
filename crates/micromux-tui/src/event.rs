@@ -63,6 +63,11 @@ impl InputHandler {
     pub async fn next(&mut self) -> Option<Input> {
         self.receiver.recv().await
     }
+
+    /// Returns one already-buffered event without waiting.
+    pub fn try_next(&mut self) -> Option<Input> {
+        self.receiver.try_recv().ok()
+    }
 }
 
 /// Task that forwards terminal events until the receiver is dropped.

@@ -12,6 +12,7 @@ use crate::{
 };
 use codespan_reporting::diagnostic::Severity;
 use std::collections::{HashMap, VecDeque};
+use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -229,6 +230,7 @@ pub(super) struct RunConfig {
     working_dir: Option<String>,
     advertised_ports: Vec<u16>,
     healthcheck: Option<HealthcheckConfig>,
+    stop_grace_period: Duration,
 }
 
 impl From<&Service> for RunConfig {
@@ -242,6 +244,7 @@ impl From<&Service> for RunConfig {
                 .healthcheck
                 .as_ref()
                 .map(HealthcheckConfig::from),
+            stop_grace_period: service.spec.stop_grace_period,
         }
     }
 }
@@ -618,6 +621,7 @@ pub(super) fn project_snapshot(
         advertised_ports: run_config.advertised_ports.clone(),
         healthcheck_configured: run_config.healthcheck.is_some(),
         healthcheck: run_config.healthcheck.clone(),
+        stop_grace_period: run_config.stop_grace_period,
         config_stale: runtime
             .run_config
             .as_ref()
@@ -752,6 +756,12 @@ fn load_services_from_disk(reload: &ReloadConfig) -> Result<ServiceMap, String> 
     ServiceGraph::new(&services)
         .map_err(|err| format!("validate {}: {err}", reload.config_path.display()))?;
     Ok(services)
+}
+
+async fn load_services_from_disk_async(reload: ReloadConfig) -> Result<ServiceMap, String> {
+    tokio::task::spawn_blocking(move || load_services_from_disk(&reload))
+        .await
+        .map_err(|err| format!("config reload task failed: {err}"))?
 }
 
 fn validate_reloaded_services(
@@ -1560,11 +1570,45 @@ impl SchedulerRuntime {
         }
     }
 
-    fn reload_services(&mut self, services: &mut ServiceMap) -> Result<(), CommandRejection> {
-        let Some(reload) = &self.reload_config else {
+    async fn await_loaded_services<F>(
+        &mut self,
+        services: &ServiceMap,
+        events_rx: &mut mpsc::Receiver<ProcessEvent>,
+        load: F,
+    ) -> Result<ServiceMap, String>
+    where
+        F: Future<Output = Result<ServiceMap, String>>,
+    {
+        // Exit handling must keep freeing event-channel capacity while a slow filesystem reloads
+        // configuration; applying the completed candidate remains serialized on this task.
+        tokio::pin!(load);
+        let mut events_open = true;
+        loop {
+            tokio::select! {
+                result = &mut load => return result,
+                event = events_rx.recv(), if events_open => {
+                    if let Some(event) = event {
+                        let _ = self.handle_event(services, &event);
+                    } else {
+                        events_open = false;
+                    }
+                }
+            }
+        }
+    }
+
+    async fn reload_services(
+        &mut self,
+        services: &mut ServiceMap,
+        events_rx: &mut mpsc::Receiver<ProcessEvent>,
+    ) -> Result<(), CommandRejection> {
+        let Some(reload) = self.reload_config.clone() else {
             return Ok(());
         };
-        let updated = load_services_from_disk(reload).map_err(CommandRejection::ConfigReload)?;
+        let updated = self
+            .await_loaded_services(services, events_rx, load_services_from_disk_async(reload))
+            .await
+            .map_err(CommandRejection::ConfigReload)?;
         validate_reloaded_services(services, &self.services, &updated)
             .map_err(CommandRejection::ConfigReload)?;
 
@@ -1829,18 +1873,22 @@ impl SchedulerRuntime {
         }
     }
 
-    fn reconcile_config(
+    async fn reconcile_config(
         &mut self,
         services: &mut ServiceMap,
+        events_rx: &mut mpsc::Receiver<ProcessEvent>,
         dry_run: bool,
     ) -> Result<ReconcileReceipt, CommandRejection> {
-        let reload = self.reload_config.as_ref().ok_or_else(|| {
+        let reload = self.reload_config.clone().ok_or_else(|| {
             CommandRejection::ConfigReload(
                 "session has no config path; config reconciliation is unavailable".to_string(),
             )
         })?;
         let config_path = reload.config_path.display().to_string();
-        let updated = load_services_from_disk(reload).map_err(CommandRejection::ConfigReload)?;
+        let updated = self
+            .await_loaded_services(services, events_rx, load_services_from_disk_async(reload))
+            .await
+            .map_err(CommandRejection::ConfigReload)?;
         let actions = self.reconcile_actions(services, &updated);
         // Validate on dry runs too: a preview that reports actions the apply would then
         // reject (dynamic-id collision, orphaned dependents, graph failure) is not a preview.
@@ -1887,11 +1935,15 @@ impl SchedulerRuntime {
         })
     }
 
-    fn reload_before_auto_restart(&mut self, services: &mut ServiceMap) {
+    async fn reload_before_auto_restart(
+        &mut self,
+        services: &mut ServiceMap,
+        events_rx: &mut mpsc::Receiver<ProcessEvent>,
+    ) {
         if self.reload_config.is_none() || !self.has_due_auto_restart(services) {
             return;
         }
-        if let Err(err) = self.reload_services(services) {
+        if let Err(err) = self.reload_services(services, events_rx).await {
             tracing::warn!(
                 ?err,
                 "config reload before automatic restart failed; keeping previous service definitions"
@@ -1899,8 +1951,12 @@ impl SchedulerRuntime {
         }
     }
 
-    fn schedule_pass(&mut self, services: &mut ServiceMap) {
-        self.reload_before_auto_restart(services);
+    async fn schedule_pass(
+        &mut self,
+        services: &mut ServiceMap,
+        events_rx: &mut mpsc::Receiver<ProcessEvent>,
+    ) {
+        self.reload_before_auto_restart(services, events_rx).await;
         schedule::schedule_ready(&mut schedule::ScheduleContext {
             services,
             runtimes: &mut self.services,
@@ -1939,9 +1995,10 @@ impl SchedulerRuntime {
 
     /// Restart a service, latching the run generation *before* the restart. Restarting a disabled
     /// service is invalid for every caller: `enable` is the operation that starts disabled services.
-    fn apply_restart(
+    async fn apply_restart(
         &mut self,
         services: &mut ServiceMap,
+        events_rx: &mut mpsc::Receiver<ProcessEvent>,
         service_id: &ServiceID,
     ) -> ServiceCommandResult {
         if !self.services.contains_key(service_id) {
@@ -1961,7 +2018,7 @@ impl SchedulerRuntime {
                 "the service is disabled; enable it before restarting".to_string(),
             ));
         }
-        self.reload_services(services)?;
+        self.reload_services(services, events_rx).await?;
         let runtime = self
             .services
             .get_mut(service_id)
@@ -1982,9 +2039,10 @@ impl SchedulerRuntime {
         }])
     }
 
-    fn apply_enable(
+    async fn apply_enable(
         &mut self,
         services: &mut ServiceMap,
+        events_rx: &mut mpsc::Receiver<ProcessEvent>,
         service_id: &ServiceID,
     ) -> ServiceCommandResult {
         if !self.services.contains_key(service_id) {
@@ -1999,7 +2057,7 @@ impl SchedulerRuntime {
                 Self::retired_guidance(reason).to_string(),
             ));
         }
-        self.reload_services(services)?;
+        self.reload_services(services, events_rx).await?;
         let runtime = self
             .services
             .get_mut(service_id)
@@ -2040,8 +2098,12 @@ impl SchedulerRuntime {
         }])
     }
 
-    fn apply_restart_all(&mut self, services: &mut ServiceMap) -> ServiceCommandResult {
-        self.reload_services(services)?;
+    async fn apply_restart_all(
+        &mut self,
+        services: &mut ServiceMap,
+        events_rx: &mut mpsc::Receiver<ProcessEvent>,
+    ) -> ServiceCommandResult {
+        self.reload_services(services, events_rx).await?;
         let mut acks = Vec::new();
         for service_id in services.keys() {
             let restart = self
@@ -2069,20 +2131,25 @@ impl SchedulerRuntime {
         Ok(acks)
     }
 
-    fn handle_command(&mut self, services: &mut ServiceMap, command: Command) -> bool {
+    async fn handle_command(
+        &mut self,
+        services: &mut ServiceMap,
+        events_rx: &mut mpsc::Receiver<ProcessEvent>,
+        command: Command,
+    ) -> bool {
         match command {
             Command::Restart { service, ack } => {
-                let result = self.apply_restart(services, &service);
+                let result = self.apply_restart(services, events_rx, &service).await;
                 Self::reply(ack, result);
                 true
             }
             Command::Enable { service, ack } => {
-                let result = self.apply_enable(services, &service);
+                let result = self.apply_enable(services, events_rx, &service).await;
                 Self::reply(ack, result);
                 true
             }
             Command::RestartAll { ack } => {
-                let result = self.apply_restart_all(services);
+                let result = self.apply_restart_all(services, events_rx).await;
                 Self::reply(ack, result);
                 true
             }
@@ -2096,7 +2163,7 @@ impl SchedulerRuntime {
                 true
             }
             Command::ReconcileConfig { dry_run, ack } => {
-                let result = self.reconcile_config(services, dry_run);
+                let result = self.reconcile_config(services, events_rx, dry_run).await;
                 ack.send(result);
                 true
             }
@@ -2135,7 +2202,7 @@ impl SchedulerRuntime {
                 if let Some(runtime) = self.services.get(&service_id)
                     && let Some(running) = &runtime.running
                 {
-                    running.pty.write_input(&service_id, data);
+                    running.pty.write_input(&service_id, &data);
                 }
                 false
             }
@@ -2303,13 +2370,13 @@ impl SchedulerRuntime {
         }
     }
 
-    /// Keep the runtime alive after a shutdown so the per-service termination tasks can finish
-    /// their SIGTERM -> deadline -> SIGKILL escalation and reap their children.
+    /// Keep the runtime alive after shutdown so per-service termination tasks can finish their
+    /// configured graceful-stop window, forced termination, PTY hangup, and child reap.
     ///
     /// Without this drain the tokio runtime would be dropped the instant the scheduler returns,
     /// aborting those detached tasks mid-escalation and orphaning any process that ignores
     /// SIGTERM. Each matching `Exited` event removes the service's run handle, so the drain ends as
-    /// soon as every child has been reaped (bounded by an overall timeout).
+    /// soon as every child has been reaped.
     async fn drain_on_shutdown(
         &mut self,
         services: &ServiceMap,
@@ -2322,7 +2389,22 @@ impl SchedulerRuntime {
             remaining = self.running_count(),
             "draining services on shutdown"
         );
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let max_stop_grace = self
+            .services
+            .values()
+            .filter(|runtime| runtime.running.is_some())
+            .filter_map(|runtime| runtime.run_config.as_ref())
+            .map(|config| config.stop_grace_period)
+            .max()
+            .unwrap_or(crate::spec::DEFAULT_STOP_GRACE_PERIOD);
+        // Healthcheck teardown and final event delivery begin only after the child wait completes,
+        // so their budget is separate from the PTY-close window.
+        let drain_budget = max_stop_grace
+            .saturating_add(pty::PTY_HANGUP_AFTER_ESCALATION)
+            .saturating_add(pty::HEALTH_TASK_STOP_TIMEOUT)
+            .saturating_add(Duration::from_secs(2));
+        let now = tokio::time::Instant::now();
+        let deadline = now.checked_add(drain_budget).unwrap_or(now);
         while self.running_count() > 0 {
             tokio::select! {
                 () = tokio::time::sleep_until(deadline) => {
@@ -2397,7 +2479,7 @@ pub(crate) async fn scheduler(input: SchedulerInput) -> Result<(), crate::graph:
 
     // Initial scheduling pass
     tracing::debug!("started initial scheduling pass");
-    rt.schedule_pass(&mut services);
+    rt.schedule_pass(&mut services, &mut events_rx).await;
     tracing::debug!("completed initial scheduling pass");
 
     // Whenever an event comes in, try to (re)start any services whose deps are now healthy
@@ -2417,7 +2499,7 @@ pub(crate) async fn scheduler(input: SchedulerInput) -> Result<(), crate::graph:
                 let Some(command) = command else {
                     break;
                 };
-                rt.handle_command(&mut services, command)
+                rt.handle_command(&mut services, &mut events_rx, command).await
             }
             event = events_rx.recv() => {
                 let Some(event) = event else {
@@ -2453,7 +2535,7 @@ pub(crate) async fn scheduler(input: SchedulerInput) -> Result<(), crate::graph:
         // insertion.
         rt.evict_retired(&mut services);
         if needs_schedule {
-            rt.schedule_pass(&mut services);
+            rt.schedule_pass(&mut services, &mut events_rx).await;
         }
     }
 

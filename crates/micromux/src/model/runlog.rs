@@ -4,26 +4,42 @@ use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use parking_lot::Mutex;
+
 use crate::scheduler::ServiceID;
 
-use super::disk::{DiskLogOp, DiskLogRecord, DiskLogWriter};
+use super::disk::{
+    DiskLogOp, DiskLogRecord, DiskLogWriter, DiskRunMetadata, SharedDiskRunMetadata,
+};
 use super::{LogLine, LogRunSummary};
 
 pub(super) const RUN_LOG_OFFSET_CACHE: usize = 4096;
 
 #[derive(Clone, Debug, Default)]
 pub(super) struct RunLogReadIndex {
+    pub(super) segment_epoch: u64,
     pub(super) scanned_to: u64,
     pub(super) last_append_seq: Option<u64>,
-    pub(super) append_offsets: Vec<(u64, u64)>,
+    pub(super) append_offsets: VecDeque<(u64, u64)>,
 }
 
 impl RunLogReadIndex {
+    fn reset_scan(&mut self) {
+        self.scanned_to = 0;
+        self.last_append_seq = None;
+        self.append_offsets.clear();
+    }
+
+    fn reset_for_segment(&mut self, segment_epoch: u64) {
+        if self.segment_epoch != segment_epoch {
+            self.reset_scan();
+            self.segment_epoch = segment_epoch;
+        }
+    }
+
     fn reset_if_past_end(&mut self, file_len: u64) {
         if self.scanned_to > file_len {
-            self.scanned_to = 0;
-            self.last_append_seq = None;
-            self.append_offsets.clear();
+            self.reset_scan();
         }
     }
 
@@ -41,15 +57,18 @@ impl RunLogReadIndex {
             self.last_append_seq
                 .map_or(seq, |last_seq| last_seq.max(seq)),
         );
-        match self
+        let idx = self
             .append_offsets
-            .binary_search_by_key(&seq, |(known_seq, _offset)| *known_seq)
+            .partition_point(|(known_seq, _offset)| *known_seq < seq);
+        if self
+            .append_offsets
+            .get(idx)
+            .is_none_or(|(known_seq, _offset)| *known_seq != seq)
         {
-            Ok(_) => {}
-            Err(idx) => self.append_offsets.insert(idx, (seq, offset)),
+            self.append_offsets.insert(idx, (seq, offset));
         }
         while self.append_offsets.len() > RUN_LOG_OFFSET_CACHE {
-            self.append_offsets.remove(0);
+            self.append_offsets.pop_front();
         }
     }
 
@@ -61,11 +80,10 @@ impl RunLogReadIndex {
 pub(super) struct RunLogEntry {
     pub(super) run_generation: u64,
     pub(super) path: Option<PathBuf>,
-    pub(super) line_count: usize,
-    pub(super) first_seq: Option<u64>,
     pub(super) last_seq: Option<u64>,
     pub(super) live_snapshot_id: Option<u64>,
-    pub(super) read_index: RunLogReadIndex,
+    pub(super) read_index: std::sync::Arc<Mutex<RunLogReadIndex>>,
+    pub(super) disk_metadata: SharedDiskRunMetadata,
 }
 
 impl RunLogEntry {
@@ -79,49 +97,42 @@ impl RunLogEntry {
             dir.join(service_log_dir_name(service_id))
                 .join(format!("run-{run_generation}.jsonl"))
         });
+        let disk_metadata = std::sync::Arc::new(Mutex::new(DiskRunMetadata::default()));
         if let (Some(path), Some(disk)) = (&path, disk) {
-            disk.begin(path.clone());
+            disk.begin(path.clone(), disk_metadata.clone());
         }
 
         Self {
             run_generation,
             path,
-            line_count: 0,
-            first_seq: None,
             last_seq: None,
             live_snapshot_id: None,
-            read_index: RunLogReadIndex::default(),
+            read_index: std::sync::Arc::new(Mutex::new(RunLogReadIndex::default())),
+            disk_metadata,
         }
     }
 
     pub(super) fn summary(&self, current: bool) -> LogRunSummary {
+        let metadata = self.disk_metadata.lock();
         LogRunSummary {
             run_generation: self.run_generation,
             current,
             path: self.path.as_ref().map(|path| path.display().to_string()),
-            line_count: self.line_count,
-            first_seq: self.first_seq,
-            last_seq: self.last_seq,
+            line_count: metadata.line_count,
+            first_seq: metadata.first_seq,
+            last_seq: metadata.last_seq,
         }
     }
 
     pub(super) fn append_metadata(&mut self, seq: u64) {
-        self.line_count = self.line_count.saturating_add(1);
-        self.first_seq.get_or_insert(seq);
         self.last_seq = Some(seq);
     }
 
     pub(super) fn replace_metadata(&mut self, seq: u64) {
-        if self.line_count == 0 {
+        if self.last_seq.is_none() {
             self.append_metadata(seq);
         } else {
             self.last_seq = Some(seq);
-        }
-    }
-
-    pub(super) fn enqueue_write(&self, disk: Option<&DiskLogWriter>, record: DiskLogRecord) {
-        if let (Some(path), Some(disk)) = (&self.path, disk) {
-            disk.write(path.clone(), record);
         }
     }
 
@@ -273,16 +284,19 @@ pub(super) fn read_run_log_file(
     tail: Option<usize>,
     after: Option<u64>,
     limit: Option<usize>,
-    mut index: RunLogReadIndex,
-) -> Option<(Vec<LogLine>, RunLogReadIndex)> {
+    index: &mut RunLogReadIndex,
+    disk_metadata: &SharedDiskRunMetadata,
+) -> Option<Vec<LogLine>> {
+    let disk_metadata = disk_metadata.lock();
     let Ok(file) = File::open(path) else {
         return None;
     };
     let file_len = file.metadata().ok()?.len();
+    index.reset_for_segment(disk_metadata.segment_epoch);
     index.reset_if_past_end(file_len);
-    let start_offset = start_offset_for_read(&index, tail, after, file_len);
+    let start_offset = start_offset_for_read(index, tail, after, file_len);
     if start_offset == 0 {
-        index = RunLogReadIndex::default();
+        index.reset_scan();
     }
 
     let mut reader = BufReader::new(file);
@@ -345,16 +359,16 @@ pub(super) fn read_run_log_file(
             }
         }
     }
-    Some((lines.into_iter().collect(), index))
+    Some(lines.into_iter().collect())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use color_eyre::eyre;
-    #[cfg(unix)]
     use similar_asserts::assert_eq;
     use std::fs::{self, File, OpenOptions};
+    use std::io::Write as _;
 
     #[cfg(unix)]
     #[test]
@@ -397,6 +411,57 @@ mod tests {
         assert!(!stale.exists());
         assert!(locked.exists());
         assert!(fresh_without_lock.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn segment_epoch_resets_an_index_after_truncate_and_regrow() -> eyre::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("run.jsonl");
+        let metadata = std::sync::Arc::new(Mutex::new(DiskRunMetadata {
+            segment_epoch: 1,
+            line_count: 1,
+            first_seq: Some(1),
+            last_seq: Some(1),
+        }));
+        let first = DiskLogRecord {
+            seq: 1,
+            run_generation: 1,
+            timestamp_unix_ms: 0,
+            op: DiskLogOp::Append,
+            line: "first".to_string(),
+        };
+        let mut file = File::create(&path)?;
+        serde_json::to_writer(&mut file, &first)?;
+        file.write_all(b"\n")?;
+        drop(file);
+
+        let mut index = RunLogReadIndex::default();
+        let initial = read_run_log_file(&path, None, None, None, &mut index, &metadata)
+            .ok_or_else(|| eyre::eyre!("initial run log was unreadable"))?;
+        let old_scanned_to = index.scanned_to;
+        assert_eq!(initial.len(), 1);
+
+        let second = DiskLogRecord {
+            seq: 2,
+            line: "x".repeat(usize::try_from(old_scanned_to)?.saturating_add(32)),
+            ..first
+        };
+        let mut file = File::create(&path)?;
+        serde_json::to_writer(&mut file, &second)?;
+        file.write_all(b"\n")?;
+        drop(file);
+        {
+            let mut metadata = metadata.lock();
+            metadata.segment_epoch = 2;
+            metadata.first_seq = Some(2);
+            metadata.last_seq = Some(2);
+        }
+
+        let after_rotation = read_run_log_file(&path, None, Some(1), None, &mut index, &metadata)
+            .ok_or_else(|| eyre::eyre!("rotated run log was unreadable"))?;
+
+        assert_eq!(after_rotation.first().map(|line| line.seq), Some(2));
         Ok(())
     }
 }

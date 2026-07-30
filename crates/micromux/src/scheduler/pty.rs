@@ -57,9 +57,20 @@ use std::os::fd::AsRawFd;
 const POLL_EVENTS: i16 = POLLIN | POLLHUP | POLLERR;
 
 const ALT_SCREEN_MAX_UPDATES_PER_SEC: u32 = 4;
+const PTY_LOG_LINE_MAX_BYTES: usize = 16 * 1024;
 
-/// How long graceful termination may run before forced termination.
-const FORCE_KILL_AFTER_TERMINATION: Duration = Duration::from_millis(750);
+fn bounded_line_split(line: &[u8]) -> usize {
+    let limit = PTY_LOG_LINE_MAX_BYTES.min(line.len());
+    let mut split = limit;
+    while split > 0
+        && line
+            .get(split)
+            .is_some_and(|byte| byte & 0b1100_0000 == 0b1000_0000)
+    {
+        split = split.saturating_sub(1);
+    }
+    if split == 0 { limit } else { split }
+}
 
 /// Maximum time a single input batch may wait for slave-side backpressure to clear.
 ///
@@ -68,14 +79,20 @@ const FORCE_KILL_AFTER_TERMINATION: Duration = Duration::from_millis(750);
 #[cfg(unix)]
 const PTY_INPUT_WRITE_TIMEOUT: Duration = Duration::from_millis(500);
 
-/// Bounds the number of queued write batches when a service stops consuming input.
+/// Bounds queued write batches when a service stops consuming input.
 const PTY_WRITE_QUEUE_CAPACITY: usize = 64;
+/// Bounds one atomic input batch, making the queue's count limit a memory limit too.
+const PTY_WRITE_BATCH_MAX_BYTES: usize = 64 * 1024;
 
 /// How long output may drain after escalation before the PTY is closed.
 ///
 /// The delay preserves normal tail output while bounding how long an escaped session can retain the
 /// slave side and prevent the original child from being reaped.
-const PTY_HANGUP_AFTER_ESCALATION: Duration = Duration::from_secs(2);
+pub(super) const PTY_HANGUP_AFTER_ESCALATION: Duration = Duration::from_secs(2);
+/// Maximum time allowed for an active healthcheck task to finish after its service exits.
+pub(super) const HEALTH_TASK_STOP_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long termination waits inline before continuing lifecycle notification independently.
+const TERMINATION_EVENT_NOTIFY_TIMEOUT: Duration = Duration::from_millis(100);
 
 #[cfg(unix)]
 fn poll_error_is_interrupted(error: &filedescriptor::Error) -> bool {
@@ -182,22 +199,28 @@ impl PtyHandles {
         ))
     }
 
-    pub(super) fn write_input(&self, service_id: &ServiceID, data: Vec<u8>) {
+    pub(super) fn write_input(&self, service_id: &ServiceID, data: &[u8]) {
         let input_len = data.len();
-        let send_result = {
-            let write_queue = self.write_queue.lock();
-            let Some(write_queue) = write_queue.as_ref() else {
-                return;
-            };
-            write_queue.try_send(PtyWrite::Input(data))
+        if input_len > PTY_WRITE_BATCH_MAX_BYTES {
+            tracing::warn!(
+                service_id,
+                input_len,
+                batch_limit_bytes = PTY_WRITE_BATCH_MAX_BYTES,
+                "pty input batch is too large; dropping it atomically"
+            );
+            return;
+        }
+        let write_queue = self.write_queue.lock();
+        let Some(write_queue) = write_queue.as_ref() else {
+            return;
         };
-        match send_result {
+        match write_queue.try_send(PtyWrite::Input(data.to_vec())) {
             Ok(()) | Err(std_mpsc::TrySendError::Disconnected(_)) => {}
             Err(std_mpsc::TrySendError::Full(_)) => {
                 tracing::warn!(
                     service_id,
                     input_len,
-                    "pty input queue is full; dropping input batch"
+                    "pty input queue is full; dropping input batch atomically"
                 );
             }
         }
@@ -810,7 +833,8 @@ impl PtyOutputReader {
         #[cfg(unix)]
         {
             let (cancel_read, cancellation) = PtyCancellation::pipe()?;
-            let reader = PollingPtyReader::new(master, cancel_read)?;
+            let reader =
+                PollingPtyReader::new(master, cancel_read, cancellation.cancelled.clone())?;
             Ok((Self::Polling(reader), LogReaderHandle { cancellation }))
         }
 
@@ -954,6 +978,7 @@ struct PollingPtyReader {
     reader: Box<dyn Read + Send>,
     poll_read: FileDescriptor,
     cancel_read: FileDescriptor,
+    cancelled: Arc<AtomicBool>,
 }
 
 #[cfg(unix)]
@@ -995,6 +1020,7 @@ impl PollingPtyReader {
     fn new(
         master: &(dyn portable_pty::MasterPty + Send),
         cancel_read: FileDescriptor,
+        cancelled: Arc<AtomicBool>,
     ) -> Result<Self, Error> {
         let pty_fd = master.as_raw_fd().ok_or_else(|| {
             Error::operation(
@@ -1011,11 +1037,15 @@ impl PollingPtyReader {
             reader,
             poll_read,
             cancel_read,
+            cancelled,
         })
     }
 
     fn read(&mut self, buf: &mut [u8]) -> io::Result<Option<NonZeroUsize>> {
         loop {
+            if self.cancelled.load(Ordering::Acquire) {
+                return Ok(None);
+            }
             let mut fds = [
                 pollfd {
                     fd: self.poll_read.as_raw_fd(),
@@ -1039,7 +1069,7 @@ impl PollingPtyReader {
             let pty_events = events.next().unwrap_or_default();
             let cancel_events = events.next().unwrap_or_default();
 
-            if cancel_events & POLL_EVENTS != 0 {
+            if self.cancelled.load(Ordering::Acquire) || cancel_events & POLL_EVENTS != 0 {
                 return Ok(None);
             }
 
@@ -1294,6 +1324,13 @@ fn spawn_log_reader_thread(args: LogReaderArgs) {
             line.clear();
         }
 
+        fn flush_bounded(line: &mut Vec<u8>, sink: &RunSink) {
+            let split = bounded_line_split(line);
+            let suffix = line.split_off(split);
+            flush(line, sink);
+            *line = suffix;
+        }
+
         /// Emit a complete newline-terminated record, preserving blank/whitespace-only lines.
         ///
         /// Unlike [`flush`] (used for partial lines at EOF / the 16 KiB overflow guard), this
@@ -1476,8 +1513,8 @@ fn spawn_log_reader_thread(args: LogReaderArgs) {
                             }
                         }
 
-                        if !snapshot_mode && line.len() >= 16 * 1024 {
-                            flush(&mut line, &sink);
+                        if !snapshot_mode && line.len() >= PTY_LOG_LINE_MAX_BYTES {
+                            flush_bounded(&mut line, &sink);
                         }
                     }
                 }
@@ -1509,6 +1546,7 @@ struct TerminationTaskArgs {
     process_group_leader_id: Option<i32>,
     pty_shutdown: PtyShutdown,
     child: Box<dyn portable_pty::Child + Send + Sync>,
+    health_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 #[derive(Clone, Copy)]
@@ -1520,6 +1558,7 @@ struct TerminationTiming {
 struct TerminationStart {
     kill_deadline: Option<tokio::time::Instant>,
     escalated: bool,
+    pending_notification: Option<tokio::task::JoinHandle<()>>,
 }
 
 struct TerminationTarget {
@@ -1540,32 +1579,51 @@ impl TerminationTarget {
         let _ = force_kill_after;
 
         tracing::info!(pid = self.pid, service_id, "killing process");
-        let _ = events_tx
-            .send(ProcessEvent::Killed {
-                service_id: service_id.clone(),
-                run_id,
-            })
-            .await;
 
         #[cfg(unix)]
-        {
+        let (kill_deadline, escalated) = {
             if !self.signal(Signal::SIGTERM) {
                 self.kill_with_backend();
             }
-            TerminationStart {
-                kill_deadline: Some(tokio::time::Instant::now() + force_kill_after),
-                escalated: false,
-            }
-        }
+            let now = tokio::time::Instant::now();
+            (
+                Some(now.checked_add(force_kill_after).unwrap_or(now)),
+                false,
+            )
+        };
 
         #[cfg(not(unix))]
-        {
+        let (kill_deadline, escalated) = {
             let _ = self.process_group_leader_id;
             self.kill_with_backend();
-            TerminationStart {
-                kill_deadline: None,
-                escalated: true,
-            }
+            (None, true)
+        };
+
+        // Signal delivery establishes the stop deadline. If notification outlives the short inline
+        // wait, finish it independently so escalation continues while `Killed` remains ordered
+        // before `Exited`.
+        let event = ProcessEvent::Killed {
+            service_id: service_id.clone(),
+            run_id,
+        };
+        let pending_notification = if tokio::time::timeout(
+            TERMINATION_EVENT_NOTIFY_TIMEOUT,
+            events_tx.send(event.clone()),
+        )
+        .await
+        .is_err()
+        {
+            let events_tx = events_tx.clone();
+            Some(tokio::spawn(async move {
+                let _ = events_tx.send(event).await;
+            }))
+        } else {
+            None
+        };
+        TerminationStart {
+            kill_deadline,
+            escalated,
+            pending_notification,
         }
     }
 
@@ -1685,14 +1743,29 @@ fn exit_code_from_wait(
     }
 }
 
-fn spawn_termination_task(args: TerminationTaskArgs) {
+fn spawn_termination_task(args: TerminationTaskArgs, force_kill_after: Duration) {
     spawn_termination_task_with_timing(
         args,
         TerminationTiming {
-            force_kill_after: FORCE_KILL_AFTER_TERMINATION,
+            force_kill_after,
             pty_hangup_after: PTY_HANGUP_AFTER_ESCALATION,
         },
     );
+}
+
+async fn stop_health_task(
+    service_id: &ServiceID,
+    health_task: &mut Option<tokio::task::JoinHandle<()>>,
+) {
+    if let Some(mut task) = health_task.take()
+        && tokio::time::timeout(HEALTH_TASK_STOP_TIMEOUT, &mut task)
+            .await
+            .is_err()
+    {
+        tracing::warn!(%service_id, "timed out stopping healthcheck task");
+        task.abort();
+        let _ = task.await;
+    }
 }
 
 fn spawn_termination_task_with_timing(args: TerminationTaskArgs, timing: TerminationTiming) {
@@ -1708,6 +1781,7 @@ fn spawn_termination_task_with_timing(args: TerminationTaskArgs, timing: Termina
             pty_shutdown,
             killer,
             mut child,
+            mut health_task,
         } = args;
 
         let mut target = TerminationTarget {
@@ -1722,10 +1796,17 @@ fn spawn_termination_task_with_timing(args: TerminationTaskArgs, timing: Termina
         let mut termination_escalated = false;
         let mut kill_deadline: Option<tokio::time::Instant> = None;
         let mut pty_hangup_deadline: Option<tokio::time::Instant> = None;
+        let mut pending_killed_notification = None;
         let mut pty_shutdown = Some(pty_shutdown);
         loop {
             tokio::select! {
+                biased;
                 res = &mut wait_handle => {
+                    terminate.cancel();
+                    stop_health_task(&service_id, &mut health_task).await;
+                    if let Some(notification) = pending_killed_notification.take() {
+                        let _ = notification.await;
+                    }
                     let code = exit_code_from_wait(res, &service_id, run_id, pid);
                     let event = ProcessEvent::Exited {
                         service_id: service_id.clone(),
@@ -1741,16 +1822,15 @@ fn spawn_termination_task_with_timing(args: TerminationTaskArgs, timing: Termina
                         () = terminate.cancelled() => {}
                     }
                 }, if !termination_started => {
-                    let started = target
-                        .request(
-                            &events_tx,
-                            &service_id,
-                            run_id,
-                            timing.force_kill_after,
-                        )
-                        .await;
+                    let started = target.request(
+                        &events_tx,
+                        &service_id,
+                        run_id,
+                        timing.force_kill_after,
+                    ).await;
                     kill_deadline = started.kill_deadline;
                     termination_escalated = started.escalated;
+                    pending_killed_notification = started.pending_notification;
                     pty_hangup_deadline = started
                         .escalated
                         .then(|| tokio::time::Instant::now() + timing.pty_hangup_after);
@@ -1828,7 +1908,13 @@ pub(super) fn start_service_with_pty_size(
     let mut env_keys = env_vars.keys().map(String::as_str).collect::<Vec<_>>();
     env_keys.sort_unstable();
     // Values may contain secrets from env files; log only the key names.
-    tracing::info!(service_id, prog, ?args, ?env_keys, "start service");
+    tracing::info!(
+        service_id,
+        prog,
+        args_count = args.len(),
+        ?env_keys,
+        "start service"
+    );
 
     let pty_system = portable_pty::native_pty_system();
     let pair = pty_system
@@ -1894,51 +1980,53 @@ pub(super) fn start_service_with_pty_size(
         pty_size: size.clone(),
     });
 
-    spawn_termination_task(TerminationTaskArgs {
-        service_id: service_id.clone(),
-        run_id,
-        events_tx: events_tx.clone(),
-        shutdown: shutdown.clone(),
-        terminate: terminate.clone(),
-        killer,
-        pid,
-        process_group_leader_id: process_group_leader,
-        pty_shutdown,
-        child,
+    let health_task = service.spec.healthcheck.clone().map(|health_check| {
+        let service_id = service_id.clone();
+        let working_dir = service.spec.working_dir.clone();
+        let environment: std::collections::HashMap<String, String> = service
+            .spec
+            .environment
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let events_tx = events_tx.clone();
+        let shutdown = shutdown.clone();
+        let terminate = terminate.clone();
+        tokio::spawn(async move {
+            health_check::run_loop(
+                health_check,
+                health_check::RunLoopParams {
+                    service_id,
+                    run_id,
+                    sink,
+                    working_dir,
+                    environment,
+                    events_tx,
+                    shutdown,
+                    terminate,
+                },
+            )
+            .await;
+        })
     });
-    child_guard.disarm();
 
-    if let Some(health_check) = service.spec.healthcheck.clone() {
-        tokio::spawn({
-            let service_id = service_id.clone();
-            let working_dir = service.spec.working_dir.clone();
-            let environment: std::collections::HashMap<String, String> = service
-                .spec
-                .environment
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect();
-            let events_tx = events_tx.clone();
-            let shutdown = shutdown.clone();
-            let terminate = terminate.clone();
-            async move {
-                health_check::run_loop(
-                    health_check,
-                    health_check::RunLoopParams {
-                        service_id,
-                        run_id,
-                        sink,
-                        working_dir,
-                        environment,
-                        events_tx,
-                        shutdown,
-                        terminate,
-                    },
-                )
-                .await;
-            }
-        });
-    }
+    spawn_termination_task(
+        TerminationTaskArgs {
+            service_id: service_id.clone(),
+            run_id,
+            events_tx: events_tx.clone(),
+            shutdown: shutdown.clone(),
+            terminate: terminate.clone(),
+            killer,
+            pid,
+            process_group_leader_id: process_group_leader,
+            pty_shutdown,
+            child,
+            health_task,
+        },
+        service.spec.stop_grace_period,
+    );
+    child_guard.disarm();
 
     Ok(StartedPty {
         pid,
@@ -2128,7 +2216,7 @@ mod tests {
                     &events_tx,
                     &service_id,
                     run_id,
-                    FORCE_KILL_AFTER_TERMINATION,
+                    crate::spec::DEFAULT_STOP_GRACE_PERIOD,
                 )
                 .await;
 
@@ -2144,6 +2232,61 @@ mod tests {
                     run_id: killed_run_id,
                 }) if killed_service_id == service_id && killed_run_id == run_id
             ));
+        }
+
+        #[tokio::test]
+        async fn saturated_event_channel_does_not_delay_or_drop_termination_signal() {
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut target = target_with_invalid_os_ids(calls.clone());
+            let (events_tx, mut events_rx) = mpsc::channel(1);
+            events_tx
+                .send(ProcessEvent::Killed {
+                    service_id: "occupied".to_string(),
+                    run_id: RunId::new(1),
+                })
+                .await
+                .expect("test channel should accept its first event");
+
+            let mut started = target
+                .request(
+                    &events_tx,
+                    &"svc".to_string(),
+                    RunId::new(7),
+                    Duration::from_secs(1),
+                )
+                .await;
+
+            assert!(started.kill_deadline.is_some());
+            assert_eq!(calls.load(Ordering::Relaxed), 1);
+            assert!(started.pending_notification.is_some());
+            assert!(matches!(
+                events_rx.recv().await,
+                Some(ProcessEvent::Killed { service_id, .. }) if service_id == "occupied"
+            ));
+            if let Some(notification) = started.pending_notification.take() {
+                assert!(notification.await.is_ok());
+            }
+            assert!(matches!(
+                events_rx.recv().await,
+                Some(ProcessEvent::Killed {
+                    service_id,
+                    run_id,
+                }) if service_id == "svc" && run_id == RunId::new(7)
+            ));
+        }
+
+        #[test]
+        fn bounded_log_split_preserves_utf8_characters() {
+            let line = format!("x{}tail", "é".repeat(PTY_LOG_LINE_MAX_BYTES / 2 + 1));
+            let split = bounded_line_split(line.as_bytes());
+
+            assert!(std::str::from_utf8(&line.as_bytes()[..split]).is_ok());
+            assert!(std::str::from_utf8(&line.as_bytes()[split..]).is_ok());
+            assert!(split <= PTY_LOG_LINE_MAX_BYTES);
+            assert_eq!(
+                bounded_line_split(&vec![0x80; PTY_LOG_LINE_MAX_BYTES + 1]),
+                PTY_LOG_LINE_MAX_BYTES
+            );
         }
 
         #[test]
@@ -2249,7 +2392,7 @@ mod tests {
             // Enqueuing is the scheduler-facing operation. It must return well before the writer
             // worker reaches its backpressure deadline.
             let started_at = Instant::now();
-            handles.write_input(&"svc".to_string(), vec![b'x'; 1024 * 1024]);
+            handles.write_input(&"svc".to_string(), &vec![b'x'; PTY_WRITE_BATCH_MAX_BYTES]);
             let enqueue_elapsed = started_at.elapsed();
 
             shutdown.close();
@@ -2308,7 +2451,7 @@ mod tests {
                 }
 
                 let input = vec![b'x'; INPUT_LEN];
-                handles.write_input(&"svc".to_string(), input);
+                handles.write_input(&"svc".to_string(), &input);
 
                 // Raw-mode queues are much smaller than this paste.
                 //
@@ -2573,6 +2716,7 @@ mod tests {
                     process_group_leader_id: None,
                     pty_shutdown,
                     child: Box::new(child),
+                    health_task: None,
                 },
                 TerminationTiming {
                     force_kill_after: Duration::from_millis(10),

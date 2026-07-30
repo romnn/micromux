@@ -100,6 +100,7 @@ futures = "0"
 
 # shared platform / process / terminal deps (features added per crate)
 nix = "0.31.3"
+rustix = "1"
 portable-pty = "0.9"
 directories = "6"
 strip-ansi-escapes = "0.2"

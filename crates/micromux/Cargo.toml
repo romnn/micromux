@@ -76,3 +76,6 @@ indoc.workspace = true
 jsonschema = { version = "0", default-features = false }
 serde_yaml = "0"
 similar-asserts.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true, features = ["process"] }

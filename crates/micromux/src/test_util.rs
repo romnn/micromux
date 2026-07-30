@@ -35,6 +35,10 @@ pub(crate) fn service_config(name: &str, command: (&str, &[&str])) -> config::Se
         ports: Vec::new(),
         restart: None,
         restart_policy: RestartPolicy::Never,
+        stop_grace_period: Spanned {
+            span: yaml_spanned::spanned::Span::default(),
+            inner: crate::spec::DEFAULT_STOP_GRACE_PERIOD,
+        },
         color: None,
         log_retention: LogRetention::default(),
     }

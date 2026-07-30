@@ -314,12 +314,12 @@
     "logs": {
       "type": "object",
       "additionalProperties": false,
-      "description": "Log retention settings. Disk run logs retain full logs and rotate only by run count.",
+      "description": "Log retention settings. Disk run logs retain the newest bounded segment of each retained run.",
       "properties": {
         "retained_runs": {
           "type": "integer",
           "minimum": 1,
-          "description": "Number of full disk-backed service runs retained, including the current/latest run (default 5)."
+          "description": "Number of bounded disk-backed service runs retained, including the current/latest run (default 5)."
         },
         "runs": {
           "type": "integer",
@@ -397,6 +397,10 @@
         },
         "restart": {
           "$ref": "#/definitions/restart"
+        },
+        "stop_grace_period": {
+          "$ref": "#/definitions/duration",
+          "description": "Time allowed for graceful termination before forced termination (default 10s, maximum 5m)."
         },
         "color": {
           "type": "boolean"

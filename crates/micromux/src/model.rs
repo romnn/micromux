@@ -34,6 +34,7 @@ const MIB: usize = 1024 * KIB;
 const DEFAULT_LOG_RETAINED_RUNS: usize = 5;
 const DEFAULT_MEMORY_LOG_MAX_LINES: usize = 1000;
 const DEFAULT_MEMORY_LOG_MAX_BYTES: usize = 64 * MIB;
+pub(crate) const MODEL_STRING_MAX_BYTES: usize = 16 * KIB;
 
 /// How many recent healthcheck attempts the model retains per service.
 const HEALTH_HISTORY: usize = 8;
@@ -216,7 +217,11 @@ pub struct ServiceSnapshot {
     /// Effective healthcheck timing for the represented run, when available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub healthcheck: Option<HealthcheckConfig>,
-    /// Whether the current command, working directory, ports, or effective healthcheck timing
+    /// Graceful-stop window captured for this run.
+    #[serde(default = "crate::spec::default_stop_grace_period")]
+    #[schemars(with = "DurationSchema")]
+    pub stop_grace_period: Duration,
+    /// Whether the current command, working directory, ports, healthcheck timing, or stop grace
     /// differs from the configuration captured for this run.
     #[serde(default)]
     pub config_stale: bool,
@@ -272,6 +277,7 @@ impl ServiceSnapshot {
             advertised_ports,
             healthcheck_configured: healthcheck.is_some(),
             healthcheck,
+            stop_grace_period: crate::spec::DEFAULT_STOP_GRACE_PERIOD,
             config_stale: false,
             restart_state: None,
             last_exit_code: None,
@@ -347,7 +353,7 @@ impl Default for DiskLogRetention {
 pub struct LogRetention {
     /// In-memory tail used by the TUI/default log stream.
     pub memory: MemoryLogRetention,
-    /// Disk-backed full run retention.
+    /// Disk-backed bounded run-segment retention.
     pub disk: DiskLogRetention,
 }
 
@@ -593,9 +599,10 @@ mod disk;
 mod memory;
 mod runlog;
 
-use self::disk::{DiskLogOp, DiskLogRecord, DiskLogWorker, DiskLogWriter};
+use self::disk::{DiskLogOp, DiskLogRecord, DiskLogWorker, DiskLogWriter, SharedDiskRunMetadata};
 use self::memory::MemoryLogBuffer;
 pub use self::memory::trim_to_last_bytes;
+pub(crate) use self::memory::truncate_to_first_bytes;
 #[cfg(test)]
 use self::runlog::RUN_LOG_OFFSET_CACHE;
 use self::runlog::{
@@ -610,6 +617,7 @@ struct ServiceEntry {
     visible: MemoryLogBuffer,
     runs: VecDeque<RunLogEntry>,
     next_log_seq: u64,
+    last_ingest_timestamp_unix_ms: u64,
     log_retention: LogRetention,
     spool_dir: Option<PathBuf>,
     disk: Option<DiskLogWriter>,
@@ -620,7 +628,21 @@ struct ServiceEntry {
 
 struct RunLogSource {
     path: PathBuf,
-    index: RunLogReadIndex,
+    index: Arc<parking_lot::Mutex<RunLogReadIndex>>,
+    disk_metadata: SharedDiskRunMetadata,
+}
+
+struct PendingDiskWrite {
+    writer: DiskLogWriter,
+    path: PathBuf,
+    metadata: SharedDiskRunMetadata,
+    record: DiskLogRecord,
+}
+
+impl PendingDiskWrite {
+    fn enqueue(self) {
+        self.writer.write(self.path, self.metadata, self.record);
+    }
 }
 
 impl ServiceEntry {
@@ -644,6 +666,7 @@ impl ServiceEntry {
             visible: MemoryLogBuffer::new(log_retention.memory),
             runs: VecDeque::new(),
             next_log_seq: 1,
+            last_ingest_timestamp_unix_ms: 0,
             log_retention,
             spool_dir: spool_dir.map(Path::to_path_buf),
             disk,
@@ -663,6 +686,12 @@ impl ServiceEntry {
 
     fn latest_run_generation(&self) -> u64 {
         self.snapshot.run_generation
+    }
+
+    fn next_ingest_timestamp(&mut self) -> u64 {
+        let timestamp = unix_timestamp_ms().max(self.last_ingest_timestamp_unix_ms);
+        self.last_ingest_timestamp_unix_ms = timestamp;
+        timestamp
     }
 
     fn ensure_run(&mut self, run_generation: u64) -> Option<&mut RunLogEntry> {
@@ -708,7 +737,14 @@ impl ServiceEntry {
         None
     }
 
-    fn append_log(&mut self, run_generation: u64, update: LogUpdateKind, line: String) {
+    fn append_log(
+        &mut self,
+        run_generation: u64,
+        update: LogUpdateKind,
+        line: String,
+        disk_line: Option<String>,
+        timestamp_unix_ms: u64,
+    ) -> Option<PendingDiskWrite> {
         // A late record from a run the retention ring already evicted must not resurrect it:
         // `ensure_run` would re-add the old generation *behind* newer runs and the ring would
         // evict a newer run in its place. Late records are only kept while their run's entry
@@ -719,15 +755,14 @@ impl ServiceEntry {
                 .iter()
                 .any(|run| run.run_generation == run_generation)
         {
-            return;
+            return None;
         }
         let mut next_seq = self.next_log_seq;
         let disk = self.disk.clone();
-        let timestamp_unix_ms = unix_timestamp_ms();
-        let Some((op, line)) = ({
-            let Some(run) = self.ensure_run(run_generation) else {
-                return;
-            };
+        let visible_last_seq = self.visible.entries.back().map(|line| line.seq);
+        let current_run = run_generation == self.latest_begun_run;
+        let (op, line, disk_write) = {
+            let run = self.ensure_run(run_generation)?;
             let (op, seq) = match update {
                 LogUpdateKind::Append => {
                     run.live_snapshot_id = None;
@@ -738,10 +773,12 @@ impl ServiceEntry {
                 }
                 LogUpdateKind::LiveSnapshot { id } => {
                     let resolved = if run.live_snapshot_id == Some(id) {
-                        run.last_seq.map(|seq| {
-                            run.replace_metadata(seq);
-                            (DiskLogOp::ReplaceLast, seq)
-                        })
+                        run.last_seq
+                            .filter(|seq| !current_run || visible_last_seq == Some(*seq))
+                            .map(|seq| {
+                                run.replace_metadata(seq);
+                                (DiskLogOp::ReplaceLast, seq)
+                            })
                     } else {
                         None
                     };
@@ -762,17 +799,22 @@ impl ServiceEntry {
                 timestamp_unix_ms,
                 line,
             };
-            let record = DiskLogRecord {
-                seq,
-                run_generation,
-                timestamp_unix_ms,
-                op,
-                line: line.line.clone(),
-            };
-            run.enqueue_write(disk.as_ref(), record);
-            Some((op, line))
-        }) else {
-            return;
+            let disk_write =
+                disk.zip(run.path.clone())
+                    .zip(disk_line)
+                    .map(|((disk, path), line)| PendingDiskWrite {
+                        writer: disk,
+                        path,
+                        metadata: run.disk_metadata.clone(),
+                        record: DiskLogRecord {
+                            seq,
+                            run_generation,
+                            timestamp_unix_ms,
+                            op,
+                            line,
+                        },
+                    });
+            (op, line, disk_write)
         };
         self.next_log_seq = next_seq;
 
@@ -782,12 +824,24 @@ impl ServiceEntry {
                 DiskLogOp::ReplaceLast => self.visible.replace_last(line),
             }
         }
+        disk_write
     }
 
     /// Append a lifecycle banner to the run the visible log currently belongs to, so the annotation
     /// lands in the same stream — and the same retained run file — as the output it explains.
-    fn append_banner(&mut self, line: String) {
-        self.append_log(self.latest_begun_run, LogUpdateKind::Append, line);
+    fn append_banner(
+        &mut self,
+        line: String,
+        disk_line: Option<String>,
+        timestamp_unix_ms: u64,
+    ) -> Option<PendingDiskWrite> {
+        self.append_log(
+            self.latest_begun_run,
+            LogUpdateKind::Append,
+            line,
+            disk_line,
+            timestamp_unix_ms,
+        )
     }
 
     fn clear_visible_logs(&mut self) {
@@ -826,6 +880,7 @@ impl ServiceEntry {
                 run.path.clone().map(|path| RunLogSource {
                     path,
                     index: run.read_index.clone(),
+                    disk_metadata: run.disk_metadata.clone(),
                 })
             })
     }
@@ -848,21 +903,15 @@ impl ServiceEntry {
         })
     }
 
-    fn install_run_log_index(
-        &mut self,
-        run_generation: u64,
-        path: &Path,
-        index: RunLogReadIndex,
-    ) -> Option<bool> {
+    fn is_current_run_path(&self, run_generation: u64, path: &Path) -> Option<bool> {
         let latest = self.latest_run_generation();
         let run = self
             .runs
-            .iter_mut()
+            .iter()
             .find(|run| run.run_generation == run_generation)?;
         if run.path.as_deref() != Some(path) {
             return None;
         }
-        run.read_index = index;
         Some(run.run_generation == latest)
     }
 
@@ -898,7 +947,7 @@ impl ServiceEntry {
 }
 
 struct Inner {
-    services: RwLock<IndexMap<ServiceID, ServiceEntry>>,
+    services: RwLock<IndexMap<ServiceID, Arc<RwLock<ServiceEntry>>>>,
     change_tx: broadcast::Sender<SessionChange>,
     spool_dir: Option<PathBuf>,
     _spool_lock: Option<File>,
@@ -907,6 +956,10 @@ struct Inner {
 }
 
 impl Inner {
+    fn service_entry(&self, id: &str) -> Option<Arc<RwLock<ServiceEntry>>> {
+        self.services.read().get(id).cloned()
+    }
+
     fn publish(&self, service_id: &ServiceID, kind: ChangeKind) {
         // A send error only means there are no subscribers right now; that is fine.
         let _ = self.change_tx.send(SessionChange {
@@ -963,8 +1016,8 @@ impl SessionModelReader {
         }
 
         let target = {
-            let guard = self.inner.services.read();
-            let entry = guard.get(id)?;
+            let entry = self.inner.service_entry(id)?;
+            let entry = entry.read();
             if let Some(source) = entry.run_log_source(run_generation) {
                 Target::Disk(source)
             } else {
@@ -976,12 +1029,21 @@ impl SessionModelReader {
             Target::Synthetic(run) => Some(run),
             Target::Disk(source) => {
                 self.inner.flush_disk();
-                let (lines, index) =
-                    read_run_log_file(&source.path, tail, after, limit, source.index)?;
+                let lines = {
+                    let mut index = source.index.lock();
+                    read_run_log_file(
+                        &source.path,
+                        tail,
+                        after,
+                        limit,
+                        &mut index,
+                        &source.disk_metadata,
+                    )?
+                };
                 let current = {
-                    let mut guard = self.inner.services.write();
-                    let entry = guard.get_mut(id)?;
-                    entry.install_run_log_index(run_generation, &source.path, index)?
+                    let entry = self.inner.service_entry(id)?;
+                    let entry = entry.read();
+                    entry.is_current_run_path(run_generation, &source.path)?
                 };
                 Some(LogRun {
                     run_generation,
@@ -993,26 +1055,38 @@ impl SessionModelReader {
     }
 
     /// A snapshot of every service, in configuration order, with `uptime` refreshed to now.
+    ///
+    /// Each service is locked independently, so one result may reflect changes that occurred after
+    /// an earlier service in the same result was read.
     #[must_use]
     pub fn services(&self) -> Vec<ServiceSnapshot> {
-        let guard = self.inner.services.read();
-        guard.values().map(ServiceEntry::current_snapshot).collect()
+        let entries = self
+            .inner
+            .services
+            .read()
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        entries
+            .into_iter()
+            .map(|entry| entry.read().current_snapshot())
+            .collect()
     }
 
     /// The snapshot of a single service, if present.
     #[must_use]
     pub fn service(&self, id: &str) -> Option<ServiceSnapshot> {
-        let guard = self.inner.services.read();
-        guard.get(id).map(ServiceEntry::current_snapshot)
+        self.inner
+            .service_entry(id)
+            .map(|entry| entry.read().current_snapshot())
     }
 
     /// The retained log lines for a service. `tail` bounds the result to the most recent lines.
     #[must_use]
     pub fn logs(&self, id: &str, tail: Option<usize>) -> Vec<LogLine> {
-        let guard = self.inner.services.read();
-        guard
-            .get(id)
-            .map(|entry| entry.visible_lines(tail))
+        self.inner
+            .service_entry(id)
+            .map(|entry| entry.read().visible_lines(tail))
             .unwrap_or_default()
     }
 
@@ -1020,19 +1094,20 @@ impl SessionModelReader {
     /// consumers can prune entries the visible buffer has evicted or cleared.
     #[must_use]
     pub fn logs_since(&self, id: &str, after: u64) -> (Option<u64>, Vec<LogLine>) {
-        let guard = self.inner.services.read();
-        guard
-            .get(id)
-            .map_or((None, Vec::new()), |entry| entry.visible_lines_since(after))
+        self.inner
+            .service_entry(id)
+            .map_or((None, Vec::new()), |entry| {
+                entry.read().visible_lines_since(after)
+            })
     }
 
     /// Summaries of retained log runs for a service, oldest retained run first.
     #[must_use]
     pub fn log_runs(&self, id: &str) -> Vec<LogRunSummary> {
-        let guard = self.inner.services.read();
-        guard
-            .get(id)
-            .map(ServiceEntry::log_runs)
+        self.inner.flush_disk();
+        self.inner
+            .service_entry(id)
+            .map(|entry| entry.read().log_runs())
             .unwrap_or_default()
     }
 
@@ -1059,10 +1134,9 @@ impl SessionModelReader {
     /// This remains queryable after exit for diagnosis, but is cleared when the next run begins.
     #[must_use]
     pub fn healthchecks(&self, id: &str) -> Vec<HealthAttempt> {
-        let guard = self.inner.services.read();
-        guard
-            .get(id)
-            .map(|entry| entry.health.iter().cloned().collect())
+        self.inner
+            .service_entry(id)
+            .map(|entry| entry.read().health.iter().cloned().collect())
             .unwrap_or_default()
     }
 
@@ -1073,8 +1147,9 @@ impl SessionModelReader {
     /// through [`Self::healthchecks`] for diagnosis but are not current health.
     #[must_use]
     pub fn latest_health(&self, id: &str) -> Option<HealthAttempt> {
-        let guard = self.inner.services.read();
-        guard.get(id).and_then(ServiceEntry::latest_current_health)
+        self.inner
+            .service_entry(id)
+            .and_then(|entry| entry.read().latest_current_health())
     }
 
     /// Retained lifecycle events, either forward from `after` or as the newest chronological tail.
@@ -1087,10 +1162,10 @@ impl SessionModelReader {
         after: Option<u64>,
         tail: Option<usize>,
     ) -> (Vec<ServiceEvent>, bool) {
-        let guard = self.inner.services.read();
-        let Some(entry) = guard.get(id) else {
+        let Some(entry) = self.inner.service_entry(id) else {
             return (Vec::new(), false);
         };
+        let entry = entry.read();
         let limit = tail.unwrap_or(EVENT_HISTORY).min(EVENT_HISTORY);
         let retention_truncated = entry
             .events
@@ -1146,22 +1221,37 @@ impl RunSink {
             OutputStream::Stdout | OutputStream::Unknown => line,
             OutputStream::Stderr => format!("[stderr] {line}"),
         };
+        let line = match update {
+            LogUpdateKind::Append => truncate_to_first_bytes(line, MODEL_STRING_MAX_BYTES),
+            LogUpdateKind::LiveSnapshot { .. } => line,
+        };
+        let disk_line = self.inner.disk_writer.as_ref().map(|_| line.clone());
         {
-            let mut guard = self.inner.services.write();
-            let Some(entry) = guard.get_mut(&self.service_id) else {
+            let Some(entry) = self.inner.service_entry(&self.service_id) else {
                 return;
             };
-            entry.append_log(self.run_generation, update, line);
+            let mut entry = entry.write();
+            let timestamp_unix_ms = entry.next_ingest_timestamp();
+            if let Some(disk_write) = entry.append_log(
+                self.run_generation,
+                update,
+                line,
+                disk_line,
+                timestamp_unix_ms,
+            ) {
+                disk_write.enqueue();
+            }
         }
         self.inner.publish(&self.service_id, ChangeKind::Logs);
     }
 
     pub(crate) fn start_health_attempt(&self, attempt: u64, command: String) {
+        let command = truncate_to_first_bytes(command, MODEL_STRING_MAX_BYTES);
         {
-            let mut guard = self.inner.services.write();
-            let Some(entry) = guard.get_mut(&self.service_id) else {
+            let Some(entry) = self.inner.service_entry(&self.service_id) else {
                 return;
             };
+            let mut entry = entry.write();
             if entry.latest_begun_run != self.run_generation {
                 return;
             }
@@ -1180,11 +1270,12 @@ impl RunSink {
     }
 
     pub(crate) fn append_health_line(&self, attempt: u64, stream: OutputStream, line: String) {
+        let line = truncate_to_first_bytes(line, MODEL_STRING_MAX_BYTES);
         {
-            let mut guard = self.inner.services.write();
-            let Some(entry) = guard.get_mut(&self.service_id) else {
+            let Some(entry) = self.inner.service_entry(&self.service_id) else {
                 return;
             };
+            let mut entry = entry.write();
             if entry.latest_begun_run != self.run_generation {
                 return;
             }
@@ -1209,10 +1300,10 @@ impl RunSink {
         cancelled: bool,
     ) {
         {
-            let mut guard = self.inner.services.write();
-            let Some(entry) = guard.get_mut(&self.service_id) else {
+            let Some(entry) = self.inner.service_entry(&self.service_id) else {
                 return;
             };
+            let mut entry = entry.write();
             if entry.latest_begun_run != self.run_generation {
                 return;
             }
@@ -1243,12 +1334,12 @@ impl SessionModelWriter {
             }
             guard.insert(
                 service_id.clone(),
-                ServiceEntry::new(
+                Arc::new(RwLock::new(ServiceEntry::new(
                     snapshot,
                     retention,
                     self.inner.spool_dir.as_deref(),
                     self.inner.disk_writer.clone(),
-                ),
+                ))),
             );
         }
         self.inner.publish(&service_id, ChangeKind::Roster);
@@ -1256,13 +1347,11 @@ impl SessionModelWriter {
 
     /// Remove a fully drained service from the roster.
     pub(crate) fn remove_service(&self, id: &ServiceID) {
-        let removed = self
-            .inner
-            .services
-            .write()
-            .shift_remove(id)
-            .map(|mut entry| entry.remove_retained_run_files())
-            .is_some();
+        let removed = self.inner.services.write().shift_remove(id);
+        if let Some(entry) = &removed {
+            entry.write().remove_retained_run_files();
+        }
+        let removed = removed.is_some();
         if removed {
             self.inner.publish(id, ChangeKind::Roster);
         } else {
@@ -1274,22 +1363,30 @@ impl SessionModelWriter {
     /// transitions that stall the log as a banner in the log stream itself. Both writes happen under
     /// one lock so a reader never sees the timeline and the log disagree about a transition.
     pub(crate) fn append_event(&self, id: &ServiceID, mut event: ServiceEvent) {
+        event.detail = truncate_to_first_bytes(event.detail, MODEL_STRING_MAX_BYTES);
         let banner = event.log_banner();
         let mirrored = banner.is_some();
+        let disk_line = banner
+            .as_ref()
+            .filter(|_| self.inner.disk_writer.is_some())
+            .cloned();
         {
-            let mut guard = self.inner.services.write();
-            let Some(entry) = guard.get_mut(id) else {
+            let Some(entry) = self.inner.service_entry(id) else {
                 tracing::warn!(service_id = id, "ignoring event for unknown service");
                 return;
             };
+            let mut entry = entry.write();
+            let timestamp_unix_ms = entry.next_ingest_timestamp();
             event.seq = entry.next_event_seq;
             entry.next_event_seq = entry.next_event_seq.saturating_add(1);
             while entry.events.len() >= EVENT_HISTORY {
                 entry.events.pop_front();
             }
             entry.events.push_back(event);
-            if let Some(banner) = banner {
-                entry.append_banner(banner);
+            if let Some(banner) = banner
+                && let Some(disk_write) = entry.append_banner(banner, disk_line, timestamp_unix_ms)
+            {
+                disk_write.enqueue();
             }
         }
         self.inner.publish(id, ChangeKind::Events);
@@ -1311,8 +1408,8 @@ impl SessionModelWriter {
     pub(crate) fn write_snapshot(&self, snapshot: ServiceSnapshot, started_at: Option<Instant>) {
         let service_id = snapshot.id.clone();
         {
-            let mut guard = self.inner.services.write();
-            if let Some(entry) = guard.get_mut(&service_id) {
+            if let Some(entry) = self.inner.service_entry(&service_id) {
+                let mut entry = entry.write();
                 entry.snapshot = snapshot;
                 entry.started_at = started_at;
             } else {
@@ -1340,10 +1437,10 @@ impl SessionModelWriter {
     /// Hide older retained logs from the default visible log stream (e.g. on manual restart).
     pub(crate) fn clear_logs(&self, id: &ServiceID) {
         {
-            let mut guard = self.inner.services.write();
-            let Some(entry) = guard.get_mut(id) else {
+            let Some(entry) = self.inner.service_entry(id) else {
                 return;
             };
+            let mut entry = entry.write();
             entry.clear_visible_logs();
         }
         self.inner.publish(id, ChangeKind::Logs);
@@ -1352,9 +1449,8 @@ impl SessionModelWriter {
     /// Begin a started run's retained state.
     pub(crate) fn begin_run(&self, id: &ServiceID, run_generation: u64) {
         {
-            let mut guard = self.inner.services.write();
-            if let Some(entry) = guard.get_mut(id) {
-                entry.begin_run(run_generation);
+            if let Some(entry) = self.inner.service_entry(id) {
+                entry.write().begin_run(run_generation);
             }
         }
         self.inner.publish(id, ChangeKind::Logs);
@@ -1364,11 +1460,10 @@ impl SessionModelWriter {
     /// Apply updated log retention from a reloaded service definition.
     pub(crate) fn reconfigure_log_retention(&self, id: &ServiceID, log_retention: LogRetention) {
         {
-            let mut guard = self.inner.services.write();
-            let Some(entry) = guard.get_mut(id) else {
+            let Some(entry) = self.inner.service_entry(id) else {
                 return;
             };
-            entry.reconfigure_log_retention(log_retention);
+            entry.write().reconfigure_log_retention(log_retention);
         }
         self.inner.publish(id, ChangeKind::Logs);
     }
@@ -1433,12 +1528,12 @@ pub(crate) fn new_with_retention(
     for (snapshot, log_retention) in initial {
         services.insert(
             snapshot.id.clone(),
-            ServiceEntry::new(
+            Arc::new(RwLock::new(ServiceEntry::new(
                 snapshot,
                 log_retention,
                 spool_dir.as_deref(),
                 disk_writer.clone(),
-            ),
+            ))),
         );
     }
     let (change_tx, _) = broadcast::channel(CHANGE_CHANNEL_CAPACITY);
@@ -2376,11 +2471,13 @@ mod tests {
             Some(vec!["line 2".to_string(), "line 3".to_string()])
         );
         let scanned_after_first_read = {
-            let guard = reader.inner.services.read();
-            guard
-                .get(&id)
-                .and_then(|entry| entry.runs.front())
-                .map(|run| run.read_index.scanned_to)
+            reader.inner.service_entry(&id).and_then(|entry| {
+                entry
+                    .read()
+                    .runs
+                    .front()
+                    .map(|run| run.read_index.lock().scanned_to)
+            })
         };
 
         let second_page = reader.run_log_after(&id, 1, Some(4), Some(1));
@@ -2393,11 +2490,13 @@ mod tests {
             Some(vec!["line 4".to_string()])
         );
         let scanned_after_second_read = {
-            let guard = reader.inner.services.read();
-            guard
-                .get(&id)
-                .and_then(|entry| entry.runs.front())
-                .map(|run| run.read_index.scanned_to)
+            reader.inner.service_entry(&id).and_then(|entry| {
+                entry
+                    .read()
+                    .runs
+                    .front()
+                    .map(|run| run.read_index.lock().scanned_to)
+            })
         };
         assert!(
             scanned_after_second_read
@@ -2855,5 +2954,128 @@ mod tests {
             panic!("expected current-run healthcheck attempt");
         };
         assert_eq!(attempt.result.map(|result| result.success), Some(true));
+    }
+
+    #[test]
+    fn unrelated_service_log_writes_do_not_share_one_entry_lock() {
+        let (reader, writer) = new([entry("a"), entry("b")]);
+        let held_entry = reader.inner.service_entry("a").expect("service a exists");
+        let _held = held_entry.write();
+        let sink = writer.run_sink(&"b".to_string(), 0);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+
+        let thread = std::thread::spawn(move || {
+            sink.append_log(
+                OutputStream::Stdout,
+                LogUpdateKind::Append,
+                "independent".to_string(),
+            );
+            let _ = done_tx.send(());
+        });
+
+        assert!(
+            done_rx.recv_timeout(Duration::from_secs(1)).is_ok(),
+            "service b write waited on service a's entry lock"
+        );
+        thread.join().expect("log writer thread should finish");
+    }
+
+    #[test]
+    fn repeated_snapshot_gets_a_new_sequence_after_its_visible_target_is_evicted() {
+        let (reader, writer) = new([entry("svc")]);
+        let id = "svc".to_string();
+        writer.begin_run(&id, 1);
+        writer.append_log(
+            &id,
+            1,
+            OutputStream::Stdout,
+            LogUpdateKind::LiveSnapshot { id: 7 },
+            "frame one".to_string(),
+        );
+        let entry = reader.inner.service_entry(&id).expect("service exists");
+        {
+            let mut entry = entry.write();
+            entry.visible.entries.clear();
+            entry.visible.current_bytes = 0;
+        }
+
+        writer.append_log(
+            &id,
+            1,
+            OutputStream::Stdout,
+            LogUpdateKind::LiveSnapshot { id: 7 },
+            "frame two".to_string(),
+        );
+
+        let lines = reader.logs(&id, None);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines.first().map(|line| line.seq), Some(2));
+    }
+
+    #[test]
+    fn model_ingress_caps_untrusted_strings_without_truncating_snapshots() {
+        let (reader, writer) = new([entry("svc")]);
+        let id = "svc".to_string();
+        let oversized = "é".repeat(MODEL_STRING_MAX_BYTES);
+        writer.begin_run(&id, 1);
+        writer.append_log(
+            &id,
+            1,
+            OutputStream::Stdout,
+            LogUpdateKind::Append,
+            oversized.clone(),
+        );
+        writer.append_log(
+            &id,
+            1,
+            OutputStream::Stdout,
+            LogUpdateKind::LiveSnapshot { id: 1 },
+            oversized.clone(),
+        );
+        writer.start_health_attempt(&id, 1, 1, oversized.clone());
+        writer.append_health_line(&id, 1, 1, OutputStream::Stdout, oversized.clone());
+        writer.append_event(
+            &id,
+            ServiceEvent {
+                seq: 0,
+                at_unix_ms: 0,
+                run_generation: 1,
+                kind: ServiceEventKind::ConfigReloaded,
+                detail: oversized.clone(),
+                exit_code: None,
+                pid: None,
+                delay_ms: None,
+                blocked_on: None,
+            },
+        );
+
+        let logs = reader.logs(&id, None);
+        assert_eq!(
+            logs.first().map(|line| line.line.len()),
+            Some(MODEL_STRING_MAX_BYTES)
+        );
+        assert_eq!(
+            logs.last().map(|line| line.line.as_str()),
+            Some(oversized.as_str())
+        );
+        let health = reader.healthchecks(&id);
+        assert!(
+            health
+                .iter()
+                .all(|attempt| attempt.command.len() <= MODEL_STRING_MAX_BYTES)
+        );
+        assert!(
+            health
+                .iter()
+                .flat_map(|attempt| &attempt.output)
+                .all(|line| line.line.len() <= MODEL_STRING_MAX_BYTES)
+        );
+        assert!(
+            reader
+                .events(&id, None, None)
+                .0
+                .iter()
+                .all(|event| event.detail.len() <= MODEL_STRING_MAX_BYTES)
+        );
     }
 }

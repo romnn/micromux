@@ -29,6 +29,7 @@ const KNOWN_SERVICE_KEYS: &[&str] = &[
     "healthcheck",
     "ports",
     "restart",
+    "stop_grace_period",
     "color",
     "logs",
 ];
@@ -894,12 +895,16 @@ fn parse_health_check<F: Copy>(
                     .or_else(|| healthcheck.get("initial_delay")),
             )?
             .or_else(|| defaults.start_delay.clone());
-            let interval =
-                parse_duration(healthcheck.get("interval"))?.or_else(|| defaults.interval.clone());
+            let interval = parse_positive_duration(
+                parse_duration(healthcheck.get("interval"))?.or_else(|| defaults.interval.clone()),
+                "healthcheck interval",
+            )?;
             let retries = parse_optional::<usize>(healthcheck.get("retries"))?
                 .or_else(|| defaults.retries.clone());
-            let timeout =
-                parse_duration(healthcheck.get("timeout"))?.or_else(|| defaults.timeout.clone());
+            let timeout = parse_positive_duration(
+                parse_duration(healthcheck.get("timeout"))?.or_else(|| defaults.timeout.clone()),
+                "healthcheck timeout",
+            )?;
             Ok(super::HealthCheck {
                 test,
                 start_delay,
@@ -909,6 +914,36 @@ fn parse_health_check<F: Copy>(
             })
         })
         .transpose()
+}
+
+fn parse_positive_duration(
+    duration: Option<Spanned<std::time::Duration>>,
+    name: &str,
+) -> Result<Option<Spanned<std::time::Duration>>, ConfigError> {
+    if let Some(duration) = &duration
+        && duration.is_zero()
+    {
+        return Err(ConfigError::InvalidValue {
+            message: format!("{name} must be greater than zero"),
+            span: duration.span.into(),
+        });
+    }
+    Ok(duration)
+}
+
+fn parse_stop_grace_period(
+    duration: Option<Spanned<std::time::Duration>>,
+) -> Result<Option<Spanned<std::time::Duration>>, ConfigError> {
+    let duration = parse_positive_duration(duration, "stop grace period")?;
+    if let Some(duration) = &duration
+        && **duration > crate::spec::MAX_STOP_GRACE_PERIOD
+    {
+        return Err(ConfigError::InvalidValue {
+            message: "stop grace period must not exceed 5m".to_string(),
+            span: duration.span.into(),
+        });
+    }
+    Ok(duration)
 }
 
 fn parse_healthcheck_defaults<F: Copy>(
@@ -936,8 +971,14 @@ fn parse_healthcheck_defaults<F: Copy>(
                 .or_else(|| mapping.get("startup_delay"))
                 .or_else(|| mapping.get("initial_delay")),
         )?,
-        interval: parse_duration(mapping.get("interval"))?,
-        timeout: parse_duration(mapping.get("timeout"))?,
+        interval: parse_positive_duration(
+            parse_duration(mapping.get("interval"))?,
+            "healthcheck interval",
+        )?,
+        timeout: parse_positive_duration(
+            parse_duration(mapping.get("timeout"))?,
+            "healthcheck timeout",
+        )?,
         retries: parse_optional::<usize>(mapping.get("retries"))?,
     })
 }
@@ -1000,6 +1041,13 @@ fn parse_service<F: Copy>(
     let restart_policy = restart
         .clone()
         .unwrap_or_else(|| defaults.restart_policy.clone());
+    let stop_grace_period = parse_stop_grace_period(parse_duration(
+        mapping.get("stop_grace_period"),
+    )?)?
+    .unwrap_or(Spanned {
+        inner: crate::spec::DEFAULT_STOP_GRACE_PERIOD,
+        span: *span,
+    });
     let log_retention = parse_log_retention(
         mapping.get("logs"),
         defaults.log_retention,
@@ -1020,6 +1068,7 @@ fn parse_service<F: Copy>(
         ports,
         restart,
         restart_policy,
+        stop_grace_period,
         color,
         log_retention,
     })
@@ -1182,6 +1231,53 @@ mod tests {
 
         assert_eq!(schema_keys, parser_keys);
         Ok(())
+    }
+
+    #[test]
+    fn recurring_healthcheck_durations_must_be_positive() {
+        for (field, yaml) in [
+            (
+                "healthcheck interval",
+                "version: 1\nservices:\n  app:\n    command: \"true\"\n    healthcheck:\n      test: \"true\"\n      interval: 0s\n",
+            ),
+            (
+                "healthcheck timeout",
+                "version: 1\nhealthcheck:\n  timeout: 0s\nservices:\n  app:\n    command: \"true\"\n    healthcheck:\n      test: \"true\"\n",
+            ),
+        ] {
+            let mut diagnostics: Vec<Diagnostic<usize>> = Vec::new();
+            let error = config::from_str(yaml, Path::new("."), 0, None, &mut diagnostics)
+                .expect_err("zero duration should be rejected");
+            assert!(
+                matches!(error, config::ConfigError::InvalidValue { message, .. } if message.contains(field))
+            );
+        }
+    }
+
+    #[test]
+    fn stop_grace_period_must_be_positive() {
+        let yaml =
+            "version: 1\nservices:\n  app:\n    command: \"true\"\n    stop_grace_period: 0s\n";
+        let mut diagnostics: Vec<Diagnostic<usize>> = Vec::new();
+        let error = config::from_str(yaml, Path::new("."), 0, None, &mut diagnostics)
+            .expect_err("zero stop grace should be rejected");
+
+        assert!(
+            matches!(error, config::ConfigError::InvalidValue { message, .. } if message.contains("stop grace period"))
+        );
+    }
+
+    #[test]
+    fn stop_grace_period_must_not_exceed_five_minutes() {
+        let yaml =
+            "version: 1\nservices:\n  app:\n    command: \"true\"\n    stop_grace_period: 301s\n";
+        let mut diagnostics: Vec<Diagnostic<usize>> = Vec::new();
+        let error = config::from_str(yaml, Path::new("."), 0, None, &mut diagnostics)
+            .expect_err("excessive stop grace should be rejected");
+
+        assert!(
+            matches!(error, config::ConfigError::InvalidValue { message, .. } if message.contains("must not exceed 5m"))
+        );
     }
 
     #[test]
