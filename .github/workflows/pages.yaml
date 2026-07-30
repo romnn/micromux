@@ -38,6 +38,7 @@ jobs:
       # go + extended Hugo alone — no Rust toolchain, no micromux binary.
       - uses: jdx/mise-action@v4
         with:
+          version: 2026.7.16
           install: false
           cache: true
           env: false
