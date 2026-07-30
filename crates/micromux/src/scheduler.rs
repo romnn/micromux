@@ -2135,7 +2135,7 @@ impl SchedulerRuntime {
                 if let Some(runtime) = self.services.get(&service_id)
                     && let Some(running) = &runtime.running
                 {
-                    running.pty.write_input(&service_id, &data);
+                    running.pty.write_input(&service_id, data);
                 }
                 false
             }

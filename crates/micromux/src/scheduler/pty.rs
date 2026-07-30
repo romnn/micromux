@@ -5,7 +5,8 @@ use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::mpsc as std_mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -43,7 +44,7 @@ use nix::{errno::Errno, sys::signal::Signal, unistd::Pid};
 
 #[cfg(unix)]
 use filedescriptor::{
-    AsRawFileDescriptor, FileDescriptor, POLLERR, POLLHUP, POLLIN, Pipe, poll, pollfd,
+    AsRawFileDescriptor, FileDescriptor, POLLERR, POLLHUP, POLLIN, POLLOUT, Pipe, poll, pollfd,
 };
 
 #[cfg(unix)]
@@ -57,16 +58,67 @@ const POLL_EVENTS: i16 = POLLIN | POLLHUP | POLLERR;
 
 const ALT_SCREEN_MAX_UPDATES_PER_SEC: u32 = 4;
 
-/// Delay before warning that termination escalation has not produced a reaped child.
-///
-/// The deadline is diagnostic only; it never substitutes for process-wait completion.
-const UNREAPED_WARN_AFTER_ESCALATION: Duration = Duration::from_secs(2);
+/// How long graceful termination may run before forced termination.
+const FORCE_KILL_AFTER_TERMINATION: Duration = Duration::from_millis(750);
 
-#[derive(Clone)]
+/// Maximum time a single input batch may wait for slave-side backpressure to clear.
+///
+/// The bound lets active readers drain transient backpressure without allowing one batch to occupy
+/// the writer worker indefinitely.
+#[cfg(unix)]
+const PTY_INPUT_WRITE_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Bounds the number of queued write batches when a service stops consuming input.
+const PTY_WRITE_QUEUE_CAPACITY: usize = 64;
+
+/// How long output may drain after escalation before the PTY is closed.
+///
+/// The delay preserves normal tail output while bounding how long an escaped session can retain the
+/// slave side and prevent the original child from being reaped.
+const PTY_HANGUP_AFTER_ESCALATION: Duration = Duration::from_secs(2);
+
+#[cfg(unix)]
+fn poll_error_is_interrupted(error: &filedescriptor::Error) -> bool {
+    // `filedescriptor` uses `poll(2)` on most Unix targets and `select(2)` on macOS, which wrap
+    // `EINTR` as `Error::Poll` and `Error::Io` respectively.
+    match error {
+        filedescriptor::Error::Poll(error) | filedescriptor::Error::Io(error) => {
+            error.kind() == io::ErrorKind::Interrupted
+        }
+        _ => false,
+    }
+}
+
+type SharedPtyMaster = Arc<Mutex<Option<Box<dyn portable_pty::MasterPty + Send>>>>;
+type SharedPtyWriteQueue = Arc<Mutex<Option<std_mpsc::SyncSender<PtyWrite>>>>;
+
+struct PtyWriter {
+    service_id: ServiceID,
+    writer: Box<dyn Write + Send>,
+    cancellation: PtyCancellation,
+    #[cfg(unix)]
+    poll_write: FileDescriptor,
+    #[cfg(unix)]
+    cancel_read: FileDescriptor,
+}
+
+enum PtyWrite {
+    Input(Vec<u8>),
+    TerminalResponse(Vec<u8>),
+}
+
 pub(super) struct PtyHandles {
-    master: Arc<Mutex<Box<dyn portable_pty::MasterPty + Send>>>,
-    writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    master: SharedPtyMaster,
+    write_queue: SharedPtyWriteQueue,
     size: Arc<AtomicU32>,
+}
+
+/// A teardown capability for disconnecting every PTY endpoint associated with one run.
+struct PtyShutdown {
+    master: SharedPtyMaster,
+    write_queue: SharedPtyWriteQueue,
+    reader_cancellation: PtyCancellation,
+    writer_cancellation: PtyCancellation,
 }
 
 pub(super) struct StartedPty {
@@ -78,23 +130,283 @@ pub(super) struct StartedPty {
 }
 
 impl PtyHandles {
-    pub(super) fn write_input(&self, service_id: &ServiceID, data: &[u8]) {
-        let mut guard = self.writer.lock();
-        if let Err(err) = guard.write_all(data) {
-            tracing::warn!(?err, service_id, "failed to write to pty");
-        }
-        if let Err(err) = guard.flush() {
-            tracing::warn!(?err, service_id, "failed to flush pty");
+    #[cfg_attr(
+        not(unix),
+        expect(
+            clippy::unnecessary_wraps,
+            reason = "Unix setup is fallible; one constructor keeps the API consistent"
+        )
+    )]
+    fn new(
+        service_id: ServiceID,
+        master: Box<dyn portable_pty::MasterPty + Send>,
+        writer: Box<dyn Write + Send>,
+        size: Arc<AtomicU32>,
+        log_reader: &LogReaderHandle,
+    ) -> Result<(Self, PtyShutdown), Error> {
+        #[cfg(unix)]
+        let poll_write = configure_nonblocking_pty(master.as_ref())?;
+        #[cfg(unix)]
+        let (cancel_read, writer_cancellation) = PtyCancellation::pipe()?;
+        #[cfg(not(unix))]
+        let writer_cancellation = PtyCancellation::new();
+
+        let master = Arc::new(Mutex::new(Some(master)));
+        let (writer_tx, writer_rx) = std_mpsc::sync_channel(PTY_WRITE_QUEUE_CAPACITY);
+        let write_queue = Arc::new(Mutex::new(Some(writer_tx)));
+        spawn_pty_writer_thread(
+            PtyWriter {
+                service_id,
+                writer,
+                cancellation: writer_cancellation.clone(),
+                #[cfg(unix)]
+                poll_write,
+                #[cfg(unix)]
+                cancel_read,
+            },
+            writer_rx,
+        );
+        let shutdown = PtyShutdown {
+            master: master.clone(),
+            write_queue: write_queue.clone(),
+            reader_cancellation: log_reader.cancellation.clone(),
+            writer_cancellation,
+        };
+        Ok((
+            Self {
+                master,
+                write_queue,
+                size,
+            },
+            shutdown,
+        ))
+    }
+
+    pub(super) fn write_input(&self, service_id: &ServiceID, data: Vec<u8>) {
+        let input_len = data.len();
+        let send_result = {
+            let write_queue = self.write_queue.lock();
+            let Some(write_queue) = write_queue.as_ref() else {
+                return;
+            };
+            write_queue.try_send(PtyWrite::Input(data))
+        };
+        match send_result {
+            Ok(()) | Err(std_mpsc::TrySendError::Disconnected(_)) => {}
+            Err(std_mpsc::TrySendError::Full(_)) => {
+                tracing::warn!(
+                    service_id,
+                    input_len,
+                    "pty input queue is full; dropping input batch"
+                );
+            }
         }
     }
 
     pub(super) fn resize(&self, service_id: &ServiceID, size: portable_pty::PtySize) {
-        let guard = self.master.lock();
-        if let Err(err) = guard.resize(size) {
-            tracing::warn!(?err, service_id, "failed to resize pty");
-        }
         let packed = (u32::from(size.rows) << 16) | u32::from(size.cols);
         self.size.store(packed, Ordering::Relaxed);
+
+        let master = self.master.lock();
+        let Some(master) = master.as_ref() else {
+            return;
+        };
+        if let Err(err) = master.resize(size) {
+            tracing::warn!(?err, service_id, "failed to resize pty");
+        }
+    }
+}
+
+impl PtyWriter {
+    fn run(mut self, receiver: &std_mpsc::Receiver<PtyWrite>) {
+        while !self.cancellation.is_cancelled() {
+            let Ok(message) = receiver.recv() else {
+                break;
+            };
+            if self.cancellation.is_cancelled() {
+                break;
+            }
+            match message {
+                PtyWrite::Input(data) => {
+                    if let Err(err) = self.write_input(&data)
+                        && !self.cancellation.is_cancelled()
+                    {
+                        tracing::warn!(
+                            ?err,
+                            service_id = self.service_id,
+                            "failed to write to pty"
+                        );
+                    }
+                }
+                PtyWrite::TerminalResponse(data) => {
+                    let _ = self.write_terminal_response(&data);
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn write_input(&mut self, data: &[u8]) -> io::Result<()> {
+        self.write_all(data, Some(Instant::now() + PTY_INPUT_WRITE_TIMEOUT))
+    }
+
+    #[cfg(not(unix))]
+    fn write_input(&mut self, data: &[u8]) -> io::Result<()> {
+        // Portable PTY exposes no readiness handle for interrupting a blocked write on these
+        // platforms.
+        //
+        // The dedicated writer thread still keeps the scheduler responsive, but it may retain its
+        // endpoint until the platform write returns.
+        self.writer.write_all(data)?;
+        self.writer.flush()
+    }
+
+    #[cfg(unix)]
+    fn write_terminal_response(&mut self, data: &[u8]) -> io::Result<()> {
+        // Keep a response ahead of later input and retry backpressure without a deadline.
+        //
+        // This avoids deliberately abandoning a partially written escape sequence, while PTY
+        // cancellation still interrupts the wait during teardown.
+        self.write_all(data, None)
+    }
+
+    #[cfg(not(unix))]
+    fn write_terminal_response(&mut self, data: &[u8]) -> io::Result<()> {
+        self.writer.write_all(data)?;
+        self.writer.flush()
+    }
+
+    #[cfg(unix)]
+    fn write_all(&mut self, mut remaining: &[u8], deadline: Option<Instant>) -> io::Result<()> {
+        while !remaining.is_empty() {
+            if self.cancellation.is_cancelled() {
+                return Err(Self::cancelled());
+            }
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                return Err(Self::input_timeout());
+            }
+
+            match self.writer.write(remaining) {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "failed to write the complete pty data",
+                    ));
+                }
+                Ok(written) => {
+                    remaining = remaining.get(written..).ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "pty writer reported more bytes than it received",
+                        )
+                    })?;
+                }
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                    self.wait_until_writable(deadline)?;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        self.writer.flush()
+    }
+
+    #[cfg(unix)]
+    fn cancelled() -> io::Error {
+        io::Error::new(io::ErrorKind::Interrupted, "pty writer was cancelled")
+    }
+
+    #[cfg(unix)]
+    fn input_timeout() -> io::Error {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            "timed out waiting for pty input backpressure to clear",
+        )
+    }
+
+    #[cfg(unix)]
+    fn wait_until_writable(&self, deadline: Option<Instant>) -> io::Result<()> {
+        loop {
+            let timeout = match deadline {
+                Some(deadline) => Some(
+                    deadline
+                        .checked_duration_since(Instant::now())
+                        .ok_or_else(Self::input_timeout)?,
+                ),
+                None => None,
+            };
+            let mut descriptors = [
+                pollfd {
+                    fd: self.poll_write.as_raw_fd(),
+                    events: POLLOUT | POLLHUP | POLLERR,
+                    revents: 0,
+                },
+                pollfd {
+                    fd: self.cancel_read.as_raw_fd(),
+                    events: POLL_EVENTS,
+                    revents: 0,
+                },
+            ];
+
+            match poll(&mut descriptors, timeout) {
+                Ok(0) => return Err(Self::input_timeout()),
+                Ok(_) => {
+                    let writer_events = descriptors
+                        .first()
+                        .map_or(0, |descriptor| descriptor.revents);
+                    let cancel_events = descriptors
+                        .get(1)
+                        .map_or(0, |descriptor| descriptor.revents);
+                    if cancel_events & POLL_EVENTS != 0 {
+                        return Err(Self::cancelled());
+                    }
+                    if writer_events & POLLOUT != 0 {
+                        return Ok(());
+                    }
+                    if writer_events & (POLLHUP | POLLERR) != 0 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            "pty closed while waiting to write",
+                        ));
+                    }
+                }
+                Err(err) if poll_error_is_interrupted(&err) => {}
+                Err(err) => return Err(io::Error::other(err)),
+            }
+        }
+    }
+}
+
+fn spawn_pty_writer_thread(writer: PtyWriter, receiver: std_mpsc::Receiver<PtyWrite>) {
+    thread::spawn(move || writer.run(&receiver));
+}
+
+impl PtyShutdown {
+    fn close(self) {
+        // The Unix reader and writer workers own duplicated master descriptors, so the slave
+        // remains connected until both workers release them.
+        //
+        // Wake the workers before disconnecting the queue and interactive master.
+        //
+        // Other platforms cannot interrupt an in-flight portable-pty read or write.
+        //
+        // Cancellation prevents later queued writes, while endpoint release still depends on the
+        // active call returning.
+        self.reader_cancellation.cancel();
+        self.writer_cancellation.cancel();
+        self.write_queue.lock().take();
+        self.master.lock().take();
+    }
+}
+
+impl Drop for PtyShutdown {
+    fn drop(&mut self) {
+        // Preserve the output reader for post-exit drain, but request writer cancellation as soon
+        // as the termination task relinquishes the run.
+        //
+        // On Unix, this also wakes a terminal response waiting on backpressure without a deadline,
+        // preventing it from retaining its master descriptor.
+        self.writer_cancellation.cancel();
     }
 }
 
@@ -497,9 +809,9 @@ impl PtyOutputReader {
     ) -> Result<(Self, LogReaderHandle), Error> {
         #[cfg(unix)]
         {
-            let (cancel_read, log_reader) = LogReaderHandle::pipe()?;
+            let (cancel_read, cancellation) = PtyCancellation::pipe()?;
             let reader = PollingPtyReader::new(master, cancel_read)?;
-            Ok((Self::Polling(reader), log_reader))
+            Ok((Self::Polling(reader), LogReaderHandle { cancellation }))
         }
 
         #[cfg(not(unix))]
@@ -525,43 +837,67 @@ impl PtyOutputReader {
 }
 
 pub(super) struct LogReaderHandle {
-    #[cfg(unix)]
-    cancel_write: Option<FileDescriptor>,
+    cancellation: PtyCancellation,
 }
 
-impl LogReaderHandle {
+/// A cloneable, idempotent cancellation signal for PTY workers.
+///
+/// Unix workers poll a pipe owned by the signal, so dropping its write end interrupts their
+/// readiness waits.
+///
+/// Other platforms stop queued writes between portable-pty calls, while blocking readers still
+/// rely on EOF.
+#[derive(Clone)]
+struct PtyCancellation {
+    cancelled: Arc<AtomicBool>,
+    #[cfg(unix)]
+    cancel_write: Arc<Mutex<Option<FileDescriptor>>>,
+}
+
+impl PtyCancellation {
     #[cfg(unix)]
     fn pipe() -> Result<(FileDescriptor, Self), Error> {
-        let pipe = Pipe::new().map_err(|err| {
-            Error::operation("failed to create pty reader cancellation pipe", err)
-        })?;
+        let pipe = Pipe::new()
+            .map_err(|err| Error::operation("failed to create pty cancellation pipe", err))?;
         Ok((
             pipe.read,
             Self {
-                cancel_write: Some(pipe.write),
+                cancelled: Arc::new(AtomicBool::new(false)),
+                cancel_write: Arc::new(Mutex::new(Some(pipe.write))),
             },
         ))
     }
 
     #[cfg(not(unix))]
     fn new() -> Self {
-        Self {}
+        Self {
+            cancelled: Arc::new(AtomicBool::new(false)),
+        }
     }
 
-    // On Unix this drops the cancellation pipe's write end, waking the reader's poll; other
-    // platforms have no such pipe, so cancellation is a no-op and the receiver goes unused there.
-    #[cfg_attr(
-        not(unix),
-        expect(
-            clippy::unused_self,
-            reason = "Unix cancellation consumes an owned pipe fd; unsupported platforms keep the same handle API"
-        )
-    )]
-    pub(super) fn cancel(&mut self) {
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
         #[cfg(unix)]
         {
-            self.cancel_write.take();
+            self.cancel_write.lock().take();
         }
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+}
+
+impl LogReaderHandle {
+    #[cfg(not(unix))]
+    fn new() -> Self {
+        Self {
+            cancellation: PtyCancellation::new(),
+        }
+    }
+
+    pub(super) fn cancel(&self) {
+        self.cancellation.cancel();
     }
 }
 
@@ -575,7 +911,12 @@ impl Drop for LogReaderHandle {
 impl LogReaderHandle {
     /// A handle with no cancellation pipe, for unit tests that only exercise handle bookkeeping.
     pub(super) fn test_dummy() -> Self {
-        Self { cancel_write: None }
+        Self {
+            cancellation: PtyCancellation {
+                cancelled: Arc::new(AtomicBool::new(false)),
+                cancel_write: Arc::new(Mutex::new(None)),
+            },
+        }
     }
 }
 
@@ -596,11 +937,15 @@ impl PtyHandles {
             .master
             .take_writer()
             .map_err(|err| Error::operation("failed to take test pty writer", err))?;
-        Ok(Self {
-            master: Arc::new(Mutex::new(pair.master)),
-            writer: Arc::new(Mutex::new(writer)),
-            size: Arc::new(AtomicU32::new(0)),
-        })
+        let log_reader = LogReaderHandle::test_dummy();
+        let (handles, _shutdown) = Self::new(
+            "test".to_string(),
+            pair.master,
+            writer,
+            Arc::new(AtomicU32::new(0)),
+            &log_reader,
+        )?;
+        Ok(handles)
     }
 }
 
@@ -619,6 +964,30 @@ impl AsRawFileDescriptor for BorrowedRawFd {
     fn as_raw_file_descriptor(&self) -> filedescriptor::RawFileDescriptor {
         self.0
     }
+}
+
+/// Enables readiness-based PTY writes and cancellable teardown.
+///
+/// Unix master descriptors share one open file description, so setting the returned duplicate to
+/// nonblocking also covers the writer and reader duplicates.
+///
+/// The same descriptor observes write readiness for that terminal.
+#[cfg(unix)]
+fn configure_nonblocking_pty(
+    master: &(dyn portable_pty::MasterPty + Send),
+) -> Result<FileDescriptor, Error> {
+    let pty_fd = master.as_raw_fd().ok_or_else(|| {
+        Error::operation(
+            "failed to access native pty",
+            "master did not expose a raw fd",
+        )
+    })?;
+    let mut descriptor = FileDescriptor::dup(&BorrowedRawFd(pty_fd))
+        .map_err(|err| Error::operation("failed to clone pty control fd", err))?;
+    descriptor
+        .set_non_blocking(true)
+        .map_err(|err| Error::operation("failed to make pty nonblocking", err))?;
+    Ok(descriptor)
 }
 
 #[cfg(unix)]
@@ -662,11 +1031,7 @@ impl PollingPtyReader {
 
             match poll(&mut fds, None) {
                 Ok(_) => {}
-                Err(filedescriptor::Error::Poll(err))
-                    if err.kind() == io::ErrorKind::Interrupted =>
-                {
-                    continue;
-                }
+                Err(err) if poll_error_is_interrupted(&err) => continue,
                 Err(err) => return Err(io::Error::other(err)),
             }
 
@@ -740,7 +1105,7 @@ struct LogReaderArgs {
     run_id: RunId,
     sink: RunSink,
     reader: PtyOutputReader,
-    writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    write_queue: SharedPtyWriteQueue,
     events_tx: mpsc::Sender<ProcessEvent>,
     pty_rows: u16,
     pty_cols: u16,
@@ -772,7 +1137,7 @@ fn spawn_log_reader_thread(args: LogReaderArgs) {
     thread::spawn(move || {
         #[derive(Clone)]
         struct PtyEventProxy {
-            writer: Arc<Mutex<Box<dyn Write + Send>>>,
+            write_queue: SharedPtyWriteQueue,
             pty_size: Arc<AtomicU32>,
         }
 
@@ -801,10 +1166,15 @@ fn spawn_log_reader_thread(args: LogReaderArgs) {
                     return;
                 };
 
-                let mut guard = self.writer.lock();
-                if guard.write_all(text.as_bytes()).is_ok() {
-                    let _ = guard.flush();
-                }
+                // Queue access is best-effort because this callback runs on the reader thread.
+                // Contention or saturation drops the whole reply before any bytes are written.
+                let Some(write_queue) = self.write_queue.try_lock() else {
+                    return;
+                };
+                let Some(write_queue) = write_queue.as_ref() else {
+                    return;
+                };
+                let _ = write_queue.try_send(PtyWrite::TerminalResponse(text.into_bytes()));
             }
         }
 
@@ -954,7 +1324,7 @@ fn spawn_log_reader_thread(args: LogReaderArgs) {
             run_id,
             sink,
             reader,
-            writer,
+            write_queue,
             events_tx,
             pty_rows,
             pty_cols,
@@ -977,7 +1347,7 @@ fn spawn_log_reader_thread(args: LogReaderArgs) {
         let mut scratch: Vec<u8> = Vec::new();
         let mut filter = AnsiFilter::new();
         let proxy = PtyEventProxy {
-            writer,
+            write_queue,
             pty_size: pty_size.clone(),
         };
         let size = TermSize {
@@ -1137,7 +1507,14 @@ struct TerminationTaskArgs {
     killer: Box<dyn portable_pty::ChildKiller + Send + Sync>,
     pid: Option<u32>,
     process_group_leader_id: Option<i32>,
+    pty_shutdown: PtyShutdown,
     child: Box<dyn portable_pty::Child + Send + Sync>,
+}
+
+#[derive(Clone, Copy)]
+struct TerminationTiming {
+    force_kill_after: Duration,
+    pty_hangup_after: Duration,
 }
 
 struct TerminationStart {
@@ -1157,7 +1534,11 @@ impl TerminationTarget {
         events_tx: &mpsc::Sender<ProcessEvent>,
         service_id: &ServiceID,
         run_id: RunId,
+        force_kill_after: Duration,
     ) -> TerminationStart {
+        #[cfg(not(unix))]
+        let _ = force_kill_after;
+
         tracing::info!(pid = self.pid, service_id, "killing process");
         let _ = events_tx
             .send(ProcessEvent::Killed {
@@ -1172,7 +1553,7 @@ impl TerminationTarget {
                 self.kill_with_backend();
             }
             TerminationStart {
-                kill_deadline: Some(tokio::time::Instant::now() + Duration::from_millis(750)),
+                kill_deadline: Some(tokio::time::Instant::now() + force_kill_after),
                 escalated: false,
             }
         }
@@ -1305,6 +1686,16 @@ fn exit_code_from_wait(
 }
 
 fn spawn_termination_task(args: TerminationTaskArgs) {
+    spawn_termination_task_with_timing(
+        args,
+        TerminationTiming {
+            force_kill_after: FORCE_KILL_AFTER_TERMINATION,
+            pty_hangup_after: PTY_HANGUP_AFTER_ESCALATION,
+        },
+    );
+}
+
+fn spawn_termination_task_with_timing(args: TerminationTaskArgs, timing: TerminationTiming) {
     tokio::spawn(async move {
         let TerminationTaskArgs {
             service_id,
@@ -1314,6 +1705,7 @@ fn spawn_termination_task(args: TerminationTaskArgs) {
             terminate,
             pid,
             process_group_leader_id,
+            pty_shutdown,
             killer,
             mut child,
         } = args;
@@ -1329,7 +1721,8 @@ fn spawn_termination_task(args: TerminationTaskArgs) {
         let mut termination_started = false;
         let mut termination_escalated = false;
         let mut kill_deadline: Option<tokio::time::Instant> = None;
-        let mut unreaped_warn_deadline: Option<tokio::time::Instant> = None;
+        let mut pty_hangup_deadline: Option<tokio::time::Instant> = None;
+        let mut pty_shutdown = Some(pty_shutdown);
         loop {
             tokio::select! {
                 res = &mut wait_handle => {
@@ -1342,22 +1735,25 @@ fn spawn_termination_task(args: TerminationTaskArgs) {
                     let _ = events_tx.send(event).await;
                     break;
                 }
-                () = shutdown.cancelled(), if !termination_started => {
-                    let started = target.request(&events_tx, &service_id, run_id).await;
+                () = async {
+                    tokio::select! {
+                        () = shutdown.cancelled() => {}
+                        () = terminate.cancelled() => {}
+                    }
+                }, if !termination_started => {
+                    let started = target
+                        .request(
+                            &events_tx,
+                            &service_id,
+                            run_id,
+                            timing.force_kill_after,
+                        )
+                        .await;
                     kill_deadline = started.kill_deadline;
                     termination_escalated = started.escalated;
-                    unreaped_warn_deadline = started
+                    pty_hangup_deadline = started
                         .escalated
-                        .then(|| tokio::time::Instant::now() + UNREAPED_WARN_AFTER_ESCALATION);
-                    termination_started = true;
-                }
-                () = terminate.cancelled(), if !termination_started => {
-                    let started = target.request(&events_tx, &service_id, run_id).await;
-                    kill_deadline = started.kill_deadline;
-                    termination_escalated = started.escalated;
-                    unreaped_warn_deadline = started
-                        .escalated
-                        .then(|| tokio::time::Instant::now() + UNREAPED_WARN_AFTER_ESCALATION);
+                        .then(|| tokio::time::Instant::now() + timing.pty_hangup_after);
                     termination_started = true;
                 }
                 () = async {
@@ -1370,24 +1766,30 @@ fn spawn_termination_task(args: TerminationTaskArgs) {
                     // survive the leader and keep its PTY open.
                     target.force_kill();
                     termination_escalated = true;
-                    unreaped_warn_deadline =
-                        Some(tokio::time::Instant::now() + UNREAPED_WARN_AFTER_ESCALATION);
+                    pty_hangup_deadline =
+                        Some(tokio::time::Instant::now() + timing.pty_hangup_after);
                 }
                 () = async {
-                    match unreaped_warn_deadline {
+                    match pty_hangup_deadline {
                         Some(deadline) => tokio::time::sleep_until(deadline).await,
                         None => std::future::pending::<()>().await,
                     }
-                }, if unreaped_warn_deadline.is_some() => {
-                    // Escalation does not prove delivery or exit. Keep the run live until the wait
-                    // task completes so a replacement cannot overlap the old process.
+                }, if pty_hangup_deadline.is_some() => {
+                    // A descendant in another session can retain the slave after process-group
+                    // escalation.
+                    //
+                    // Close every master endpoint so the terminal cannot keep the original child's
+                    // wait from completing.
                     tracing::warn!(
                         ?pid,
                         %service_id,
                         run_id = run_id.get(),
-                        "termination escalated but the process is still unreaped; waiting for its exit"
+                        "termination escalated but the process is still unreaped; closing its pty"
                     );
-                    unreaped_warn_deadline = None;
+                    if let Some(shutdown) = pty_shutdown.take() {
+                        shutdown.close();
+                    }
+                    pty_hangup_deadline = None;
                 }
             }
         }
@@ -1469,18 +1871,23 @@ pub(super) fn start_service_with_pty_size(
         .take_writer()
         .map_err(|err| Error::operation("failed to take pty writer", err))?;
 
-    let master = Arc::new(Mutex::new(pair.master));
-    let writer = Arc::new(Mutex::new(writer));
     let size = Arc::new(AtomicU32::new(
         (u32::from(pty_size.rows) << 16) | u32::from(pty_size.cols),
     ));
+    let (handles, pty_shutdown) = PtyHandles::new(
+        service_id.clone(),
+        pair.master,
+        writer,
+        size.clone(),
+        &log_reader,
+    )?;
 
     spawn_log_reader_thread(LogReaderArgs {
         service_id: service_id.clone(),
         run_id,
         sink: sink.clone(),
         reader,
-        writer: writer.clone(),
+        write_queue: handles.write_queue.clone(),
         events_tx: events_tx.clone(),
         pty_rows: pty_size.rows,
         pty_cols: pty_size.cols,
@@ -1496,6 +1903,7 @@ pub(super) fn start_service_with_pty_size(
         killer,
         pid,
         process_group_leader_id: process_group_leader,
+        pty_shutdown,
         child,
     });
     child_guard.disarm();
@@ -1534,11 +1942,7 @@ pub(super) fn start_service_with_pty_size(
 
     Ok(StartedPty {
         pid,
-        handles: PtyHandles {
-            master,
-            writer,
-            size,
-        },
+        handles,
         log_reader,
     })
 }
@@ -1547,58 +1951,6 @@ pub(super) fn start_service_with_pty_size(
 mod tests {
     use super::*;
     use similar_asserts::assert_eq;
-
-    #[cfg(unix)]
-    #[derive(Clone, Debug)]
-    struct CountingKiller {
-        calls: Arc<std::sync::atomic::AtomicUsize>,
-    }
-
-    #[cfg(unix)]
-    impl portable_pty::ChildKiller for CountingKiller {
-        fn kill(&mut self) -> io::Result<()> {
-            self.calls.fetch_add(1, Ordering::Relaxed);
-            Ok(())
-        }
-
-        fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
-            Box::new(self.clone())
-        }
-    }
-
-    #[cfg(unix)]
-    fn target_with_invalid_os_ids(calls: Arc<std::sync::atomic::AtomicUsize>) -> TerminationTarget {
-        TerminationTarget {
-            killer: Box::new(CountingKiller { calls }),
-            pid: Some(u32::MAX),
-            process_group_leader_id: Some(i32::MAX),
-        }
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn failed_sigterm_uses_backend_without_skipping_escalation() {
-        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let mut target = target_with_invalid_os_ids(calls.clone());
-        let (events_tx, mut events_rx) = mpsc::channel(1);
-        let service_id = "svc".to_string();
-        let run_id = RunId::new(7);
-
-        let started = target.request(&events_tx, &service_id, run_id).await;
-
-        assert!(!started.escalated);
-        assert!(started.kill_deadline.is_some());
-        assert_eq!(calls.load(Ordering::Relaxed), 1);
-        target.force_kill();
-        assert_eq!(calls.load(Ordering::Relaxed), 2);
-        assert!(matches!(
-            events_rx.recv().await,
-            Some(ProcessEvent::Killed {
-                service_id: killed_service_id,
-                run_id: killed_run_id,
-            }) if killed_service_id == service_id && killed_run_id == run_id
-        ));
-    }
 
     #[test]
     fn log_reader_finished_guard_reports_completion_on_drop() {
@@ -1621,6 +1973,632 @@ mod tests {
                 run_id: finished_run_id,
             }) if finished_service_id == service_id && finished_run_id == run_id
         ));
+    }
+
+    #[cfg(unix)]
+    mod unix {
+        use super::*;
+        use color_eyre::eyre::{self, OptionExt as _};
+        use similar_asserts::assert_eq;
+        use std::fs;
+
+        #[derive(Clone, Debug)]
+        struct CountingKiller {
+            calls: Arc<std::sync::atomic::AtomicUsize>,
+        }
+
+        impl portable_pty::ChildKiller for CountingKiller {
+            fn kill(&mut self) -> io::Result<()> {
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+
+            fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
+                Box::new(self.clone())
+            }
+        }
+
+        #[test]
+        fn poll_eintr_is_retryable_for_native_poll_and_macos_select() {
+            let native_poll =
+                filedescriptor::Error::Poll(io::Error::from(io::ErrorKind::Interrupted));
+            let macos_select =
+                filedescriptor::Error::Io(io::Error::from(io::ErrorKind::Interrupted));
+            let fatal_poll = filedescriptor::Error::Poll(io::Error::other("fatal poll error"));
+            let unrelated = filedescriptor::Error::IllegalFdValue(-1);
+
+            assert!(poll_error_is_interrupted(&native_poll));
+            assert!(poll_error_is_interrupted(&macos_select));
+            assert!(!poll_error_is_interrupted(&fatal_poll));
+            assert!(!poll_error_is_interrupted(&unrelated));
+        }
+
+        struct ExitOnDropWriter {
+            writer: Option<Box<dyn Write + Send>>,
+            exited: Option<std::sync::mpsc::Sender<()>>,
+            would_block: Option<std::sync::mpsc::Sender<()>>,
+        }
+
+        impl Write for ExitOnDropWriter {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                let Some(writer) = self.writer.as_mut() else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "test PTY writer was already dropped",
+                    ));
+                };
+                let result = writer.write(buf);
+                if matches!(&result, Err(err) if err.kind() == io::ErrorKind::WouldBlock)
+                    && let Some(would_block) = self.would_block.take()
+                {
+                    let _ = would_block.send(());
+                }
+                result
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                let Some(writer) = self.writer.as_mut() else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "test PTY writer was already dropped",
+                    ));
+                };
+                writer.flush()
+            }
+        }
+
+        impl Drop for ExitOnDropWriter {
+            fn drop(&mut self) {
+                drop(self.writer.take());
+                if let Some(exited) = self.exited.take() {
+                    let _ = exited.send(());
+                }
+            }
+        }
+
+        struct WaitingChild {
+            exited: Mutex<std::sync::mpsc::Receiver<()>>,
+            kill_calls: Arc<std::sync::atomic::AtomicUsize>,
+        }
+
+        impl std::fmt::Debug for WaitingChild {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter
+                    .debug_struct("WaitingChild")
+                    .finish_non_exhaustive()
+            }
+        }
+
+        impl portable_pty::ChildKiller for WaitingChild {
+            fn kill(&mut self) -> io::Result<()> {
+                self.kill_calls.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+
+            fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
+                Box::new(CountingKiller {
+                    calls: self.kill_calls.clone(),
+                })
+            }
+        }
+
+        impl portable_pty::Child for WaitingChild {
+            fn try_wait(&mut self) -> io::Result<Option<portable_pty::ExitStatus>> {
+                match self.exited.lock().try_recv() {
+                    Ok(()) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        Ok(Some(portable_pty::ExitStatus::with_exit_code(0)))
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => Ok(None),
+                }
+            }
+
+            fn wait(&mut self) -> io::Result<portable_pty::ExitStatus> {
+                self.exited
+                    .lock()
+                    .recv()
+                    .map_err(|err| io::Error::other(err.to_string()))?;
+                Ok(portable_pty::ExitStatus::with_exit_code(0))
+            }
+
+            fn process_id(&self) -> Option<u32> {
+                None
+            }
+        }
+
+        fn target_with_invalid_os_ids(
+            calls: Arc<std::sync::atomic::AtomicUsize>,
+        ) -> TerminationTarget {
+            TerminationTarget {
+                killer: Box::new(CountingKiller { calls }),
+                pid: Some(u32::MAX),
+                process_group_leader_id: Some(i32::MAX),
+            }
+        }
+
+        #[tokio::test]
+        async fn failed_sigterm_uses_backend_without_skipping_escalation() {
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut target = target_with_invalid_os_ids(calls.clone());
+            let (events_tx, mut events_rx) = mpsc::channel(1);
+            let service_id = "svc".to_string();
+            let run_id = RunId::new(7);
+
+            let started = target
+                .request(
+                    &events_tx,
+                    &service_id,
+                    run_id,
+                    FORCE_KILL_AFTER_TERMINATION,
+                )
+                .await;
+
+            assert!(!started.escalated);
+            assert!(started.kill_deadline.is_some());
+            assert_eq!(calls.load(Ordering::Relaxed), 1);
+            target.force_kill();
+            assert_eq!(calls.load(Ordering::Relaxed), 2);
+            assert!(matches!(
+                events_rx.recv().await,
+                Some(ProcessEvent::Killed {
+                    service_id: killed_service_id,
+                    run_id: killed_run_id,
+                }) if killed_service_id == service_id && killed_run_id == run_id
+            ));
+        }
+
+        #[test]
+        fn pty_input_write_times_out_when_the_slave_queue_is_full() -> eyre::Result<()> {
+            let fixture_dir = tempfile::tempdir()?;
+            let ready_file = fixture_dir.path().join("ready");
+            let pair = portable_pty::native_pty_system()
+                .openpty(portable_pty::PtySize::default())
+                .map_err(|err| eyre::eyre!("failed to open test PTY: {err}"))?;
+            let mut command = portable_pty::CommandBuilder::new("sh");
+            command.args(["-c", "stty raw -echo; : > \"$READY\"; exec sleep 60"]);
+            command.env("READY", &ready_file);
+            let mut child = pair
+                .slave
+                .spawn_command(command)
+                .map_err(|err| eyre::eyre!("failed to spawn stalled raw-mode reader: {err}"))?;
+            let poll_write = configure_nonblocking_pty(pair.master.as_ref())?;
+            let (cancel_read, cancellation) = PtyCancellation::pipe()?;
+            let writer = pair
+                .master
+                .take_writer()
+                .map_err(|err| eyre::eyre!("failed to take test PTY writer: {err}"))?;
+            let mut writer = PtyWriter {
+                service_id: "svc".to_string(),
+                writer,
+                cancellation,
+                poll_write,
+                cancel_read,
+            };
+
+            let ready_deadline = Instant::now() + Duration::from_secs(3);
+            while !ready_file.exists() {
+                if Instant::now() >= ready_deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    eyre::bail!("stalled raw-mode reader did not become ready");
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+
+            // The slave never drains its raw-mode input queue, so the worker must abandon this
+            // batch at its deadline instead of remaining occupied forever.
+            let started_at = Instant::now();
+            let write_result = writer.write_input(&vec![b'x'; 1024 * 1024]);
+            let write_elapsed = started_at.elapsed();
+
+            let _ = child.kill();
+            let _ = child.wait();
+            if !matches!(
+                &write_result,
+                Err(err) if err.kind() == io::ErrorKind::TimedOut
+            ) {
+                eyre::bail!("stalled PTY write did not time out: {write_result:?}");
+            }
+            let earliest_timeout =
+                PTY_INPUT_WRITE_TIMEOUT.saturating_sub(Duration::from_millis(100));
+            if write_elapsed < earliest_timeout {
+                eyre::bail!("stalled PTY write returned before the retry deadline");
+            }
+            if write_elapsed >= Duration::from_secs(3) {
+                eyre::bail!("stalled PTY write exceeded its retry deadline");
+            }
+            Ok(())
+        }
+
+        #[test]
+        fn pty_input_enqueue_does_not_wait_for_slave_backpressure() -> eyre::Result<()> {
+            let fixture_dir = tempfile::tempdir()?;
+            let ready_file = fixture_dir.path().join("ready");
+            let pair = portable_pty::native_pty_system()
+                .openpty(portable_pty::PtySize::default())
+                .map_err(|err| eyre::eyre!("failed to open test PTY: {err}"))?;
+            let mut command = portable_pty::CommandBuilder::new("sh");
+            command.args(["-c", "stty raw -echo; : > \"$READY\"; exec sleep 60"]);
+            command.env("READY", &ready_file);
+            let mut child = pair
+                .slave
+                .spawn_command(command)
+                .map_err(|err| eyre::eyre!("failed to spawn stalled raw-mode reader: {err}"))?;
+            let writer = pair
+                .master
+                .take_writer()
+                .map_err(|err| eyre::eyre!("failed to take test PTY writer: {err}"))?;
+            let log_reader = LogReaderHandle::test_dummy();
+            let (handles, shutdown) = PtyHandles::new(
+                "svc".to_string(),
+                pair.master,
+                writer,
+                Arc::new(AtomicU32::new(0)),
+                &log_reader,
+            )?;
+
+            let ready_deadline = Instant::now() + Duration::from_secs(3);
+            while !ready_file.exists() {
+                if Instant::now() >= ready_deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    eyre::bail!("stalled raw-mode reader did not become ready");
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+
+            // Enqueuing is the scheduler-facing operation. It must return well before the writer
+            // worker reaches its backpressure deadline.
+            let started_at = Instant::now();
+            handles.write_input(&"svc".to_string(), vec![b'x'; 1024 * 1024]);
+            let enqueue_elapsed = started_at.elapsed();
+
+            shutdown.close();
+            let _ = child.kill();
+            let _ = child.wait();
+            let latest_enqueue = PTY_INPUT_WRITE_TIMEOUT.saturating_sub(Duration::from_millis(100));
+            if enqueue_elapsed >= latest_enqueue {
+                eyre::bail!("PTY input enqueue waited for slave backpressure");
+            }
+            Ok(())
+        }
+
+        #[test]
+        fn pty_input_write_retries_backpressure_for_an_active_raw_reader() -> eyre::Result<()> {
+            const INPUT_LEN: usize = 64 * 1024;
+
+            let expected_len = u64::try_from(INPUT_LEN)?;
+            let fixture_dir = tempfile::tempdir()?;
+            let ready_file = fixture_dir.path().join("ready");
+            let output_file = fixture_dir.path().join("output");
+            let pair = portable_pty::native_pty_system()
+                .openpty(portable_pty::PtySize::default())
+                .map_err(|err| eyre::eyre!("failed to open test PTY: {err}"))?;
+            let mut command = portable_pty::CommandBuilder::new("sh");
+            command.args([
+                "-c",
+                "stty raw -echo; : > \"$READY\"; exec head -c \"$INPUT_LEN\" > \"$OUTPUT\"",
+            ]);
+            command.env("READY", &ready_file);
+            command.env("OUTPUT", &output_file);
+            command.env("INPUT_LEN", INPUT_LEN.to_string());
+            let mut child = pair
+                .slave
+                .spawn_command(command)
+                .map_err(|err| eyre::eyre!("failed to spawn raw-mode reader: {err}"))?;
+            let writer = pair
+                .master
+                .take_writer()
+                .map_err(|err| eyre::eyre!("failed to take test PTY writer: {err}"))?;
+            let log_reader = LogReaderHandle::test_dummy();
+            let (handles, shutdown) = PtyHandles::new(
+                "svc".to_string(),
+                pair.master,
+                writer,
+                Arc::new(AtomicU32::new(0)),
+                &log_reader,
+            )?;
+
+            let transfer_result = (|| -> eyre::Result<()> {
+                let ready_deadline = Instant::now() + Duration::from_secs(3);
+                while !ready_file.exists() {
+                    if Instant::now() >= ready_deadline {
+                        eyre::bail!("raw-mode reader did not become ready");
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+
+                let input = vec![b'x'; INPUT_LEN];
+                handles.write_input(&"svc".to_string(), input);
+
+                // Raw-mode queues are much smaller than this paste.
+                //
+                // The complete output proves transient `EAGAIN` was retried rather than treated as
+                // a terminal write failure.
+                let output_deadline = Instant::now() + Duration::from_secs(3);
+                while fs::metadata(&output_file).map_or(0, |metadata| metadata.len()) < expected_len
+                {
+                    if Instant::now() >= output_deadline {
+                        eyre::bail!("raw-mode reader received truncated input");
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Ok(())
+            })();
+
+            if transfer_result.is_err() {
+                let _ = child.kill();
+            }
+            let wait_result = child.wait();
+            shutdown.close();
+            transfer_result?;
+            let status = wait_result?;
+            if !status.success() {
+                eyre::bail!("raw-mode reader exited with {status}");
+            }
+            Ok(())
+        }
+
+        #[test]
+        fn pty_terminal_response_survives_extended_backpressure() -> eyre::Result<()> {
+            const RESPONSE_LEN: usize = 64 * 1024;
+
+            let expected_len = u64::try_from(RESPONSE_LEN)?;
+            let fixture_dir = tempfile::tempdir()?;
+            let ready_file = fixture_dir.path().join("ready");
+            let output_file = fixture_dir.path().join("output");
+            let pair = portable_pty::native_pty_system()
+                .openpty(portable_pty::PtySize::default())
+                .map_err(|err| eyre::eyre!("failed to open test PTY: {err}"))?;
+            let mut command = portable_pty::CommandBuilder::new("sh");
+            command.args([
+                "-c",
+                "stty raw -echo; : > \"$READY\"; sleep 1; \
+                 exec head -c \"$RESPONSE_LEN\" > \"$OUTPUT\"",
+            ]);
+            command.env("READY", &ready_file);
+            command.env("OUTPUT", &output_file);
+            command.env("RESPONSE_LEN", RESPONSE_LEN.to_string());
+            let mut child = pair
+                .slave
+                .spawn_command(command)
+                .map_err(|err| eyre::eyre!("failed to spawn delayed raw-mode reader: {err}"))?;
+            let writer = pair
+                .master
+                .take_writer()
+                .map_err(|err| eyre::eyre!("failed to take test PTY writer: {err}"))?;
+            let log_reader = LogReaderHandle::test_dummy();
+            let (handles, shutdown) = PtyHandles::new(
+                "svc".to_string(),
+                pair.master,
+                writer,
+                Arc::new(AtomicU32::new(0)),
+                &log_reader,
+            )?;
+
+            let transfer_result = (|| -> eyre::Result<()> {
+                let ready_deadline = Instant::now() + Duration::from_secs(3);
+                while !ready_file.exists() {
+                    if Instant::now() >= ready_deadline {
+                        eyre::bail!("delayed raw-mode reader did not become ready");
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+
+                let response = vec![b'x'; RESPONSE_LEN];
+                handles
+                    .write_queue
+                    .lock()
+                    .as_ref()
+                    .ok_or_eyre("PTY writer closed before terminal response")?
+                    .try_send(PtyWrite::TerminalResponse(response))
+                    .map_err(|err| eyre::eyre!("failed to queue terminal response: {err}"))?;
+
+                // The slave waits longer than the input-write deadline before reading.
+                //
+                // A complete output proves terminal replies retain their unwritten tail across
+                // backpressure.
+                let output_deadline = Instant::now() + Duration::from_secs(4);
+                while fs::metadata(&output_file).map_or(0, |metadata| metadata.len()) < expected_len
+                {
+                    if Instant::now() >= output_deadline {
+                        eyre::bail!("raw-mode reader received a truncated terminal response");
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Ok(())
+            })();
+
+            if transfer_result.is_err() {
+                let _ = child.kill();
+            }
+            let wait_result = child.wait();
+            shutdown.close();
+            transfer_result?;
+            let status = wait_result?;
+            if !status.success() {
+                eyre::bail!("delayed raw-mode reader exited with {status}");
+            }
+            Ok(())
+        }
+
+        #[test]
+        fn pty_shutdown_closes_interactive_handles_and_wakes_reader() -> eyre::Result<()> {
+            let pair = portable_pty::native_pty_system()
+                .openpty(portable_pty::PtySize {
+                    rows: 24,
+                    cols: 80,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                })
+                .map_err(|err| eyre::eyre!("failed to open test PTY: {err}"))?;
+            let (mut reader, log_reader) = PtyOutputReader::new(pair.master.as_ref())?;
+            let writer = pair
+                .master
+                .take_writer()
+                .map_err(|err| eyre::eyre!("failed to take test PTY writer: {err}"))?;
+            let size = Arc::new(AtomicU32::new(0));
+            let (handles, shutdown) =
+                PtyHandles::new("svc".to_string(), pair.master, writer, size, &log_reader)?;
+
+            shutdown.close();
+
+            // Closing the interactive handles alone is insufficient because the reader owns two
+            // duplicated master descriptors.
+            //
+            // Its cancellation signal must also become readable.
+            assert!(handles.master.lock().is_none());
+            assert!(handles.write_queue.lock().is_none());
+            assert_eq!(reader.read(&mut [0; 1])?, None);
+            Ok(())
+        }
+
+        #[test]
+        fn dropping_pty_shutdown_cancels_a_blocked_terminal_response() -> eyre::Result<()> {
+            const RESPONSE_LEN: usize = 1024 * 1024;
+
+            let fixture_dir = tempfile::tempdir()?;
+            let ready_file = fixture_dir.path().join("ready");
+            let pair = portable_pty::native_pty_system()
+                .openpty(portable_pty::PtySize::default())
+                .map_err(|err| eyre::eyre!("failed to open test PTY: {err}"))?;
+            let mut command = portable_pty::CommandBuilder::new("sh");
+            command.args(["-c", "stty raw -echo; : > \"$READY\"; exec sleep 60"]);
+            command.env("READY", &ready_file);
+            let mut child = pair
+                .slave
+                .spawn_command(command)
+                .map_err(|err| eyre::eyre!("failed to spawn stalled raw-mode reader: {err}"))?;
+            let writer = pair
+                .master
+                .take_writer()
+                .map_err(|err| eyre::eyre!("failed to take test PTY writer: {err}"))?;
+            let (would_block_tx, would_block_rx) = std::sync::mpsc::channel();
+            let (writer_dropped_tx, writer_dropped_rx) = std::sync::mpsc::channel();
+            let writer = ExitOnDropWriter {
+                writer: Some(writer),
+                exited: Some(writer_dropped_tx),
+                would_block: Some(would_block_tx),
+            };
+            let log_reader = LogReaderHandle::test_dummy();
+            let (handles, shutdown) = PtyHandles::new(
+                "svc".to_string(),
+                pair.master,
+                Box::new(writer),
+                Arc::new(AtomicU32::new(0)),
+                &log_reader,
+            )?;
+
+            let test_result = (|| -> eyre::Result<()> {
+                let ready_deadline = Instant::now() + Duration::from_secs(3);
+                while !ready_file.exists() {
+                    if Instant::now() >= ready_deadline {
+                        eyre::bail!("stalled raw-mode reader did not become ready");
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+
+                handles
+                    .write_queue
+                    .lock()
+                    .as_ref()
+                    .ok_or_eyre("PTY writer closed before terminal response")?
+                    .try_send(PtyWrite::TerminalResponse(vec![b'x'; RESPONSE_LEN]))
+                    .map_err(|err| eyre::eyre!("failed to queue terminal response: {err}"))?;
+                would_block_rx
+                    .recv_timeout(Duration::from_secs(3))
+                    .map_err(|err| eyre::eyre!("PTY writer did not reach backpressure: {err}"))?;
+
+                // Keep the queue and slave open so only the shutdown capability's drop can wake
+                // the blocked worker and release its writer endpoint.
+                drop(shutdown);
+                writer_dropped_rx
+                    .recv_timeout(Duration::from_secs(1))
+                    .map_err(|err| {
+                        eyre::eyre!("PTY writer remained blocked after teardown: {err}")
+                    })?;
+                assert!(handles.write_queue.lock().is_some());
+                assert!(handles.master.lock().is_some());
+                Ok(())
+            })();
+
+            let _ = child.kill();
+            let _ = child.wait();
+            test_result
+        }
+
+        #[tokio::test]
+        async fn escalation_closes_the_pty_before_reporting_exit() -> eyre::Result<()> {
+            let pair = portable_pty::native_pty_system()
+                .openpty(portable_pty::PtySize::default())
+                .map_err(|err| eyre::eyre!("failed to open test PTY: {err}"))?;
+            let writer = pair
+                .master
+                .take_writer()
+                .map_err(|err| eyre::eyre!("failed to take test PTY writer: {err}"))?;
+            let (child_exited_tx, child_exited_rx) = std::sync::mpsc::channel();
+            let writer = ExitOnDropWriter {
+                writer: Some(writer),
+                exited: Some(child_exited_tx),
+                would_block: None,
+            };
+            let log_reader = LogReaderHandle::test_dummy();
+            let (handles, pty_shutdown) = PtyHandles::new(
+                "svc".to_string(),
+                pair.master,
+                Box::new(writer),
+                Arc::new(AtomicU32::new(0)),
+                &log_reader,
+            )?;
+            let _slave = pair.slave;
+
+            let kill_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let child = WaitingChild {
+                exited: Mutex::new(child_exited_rx),
+                kill_calls: kill_calls.clone(),
+            };
+            let (events_tx, mut events_rx) = mpsc::channel(4);
+            let shutdown = CancellationToken::new();
+            let terminate = CancellationToken::new();
+            spawn_termination_task_with_timing(
+                TerminationTaskArgs {
+                    service_id: "svc".to_string(),
+                    run_id: RunId::new(7),
+                    events_tx,
+                    shutdown,
+                    terminate: terminate.clone(),
+                    killer: Box::new(CountingKiller {
+                        calls: kill_calls.clone(),
+                    }),
+                    pid: None,
+                    process_group_leader_id: None,
+                    pty_shutdown,
+                    child: Box::new(child),
+                },
+                TerminationTiming {
+                    force_kill_after: Duration::from_millis(10),
+                    pty_hangup_after: Duration::from_millis(10),
+                },
+            );
+
+            terminate.cancel();
+            let killed = tokio::time::timeout(Duration::from_secs(1), events_rx.recv())
+                .await?
+                .ok_or_eyre("termination task ended without a killed event")?;
+            assert!(matches!(killed, ProcessEvent::Killed { .. }));
+
+            // The fake child ignores both kill requests and finishes only when PTY shutdown drops
+            // its writer.
+            //
+            // Receiving `Exited` therefore exercises the escalation deadline and close path.
+            let exited = tokio::time::timeout(Duration::from_secs(1), events_rx.recv())
+                .await?
+                .ok_or_eyre("termination task ended without an exit event")?;
+            assert!(matches!(exited, ProcessEvent::Exited { exit_code: 0, .. }));
+            assert_eq!(kill_calls.load(Ordering::Relaxed), 2);
+            assert!(handles.write_queue.lock().is_none());
+            assert!(handles.master.lock().is_none());
+            Ok(())
+        }
     }
 
     #[test]

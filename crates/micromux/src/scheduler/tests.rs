@@ -2414,6 +2414,139 @@ async fn restart_reaps_service_while_pty_output_is_saturated() -> eyre::Result<(
     Ok(())
 }
 
+#[cfg(unix)]
+mod escaped_session {
+    use super::*;
+    use color_eyre::eyre::{self, OptionExt as _};
+    use std::io::Write as _;
+
+    const HELPER_MODE: &str = "MICROMUX_TEST_ESCAPED_SESSION_HELPER";
+    const READY_FILE: &str = "MICROMUX_TEST_ESCAPED_SESSION_READY_FILE";
+    const EXITED_FILE: &str = "MICROMUX_TEST_ESCAPED_SESSION_EXITED_FILE";
+    const HELPER_TEST: &str = "scheduler::tests::escaped_session::writer_helper";
+
+    #[test]
+    fn writer_helper() -> eyre::Result<()> {
+        let Ok(mode) = std::env::var(HELPER_MODE) else {
+            return Ok(());
+        };
+
+        // The service process remains in the original process group while its child creates a new
+        // session and inherits the slave PTY.
+        if mode == "parent" {
+            let status = std::process::Command::new(std::env::current_exe()?)
+                .args(["--exact", HELPER_TEST, "--nocapture", "--test-threads=1"])
+                .env(HELPER_MODE, "writer")
+                .status()?;
+            if !status.success() {
+                eyre::bail!("escaped-session writer exited with {status}");
+            }
+            return Ok(());
+        }
+
+        if mode != "writer" {
+            eyre::bail!("unknown escaped-session helper mode `{mode}`");
+        }
+
+        nix::unistd::setsid()?;
+        let ready_file =
+            std::env::var_os(READY_FILE).ok_or_eyre("escaped-session ready file is missing")?;
+        let exited_file =
+            std::env::var_os(EXITED_FILE).ok_or_eyre("escaped-session exit file is missing")?;
+        fs::write(ready_file, b"ready")?;
+
+        let mut stdout = std::io::stdout().lock();
+        let output = [b'x'; 4096];
+        while stdout.write_all(&output).is_ok() {}
+        fs::write(exited_file, b"exited")?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn restart_escalates_and_releases_an_escaped_session_writer() -> eyre::Result<()> {
+        let fixture_dir = unique_tmp_dir("escaped-session");
+        fs::create_dir_all(&fixture_dir)?;
+        let ready_file = fixture_dir.join("ready");
+        let exited_file = fixture_dir.join("exited");
+        let executable = std::env::current_exe()?.to_string_lossy().into_owned();
+        let command_args = [
+            "-c",
+            "trap '' TERM; exec \"$@\"",
+            "sh",
+            &executable,
+            "--exact",
+            HELPER_TEST,
+            "--nocapture",
+            "--test-threads=1",
+        ];
+        // Ignoring `SIGTERM` forces the fixture through escalation before the parent can be reaped.
+        let mut cfg = service_config("svc", ("sh", &command_args));
+        cfg.environment
+            .insert(spanned_string(HELPER_MODE), spanned_string("parent"));
+        cfg.environment.insert(
+            spanned_string(READY_FILE),
+            spanned_string(&ready_file.to_string_lossy()),
+        );
+        cfg.environment.insert(
+            spanned_string(EXITED_FILE),
+            spanned_string(&exited_file.to_string_lossy()),
+        );
+        let mut services = ServiceMap::new();
+        services.insert("svc".to_string(), Service::new("svc", Path::new("."), cfg)?);
+        let harness = spawn_harness(services, None);
+
+        let restarted: eyre::Result<()> = async {
+            wait_until(&harness.reader, "svc", |snapshot| {
+                snapshot.run_generation == 1 && snapshot.execution == Execution::Running
+            })
+            .await?;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while !ready_file.exists() {
+                if tokio::time::Instant::now() >= deadline {
+                    eyre::bail!("escaped-session writer did not become ready");
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            // Give the escaped writer time to keep the terminal queue continuously active.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+
+            let restart_requested_at = tokio::time::Instant::now();
+            accepted(harness.control.restart(&"svc".to_string()).await)?;
+            wait_until(&harness.reader, "svc", |snapshot| {
+                snapshot.run_generation >= 2 && snapshot.execution == Execution::Running
+            })
+            .await?;
+            // A prompt restart would mean `SIGTERM` killed the parent before escalation ran.
+            if restart_requested_at.elapsed() < Duration::from_millis(500) {
+                eyre::bail!("fixture restarted before forced termination could run");
+            }
+
+            // Release may come from forced PTY hangup, Darwin slave revocation, or the post-exit
+            // reader-drain cap.
+            //
+            // Leave a separate scheduling margin beyond the configured cap.
+            let deadline =
+                tokio::time::Instant::now() + POST_EXIT_DRAIN_GRACE + Duration::from_secs(5);
+            while !exited_file.exists() {
+                if tokio::time::Instant::now() >= deadline {
+                    eyre::bail!("escaped-session writer retained the slave PTY after restart");
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Ok(())
+        }
+        .await;
+
+        // Tear down both generations before propagating a failure so no escaped writer survives the
+        // test process.
+        harness.shutdown.cancel();
+        let scheduler_result = harness.handle.await;
+        fs::remove_dir_all(&fixture_dir)?;
+        scheduler_result??;
+        restarted
+    }
+}
+
 #[tokio::test]
 async fn restart_timeline_orders_request_spawn_and_exit() -> eyre::Result<()> {
     let mut services = ServiceMap::new();
