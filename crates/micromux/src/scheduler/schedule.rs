@@ -312,12 +312,11 @@ fn start_service_if_ready(
 
     runtime.start_requested = false;
     runtime.clear_logs_on_start = false;
-    // A still-draining reader only feeds the finished run's retained log from here on. That tail
-    // is worth capturing until the replacement run begins, but not worth pinning a reader thread
-    // and its fds for as long as some descendant keeps the PTY slave open — so the new run's start
-    // caps the drain.
-    for (_, log_reader) in &mut runtime.draining_log_readers {
-        log_reader.cancel();
+    // Bound the old run's tail capture before starting its replacement. The entry remains until
+    // acknowledgement so a late completion cannot alias a reused run ID; non-Unix readers still
+    // rely on EOF because their PTY reads are not cancellable.
+    for draining in &mut runtime.draining_log_readers {
+        draining.request_cancel();
     }
     runtime.mark_starting();
     runtime.run_config = Some(RunConfig::from(service));

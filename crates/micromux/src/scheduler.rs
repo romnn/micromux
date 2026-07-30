@@ -24,6 +24,9 @@ const RESTART_BACKOFF_BASE: Duration = Duration::from_millis(250);
 const RESTART_BACKOFF_MAX: Duration = Duration::from_secs(10);
 /// Minimum uptime after which a service is considered stable and its backoff is reset.
 const RESTART_BACKOFF_RESET: Duration = RESTART_BACKOFF_MAX;
+
+/// Grace period for tail output before cancellation of a finished run's PTY reader is requested.
+const POST_EXIT_DRAIN_GRACE: Duration = Duration::from_secs(5);
 const MAX_RETIRED_SERVICES: usize = 8;
 const IDEMPOTENCY_WINDOW: usize = 64;
 
@@ -163,11 +166,12 @@ pub(super) struct RunningService {
 }
 
 impl RunningService {
+    /// Requests process termination while keeping the PTY reader active.
+    ///
+    /// On Darwin, stopping the reader while terminal output remains queued can keep `wait` from
+    /// completing and leave the service unable to restart.
     fn cancel(&mut self) {
         self.terminate.cancel();
-        if let Some(log_reader) = &mut self.log_reader {
-            log_reader.cancel();
-        }
     }
 
     fn stable(&self) -> bool {
@@ -179,6 +183,32 @@ impl RunningService {
         let stable = self.stable();
         let log_reader = self.log_reader.take();
         (run_id, stable, log_reader)
+    }
+}
+
+/// Holds a reader for a finished run and reserves its ID until `LogReaderFinished` is handled.
+///
+/// Without the reservation, a late completion event could match the first run of a retired service
+/// that was evicted and recreated under the same ID.
+struct DrainingLogReader {
+    run_id: RunId,
+    handle: pty::LogReaderHandle,
+    cancel_at: Option<tokio::time::Instant>,
+}
+
+impl DrainingLogReader {
+    fn request_cancel(&mut self) {
+        if self.cancel_at.take().is_some() {
+            self.handle.cancel();
+        }
+    }
+
+    fn cancel_if_due(&mut self, now: tokio::time::Instant) -> bool {
+        if self.cancel_at.is_none_or(|cancel_at| cancel_at > now) {
+            return false;
+        }
+        self.request_cancel();
+        true
     }
 }
 
@@ -236,7 +266,7 @@ pub(super) struct ServiceRuntime {
     last_exit_code: Option<i32>,
     /// Fields that describe the most recent run rather than the current config.
     run_config: Option<RunConfig>,
-    draining_log_readers: Vec<(RunId, pty::LogReaderHandle)>,
+    draining_log_readers: Vec<DrainingLogReader>,
     retired: Option<RetiredReason>,
     retired_at_unix_ms: Option<u64>,
     expires_at: Option<tokio::time::Instant>,
@@ -440,17 +470,31 @@ impl ServiceRuntime {
         };
         let (finished_run_id, stable, log_reader) = running.finish();
         if let Some(log_reader) = log_reader {
-            self.draining_log_readers
-                .push((finished_run_id, log_reader));
+            self.draining_log_readers.push(DrainingLogReader {
+                run_id: finished_run_id,
+                handle: log_reader,
+                cancel_at: Some(tokio::time::Instant::now() + POST_EXIT_DRAIN_GRACE),
+            });
         }
         self.finish_run_state(policy, exit_code, Some(finished_run_id), stable);
     }
 
-    /// Drop the reader handle for a run whose `LogReaderFinished` event was just processed. The
-    /// reader can finish either before or after the run's `Exited` event: afterwards the handle
-    /// sits in `draining_log_readers`; beforehand it is still attached to the live run and must be
-    /// cleared here so `finish_current_run` does not park an already-finished reader in the
-    /// draining list, where nothing would ever remove it (its finish event has been consumed).
+    fn cancel_due_drains(&mut self, service_id: &ServiceID, now: tokio::time::Instant) {
+        for draining in &mut self.draining_log_readers {
+            if draining.cancel_if_due(now) {
+                tracing::debug!(
+                    %service_id,
+                    run_id = draining.run_id.get(),
+                    "capping post-exit log drain"
+                );
+            }
+        }
+    }
+
+    /// Releases a reader whether its completion arrives before or after process exit.
+    ///
+    /// If completion wins the race, clearing the live handle prevents `finish_current_run` from
+    /// parking a reader whose only completion event has already been consumed.
     fn finish_log_reader(&mut self, run_id: RunId) {
         if let Some(running) = &mut self.running
             && running.run_id == run_id
@@ -460,7 +504,7 @@ impl ServiceRuntime {
         if let Some(idx) = self
             .draining_log_readers
             .iter()
-            .position(|(draining_run_id, _)| *draining_run_id == run_id)
+            .position(|draining| draining.run_id == run_id)
         {
             self.draining_log_readers.remove(idx);
         }
@@ -1452,6 +1496,21 @@ impl SchedulerRuntime {
         !due.is_empty()
     }
 
+    fn next_drain_deadline(&self) -> Option<tokio::time::Instant> {
+        self.services
+            .values()
+            .flat_map(|runtime| runtime.draining_log_readers.iter())
+            .filter_map(|draining| draining.cancel_at)
+            .min()
+    }
+
+    fn cancel_due_drains(&mut self) {
+        let now = tokio::time::Instant::now();
+        for (service_id, runtime) in &mut self.services {
+            runtime.cancel_due_drains(service_id, now);
+        }
+    }
+
     fn next_expiry(&self) -> Option<tokio::time::Instant> {
         self.services
             .values()
@@ -2171,7 +2230,7 @@ impl SchedulerRuntime {
             && runtime
                 .draining_log_readers
                 .iter()
-                .any(|(run_id, _)| *run_id == event.run_id());
+                .any(|draining| draining.run_id == event.run_id());
         if current_run_id != Some(event.run_id()) && !log_reader_finished {
             tracing::debug!(
                 service_id,
@@ -2344,10 +2403,11 @@ pub(crate) async fn scheduler(input: SchedulerInput) -> Result<(), crate::graph:
     // Whenever an event comes in, try to (re)start any services whose deps are now healthy
     loop {
         tracing::debug!("waiting for scheduling event");
-        // Wake the loop when the nearest pending restart backoff expires; without this a
-        // backed-off service would never restart unless some unrelated event happened to arrive.
+        // Snapshot time-based work before selecting. Without explicit timer arms, restart
+        // backoffs, lease expiry, and capped reader drains would wait for an unrelated event.
         let next_backoff = rt.next_backoff();
         let next_expiry = rt.next_expiry();
+        let next_drain_deadline = rt.next_drain_deadline();
         let needs_schedule = tokio::select! {
             () = shutdown.cancelled() => {
                 tracing::debug!("exiting scheduler");
@@ -2377,6 +2437,15 @@ pub(crate) async fn scheduler(input: SchedulerInput) -> Result<(), crate::graph:
                     None => std::future::pending::<()>().await,
                 }
             } => rt.expire_due(&services),
+            () = async {
+                match next_drain_deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
+                rt.cancel_due_drains();
+                false
+            }
         };
 
         // Retirement can become evictable only after later process/log-reader events arrive, so

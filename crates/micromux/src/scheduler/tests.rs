@@ -533,7 +533,7 @@ fn project_snapshot_reports_active_restart_backoff() -> eyre::Result<()> {
     Ok(())
 }
 
-/// Start a fake run on `runtime` without spawning a process, for handle-bookkeeping tests.
+/// Builds a run with inert PTY handles so lifecycle tests do not need a child process.
 fn start_dummy_run(runtime: &mut ServiceRuntime) -> eyre::Result<RunId> {
     runtime.mark_starting();
     let run_id = runtime.allocate_run_id();
@@ -548,10 +548,38 @@ fn start_dummy_run(runtime: &mut ServiceRuntime) -> eyre::Result<RunId> {
     Ok(run_id)
 }
 
-/// `LogReaderFinished` and `Exited` race through the same events channel from two producers, so
-/// either order must leave no parked reader handle behind — a leaked handle holds a pipe fd, and
-/// with the reader-finishes-first order (the common one: PTY EOF races the child reap, and every
-/// manual restart/disable cancels the reader before the exit) it would accumulate one fd per run.
+// Cancelling an expired reader must retain its run ID until completion; otherwise eviction and
+// recreation could make its completion event alias a new run.
+#[tokio::test]
+async fn post_exit_drain_cap_keeps_run_reserved_until_reader_finishes() -> eyre::Result<()> {
+    let policy = crate::service::RestartPolicy::Never;
+    let service_id = "svc".to_string();
+    let mut runtime = ServiceRuntime::new(ServiceRuntimeInit {
+        restart_policy: &policy,
+        startup_mode: StartupMode::Enabled,
+    });
+
+    let run_id = start_dummy_run(&mut runtime)?;
+    runtime.finish_current_run(&policy, 0);
+    assert_eq!(runtime.draining_log_readers.len(), 1);
+
+    runtime.cancel_due_drains(&service_id, tokio::time::Instant::now());
+    assert!(runtime.draining_log_readers[0].cancel_at.is_some());
+
+    // The reservation outlives cancellation so retirement cannot reuse the run ID too early.
+    runtime.cancel_due_drains(
+        &service_id,
+        tokio::time::Instant::now() + POST_EXIT_DRAIN_GRACE,
+    );
+    assert_eq!(runtime.draining_log_readers.len(), 1);
+    assert!(runtime.draining_log_readers[0].cancel_at.is_none());
+
+    runtime.finish_log_reader(run_id);
+    assert!(runtime.draining_log_readers.is_empty());
+    Ok(())
+}
+
+// PTY completion and process exit come from different threads, so either can arrive first.
 #[tokio::test]
 async fn log_reader_finished_leaves_no_draining_handle_in_either_order() -> eyre::Result<()> {
     let policy = crate::service::RestartPolicy::Never;
@@ -2345,6 +2373,44 @@ async fn restart_restarts_service() -> eyre::Result<()> {
     assert!(saw_second_start);
     shutdown.cancel();
     handle.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn restart_reaps_service_while_pty_output_is_saturated() -> eyre::Result<()> {
+    let mut cfg = service_config("svc", ("sh", &["-c", "exec yes output"]));
+    cfg.log_retention = crate::LogRetention {
+        memory: crate::MemoryLogRetention {
+            max_lines: crate::LogLimit::bounded(64),
+            max_bytes: crate::LogLimit::bounded(64 * 1024),
+        },
+        disk: crate::DiskLogRetention { retained_runs: 0 },
+    };
+    let mut services = ServiceMap::new();
+    services.insert("svc".to_string(), Service::new("svc", Path::new("."), cfg)?);
+    let harness = spawn_harness(services, None);
+
+    // Continuous output keeps the terminal queue under pressure while termination waits for the
+    // child. The master reader must remain active until the process is reaped.
+    let restarted: eyre::Result<()> = async {
+        wait_until(&harness.reader, "svc", |snapshot| {
+            snapshot.run_generation == 1 && snapshot.execution == Execution::Running
+        })
+        .await?;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        accepted(harness.control.restart(&"svc".to_string()).await)?;
+        wait_until(&harness.reader, "svc", |snapshot| {
+            snapshot.run_generation >= 2 && snapshot.execution == Execution::Running
+        })
+        .await?;
+        Ok(())
+    }
+    .await;
+
+    // Shut down the producer before propagating any failure so the test cannot leak it.
+    harness.shutdown.cancel();
+    harness.handle.await??;
+    restarted?;
     Ok(())
 }
 

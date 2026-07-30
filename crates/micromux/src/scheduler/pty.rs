@@ -3,6 +3,7 @@ use crate::{health_check, model::RunSink, service::Service};
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::thread;
@@ -55,6 +56,11 @@ use std::os::fd::AsRawFd;
 const POLL_EVENTS: i16 = POLLIN | POLLHUP | POLLERR;
 
 const ALT_SCREEN_MAX_UPDATES_PER_SEC: u32 = 4;
+
+/// Delay before warning that termination escalation has not produced a reaped child.
+///
+/// The deadline is diagnostic only; it never substitutes for process-wait completion.
+const UNREAPED_WARN_AFTER_ESCALATION: Duration = Duration::from_secs(2);
 
 #[derive(Clone)]
 pub(super) struct PtyHandles {
@@ -478,13 +484,6 @@ impl RateLimit {
     }
 }
 
-enum PtyRead {
-    Bytes(usize),
-    Eof,
-    #[cfg(unix)]
-    Cancelled,
-}
-
 enum PtyOutputReader {
     #[cfg(unix)]
     Polling(PollingPtyReader),
@@ -515,15 +514,12 @@ impl PtyOutputReader {
         }
     }
 
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<PtyRead> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<Option<NonZeroUsize>> {
         match self {
             #[cfg(unix)]
             Self::Polling(reader) => reader.read(buf),
             #[cfg(not(unix))]
-            Self::Blocking(reader) => match reader.read(buf)? {
-                0 => Ok(PtyRead::Eof),
-                n => Ok(PtyRead::Bytes(n)),
-            },
+            Self::Blocking(reader) => Ok(NonZeroUsize::new(reader.read(buf)?)),
         }
     }
 }
@@ -649,7 +645,7 @@ impl PollingPtyReader {
         })
     }
 
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<PtyRead> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<Option<NonZeroUsize>> {
         loop {
             let mut fds = [
                 pollfd {
@@ -679,17 +675,17 @@ impl PollingPtyReader {
             let cancel_events = events.next().unwrap_or_default();
 
             if cancel_events & POLL_EVENTS != 0 {
-                return Ok(PtyRead::Cancelled);
+                return Ok(None);
             }
 
             if pty_events & POLL_EVENTS != 0 {
                 match self.reader.read(buf) {
-                    Ok(0) => return Ok(PtyRead::Eof),
-                    Ok(n) => return Ok(PtyRead::Bytes(n)),
+                    Ok(0) => return Ok(None),
+                    Ok(n) => return Ok(NonZeroUsize::new(n)),
                     Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
                     Err(err) if err.kind() == io::ErrorKind::WouldBlock => {}
                     Err(err) if err.raw_os_error() == Some(Errno::EIO as i32) => {
-                        return Ok(PtyRead::Eof);
+                        return Ok(None);
                     }
                     Err(err) => return Err(err),
                 }
@@ -751,6 +747,23 @@ struct LogReaderArgs {
     pty_size: Arc<AtomicU32>,
 }
 
+struct LogReaderFinishedGuard<'a> {
+    events_tx: &'a mpsc::Sender<ProcessEvent>,
+    service_id: &'a ServiceID,
+    run_id: RunId,
+}
+
+impl Drop for LogReaderFinishedGuard<'_> {
+    fn drop(&mut self) {
+        let _ = self
+            .events_tx
+            .blocking_send(ProcessEvent::LogReaderFinished {
+                service_id: self.service_id.clone(),
+                run_id: self.run_id,
+            });
+    }
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "the PTY reader thread owns the terminal emulator and rate-limit state in one loop"
@@ -793,17 +806,6 @@ fn spawn_log_reader_thread(args: LogReaderArgs) {
                     let _ = guard.flush();
                 }
             }
-        }
-
-        fn send_log_reader_finished(
-            events_tx: &mpsc::Sender<ProcessEvent>,
-            service_id: &ServiceID,
-            run_id: RunId,
-        ) {
-            let _ = events_tx.blocking_send(ProcessEvent::LogReaderFinished {
-                service_id: service_id.clone(),
-                run_id,
-            });
         }
 
         fn emit_snapshot(
@@ -959,6 +961,13 @@ fn spawn_log_reader_thread(args: LogReaderArgs) {
             pty_size,
         } = args;
 
+        // The scheduler reserves this run ID until acknowledgement, so every thread exit path must
+        // send one, including I/O errors and unwinding.
+        let _finished = LogReaderFinishedGuard {
+            events_tx: &events_tx,
+            service_id: &service_id,
+            run_id,
+        };
         #[cfg(test)]
         let _active_reader = ActiveLogReaderGuard::new(service_id.clone(), run_id);
 
@@ -1011,27 +1020,19 @@ fn spawn_log_reader_thread(args: LogReaderArgs) {
                 dirty = true;
             }
 
-            let read = reader.read(&mut buf)?;
-            let n = match read {
-                PtyRead::Bytes(n) => n,
-                PtyRead::Eof => {
-                    finish_stream(snapshot_mode, &term, &mut rate, &sink, &mut line);
-                    send_log_reader_finished(&events_tx, &service_id, run_id);
-                    break;
-                }
-                #[cfg(unix)]
-                PtyRead::Cancelled => {
-                    finish_stream(snapshot_mode, &term, &mut rate, &sink, &mut line);
-                    send_log_reader_finished(&events_tx, &service_id, run_id);
+            let n = match reader.read(&mut buf) {
+                Ok(Some(n)) => n.get(),
+                Ok(None) => break,
+                Err(err) => {
+                    tracing::warn!(
+                        ?err,
+                        %service_id,
+                        run_id = run_id.get(),
+                        "failed to read service pty"
+                    );
                     break;
                 }
             };
-
-            if n == 0 {
-                finish_stream(snapshot_mode, &term, &mut rate, &sink, &mut line);
-                send_log_reader_finished(&events_tx, &service_id, run_id);
-                break;
-            }
 
             let Some(chunk) = buf.get(..n) else {
                 continue;
@@ -1123,8 +1124,7 @@ fn spawn_log_reader_thread(args: LogReaderArgs) {
                 }
             }
         }
-
-        Ok::<_, std::io::Error>(())
+        finish_stream(snapshot_mode, &term, &mut rate, &sink, &mut line);
     });
 }
 
@@ -1142,7 +1142,7 @@ struct TerminationTaskArgs {
 
 struct TerminationStart {
     kill_deadline: Option<tokio::time::Instant>,
-    hard_killed: bool,
+    escalated: bool,
 }
 
 struct TerminationTarget {
@@ -1168,20 +1168,22 @@ impl TerminationTarget {
 
         #[cfg(unix)]
         {
-            let _ = self.signal(Signal::SIGTERM);
+            if !self.signal(Signal::SIGTERM) {
+                self.kill_with_backend();
+            }
             TerminationStart {
                 kill_deadline: Some(tokio::time::Instant::now() + Duration::from_millis(750)),
-                hard_killed: false,
+                escalated: false,
             }
         }
 
         #[cfg(not(unix))]
         {
             let _ = self.process_group_leader_id;
-            let _ = self.killer.kill();
+            self.kill_with_backend();
             TerminationStart {
                 kill_deadline: None,
-                hard_killed: true,
+                escalated: true,
             }
         }
     }
@@ -1190,27 +1192,52 @@ impl TerminationTarget {
         #[cfg(unix)]
         {
             if !self.signal(Signal::SIGKILL) {
-                let _ = self.killer.kill();
+                self.kill_with_backend();
             }
         }
 
         #[cfg(not(unix))]
         {
-            let _ = self.killer.kill();
+            self.kill_with_backend();
+        }
+    }
+
+    fn kill_with_backend(&mut self) {
+        if let Err(err) = self.killer.kill() {
+            #[cfg(unix)]
+            if err.raw_os_error() == Some(Errno::ESRCH as i32) {
+                tracing::debug!(pid = self.pid, "process exited before backend kill");
+                return;
+            }
+            tracing::warn!(?err, pid = self.pid, "failed to kill process");
         }
     }
 
     #[cfg(unix)]
     fn signal(&self, signal: Signal) -> bool {
         if let Some(pgid) = self.process_group_leader_id {
-            let _ = nix::sys::signal::killpg(Pid::from_raw(pgid), signal);
-            true
-        } else if let Some(pid) = self.pid.and_then(|pid| i32::try_from(pid).ok()) {
-            let _ = nix::sys::signal::kill(Pid::from_raw(pid), signal);
-            true
-        } else {
-            false
+            match nix::sys::signal::killpg(Pid::from_raw(pgid), signal) {
+                Ok(()) => return true,
+                Err(Errno::ESRCH) => {
+                    tracing::debug!(?signal, pgid, "process group exited before signal delivery");
+                }
+                Err(err) => {
+                    tracing::warn!(?err, ?signal, pgid, "failed to signal process group");
+                }
+            }
         }
+        if let Some(pid) = self.pid.and_then(|pid| i32::try_from(pid).ok()) {
+            match nix::sys::signal::kill(Pid::from_raw(pid), signal) {
+                Ok(()) => return true,
+                Err(Errno::ESRCH) => {
+                    tracing::debug!(?signal, pid, "process exited before signal delivery");
+                }
+                Err(err) => {
+                    tracing::warn!(?err, ?signal, pid, "failed to signal process");
+                }
+            }
+        }
+        false
     }
 }
 
@@ -1246,6 +1273,37 @@ impl Drop for SpawnedChildGuard {
     }
 }
 
+fn exit_code_from_wait(
+    result: Result<io::Result<portable_pty::ExitStatus>, tokio::task::JoinError>,
+    service_id: &ServiceID,
+    run_id: RunId,
+    pid: Option<u32>,
+) -> i32 {
+    match result {
+        Ok(Ok(status)) => i32::try_from(status.exit_code()).unwrap_or(i32::MAX),
+        Ok(Err(err)) => {
+            tracing::error!(
+                ?err,
+                ?pid,
+                %service_id,
+                run_id = run_id.get(),
+                "failed to wait for process"
+            );
+            -1
+        }
+        Err(err) => {
+            tracing::error!(
+                ?err,
+                ?pid,
+                %service_id,
+                run_id = run_id.get(),
+                "process wait task failed"
+            );
+            -1
+        }
+    }
+}
+
 fn spawn_termination_task(args: TerminationTaskArgs) {
     tokio::spawn(async move {
         let TerminationTaskArgs {
@@ -1265,46 +1323,41 @@ fn spawn_termination_task(args: TerminationTaskArgs) {
             pid,
             process_group_leader_id,
         };
-        // A blocking wait consumes one blocking-pool thread until the child is reaped. The
-        // termination guard escalates to SIGKILL, so runtime shutdown is only held up by a process
-        // the OS itself cannot reap.
+        // The blocking-pool thread remains occupied until the child wait completes. Forced
+        // termination may not unblock it if the OS is still tearing the process down.
         let mut wait_handle = tokio::task::spawn_blocking(move || child.wait());
         let mut termination_started = false;
-        let mut hard_killed = false;
+        let mut termination_escalated = false;
         let mut kill_deadline: Option<tokio::time::Instant> = None;
+        let mut unreaped_warn_deadline: Option<tokio::time::Instant> = None;
         loop {
             tokio::select! {
                 res = &mut wait_handle => {
-                    let code = match res {
-                        Ok(Ok(status)) => i32::try_from(status.exit_code()).unwrap_or(i32::MAX),
-                        Ok(Err(err)) => {
-                            tracing::error!(?err, "failed to wait for process");
-                            -1
-                        }
-                        Err(err) => {
-                            tracing::error!(?err, "process wait task failed");
-                            -1
-                        }
+                    let code = exit_code_from_wait(res, &service_id, run_id, pid);
+                    let event = ProcessEvent::Exited {
+                        service_id: service_id.clone(),
+                        run_id,
+                        exit_code: code,
                     };
-                    let _ = events_tx
-                        .send(ProcessEvent::Exited {
-                            service_id: service_id.clone(),
-                            run_id,
-                            exit_code: code,
-                        })
-                        .await;
+                    let _ = events_tx.send(event).await;
                     break;
                 }
                 () = shutdown.cancelled(), if !termination_started => {
                     let started = target.request(&events_tx, &service_id, run_id).await;
                     kill_deadline = started.kill_deadline;
-                    hard_killed = started.hard_killed;
+                    termination_escalated = started.escalated;
+                    unreaped_warn_deadline = started
+                        .escalated
+                        .then(|| tokio::time::Instant::now() + UNREAPED_WARN_AFTER_ESCALATION);
                     termination_started = true;
                 }
                 () = terminate.cancelled(), if !termination_started => {
                     let started = target.request(&events_tx, &service_id, run_id).await;
                     kill_deadline = started.kill_deadline;
-                    hard_killed = started.hard_killed;
+                    termination_escalated = started.escalated;
+                    unreaped_warn_deadline = started
+                        .escalated
+                        .then(|| tokio::time::Instant::now() + UNREAPED_WARN_AFTER_ESCALATION);
                     termination_started = true;
                 }
                 () = async {
@@ -1312,12 +1365,29 @@ fn spawn_termination_task(args: TerminationTaskArgs) {
                         Some(deadline) => tokio::time::sleep_until(deadline).await,
                         None => std::future::pending::<()>().await,
                     }
-                }, if termination_started && !hard_killed => {
-                    // Escalate to SIGKILL on the whole process group (mirroring the SIGTERM path),
-                    // not just the group leader. Otherwise a leader that ignored SIGTERM is killed
-                    // while its descendants survive and are orphaned once wait reaps the leader.
+                }, if termination_started && !termination_escalated => {
+                    // On Unix, target the process group when available so descendants cannot
+                    // survive the leader and keep its PTY open.
                     target.force_kill();
-                    hard_killed = true;
+                    termination_escalated = true;
+                    unreaped_warn_deadline =
+                        Some(tokio::time::Instant::now() + UNREAPED_WARN_AFTER_ESCALATION);
+                }
+                () = async {
+                    match unreaped_warn_deadline {
+                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                }, if unreaped_warn_deadline.is_some() => {
+                    // Escalation does not prove delivery or exit. Keep the run live until the wait
+                    // task completes so a replacement cannot overlap the old process.
+                    tracing::warn!(
+                        ?pid,
+                        %service_id,
+                        run_id = run_id.get(),
+                        "termination escalated but the process is still unreaped; waiting for its exit"
+                    );
+                    unreaped_warn_deadline = None;
                 }
             }
         }
@@ -1477,6 +1547,81 @@ pub(super) fn start_service_with_pty_size(
 mod tests {
     use super::*;
     use similar_asserts::assert_eq;
+
+    #[cfg(unix)]
+    #[derive(Clone, Debug)]
+    struct CountingKiller {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[cfg(unix)]
+    impl portable_pty::ChildKiller for CountingKiller {
+        fn kill(&mut self) -> io::Result<()> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+
+        fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
+            Box::new(self.clone())
+        }
+    }
+
+    #[cfg(unix)]
+    fn target_with_invalid_os_ids(calls: Arc<std::sync::atomic::AtomicUsize>) -> TerminationTarget {
+        TerminationTarget {
+            killer: Box::new(CountingKiller { calls }),
+            pid: Some(u32::MAX),
+            process_group_leader_id: Some(i32::MAX),
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_sigterm_uses_backend_without_skipping_escalation() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut target = target_with_invalid_os_ids(calls.clone());
+        let (events_tx, mut events_rx) = mpsc::channel(1);
+        let service_id = "svc".to_string();
+        let run_id = RunId::new(7);
+
+        let started = target.request(&events_tx, &service_id, run_id).await;
+
+        assert!(!started.escalated);
+        assert!(started.kill_deadline.is_some());
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        target.force_kill();
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        assert!(matches!(
+            events_rx.recv().await,
+            Some(ProcessEvent::Killed {
+                service_id: killed_service_id,
+                run_id: killed_run_id,
+            }) if killed_service_id == service_id && killed_run_id == run_id
+        ));
+    }
+
+    #[test]
+    fn log_reader_finished_guard_reports_completion_on_drop() {
+        let (events_tx, mut events_rx) = mpsc::channel(1);
+        let service_id = "svc".to_string();
+        let run_id = RunId::new(7);
+
+        {
+            let _finished = LogReaderFinishedGuard {
+                events_tx: &events_tx,
+                service_id: &service_id,
+                run_id,
+            };
+        }
+
+        assert!(matches!(
+            events_rx.blocking_recv(),
+            Some(ProcessEvent::LogReaderFinished {
+                service_id: finished_service_id,
+                run_id: finished_run_id,
+            }) if finished_service_id == service_id && finished_run_id == run_id
+        ));
+    }
 
     #[test]
     fn rate_limit_increments_id_on_alt_screen_transition() {
