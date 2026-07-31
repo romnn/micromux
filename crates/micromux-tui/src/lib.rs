@@ -43,9 +43,6 @@ fn format_byte_limit(bytes: usize) -> String {
 /// Errors from running or rendering the terminal interface.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    /// The terminal event task stopped before the application shut down.
-    #[error("terminal input event channel closed")]
-    InputClosed,
     /// The terminal backend failed.
     #[error(transparent)]
     Terminal(#[from] std::io::Error),
@@ -296,6 +293,11 @@ impl App {
                 kind,
                 bytes,
                 max_bytes,
+            }
+            | PtyInputPrepareError::ServiceBudgetExhausted {
+                kind,
+                bytes,
+                max_bytes,
             } => (kind, bytes, max_bytes),
         };
         let kind = kind.as_str();
@@ -306,6 +308,9 @@ impl App {
             ),
             PtyInputPrepareError::BudgetExhausted { .. } => {
                 format!("{kind} discarded: terminal input backlog is full")
+            }
+            PtyInputPrepareError::ServiceBudgetExhausted { .. } => {
+                format!("{kind} discarded: this service's input backlog is full")
             }
         });
         tracing::warn!(
@@ -389,7 +394,7 @@ impl App {
             let wake = tokio::select! {
                 () = self.shutdown.cancelled() => None,
                 input = self.input_event_handler.next() => {
-                    Some(Wake::Input(input.ok_or(Error::InputClosed)?))
+                    Some(Wake::Input(input))
                 },
                 change = self.changes.recv() => match change {
                     Ok(change) => Some(Wake::Change(change)),
@@ -1288,12 +1293,9 @@ mod tests {
         assert_eq!(app.pending_pty_input.len(), 2);
         assert!(app.input_notice.is_none());
 
-        for _ in 0..6 {
-            app.enqueue_pty_paste("svc", &paste);
-        }
-        assert_eq!(app.pending_pty_input.len(), 8);
         app.enqueue_pty_paste("svc", &paste);
 
+        assert_eq!(app.pending_pty_input.len(), 2);
         assert!(
             app.input_notice
                 .as_deref()

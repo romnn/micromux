@@ -1,59 +1,99 @@
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
+use parking_lot::Mutex;
 use tokio::sync::mpsc;
 
 use super::{Command, MAX_PTY_INPUT_BATCH_BYTES, MAX_PTY_PASTE_BYTES, ServiceID};
 
 /// Maximum PTY input retained across every queue and active write in one session.
 const PTY_INPUT_GLOBAL_MAX_BYTES: usize = 8 * MAX_PTY_PASTE_BYTES;
+/// Maximum PTY input one service may retain within the session-wide budget.
+const PTY_INPUT_PER_SERVICE_MAX_BYTES: usize = 2 * MAX_PTY_PASTE_BYTES;
 /// Maximum prepared inputs waiting for the scheduler, independent of their byte reservations.
 const PTY_INPUT_CHANNEL_CAPACITY: usize = 64;
 
+#[derive(Debug, Default)]
+struct InputBudgetState {
+    used: usize,
+    per_service: HashMap<Arc<str>, usize>,
+}
+
 #[derive(Debug)]
 pub(super) struct InputBudget {
-    used: AtomicUsize,
+    state: Mutex<InputBudgetState>,
     max_bytes: usize,
+    per_service_max_bytes: usize,
 }
 
 impl InputBudget {
     fn shared() -> Arc<Self> {
-        Self::shared_with_limit(PTY_INPUT_GLOBAL_MAX_BYTES)
+        Self::shared_with_limits(PTY_INPUT_GLOBAL_MAX_BYTES, PTY_INPUT_PER_SERVICE_MAX_BYTES)
     }
 
+    #[cfg(test)]
     pub(super) fn shared_with_limit(max_bytes: usize) -> Arc<Self> {
+        Self::shared_with_limits(max_bytes, max_bytes)
+    }
+
+    fn shared_with_limits(max_bytes: usize, per_service_max_bytes: usize) -> Arc<Self> {
         Arc::new(Self {
-            used: AtomicUsize::new(0),
+            state: Mutex::new(InputBudgetState::default()),
             max_bytes,
+            per_service_max_bytes,
         })
     }
 
-    fn try_reserve(self: &Arc<Self>, bytes: usize) -> Option<InputPermit> {
-        let mut used = self.used.load(Ordering::Relaxed);
-        loop {
-            let next = used.checked_add(bytes)?;
-            if next > self.max_bytes {
-                return None;
-            }
-            match self
-                .used
-                .compare_exchange_weak(used, next, Ordering::AcqRel, Ordering::Relaxed)
-            {
-                Ok(_) => {
-                    return Some(InputPermit {
-                        budget: Arc::clone(self),
-                        bytes,
-                    });
-                }
-                Err(observed) => used = observed,
-            }
+    fn try_reserve(
+        self: &Arc<Self>,
+        service_id: Arc<str>,
+        bytes: usize,
+    ) -> Result<InputPermit, InputBudgetExhausted> {
+        let mut state = self.state.lock();
+        let next_global = state
+            .used
+            .checked_add(bytes)
+            .ok_or(InputBudgetExhausted::Global)?;
+        if next_global > self.max_bytes {
+            return Err(InputBudgetExhausted::Global);
         }
+        let service_used = state
+            .per_service
+            .get(service_id.as_ref())
+            .copied()
+            .unwrap_or(0);
+        let next_service = service_used
+            .checked_add(bytes)
+            .ok_or(InputBudgetExhausted::Service)?;
+        if next_service > self.per_service_max_bytes {
+            return Err(InputBudgetExhausted::Service);
+        }
+
+        state.used = next_global;
+        if bytes > 0 {
+            state
+                .per_service
+                .insert(Arc::clone(&service_id), next_service);
+        }
+        drop(state);
+        Ok(InputPermit {
+            budget: Arc::clone(self),
+            service_id,
+            bytes,
+        })
     }
+}
+
+#[derive(Clone, Copy)]
+enum InputBudgetExhausted {
+    Global,
+    Service,
 }
 
 #[derive(Debug)]
 pub(super) struct InputPermit {
     budget: Arc<InputBudget>,
+    service_id: Arc<str>,
     bytes: usize,
 }
 
@@ -67,7 +107,27 @@ impl InputPermit {
 
 impl Drop for InputPermit {
     fn drop(&mut self) {
-        self.budget.used.fetch_sub(self.bytes, Ordering::AcqRel);
+        if self.bytes == 0 {
+            return;
+        }
+
+        let mut state = self.budget.state.lock();
+        debug_assert!(state.used >= self.bytes);
+        state.used = state.used.saturating_sub(self.bytes);
+        debug_assert!(
+            state.per_service.contains_key(self.service_id.as_ref()),
+            "input reservation lost its per-service accounting"
+        );
+        let std::collections::hash_map::Entry::Occupied(mut service) =
+            state.per_service.entry(Arc::clone(&self.service_id))
+        else {
+            return;
+        };
+        debug_assert!(*service.get() >= self.bytes);
+        *service.get_mut() = service.get().saturating_sub(self.bytes);
+        if *service.get() == 0 {
+            service.remove();
+        }
     }
 }
 
@@ -98,13 +158,13 @@ impl PtyInputKind {
     }
 }
 
-/// PTY input that already owns space in the session-wide byte budget.
+/// PTY input that already owns space in the session-wide and per-service byte budgets.
 ///
 /// The reservation follows the payload from the TUI backlog through the scheduler and into the
 /// per-run writer queue. Dropping this value at any point releases the space.
 #[derive(Debug)]
 pub struct PreparedPtyInput {
-    service_id: ServiceID,
+    service_id: Arc<str>,
     data: Vec<u8>,
     kind: PtyInputKind,
     permit: InputPermit,
@@ -126,12 +186,23 @@ impl PreparedPtyInput {
                 max_bytes,
             });
         }
-        let Some(permit) = budget.try_reserve(bytes) else {
-            return Err(PtyInputPrepareError::BudgetExhausted {
-                kind,
-                bytes,
-                max_bytes: budget.max_bytes,
-            });
+        let service_id = Arc::<str>::from(service_id);
+        let permit = match budget.try_reserve(Arc::clone(&service_id), bytes) {
+            Ok(permit) => permit,
+            Err(InputBudgetExhausted::Global) => {
+                return Err(PtyInputPrepareError::BudgetExhausted {
+                    kind,
+                    bytes,
+                    max_bytes: budget.max_bytes,
+                });
+            }
+            Err(InputBudgetExhausted::Service) => {
+                return Err(PtyInputPrepareError::ServiceBudgetExhausted {
+                    kind,
+                    bytes,
+                    max_bytes: budget.per_service_max_bytes,
+                });
+            }
         };
         Ok(Self {
             service_id,
@@ -221,6 +292,18 @@ pub enum PtyInputPrepareError {
         /// Session-wide limit.
         max_bytes: usize,
     },
+    /// This service's retained-input share has no room for the complete payload.
+    #[error(
+        "{kind:?} payload is {bytes} bytes, but the {max_bytes}-byte per-service input budget is full"
+    )]
+    ServiceBudgetExhausted {
+        /// Input kind being prepared.
+        kind: PtyInputKind,
+        /// Payload size.
+        bytes: usize,
+        /// Per-service limit.
+        max_bytes: usize,
+    },
 }
 
 /// Failure to enqueue prepared PTY input.
@@ -239,9 +322,9 @@ pub enum PtyInputSendError {
 
 /// Trusted terminal capability for bounded PTY input and resize requests.
 ///
-/// Clones share one byte budget. Preparing input reserves its bytes before it can enter any
-/// application or scheduler queue, so the limit covers the complete path through the active PTY
-/// write.
+/// Clones share global and per-service byte budgets. Preparing input reserves its bytes before it
+/// can enter any application or scheduler queue, so both limits cover the complete path through
+/// the active PTY write.
 #[derive(Clone)]
 pub struct TerminalControl {
     commands: mpsc::Sender<Command>,
@@ -285,7 +368,7 @@ impl TerminalControl {
     ///
     /// # Errors
     ///
-    /// Returns [`PtyInputPrepareError`] when the batch or session-wide retained-input budget would
+    /// Returns [`PtyInputPrepareError`] when the batch, session-wide budget, or service share would
     /// be exceeded.
     pub fn prepare_input(
         &self,
@@ -299,7 +382,7 @@ impl TerminalControl {
     ///
     /// # Errors
     ///
-    /// Returns [`PtyInputPrepareError`] when the paste or session-wide retained-input budget would
+    /// Returns [`PtyInputPrepareError`] when the paste, session-wide budget, or service share would
     /// be exceeded.
     pub fn prepare_paste(
         &self,
@@ -309,7 +392,7 @@ impl TerminalControl {
         PreparedPtyInput::prepare(&self.budget, service_id, data, PtyInputKind::Paste)
     }
 
-    /// Enqueue input that already owns its global byte reservation.
+    /// Enqueue input that already owns its global and per-service byte reservations.
     ///
     /// # Errors
     ///
@@ -404,6 +487,51 @@ mod tests {
         first.try_send(prepared)?;
         assert_eq!(first_input.try_recv()?.data(), b"a");
         assert_eq!(second_input.try_recv()?.data(), b"b");
+        Ok(())
+    }
+
+    #[test]
+    fn one_service_cannot_exhaust_the_session_input_budget() -> eyre::Result<()> {
+        let budget = InputBudget::shared_with_limits(6, 4);
+        let first = PreparedPtyInput::prepare(
+            &budget,
+            "first".to_string(),
+            b"abcd".to_vec(),
+            PtyInputKind::Input,
+        )?;
+
+        assert_matches!(
+            PreparedPtyInput::prepare(
+                &budget,
+                "first".to_string(),
+                vec![b'e'],
+                PtyInputKind::Input,
+            ),
+            Err(PtyInputPrepareError::ServiceBudgetExhausted { .. })
+        );
+        let second = PreparedPtyInput::prepare(
+            &budget,
+            "second".to_string(),
+            b"ef".to_vec(),
+            PtyInputKind::Input,
+        )?;
+        assert_matches!(
+            PreparedPtyInput::prepare(
+                &budget,
+                "third".to_string(),
+                vec![b'g'],
+                PtyInputKind::Input,
+            ),
+            Err(PtyInputPrepareError::BudgetExhausted { .. })
+        );
+
+        drop((first, second));
+        PreparedPtyInput::prepare(
+            &budget,
+            "first".to_string(),
+            b"abcd".to_vec(),
+            PtyInputKind::Input,
+        )?;
         Ok(())
     }
 }

@@ -69,7 +69,8 @@ impl SubscriptionPolicy {
             keepalive_interval: IDLE_TIMEOUT,
             // Older peers already understand `Events` and treat a session-wide event as a no-op.
             // Reusing it here probes the write side without making them interpret `Heartbeat` as an
-            // unknown change and resynchronize the whole roster.
+            // unknown change and resynchronize the whole roster. The trade-off is one harmless
+            // session-wide event lookup per idle interval on older clients.
             keepalive_kind: ChangeKind::Events,
             inbound_frame_window: UNSOLICITED_SUBSCRIPTION_FRAME_WINDOW,
         }

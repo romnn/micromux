@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// Bump the minor for additive changes (new optional/defaulted fields, new tools that reuse
 /// existing requests), and bump the major for incompatible request/response semantics.
-pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(3, 8);
+pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(3, 9);
 
 pub(crate) const fn supports_versioned_subscriptions(version: ProtocolVersion) -> bool {
     version.major() == PROTOCOL_VERSION.major() && version.minor() >= 7
@@ -276,9 +276,12 @@ pub struct SessionCapabilities {
 /// Current capacity, occupancy, and timeout history of the disk-log read pool.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, JsonSchema)]
 pub struct DiskLogReadHealth {
-    /// Whether the worker pool started successfully.
+    /// Whether the pool has started its workers.
+    #[serde(default = "default_initialized_disk_log_pool")]
+    pub initialized: bool,
+    /// Whether the pool can initialize or has an unoccupied worker.
     pub available: bool,
-    /// Worker threads owned by the pool.
+    /// Worker slots configured for the pool.
     pub workers: usize,
     /// Worker threads currently executing a filesystem read.
     pub active: usize,
@@ -286,9 +289,17 @@ pub struct DiskLogReadHealth {
     pub queue_capacity: usize,
     /// Reads currently waiting for a worker.
     pub queued: usize,
+    /// Reads whose callers timed out or disconnected while the filesystem call remained blocked.
+    #[serde(default)]
+    pub abandoned: usize,
     /// Requests that have exceeded the read deadline since this session started.
     #[serde(default)]
     pub timed_out_requests: usize,
+}
+
+const fn default_initialized_disk_log_pool() -> bool {
+    // Protocol 3.8 created the pool while building `Describe`, before this field existed.
+    true
 }
 
 /// Dynamic-service limits and current usage advertised by a session.
@@ -469,14 +480,14 @@ mod tests {
     fn protocol_version_uses_major_minor_shape_and_accepts_same_major() {
         assert_eq!(
             serde_json::to_value(PROTOCOL_VERSION).unwrap(),
-            json!({ "major": 3, "minor": 8 })
+            json!({ "major": 3, "minor": 9 })
         );
         assert_eq!(
             serde_json::from_value::<ProtocolVersion>(json!({ "major": 1, "minor": 0 })).unwrap(),
             ProtocolVersion::new(1, 0)
         );
 
-        assert!(PROTOCOL_VERSION.is_compatible_with(ProtocolVersion::new(3, 9)));
+        assert!(PROTOCOL_VERSION.is_compatible_with(ProtocolVersion::new(3, 10)));
         assert!(!PROTOCOL_VERSION.is_compatible_with(ProtocolVersion::new(2, 9)));
         assert!(!supports_versioned_subscriptions(ProtocolVersion::new(
             3, 6
@@ -540,6 +551,8 @@ mod tests {
         }))
         .unwrap();
 
+        assert!(health.initialized);
+        assert_eq!(health.abandoned, 0);
         assert_eq!(health.timed_out_requests, 0);
     }
 
@@ -683,7 +696,7 @@ mod tests {
     fn protocol_version_ignores_additive_fields() {
         let version = serde_json::from_value::<ProtocolVersion>(json!({
             "major": 3,
-            "minor": 8,
+            "minor": 9,
             "future_capability": true
         }))
         .unwrap();

@@ -63,3 +63,7 @@ Reconciliation **adds** newly-defined services, **retires** removed ones, and **
 
 > [!NOTE]
 > Over MCP the same flow is `reconcile_config` — run it with `dry_run=true` first, then apply. For a config that has no running session, `validate_config` checks a candidate file without starting anything.
+
+## Protocol compatibility
+
+Protocol 3 peers accept additive fields from newer minor revisions. Revision 3.8 changed transient disk-log rotation and reader saturation failures from `LimitExceeded` to the retryable `Busy` code. Revision 3.9 distinguishes an uninitialized disk-reader pool and reports reads that still occupy workers after their callers leave.

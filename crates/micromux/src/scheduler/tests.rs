@@ -437,6 +437,30 @@ fn effective_lifetime_clamps_requests_to_the_policy_cap() {
 }
 
 #[test]
+fn input_drop_throttle_reports_once_per_interval_with_a_count() {
+    let mut throttle = InputDropThrottle::default();
+    let started = tokio::time::Instant::now();
+
+    assert!(throttle.record(started));
+    assert!(!throttle.record(started));
+    assert!(!throttle.record(started));
+    assert_eq!(
+        throttle.take_due(started + INPUT_DROP_REPORT_INTERVAL),
+        Some(2)
+    );
+    assert!(!throttle.record(started + INPUT_DROP_REPORT_INTERVAL));
+    assert_eq!(
+        throttle.take_due(started + 2 * INPUT_DROP_REPORT_INTERVAL),
+        Some(1)
+    );
+    assert_eq!(
+        throttle.take_due(started + 3 * INPUT_DROP_REPORT_INTERVAL),
+        None
+    );
+    assert!(throttle.record(started + 3 * INPUT_DROP_REPORT_INTERVAL));
+}
+
+#[test]
 fn project_execution_maps_the_desired_execution_table() {
     assert_eq!(
         project_execution(false, &State::Pending, false, false),

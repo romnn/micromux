@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, mpsc};
 use std::time::Duration;
 
@@ -15,14 +15,16 @@ struct Job {
     read: Read,
     response: tokio::sync::oneshot::Sender<Response>,
     queue_permit: QueuePermit,
+    state: Arc<JobState>,
 }
 
 /// Keeps uncancellable filesystem reads off Tokio workers while bounding blocked threads and queued
 /// work after clients time out.
 ///
-/// Workers whose clients time out are not replaced: the underlying filesystem call cannot be
-/// cancelled, so replacement would turn a stalled mount into an unbounded thread leak. Saturation
-/// instead returns the active and queued counts to the caller and emits them through tracing.
+/// Workers still executing after their callers leave are not replaced: the underlying filesystem
+/// call cannot be cancelled, so replacement would turn a stalled mount into an unbounded thread
+/// leak. Saturation instead returns the pool's health counters to the caller and emits them through
+/// tracing.
 struct BlockingLogReadPool {
     jobs: mpsc::SyncSender<Job>,
     health: Arc<PoolHealth>,
@@ -35,7 +37,60 @@ struct BlockingLogReadPool {
 struct PoolHealth {
     active: AtomicUsize,
     queued: AtomicUsize,
+    abandoned: AtomicUsize,
     timed_out_requests: AtomicUsize,
+}
+
+const JOB_QUEUED: u8 = 0;
+const JOB_ACTIVE: u8 = 1;
+const JOB_ABANDONED: u8 = 2;
+const JOB_COMPLETE: u8 = 3;
+const JOB_CANCELED: u8 = 4;
+
+struct JobState {
+    state: AtomicU8,
+    health: Arc<PoolHealth>,
+}
+
+impl JobState {
+    fn new(health: Arc<PoolHealth>) -> Self {
+        Self {
+            state: AtomicU8::new(JOB_QUEUED),
+            health,
+        }
+    }
+
+    fn caller_left(&self) {
+        loop {
+            let state = self.state.load(Ordering::Acquire);
+            let next = match state {
+                JOB_QUEUED => JOB_CANCELED,
+                JOB_ACTIVE => JOB_ABANDONED,
+                _ => return,
+            };
+            if self
+                .state
+                .compare_exchange(state, next, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                if next == JOB_ABANDONED {
+                    self.health.abandoned.fetch_add(1, Ordering::Relaxed);
+                }
+                return;
+            }
+        }
+    }
+}
+
+/// Records queued cancellation or an in-flight abandoned read when its request future ends.
+struct RequestGuard {
+    state: Arc<JobState>,
+}
+
+impl Drop for RequestGuard {
+    fn drop(&mut self) {
+        self.state.caller_left();
+    }
 }
 
 struct QueuePermit {
@@ -82,10 +137,15 @@ impl BlockingLogReadPool {
         let Some(queue_permit) = self.reserve_queue_slot() else {
             return self.saturated_response();
         };
+        let state = Arc::new(JobState::new(Arc::clone(&self.health)));
+        let _request = RequestGuard {
+            state: Arc::clone(&state),
+        };
         match self.jobs.try_send(Job {
             read: Box::new(read),
             response,
             queue_permit,
+            state,
         }) {
             Ok(()) => {}
             Err(mpsc::TrySendError::Full(_)) => return self.saturated_response(),
@@ -131,6 +191,7 @@ impl BlockingLogReadPool {
         tracing::warn!(
             active = health.active,
             queued = health.queued,
+            abandoned = health.abandoned,
             timed_out_requests = health.timed_out_requests,
             workers = health.workers,
             queue_capacity = health.queue_capacity,
@@ -140,19 +201,27 @@ impl BlockingLogReadPool {
             ErrorCode::Busy,
             format!(
                 "the disk log reader is busy ({}/{} workers active, {}/{} jobs queued); retry the \
-                 request",
-                health.active, health.workers, health.queued, health.queue_capacity
+                 request ({} abandoned reads still running)",
+                health.active,
+                health.workers,
+                health.queued,
+                health.queue_capacity,
+                health.abandoned
             ),
         )
     }
 
     fn health(&self) -> DiskLogReadHealth {
+        let active = self.health.active.load(Ordering::Relaxed);
+        let abandoned = self.health.abandoned.load(Ordering::Relaxed);
         DiskLogReadHealth {
-            available: true,
+            initialized: true,
+            available: active.max(abandoned) < self.worker_count,
             workers: self.worker_count,
-            active: self.health.active.load(Ordering::Relaxed),
+            active,
             queue_capacity: self.queue_capacity,
             queued: self.health.queued.load(Ordering::Relaxed),
+            abandoned,
             timed_out_requests: self.health.timed_out_requests.load(Ordering::Relaxed),
         }
     }
@@ -171,9 +240,14 @@ fn worker(receiver: &Mutex<mpsc::Receiver<Job>>, health: &PoolHealth) {
             read,
             response,
             queue_permit,
+            state,
         } = job;
         drop(queue_permit);
-        if response.is_closed() {
+        if state
+            .state
+            .compare_exchange(JOB_QUEUED, JOB_ACTIVE, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
             continue;
         }
         health.active.fetch_add(1, Ordering::Relaxed);
@@ -181,17 +255,82 @@ fn worker(receiver: &Mutex<mpsc::Receiver<Job>>, health: &PoolHealth) {
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(read)).unwrap_or_else(|_| {
                 Response::error(ErrorCode::Internal, "the disk log reader panicked")
             });
+        let previous = state.state.swap(JOB_COMPLETE, Ordering::AcqRel);
         health.active.fetch_sub(1, Ordering::Relaxed);
+        if previous == JOB_ABANDONED {
+            health.abandoned.fetch_sub(1, Ordering::Relaxed);
+        }
         let _ = response.send(result);
     }
 }
 
-static DISK_LOG_READS: LazyLock<Result<BlockingLogReadPool, String>> = LazyLock::new(|| {
-    BlockingLogReadPool::new(WORKER_COUNT, QUEUE_CAPACITY).map_err(|err| err.to_string())
-});
+#[derive(Default)]
+struct PoolRegistry {
+    state: Mutex<PoolRegistryState>,
+}
+
+#[derive(Default)]
+struct PoolRegistryState {
+    pool: Option<Arc<BlockingLogReadPool>>,
+    last_start_failed: bool,
+}
+
+impl PoolRegistry {
+    fn get_or_start(&self) -> Result<Arc<BlockingLogReadPool>, String> {
+        self.get_or_start_with(|| BlockingLogReadPool::new(WORKER_COUNT, QUEUE_CAPACITY))
+    }
+
+    fn get_or_start_with(
+        &self,
+        start: impl FnOnce() -> std::io::Result<BlockingLogReadPool>,
+    ) -> Result<Arc<BlockingLogReadPool>, String> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(pool) = &state.pool {
+            return Ok(Arc::clone(pool));
+        }
+
+        match start() {
+            Ok(pool) => {
+                let pool = Arc::new(pool);
+                state.pool = Some(Arc::clone(&pool));
+                state.last_start_failed = false;
+                Ok(pool)
+            }
+            Err(err) => {
+                state.last_start_failed = true;
+                Err(err.to_string())
+            }
+        }
+    }
+
+    fn health(&self, worker_count: usize, queue_capacity: usize) -> DiskLogReadHealth {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.pool.as_ref().map_or_else(
+            || DiskLogReadHealth {
+                initialized: false,
+                available: !state.last_start_failed,
+                workers: worker_count,
+                active: 0,
+                queue_capacity,
+                queued: 0,
+                abandoned: 0,
+                timed_out_requests: 0,
+            },
+            |pool| pool.health(),
+        )
+    }
+}
+
+static DISK_LOG_READS: LazyLock<PoolRegistry> = LazyLock::new(PoolRegistry::default);
 
 pub(super) async fn run(read: impl FnOnce() -> Response + Send + 'static) -> Response {
-    match &*DISK_LOG_READS {
+    match DISK_LOG_READS.get_or_start() {
         Ok(pool) => pool.run(read).await,
         Err(err) => Response::error(
             ErrorCode::Internal,
@@ -201,10 +340,7 @@ pub(super) async fn run(read: impl FnOnce() -> Response + Send + 'static) -> Res
 }
 
 pub(super) fn health() -> DiskLogReadHealth {
-    match &*DISK_LOG_READS {
-        Ok(pool) => pool.health(),
-        Err(_) => DiskLogReadHealth::default(),
-    }
+    DISK_LOG_READS.health(WORKER_COUNT, QUEUE_CAPACITY)
 }
 
 #[cfg(test)]
@@ -373,8 +509,54 @@ mod tests {
         let health = pool.health();
         assert_eq!(health.active, 1);
         assert_eq!(health.workers, 1);
+        assert_eq!(health.abandoned, 1);
         assert_eq!(health.timed_out_requests, 1);
+        assert!(!health.available);
         release.send(())?;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while pool.health().active != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        assert_eq!(pool.health().abandoned, 0);
+        assert!(pool.health().available);
+        Ok(())
+    }
+
+    #[test]
+    fn pool_start_failure_is_retryable_and_health_does_not_start_workers() -> eyre::Result<()> {
+        let registry = PoolRegistry::default();
+
+        let health = registry.health(1, 1);
+        assert!(!health.initialized);
+        assert!(health.available);
+        assert_eq!(health.workers, 1);
+        let Err(message) =
+            registry.get_or_start_with(|| Err(std::io::Error::other("injected spawn failure")))
+        else {
+            eyre::bail!("injected pool startup failure unexpectedly succeeded");
+        };
+        assert!(message.contains("injected spawn failure"));
+        let failed = registry.health(1, 1);
+        assert!(!failed.initialized);
+        assert!(!failed.available);
+        assert_eq!(failed.workers, 1);
+
+        let pool = registry
+            .get_or_start_with(|| BlockingLogReadPool::new(1, 1))
+            .map_err(eyre::Report::msg)?;
+        assert!(Arc::ptr_eq(
+            &pool,
+            &registry
+                .get_or_start_with(|| {
+                    Err(std::io::Error::other("initializer must not run twice"))
+                })
+                .map_err(eyre::Report::msg)?
+        ));
+        let health = registry.health(1, 1);
+        assert!(health.initialized);
+        assert!(health.available);
         Ok(())
     }
 }

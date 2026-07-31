@@ -39,10 +39,11 @@ impl std::fmt::Display for Input {
 /// Terminal event handler.
 #[derive(Debug)]
 pub struct InputHandler {
-    /// Event sender channel.
-    sender: Option<mpsc::Sender<Input>>,
+    /// Retained sender that keeps terminal EOF from looking like application shutdown.
+    sender: mpsc::Sender<Input>,
     /// Event receiver channel.
     receiver: mpsc::Receiver<Input>,
+    started: bool,
 }
 
 impl InputHandler {
@@ -54,21 +55,28 @@ impl InputHandler {
     pub fn new() -> Self {
         let (sender, receiver) = mpsc::channel(INPUT_QUEUE_CAPACITY);
         Self {
-            sender: Some(sender),
+            sender,
             receiver,
+            started: false,
         }
     }
 
-    /// Receives an event from the sender.
+    /// Receives the next terminal event.
     ///
-    /// This function blocks until an event is received.
-    ///
-    pub async fn next(&mut self) -> Option<Input> {
-        if let Some(sender) = self.sender.take() {
-            let actor = EventTask::new(sender);
+    /// The call remains pending after terminal EOF so losing stdin does not end the supervised
+    /// session.
+    pub async fn next(&mut self) -> Input {
+        if !self.started {
+            self.started = true;
+            let actor = EventTask::new(self.sender.clone());
             tokio::spawn(async move { actor.run().await });
         }
-        self.receiver.recv().await
+        match self.receiver.recv().await {
+            Some(input) => input,
+            // `self.sender` stays alive for this handler's lifetime. Keep the API robust if that
+            // invariant changes instead of turning input EOF into session shutdown.
+            None => std::future::pending().await,
+        }
     }
 
     /// Returns one already-buffered event without waiting.
@@ -91,7 +99,11 @@ impl EventTask {
 
     /// Runs the event task, forwarding crossterm events until the receiver is dropped.
     async fn run(self) {
-        let mut reader = crossterm::event::EventStream::new();
+        self.run_stream(crossterm::event::EventStream::new()).await;
+    }
+
+    async fn run_stream<E>(self, reader: impl futures::Stream<Item = Result<CrosstermEvent, E>>) {
+        tokio::pin!(reader);
         loop {
             tokio::select! {
               () = self.sender.closed() => break,
@@ -149,6 +161,24 @@ mod tests {
         assert_eq!(
             receiver.recv().await,
             Some(Input::Event(CrosstermEvent::FocusLost))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn terminal_eof_leaves_input_dormant() -> eyre::Result<()> {
+        let mut handler = InputHandler::new();
+        handler.started = true;
+        EventTask::new(handler.sender.clone())
+            .run_stream(futures::stream::empty::<
+                Result<CrosstermEvent, std::io::Error>,
+            >())
+            .await;
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), handler.next())
+                .await
+                .is_err()
         );
         Ok(())
     }

@@ -1,7 +1,4 @@
-use super::{
-    LogUpdateKind, OutputStream, ProcessEvent, RunId, ServiceID,
-    input::{InputPermit, PreparedPtyInput, PtyInputKind},
-};
+use super::{LogUpdateKind, OutputStream, ProcessEvent, RunId, ServiceID, input::PreparedPtyInput};
 use crate::{health_check, model::RunSink, service::Service};
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -75,10 +72,10 @@ fn bounded_line_split(line: &[u8]) -> usize {
     if split == 0 { limit } else { split }
 }
 
-/// Maximum time a single input batch may wait for slave-side backpressure to clear.
+/// Maximum time PTY input may make no write progress.
 ///
-/// The bound lets active readers drain transient backpressure without allowing one batch to occupy
-/// the writer worker indefinitely.
+/// Each successful write restarts the interval, so a slow reader may consume a large paste without
+/// letting a fully stalled reader occupy the writer worker indefinitely.
 #[cfg(unix)]
 const PTY_INPUT_WRITE_TIMEOUT: Duration = Duration::from_millis(500);
 
@@ -240,6 +237,8 @@ pub(super) enum PtyInputDrop {
 
 struct PtyWriter {
     service_id: ServiceID,
+    run_id: RunId,
+    events_tx: mpsc::Sender<ProcessEvent>,
     writer: Box<dyn Write + Send>,
     cancellation: PtyCancellation,
     #[cfg(unix)]
@@ -252,11 +251,7 @@ struct PtyWriter {
 
 #[derive(Debug)]
 enum PtyWrite {
-    Input {
-        kind: PtyInputKind,
-        data: Vec<u8>,
-        permit: InputPermit,
-    },
+    Input(PreparedPtyInput),
     TerminalResponse(Vec<u8>),
 }
 
@@ -302,6 +297,8 @@ impl PtyHandles {
     )]
     fn new(
         service_id: ServiceID,
+        run_id: RunId,
+        events_tx: mpsc::Sender<ProcessEvent>,
         master: Box<dyn portable_pty::MasterPty + Send>,
         writer: Box<dyn Write + Send>,
         size: Arc<AtomicU32>,
@@ -323,6 +320,8 @@ impl PtyHandles {
         spawn_pty_writer_thread(
             PtyWriter {
                 service_id,
+                run_id,
+                events_tx,
                 writer,
                 cancellation: writer_cancellation.clone(),
                 #[cfg(unix)]
@@ -351,13 +350,11 @@ impl PtyHandles {
     }
 
     pub(super) fn write_input(&self, input: PreparedPtyInput) -> Result<(), PtyInputDrop> {
-        let (data, kind, permit) = input.into_parts();
-        let input = PtyWrite::Input { kind, data, permit };
         let write_queue = self.write_queue.lock();
         let Some(write_queue) = write_queue.as_ref() else {
             return Err(PtyInputDrop::WriterStopped);
         };
-        match write_queue.try_send(input) {
+        match write_queue.try_send(PtyWrite::Input(input)) {
             Ok(()) => Ok(()),
             Err(std_mpsc::TrySendError::Disconnected(_)) => Err(PtyInputDrop::WriterStopped),
             Err(std_mpsc::TrySendError::Full(_)) => Err(PtyInputDrop::QueueFull),
@@ -388,7 +385,8 @@ impl PtyWriter {
                 break;
             }
             match message {
-                PtyWrite::Input { kind, data, permit } => {
+                PtyWrite::Input(input) => {
+                    let (data, kind, permit) = input.into_parts();
                     let result = self.write_input(&data);
                     if let Err(err) = result
                         && !self.cancellation.is_cancelled()
@@ -400,9 +398,18 @@ impl PtyWriter {
                             input_len = data.len(),
                             "failed to write complete pty input; dropping its suffix"
                         );
+                        // Never wait for scheduler capacity while this thread owns the PTY writer.
+                        // Teardown depends on the endpoint being dropped even if the event channel
+                        // is saturated; the warning above remains as the diagnostic fallback.
+                        let _ = self.events_tx.try_send(ProcessEvent::InputDropped {
+                            service_id: self.service_id.clone(),
+                            run_id: self.run_id,
+                            input_kind: kind.as_str(),
+                            reason: format!("PTY write stopped before the complete payload: {err}"),
+                        });
                     }
-                    // Keep the reservation until the payload allocation is gone, so the global
-                    // budget never undercounts live input bytes.
+                    // Keep the reservation until the payload allocation is gone, so neither
+                    // retained-input budget undercounts live bytes.
                     drop(data);
                     drop(permit);
                 }
@@ -415,7 +422,7 @@ impl PtyWriter {
 
     #[cfg(unix)]
     fn write_input(&mut self, data: &[u8]) -> io::Result<()> {
-        self.write_all(data, Some(Instant::now() + PTY_INPUT_WRITE_TIMEOUT))
+        self.write_all(data, Some(PTY_INPUT_WRITE_TIMEOUT))
     }
 
     #[cfg(not(unix))]
@@ -445,7 +452,12 @@ impl PtyWriter {
     }
 
     #[cfg(unix)]
-    fn write_all(&mut self, mut remaining: &[u8], deadline: Option<Instant>) -> io::Result<()> {
+    fn write_all(
+        &mut self,
+        mut remaining: &[u8],
+        stall_timeout: Option<Duration>,
+    ) -> io::Result<()> {
+        let mut deadline = stall_timeout.and_then(|timeout| Instant::now().checked_add(timeout));
         while !remaining.is_empty() {
             if self.cancellation.is_cancelled() {
                 return Err(Self::cancelled());
@@ -468,6 +480,8 @@ impl PtyWriter {
                             "pty writer reported more bytes than it received",
                         )
                     })?;
+                    deadline =
+                        stall_timeout.and_then(|timeout| Instant::now().checked_add(timeout));
                 }
                 Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
                 Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
@@ -1107,8 +1121,11 @@ impl PtyHandles {
             .take_writer()
             .map_err(|err| Error::operation("failed to take test pty writer", err))?;
         let log_reader = LogReaderHandle::test_dummy();
+        let (events_tx, _events_rx) = mpsc::channel(1);
         let (handles, _shutdown) = Self::new(
             "test".to_string(),
+            RunId::new(1),
+            events_tx,
             pair.master,
             writer,
             Arc::new(AtomicU32::new(0)),
@@ -2138,6 +2155,8 @@ pub(super) fn start_service_with_pty_size(
     ));
     let (handles, pty_shutdown) = PtyHandles::new(
         service_id.clone(),
+        run_id,
+        events_tx.clone(),
         pair.master,
         writer,
         size.clone(),
@@ -2246,7 +2265,7 @@ mod tests {
     #[cfg(unix)]
     mod unix {
         use super::*;
-        use crate::scheduler::input::{InputBudget, PtyInputPrepareError};
+        use crate::scheduler::input::{InputBudget, PtyInputKind, PtyInputPrepareError};
         use crate::{MAX_PTY_INPUT_BATCH_BYTES, MAX_PTY_PASTE_BYTES};
         use color_eyre::eyre::{self, OptionExt as _};
         use similar_asserts::assert_eq;
@@ -2370,6 +2389,24 @@ mod tests {
             }
         }
 
+        fn test_pty_handles(
+            master: Box<dyn portable_pty::MasterPty + Send>,
+            writer: Box<dyn Write + Send>,
+            size: Arc<AtomicU32>,
+            log_reader: &LogReaderHandle,
+        ) -> Result<(PtyHandles, PtyShutdown), Error> {
+            let (events_tx, _events_rx) = mpsc::channel(1);
+            PtyHandles::new(
+                "svc".to_string(),
+                RunId::new(1),
+                events_tx,
+                master,
+                writer,
+                size,
+                log_reader,
+            )
+        }
+
         #[tokio::test]
         async fn failed_sigterm_uses_backend_without_skipping_escalation() {
             let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -2476,12 +2513,10 @@ mod tests {
             handles.write_input(input)?;
 
             match queued.try_recv() {
-                Ok(PtyWrite::Input {
-                    kind: PtyInputKind::Paste,
-                    data,
-                    ..
-                }) => assert_eq!(data, paste),
-                Ok(PtyWrite::Input { .. } | PtyWrite::TerminalResponse(_)) => {
+                Ok(PtyWrite::Input(input)) if input.kind() == PtyInputKind::Paste => {
+                    assert_eq!(input.data(), paste);
+                }
+                Ok(PtyWrite::Input(_) | PtyWrite::TerminalResponse(_)) => {
                     panic!("paste was split into another queue entry")
                 }
                 Err(err) => panic!("paste was not queued: {err}"),
@@ -2591,8 +2626,11 @@ mod tests {
                 .master
                 .take_writer()
                 .map_err(|err| eyre::eyre!("failed to take test PTY writer: {err}"))?;
+            let (events_tx, _events_rx) = mpsc::channel(1);
             let mut writer = PtyWriter {
                 service_id: "svc".to_string(),
+                run_id: RunId::new(1),
+                events_tx,
                 writer,
                 cancellation,
                 poll_write,
@@ -2661,8 +2699,11 @@ mod tests {
                 would_block: Some(would_block_tx),
             };
             let log_reader = LogReaderHandle::test_dummy();
+            let (events_tx, mut events_rx) = mpsc::channel(1);
             let (handles, shutdown) = PtyHandles::new(
                 "svc".to_string(),
+                RunId::new(7),
+                events_tx,
                 pair.master,
                 Box::new(writer),
                 Arc::new(AtomicU32::new(0)),
@@ -2701,6 +2742,25 @@ mod tests {
                     PtyInputKind::Input,
                 ),
                 Err(PtyInputPrepareError::BudgetExhausted { .. })
+            );
+            let event_deadline = Instant::now() + Duration::from_secs(3);
+            let dropped = loop {
+                match events_rx.try_recv() {
+                    Ok(event) => break event,
+                    Err(mpsc::error::TryRecvError::Empty) if Instant::now() < event_deadline => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(err) => eyre::bail!("PTY writer did not report discarded input: {err}"),
+                }
+            };
+            assert_matches!(
+                dropped,
+                ProcessEvent::InputDropped {
+                    service_id,
+                    run_id,
+                    input_kind: "input",
+                    ..
+                } if service_id == "svc" && run_id == RunId::new(7)
             );
 
             shutdown.close();
@@ -2741,8 +2801,7 @@ mod tests {
                 .take_writer()
                 .map_err(|err| eyre::eyre!("failed to take test PTY writer: {err}"))?;
             let log_reader = LogReaderHandle::test_dummy();
-            let (handles, shutdown) = PtyHandles::new(
-                "svc".to_string(),
+            let (handles, shutdown) = test_pty_handles(
                 pair.master,
                 writer,
                 Arc::new(AtomicU32::new(0)),
@@ -2796,6 +2855,128 @@ mod tests {
         }
 
         #[test]
+        fn pty_input_timeout_measures_stalls_instead_of_total_transfer_time() -> eyre::Result<()> {
+            const INPUT_LEN: usize = 128 * 1024;
+            const READ_SIZE: usize = 8 * 1024;
+            const READ_INTERVAL: Duration = Duration::from_millis(100);
+
+            let mut pipe = Pipe::new()?;
+            pipe.write.set_non_blocking(true)?;
+            let poll_write = pipe.write.try_clone()?;
+            let (cancel_read, cancellation) = PtyCancellation::pipe()?;
+            let (events_tx, _events_rx) = mpsc::channel(1);
+            let mut writer = PtyWriter {
+                service_id: "svc".to_string(),
+                run_id: RunId::new(1),
+                events_tx,
+                writer: Box::new(pipe.write),
+                cancellation,
+                poll_write,
+                cancel_read,
+                poller: PtyPoller::new()?,
+            };
+            let reader = thread::spawn(move || -> io::Result<usize> {
+                let mut reader = pipe.read;
+                let mut total = 0;
+                let mut buffer = [0; READ_SIZE];
+                loop {
+                    let read = reader.read(&mut buffer)?;
+                    if read == 0 {
+                        return Ok(total);
+                    }
+                    total += read;
+                    thread::sleep(READ_INTERVAL);
+                }
+            });
+
+            let started = Instant::now();
+            let result = writer.write_input(&vec![b'x'; INPUT_LEN]);
+            let elapsed = started.elapsed();
+            drop(writer);
+            let received = reader
+                .join()
+                .map_err(|_| eyre::eyre!("slow pipe reader panicked"))??;
+
+            result?;
+            assert_eq!(received, INPUT_LEN);
+            if elapsed <= PTY_INPUT_WRITE_TIMEOUT {
+                eyre::bail!("test transfer did not outlive one stall interval");
+            }
+            Ok(())
+        }
+
+        #[test]
+        fn input_drop_notification_cannot_pin_the_pty_writer() -> eyre::Result<()> {
+            struct FailingWriter;
+
+            impl Write for FailingWriter {
+                fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+                    Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "injected PTY write failure",
+                    ))
+                }
+
+                fn flush(&mut self) -> io::Result<()> {
+                    Ok(())
+                }
+            }
+
+            let (events_tx, mut events_rx) = mpsc::channel(1);
+            events_tx.try_send(ProcessEvent::Killed {
+                service_id: "occupied".to_string(),
+                run_id: RunId::new(1),
+            })?;
+            let poll_pipe = Pipe::new()?;
+            let (cancel_read, cancellation) = PtyCancellation::pipe()?;
+            let writer = PtyWriter {
+                service_id: "svc".to_string(),
+                run_id: RunId::new(7),
+                events_tx,
+                writer: Box::new(FailingWriter),
+                cancellation,
+                poll_write: poll_pipe.write,
+                cancel_read,
+                poller: PtyPoller::new()?,
+            };
+            let (write_tx, write_rx) = std_mpsc::sync_channel(1);
+            let budget = InputBudget::shared_with_limit(1);
+            let input = PreparedPtyInput::prepare(
+                &budget,
+                "svc".to_string(),
+                vec![b'x'],
+                PtyInputKind::Input,
+            )?;
+            write_tx.send(PtyWrite::Input(input))?;
+            drop(write_tx);
+            let (finished_tx, finished_rx) = std_mpsc::channel();
+            let worker = thread::spawn(move || {
+                writer.run(&write_rx);
+                let _ = finished_tx.send(());
+            });
+
+            if let Err(err) = finished_rx.recv_timeout(Duration::from_secs(1)) {
+                // Release an implementation that accidentally blocks on the full event channel so
+                // the test does not leak its worker while reporting the regression.
+                let _ = events_rx.try_recv();
+                let _ = worker.join();
+                return Err(eyre::eyre!(
+                    "PTY writer was pinned by its notification: {err}"
+                ));
+            }
+            worker
+                .join()
+                .map_err(|_| eyre::eyre!("PTY writer thread panicked"))?;
+
+            assert_matches!(
+                events_rx.try_recv(),
+                Ok(ProcessEvent::Killed { service_id, .. }) if service_id == "occupied"
+            );
+            PreparedPtyInput::prepare(&budget, "svc".to_string(), vec![b'y'], PtyInputKind::Input)?;
+            Ok(())
+        }
+
+        #[test]
         fn pty_terminal_response_survives_extended_backpressure() -> eyre::Result<()> {
             const RESPONSE_LEN: usize = 64 * 1024;
 
@@ -2824,8 +3005,7 @@ mod tests {
                 .take_writer()
                 .map_err(|err| eyre::eyre!("failed to take test PTY writer: {err}"))?;
             let log_reader = LogReaderHandle::test_dummy();
-            let (handles, shutdown) = PtyHandles::new(
-                "svc".to_string(),
+            let (handles, shutdown) = test_pty_handles(
                 pair.master,
                 writer,
                 Arc::new(AtomicU32::new(0)),
@@ -2894,8 +3074,7 @@ mod tests {
                 .take_writer()
                 .map_err(|err| eyre::eyre!("failed to take test PTY writer: {err}"))?;
             let size = Arc::new(AtomicU32::new(0));
-            let (handles, shutdown) =
-                PtyHandles::new("svc".to_string(), pair.master, writer, size, &log_reader)?;
+            let (handles, shutdown) = test_pty_handles(pair.master, writer, size, &log_reader)?;
 
             shutdown.close();
 
@@ -2937,8 +3116,7 @@ mod tests {
                 would_block: Some(would_block_tx),
             };
             let log_reader = LogReaderHandle::test_dummy();
-            let (handles, shutdown) = PtyHandles::new(
-                "svc".to_string(),
+            let (handles, shutdown) = test_pty_handles(
                 pair.master,
                 Box::new(writer),
                 Arc::new(AtomicU32::new(0)),
@@ -2999,8 +3177,7 @@ mod tests {
                 would_block: None,
             };
             let log_reader = LogReaderHandle::test_dummy();
-            let (handles, pty_shutdown) = PtyHandles::new(
-                "svc".to_string(),
+            let (handles, pty_shutdown) = test_pty_handles(
                 pair.master,
                 Box::new(writer),
                 Arc::new(AtomicU32::new(0)),

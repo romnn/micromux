@@ -12,3 +12,7 @@
   clients. Keep the enforcement boundary clear: MCP exposes no service-input tool.
 - Attach v2: an explicit remote session-shutdown key with confirmation; detach must remain the
   default `q` behavior.
+- Control protocol: paginate service rosters and retained-run indexes instead of returning
+  `LimitExceeded` when either response exceeds one frame.
+- Windows: add suspended PTY child spawning upstream in `portable-pty`, then assign each child to
+  its kill-on-close job before resuming it.

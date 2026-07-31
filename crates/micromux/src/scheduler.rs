@@ -28,6 +28,8 @@ const RESTART_BACKOFF_RESET: Duration = RESTART_BACKOFF_MAX;
 
 /// Grace period for tail output before cancellation of a finished run's PTY reader is requested.
 const POST_EXIT_DRAIN_GRACE: Duration = Duration::from_secs(5);
+/// Minimum interval between operator-visible input-drop reports for one service.
+const INPUT_DROP_REPORT_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_RETIRED_SERVICES: usize = 8;
 const IDEMPOTENCY_WINDOW: usize = 64;
 
@@ -283,6 +285,38 @@ pub(super) struct ServiceRuntime {
     /// start. Non-empty exactly while the service is held back by them, so the projection can report
     /// a blocked service as such instead of leaving it at its pre-start state.
     blocked_on: Vec<ServiceID>,
+    input_drops: InputDropThrottle,
+}
+
+#[derive(Default)]
+struct InputDropThrottle {
+    report_at: Option<tokio::time::Instant>,
+    suppressed: usize,
+}
+
+impl InputDropThrottle {
+    fn record(&mut self, now: tokio::time::Instant) -> bool {
+        if self.report_at.is_none() {
+            self.report_at = now.checked_add(INPUT_DROP_REPORT_INTERVAL);
+            return true;
+        }
+        self.suppressed = self.suppressed.saturating_add(1);
+        false
+    }
+
+    fn take_due(&mut self, now: tokio::time::Instant) -> Option<usize> {
+        if self.report_at.is_none_or(|deadline| deadline > now) {
+            return None;
+        }
+        if self.suppressed == 0 {
+            self.report_at = None;
+            return None;
+        }
+
+        let suppressed = std::mem::take(&mut self.suppressed);
+        self.report_at = now.checked_add(INPUT_DROP_REPORT_INTERVAL);
+        Some(suppressed)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -351,6 +385,7 @@ impl ServiceRuntime {
             retired_at_unix_ms: None,
             expires_at: None,
             blocked_on: Vec::new(),
+            input_drops: InputDropThrottle::default(),
         }
     }
 
@@ -387,6 +422,7 @@ impl ServiceRuntime {
         self.started_at_unix_ms = unix_now_ms();
         self.running = Some(running);
         self.state = State::Running { health: None };
+        self.input_drops = InputDropThrottle::default();
     }
 
     /// Mark a spawn attempt in progress.
@@ -964,22 +1000,74 @@ impl SchedulerRuntime {
     }
 
     fn report_input_drop(
-        &self,
+        &mut self,
         service_id: &ServiceID,
         input_kind: &str,
         result: Result<(), pty::PtyInputDrop>,
     ) {
         if let Err(err) = result {
+            self.record_input_drop(service_id, input_kind, &err.to_string());
+        }
+    }
+
+    fn record_input_drop(&mut self, service_id: &ServiceID, input_kind: &str, reason: &str) {
+        let report = self
+            .services
+            .get_mut(service_id)
+            .is_some_and(|runtime| runtime.input_drops.record(tokio::time::Instant::now()));
+        if !report {
+            return;
+        }
+
+        tracing::warn!(
+            service_id,
+            input_kind,
+            error = %reason,
+            "terminal input was discarded before reaching the service"
+        );
+        self.append_event(
+            service_id,
+            ServiceEventKind::InputDropped,
+            format!("terminal {input_kind} discarded: {reason}"),
+        );
+    }
+
+    fn next_input_drop_report(&self) -> Option<tokio::time::Instant> {
+        self.services
+            .values()
+            .filter_map(|runtime| runtime.input_drops.report_at)
+            .min()
+    }
+
+    fn report_due_input_drops(&mut self) {
+        let now = tokio::time::Instant::now();
+        let due = self
+            .services
+            .iter_mut()
+            .filter_map(|(service_id, runtime)| {
+                runtime
+                    .input_drops
+                    .take_due(now)
+                    .map(|count| (service_id.clone(), count))
+            })
+            .collect::<Vec<_>>();
+        for (service_id, count) in due {
             tracing::warn!(
-                service_id,
-                input_kind,
-                error = %err,
-                "terminal input was discarded before reaching the service"
+                %service_id,
+                count,
+                "additional terminal input was discarded"
             );
             self.append_event(
-                service_id,
+                &service_id,
                 ServiceEventKind::InputDropped,
-                format!("terminal {input_kind} discarded: {err}"),
+                format!(
+                    "{count} additional terminal input {} discarded",
+                    if count == 1 {
+                        "batch was"
+                    } else {
+                        "batches were"
+                    }
+                ),
             );
         }
     }
@@ -1003,6 +1091,7 @@ impl SchedulerRuntime {
             let next_backoff = self.next_backoff();
             let next_expiry = self.next_expiry();
             let next_drain_deadline = self.next_drain_deadline();
+            let next_input_drop_report = self.next_input_drop_report();
             let needs_schedule = tokio::select! {
                 () = self.shutdown.cancelled() => {
                     tracing::debug!("exiting scheduler");
@@ -1058,6 +1147,15 @@ impl SchedulerRuntime {
                     }
                 } => {
                     self.cancel_due_drains();
+                    false
+                },
+                () = async {
+                    match next_input_drop_report {
+                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {
+                    self.report_due_input_drops();
                     false
                 }
             };
@@ -2450,7 +2548,11 @@ impl SchedulerRuntime {
                 .draining_log_readers
                 .iter()
                 .any(|draining| draining.run_id == event.run_id());
-        if current_run_id != Some(event.run_id()) && !log_reader_finished {
+        let latest_run_input_drop = matches!(event, ProcessEvent::InputDropped { .. })
+            && current_run_id.is_none()
+            && runtime.last_run_id == Some(event.run_id());
+        if current_run_id != Some(event.run_id()) && !log_reader_finished && !latest_run_input_drop
+        {
             tracing::debug!(
                 service_id,
                 event_run_id = ?event.run_id(),
@@ -2491,6 +2593,14 @@ impl SchedulerRuntime {
                 if let Some(runtime) = self.services.get_mut(&service_id) {
                     runtime.finish_log_reader(*run_id);
                 }
+                #[cfg(test)]
+                self.test_events.forward(event.to_test_event());
+                false
+            }
+            ProcessEvent::InputDropped {
+                input_kind, reason, ..
+            } => {
+                self.record_input_drop(&service_id, input_kind, reason);
                 #[cfg(test)]
                 self.test_events.forward(event.to_test_event());
                 false

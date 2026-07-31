@@ -66,6 +66,12 @@ pub(crate) enum ProcessEvent {
         service_id: ServiceID,
         run_id: RunId,
     },
+    InputDropped {
+        service_id: ServiceID,
+        run_id: RunId,
+        input_kind: &'static str,
+        reason: String,
+    },
 }
 
 impl ProcessEvent {
@@ -75,7 +81,8 @@ impl ProcessEvent {
             | Self::Exited { service_id, .. }
             | Self::LogReaderFinished { service_id, .. }
             | Self::Healthy { service_id, .. }
-            | Self::Unhealthy { service_id, .. } => service_id,
+            | Self::Unhealthy { service_id, .. }
+            | Self::InputDropped { service_id, .. } => service_id,
         }
     }
 
@@ -85,7 +92,8 @@ impl ProcessEvent {
             | Self::Exited { run_id, .. }
             | Self::LogReaderFinished { run_id, .. }
             | Self::Healthy { run_id, .. }
-            | Self::Unhealthy { run_id, .. } => *run_id,
+            | Self::Unhealthy { run_id, .. }
+            | Self::InputDropped { run_id, .. } => *run_id,
         }
     }
 
@@ -103,6 +111,7 @@ impl ProcessEvent {
             }
             Self::Healthy { service_id, .. } => Event::Healthy(service_id.clone()),
             Self::Unhealthy { service_id, .. } => Event::Unhealthy(service_id.clone()),
+            Self::InputDropped { service_id, .. } => Event::InputDropped(service_id.clone()),
         }
     }
 }
@@ -132,6 +141,8 @@ pub(crate) enum Event {
     Healthy(ServiceID),
     /// A service became unhealthy.
     Unhealthy(ServiceID),
+    /// Terminal input was discarded while writing to the service.
+    InputDropped(ServiceID),
     /// A service was disabled.
     Disabled(ServiceID),
     /// Clear the log buffer for a service (e.g. on restart).
@@ -174,6 +185,7 @@ impl std::fmt::Display for Event {
             Self::LogReaderFinished(service_id) => write!(f, "LogReaderFinished({service_id})"),
             Self::Healthy(service_id) => write!(f, "Healthy({service_id})"),
             Self::Unhealthy(service_id) => write!(f, "Unhealthy({service_id})"),
+            Self::InputDropped(service_id) => write!(f, "InputDropped({service_id})"),
             Self::Disabled(service_id) => write!(f, "Disabled({service_id})"),
             Self::ClearLogs(service_id) => write!(f, "ClearLogs({service_id})"),
         }
