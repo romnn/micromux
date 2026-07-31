@@ -39,6 +39,7 @@ regex = "1"
 strip-ansi-escapes.workspace = true
 
 tokio.workspace = true
+tracing.workspace = true
 
 # Confirm a stopped session's process is gone (safe `kill(pid, 0)` wrapper).
 [target.'cfg(unix)'.dependencies]
@@ -52,3 +53,6 @@ similar-asserts.workspace = true
 color-eyre.workspace = true
 tempfile.workspace = true
 fs2 = "0.4"
+
+[target.'cfg(unix)'.dev-dependencies]
+rustix = { workspace = true, features = ["process"] }

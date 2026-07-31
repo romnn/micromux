@@ -81,6 +81,8 @@ const DIAGNOSE_LOG_SCAN: usize = 500;
 /// timeout.
 const WAIT_POLL_FLOOR: Duration = Duration::from_secs(1);
 const WAIT_LOG_POLL: Duration = Duration::from_millis(250);
+/// Optional cursor capture must not materially delay the mutation it annotates.
+const MUTATION_CURSOR_TIMEOUT: Duration = Duration::from_millis(250);
 const MAX_SESSION_STARTS_PER_WINDOW: usize = 8;
 const SESSION_START_WINDOW: Duration = Duration::from_mins(1);
 const GREP_REGEX_SIZE_LIMIT: usize = 256 * 1024;
@@ -473,8 +475,9 @@ struct MutationResult {
     accepted: Vec<micromux::ServiceCommandAck>,
     service: String,
     generation: Option<u64>,
-    /// The service's last visible log seq, captured before the mutation was sent; pass it to
-    /// `follow_logs` as `after_seq` to read exactly the output this action caused.
+    /// The service's last visible log seq, when it could be captured before the mutation was sent.
+    ///
+    /// Pass it to `follow_logs` as `after_seq` to read exactly the output this action caused.
     log_cursor: Option<u64>,
 }
 
@@ -1166,11 +1169,10 @@ impl McpServer {
         let resolved = select::resolve(&self.cwd, session)
             .await
             .map_err(error_data)?;
+        let log_cursor = capture_mutation_cursor(&resolved.endpoint, service).await;
         let mut conn = SessionConn::connect(&resolved.endpoint)
             .await
             .map_err(error_data)?;
-        let log_cursor =
-            service_result(service, current_service_cursor(&mut conn, service).await).await?;
         let response = conn.request(request).await.map_err(error_data)?;
         let acks = service_result(service, convert::accepted(response)).await?;
         let generation = acks
@@ -1182,7 +1184,7 @@ impl McpServer {
             accepted: acks,
             service: service.to_string(),
             generation,
-            log_cursor: Some(log_cursor),
+            log_cursor,
         }))
     }
 
@@ -1365,6 +1367,41 @@ impl McpServer {
             .map_err(error_data)?;
         let receipt = service_result(service, convert::dynamic_service(response)).await?;
         Ok(DynamicMutation { resolved, receipt })
+    }
+}
+
+/// Captures the optional pre-mutation cursor on a disposable connection.
+///
+/// A timed-out read can leave a late response in the framing buffer. Keeping this observation
+/// separate ensures neither its result nor its transport state can prevent or corrupt the
+/// mutation.
+async fn capture_mutation_cursor(endpoint: &ControlEndpoint, service: &str) -> Option<u64> {
+    let capture = async {
+        let mut conn = SessionConn::connect(endpoint).await?;
+        current_service_cursor(&mut conn, service).await
+    };
+    if let Ok(cursor) = tokio::time::timeout(MUTATION_CURSOR_TIMEOUT, capture).await {
+        return best_effort_mutation_cursor(service, cursor);
+    }
+    tracing::warn!(
+        service,
+        timeout_ms = %MUTATION_CURSOR_TIMEOUT.as_millis(),
+        "timed out capturing the pre-mutation log cursor"
+    );
+    None
+}
+
+fn best_effort_mutation_cursor(service: &str, cursor: Result<u64, ToolError>) -> Option<u64> {
+    match cursor {
+        Ok(cursor) => Some(cursor),
+        Err(err) => {
+            tracing::warn!(
+                service,
+                error = %err,
+                "could not capture the pre-mutation log cursor"
+            );
+            None
+        }
     }
 }
 
@@ -1719,11 +1756,11 @@ impl McpServer {
 
     #[tool(
         description = "Restart a service. Returns the run generation *before* the restart; pass \
-        it to wait_for_healthy as after_generation. Also returns log_cursor, the pre-restart log \
-        position; pass it to follow_logs as after_seq to read exactly the new run's output. \
-        Reloads the latest micromux config before spawning the replacement, so edited command \
-        flags, healthchecks, and log retention take effect. Restarting a disabled service is \
-        rejected."
+        it to wait_for_healthy as after_generation. When available, log_cursor is the pre-restart \
+        log position; pass it to follow_logs as after_seq to read exactly the new run's output. \
+        Cursor capture is best-effort and never prevents the restart. Reloads the latest micromux \
+        config before spawning the replacement, so edited command flags, healthchecks, and log \
+        retention take effect. Restarting a disabled service is rejected."
     )]
     async fn restart_service(&self, args: Parameters<ServiceArgs>) -> ToolResult<MutationResult> {
         let Parameters(args) = args;
@@ -1875,9 +1912,10 @@ impl McpServer {
 
     #[tool(
         description = "Enable (and start) a service. Returns the run generation before enabling \
-        plus log_cursor, the pre-enable log position (pass to follow_logs as after_seq). Reloads \
-        the latest micromux config before spawning, so edited command flags, healthchecks, and \
-        log retention take effect."
+        plus the pre-enable log position in log_cursor when cursor capture succeeds (pass it to \
+        follow_logs as after_seq). Cursor capture is best-effort and never prevents the enable. \
+        Reloads the latest micromux config before spawning, so edited command flags, healthchecks, \
+        and log retention take effect."
     )]
     async fn enable_service(&self, args: Parameters<ServiceArgs>) -> ToolResult<MutationResult> {
         let Parameters(args) = args;
@@ -3010,9 +3048,11 @@ mod tests {
     use super::{
         DynamicMutationResult, ExitVerdict, GREP_PATTERN_MAX_BYTES, McpServer, MutationResult,
         RestartAndWaitResult, SessionMutationResult, SessionRef, StartDynamicAndWaitResult,
-        StopSessionResult, WaitForExitResult, WaitForExitStatus, WaitResult, classify_exit,
-        compile_grep, matching_service, parse_since_text, session_has_service, session_selector,
+        StopSessionResult, WaitForExitResult, WaitForExitStatus, WaitResult,
+        best_effort_mutation_cursor, classify_exit, compile_grep, matching_service,
+        parse_since_text, session_has_service, session_selector,
     };
+    use crate::select::ToolError;
     use crate::tools::health::health_attempt_matches_snapshot;
     use crate::tools::logs::{
         MergedFollowPage, follow_all_after_seq, follow_gap, merge_follow_pages, next_follow_cursor,
@@ -3027,12 +3067,25 @@ mod tests {
     use std::collections::BTreeMap;
     use std::time::Duration;
 
+    #[test]
+    fn mutations_continue_without_the_optional_log_cursor() {
+        assert_eq!(
+            best_effort_mutation_cursor(
+                "api",
+                Err(ToolError::Busy("disk log reader unavailable".to_string()))
+            ),
+            None
+        );
+        assert_eq!(best_effort_mutation_cursor("api", Ok(42)), Some(42));
+    }
+
     #[cfg(unix)]
     use super::{
         DynamicServiceArgs, EnsureAction, EnsureActionKind, EnsureReadyArgs, LogFilterArgs,
         LogsArgs, ReconcileConfigArgs, RenewDynamicServiceArgs, ReplaceDynamicServiceArgs,
         ServiceArgs, ServiceEventsArgs, ServiceEventsResult, SessionArgs,
         SessionServiceEventsResult, StartDynamicAndWaitArgs, WaitForExitArgs, WaitStatus,
+        capture_mutation_cursor,
     };
 
     #[cfg(unix)]
@@ -3043,6 +3096,39 @@ mod tests {
 
     #[cfg(unix)]
     use std::sync::Arc;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mutation_cursor_capture_is_bounded_by_its_own_timeout() -> eyre::Result<()> {
+        let dir = tempfile::Builder::new()
+            .prefix("micromux-mcp-cursor-")
+            .tempdir_in("/tmp")?;
+        let endpoint =
+            micromux_control::ControlEndpoint::Unix(dir.path().join("unresponsive.sock"));
+        let micromux_control::ControlEndpoint::Unix(path) = &endpoint else {
+            eyre::bail!("expected Unix control endpoint");
+        };
+        let listener = tokio::net::UnixListener::bind(path)?;
+        let peer = tokio::spawn(async move {
+            // Accept the cursor request but never answer it, modelling a wedged control read.
+            if let Ok((stream, _)) = listener.accept().await {
+                let _stream = stream;
+                std::future::pending::<()>().await;
+            }
+        });
+        let started = tokio::time::Instant::now();
+
+        let cursor = capture_mutation_cursor(&endpoint, "api").await;
+
+        assert_eq!(cursor, None);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "optional cursor capture delayed the mutation path"
+        );
+        peer.abort();
+        let _ = peer.await;
+        Ok(())
+    }
 
     #[cfg(unix)]
     struct RunningMcpSession {

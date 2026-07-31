@@ -316,7 +316,33 @@ mod tests {
         _runner: tokio::task::JoinHandle<Result<(), micromux::Error>>,
     }
 
+    fn raise_test_file_descriptor_limit() {
+        use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
+
+        static RAISE: std::sync::Once = std::sync::Once::new();
+        RAISE.call_once(|| {
+            // The production binary raises this before opening control and PTY descriptors. Mirror
+            // that environment so concurrent endpoint tests exercise discovery rather than the
+            // shell's soft limit.
+            const TARGET: u64 = 4096;
+            let current = getrlimit(Resource::Nofile);
+            let desired = current
+                .maximum
+                .map_or(TARGET, |maximum| TARGET.min(maximum));
+            if current.current.is_some_and(|limit| limit < desired) {
+                let _ = setrlimit(
+                    Resource::Nofile,
+                    Rlimit {
+                        current: Some(desired),
+                        maximum: current.maximum,
+                    },
+                );
+            }
+        });
+    }
+
     fn temp_dir(prefix: &str) -> eyre::Result<tempfile::TempDir> {
+        raise_test_file_descriptor_limit();
         Ok(tempfile::Builder::new()
             .prefix(&format!("micromux-mcp-{prefix}-"))
             .tempdir_in(socket_test_base())?)
