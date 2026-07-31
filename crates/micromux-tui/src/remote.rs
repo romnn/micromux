@@ -1,9 +1,10 @@
 //! Client-side session mirror used by attach mode.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures::FutureExt as _;
 use indexmap::IndexMap;
 use micromux::{
     CancellationToken, ChangeKind, HealthAttempt, LogLine, ServiceCommandAck, ServiceID,
@@ -21,6 +22,8 @@ const CHANGE_CHANNEL_CAPACITY: usize = 1024;
 const REMOTE_LOG_TAIL: usize = 200;
 const INITIAL_RECONNECT_DELAY: Duration = Duration::from_millis(250);
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(5);
+/// Connected lifetime after which a reconnect is stable enough to reset its backoff.
+const STABLE_CONNECTION_DURATION: Duration = Duration::from_secs(30);
 
 /// A synchronous mirror of a remote session, maintained by one background task.
 pub struct RemoteSource {
@@ -65,6 +68,46 @@ enum ExpectedCommandResponse {
 enum ConnectedLoopExit {
     Shutdown,
     Reconnect,
+}
+
+struct ReconnectBackoff {
+    next: Duration,
+}
+
+impl ReconnectBackoff {
+    fn new() -> Self {
+        Self {
+            next: INITIAL_RECONNECT_DELAY,
+        }
+    }
+
+    fn next_delay(&mut self) -> Duration {
+        let current = self.next;
+        self.next = self.next.saturating_mul(2).min(MAX_RECONNECT_DELAY);
+        current
+    }
+
+    fn reset(&mut self) {
+        self.next = INITIAL_RECONNECT_DELAY;
+    }
+}
+
+struct CoalescedChanges(Vec<SessionChange>);
+
+impl CoalescedChanges {
+    fn new(changes: Vec<SessionChange>) -> Self {
+        let mut seen = HashSet::with_capacity(changes.len());
+        Self(
+            changes
+                .into_iter()
+                .filter(|change| seen.insert((change.service_id.clone(), change.kind)))
+                .collect(),
+        )
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &SessionChange> {
+        self.0.iter()
+    }
 }
 
 trait RequestConnection {
@@ -241,6 +284,8 @@ async fn run_remote(
     mut request: Client,
     mut subscription: Subscription,
 ) {
+    let mut backoff = ReconnectBackoff::new();
+    let mut connected_at = tokio::time::Instant::now();
     loop {
         match run_connected(
             &mut request,
@@ -255,9 +300,12 @@ async fn run_remote(
             ConnectedLoopExit::Shutdown => return,
             ConnectedLoopExit::Reconnect => mark_disconnected(&store, &changes),
         }
+        if connected_at.elapsed() >= STABLE_CONNECTION_DURATION {
+            backoff.reset();
+        }
 
-        let mut delay = INITIAL_RECONNECT_DELAY;
         loop {
+            let delay = backoff.next_delay();
             tokio::select! {
                 () = shutdown.cancelled() => return,
                 () = tokio::time::sleep(delay) => {}
@@ -271,11 +319,11 @@ async fn run_remote(
                 Ok((new_request, new_subscription)) => {
                     request = new_request;
                     subscription = new_subscription;
+                    connected_at = tokio::time::Instant::now();
                     break;
                 }
                 Err(err) => {
                     tracing::debug!(?err, "remote mirror reconnect failed");
-                    delay = delay.saturating_mul(2).min(MAX_RECONNECT_DELAY);
                 }
             }
         }
@@ -307,12 +355,32 @@ async fn run_connected(
             received = subscription.recv() => {
                 match received {
                     Ok(Some(change)) => {
-                        if let Err(err) = refresh_and_forward(request, store, changes, change.clone()).await {
+                        let mut batch = vec![change];
+                        let mut reconnect_after_batch = false;
+                        while let Some(received) = subscription.recv().now_or_never() {
+                            match received {
+                                Ok(Some(change)) => batch.push(change),
+                                Ok(None) => {
+                                    reconnect_after_batch = true;
+                                    break;
+                                }
+                                Err(err) if reconnect_after_subscription_error(&err) => {
+                                    reconnect_after_batch = true;
+                                    break;
+                                }
+                                Err(err) => record_notice(store, changes, err.to_string()),
+                            }
+                        }
+                        let batch = CoalescedChanges::new(batch);
+                        if let Err(err) = refresh_and_forward_batch(request, store, changes, &batch).await {
                             if reconnect_after_refresh_error(&err) {
                                 return ConnectedLoopExit::Reconnect;
                             }
                             record_notice(store, changes, err.to_string());
-                            publish(changes, change);
+                            publish_batch(changes, &batch);
+                        }
+                        if reconnect_after_batch {
+                            return ConnectedLoopExit::Reconnect;
                         }
                     }
                     Ok(None) => return ConnectedLoopExit::Reconnect,
@@ -378,22 +446,55 @@ async fn full_sync<C: RequestConnection>(
     Ok(store.read().services.keys().cloned().collect())
 }
 
+#[cfg(test)]
 async fn refresh_and_forward<C: RequestConnection>(
     request: &mut C,
     store: &Arc<RwLock<MirrorStore>>,
     changes: &broadcast::Sender<SessionChange>,
     change: SessionChange,
 ) -> Result<(), ControlError> {
-    match change.kind {
-        ChangeKind::Logs => refresh_logs(request, store, &change.service_id).await?,
-        ChangeKind::Health => refresh_health(request, store, &change.service_id).await?,
-        ChangeKind::Status | ChangeKind::Roster | ChangeKind::Unknown => {
-            refresh_roster(request, store).await?;
-        }
-        ChangeKind::Events | ChangeKind::Heartbeat => {}
+    refresh_and_forward_batch(
+        request,
+        store,
+        changes,
+        &CoalescedChanges::new(vec![change]),
+    )
+    .await
+}
+
+async fn refresh_and_forward_batch<C: RequestConnection>(
+    request: &mut C,
+    store: &Arc<RwLock<MirrorStore>>,
+    changes: &broadcast::Sender<SessionChange>,
+    batch: &CoalescedChanges,
+) -> Result<(), ControlError> {
+    if batch.iter().any(|change| {
+        matches!(
+            change.kind,
+            ChangeKind::Status | ChangeKind::Roster | ChangeKind::Unknown
+        )
+    }) {
+        refresh_roster(request, store).await?;
     }
-    publish(changes, change);
+    for change in batch.iter() {
+        match change.kind {
+            ChangeKind::Logs => refresh_logs(request, store, &change.service_id).await?,
+            ChangeKind::Health => refresh_health(request, store, &change.service_id).await?,
+            ChangeKind::Status
+            | ChangeKind::Roster
+            | ChangeKind::Unknown
+            | ChangeKind::Events
+            | ChangeKind::Heartbeat => {}
+        }
+    }
+    publish_batch(changes, batch);
     Ok(())
+}
+
+fn publish_batch(changes: &broadcast::Sender<SessionChange>, batch: &CoalescedChanges) {
+    for change in batch.iter().cloned() {
+        publish(changes, change);
+    }
 }
 
 async fn refresh_roster<C: RequestConnection>(
@@ -681,7 +782,10 @@ fn reconnect_after_refresh_error(error: &ControlError) -> bool {
 }
 
 fn reconnect_after_subscription_error(error: &ControlError) -> bool {
-    matches!(error, ControlError::Io(_) | ControlError::Closed)
+    matches!(
+        error,
+        ControlError::Io(_) | ControlError::Closed | ControlError::Timeout
+    )
 }
 
 fn mark_disconnected(store: &Arc<RwLock<MirrorStore>>, changes: &broadcast::Sender<SessionChange>) {
@@ -737,6 +841,8 @@ fn publish(changes: &broadcast::Sender<SessionChange>, change: SessionChange) {
 
 #[cfg(test)]
 mod tests {
+    use std::assert_matches;
+
     use super::*;
     use color_eyre::eyre;
     use micromux::RestartPolicy;
@@ -802,6 +908,67 @@ mod tests {
             timestamp_unix_ms: seq,
             line: text.to_string(),
         }
+    }
+
+    #[test]
+    fn reconnect_backoff_survives_short_lived_reconnections() {
+        let mut backoff = ReconnectBackoff::new();
+
+        assert_eq!(backoff.next_delay(), Duration::from_millis(250));
+        assert_eq!(backoff.next_delay(), Duration::from_millis(500));
+        assert_eq!(backoff.next_delay(), Duration::from_secs(1));
+        backoff.reset();
+        assert_eq!(backoff.next_delay(), Duration::from_millis(250));
+    }
+
+    #[test]
+    fn subscription_timeouts_trigger_reconnection() {
+        assert!(reconnect_after_subscription_error(&ControlError::Timeout));
+    }
+
+    #[tokio::test]
+    async fn ready_change_batches_coalesce_remote_round_trips() -> eyre::Result<()> {
+        let store = store_with(entry_with_log(1, "line"));
+        let mut request = ScriptedConnection::new([
+            Response::Services(vec![snapshot("svc", 1)]),
+            Response::Logs {
+                lines: vec![line(2, "new")],
+                truncated: false,
+                first_retained_seq: Some(1),
+            },
+        ]);
+        let (changes, _) = broadcast::channel(8);
+        let batch = CoalescedChanges::new(vec![
+            SessionChange {
+                service_id: "svc".to_string(),
+                kind: ChangeKind::Status,
+            },
+            SessionChange {
+                service_id: "svc".to_string(),
+                kind: ChangeKind::Status,
+            },
+            SessionChange {
+                service_id: "other".to_string(),
+                kind: ChangeKind::Status,
+            },
+            SessionChange {
+                service_id: "svc".to_string(),
+                kind: ChangeKind::Logs,
+            },
+            SessionChange {
+                service_id: "svc".to_string(),
+                kind: ChangeKind::Logs,
+            },
+        ]);
+
+        refresh_and_forward_batch(&mut request, &store, &changes, &batch).await?;
+
+        assert_eq!(request.requests.len(), 2);
+        assert_matches!(
+            request.requests.as_slice(),
+            [Request::ListServices, Request::FollowLogs { .. }]
+        );
+        Ok(())
     }
 
     fn store_with(entry: MirrorEntry) -> Arc<RwLock<MirrorStore>> {

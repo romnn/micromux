@@ -569,7 +569,7 @@ pub enum ServiceEventKind {
 
 /// What kind of change a [`SessionChange`] notification coalesces. The broadcast is liveness-only:
 /// subscribers receive the kind and re-query the model for content.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub enum ChangeKind {
     /// The service's status snapshot changed.
     Status,
