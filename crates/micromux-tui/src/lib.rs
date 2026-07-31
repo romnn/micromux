@@ -27,6 +27,7 @@ pub use source::{LocalSource, SessionSource};
 
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 const PENDING_PTY_INPUT_RETRY: Duration = Duration::from_millis(5);
+const TERMINAL_INPUT_CLOSED_NOTICE: &str = "terminal input closed; send SIGINT or SIGTERM to exit";
 
 fn format_byte_limit(bytes: usize) -> String {
     const KIB: usize = 1024;
@@ -55,6 +56,7 @@ pub struct App {
     input: Option<TerminalControl>,
     pending_pty_input: VecDeque<PreparedPtyInput>,
     input_notice: Option<String>,
+    terminal_input_closed: bool,
     /// Prevents coalesced change notifications from hiding an intervening input-drop event.
     event_cursors: HashMap<String, u64>,
     shutdown: micromux::CancellationToken,
@@ -119,6 +121,7 @@ impl App {
             input,
             pending_pty_input: VecDeque::new(),
             input_notice: None,
+            terminal_input_closed: false,
             event_cursors,
             shutdown,
             source,
@@ -364,10 +367,7 @@ impl App {
     ///
     /// # Errors
     ///
-    /// Returns an error if:
-    ///
-    /// - Receiving an input event fails.
-    /// - The underlying terminal backend fails to draw.
+    /// Returns an error if the underlying terminal backend fails to draw.
     pub async fn run(mut self, mut terminal: DefaultTerminal) -> Result<(), Error> {
         enum Wake {
             Input(event::Input),
@@ -547,8 +547,15 @@ impl App {
     }
 
     fn handle_input_event(&mut self, input_event: event::Input) {
-        let event::Input::Event(event) = input_event;
-        self.handle_crossterm_event(&event);
+        match input_event {
+            event::Input::Event(event) => self.handle_crossterm_event(&event),
+            event::Input::Closed => {
+                if !self.terminal_input_closed {
+                    tracing::warn!("terminal input closed; supervision will continue");
+                    self.terminal_input_closed = true;
+                }
+            }
+        }
     }
 
     fn handle_crossterm_event(&mut self, event: &crossterm::event::Event) {
@@ -1033,6 +1040,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn terminal_eof_is_visible_without_stopping_the_session() -> eyre::Result<()> {
+        let mut diagnostics = Vec::new();
+        let parsed = micromux::from_str(
+            "version: 1\nservices: {}\n",
+            Path::new("."),
+            0usize,
+            None,
+            &mut diagnostics,
+        )?;
+        let mux = std::sync::Arc::new(micromux::Micromux::new(&parsed)?);
+        let shutdown = micromux::CancellationToken::new();
+        let (_runner, handles) = mux.start(shutdown.clone());
+        let mut app = App::new(
+            SessionSource::Local(LocalSource::new(handles.reader, handles.commands.clone())),
+            Some(handles.terminal),
+            shutdown.clone(),
+            true,
+        );
+
+        app.handle_input_event(crate::event::Input::Closed);
+        // Successful input clears transient notices; terminal EOF must remain visible through that
+        // lifecycle.
+        app.input_notice = None;
+
+        assert!(app.running);
+        assert!(!shutdown.is_cancelled());
+        assert!(app.terminal_input_closed);
+
+        let area = ratatui::layout::Rect::new(0, 0, 160, 24);
+        let mut buffer = ratatui::buffer::Buffer::empty(area);
+        (&mut app).render(area, &mut buffer);
+        let text = buffer
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(text.contains(TERMINAL_INPUT_CLOSED_NOTICE));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn healthcheck_text_is_parsed_once_until_the_model_marks_it_dirty() -> eyre::Result<()> {
         let yaml = indoc! {r#"
             version: 1
@@ -1379,7 +1427,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_warning_outranks_a_transient_input_notice() -> eyre::Result<()> {
+    async fn session_warning_outranks_terminal_notices() -> eyre::Result<()> {
         let yaml = "version: 1\nservices:\n  svc:\n    command: [\"true\"]\n";
         let mut diagnostics = Vec::new();
         let parsed = micromux::from_str(yaml, Path::new("."), 0usize, None, &mut diagnostics)?;
@@ -1395,6 +1443,7 @@ mod tests {
             true,
         );
         app.input_notice = Some("input warning".to_string());
+        app.terminal_input_closed = true;
 
         let area = ratatui::layout::Rect::new(0, 0, 160, 24);
         let mut buffer = ratatui::buffer::Buffer::empty(area);
@@ -1407,6 +1456,7 @@ mod tests {
 
         assert!(text.contains("session warning"));
         assert!(!text.contains("input warning"));
+        assert!(!text.contains(TERMINAL_INPUT_CLOSED_NOTICE));
         Ok(())
     }
 

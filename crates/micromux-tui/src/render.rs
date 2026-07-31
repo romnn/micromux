@@ -730,8 +730,8 @@ impl App {
             status.session.name.bold(),
             format!(" ({})", status.session.config_path).into(),
         ]);
-        if let Some(notice) = status.notice.or_else(|| self.input_notice.clone()) {
-            spans.extend([" — ".into(), notice.fg(tailwind::RED.c400)]);
+        if let Some(notice) = status.notice.as_deref().or_else(|| self.terminal_notice()) {
+            spans.extend([" — ".into(), notice.to_string().fg(tailwind::RED.c400)]);
         }
         Some(Line::from(spans).centered())
     }
@@ -740,7 +740,7 @@ impl App {
         let notice = self
             .source
             .local_notice()
-            .or(self.input_notice.as_deref())?;
+            .or_else(|| self.terminal_notice())?;
         Some(
             Line::from(vec![
                 format!("micromux v{}", env!("CARGO_PKG_VERSION"))
@@ -751,6 +751,12 @@ impl App {
             ])
             .centered(),
         )
+    }
+
+    fn terminal_notice(&self) -> Option<&str> {
+        self.terminal_input_closed
+            .then_some(crate::TERMINAL_INPUT_CLOSED_NOTICE)
+            .or(self.input_notice.as_deref())
     }
 
     fn render_services(&self, area: Rect, buf: &mut Buffer) {

@@ -1011,11 +1011,16 @@ impl SchedulerRuntime {
     }
 
     fn record_input_drop(&mut self, service_id: &ServiceID, input_kind: &str, reason: &str) {
-        let report = self
-            .services
-            .get_mut(service_id)
-            .is_some_and(|runtime| runtime.input_drops.record(tokio::time::Instant::now()));
-        if !report {
+        let Some(runtime) = self.services.get_mut(service_id) else {
+            tracing::warn!(
+                service_id,
+                input_kind,
+                error = %reason,
+                "terminal input was discarded for an unknown service"
+            );
+            return;
+        };
+        if !runtime.input_drops.record(tokio::time::Instant::now()) {
             return;
         }
 

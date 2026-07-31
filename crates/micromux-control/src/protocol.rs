@@ -274,7 +274,7 @@ pub struct SessionCapabilities {
 }
 
 /// Current capacity, occupancy, and timeout history of the disk-log read pool.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema)]
 pub struct DiskLogReadHealth {
     /// Whether the pool has started its workers.
     #[serde(default = "default_initialized_disk_log_pool")]
@@ -295,6 +295,21 @@ pub struct DiskLogReadHealth {
     /// Requests that have exceeded the read deadline since this session started.
     #[serde(default)]
     pub timed_out_requests: usize,
+}
+
+impl Default for DiskLogReadHealth {
+    fn default() -> Self {
+        Self {
+            initialized: default_initialized_disk_log_pool(),
+            available: false,
+            workers: 0,
+            active: 0,
+            queue_capacity: 0,
+            queued: 0,
+            abandoned: 0,
+            timed_out_requests: 0,
+        }
+    }
 }
 
 const fn default_initialized_disk_log_pool() -> bool {
@@ -554,6 +569,7 @@ mod tests {
         assert!(health.initialized);
         assert_eq!(health.abandoned, 0);
         assert_eq!(health.timed_out_requests, 0);
+        assert_eq!(health.initialized, DiskLogReadHealth::default().initialized);
     }
 
     #[test]

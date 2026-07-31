@@ -133,6 +133,9 @@ impl BlockingLogReadPool {
     }
 
     async fn run(&self, read: impl FnOnce() -> Response + Send + 'static) -> Response {
+        if self.all_workers_abandoned() {
+            return self.saturated_response();
+        }
         let (response, wait) = tokio::sync::oneshot::channel();
         let Some(queue_permit) = self.reserve_queue_slot() else {
             return self.saturated_response();
@@ -172,6 +175,10 @@ impl BlockingLogReadPool {
                 )
             }
         }
+    }
+
+    fn all_workers_abandoned(&self) -> bool {
+        self.health.abandoned.load(Ordering::Relaxed) >= self.worker_count
     }
 
     fn reserve_queue_slot(&self) -> Option<QueuePermit> {
@@ -272,6 +279,10 @@ struct PoolRegistry {
 #[derive(Default)]
 struct PoolRegistryState {
     pool: Option<Arc<BlockingLogReadPool>>,
+    /// Whether the latest lazy start attempt failed.
+    ///
+    /// Health inspection reports the failure but never retries it because `Describe` must not spawn
+    /// workers. The next real disk read retries initialization.
     last_start_failed: bool,
 }
 
@@ -405,6 +416,9 @@ mod tests {
         })
         .await?;
 
+        // A healthy busy worker must still accept bounded queued work; only abandoned workers make
+        // the pool unusable.
+        assert!(!pool.health().available);
         let rejected = pool.run(|| Response::ShuttingDown).await;
 
         assert_matches!(
@@ -512,6 +526,16 @@ mod tests {
         assert_eq!(health.abandoned, 1);
         assert_eq!(health.timed_out_requests, 1);
         assert!(!health.available);
+        let rejected = pool.run(|| Response::ShuttingDown).await;
+        assert_matches!(
+            rejected,
+            Response::Error {
+                code: ErrorCode::Busy,
+                message,
+            } if message.contains("1 abandoned")
+        );
+        assert_eq!(pool.health().queued, 0);
+
         release.send(())?;
         tokio::time::timeout(Duration::from_secs(1), async {
             while pool.health().active != 0 {

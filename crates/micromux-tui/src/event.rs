@@ -13,6 +13,8 @@ const INPUT_QUEUE_CAPACITY: usize = 1024;
 pub enum Input {
     /// Crossterm events emitted by the terminal.
     Event(CrosstermEvent),
+    /// The terminal input stream reached EOF.
+    Closed,
 }
 
 impl std::fmt::Display for Input {
@@ -32,6 +34,7 @@ impl std::fmt::Display for Input {
                 write!(f, "Mouse({kind:?}, col={column}, row={row})")
             }
             other @ Self::Event(_) => std::fmt::Debug::fmt(other, f),
+            Self::Closed => f.write_str("Closed"),
         }
     }
 }
@@ -63,8 +66,8 @@ impl InputHandler {
 
     /// Receives the next terminal event.
     ///
-    /// The call remains pending after terminal EOF so losing stdin does not end the supervised
-    /// session.
+    /// Returns [`Input::Closed`] once after terminal EOF, then remains pending so losing stdin does
+    /// not end the supervised session.
     pub async fn next(&mut self) -> Input {
         if !self.started {
             self.started = true;
@@ -114,7 +117,10 @@ impl EventTask {
                     }
                 }
                 Some(Err(_)) => {}
-                None => break,
+                None => {
+                    let _ = self.send(Input::Closed).await;
+                    break;
+                }
               },
             }
         }
@@ -134,6 +140,8 @@ impl Default for InputHandler {
 
 #[cfg(test)]
 mod tests {
+    use std::assert_matches;
+
     use super::*;
     use color_eyre::eyre;
     use similar_asserts::assert_eq;
@@ -175,6 +183,10 @@ mod tests {
             >())
             .await;
 
+        assert_matches!(
+            tokio::time::timeout(Duration::from_millis(20), handler.next()).await,
+            Ok(Input::Closed)
+        );
         assert!(
             tokio::time::timeout(Duration::from_millis(20), handler.next())
                 .await
