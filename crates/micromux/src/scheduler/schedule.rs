@@ -206,9 +206,9 @@ fn finish_service_start(
     terminate: CancellationToken,
     #[cfg(test)] clear_logs: bool,
     result: Result<pty::StartedPty, pty::Error>,
-) {
+) -> bool {
     let Some(runtime) = ctx.runtimes.get_mut(service_id) else {
-        return;
+        return false;
     };
     match result {
         Ok(started) => {
@@ -242,6 +242,7 @@ fn finish_service_start(
                     service_id: service_id.clone(),
                 });
             }
+            true
         }
         Err(err) => {
             tracing::error!(?err, service_id, "failed to start service");
@@ -274,6 +275,7 @@ fn finish_service_start(
             #[cfg(test)]
             ctx.test_events
                 .forward(Event::Exited(service_id.clone(), -1));
+            false
         }
     }
 }
@@ -283,17 +285,15 @@ fn start_service_if_ready(
     service_id: &ServiceID,
     service: &crate::service::Service,
     exited_code: Option<i32>,
-) {
-    let blocked = blocking_dependencies(ctx, service);
-    if !blocked.is_empty() {
-        record_dependency_block(ctx, service_id, service, &blocked);
-        return;
+) -> bool {
+    if !blocking_dependencies(ctx, service).is_empty() {
+        return false;
     }
 
     tracing::info!(service_id, "starting service");
 
     let Some(runtime) = ctx.runtimes.get_mut(service_id) else {
-        return;
+        return false;
     };
     if !runtime.blocked_on.is_empty() {
         runtime.blocked_on.clear();
@@ -348,26 +348,52 @@ fn start_service_if_ready(
         #[cfg(test)]
         clear_logs,
         result,
-    );
+    )
+}
+
+/// Records only blockers that remain after every startable dependency has been started.
+///
+/// Recording during an intermediate fixed-point pass would expose declaration order as a
+/// short-lived `Blocked` state even when all dependencies start in the same scheduling operation.
+fn record_stable_dependency_blocks(ctx: &mut ScheduleContext<'_>) {
+    for (service_id, service) in ctx.services {
+        let StartCheck::Consider { .. } = should_consider_start(ctx, service_id, service) else {
+            continue;
+        };
+        let blocked = blocking_dependencies(ctx, service);
+        if !blocked.is_empty() {
+            record_dependency_block(ctx, service_id, service, &blocked);
+        }
+    }
 }
 
 pub(super) fn schedule_ready(ctx: &mut ScheduleContext<'_>) {
-    for (service_id, service) in ctx.services {
-        let exited_code = match should_consider_start(ctx, service_id, service) {
-            StartCheck::Skip => {
-                clear_dependency_block(ctx, service_id, service);
-                continue;
-            }
-            StartCheck::Consider { exited_code } => exited_code,
-        };
+    loop {
+        let mut started = false;
+        for (service_id, service) in ctx.services {
+            let exited_code = match should_consider_start(ctx, service_id, service) {
+                StartCheck::Skip => {
+                    clear_dependency_block(ctx, service_id, service);
+                    continue;
+                }
+                StartCheck::Consider { exited_code } => exited_code,
+            };
 
-        tracing::debug!(
-            service_id,
-            state = ?ctx.runtimes.get(service_id).map(|runtime| &runtime.state),
-            "evaluating service"
-        );
+            tracing::debug!(
+                service_id,
+                state = ?ctx.runtimes.get(service_id).map(|runtime| &runtime.state),
+                "evaluating service"
+            );
 
-        start_service_if_ready(ctx, service_id, service, exited_code);
+            started |= start_service_if_ready(ctx, service_id, service, exited_code);
+        }
+        // A successful start is the only synchronous transition that can unblock an earlier
+        // candidate. Health and exit changes arrive later as events, so successful starts alone
+        // participate in this bounded fixed-point pass.
+        if !started {
+            record_stable_dependency_blocks(ctx);
+            break;
+        }
     }
 }
 

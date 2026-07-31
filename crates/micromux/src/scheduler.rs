@@ -1165,6 +1165,9 @@ impl SchedulerRuntime {
                 }
             };
 
+            if self.shutdown.is_cancelled() {
+                break;
+            }
             // Retirement can become evictable only after later process/log-reader events arrive,
             // so enforce the bounded tombstone roster after every scheduler wake rather than only
             // on insertion.
@@ -1801,9 +1804,8 @@ impl SchedulerRuntime {
                 return;
             }
             let depended_on = services
-                .iter()
-                .filter(|(id, _)| self.services.get(*id).is_some_and(ServiceRuntime::is_live))
-                .flat_map(|(_, service)| {
+                .values()
+                .flat_map(|service| {
                     service
                         .spec
                         .depends_on
@@ -1840,12 +1842,17 @@ impl SchedulerRuntime {
     where
         F: Future<Output = Result<ServiceMap, String>>,
     {
-        // Exit handling must keep freeing event-channel capacity while a slow filesystem reloads
-        // configuration; applying the completed candidate remains serialized on this task.
+        // Process exits must keep freeing event-channel capacity during a slow reload, while
+        // shutdown must stop waiting so service termination is not coupled to filesystem liveness.
+        // Applying a completed candidate remains serialized on this task.
         tokio::pin!(load);
         let mut events_open = true;
         loop {
             tokio::select! {
+                biased;
+                () = self.shutdown.cancelled() => {
+                    return Err("config reload interrupted by session shutdown".to_string());
+                }
                 result = &mut load => return result,
                 event = events_rx.recv(), if events_open => {
                     if let Some(event) = event {
@@ -2204,7 +2211,9 @@ impl SchedulerRuntime {
         if self.reload_config.is_none() || !self.has_due_auto_restart(services) {
             return;
         }
-        if let Err(err) = self.reload_services(services, events_rx).await {
+        if let Err(err) = self.reload_services(services, events_rx).await
+            && !self.shutdown.is_cancelled()
+        {
             tracing::warn!(
                 ?err,
                 "config reload before automatic restart failed; keeping previous service definitions"
@@ -2218,6 +2227,9 @@ impl SchedulerRuntime {
         events_rx: &mut mpsc::Receiver<ProcessEvent>,
     ) {
         self.reload_before_auto_restart(services, events_rx).await;
+        if self.shutdown.is_cancelled() {
+            return;
+        }
         schedule::schedule_ready(&mut schedule::ScheduleContext {
             services,
             runtimes: &mut self.services,

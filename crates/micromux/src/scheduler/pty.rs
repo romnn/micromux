@@ -648,10 +648,14 @@ enum AnsiState {
     Charset,
 }
 
+/// Maximum control-sequence payload before capture resumes in visible-text mode.
+pub(super) const ANSI_SEQUENCE_PAYLOAD_MAX_BYTES: usize = 1024;
+
 struct AnsiFilter {
     state: AnsiState,
     esc_seen: bool,
     csi_buf: Vec<u8>,
+    string_len: usize,
 }
 
 impl AnsiFilter {
@@ -660,13 +664,62 @@ impl AnsiFilter {
             state: AnsiState::Ground,
             esc_seen: false,
             csi_buf: Vec::new(),
+            string_len: 0,
         }
     }
 
-    /// Feed one byte into the filter. Printable text and SGR color
-    /// sequences are appended to `out`. Returns `true` when a
-    /// screen-clearing CSI sequence just finished, signalling the caller to flush accumulated
-    /// text. Other cursor/progress controls are filtered but do not change the log record mode:
+    const fn captures_line_break(&self) -> bool {
+        matches!(self.state, AnsiState::Ground)
+    }
+
+    fn finish_string(&mut self) {
+        self.state = AnsiState::Ground;
+        self.esc_seen = false;
+        self.string_len = 0;
+    }
+
+    fn advance_string_len(&mut self) -> bool {
+        self.string_len = self.string_len.saturating_add(1);
+        if self.string_len > ANSI_SEQUENCE_PAYLOAD_MAX_BYTES {
+            self.finish_string();
+            return false;
+        }
+        true
+    }
+
+    fn push_string(&mut self, b: u8) {
+        if self.esc_seen {
+            self.esc_seen = false;
+            if b == b'\\' {
+                self.finish_string();
+                return;
+            }
+            // The preceding ESC was payload rather than the first half of the ST terminator.
+            if !self.advance_string_len() {
+                return;
+            }
+        }
+        if b == 0x9c {
+            self.finish_string();
+            return;
+        }
+        if self.state == AnsiState::Osc && b == 0x07 {
+            self.finish_string();
+            return;
+        }
+        if b == 0x1b {
+            self.esc_seen = true;
+        } else {
+            let _ = self.advance_string_len();
+        }
+    }
+
+    /// Feeds one byte into the filter.
+    ///
+    /// Printable text and SGR color sequences are appended to `out`. Returns `true` when a
+    /// screen-clearing CSI sequence finishes, signalling the caller to flush accumulated text.
+    ///
+    /// Other cursor and progress controls are filtered without changing the log record mode;
     /// wrapping belongs to the TUI renderer, not to captured service logs.
     fn push(&mut self, b: u8, out: &mut Vec<u8>) -> bool {
         match self.state {
@@ -694,18 +747,22 @@ impl AnsiFilter {
                     b']' => {
                         self.state = AnsiState::Osc;
                         self.esc_seen = false;
+                        self.string_len = 0;
                     }
                     b'P' => {
                         self.state = AnsiState::Dcs;
                         self.esc_seen = false;
+                        self.string_len = 0;
                     }
                     b'^' => {
                         self.state = AnsiState::Pm;
                         self.esc_seen = false;
+                        self.string_len = 0;
                     }
                     b'_' => {
                         self.state = AnsiState::Apc;
                         self.esc_seen = false;
+                        self.string_len = 0;
                     }
                     b'(' | b')' | b'*' | b'+' | b'-' | b'.' | b'/' | b'%' | b'#' => {
                         self.state = AnsiState::Charset;
@@ -720,7 +777,7 @@ impl AnsiFilter {
             }
             AnsiState::Csi => {
                 self.csi_buf.push(b);
-                if self.csi_buf.len() > 1024 {
+                if self.csi_buf.len() > ANSI_SEQUENCE_PAYLOAD_MAX_BYTES + 2 {
                     self.csi_buf.clear();
                     self.state = AnsiState::Ground;
                     return false;
@@ -740,20 +797,7 @@ impl AnsiFilter {
                 }
             }
             AnsiState::Osc | AnsiState::Dcs | AnsiState::Pm | AnsiState::Apc => {
-                if self.esc_seen {
-                    self.esc_seen = false;
-                    if b == b'\\' {
-                        self.state = AnsiState::Ground;
-                        return false;
-                    }
-                }
-                if self.state == AnsiState::Osc && b == 0x07 {
-                    self.state = AnsiState::Ground;
-                    return false;
-                }
-                if b == 0x1b {
-                    self.esc_seen = true;
-                }
+                self.push_string(b);
                 false
             }
         }
@@ -1611,29 +1655,8 @@ fn spawn_log_reader_thread(args: LogReaderArgs) {
                 continue;
             };
 
-            processor.advance(&mut term, chunk);
-
-            let alt_screen = term.mode().contains(TermMode::ALT_SCREEN);
-            if alt_screen != last_alt_screen {
-                last_alt_screen = alt_screen;
-                rate.set_alt_screen(alt_screen);
-                snapshot_mode = alt_screen;
-                dirty = alt_screen;
-                if alt_screen {
-                    flush_record(&mut line, &sink);
-                } else {
-                    line.clear();
-                }
-                // The mode switch ends the current line record, so a CR seen before the flip must
-                // not carry over and swallow the next newline once we are back in line mode.
-                prev_was_cr = false;
-                pending_cr_blank = false;
-            }
-            if snapshot_mode {
-                dirty = true;
-            }
-
             for &b in chunk {
+                let line_break_is_visible = !snapshot_mode && filter.captures_line_break();
                 match b {
                     // \r and \n both terminate a line. A \r\n pair is coalesced (the \r flushes,
                     // the trailing \n is swallowed) so it produces one record, while a lone \n
@@ -1645,22 +1668,20 @@ fn spawn_log_reader_thread(args: LogReaderArgs) {
                     // after it produces nothing. This absorbs the duplicated CR that BSD/macOS tty
                     // drivers emit around an ONLCR-expanded `\r\n` under load — whichever side of
                     // the pair the duplicate lands on — while keeping genuine blank lines intact.
-                    b'\r' => {
-                        if !snapshot_mode {
-                            if line.is_empty() {
-                                // Successive CRs collapse: after a CR the cursor is already at
-                                // column 0, so returning it again cannot open another record.
-                                if !prev_was_cr {
-                                    pending_cr_blank = true;
-                                }
-                            } else {
-                                flush_record(&mut line, &sink);
+                    b'\r' if line_break_is_visible => {
+                        if line.is_empty() {
+                            // Successive CRs collapse: after a CR the cursor is already at
+                            // column 0, so returning it again cannot open another record.
+                            if !prev_was_cr {
+                                pending_cr_blank = true;
                             }
+                        } else {
+                            flush_record(&mut line, &sink);
                         }
                         prev_was_cr = true;
                     }
-                    b'\n' => {
-                        if !snapshot_mode && (pending_cr_blank || !prev_was_cr) {
+                    b'\n' if line_break_is_visible => {
+                        if pending_cr_blank || !prev_was_cr {
                             flush_record(&mut line, &sink);
                         }
                         pending_cr_blank = false;
@@ -1683,6 +1704,30 @@ fn spawn_log_reader_thread(args: LogReaderArgs) {
                             flush_bounded(&mut line, &sink);
                         }
                     }
+                }
+
+                // Consume the byte in the mode that was active when its control sequence began.
+                // The final byte of an alt-screen transition completes that sequence; switching
+                // capture first would strand the line-mode ANSI filter in its intermediate state.
+                processor.advance(&mut term, std::slice::from_ref(&b));
+                let alt_screen = term.mode().contains(TermMode::ALT_SCREEN);
+                if alt_screen != last_alt_screen {
+                    last_alt_screen = alt_screen;
+                    rate.set_alt_screen(alt_screen);
+                    snapshot_mode = alt_screen;
+                    dirty = alt_screen;
+                    if alt_screen && !line.is_empty() {
+                        flush_record(&mut line, &sink);
+                    } else {
+                        line.clear();
+                    }
+                    // The mode switch ends the current line record, so a CR seen before the flip
+                    // must not carry over and swallow the next newline once line mode resumes.
+                    prev_was_cr = false;
+                    pending_cr_blank = false;
+                }
+                if snapshot_mode {
+                    dirty = true;
                 }
             }
 
@@ -2260,6 +2305,58 @@ mod tests {
                 run_id: finished_run_id,
             }) if finished_service_id == service_id && finished_run_id == run_id
         );
+    }
+
+    #[test]
+    fn ansi_filter_recovers_from_unterminated_string_sequences() {
+        for introducer in *b"]P^_" {
+            let mut filter = AnsiFilter::new();
+            let mut output = Vec::new();
+            for byte in [0x1b, introducer]
+                .into_iter()
+                .chain(std::iter::repeat_n(
+                    b'x',
+                    ANSI_SEQUENCE_PAYLOAD_MAX_BYTES + 1,
+                ))
+                .chain(*b"visible")
+            {
+                let _ = filter.push(byte, &mut output);
+            }
+            assert_eq!(output, b"visible");
+        }
+    }
+
+    #[test]
+    fn ansi_filter_recognizes_string_terminators_across_reads() {
+        let mut filter = AnsiFilter::new();
+        let mut output = Vec::new();
+        for byte in b"\x1b]title\x1b" {
+            let _ = filter.push(*byte, &mut output);
+        }
+        for byte in b"\\visible" {
+            let _ = filter.push(*byte, &mut output);
+        }
+
+        assert_eq!(output, b"visible");
+
+        let mut filter = AnsiFilter::new();
+        let mut output = Vec::new();
+        for byte in b"\x1b]title\x9cvisible" {
+            let _ = filter.push(*byte, &mut output);
+        }
+        assert_eq!(output, b"visible");
+
+        let mut filter = AnsiFilter::new();
+        let mut output = Vec::new();
+        for byte in b"\x1b]"
+            .iter()
+            .copied()
+            .chain(std::iter::repeat_n(b'x', ANSI_SEQUENCE_PAYLOAD_MAX_BYTES))
+            .chain(*b"\x1b\\visible")
+        {
+            let _ = filter.push(byte, &mut output);
+        }
+        assert_eq!(output, b"visible");
     }
 
     #[cfg(unix)]

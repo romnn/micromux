@@ -3,6 +3,7 @@ use crate::config;
 use crate::service::Service;
 use crate::test_util::{service_config, spanned_string, unique_tmp_dir};
 use color_eyre::eyre;
+use std::assert_matches;
 use std::fs;
 use std::path::{Path, PathBuf};
 use tokio::time::{Duration, timeout};
@@ -178,6 +179,43 @@ async fn config_reload_wait_keeps_draining_process_events() -> eyre::Result<()> 
         .map_err(|err| eyre::eyre!(err))?;
 
     assert!(loaded.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn config_reload_wait_yields_to_session_shutdown() -> eyre::Result<()> {
+    let services = ServiceMap::default();
+    let (_reader, writer) = crate::model::new(crate::initial_model_entries(&services));
+    let (events_tx, mut events_rx) = mpsc::channel(1);
+    let (test_events_tx, _test_events_rx) = mpsc::channel(1);
+    let shutdown = CancellationToken::new();
+    let mut runtime = SchedulerRuntime::new(
+        &services,
+        SchedulerResources {
+            reload_config: None,
+            events_tx,
+            test_events: TestEventSink::new(test_events_tx),
+            writer,
+            shutdown: shutdown.clone(),
+            config_dir: PathBuf::new(),
+            dynamic_policy: DynamicServicesPolicy::default(),
+            default_log_retention: LogRetention::default(),
+        },
+    );
+    shutdown.cancel();
+
+    let result = runtime
+        .await_loaded_services(
+            &services,
+            &mut events_rx,
+            std::future::pending::<Result<ServiceMap, String>>(),
+        )
+        .await;
+
+    assert_matches!(
+        result,
+        Err(error) if error == "config reload interrupted by session shutdown"
+    );
     Ok(())
 }
 
@@ -1384,6 +1422,92 @@ async fn retired_eviction_keeps_live_dependency_targets() -> eyre::Result<()> {
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+
+    harness.shutdown.cancel();
+    harness.handle.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn retired_eviction_keeps_dependencies_until_their_dependents_are_evicted() -> eyre::Result<()>
+{
+    let dir = tempfile::tempdir()?;
+    let mut policy = enabled_dynamic_policy(dir.path())?;
+    policy.max_services = MAX_RETIRED_SERVICES + 4;
+    let harness =
+        spawn_harness_with_policy(ServiceMap::new(), None, dir.path().to_path_buf(), policy);
+
+    dynamic_accepted(
+        harness
+            .control
+            .start_dynamic(dynamic_params("anchor", &["sh", "-c", "sleep 60"]))
+            .await,
+    )?;
+    let mut dependent = dynamic_params("dependent", &["sh", "-c", "sleep 60"]);
+    dependent.spec.depends_on = Some(vec![crate::DependencySpec {
+        service: "anchor".to_string(),
+        condition: config::DependencyCondition::Started,
+    }]);
+    dynamic_accepted(harness.control.start_dynamic(dependent).await)?;
+    wait_until(&harness.reader, "dependent", |snapshot| {
+        snapshot.execution == Execution::Running
+    })
+    .await?;
+
+    dynamic_accepted(harness.control.stop_dynamic(&"dependent".to_string()).await)?;
+    dynamic_accepted(harness.control.stop_dynamic(&"anchor".to_string()).await)?;
+
+    // Create exactly one excess tombstone. Removing both sides of the dependency would hide an
+    // invalid intermediate graph.
+    for index in 0..(MAX_RETIRED_SERVICES - 1) {
+        let id = format!("disposable-{index:02}");
+        dynamic_accepted(
+            harness
+                .control
+                .start_dynamic(dynamic_params(&id, &["true"]))
+                .await,
+        )?;
+        wait_until(&harness.reader, &id, |snapshot| {
+            snapshot.execution == Execution::Exited
+        })
+        .await?;
+        dynamic_accepted(harness.control.stop_dynamic(&id).await)?;
+    }
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let snapshots = harness.reader.services();
+        let retired = snapshots
+            .iter()
+            .filter(|snapshot| snapshot.retired.is_some())
+            .count();
+        if retired <= MAX_RETIRED_SERVICES {
+            let has_anchor = snapshots.iter().any(|snapshot| snapshot.id == "anchor");
+            let has_dependent = snapshots.iter().any(|snapshot| snapshot.id == "dependent");
+            // Any surviving dependent must retain its dependency so later graph validation remains
+            // usable.
+            assert!(
+                !has_dependent || has_anchor,
+                "retired eviction left a dangling dependency"
+            );
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            eyre::bail!("retired dynamic roster did not return to its bounded size");
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    dynamic_accepted(
+        harness
+            .control
+            .start_dynamic(dynamic_params("after-eviction", &["true"]))
+            .await,
+    )?;
+    wait_until(&harness.reader, "after-eviction", |snapshot| {
+        snapshot.execution == Execution::Exited
+    })
+    .await?;
 
     harness.shutdown.cancel();
     harness.handle.await??;
@@ -3487,6 +3611,55 @@ async fn disabling_dependency_blocks_pending_dependents_immediately() -> eyre::R
     Ok(())
 }
 
+#[tokio::test]
+async fn started_dependencies_schedule_independently_of_declaration_order() -> eyre::Result<()> {
+    let config_dir = Path::new(".");
+    let mut services = ServiceMap::new();
+    let mut app_cfg = service_config("app", ("sh", &["-c", "sleep 60"]));
+    app_cfg.depends_on = vec![config::Dependency {
+        name: spanned_string("dep"),
+        condition: Some(Spanned {
+            span: yaml_spanned::spanned::Span::default(),
+            inner: config::DependencyCondition::Started,
+        }),
+    }];
+    services.insert("app".to_string(), Service::new("app", config_dir, app_cfg)?);
+    services.insert(
+        "dep".to_string(),
+        Service::new(
+            "dep",
+            config_dir,
+            service_config("dep", ("sh", &["-c", "sleep 60"])),
+        )?,
+    );
+    let harness = spawn_harness(services, None);
+
+    wait_until(&harness.reader, "app", |snapshot| {
+        snapshot.execution == Execution::Running
+    })
+    .await?;
+    assert_eq!(
+        harness
+            .reader
+            .service("dep")
+            .map(|snapshot| snapshot.execution),
+        Some(Execution::Running)
+    );
+    assert!(
+        !harness
+            .reader
+            .events("app", None, None)
+            .0
+            .iter()
+            .any(|event| event.kind == ServiceEventKind::DependencyBlocked),
+        "declaration order surfaced as a transient dependency block"
+    );
+
+    harness.shutdown.cancel();
+    harness.handle.await??;
+    Ok(())
+}
+
 /// A dependent held back by `restart_all` is the case that reads as a bug without either half of
 /// this: the sidebar would report the state it happens to be idling in (`Exited`), and its log would
 /// simply stop mid-run with nothing to say why.
@@ -3625,6 +3798,73 @@ async fn non_alt_screen_control_sequences_keep_raw_log_records() -> eyre::Result
         .ok_or_else(|| eyre::eyre!("missing structured log record"))?;
     assert_eq!(line.line, json);
     assert_eq!(line.line.find('\n'), None);
+
+    harness.shutdown.cancel();
+    harness.handle.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn alt_screen_transitions_classify_bytes_at_the_transition_point() -> eyre::Result<()> {
+    let config_dir = Path::new(".");
+    let mut services = ServiceMap::new();
+    services.insert(
+        "svc".to_string(),
+        Service::new(
+            "svc",
+            config_dir,
+            service_config(
+                "svc",
+                (
+                    "sh",
+                    &[
+                        "-c",
+                        "printf 'before\\n\\033[?1049hinside\\033[?1049lafter\\n'",
+                    ],
+                ),
+            ),
+        )?,
+    );
+    let harness = spawn_harness(services, None);
+
+    wait_for_log(&harness.reader, "svc", "after").await?;
+    let logs = harness.reader.logs("svc", None);
+    assert!(logs.iter().any(|line| line.line == "before"));
+    assert!(logs.iter().any(|line| line.line == "after"));
+    assert!(!logs.iter().any(|line| line.line.contains("inside")));
+    assert!(!logs.iter().any(|line| line.line.is_empty()));
+
+    harness.shutdown.cancel();
+    harness.handle.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn unterminated_ansi_strings_recover_across_line_breaks() -> eyre::Result<()> {
+    let config_dir = Path::new(".");
+    let mut services = ServiceMap::new();
+    let line_breaks = pty::ANSI_SEQUENCE_PAYLOAD_MAX_BYTES + 1;
+    // Disable newline translation so each emitted byte advances the filter's recovery bound once.
+    let script = format!(
+        "stty -onlcr; printf '\\033]'; i=0; while [ \"$i\" -lt {line_breaks} ]; do printf '\\n'; i=$((i + 1)); done; printf 'visible\\n'"
+    );
+    services.insert(
+        "svc".to_string(),
+        Service::new(
+            "svc",
+            config_dir,
+            service_config("svc", ("sh", &["-c", script.as_str()])),
+        )?,
+    );
+    let harness = spawn_harness(services, None);
+
+    wait_for_log(&harness.reader, "svc", "visible").await?;
+    let logs = harness.reader.logs("svc", None);
+    assert!(logs.iter().any(|line| line.line == "visible"));
+    assert!(
+        !logs.iter().any(|line| line.line.is_empty()),
+        "control-sequence line breaks escaped as blank log records"
+    );
 
     harness.shutdown.cancel();
     harness.handle.await??;
