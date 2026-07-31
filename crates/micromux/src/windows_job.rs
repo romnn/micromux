@@ -25,43 +25,88 @@ pub(crate) fn attach_kill_on_close(process: isize) -> Result<win32job::Job, Erro
 
 #[cfg(test)]
 mod tests {
+    use std::fs::OpenOptions;
+    use std::os::windows::fs::OpenOptionsExt as _;
     use std::os::windows::io::AsRawHandle as _;
+    use std::path::PathBuf;
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
 
     use color_eyre::eyre;
 
-    fn powershell_literal(path: &std::path::Path) -> String {
-        path.to_string_lossy().replace('\'', "''")
+    const PARENT_HELPER: &str = "windows_job::tests::job_tree_parent_helper";
+    const DESCENDANT_HELPER: &str = "windows_job::tests::job_tree_descendant_helper";
+    const GATE_ENV: &str = "MICROMUX_WINDOWS_JOB_TEST_GATE";
+    const HELD_FILE_ENV: &str = "MICROMUX_WINDOWS_JOB_TEST_HELD_FILE";
+    const READY_FILE_ENV: &str = "MICROMUX_WINDOWS_JOB_TEST_READY_FILE";
+    const HELPER_TIMEOUT: Duration = Duration::from_secs(30);
+
+    fn required_path(name: &str) -> eyre::Result<PathBuf> {
+        std::env::var_os(name)
+            .map(PathBuf::from)
+            .ok_or_else(|| eyre::eyre!("missing {name}"))
     }
 
-    fn process_exists(pid: u32) -> eyre::Result<bool> {
-        let output = Command::new("tasklist.exe")
-            .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"]) // spellcheck:ignore-line
-            .output()?;
-        let pid = pid.to_string();
-        Ok(String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .filter_map(|line| line.split(',').nth(1))
-            .any(|field| field.trim_matches('"') == pid))
+    fn helper_command(test: &str) -> eyre::Result<Command> {
+        let mut command = Command::new(std::env::current_exe()?);
+        command.args([
+            "--ignored",
+            "--exact",
+            test,
+            "--nocapture",
+            "--test-threads=1",
+        ]);
+        Ok(command)
+    }
+
+    #[test]
+    #[ignore = "spawned by dropping_job_terminates_an_attached_process_tree"]
+    fn job_tree_parent_helper() -> eyre::Result<()> {
+        let gate = required_path(GATE_ENV)?;
+        let deadline = Instant::now() + HELPER_TIMEOUT;
+        while !gate.exists() {
+            if Instant::now() >= deadline {
+                eyre::bail!("timed out waiting for the job-assignment gate");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let mut descendant = helper_command(DESCENDANT_HELPER)?
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?;
+        let _status = descendant.wait()?;
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "spawned by job_tree_parent_helper"]
+    fn job_tree_descendant_helper() -> eyre::Result<()> {
+        let held_file = required_path(HELD_FILE_ENV)?;
+        let ready_file = required_path(READY_FILE_ENV)?;
+        let _held = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .share_mode(0)
+            .open(held_file)?;
+        std::fs::write(ready_file, b"ready")?;
+        std::thread::sleep(Duration::from_mins(5));
+        Ok(())
     }
 
     #[test]
     fn dropping_job_terminates_an_attached_process_tree() -> eyre::Result<()> {
         let directory = tempfile::tempdir()?;
         let gate = directory.path().join("start");
-        let child_pid = directory.path().join("child.pid");
-        let script = format!(
-            "while (-not (Test-Path -LiteralPath '{}')) {{ Start-Sleep -Milliseconds 10 }}; \
-             $child = Start-Process -FilePath 'powershell.exe' -ArgumentList \
-             '-NoProfile','-Command','Start-Sleep -Seconds 300' -PassThru; \
-             Set-Content -LiteralPath '{}' -Value $child.Id -NoNewline; \
-             Wait-Process -Id $child.Id",
-            powershell_literal(&gate),
-            powershell_literal(&child_pid),
-        );
-        let mut parent = Command::new("powershell.exe")
-            .args(["-NoProfile", "-Command", &script])
+        let held_file = directory.path().join("held");
+        let ready_file = directory.path().join("ready");
+        let mut parent = helper_command(PARENT_HELPER)?
+            .env(GATE_ENV, &gate)
+            .env(HELD_FILE_ENV, &held_file)
+            .env(READY_FILE_ENV, &ready_file)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -76,24 +121,30 @@ mod tests {
         };
         // Hold the parent behind the gate until assignment so its descendant must inherit the job.
         std::fs::write(&gate, b"go")?;
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let descendant = loop {
-            if let Ok(raw_pid) = std::fs::read_to_string(&child_pid)
-                && let Ok(pid) = raw_pid.parse::<u32>()
-            {
-                break pid;
+        let deadline = Instant::now() + HELPER_TIMEOUT;
+        while !ready_file.exists() {
+            if let Some(status) = parent.try_wait()? {
+                eyre::bail!("the attached parent exited before its descendant was ready: {status}");
             }
             if Instant::now() >= deadline {
                 eyre::bail!("the attached parent did not create its descendant");
             }
             std::thread::sleep(Duration::from_millis(10));
-        };
-        assert!(process_exists(descendant)?);
+        }
+        // The exclusive handle follows this exact descendant; a numeric PID can be recycled while
+        // teardown is still being polled.
+        if std::fs::remove_file(&held_file).is_ok() {
+            eyre::bail!("the descendant did not retain its exclusive file handle");
+        }
 
         drop(job);
 
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while parent.try_wait()?.is_none() || process_exists(descendant)? {
+        let deadline = Instant::now() + HELPER_TIMEOUT;
+        let mut descendant_exited = false;
+        while parent.try_wait()?.is_none() || !descendant_exited {
+            if !descendant_exited {
+                descendant_exited = std::fs::remove_file(&held_file).is_ok();
+            }
             if Instant::now() >= deadline {
                 eyre::bail!("dropping the job did not terminate the full process tree");
             }
