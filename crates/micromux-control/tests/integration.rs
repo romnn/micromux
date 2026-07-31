@@ -721,6 +721,51 @@ async fn endpoint_owner_lock_probe_is_read_only() -> eyre::Result<()> {
 }
 
 #[tokio::test]
+async fn endpoint_owner_probes_do_not_report_other_probes_as_owners() -> eyre::Result<()> {
+    let dir = unique_dir("owner-lock-shared")?;
+    let socket_path = dir.path().join("owned.sock");
+    let endpoint = ControlEndpoint::Unix(socket_path.clone());
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(socket_path.with_extension("lock"))?;
+    fs2::FileExt::try_lock_shared(&lock_file)?;
+
+    assert!(!endpoint_owner_lock_held(&endpoint)?);
+    Ok(())
+}
+
+#[tokio::test]
+async fn endpoint_startup_waits_for_an_overlapping_owner_probe() -> eyre::Result<()> {
+    let dir = unique_dir("owner-lock-race")?;
+    let socket_path = dir.path().join("owned.sock");
+    let endpoint = ControlEndpoint::Unix(socket_path.clone());
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(socket_path.with_extension("lock"))?;
+    fs2::FileExt::try_lock_shared(&lock_file)?;
+    // Keep the shared lock long enough for `bind` to observe it, then release it within the
+    // diagnostic-probe grace period.
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        drop(lock_file);
+    });
+
+    let guard = bind(&endpoint)?;
+    release
+        .join()
+        .map_err(|_| eyre::eyre!("owner-probe release thread panicked"))?;
+
+    assert!(guard.is_some(), "a transient owner probe blocked startup");
+    Ok(())
+}
+
+#[tokio::test]
 async fn subscribe_streams_liveness_changes() -> eyre::Result<()> {
     let dir = unique_dir("subscribe")?;
     let session = build_session(dir.path(), "sleep 60")?;

@@ -6,7 +6,7 @@ use std::sync::Arc;
 use futures::{SinkExt, StreamExt};
 use micromux::{
     ChangeKind, CommandRejection, SchedulerStopped, ServiceCommandResult, ServiceSnapshot,
-    SessionChange, SessionModelReader, trim_to_last_bytes,
+    SessionChange, SessionModelReader,
 };
 use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -55,6 +55,9 @@ const UNSOLICITED_SUBSCRIPTION_FRAME_WINDOW: std::time::Duration =
     std::time::Duration::from_mins(1);
 /// A stalled subscriber must release its connection permit promptly.
 const SUBSCRIPTION_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+/// Grace for a diagnostic shared lock to clear before startup concludes that an owner exists.
+const OWNER_PROBE_LOCK_GRACE: std::time::Duration = std::time::Duration::from_millis(50);
+const OWNER_PROBE_LOCK_RETRY: std::time::Duration = std::time::Duration::from_millis(1);
 
 #[derive(Clone, Copy)]
 struct SubscriptionPolicy {
@@ -190,10 +193,8 @@ fn bind_unix(
 
     // The lifetime-held lock is the authoritative ownership signal — more robust than connect-probing
     // a possibly-wedged listener. "lock acquirable" ⇔ "no live owner".
-    match fs2::FileExt::try_lock_exclusive(&lock_file) {
-        Ok(()) => {}
-        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
-        Err(err) => return Err(err.into()),
+    if !try_lock_endpoint_owner(&lock_file)? {
+        return Ok(None);
     }
 
     // We hold the lock ⇒ no live owner: unlink any crash-leaked socket and bind.
@@ -214,6 +215,27 @@ fn bind_unix(
     }))
 }
 
+/// Acquires the endpoint lock after allowing an overlapping diagnostic probe to finish.
+///
+/// BSD `flock` has no non-mutating ownership query. Probes therefore take a shared lock briefly,
+/// and startup gives that transient reader time to clear before treating contention as ownership.
+fn try_lock_endpoint_owner(lock_file: &std::fs::File) -> std::io::Result<bool> {
+    let deadline = std::time::Instant::now() + OWNER_PROBE_LOCK_GRACE;
+    loop {
+        match fs2::FileExt::try_lock_exclusive(lock_file) {
+            Ok(()) => return Ok(true),
+            Err(err)
+                if err.kind() == std::io::ErrorKind::WouldBlock
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(OWNER_PROBE_LOCK_RETRY);
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => return Ok(false),
+            Err(err) => return Err(err),
+        }
+    }
+}
+
 fn owner_lock_held_unix(socket_path: &Path) -> Result<bool, ControlError> {
     let lock_path = socket_path.with_extension("lock");
     let lock_file = match std::fs::OpenOptions::new()
@@ -226,7 +248,7 @@ fn owner_lock_held_unix(socket_path: &Path) -> Result<bool, ControlError> {
         Err(err) => return Err(err.into()),
     };
 
-    match fs2::FileExt::try_lock_exclusive(&lock_file) {
+    match fs2::FileExt::try_lock_shared(&lock_file) {
         Ok(()) => Ok(false),
         Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => Ok(true),
         Err(err) => Err(err.into()),
@@ -617,8 +639,9 @@ fn get_events(
         return unknown_service(service);
     }
     let requested_tail = tail.unwrap_or(DEFAULT_EVENT_TAIL);
-    let (events, truncated) =
+    let (mut events, mut truncated) =
         reader.events(service, after, Some(requested_tail.min(MAX_EVENT_TAIL)));
+    bound_events(&mut events, &mut truncated, after.is_none());
     Response::Events { events, truncated }
 }
 
@@ -953,11 +976,14 @@ fn encoded_len(value: &impl Serialize) -> Option<usize> {
 }
 
 fn bound_health_attempt(attempt: &mut Option<micromux::HealthAttempt>) {
+    if health_response_fits(attempt.as_ref()) {
+        return;
+    }
     let Some(attempt) = attempt else {
         return;
     };
 
-    bound_health_attempt_to(attempt, RESPONSE_MAX_BYTES);
+    trim_health_attempt_to_fit(attempt, |attempt| health_response_fits(Some(attempt)));
 }
 
 fn get_health_history(reader: &SessionModelReader, service: &str) -> Response {
@@ -969,57 +995,140 @@ fn get_health_history(reader: &SessionModelReader, service: &str) -> Response {
     Response::HealthHistory { attempts }
 }
 
-fn bound_health_attempt_to(attempt: &mut micromux::HealthAttempt, max_bytes: usize) {
-    let mut total = attempt.command.len()
-        + attempt
-            .output
-            .iter()
-            .map(|line| line.line.len())
-            .sum::<usize>();
-    let mut drop_count = 0;
-    for line in &attempt.output {
-        if total <= max_bytes {
-            break;
-        }
-        total = total.saturating_sub(line.line.len());
-        drop_count += 1;
-    }
-    if drop_count > 0 {
-        attempt.output.drain(0..drop_count);
-    }
-    if total > max_bytes {
-        attempt.command = trim_to_last_bytes(std::mem::take(&mut attempt.command), max_bytes);
-    }
+fn health_response_fits(attempt: Option<&micromux::HealthAttempt>) -> bool {
+    encoded_len(&Response::Health(attempt.cloned())).is_some_and(|len| len <= RESPONSE_MAX_BYTES)
 }
 
-fn health_attempt_bytes(attempt: &micromux::HealthAttempt) -> usize {
-    attempt.command.len()
-        + attempt
-            .output
-            .iter()
-            .map(|line| line.line.len())
-            .sum::<usize>()
+fn trim_health_attempt_to_fit(
+    attempt: &mut micromux::HealthAttempt,
+    fits: impl Fn(&micromux::HealthAttempt) -> bool,
+) {
+    let output = std::mem::take(&mut attempt.output);
+    let mut low = 0usize;
+    let mut high = output.len();
+    while low < high {
+        let middle = low + (high - low).div_ceil(2);
+        attempt.output = output
+            .get(output.len().saturating_sub(middle)..)
+            .unwrap_or_default()
+            .to_vec();
+        if fits(attempt) {
+            low = middle;
+        } else {
+            high = middle - 1;
+        }
+    }
+    attempt.output = output
+        .get(output.len().saturating_sub(low)..)
+        .unwrap_or_default()
+        .to_vec();
+    if fits(attempt) {
+        return;
+    }
+
+    let command = std::mem::take(&mut attempt.command);
+    let mut boundaries = command
+        .char_indices()
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    boundaries.push(command.len());
+    let mut low = 0usize;
+    let mut high = boundaries.len().saturating_sub(1);
+    while low < high {
+        let middle = low + (high - low) / 2;
+        let start = boundaries.get(middle).copied().unwrap_or(command.len());
+        attempt.command = command.get(start..).unwrap_or_default().to_string();
+        if fits(attempt) {
+            high = middle;
+        } else {
+            low = middle + 1;
+        }
+    }
+    let start = boundaries.get(low).copied().unwrap_or(command.len());
+    attempt.command = command.get(start..).unwrap_or_default().to_string();
 }
 
 /// Drop whole oldest attempts before trimming content from the oldest attempt that survives.
 fn bound_health_history(attempts: &mut Vec<micromux::HealthAttempt>) {
-    let mut total = attempts.iter().map(health_attempt_bytes).sum::<usize>();
-    let mut drop_count = 0;
-    for attempt in attempts.iter() {
-        if total <= RESPONSE_MAX_BYTES || attempts.len().saturating_sub(drop_count) <= 1 {
-            break;
+    if health_history_fits(attempts) {
+        return;
+    }
+    let original = std::mem::take(attempts);
+    let mut low = 0usize;
+    let mut high = original.len();
+    while low < high {
+        let middle = low + (high - low).div_ceil(2);
+        *attempts = original
+            .get(original.len().saturating_sub(middle)..)
+            .unwrap_or_default()
+            .to_vec();
+        if health_history_fits(attempts) {
+            low = middle;
+        } else {
+            high = middle - 1;
         }
-        total = total.saturating_sub(health_attempt_bytes(attempt));
-        drop_count += 1;
     }
-    if drop_count > 0 {
-        attempts.drain(0..drop_count);
-    }
-    if let Some(attempt) = attempts.first_mut()
-        && total > RESPONSE_MAX_BYTES
+    *attempts = original
+        .get(original.len().saturating_sub(low.max(1))..)
+        .unwrap_or_default()
+        .to_vec();
+    if !health_history_fits(attempts)
+        && let Some(attempt) = attempts.first_mut()
     {
-        bound_health_attempt_to(attempt, RESPONSE_MAX_BYTES);
+        trim_health_attempt_to_fit(attempt, |attempt| {
+            health_history_fits(std::slice::from_ref(attempt))
+        });
     }
+}
+
+fn health_history_fits(attempts: &[micromux::HealthAttempt]) -> bool {
+    encoded_len(&Response::HealthHistory {
+        attempts: attempts.to_vec(),
+    })
+    .is_some_and(|len| len <= RESPONSE_MAX_BYTES)
+}
+
+/// Preserves the newest tail or oldest cursor page while fitting the encoded event response.
+fn bound_events(events: &mut Vec<micromux::ServiceEvent>, truncated: &mut bool, keep_tail: bool) {
+    if events_response_fits(events, *truncated) {
+        return;
+    }
+    let original = std::mem::take(events);
+    let mut low = 0usize;
+    let mut high = original.len();
+    while low < high {
+        let middle = low + (high - low).div_ceil(2);
+        *events = if keep_tail {
+            original
+                .get(original.len().saturating_sub(middle)..)
+                .unwrap_or_default()
+                .to_vec()
+        } else {
+            original.get(..middle).unwrap_or_default().to_vec()
+        };
+        if events_response_fits(events, true) {
+            low = middle;
+        } else {
+            high = middle - 1;
+        }
+    }
+    *events = if keep_tail {
+        original
+            .get(original.len().saturating_sub(low)..)
+            .unwrap_or_default()
+            .to_vec()
+    } else {
+        original.get(..low).unwrap_or_default().to_vec()
+    };
+    *truncated = true;
+}
+
+fn events_response_fits(events: &[micromux::ServiceEvent], truncated: bool) -> bool {
+    encoded_len(&Response::Events {
+        events: events.to_vec(),
+        truncated,
+    })
+    .is_some_and(|len| len <= RESPONSE_MAX_BYTES)
 }
 
 /// Map a scheduler rejection to its wire error. Shared by every mutation acknowledgement so a
@@ -1084,8 +1193,8 @@ mod tests {
 
     use color_eyre::eyre;
     use micromux::{
-        ChangeKind, HealthAttempt, HealthLine, LogLine, OutputStream, RestartPolicy,
-        ServiceSnapshot, SessionChange,
+        ChangeKind, HealthAttempt, HealthLine, LogLine, OutputStream, RestartPolicy, ServiceEvent,
+        ServiceEventKind, ServiceSnapshot, SessionChange,
     };
     use similar_asserts::assert_eq;
 
@@ -1097,9 +1206,9 @@ mod tests {
     use super::{
         InboundFrameRate, MAX_LOG_TAIL, MAX_UNSOLICITED_SUBSCRIPTION_FRAMES_PER_WINDOW,
         RESPONSE_MAX_BYTES, SubscriptionPolicy, bind_project, bound_follow_response_lines,
-        bound_follow_response_lines_page, bound_health_history, bound_tail_response_lines,
-        describe, encoded_len, health_attempt_bytes, lag_replay_changes, log_read_error, logs_fit,
-        project_lock_path, response_within_frame, stream_changes,
+        bound_follow_response_lines_page, bound_health_attempt, bound_health_history,
+        bound_tail_response_lines, describe, encoded_len, lag_replay_changes, log_read_error,
+        logs_fit, project_lock_path, response_within_frame, stream_changes,
     };
 
     fn line(seq: u64, len: usize) -> LogLine {
@@ -1147,7 +1256,10 @@ mod tests {
 
         assert_eq!(attempts.len(), 1);
         assert_eq!(attempts.first().map(|attempt| attempt.attempt), Some(2));
-        assert!(attempts.iter().map(health_attempt_bytes).sum::<usize>() <= RESPONSE_MAX_BYTES);
+        assert!(
+            encoded_len(&Response::HealthHistory { attempts })
+                .is_some_and(|len| len <= RESPONSE_MAX_BYTES)
+        );
     }
 
     #[test]
@@ -1157,7 +1269,86 @@ mod tests {
         bound_health_history(&mut attempts);
 
         assert_eq!(attempts.first().map(|attempt| attempt.attempt), Some(7));
-        assert!(attempts.iter().map(health_attempt_bytes).sum::<usize>() <= RESPONSE_MAX_BYTES);
+        assert!(
+            encoded_len(&Response::HealthHistory { attempts })
+                .is_some_and(|len| len <= RESPONSE_MAX_BYTES)
+        );
+    }
+
+    #[test]
+    fn health_bounding_accounts_for_json_escaping() {
+        let escaped = "\\\"".repeat(1_300);
+        let mut attempt = Some(HealthAttempt {
+            run_generation: 1,
+            attempt: 7,
+            command: "probe".to_string(),
+            output: (0..200)
+                .map(|_| HealthLine {
+                    stream: OutputStream::Stdout,
+                    line: escaped.clone(),
+                })
+                .collect(),
+            result: None,
+        });
+        assert!(attempt.as_ref().is_some_and(|attempt| {
+            attempt
+                .output
+                .iter()
+                .map(|line| line.line.len())
+                .sum::<usize>()
+                < RESPONSE_MAX_BYTES
+        }));
+
+        bound_health_attempt(&mut attempt);
+
+        assert!(
+            encoded_len(&Response::Health(attempt)).is_some_and(|len| len <= RESPONSE_MAX_BYTES)
+        );
+    }
+
+    #[test]
+    fn event_bounding_keeps_the_requested_end_and_accounts_for_encoding() {
+        let escaped = "\\\"".repeat(1_300);
+        let events = (1..=200)
+            .map(|seq| ServiceEvent {
+                seq,
+                at_unix_ms: seq,
+                run_generation: 1,
+                kind: ServiceEventKind::Spawned,
+                detail: escaped.clone(),
+                exit_code: None,
+                pid: None,
+                delay_ms: None,
+                blocked_on: None,
+            })
+            .collect::<Vec<_>>();
+        assert!(events.iter().map(|event| event.detail.len()).sum::<usize>() < RESPONSE_MAX_BYTES);
+
+        let mut tail = events.clone();
+        let mut tail_truncated = false;
+        super::bound_events(&mut tail, &mut tail_truncated, true);
+        assert!(tail_truncated);
+        assert_eq!(tail.last().map(|event| event.seq), Some(200));
+        assert!(
+            encoded_len(&Response::Events {
+                events: tail,
+                truncated: tail_truncated,
+            })
+            .is_some_and(|len| len <= RESPONSE_MAX_BYTES)
+        );
+
+        let mut page = events;
+        let mut page_truncated = false;
+        super::bound_events(&mut page, &mut page_truncated, false);
+        assert!(page_truncated);
+        assert_eq!(page.first().map(|event| event.seq), Some(1));
+        assert!(
+            encoded_len(&Response::Events {
+                events: page,
+                truncated: page_truncated,
+            })
+            .is_some_and(|len| len <= RESPONSE_MAX_BYTES)
+        );
     }
 
     #[test]
