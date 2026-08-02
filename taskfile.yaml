@@ -142,7 +142,7 @@ tasks:
   outdated:
     desc: "list outdated deps (incl. new majors): adoptable now vs still in cooldown"
     cmds:
-      - cooldown outdated --sync {{.CLI_ARGS}}
+      - cooldown outdated --major --sync {{.CLI_ARGS}}
 
   outdated:minor:
     desc: "list outdated deps within the current major only"
