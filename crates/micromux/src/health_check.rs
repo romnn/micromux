@@ -449,7 +449,7 @@ pub(crate) struct RunLoopParams {
     pub service_id: ServiceID,
     pub run_id: RunId,
     pub sink: RunSink,
-    pub working_dir: Option<std::path::PathBuf>,
+    pub working_dir: Option<crate::service::SpawnWorkingDirectory>,
     pub environment: std::collections::HashMap<String, String>,
     pub events_tx: mpsc::Sender<ProcessEvent>,
     pub shutdown: CancellationToken,
@@ -578,7 +578,10 @@ pub async fn run_loop(health_check: crate::HealthcheckSpec, params: RunLoopParam
             &health_check,
             attempt_id,
             RunParams {
-                working_dir: params.working_dir.as_deref(),
+                working_dir: params
+                    .working_dir
+                    .as_ref()
+                    .map(crate::service::SpawnWorkingDirectory::as_path),
                 environment: &params.environment,
                 sink: params.sink.clone(),
                 shutdown: params.shutdown.clone(),

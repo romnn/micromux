@@ -5,7 +5,7 @@ use crate::{
     scheduler::ServiceID,
     spec::{DependencySpec, HealthcheckSpec, ServiceOrigin, ServiceSpec},
 };
-use std::path::Path;
+use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::sync::Arc;
 
@@ -139,10 +139,13 @@ mod tests {
         let anchored = service
             .spawn_working_directory()?
             .ok_or_else(|| eyre::eyre!("working directory was not anchored"))?;
-        assert_eq!(fs::read_to_string(anchored.join("identity"))?, "original");
+        assert_eq!(
+            fs::read_to_string(anchored.as_path().join("identity"))?,
+            "original"
+        );
         let output = std::process::Command::new("sh")
             .args(["-c", "cat identity"])
-            .current_dir(&anchored)
+            .current_dir(anchored.as_path())
             .output()?;
         assert!(output.status.success());
         assert_eq!(String::from_utf8(output.stdout)?, "original");
@@ -391,6 +394,28 @@ pub struct Service {
     working_directory: Option<Arc<std::fs::File>>,
 }
 
+/// A spawn path that retains its validated directory identity where the platform supports it.
+///
+/// Holding a value keeps the anchored directory descriptor open, so a descriptor-backed path
+/// such as `/proc/self/fd/N` stays spawnable even after the owning [`Service`] drops or
+/// replaces its anchor (for example when config reconciliation replaces a live definition).
+#[derive(Debug, Clone)]
+pub(crate) struct SpawnWorkingDirectory {
+    path: PathBuf,
+    #[cfg(unix)]
+    #[expect(
+        dead_code,
+        reason = "held for RAII: the open directory keeps the descriptor-backed spawn path valid"
+    )]
+    directory: Arc<std::fs::File>,
+}
+
+impl SpawnWorkingDirectory {
+    pub(crate) fn as_path(&self) -> &Path {
+        &self.path
+    }
+}
+
 impl Service {
     pub(crate) fn dynamic(
         id: ServiceID,
@@ -549,46 +574,69 @@ impl Service {
         self.spec.name.as_deref().unwrap_or(&self.id)
     }
 
-    #[cfg(unix)]
-    pub(crate) fn spawn_working_directory(&self) -> Result<Option<std::path::PathBuf>, Error> {
-        self.working_directory
-            .as_ref()
-            .map(|directory| {
-                #[cfg(target_vendor = "apple")]
-                {
-                    use std::ffi::OsString;
-                    use std::os::unix::ffi::OsStringExt as _;
+    #[cfg_attr(
+        not(unix),
+        expect(
+            clippy::unnecessary_wraps,
+            reason = "only the unix anchor resolution can fail; the fallible signature is shared across platforms"
+        )
+    )]
+    pub(crate) fn spawn_working_directory(&self) -> Result<Option<SpawnWorkingDirectory>, Error> {
+        #[cfg(unix)]
+        {
+            self.working_directory
+                .as_ref()
+                .map(|directory| {
+                    let path = {
+                        #[cfg(target_vendor = "apple")]
+                        {
+                            use std::ffi::OsString;
+                            use std::os::unix::ffi::OsStringExt as _;
 
-                    // macOS exposes `/dev/fd/N` as the directory itself but does not allow path
-                    // traversal below it, so recover the anchored vnode's current path.
-                    let path = rustix::fs::getpath(directory.as_ref()).map_err(|source| {
-                        Error::WorkingDirectory {
-                            path: self
-                                .spec
-                                .working_dir
-                                .clone()
-                                .unwrap_or_else(|| Path::new(".").to_path_buf()),
-                            source: source.into(),
+                            // macOS exposes `/dev/fd/N` as the directory itself but does not allow
+                            // path traversal below it, so recover the anchored vnode's current path.
+                            let path =
+                                rustix::fs::getpath(directory.as_ref()).map_err(|source| {
+                                    Error::WorkingDirectory {
+                                        path: self
+                                            .spec
+                                            .working_dir
+                                            .clone()
+                                            .unwrap_or_else(|| Path::new(".").to_path_buf()),
+                                        source: source.into(),
+                                    }
+                                })?;
+                            PathBuf::from(OsString::from_vec(path.into_bytes()))
                         }
-                    })?;
-                    Ok(std::path::PathBuf::from(OsString::from_vec(
-                        path.into_bytes(),
-                    )))
-                }
 
-                #[cfg(not(target_vendor = "apple"))]
-                {
-                    use std::os::fd::AsRawFd as _;
+                        #[cfg(not(target_vendor = "apple"))]
+                        {
+                            use std::os::fd::AsRawFd as _;
 
-                    let fd = directory.as_raw_fd().to_string();
-                    #[cfg(target_os = "linux")]
-                    let base = "/proc/self/fd";
-                    #[cfg(not(target_os = "linux"))]
-                    let base = "/dev/fd";
-                    Ok(std::path::Path::new(base).join(fd))
-                }
-            })
-            .transpose()
+                            let fd = directory.as_raw_fd().to_string();
+                            #[cfg(target_os = "linux")]
+                            let base = "/proc/self/fd";
+                            #[cfg(not(target_os = "linux"))]
+                            let base = "/dev/fd";
+                            Path::new(base).join(fd)
+                        }
+                    };
+                    Ok(SpawnWorkingDirectory {
+                        path,
+                        directory: Arc::clone(directory),
+                    })
+                })
+                .transpose()
+        }
+
+        #[cfg(not(unix))]
+        {
+            Ok(self
+                .spec
+                .working_dir
+                .clone()
+                .map(|path| SpawnWorkingDirectory { path }))
+        }
     }
 
     pub(crate) fn replace_spec(&mut self, spec: ServiceSpec) -> Result<(), Error> {

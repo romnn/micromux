@@ -431,13 +431,21 @@ async fn wait_for_finished_health_attempt(
     reader: &crate::model::SessionModelReader,
     id: &str,
 ) -> eyre::Result<crate::model::HealthAttempt> {
+    wait_for_finished_health_attempt_after(reader, id, 0).await
+}
+
+async fn wait_for_finished_health_attempt_after(
+    reader: &crate::model::SessionModelReader,
+    id: &str,
+    after_attempt: u64,
+) -> eyre::Result<crate::model::HealthAttempt> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
         if let Some(attempt) = reader
             .healthchecks(id)
             .into_iter()
             .rev()
-            .find(|attempt| attempt.result.is_some())
+            .find(|attempt| attempt.attempt > after_attempt && attempt.result.is_some())
         {
             return Ok(attempt);
         }
@@ -2427,6 +2435,77 @@ async fn healthcheck_inherits_working_dir() -> eyre::Result<()> {
 
     let attempt = wait_for_finished_health_attempt(&harness.reader, "svc").await?;
     assert_eq!(attempt.result.map(|result| result.success), Some(true));
+
+    harness.shutdown.cancel();
+    harness.handle.await??;
+    Ok(())
+}
+
+/// Keeps descriptor-backed probes spawnable after reconciliation replaces a live service.
+///
+/// Applying a changed config replaces the `Service` and drops its anchored directory
+/// descriptor; the running health loop must retain its own anchor or its `/proc/self/fd/N`
+/// working directory disappears and every subsequent probe fails to spawn.
+#[cfg(unix)]
+#[tokio::test]
+async fn healthcheck_keeps_working_dir_anchor_after_config_reconciliation() -> eyre::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let config_path = directory.path().join("micromux.yaml");
+    fs::write(directory.path().join("marker.txt"), "ok")?;
+    let yaml = |value| {
+        format!(
+            r#"version: "1"
+services:
+  svc:
+    command: ["sh", "-c", "sleep 60"]
+    working_dir: "."
+    environment:
+      VALUE: "{value}"
+    healthcheck:
+      test: ["CMD-SHELL", "test -f marker.txt"]
+      interval: "25ms"
+      timeout: "500ms"
+      retries: 1
+"#
+        )
+    };
+    fs::write(&config_path, yaml("before"))?;
+
+    let services = services_from_config_path(&config_path)?;
+    let harness = spawn_harness(
+        services,
+        Some(ReloadConfig {
+            config_path: config_path.clone(),
+            strict_override: None,
+        }),
+    );
+    let initial = wait_for_finished_health_attempt(&harness.reader, "svc").await?;
+    assert_eq!(initial.result.map(|result| result.success), Some(true));
+
+    fs::write(&config_path, yaml("after"))?;
+    let receipt = reconcile_accepted(harness.control.reconcile_config(false).await)?;
+    // The regression only exists if reconciliation replaced the live service; guard against
+    // a config diff that stops registering as a change and quietly makes this test vacuous.
+    assert!(
+        receipt
+            .actions
+            .iter()
+            .any(|action| action.service == "svc" && action.action == ReconcileActionKind::Changed),
+        "reconciliation must replace `svc` for this test to exercise the anchor lifetime"
+    );
+
+    // Attempts are recorded before their probe spawns, so any attempt past this watermark
+    // spawned only after reconciliation dropped the replaced service's directory anchor.
+    // Waiting merely for an attempt after `initial` could observe a probe that spawned
+    // before the reconcile applied and pass even with a dangling anchor.
+    let watermark = harness
+        .reader
+        .healthchecks("svc")
+        .last()
+        .map_or(initial.attempt, |attempt| attempt.attempt);
+    let reconciled =
+        wait_for_finished_health_attempt_after(&harness.reader, "svc", watermark).await?;
+    assert_eq!(reconciled.result.map(|result| result.success), Some(true));
 
     harness.shutdown.cancel();
     harness.handle.await??;

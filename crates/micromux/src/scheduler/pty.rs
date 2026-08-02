@@ -2115,12 +2115,9 @@ pub(super) fn start_service_with_pty_size(
     let Some((prog, args)) = service.spec.command.split_first() else {
         return Err(Error::EmptyCommand);
     };
-    #[cfg(unix)]
     let working_dir = service
         .spawn_working_directory()
         .map_err(|err| Error::operation("failed to resolve anchored working directory", err))?;
-    #[cfg(not(unix))]
-    let working_dir = service.spec.working_dir.clone();
 
     let env_vars = env_vars_for_service(service);
     let env_vars = {
@@ -2155,7 +2152,7 @@ pub(super) fn start_service_with_pty_size(
     let mut cmd = CommandBuilder::new(prog);
     cmd.args(args);
     if let Some(dir) = &working_dir {
-        cmd.cwd(dir);
+        cmd.cwd(dir.as_path());
     }
     for (k, v) in &env_vars {
         cmd.env(k, v);

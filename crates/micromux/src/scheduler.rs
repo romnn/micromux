@@ -1370,25 +1370,18 @@ impl SchedulerRuntime {
         if matches!(candidate.origin, ServiceOrigin::Dynamic(_)) {
             // Recheck the opened directory: its path could have been replaced between the policy
             // check and `Service` anchoring it.
-            #[cfg(unix)]
             let working_dir = candidate
                 .spawn_working_directory()
                 .map_err(|err| CommandRejection::InvalidSpec(err.to_string()))?
                 .ok_or_else(|| {
                     CommandRejection::InvalidSpec(
-                        "dynamic service has no anchored working directory".to_string(),
+                        "dynamic service has no resolved working directory".to_string(),
                     )
                 })?;
-            #[cfg(not(unix))]
-            let working_dir = candidate.spec.working_dir.clone().ok_or_else(|| {
-                CommandRejection::InvalidSpec(
-                    "dynamic service has no resolved working directory".to_string(),
-                )
-            })?;
-            let working_dir = std::fs::canonicalize(&working_dir).map_err(|err| {
+            let working_dir = std::fs::canonicalize(working_dir.as_path()).map_err(|err| {
                 CommandRejection::InvalidSpec(format!(
                     "anchored working directory `{}` cannot be resolved: {err}",
-                    working_dir.display()
+                    working_dir.as_path().display()
                 ))
             })?;
             if !self
