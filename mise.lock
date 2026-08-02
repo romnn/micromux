@@ -92,6 +92,7 @@ checksum = "sha256:506bf48a06017c6d74903da75f9fd3aea18cc9451cb3ad39103e4c8997c37
 url = "https://github.com/buildkite/terminal-to-html/releases/download/v3.17.1/terminal-to-html-3.17.1-linux-amd64.gz"
 url_api = "https://api.github.com/repos/buildkite/terminal-to-html/releases/assets/469851432"
 provenance = "github-attestations"
+provenance_verified = true
 
 [tools."github:buildkite/terminal-to-html"."platforms.macos-arm64"]
 checksum = "sha256:264b131fe7ae4601fc8b65e80bdc3d71e5c2cc32853f3a270c9cbaf47b2d45df"
@@ -125,26 +126,26 @@ url = "https://github.com/est31/cargo-udeps/releases/download/v0.1.61/cargo-udep
 url_api = "https://api.github.com/repos/est31/cargo-udeps/releases/assets/407804338"
 
 [[tools."github:romnn/bumpversion"]]
-version = "0.0.10"
+version = "0.0.11"
 backend = "github:romnn/bumpversion"
 
 [tools."github:romnn/bumpversion".options]
 matching = "bumpversion"
 
 [tools."github:romnn/bumpversion"."platforms.linux-x64"]
-checksum = "sha256:1bf039d01350bfffc0e1ceb82faefd84988497cdbe81020f5de058da2622a032"
-url = "https://github.com/romnn/bumpversion/releases/download/v0.0.10/bumpversion_0.0.10_linux_amd64.tar.gz"
-url_api = "https://api.github.com/repos/romnn/bumpversion/releases/assets/496005099"
+checksum = "sha256:be722778a2fc4bb9fcf14e72873e72fa5ca678034998eb497d3518d5a4b09fe7"
+url = "https://github.com/romnn/bumpversion/releases/download/v0.0.11/bumpversion_0.0.11_linux_amd64.tar.gz"
+url_api = "https://api.github.com/repos/romnn/bumpversion/releases/assets/498977536"
 
 [tools."github:romnn/bumpversion"."platforms.macos-arm64"]
-checksum = "sha256:3542d246cba084211ac8af5ef8664a3bf85b5658756f3cc1d47201600fb130d4"
-url = "https://github.com/romnn/bumpversion/releases/download/v0.0.10/bumpversion_0.0.10_darwin_arm64.tar.gz"
-url_api = "https://api.github.com/repos/romnn/bumpversion/releases/assets/496005100"
+checksum = "sha256:557d5f2cd562093993e46a2ea9d6833d7a2dca7ea6fe71834b27e61819f27089"
+url = "https://github.com/romnn/bumpversion/releases/download/v0.0.11/bumpversion_0.0.11_darwin_arm64.tar.gz"
+url_api = "https://api.github.com/repos/romnn/bumpversion/releases/assets/498977534"
 
 [tools."github:romnn/bumpversion"."platforms.windows-x64"]
-checksum = "sha256:31b1fdc42584b619b528fd732c401330c39ef905f1c4f178eb0d653eae79ced3"
-url = "https://github.com/romnn/bumpversion/releases/download/v0.0.10/bumpversion_0.0.10_windows_amd64.zip"
-url_api = "https://api.github.com/repos/romnn/bumpversion/releases/assets/496005090"
+checksum = "sha256:d76959a0de3c6141647cea8d55384c507cad3027645594d3da68bd30e9b99ec3"
+url = "https://github.com/romnn/bumpversion/releases/download/v0.0.11/bumpversion_0.0.11_windows_amd64.zip"
+url_api = "https://api.github.com/repos/romnn/bumpversion/releases/assets/498977535"
 
 [[tools."github:romnn/cargo-feature-combinations"]]
 version = "0.4.2"
