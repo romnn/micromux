@@ -1867,9 +1867,16 @@ impl TerminationTarget {
 
     #[cfg(unix)]
     fn signal(&self, signal: Signal) -> bool {
+        // Snapshot the descendant tree before signaling: once the group dies, escaped
+        // descendants reparent to init and vanish from the parent-pid walk.
+        let descendants = self
+            .pid
+            .map(crate::process_tree::descendant_pids)
+            .unwrap_or_default();
+        let mut delivered = false;
         if let Some(pgid) = self.process_group_leader_id {
             match nix::sys::signal::killpg(Pid::from_raw(pgid), signal) {
-                Ok(()) => return true,
+                Ok(()) => delivered = true,
                 Err(Errno::ESRCH) => {
                     tracing::debug!(?signal, pgid, "process group exited before signal delivery");
                 }
@@ -1878,9 +1885,9 @@ impl TerminationTarget {
                 }
             }
         }
-        if let Some(pid) = self.pid.and_then(|pid| i32::try_from(pid).ok()) {
+        if !delivered && let Some(pid) = self.pid.and_then(|pid| i32::try_from(pid).ok()) {
             match nix::sys::signal::kill(Pid::from_raw(pid), signal) {
-                Ok(()) => return true,
+                Ok(()) => delivered = true,
                 Err(Errno::ESRCH) => {
                     tracing::debug!(?signal, pid, "process exited before signal delivery");
                 }
@@ -1889,7 +1896,21 @@ impl TerminationTarget {
                 }
             }
         }
-        false
+        // Descendants that moved into their own process groups (setsid/setpgid, as
+        // turborepo task runners and daemonizing dev servers do) are unreachable via
+        // killpg; signal each one individually. Members of the group just signaled
+        // receive the signal twice, which is harmless for TERM and KILL.
+        for descendant in descendants {
+            if let Ok(pid) = i32::try_from(descendant) {
+                match nix::sys::signal::kill(Pid::from_raw(pid), signal) {
+                    Ok(()) | Err(Errno::ESRCH) => {}
+                    Err(err) => {
+                        tracing::debug!(?err, ?signal, pid, "failed to signal descendant");
+                    }
+                }
+            }
+        }
+        delivered
     }
 }
 
@@ -2059,8 +2080,8 @@ fn spawn_termination_task_with_timing(args: TerminationTaskArgs, timing: Termina
                         None => std::future::pending::<()>().await,
                     }
                 }, if termination_started && !termination_escalated => {
-                    // On Unix, target the process group when available so descendants cannot
-                    // survive the leader and keep its PTY open.
+                    // On Unix, target the process group plus any descendants that escaped
+                    // it so they cannot survive the leader and keep its PTY open.
                     target.force_kill();
                     termination_escalated = true;
                     pty_hangup_deadline =
@@ -2166,8 +2187,12 @@ pub(super) fn start_service_with_pty_size(
     let pid = child.process_id();
     let killer = child.clone_killer();
 
+    // The pty slave spawn calls `setsid()` in the child before exec, making it a session
+    // and process-group leader, so its pgid equals its pid. Deriving the group from the
+    // pid avoids `tcgetpgrp` on the master, which reports a sentinel naming no existing
+    // group once the child exits before the query.
     #[cfg(unix)]
-    let process_group_leader = pair.master.process_group_leader();
+    let process_group_leader = pid.and_then(|pid| i32::try_from(pid).ok());
     #[cfg(not(unix))]
     let process_group_leader = None;
 
@@ -2530,6 +2555,75 @@ mod tests {
                     run_id: killed_run_id,
                 }) if killed_service_id == service_id && killed_run_id == run_id
             );
+        }
+
+        /// Regression: descendants that move into their own process group (as turborepo
+        /// task runners and daemonizing dev servers do) must not survive `force_kill`,
+        /// which previously reached only the leader's own group.
+        #[test]
+        fn force_kill_reaps_descendants_that_left_the_process_group() -> eyre::Result<()> {
+            use std::os::unix::process::CommandExt as _;
+
+            // `set -m` enables job control, so the background sleep runs in its own
+            // process group and killpg on the shell's group cannot reach it.
+            let mut child = std::process::Command::new("bash")
+                .args(["-c", "set -m; sleep 30 & wait"])
+                .process_group(0)
+                .spawn()?;
+            let root = child.id();
+
+            // Wait for the escaped sleep to fork.
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            let mut escapees = crate::process_tree::descendant_pids(root);
+            while escapees.is_empty() && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(25));
+                escapees = crate::process_tree::descendant_pids(root);
+            }
+            if escapees.is_empty() {
+                let _ = child.kill();
+                let _ = child.wait();
+                eyre::bail!("expected the escaped sleep to appear under the shell");
+            }
+
+            let mut target = TerminationTarget {
+                killer: Box::new(CountingKiller {
+                    calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                }),
+                pid: Some(root),
+                process_group_leader_id: Some(i32::try_from(root)?),
+            };
+            target.force_kill();
+            // Reap the shell so the leader cannot linger as a zombie during polling.
+            let _ = child.wait();
+
+            // Poll for the escapees to disappear: the kernel still has to reparent the
+            // orphans to init and reap them after the SIGKILL sweep.
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            let all_gone = loop {
+                let all_gone = escapees.iter().all(|&pid| {
+                    i32::try_from(pid).is_ok_and(|pid| {
+                        nix::sys::signal::kill(Pid::from_raw(pid), None) == Err(Errno::ESRCH)
+                    })
+                });
+                if all_gone || std::time::Instant::now() >= deadline {
+                    break all_gone;
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            };
+
+            // Best-effort cleanup so a regression does not leak the sleeps.
+            if !all_gone {
+                for &pid in &escapees {
+                    if let Ok(pid) = i32::try_from(pid) {
+                        let _ = nix::sys::signal::kill(Pid::from_raw(pid), Signal::SIGKILL);
+                    }
+                }
+            }
+            eyre::ensure!(
+                all_gone,
+                "escaped descendants survived force_kill: {escapees:?}"
+            );
+            Ok(())
         }
 
         #[tokio::test]

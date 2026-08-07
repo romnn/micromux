@@ -25,6 +25,8 @@ mod env;
 mod graph;
 mod health_check;
 mod model;
+#[cfg(unix)]
+mod process_tree;
 mod scheduler;
 mod service;
 mod spec;

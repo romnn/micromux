@@ -2795,16 +2795,30 @@ mod escaped_session {
             return Ok(());
         };
 
-        // The service process remains in the original process group while its child creates a new
-        // session and inherits the slave PTY.
+        // The service process remains in the original process group while a detached
+        // grandchild creates a new session and inherits the slave PTY.
         if mode == "parent" {
             let status = std::process::Command::new(std::env::current_exe()?)
                 .args(["--exact", HELPER_TEST, "--nocapture", "--test-threads=1"])
-                .env(HELPER_MODE, "writer")
+                .env(HELPER_MODE, "spawner")
                 .status()?;
             if !status.success() {
-                eyre::bail!("escaped-session writer exited with {status}");
+                eyre::bail!("escaped-session spawner exited with {status}");
             }
+            // Stay alive so termination has to escalate past the ignored SIGTERM; the
+            // writer keeps running independently until the PTY is torn down.
+            loop {
+                std::thread::sleep(std::time::Duration::from_hours(1));
+            }
+        }
+
+        // Exiting right after the spawn reparents the writer to init, hiding it from the
+        // kill-time descendant sweep so release must come from the PTY teardown ladder.
+        if mode == "spawner" {
+            std::process::Command::new(std::env::current_exe()?)
+                .args(["--exact", HELPER_TEST, "--nocapture", "--test-threads=1"])
+                .env(HELPER_MODE, "writer")
+                .spawn()?;
             return Ok(());
         }
 
