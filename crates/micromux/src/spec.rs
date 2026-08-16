@@ -20,6 +20,58 @@ pub(crate) const DEFAULT_STOP_GRACE_PERIOD: Duration = Duration::from_secs(10);
 /// Longest graceful-stop window accepted for one service.
 pub(crate) const MAX_STOP_GRACE_PERIOD: Duration = Duration::from_mins(5);
 
+/// Signal delivered for the graceful stop request before force-kill escalation.
+///
+/// Defaults to [`StopSignal::Term`]. Services designed around interactive Ctrl-C
+/// shutdown can choose `SIGINT`, and nodemon-style supervisors `SIGUSR2`. On Windows
+/// the setting is accepted but ignored: termination always goes through the pty
+/// backend.
+///
+/// The signal reaches the service's whole process group, and on Unix a best-effort
+/// sweep also delivers it to descendants that escaped into a different group. The
+/// sweep observes the process table, so a process forked in the races around its scans
+/// can be missed — hard containment would need OS facilities such as cgroups — but
+/// descendants it does reach receive the signal chosen for the service. That is worth
+/// weighing for the non-`SIGTERM` values, which carry unrelated conventional meanings
+/// in other programs (`SIGUSR1` and `SIGUSR2` are commonly reload or upgrade
+/// triggers).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub enum StopSignal {
+    /// `SIGTERM`, the conventional graceful-termination request.
+    #[default]
+    #[serde(rename = "SIGTERM", alias = "TERM")]
+    Term,
+    /// `SIGINT`, equivalent to Ctrl-C for tools that only handle interactive interrupt.
+    #[serde(rename = "SIGINT", alias = "INT")]
+    Int,
+    /// `SIGHUP`, for daemons that treat terminal hangup as shutdown.
+    #[serde(rename = "SIGHUP", alias = "HUP")]
+    Hup,
+    /// `SIGQUIT`, a quit request that conventionally also dumps core.
+    #[serde(rename = "SIGQUIT", alias = "QUIT")]
+    Quit,
+    /// `SIGUSR1`, for tools with a user-defined shutdown convention.
+    #[serde(rename = "SIGUSR1", alias = "USR1")]
+    Usr1,
+    /// `SIGUSR2`, used by nodemon-style supervisors for graceful shutdown.
+    #[serde(rename = "SIGUSR2", alias = "USR2")]
+    Usr2,
+}
+
+impl std::fmt::Display for StopSignal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
+            Self::Term => "SIGTERM",
+            Self::Int => "SIGINT",
+            Self::Hup => "SIGHUP",
+            Self::Quit => "SIGQUIT",
+            Self::Usr1 => "SIGUSR1",
+            Self::Usr2 => "SIGUSR2",
+        };
+        f.write_str(name)
+    }
+}
+
 /// Whether a service id is safe for control selectors and filesystem-backed log names.
 #[must_use]
 pub fn service_id_is_valid(id: &str) -> bool {
@@ -62,6 +114,9 @@ pub struct ServiceSpec {
     #[serde(with = "duration", default = "default_stop_grace_period")]
     #[schemars(with = "String")]
     pub stop_grace_period: Duration,
+    /// Signal delivered for the graceful stop request.
+    #[serde(default)]
+    pub stop_signal: StopSignal,
 }
 
 impl Default for ServiceSpec {
@@ -76,6 +131,7 @@ impl Default for ServiceSpec {
             ports: Vec::new(),
             restart: RestartPolicy::default(),
             stop_grace_period: DEFAULT_STOP_GRACE_PERIOD,
+            stop_signal: StopSignal::default(),
         }
     }
 }
@@ -359,6 +415,9 @@ pub struct PartialServiceSpec {
     )]
     #[schemars(with = "Option<String>")]
     pub stop_grace_period: Option<Duration>,
+    /// Graceful-stop signal replacement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_signal: Option<StopSignal>,
 }
 
 impl PartialServiceSpec {
@@ -397,6 +456,9 @@ impl PartialServiceSpec {
         }
         if let Some(stop_grace_period) = self.stop_grace_period {
             base.stop_grace_period = stop_grace_period;
+        }
+        if let Some(stop_signal) = self.stop_signal {
+            base.stop_signal = stop_signal;
         }
         base
     }
@@ -675,6 +737,34 @@ mod tests {
             applied.environment.get("NEW").map(String::as_str),
             Some("value")
         );
+        Ok(())
+    }
+
+    /// `stop_signal` serializes to the canonical `SIGTERM`-style spelling, accepts the
+    /// short alias on input, and overrides through a partial spec.
+    #[test]
+    fn stop_signal_roundtrips_and_applies_through_partial_spec() -> eyre::Result<()> {
+        assert_eq!(
+            serde_json::to_value(StopSignal::Int)?,
+            serde_json::json!("SIGINT")
+        );
+        assert_eq!(
+            serde_json::from_value::<StopSignal>(serde_json::json!("USR2"))?,
+            StopSignal::Usr2
+        );
+
+        let partial = serde_json::from_value::<PartialServiceSpec>(serde_json::json!({
+            "stop_signal": "SIGINT"
+        }))?;
+        let applied = partial.apply_to(ServiceSpec::default());
+        assert_eq!(applied.stop_signal, StopSignal::Int);
+
+        // An omitted field keeps the base's configured signal.
+        let untouched = PartialServiceSpec::default().apply_to(ServiceSpec {
+            stop_signal: StopSignal::Hup,
+            ..ServiceSpec::default()
+        });
+        assert_eq!(untouched.stop_signal, StopSignal::Hup);
         Ok(())
     }
 }

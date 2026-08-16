@@ -30,6 +30,7 @@ const KNOWN_SERVICE_KEYS: &[&str] = &[
     "ports",
     "restart",
     "stop_grace_period",
+    "stop_signal",
     "color",
     "logs",
 ];
@@ -958,6 +959,46 @@ fn parse_stop_grace_period(
     Ok(duration)
 }
 
+fn parse_stop_signal_value(
+    value: &yaml_spanned::Spanned<Value>,
+) -> Result<Spanned<crate::spec::StopSignal>, ConfigError> {
+    use crate::spec::StopSignal;
+
+    let raw = parse_string_value(value, "stop signal must be a string")?;
+    let normalized = raw.trim().to_ascii_uppercase();
+    // Accept both the canonical `SIGTERM` spelling and the short `TERM` form.
+    let signal = match normalized.strip_prefix("SIG").unwrap_or(&normalized) {
+        "TERM" => StopSignal::Term,
+        "INT" => StopSignal::Int,
+        "HUP" => StopSignal::Hup,
+        "QUIT" => StopSignal::Quit,
+        "USR1" => StopSignal::Usr1,
+        "USR2" => StopSignal::Usr2,
+        _ => {
+            return Err(ConfigError::InvalidValue {
+                message: format!(
+                    "invalid stop signal `{raw}`; expected SIGTERM, SIGINT, SIGHUP, SIGQUIT, \
+                     SIGUSR1, or SIGUSR2"
+                ),
+                span: value.span().into(),
+            });
+        }
+    };
+    Ok(Spanned {
+        inner: signal,
+        span: *value.span(),
+    })
+}
+
+fn parse_stop_signal(
+    mapping: &yaml_spanned::Mapping,
+) -> Result<Option<Spanned<crate::spec::StopSignal>>, ConfigError> {
+    mapping
+        .get("stop_signal")
+        .map(parse_stop_signal_value)
+        .transpose()
+}
+
 fn parse_healthcheck_defaults<F: Copy>(
     value: &yaml_spanned::Spanned<Value>,
     file_id: F,
@@ -1060,6 +1101,10 @@ fn parse_service<F: Copy>(
         inner: crate::spec::DEFAULT_STOP_GRACE_PERIOD,
         span: *span,
     });
+    let stop_signal = parse_stop_signal(mapping)?.unwrap_or(Spanned {
+        inner: crate::spec::StopSignal::default(),
+        span: *span,
+    });
     let log_retention = parse_log_retention(
         mapping.get("logs"),
         defaults.log_retention,
@@ -1081,6 +1126,7 @@ fn parse_service<F: Copy>(
         restart,
         restart_policy,
         stop_grace_period,
+        stop_signal,
         color,
         log_retention,
     })
@@ -1333,6 +1379,116 @@ mod tests {
 
         assert!(
             matches!(error, config::ConfigError::InvalidValue { message, .. } if message.contains("must not exceed 5m"))
+        );
+    }
+
+    /// Both the canonical `SIGINT` spelling and case-insensitive short forms map onto
+    /// the same stop signal, and an omitted key falls back to `SIGTERM`.
+    #[test]
+    fn stop_signal_accepts_canonical_and_short_names() -> eyre::Result<()> {
+        let yaml = indoc! {r#"
+            version: 1
+            services:
+              app:
+                command: "true"
+                stop_signal: SIGINT
+              worker:
+                command: "true"
+                stop_signal: usr2
+              plain:
+                command: "true"
+        "#};
+
+        let mut diagnostics: Vec<Diagnostic<usize>> = vec![];
+        let parsed = config::from_str(yaml, Path::new("."), 0, None, &mut diagnostics)?;
+
+        assert_eq!(
+            get_service(&parsed.config, "app")?.stop_signal.inner,
+            crate::spec::StopSignal::Int
+        );
+        assert_eq!(
+            get_service(&parsed.config, "worker")?.stop_signal.inner,
+            crate::spec::StopSignal::Usr2
+        );
+        assert_eq!(
+            get_service(&parsed.config, "plain")?.stop_signal.inner,
+            crate::spec::StopSignal::Term
+        );
+        assert!(diagnostics.is_empty());
+        Ok(())
+    }
+
+    /// Every spelling the parser accepts must also validate against the published
+    /// schema, and every spelling it rejects must fail schema validation too.
+    ///
+    /// `service_keys_match_schema` compares only key names, so nothing else would catch
+    /// the parser and the schema disagreeing about a value domain.
+    #[test]
+    fn stop_signal_spellings_match_the_published_schema() -> eyre::Result<()> {
+        let schema: serde_json::Value =
+            serde_json::from_str(include_str!("../../../../micromux.schema.json"))?;
+        let schema = jsonschema::options()
+            .with_draft(jsonschema::Draft::Draft7)
+            .build(&schema)?;
+        // The quoted entry carries the surrounding whitespace into the value: the
+        // parser trims it, so the schema pattern must permit the padding too.
+        for accepted in [
+            "SIGTERM",
+            "SIGINT",
+            "INT",
+            "int",
+            "Int",
+            "USR2",
+            "usr2",
+            "sighup",
+            "\" SIGTERM \"",
+        ] {
+            let yaml = format!(
+                "version: 1\nservices:\n  app:\n    command: \"true\"\n    stop_signal: {accepted}\n"
+            );
+            let mut diagnostics: Vec<Diagnostic<usize>> = Vec::new();
+            config::from_str(&yaml, Path::new("."), 0, None, &mut diagnostics)
+                .map_err(|err| eyre::eyre!("parser rejected `{accepted}`: {err}"))?;
+
+            let document: serde_json::Value = serde_yaml::from_str(&yaml)?;
+            eyre::ensure!(
+                schema.validate(&document).is_ok(),
+                "parser accepts `{accepted}` but the schema rejects it"
+            );
+        }
+
+        // Interior whitespace is not trimmed, so both validators must refuse it.
+        for rejected in ["SIGSTOP", "SIGKILL", "KILL", "nonsense", "\"SIG TERM\""] {
+            let yaml = format!(
+                "version: 1\nservices:\n  app:\n    command: \"true\"\n    stop_signal: {rejected}\n"
+            );
+            let mut diagnostics: Vec<Diagnostic<usize>> = Vec::new();
+            eyre::ensure!(
+                config::from_str(&yaml, Path::new("."), 0, None, &mut diagnostics).is_err(),
+                "schema rejects `{rejected}` but the parser accepts it"
+            );
+
+            let document: serde_json::Value = serde_yaml::from_str(&yaml)?;
+            eyre::ensure!(
+                schema.validate(&document).is_err(),
+                "parser rejects `{rejected}` but the schema accepts it"
+            );
+        }
+        Ok(())
+    }
+
+    /// Signals outside the supported graceful-stop set are rejected with a spanned
+    /// config error instead of being silently coerced.
+    #[test]
+    fn stop_signal_rejects_unsupported_names() {
+        let yaml =
+            "version: 1\nservices:\n  app:\n    command: \"true\"\n    stop_signal: SIGSTOP\n";
+        let mut diagnostics: Vec<Diagnostic<usize>> = Vec::new();
+        let error = config::from_str(yaml, Path::new("."), 0, None, &mut diagnostics)
+            .expect_err("unsupported stop signal should be rejected");
+
+        assert!(
+            matches!(error, config::ConfigError::InvalidValue { message, .. } if message.contains("invalid stop signal"))
         );
     }
 

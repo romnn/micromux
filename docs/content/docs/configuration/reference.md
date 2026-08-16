@@ -40,6 +40,7 @@ Every key in `micromux.yaml`. The machine-readable source of truth is [`micromux
 | `ports` | array | Ports the service uses (metadata; not bound by micromux). |
 | `restart` | string | [Restart policy]({{< relref "restart-policies.md" >}}) for this service. |
 | `stop_grace_period` | duration | Time between graceful termination and force-kill. Defaults to `10s`; must be greater than zero and no longer than `5m`. |
+| `stop_signal` | string | Signal delivered for the graceful stop request. One of `SIGTERM` (default), `SIGINT`, `SIGHUP`, `SIGQUIT`, `SIGUSR1`, `SIGUSR2`; the `SIG` prefix is optional and matching is case-insensitive. Delivered to the service's process group and — best-effort, via a process-table sweep that cannot guarantee hard containment — to descendants that escaped it, so a non-default choice reaches child processes too. Ignored on Windows. |
 | `logs` | object | [Log retention]({{< relref "logs.md" >}}) for this service. |
 | `color` | bool | Force color handling for this service. |
 

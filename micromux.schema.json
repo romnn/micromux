@@ -402,6 +402,11 @@
           "$ref": "#/definitions/duration",
           "description": "Time allowed for graceful termination before forced termination (default 10s, maximum 5m)."
         },
+        "stop_signal": {
+          "type": "string",
+          "pattern": "^\\s*([Ss][Ii][Gg])?([Tt][Ee][Rr][Mm]|[Ii][Nn][Tt]|[Hh][Uu][Pp]|[Qq][Uu][Ii][Tt]|[Uu][Ss][Rr]1|[Uu][Ss][Rr]2)\\s*$",
+          "description": "Signal delivered for the graceful stop request (default SIGTERM). The SIG prefix is optional and matching is case-insensitive. Ignored on Windows."
+        },
         "color": {
           "type": "boolean"
         },

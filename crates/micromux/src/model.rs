@@ -221,8 +221,11 @@ pub struct ServiceSnapshot {
     #[serde(default = "crate::spec::default_stop_grace_period")]
     #[schemars(with = "DurationSchema")]
     pub stop_grace_period: Duration,
-    /// Whether the current command, working directory, ports, healthcheck timing, or stop grace
-    /// differs from the configuration captured for this run.
+    /// Graceful-stop signal captured for this run.
+    #[serde(default)]
+    pub stop_signal: crate::spec::StopSignal,
+    /// Whether the current command, working directory, ports, healthcheck timing, stop grace, or
+    /// stop signal differs from the configuration captured for this run.
     #[serde(default)]
     pub config_stale: bool,
     /// Active automatic-restart backoff, if the scheduler is delaying the next attempt.
@@ -278,6 +281,7 @@ impl ServiceSnapshot {
             healthcheck_configured: healthcheck.is_some(),
             healthcheck,
             stop_grace_period: crate::spec::DEFAULT_STOP_GRACE_PERIOD,
+            stop_signal: crate::spec::StopSignal::default(),
             config_stale: false,
             restart_state: None,
             last_exit_code: None,

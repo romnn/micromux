@@ -1755,6 +1755,9 @@ struct TerminationTaskArgs {
     killer: Box<dyn portable_pty::ChildKiller + Send + Sync>,
     pid: Option<u32>,
     process_group_leader_id: Option<i32>,
+    stop_signal: crate::spec::StopSignal,
+    #[cfg(unix)]
+    leader_stamp: Option<crate::process_tree::ProcessStamp>,
     pty_shutdown: PtyShutdown,
     child: Box<dyn portable_pty::Child + Send + Sync>,
     health_task: Option<tokio::task::JoinHandle<()>>,
@@ -1778,26 +1781,87 @@ struct TerminationTarget {
     killer: Box<dyn portable_pty::ChildKiller + Send + Sync>,
     pid: Option<u32>,
     process_group_leader_id: Option<i32>,
+    /// Identity of the direct child at spawn time, anchoring pid-reuse-safe descendant
+    /// sweeps.
+    #[cfg(unix)]
+    leader_stamp: Option<crate::process_tree::ProcessStamp>,
+    /// Descendants observed while the leader was alive.
+    ///
+    /// The kernel reparents a process's children when it exits, so a walk rooted at a
+    /// dead leader finds nothing. Retaining what earlier passes saw is the only way to
+    /// still reach an escapee once the leader is gone.
+    #[cfg(unix)]
+    retained: Vec<crate::process_tree::Descendant>,
+}
+
+/// Maps the configured graceful-stop signal onto the OS signal to deliver.
+#[cfg(unix)]
+fn stop_signal_to_nix(signal: crate::spec::StopSignal) -> Signal {
+    use crate::spec::StopSignal;
+    match signal {
+        StopSignal::Term => Signal::SIGTERM,
+        StopSignal::Int => Signal::SIGINT,
+        StopSignal::Hup => Signal::SIGHUP,
+        StopSignal::Quit => Signal::SIGQUIT,
+        StopSignal::Usr1 => Signal::SIGUSR1,
+        StopSignal::Usr2 => Signal::SIGUSR2,
+    }
 }
 
 impl TerminationTarget {
+    fn new(
+        killer: Box<dyn portable_pty::ChildKiller + Send + Sync>,
+        pid: Option<u32>,
+        process_group_leader_id: Option<i32>,
+        #[cfg(unix)] leader_stamp: Option<crate::process_tree::ProcessStamp>,
+    ) -> Self {
+        Self {
+            killer,
+            pid,
+            process_group_leader_id,
+            #[cfg(unix)]
+            leader_stamp,
+            #[cfg(unix)]
+            retained: Vec::new(),
+        }
+    }
+
     async fn request(
         &mut self,
         events_tx: &mpsc::Sender<ProcessEvent>,
         service_id: &ServiceID,
         run_id: RunId,
         force_kill_after: Duration,
+        stop_signal: crate::spec::StopSignal,
     ) -> TerminationStart {
         #[cfg(not(unix))]
-        let _ = force_kill_after;
+        let _ = (force_kill_after, stop_signal);
 
-        tracing::info!(pid = self.pid, service_id, "killing process");
+        #[cfg(unix)]
+        tracing::info!(pid = self.pid, service_id, %stop_signal, "killing process");
+        // Windows terminates through the backend, so naming a signal here would report
+        // one that is never delivered.
+        #[cfg(not(unix))]
+        tracing::info!(pid = self.pid, service_id, "terminating process");
 
         #[cfg(unix)]
         let (kill_deadline, escalated) = {
-            if !self.signal(Signal::SIGTERM) {
+            // Snapshot before signaling: this is the last moment the leader is
+            // reliably alive, and once it exits its descendants reparent away and
+            // become undiscoverable.
+            self.refresh_retained().await;
+            let signal = stop_signal_to_nix(stop_signal);
+            let delivery = self.signal_leader(signal);
+            if delivery == LeaderSignal::Missed {
                 self.kill_with_backend();
             }
+            signal_descendants(
+                self.retained.clone(),
+                self.leader_group(),
+                delivery == LeaderSignal::Group,
+                signal,
+            )
+            .await;
             let now = tokio::time::Instant::now();
             (
                 Some(now.checked_add(force_kill_after).unwrap_or(now)),
@@ -1840,11 +1904,36 @@ impl TerminationTarget {
         }
     }
 
+    /// Force-kills the leader, its group, and — on Unix — every descendant a
+    /// synchronous sweep can reach.
+    ///
+    /// Used by [`SpawnedChildGuard`], whose `Drop` may run outside a runtime and
+    /// therefore cannot await: the walk and expansion run inline on the caller's
+    /// thread. A child that fails setup has been executing since spawn and may
+    /// already have forked or escaped the group, so a non-sweeping shortcut here
+    /// would leak those descendants past the startup error. Startup failure is rare
+    /// enough that blocking the caller for the scans is acceptable; no verification
+    /// tail exists on this path.
     fn force_kill(&mut self) {
         #[cfg(unix)]
         {
-            if !self.signal(Signal::SIGKILL) {
+            // Walk before the kill: the walk needs the leader alive to be trustworthy.
+            let retained = self
+                .leader_stamp
+                .map(crate::process_tree::descendants)
+                .unwrap_or_default();
+            if self.signal_leader(Signal::SIGKILL) == LeaderSignal::Missed {
                 self.kill_with_backend();
+            }
+            let mut groups: std::collections::HashSet<u32> = retained
+                .iter()
+                .filter_map(|descendant| descendant.process_group)
+                .collect();
+            groups.extend(self.leader_group());
+            let stamps: Vec<crate::process_tree::ProcessStamp> =
+                retained.iter().map(|descendant| descendant.stamp).collect();
+            for survivor in crate::process_tree::expand_survivors(&stamps, &groups) {
+                let _ = crate::process_tree::send_signal(survivor, Signal::SIGKILL);
             }
         }
 
@@ -1854,6 +1943,55 @@ impl TerminationTarget {
         }
     }
 
+    /// Force-kills the leader, its group, and every descendant the expansion reaches.
+    ///
+    /// Converges with [`reap_retained`] on the same final operation: expand the
+    /// retained stamps and recorded groups, then SIGKILL the expanded set. The
+    /// expansion is what recovers workers forked since the snapshot whose forker has
+    /// already died — the fresh walk from the still-live leader cannot see them,
+    /// because they reparented away; only their recorded group still names them.
+    ///
+    /// Consumes the retained set, returning the stamps that were signaled so
+    /// [`verify_reaped`] can retry failed deliveries and report leaks.
+    #[cfg(unix)]
+    async fn force_kill_swept(&mut self) -> Vec<crate::process_tree::ProcessStamp> {
+        // A last walk while the leader may still be alive picks up anything forked
+        // since the graceful pass that is still reachable through it.
+        self.refresh_retained().await;
+        let delivery = self.signal_leader(Signal::SIGKILL);
+        if delivery == LeaderSignal::Missed {
+            self.kill_with_backend();
+        }
+        let retained = std::mem::take(&mut self.retained);
+        let mut groups: std::collections::HashSet<u32> = retained
+            .iter()
+            .filter_map(|descendant| descendant.process_group)
+            .collect();
+        // The leader's group joins unconditionally, closing the narrow window where a
+        // member forked between the walk above and the killpg's delivery.
+        groups.extend(self.leader_group());
+        let stamps = retained.iter().map(|descendant| descendant.stamp).collect();
+        // Members of the leader's own group need no individual delivery — the killpg
+        // above already reached them and SIGKILL cannot be blocked — but re-signaling
+        // them by stamp is harmless, so the expanded set is killed uniformly.
+        let survivors = expand_survivors(stamps, groups).await;
+        signal_stamps(survivors.clone(), Signal::SIGKILL).await;
+        survivors
+    }
+
+    /// The leader's process-group id, when it fits the descendant records' encoding.
+    #[cfg(unix)]
+    fn leader_group(&self) -> Option<u32> {
+        self.process_group_leader_id
+            .and_then(|pgid| u32::try_from(pgid).ok())
+    }
+
+    /// Falls back to portable-pty's killer when direct signalling failed.
+    ///
+    /// On Unix the backend delivers `SIGHUP` — portable-pty's `ProcessSignaller` — not
+    /// `SIGKILL`, so despite its force-kill callsites this is the weakest rung: a
+    /// process that ignores hangups survives it, and only the PTY-teardown ladder
+    /// remains. On Windows it terminates the process through the backend handle.
     fn kill_with_backend(&mut self) {
         if let Err(err) = self.killer.kill() {
             #[cfg(unix)]
@@ -1865,18 +2003,55 @@ impl TerminationTarget {
         }
     }
 
+    /// Walks the descendant tree and merges the result into the retained set.
+    ///
+    /// The walk reads the whole process table, so it runs on the blocking pool: on a
+    /// busy host it costs milliseconds of syscalls, which would otherwise stall a
+    /// runtime worker and delay the force-kill and PTY-hangup deadlines.
     #[cfg(unix)]
-    fn signal(&self, signal: Signal) -> bool {
-        // Snapshot the descendant tree before signaling: once the group dies, escaped
-        // descendants reparent to init and vanish from the parent-pid walk.
-        let descendants = self
-            .pid
-            .map(crate::process_tree::descendant_pids)
-            .unwrap_or_default();
-        let mut delivered = false;
+    async fn refresh_retained(&mut self) {
+        let Some(leader) = self.leader_stamp else {
+            return;
+        };
+        let observed =
+            tokio::task::spawn_blocking(move || crate::process_tree::descendants(leader))
+                .await
+                .unwrap_or_default();
+        for descendant in observed {
+            // Dedup by identity, not by the whole record: a process that changed its
+            // group between walks must not appear twice, or the sweep would deliver the
+            // stop signal to it twice. The newest group observation wins so the
+            // killpg-coverage skip stays accurate.
+            if let Some(existing) = self
+                .retained
+                .iter_mut()
+                .find(|retained| retained.stamp == descendant.stamp)
+            {
+                existing.process_group = descendant.process_group;
+            } else {
+                self.retained.push(descendant);
+            }
+        }
+    }
+
+    /// Signals the leader's process group, falling back to the leader alone.
+    ///
+    /// The pid is deliberately not re-verified first. A stamp-based liveness check would
+    /// be wrong here: a leader that exited but is not yet reaped is a zombie, which
+    /// reads as "not alive" while still holding its pid, so the check would skip
+    /// `killpg` and leave the rest of the group unsignalled during an ordinary stop —
+    /// and neither platform can portably distinguish zombie from reaped.
+    ///
+    /// The residual is a narrow window: the child's `wait` reaps concurrently on the
+    /// blocking pool, so between a descendant walk and this call the pid could in
+    /// principle be freed and recycled. Both platforms allocate pids cyclically, so
+    /// reuse within milliseconds requires a full pid-space wrap; the risk is accepted,
+    /// as it is by every process-tree killer without kernel containment.
+    #[cfg(unix)]
+    fn signal_leader(&self, signal: Signal) -> LeaderSignal {
         if let Some(pgid) = self.process_group_leader_id {
             match nix::sys::signal::killpg(Pid::from_raw(pgid), signal) {
-                Ok(()) => delivered = true,
+                Ok(()) => return LeaderSignal::Group,
                 Err(Errno::ESRCH) => {
                     tracing::debug!(?signal, pgid, "process group exited before signal delivery");
                 }
@@ -1885,9 +2060,9 @@ impl TerminationTarget {
                 }
             }
         }
-        if !delivered && let Some(pid) = self.pid.and_then(|pid| i32::try_from(pid).ok()) {
+        if let Some(pid) = self.pid.and_then(|pid| i32::try_from(pid).ok()) {
             match nix::sys::signal::kill(Pid::from_raw(pid), signal) {
-                Ok(()) => delivered = true,
+                Ok(()) => return LeaderSignal::LeaderOnly,
                 Err(Errno::ESRCH) => {
                     tracing::debug!(?signal, pid, "process exited before signal delivery");
                 }
@@ -1896,22 +2071,56 @@ impl TerminationTarget {
                 }
             }
         }
-        // Descendants that moved into their own process groups (setsid/setpgid, as
-        // turborepo task runners and daemonizing dev servers do) are unreachable via
-        // killpg; signal each one individually. Members of the group just signaled
-        // receive the signal twice, which is harmless for TERM and KILL.
-        for descendant in descendants {
-            if let Ok(pid) = i32::try_from(descendant) {
-                match nix::sys::signal::kill(Pid::from_raw(pid), signal) {
-                    Ok(()) | Err(Errno::ESRCH) => {}
-                    Err(err) => {
-                        tracing::debug!(?err, ?signal, pid, "failed to signal descendant");
-                    }
-                }
-            }
-        }
-        delivered
+        LeaderSignal::Missed
     }
+}
+
+/// How far a leader-directed signal reached.
+///
+/// The distinction matters downstream: only a [`LeaderSignal::Group`] delivery lets
+/// the descendant sweep skip in-group members — after a leader-only fallback those
+/// members have received nothing yet.
+#[cfg(unix)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LeaderSignal {
+    /// `killpg` reached the leader's whole process group.
+    Group,
+    /// Only the leader itself was reachable; its group members were not signaled.
+    LeaderOnly,
+    /// Neither the group nor the leader could be signaled.
+    Missed,
+}
+
+/// Signals every retained descendant that a `killpg` did not already cover.
+///
+/// `group_signaled` reports whether the leader's whole group received this signal.
+/// When it did, members of that group are skipped: re-delivering is not harmless for
+/// the configurable stop signals, since a second `SIGINT` is widely treated as "abort
+/// now, skip cleanup" — the opposite of a graceful stop.
+///
+/// Runs on the blocking pool: each delivery is an identity re-check plus a syscall,
+/// and a large tree would otherwise occupy an async worker. A pid recycled since the
+/// snapshot is skipped rather than signaled.
+#[cfg(unix)]
+async fn signal_descendants(
+    descendants: Vec<crate::process_tree::Descendant>,
+    leader_group: Option<u32>,
+    group_signaled: bool,
+    signal: Signal,
+) {
+    if descendants.is_empty() {
+        return;
+    }
+    let _ = tokio::task::spawn_blocking(move || {
+        for descendant in &descendants {
+            if group_signaled && leader_group.is_some() && descendant.process_group == leader_group
+            {
+                continue;
+            }
+            let _ = crate::process_tree::send_signal(descendant.stamp, signal);
+        }
+    })
+    .await;
 }
 
 struct SpawnedChildGuard {
@@ -1923,13 +2132,16 @@ impl SpawnedChildGuard {
         killer: Box<dyn portable_pty::ChildKiller + Send + Sync>,
         pid: Option<u32>,
         process_group_leader_id: Option<i32>,
+        #[cfg(unix)] leader_stamp: Option<crate::process_tree::ProcessStamp>,
     ) -> Self {
         Self {
-            target: Some(TerminationTarget {
+            target: Some(TerminationTarget::new(
                 killer,
                 pid,
                 process_group_leader_id,
-            }),
+                #[cfg(unix)]
+                leader_stamp,
+            )),
         }
     }
 
@@ -2002,6 +2214,237 @@ async fn stop_health_task(
     }
 }
 
+/// Delay between post-SIGKILL verification rounds, long enough for the kernel to
+/// reparent and reap killed orphans.
+#[cfg(unix)]
+const KILL_VERIFICATION_INTERVAL: Duration = Duration::from_millis(200);
+
+/// Poll interval while waiting out the remaining grace period for retained descendants.
+#[cfg(unix)]
+const REAP_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Retains only the stamps that still name live processes, on the blocking pool.
+///
+/// Each check is a process-table read; a large tree would otherwise occupy an async
+/// worker with synchronous syscalls.
+#[cfg(unix)]
+async fn retain_alive(
+    survivors: Vec<crate::process_tree::ProcessStamp>,
+) -> Vec<crate::process_tree::ProcessStamp> {
+    tokio::task::spawn_blocking(move || {
+        let mut survivors = survivors;
+        survivors.retain(|&stamp| crate::process_tree::is_alive(stamp));
+        survivors
+    })
+    .await
+    .unwrap_or_default()
+}
+
+/// Expands surviving stamps to descendants forked since the snapshot, on the blocking
+/// pool. See [`crate::process_tree::expand_survivors`].
+#[cfg(unix)]
+async fn expand_survivors(
+    survivors: Vec<crate::process_tree::ProcessStamp>,
+    groups: std::collections::HashSet<u32>,
+) -> Vec<crate::process_tree::ProcessStamp> {
+    tokio::task::spawn_blocking(move || crate::process_tree::expand_survivors(&survivors, &groups))
+        .await
+        .unwrap_or_default()
+}
+
+/// Delivers `signal` to each stamp, on the blocking pool.
+#[cfg(unix)]
+async fn signal_stamps(survivors: Vec<crate::process_tree::ProcessStamp>, signal: Signal) {
+    let _ = tokio::task::spawn_blocking(move || {
+        for &stamp in &survivors {
+            let _ = crate::process_tree::send_signal(stamp, signal);
+        }
+    })
+    .await;
+}
+
+/// Grants retained descendants the rest of the grace window, then force-kills survivors.
+///
+/// This runs **before** the service's `Exited` event is published: `Exited` is what
+/// lets the scheduler start a replacement or finish a shutdown drain, so the lethal
+/// signal must already be delivered by then — a restart must not overlap live escapees,
+/// and a runtime teardown must not outrun the kill.
+///
+/// `kill_at` is the graceful-stop deadline from the original request. Descendants that
+/// already exited are noticed immediately, so the common case — the whole group died
+/// with the graceful signal — adds no delay beyond one expansion scan.
+///
+/// `leader_group` joins the recorded groups even when the retained set is empty: a
+/// single-process leader whose stop-signal handler forks an in-group helper and exits
+/// leaves nothing in the snapshot, and only group membership can still find the
+/// helper. The scan this costs on every requested termination is milliseconds on the
+/// blocking pool.
+///
+/// Expansion discoveries share the original deadline rather than being killed on
+/// sight: some received the graceful signal (forked between the snapshot and the
+/// `killpg`), and the rest may be performing the leader's shutdown work, so they are
+/// polled like the retained stamps until the grace runs out. Only an expansion that
+/// finds nothing ends the reap early, which keeps clean stops free of added latency.
+///
+/// Returns the stamps that were force-killed, for [`verify_reaped`].
+#[cfg(unix)]
+async fn reap_retained(
+    service_id: &ServiceID,
+    run_id: RunId,
+    retained: Vec<crate::process_tree::Descendant>,
+    leader_group: Option<u32>,
+    kill_at: Option<tokio::time::Instant>,
+) -> Vec<crate::process_tree::ProcessStamp> {
+    let mut groups: std::collections::HashSet<u32> = retained
+        .iter()
+        .filter_map(|descendant| descendant.process_group)
+        .collect();
+    groups.extend(leader_group);
+    if retained.is_empty() && groups.is_empty() {
+        return Vec::new();
+    }
+    let mut survivors: Vec<crate::process_tree::ProcessStamp> = retained
+        .into_iter()
+        .map(|descendant| descendant.stamp)
+        .collect();
+    // Wait out the remaining grace. The known stamps draining is not the end: an
+    // expansion may still discover group members or fresh forks, and those inherit
+    // the same deadline instead of being killed mid-grace. Only an empty expansion
+    // leaves early.
+    if let Some(deadline) = kill_at {
+        loop {
+            survivors = retain_alive(survivors).await;
+            if survivors.is_empty() {
+                survivors = expand_survivors(survivors, groups.clone()).await;
+                if survivors.is_empty() {
+                    return Vec::new();
+                }
+            }
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                break;
+            }
+            tokio::time::sleep(REAP_POLL_INTERVAL.min(deadline - now)).await;
+        }
+    } else {
+        survivors = retain_alive(survivors).await;
+    }
+    // The snapshot aged while the grace elapsed: an escapee may have forked workers
+    // the stamps do not name. One final expansion recovers them — live descendants of
+    // the surviving roots, plus members of the recorded process groups even when the
+    // forker itself is already gone. Forks racing this scan remain the documented
+    // best-effort residual.
+    survivors = expand_survivors(survivors, groups).await;
+    if survivors.is_empty() {
+        return Vec::new();
+    }
+    tracing::debug!(
+        count = survivors.len(),
+        %service_id,
+        run_id = run_id.get(),
+        "descendants outlived the service; forcing termination"
+    );
+    signal_stamps(survivors.clone(), Signal::SIGKILL).await;
+    survivors
+}
+
+/// Re-attempts failed SIGKILL deliveries, then reports descendants that remain.
+///
+/// Runs after `Exited` on a best-effort basis: the kill itself already happened in
+/// [`reap_retained`] or the escalation arm, so only the retry rounds and the leak
+/// warning are lost if the runtime tears down first. Verification is confined to the
+/// stamps that were signaled: [`reap_retained`]'s expansion already recovered forks
+/// since the snapshot, and a `SIGKILL`ed process cannot fork again, so anything still
+/// missing here raced the final scan and stays within the documented residual.
+#[cfg(unix)]
+async fn verify_reaped(
+    service_id: &ServiceID,
+    run_id: RunId,
+    mut survivors: Vec<crate::process_tree::ProcessStamp>,
+) {
+    for _ in 0..2 {
+        tokio::time::sleep(KILL_VERIFICATION_INTERVAL).await;
+        survivors = retain_alive(survivors).await;
+        if survivors.is_empty() {
+            return;
+        }
+        signal_stamps(survivors.clone(), Signal::SIGKILL).await;
+    }
+    tokio::time::sleep(KILL_VERIFICATION_INTERVAL).await;
+    survivors = retain_alive(survivors).await;
+    if !survivors.is_empty() {
+        let pids: Vec<u32> = survivors.iter().map(|stamp| stamp.pid).collect();
+        tracing::warn!(
+            ?pids,
+            %service_id,
+            run_id = run_id.get(),
+            "descendants survived forced termination"
+        );
+    }
+}
+
+struct FinishChildExitArgs<'a> {
+    wait_result: Result<io::Result<portable_pty::ExitStatus>, tokio::task::JoinError>,
+    service_id: &'a ServiceID,
+    run_id: RunId,
+    pid: Option<u32>,
+    events_tx: &'a mpsc::Sender<ProcessEvent>,
+    health_task: &'a mut Option<tokio::task::JoinHandle<()>>,
+    pending_killed_notification: Option<tokio::task::JoinHandle<()>>,
+}
+
+/// Publishes the exit event once the child wait completes, after the health task and
+/// any pending killed notification wind down.
+async fn finish_child_exit(args: FinishChildExitArgs<'_>) {
+    let FinishChildExitArgs {
+        wait_result,
+        service_id,
+        run_id,
+        pid,
+        events_tx,
+        health_task,
+        pending_killed_notification,
+    } = args;
+    stop_health_task(service_id, health_task).await;
+    if let Some(notification) = pending_killed_notification {
+        let _ = notification.await;
+    }
+    let code = exit_code_from_wait(wait_result, service_id, run_id, pid);
+    let event = ProcessEvent::Exited {
+        service_id: service_id.clone(),
+        run_id,
+        exit_code: code,
+    };
+    let _ = events_tx.send(event).await;
+}
+
+/// Closes every pty master endpoint when escalation leaves the child unreaped.
+///
+/// A descendant in another session can retain the slave after process-group
+/// escalation; without the hangup the terminal could keep the original child's wait
+/// from completing.
+fn hangup_unreaped_pty(
+    pid: Option<u32>,
+    service_id: &ServiceID,
+    run_id: RunId,
+    pty_shutdown: &mut Option<PtyShutdown>,
+) {
+    tracing::warn!(
+        ?pid,
+        %service_id,
+        run_id = run_id.get(),
+        "termination escalated but the process is still unreaped; closing its pty"
+    );
+    if let Some(shutdown) = pty_shutdown.take() {
+        shutdown.close();
+    }
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "the escalation ladder is one state machine; its arms share deadlines and \
+              cancellation state that splitting further would have to thread by hand"
+)]
 fn spawn_termination_task_with_timing(args: TerminationTaskArgs, timing: TerminationTiming) {
     tokio::spawn(async move {
         let TerminationTaskArgs {
@@ -2012,6 +2455,9 @@ fn spawn_termination_task_with_timing(args: TerminationTaskArgs, timing: Termina
             terminate,
             pid,
             process_group_leader_id,
+            stop_signal,
+            #[cfg(unix)]
+            leader_stamp,
             pty_shutdown,
             killer,
             mut child,
@@ -2022,11 +2468,13 @@ fn spawn_termination_task_with_timing(args: TerminationTaskArgs, timing: Termina
         #[cfg(windows)]
         let _process_job = process_job;
 
-        let mut target = TerminationTarget {
+        let mut target = TerminationTarget::new(
             killer,
             pid,
             process_group_leader_id,
-        };
+            #[cfg(unix)]
+            leader_stamp,
+        );
         // The blocking-pool thread remains occupied until the child wait completes. Forced
         // termination may not unblock it if the OS is still tearing the process down.
         let mut wait_handle = tokio::task::spawn_blocking(move || child.wait());
@@ -2036,22 +2484,44 @@ fn spawn_termination_task_with_timing(args: TerminationTaskArgs, timing: Termina
         let mut pty_hangup_deadline: Option<tokio::time::Instant> = None;
         let mut pending_killed_notification = None;
         let mut pty_shutdown = Some(pty_shutdown);
+        // Stamps whose deaths still need best-effort confirmation after `Exited`.
+        #[cfg(unix)]
+        let mut to_verify: Vec<crate::process_tree::ProcessStamp> = Vec::new();
         loop {
             tokio::select! {
                 biased;
                 res = &mut wait_handle => {
                     terminate.cancel();
-                    stop_health_task(&service_id, &mut health_task).await;
-                    if let Some(notification) = pending_killed_notification.take() {
-                        let _ = notification.await;
+                    // The kill must land before `Exited`: that event frees the scheduler
+                    // to start a replacement or finish a shutdown drain, and neither may
+                    // outrun live escapees. The writer is released first so the grace
+                    // wait cannot pin PTY input meanwhile. Extending — not replacing —
+                    // `to_verify` preserves the escalation arm's stamps for the
+                    // verification tail; after escalation the retained set is empty and
+                    // this reap contributes nothing further.
+                    #[cfg(unix)]
+                    if termination_started {
+                        drop(pty_shutdown.take());
+                        let remaining = std::mem::take(&mut target.retained);
+                        let reaped = reap_retained(
+                            &service_id,
+                            run_id,
+                            remaining,
+                            target.leader_group(),
+                            kill_deadline,
+                        )
+                        .await;
+                        to_verify.extend(reaped);
                     }
-                    let code = exit_code_from_wait(res, &service_id, run_id, pid);
-                    let event = ProcessEvent::Exited {
-                        service_id: service_id.clone(),
+                    finish_child_exit(FinishChildExitArgs {
+                        wait_result: res,
+                        service_id: &service_id,
                         run_id,
-                        exit_code: code,
-                    };
-                    let _ = events_tx.send(event).await;
+                        pid,
+                        events_tx: &events_tx,
+                        health_task: &mut health_task,
+                        pending_killed_notification: pending_killed_notification.take(),
+                    }).await;
                     break;
                 }
                 () = async {
@@ -2065,6 +2535,7 @@ fn spawn_termination_task_with_timing(args: TerminationTaskArgs, timing: Termina
                         &service_id,
                         run_id,
                         timing.force_kill_after,
+                        stop_signal,
                     ).await;
                     kill_deadline = started.kill_deadline;
                     termination_escalated = started.escalated;
@@ -2082,6 +2553,11 @@ fn spawn_termination_task_with_timing(args: TerminationTaskArgs, timing: Termina
                 }, if termination_started && !termination_escalated => {
                     // On Unix, target the process group plus any descendants that escaped
                     // it so they cannot survive the leader and keep its PTY open.
+                    #[cfg(unix)]
+                    {
+                        to_verify = target.force_kill_swept().await;
+                    }
+                    #[cfg(not(unix))]
                     target.force_kill();
                     termination_escalated = true;
                     pty_hangup_deadline =
@@ -2093,23 +2569,18 @@ fn spawn_termination_task_with_timing(args: TerminationTaskArgs, timing: Termina
                         None => std::future::pending::<()>().await,
                     }
                 }, if pty_hangup_deadline.is_some() => {
-                    // A descendant in another session can retain the slave after process-group
-                    // escalation.
-                    //
-                    // Close every master endpoint so the terminal cannot keep the original child's
-                    // wait from completing.
-                    tracing::warn!(
-                        ?pid,
-                        %service_id,
-                        run_id = run_id.get(),
-                        "termination escalated but the process is still unreaped; closing its pty"
-                    );
-                    if let Some(shutdown) = pty_shutdown.take() {
-                        shutdown.close();
-                    }
+                    hangup_unreaped_pty(pid, &service_id, run_id, &mut pty_shutdown);
                     pty_hangup_deadline = None;
                 }
             }
+        }
+
+        // Best-effort tail: the kills themselves already landed before `Exited`, so a
+        // runtime teardown cutting this short loses only the retry rounds and the leak
+        // warning.
+        #[cfg(unix)]
+        if !to_verify.is_empty() {
+            verify_reaped(&service_id, run_id, to_verify).await;
         }
     });
 }
@@ -2196,7 +2667,29 @@ pub(super) fn start_service_with_pty_size(
     #[cfg(not(unix))]
     let process_group_leader = None;
 
-    let mut child_guard = SpawnedChildGuard::new(child.clone_killer(), pid, process_group_leader);
+    // Record the child's identity while its pid is guaranteed fresh, so later descendant
+    // sweeps can detect pid reuse instead of walking a stranger's process tree.
+    #[cfg(unix)]
+    let leader_stamp = pid.and_then(crate::process_tree::stamp);
+    // A missing stamp disables the descendant sweep for this run's whole lifetime; the
+    // process-group kill and PTY teardown remain, but escapees would leak silently, so
+    // the degradation must be visible.
+    #[cfg(unix)]
+    if leader_stamp.is_none() {
+        tracing::warn!(
+            ?pid,
+            service_id,
+            "cannot identify the spawned child; descendant sweep disabled for this run"
+        );
+    }
+
+    let mut child_guard = SpawnedChildGuard::new(
+        child.clone_killer(),
+        pid,
+        process_group_leader,
+        #[cfg(unix)]
+        leader_stamp,
+    );
 
     #[cfg(windows)]
     let process_job = {
@@ -2282,6 +2775,9 @@ pub(super) fn start_service_with_pty_size(
             killer,
             pid,
             process_group_leader_id: process_group_leader,
+            stop_signal: service.spec.stop_signal,
+            #[cfg(unix)]
+            leader_stamp,
             pty_shutdown,
             child,
             health_task,
@@ -2505,6 +3001,8 @@ mod tests {
                 killer: Box::new(CountingKiller { calls }),
                 pid: Some(u32::MAX),
                 process_group_leader_id: Some(i32::MAX),
+                leader_stamp: None,
+                retained: Vec::new(),
             }
         }
 
@@ -2540,6 +3038,7 @@ mod tests {
                     &service_id,
                     run_id,
                     crate::spec::DEFAULT_STOP_GRACE_PERIOD,
+                    crate::spec::StopSignal::default(),
                 )
                 .await;
 
@@ -2558,10 +3057,10 @@ mod tests {
         }
 
         /// Regression: descendants that move into their own process group (as turborepo
-        /// task runners and daemonizing dev servers do) must not survive `force_kill`,
-        /// which previously reached only the leader's own group.
-        #[test]
-        fn force_kill_reaps_descendants_that_left_the_process_group() -> eyre::Result<()> {
+        /// task runners do) must not survive the forced sweep, which previously reached
+        /// only the leader's own group.
+        #[tokio::test]
+        async fn force_kill_reaps_descendants_that_left_the_process_group() -> eyre::Result<()> {
             use std::os::unix::process::CommandExt as _;
 
             // `set -m` enables job control, so the background sleep runs in its own
@@ -2572,12 +3071,15 @@ mod tests {
                 .spawn()?;
             let root = child.id();
 
+            let root_stamp = crate::process_tree::stamp(root)
+                .ok_or_else(|| eyre::eyre!("expected a stamp for the live shell"))?;
+
             // Wait for the escaped sleep to fork.
             let deadline = std::time::Instant::now() + Duration::from_secs(10);
-            let mut escapees = crate::process_tree::descendant_pids(root);
+            let mut escapees = crate::process_tree::descendants(root_stamp);
             while escapees.is_empty() && std::time::Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(25));
-                escapees = crate::process_tree::descendant_pids(root);
+                escapees = crate::process_tree::descendants(root_stamp);
             }
             if escapees.is_empty() {
                 let _ = child.kill();
@@ -2585,26 +3087,37 @@ mod tests {
                 eyre::bail!("expected the escaped sleep to appear under the shell");
             }
 
+            // The premise of the test is that `killpg` alone cannot reach these; if the
+            // job were ever observed between `fork` and `setpgid` it would still be in
+            // the leader's group and the test would silently degrade to a no-op.
+            let leader_group = escapees
+                .iter()
+                .filter(|descendant| descendant.process_group != Some(root))
+                .count();
+
             let mut target = TerminationTarget {
                 killer: Box::new(CountingKiller {
                     calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 }),
                 pid: Some(root),
                 process_group_leader_id: Some(i32::try_from(root)?),
+                leader_stamp: Some(root_stamp),
+                retained: Vec::new(),
             };
-            target.force_kill();
+            target.force_kill_swept().await;
             // Reap the shell so the leader cannot linger as a zombie during polling.
+            // Kill first: if the sweep regressed, `wait` would otherwise block on
+            // `sleep 30 & wait` and turn a clean failure into a near-timeout.
+            let _ = child.kill();
             let _ = child.wait();
 
             // Poll for the escapees to disappear: the kernel still has to reparent the
             // orphans to init and reap them after the SIGKILL sweep.
             let deadline = std::time::Instant::now() + Duration::from_secs(10);
             let all_gone = loop {
-                let all_gone = escapees.iter().all(|&pid| {
-                    i32::try_from(pid).is_ok_and(|pid| {
-                        nix::sys::signal::kill(Pid::from_raw(pid), None) == Err(Errno::ESRCH)
-                    })
-                });
+                let all_gone = escapees
+                    .iter()
+                    .all(|descendant| !crate::process_tree::is_alive(descendant.stamp));
                 if all_gone || std::time::Instant::now() >= deadline {
                     break all_gone;
                 }
@@ -2613,15 +3126,369 @@ mod tests {
 
             // Best-effort cleanup so a regression does not leak the sleeps.
             if !all_gone {
-                for &pid in &escapees {
-                    if let Ok(pid) = i32::try_from(pid) {
-                        let _ = nix::sys::signal::kill(Pid::from_raw(pid), Signal::SIGKILL);
-                    }
+                for descendant in &escapees {
+                    let _ = crate::process_tree::send_signal(descendant.stamp, Signal::SIGKILL);
                 }
             }
             eyre::ensure!(
+                leader_group > 0,
+                "no descendant left the leader's group; killpg alone would have reaped these"
+            );
+            eyre::ensure!(
                 all_gone,
                 "escaped descendants survived force_kill: {escapees:?}"
+            );
+            Ok(())
+        }
+
+        /// The graceful stop request must deliver the configured signal: an INT trap
+        /// writes a marker file, which SIGTERM, SIGHUP, SIGQUIT, or SIGKILL would all
+        /// fail to run.
+        #[tokio::test]
+        async fn request_delivers_configured_stop_signal() -> eyre::Result<()> {
+            use std::os::unix::process::CommandExt as _;
+
+            let fixture_dir = crate::test_util::unique_tmp_dir("stop-signal");
+            fs::create_dir_all(&fixture_dir)?;
+            let marker = fixture_dir.join("trapped");
+            let ready = fixture_dir.join("ready");
+            // Announce readiness only once the trap is installed. Signalling before bash
+            // reaches the `trap` builtin kills it on the default SIGINT disposition, so
+            // without this handshake the test fails most of the time. Paths travel
+            // through the environment because interpolating them into the script breaks
+            // on any TMPDIR containing a space or quote.
+            // The loop is bounded so a failing run cannot leave the fixture behind.
+            let script = "trap 'echo done > \"$MICROMUX_MARKER\"; exit 0' INT; \
+                          : > \"$MICROMUX_READY\"; for ((i=0;i<120;i++)); do sleep 1; done";
+            let mut child = std::process::Command::new("bash")
+                .args(["-c", script])
+                .env("MICROMUX_MARKER", &marker)
+                .env("MICROMUX_READY", &ready)
+                .process_group(0)
+                .spawn()?;
+            let root = child.id();
+
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while !ready.exists() && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let trap_installed = ready.exists();
+
+            let mut target = TerminationTarget {
+                killer: Box::new(CountingKiller {
+                    calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                }),
+                pid: Some(root),
+                process_group_leader_id: Some(i32::try_from(root)?),
+                leader_stamp: crate::process_tree::stamp(root),
+                retained: Vec::new(),
+            };
+            let (events_tx, _events_rx) = mpsc::channel(1);
+            target
+                .request(
+                    &events_tx,
+                    &"svc".to_string(),
+                    RunId::new(9),
+                    Duration::from_secs(5),
+                    crate::spec::StopSignal::Int,
+                )
+                .await;
+
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while !marker.exists() && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            let marker_written = marker.exists();
+
+            // Cleanup regardless of outcome so a failure does not leak the shell.
+            let _ = nix::sys::signal::killpg(Pid::from_raw(i32::try_from(root)?), Signal::SIGKILL);
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = fs::remove_dir_all(&fixture_dir);
+
+            eyre::ensure!(trap_installed, "fixture never installed its INT trap");
+            eyre::ensure!(
+                marker_written,
+                "INT trap did not run; the configured stop signal was not delivered"
+            );
+            Ok(())
+        }
+
+        /// Regression: a descendant that ignores the stop signal must still be reaped
+        /// when the leader itself exits promptly.
+        ///
+        /// The leader's exit ends the termination loop and reparents its descendants,
+        /// so nothing can rediscover them afterwards. Only the snapshot retained from
+        /// the graceful pass can still reach the escapee.
+        #[tokio::test]
+        async fn descendants_are_reaped_when_the_leader_exits_first() -> eyre::Result<()> {
+            use std::os::unix::process::CommandExt as _;
+
+            let fixture_dir = crate::test_util::unique_tmp_dir("leader-exits-first");
+            fs::create_dir_all(&fixture_dir)?;
+            let ready = fixture_dir.join("ready");
+            // The background child ignores SIGTERM and runs in its own process group,
+            // so neither the graceful signal nor a killpg can reap it. The leader exits
+            // as soon as it is signalled. Everything is time-bounded: if the retention
+            // this test guards ever regresses, the child is orphaned with no pid
+            // recorded anywhere, and an unbounded fixture would leak it permanently.
+            // The child blocks on one long sleep rather than respawning short ones,
+            // which would race the sweep's final scan and flake the leak detection.
+            let script = "set -m; (trap '' TERM; sleep 120 & : > \"$MICROMUX_READY\"; wait) & \
+                 trap 'exit 0' TERM; for ((i=0;i<600;i++)); do sleep 0.2; done";
+            let mut child = std::process::Command::new("bash")
+                .args(["-c", script])
+                .env("MICROMUX_READY", &ready)
+                .process_group(0)
+                .spawn()?;
+            let root = child.id();
+            let root_stamp = crate::process_tree::stamp(root)
+                .ok_or_else(|| eyre::eyre!("expected a stamp for the live shell"))?;
+
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while !ready.exists() && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+
+            let mut target = TerminationTarget {
+                killer: Box::new(CountingKiller {
+                    calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                }),
+                pid: Some(root),
+                process_group_leader_id: Some(i32::try_from(root)?),
+                leader_stamp: Some(root_stamp),
+                retained: Vec::new(),
+            };
+            let (events_tx, _events_rx) = mpsc::channel(1);
+            target
+                .request(
+                    &events_tx,
+                    &"svc".to_string(),
+                    RunId::new(13),
+                    Duration::from_millis(250),
+                    crate::spec::StopSignal::Term,
+                )
+                .await;
+
+            let escapees = std::mem::take(&mut target.retained);
+            // The leader dies to its own TERM handler, mimicking the loop's wait branch.
+            let _ = child.wait();
+
+            let _ = reap_retained(
+                &"svc".to_string(),
+                RunId::new(13),
+                escapees.clone(),
+                None,
+                Some(tokio::time::Instant::now() + Duration::from_millis(250)),
+            )
+            .await;
+
+            // SIGKILL delivery is asynchronous; give the kernel a moment to reap.
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let all_gone = loop {
+                let all_gone = escapees
+                    .iter()
+                    .all(|descendant| !crate::process_tree::is_alive(descendant.stamp));
+                if all_gone || std::time::Instant::now() >= deadline {
+                    break all_gone;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            };
+
+            // Best-effort cleanup so a regression does not leak the fixture.
+            for descendant in &escapees {
+                let _ = crate::process_tree::send_signal(descendant.stamp, Signal::SIGKILL);
+            }
+            let _ = fs::remove_dir_all(&fixture_dir);
+
+            eyre::ensure!(
+                !escapees.is_empty(),
+                "expected the TERM-ignoring child to be retained from the graceful pass"
+            );
+            eyre::ensure!(
+                all_gone,
+                "descendant that ignored SIGTERM survived after the leader exited"
+            );
+            Ok(())
+        }
+
+        /// Dropping the spawn guard without disarming — the failed-startup path — must
+        /// sweep the descendants the child managed to fork before setup failed,
+        /// including ones that already escaped the process group: the child has been
+        /// executing since spawn, so "it had no chance to fork" does not hold.
+        #[tokio::test]
+        async fn dropping_spawn_guard_sweeps_escaped_descendants() -> eyre::Result<()> {
+            use std::os::unix::process::CommandExt as _;
+
+            let fixture_dir = crate::test_util::unique_tmp_dir("guard-drop-sweep");
+            fs::create_dir_all(&fixture_dir)?;
+            let ready = fixture_dir.join("ready");
+            let escapee_pid_file = fixture_dir.join("escapee-pid");
+            // The escapee moves to its own group (`set -m`), out of the killpg's reach;
+            // only the guard's walk can find it. Everything blocks on bounded sleeps.
+            let script = "set -m; \
+                 bash -c 'echo $$ > \"$MICROMUX_ESCAPEE_PID\"; sleep 120 & \
+                          : > \"$MICROMUX_READY\"; wait' & \
+                 wait";
+            let mut child = std::process::Command::new("bash")
+                .args(["-c", script])
+                .env("MICROMUX_READY", &ready)
+                .env("MICROMUX_ESCAPEE_PID", &escapee_pid_file)
+                .process_group(0)
+                .spawn()?;
+            let root = child.id();
+            let root_stamp = crate::process_tree::stamp(root)
+                .ok_or_else(|| eyre::eyre!("expected a stamp for the live shell"))?;
+
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while !ready.exists() && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let escapee_pid: i32 = fs::read_to_string(&escapee_pid_file)?.trim().parse()?;
+
+            let guard = SpawnedChildGuard::new(
+                Box::new(CountingKiller {
+                    calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                }),
+                Some(root),
+                Some(i32::try_from(root)?),
+                Some(root_stamp),
+            );
+            // No disarm: this is the startup-error path.
+            drop(guard);
+
+            // The kills are synchronous but the deaths are not; `ESRCH` proves the
+            // escapee is fully retired.
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let escapee_gone = loop {
+                let gone = nix::sys::signal::kill(Pid::from_raw(escapee_pid), None)
+                    == Err(nix::errno::Errno::ESRCH);
+                if gone || std::time::Instant::now() >= deadline {
+                    break gone;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            };
+
+            // Best-effort cleanup so a regression does not leak the fixture.
+            let _ = nix::sys::signal::kill(Pid::from_raw(escapee_pid), Signal::SIGKILL);
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = fs::remove_dir_all(&fixture_dir);
+
+            eyre::ensure!(
+                escapee_gone,
+                "escapee {escapee_pid} survived the spawn guard's failed-startup sweep"
+            );
+            Ok(())
+        }
+
+        /// A descendant that outlived the service must be force-killed by the cleanup
+        /// task rather than leaking silently — and so must the worker it forked after
+        /// the retained snapshot, which only the pre-kill expansion can discover.
+        ///
+        /// The fixture ignores SIGTERM because the real target population has already
+        /// survived the graceful pass; accepting any exit here would let a regression to
+        /// SIGTERM pass unnoticed. Its single background sleep is forked before the
+        /// readiness handshake, so the expansion observes it deterministically; the
+        /// sleep itself bounds the fixture should a failing run leave it behind.
+        #[tokio::test]
+        async fn kill_verification_reaps_surviving_descendants() -> eyre::Result<()> {
+            use std::os::unix::process::ExitStatusExt as _;
+
+            let fixture_dir = crate::test_util::unique_tmp_dir("kill-verification");
+            fs::create_dir_all(&fixture_dir)?;
+            let ready = fixture_dir.join("ready");
+            let worker_pid_file = fixture_dir.join("worker-pid");
+            let mut child = std::process::Command::new("bash")
+                .args([
+                    "-c",
+                    "trap '' TERM; sleep 120 & echo $! > \"$MICROMUX_WORKER_PID\"; \
+                     : > \"$MICROMUX_READY\"; wait",
+                ])
+                .env("MICROMUX_READY", &ready)
+                .env("MICROMUX_WORKER_PID", &worker_pid_file)
+                .spawn()?;
+            let stamp = crate::process_tree::stamp(child.id())
+                .ok_or_else(|| eyre::eyre!("expected a stamp for the live fixture"))?;
+
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while !ready.exists() && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let worker_pid: u32 = fs::read_to_string(&worker_pid_file)?.trim().parse()?;
+
+            // Hand the live process to the reaper as if the sweep had missed it;
+            // `kill_at: None` mirrors the escalation path where the grace window has
+            // already elapsed, so the SIGKILL is delivered before this returns. The
+            // worker is deliberately absent from the retained set: only the expansion
+            // can reach it.
+            let survivors = reap_retained(
+                &"svc".to_string(),
+                RunId::new(11),
+                vec![crate::process_tree::Descendant {
+                    stamp,
+                    process_group: None,
+                }],
+                None,
+                None,
+            )
+            .await;
+            let worker_swept = survivors.iter().any(|survivor| survivor.pid == worker_pid);
+
+            // The child is ours, so its death is observable via try_wait. The deadline
+            // tracks the verification interval so raising that constant does not
+            // silently break this test.
+            let deadline = std::time::Instant::now() + KILL_VERIFICATION_INTERVAL * 25;
+            let mut status = None;
+            while status.is_none() && std::time::Instant::now() < deadline {
+                status = child.try_wait()?;
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+
+            // The verification tail must observe the deaths and return without incident.
+            verify_reaped(&"svc".to_string(), RunId::new(11), survivors).await;
+
+            // The worker reparented on the fixture's death; wait for the kernel to
+            // fully retire it. `kill -0` is used rather than a stamp read: it keeps
+            // succeeding for an unreaped zombie and cannot transiently misreport a
+            // live process under load, so `ESRCH` proves the worker — and its copies
+            // of the test's output handles — are certainly gone before the test exits.
+            let worker_gone = match i32::try_from(worker_pid) {
+                Ok(pid) => {
+                    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                    loop {
+                        let gone = nix::sys::signal::kill(Pid::from_raw(pid), None)
+                            == Err(nix::errno::Errno::ESRCH);
+                        if gone || std::time::Instant::now() >= deadline {
+                            break gone;
+                        }
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                    }
+                }
+                Err(_) => false,
+            };
+
+            // Best-effort cleanup so a regression does not leak the fixture.
+            let _ = child.kill();
+            let _ = child.wait();
+            if let Ok(worker_pid) = i32::try_from(worker_pid) {
+                let _ = nix::sys::signal::kill(Pid::from_raw(worker_pid), Signal::SIGKILL);
+            }
+            let _ = fs::remove_dir_all(&fixture_dir);
+
+            let status = status
+                .ok_or_else(|| eyre::eyre!("the reaper did not kill the surviving descendant"))?;
+            eyre::ensure!(
+                status.signal() == Some(nix::libc::SIGKILL),
+                "the reaper must escalate to SIGKILL, got {status:?}"
+            );
+            eyre::ensure!(
+                worker_swept,
+                "the expansion must sweep the worker the retained stamps did not name"
+            );
+            eyre::ensure!(
+                worker_gone,
+                "the swept worker survived the forced termination"
             );
             Ok(())
         }
@@ -2645,6 +3512,7 @@ mod tests {
                     &"svc".to_string(),
                     RunId::new(7),
                     Duration::from_secs(1),
+                    crate::spec::StopSignal::default(),
                 )
                 .await;
 
@@ -3393,6 +4261,8 @@ mod tests {
                     }),
                     pid: None,
                     process_group_leader_id: None,
+                    stop_signal: crate::spec::StopSignal::default(),
+                    leader_stamp: None,
                     pty_shutdown,
                     child: Box::new(child),
                     health_task: None,

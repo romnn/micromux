@@ -71,7 +71,7 @@ pub use scheduler::{
 pub use service::{Error as ServiceError, RestartPolicy};
 pub use spec::{
     DependencySpec, DynamicOrigin, DynamicServiceParams, HealthcheckSpec, Lease,
-    PartialServiceSpec, ServiceOrigin, ServiceSpec, SpecError, SpecField,
+    PartialServiceSpec, ServiceOrigin, ServiceSpec, SpecError, SpecField, StopSignal,
 };
 pub use structured_log::{
     FIELDS_KEY, MESSAGE_KEYS, StructuredLogLevel, find_fields_object, find_key,
@@ -278,6 +278,7 @@ pub(crate) fn initial_model_entries(services: &ServiceMap) -> Vec<(ServiceSnapsh
                 service.working_dir_display(),
             );
             snapshot.stop_grace_period = service.spec.stop_grace_period;
+            snapshot.stop_signal = service.spec.stop_signal;
             snapshot.desired = match service.startup_mode {
                 service::StartupMode::Enabled => Desired::Enabled,
                 service::StartupMode::Disabled => Desired::Disabled,

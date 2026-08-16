@@ -354,6 +354,8 @@ pub struct Service {
     pub restart_policy: RestartPolicy,
     /// Time allowed for graceful termination before forced termination.
     pub stop_grace_period: Spanned<Duration>,
+    /// Signal delivered for the graceful stop request.
+    pub stop_signal: Spanned<crate::spec::StopSignal>,
     /// Whether this service should be rendered in color.
     pub color: Option<Spanned<bool>>,
     /// Effective log retention after applying global defaults and this service's overrides.

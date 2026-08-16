@@ -239,6 +239,7 @@ pub(super) struct RunConfig {
     advertised_ports: Vec<u16>,
     healthcheck: Option<HealthcheckConfig>,
     stop_grace_period: Duration,
+    stop_signal: crate::spec::StopSignal,
 }
 
 impl From<&Service> for RunConfig {
@@ -253,6 +254,7 @@ impl From<&Service> for RunConfig {
                 .as_ref()
                 .map(HealthcheckConfig::from),
             stop_grace_period: service.spec.stop_grace_period,
+            stop_signal: service.spec.stop_signal,
         }
     }
 }
@@ -664,6 +666,7 @@ pub(super) fn project_snapshot(
         healthcheck_configured: run_config.healthcheck.is_some(),
         healthcheck: run_config.healthcheck.clone(),
         stop_grace_period: run_config.stop_grace_period,
+        stop_signal: run_config.stop_signal,
         config_stale: runtime
             .run_config
             .as_ref()

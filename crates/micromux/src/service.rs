@@ -294,6 +294,7 @@ mod tests {
                 ports: vec![1023],
                 restart: RestartPolicy::Always,
                 stop_grace_period: crate::spec::DEFAULT_STOP_GRACE_PERIOD,
+                stop_signal: crate::spec::StopSignal::default(),
             }
         );
         Ok(())
@@ -547,6 +548,7 @@ impl Service {
                 ports: advertised_ports,
                 restart: config.restart_policy,
                 stop_grace_period: config.stop_grace_period.into_inner(),
+                stop_signal: config.stop_signal.into_inner(),
             },
             origin: ServiceOrigin::Configured,
             startup_mode: config.startup_mode,

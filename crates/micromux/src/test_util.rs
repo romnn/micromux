@@ -39,6 +39,10 @@ pub(crate) fn service_config(name: &str, command: (&str, &[&str])) -> config::Se
             span: yaml_spanned::spanned::Span::default(),
             inner: crate::spec::DEFAULT_STOP_GRACE_PERIOD,
         },
+        stop_signal: Spanned {
+            span: yaml_spanned::spanned::Span::default(),
+            inner: crate::spec::StopSignal::default(),
+        },
         color: None,
         log_retention: LogRetention::default(),
     }

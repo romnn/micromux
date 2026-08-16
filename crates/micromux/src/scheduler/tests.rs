@@ -764,6 +764,10 @@ async fn log_reader_finished_leaves_no_draining_handle_in_either_order() -> eyre
 async fn initially_disabled_service_stays_stopped_until_enabled() -> eyre::Result<()> {
     let mut config = service_config("svc", ("sh", &["-c", "sleep 60"]));
     config.startup_mode = StartupMode::Disabled;
+    config.stop_signal = yaml_spanned::Spanned {
+        span: yaml_spanned::spanned::Span::default(),
+        inner: crate::spec::StopSignal::Int,
+    };
     let mut services: ServiceMap = ServiceMap::new();
     services.insert(
         "svc".to_string(),
@@ -779,6 +783,9 @@ async fn initially_disabled_service_stays_stopped_until_enabled() -> eyre::Resul
     assert_eq!(snapshot.desired, Desired::Disabled);
     assert_eq!(snapshot.execution, Execution::Pending);
     assert_eq!(snapshot.run_generation, 0);
+    // A disabled service may never be re-projected from a run, so the initial
+    // projection itself must carry the configured signal instead of the default.
+    assert_eq!(snapshot.stop_signal, crate::spec::StopSignal::Int);
 
     let rejected = harness
         .control
@@ -2464,7 +2471,10 @@ services:
     healthcheck:
       test: ["CMD-SHELL", "test -f marker.txt"]
       interval: "25ms"
-      timeout: "500ms"
+      # Generous relative to the property under test (spawn cwd validity, not
+      # latency): under a loaded parallel test run a probe can take hundreds of
+      # milliseconds just to spawn, and a timeout recorded as failure fails the test.
+      timeout: "5s"
       retries: 1
 "#
         )
@@ -2806,10 +2816,10 @@ mod escaped_session {
                 eyre::bail!("escaped-session spawner exited with {status}");
             }
             // Stay alive so termination has to escalate past the ignored SIGTERM; the
-            // writer keeps running independently until the PTY is torn down.
-            loop {
-                std::thread::sleep(std::time::Duration::from_hours(1));
-            }
+            // writer keeps running independently until the PTY is torn down. The bound
+            // is a backstop, far longer than the test needs.
+            std::thread::sleep(std::time::Duration::from_mins(2));
+            return Ok(());
         }
 
         // Exiting right after the spawn reparents the writer to init, hiding it from the
@@ -2827,6 +2837,10 @@ mod escaped_session {
         }
 
         nix::unistd::setsid()?;
+        // Bound the writer's lifetime independently of the teardown ladder under test.
+        // It is detached from every ancestor and its pid is recorded nowhere, so if that
+        // ladder ever regresses nothing else can reap it.
+        nix::unistd::alarm::set(120);
         let ready_file =
             std::env::var_os(READY_FILE).ok_or_eyre("escaped-session ready file is missing")?;
         let exited_file =
@@ -2923,9 +2937,442 @@ mod escaped_session {
         // test process.
         harness.shutdown.cancel();
         let scheduler_result = harness.handle.await;
-        fs::remove_dir_all(&fixture_dir)?;
+        // Best-effort: a cleanup error must not mask the outcome under test.
+        let _ = fs::remove_dir_all(&fixture_dir);
         scheduler_result??;
         restarted
+    }
+}
+
+/// Scheduler-level contract for descendants that escape the process group: their
+/// SIGKILL is delivered before `Exited`, so neither a restart nor a shutdown drain —
+/// both gated on `Exited` — can outrun a live escapee.
+#[cfg(unix)]
+mod escaped_descendants {
+    use super::*;
+    use color_eyre::eyre;
+
+    /// The leader exits promptly on TERM; the background child moves to its own
+    /// process group (`set -m`), ignores TERM, and records its pid for the test.
+    /// Everything is time-bounded so a regression cannot leak the fixture: the
+    /// escapee blocks on a single long sleep rather than respawning short ones,
+    /// which would race the sweep's final scan and flake the leak detection.
+    const LEADER_SCRIPT: &str = "set -m; \
+        bash -c 'trap \"\" TERM; echo $$ > \"$MMX_ESCAPEE_PID\"; \
+                 sleep 120 & : > \"$MMX_ESCAPEE_READY\"; wait' & \
+        trap 'exit 0' TERM; for ((i=0;i<120;i++)); do sleep 1; done";
+
+    /// Like [`LEADER_SCRIPT`], but the escapee waits for the leader to die and only
+    /// then forks a worker, recording its pid. The worker is thus absent from any
+    /// snapshot taken while the leader lived, and no walk can reach it through the
+    /// dead leader — only the pre-`Exited` expansion from the surviving escapee (or
+    /// its recorded group) can. `kill -0` keeps observing the leader while it is an
+    /// unreaped zombie, so the fork happens strictly after the scheduler saw the exit.
+    const FORKING_LEADER_SCRIPT: &str = "set -m; export MMX_LEADER_PID=$$; \
+        bash -c 'trap \"\" TERM; echo $$ > \"$MMX_ESCAPEE_PID\"; : > \"$MMX_ESCAPEE_READY\"; \
+                 for ((i=0;i<1200;i++)); do kill -0 \"$MMX_LEADER_PID\" 2>/dev/null || break; sleep 0.05; done; \
+                 sleep 120 & echo $! > \"$MMX_WORKER_PID\"; \
+                 for ((i=0;i<120;i++)); do sleep 1; done' & \
+        trap 'exit 0' TERM; for ((i=0;i<120;i++)); do sleep 1; done";
+
+    /// Like [`FORKING_LEADER_SCRIPT`], but the leader itself ignores TERM and survives
+    /// the whole grace window, driving the deadline escalation instead of the wait-arm
+    /// reap. The escapee reacts to the sweep's TERM by forking a worker into its own
+    /// (recorded) group and exiting: by the deadline the worker's parent chain is
+    /// gone, and only the recorded group can still name it.
+    const ESCALATING_LEADER_SCRIPT: &str = "set -m; \
+        bash -c 'trap \"sleep 120 & echo \\$! > \\\"$MMX_WORKER_PID\\\"; exit 0\" TERM; \
+                 echo $$ > \"$MMX_ESCAPEE_PID\"; : > \"$MMX_ESCAPEE_READY\"; \
+                 for ((i=0;i<1200;i++)); do sleep 0.05; done' & \
+        trap \"\" TERM; for ((i=0;i<120;i++)); do sleep 1; done";
+
+    /// A leader with no descendants at all: `read` is a builtin, so nothing is forked
+    /// until the TERM handler spawns an in-group helper and exits. The helper
+    /// post-dates both the (empty) retained snapshot and the graceful `killpg`, and
+    /// it inherits the leader's ignored HUP at fork — born immune, so the
+    /// PTY-teardown hangup cannot mask the gap — leaving only the leader's own
+    /// recorded process group to find it.
+    const HELPER_FORKING_LEADER_SCRIPT: &str = "trap '' HUP; \
+         trap 'sleep 120 & echo $! > \"$MMX_WORKER_PID\"; exit 0' TERM; \
+         echo $$ > \"$MMX_ESCAPEE_PID\"; : > \"$MMX_ESCAPEE_READY\"; read -t 120 _";
+
+    /// Like [`HELPER_FORKING_LEADER_SCRIPT`], but the helper models the leader's
+    /// graceful cleanup: it works briefly, writes a completion marker, and exits on
+    /// its own. The reap must grant it the remaining grace instead of killing it on
+    /// discovery.
+    const CLEANUP_HELPER_LEADER_SCRIPT: &str = "trap '' HUP; \
+         trap '{ sleep 0.3; : > \"$MMX_WORKER_DONE\"; } & exit 0' TERM; \
+         echo $$ > \"$MMX_ESCAPEE_PID\"; : > \"$MMX_ESCAPEE_READY\"; read -t 120 _";
+
+    fn escapee_service(fixture_dir: &Path) -> eyre::Result<Service> {
+        // Short grace keeps the test fast; the escapee ignores TERM, so it consumes
+        // the whole window before the pre-`Exited` SIGKILL.
+        escapee_service_with(fixture_dir, LEADER_SCRIPT, Duration::from_millis(300))
+    }
+
+    fn escapee_service_with(
+        fixture_dir: &Path,
+        script: &str,
+        grace: Duration,
+    ) -> eyre::Result<Service> {
+        let mut config = service_config("svc", ("bash", &["-c", script]));
+        config.stop_grace_period = yaml_spanned::Spanned {
+            span: yaml_spanned::spanned::Span::default(),
+            inner: grace,
+        };
+        config.environment.insert(
+            spanned_string("MMX_ESCAPEE_PID"),
+            spanned_string(&fixture_dir.join("pid").to_string_lossy()),
+        );
+        config.environment.insert(
+            spanned_string("MMX_ESCAPEE_READY"),
+            spanned_string(&fixture_dir.join("ready").to_string_lossy()),
+        );
+        config.environment.insert(
+            spanned_string("MMX_WORKER_PID"),
+            spanned_string(&fixture_dir.join("worker").to_string_lossy()),
+        );
+        config.environment.insert(
+            spanned_string("MMX_WORKER_DONE"),
+            spanned_string(&fixture_dir.join("done").to_string_lossy()),
+        );
+        Ok(Service::new("svc", Path::new("."), config)?)
+    }
+
+    async fn wait_for_escapee(fixture_dir: &Path) -> eyre::Result<i32> {
+        let ready = fixture_dir.join("ready");
+        let pid_file = fixture_dir.join("pid");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !(ready.exists() && pid_file.exists()) {
+            if tokio::time::Instant::now() >= deadline {
+                eyre::bail!("escapee fixture did not become ready");
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        Ok(fs::read_to_string(&pid_file)?.trim().parse()?)
+    }
+
+    /// Polls until the pid no longer names a process; SIGKILL delivery and the
+    /// subsequent reap by init are asynchronous.
+    async fn wait_until_gone(pid: i32) -> bool {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            if nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None)
+                == Err(nix::errno::Errno::ESRCH)
+            {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    fn kill_best_effort(pid: i32) {
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(pid),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+    }
+
+    /// Whole-session shutdown must not outrun escapees: by the time the runner
+    /// returns, the drain has observed `Exited`, which the escapee's SIGKILL precedes.
+    #[tokio::test]
+    async fn shutdown_reaps_group_escaped_descendants_before_draining() -> eyre::Result<()> {
+        let fixture_dir = unique_tmp_dir("escaped-descendant-shutdown");
+        fs::create_dir_all(&fixture_dir)?;
+        let mut services = ServiceMap::new();
+        services.insert("svc".to_string(), escapee_service(&fixture_dir)?);
+        let harness = spawn_harness(services, None);
+
+        let started: eyre::Result<i32> = async {
+            wait_until(&harness.reader, "svc", |snapshot| {
+                snapshot.run_generation == 1 && snapshot.execution == Execution::Running
+            })
+            .await?;
+            wait_for_escapee(&fixture_dir).await
+        }
+        .await;
+
+        harness.shutdown.cancel();
+        let scheduler_result = harness.handle.await;
+        let escapee = started?;
+        let gone = wait_until_gone(escapee).await;
+        kill_best_effort(escapee);
+        let _ = fs::remove_dir_all(&fixture_dir);
+        scheduler_result??;
+        eyre::ensure!(gone, "escapee {escapee} survived session shutdown");
+        Ok(())
+    }
+
+    /// A restart must not launch the next generation over the previous generation's
+    /// live escapees: generation 2 running implies generation 1's `Exited`, which the
+    /// escapee's SIGKILL precedes.
+    #[tokio::test]
+    async fn restart_reaps_group_escaped_descendants_before_respawn() -> eyre::Result<()> {
+        let fixture_dir = unique_tmp_dir("escaped-descendant-restart");
+        fs::create_dir_all(&fixture_dir)?;
+        let mut services = ServiceMap::new();
+        services.insert("svc".to_string(), escapee_service(&fixture_dir)?);
+        let harness = spawn_harness(services, None);
+
+        let outcome: eyre::Result<(i32, Option<i32>)> = async {
+            wait_until(&harness.reader, "svc", |snapshot| {
+                snapshot.run_generation == 1 && snapshot.execution == Execution::Running
+            })
+            .await?;
+            let first = wait_for_escapee(&fixture_dir).await?;
+            // Clear the handshake so generation 2's fixture rewrites it.
+            fs::remove_file(fixture_dir.join("ready"))?;
+            fs::remove_file(fixture_dir.join("pid"))?;
+
+            accepted(harness.control.restart(&"svc".to_string()).await)?;
+            wait_until(&harness.reader, "svc", |snapshot| {
+                snapshot.run_generation >= 2 && snapshot.execution == Execution::Running
+            })
+            .await?;
+            eyre::ensure!(
+                wait_until_gone(first).await,
+                "generation 1 escapee {first} survived into generation 2"
+            );
+            // Generation 2's escapee is torn down by the harness shutdown below, but
+            // record it for best-effort cleanup should that regress.
+            let second = wait_for_escapee(&fixture_dir).await.ok();
+            Ok((first, second))
+        }
+        .await;
+
+        harness.shutdown.cancel();
+        let scheduler_result = harness.handle.await;
+        let _ = fs::remove_dir_all(&fixture_dir);
+        let (first, second) = outcome?;
+        kill_best_effort(first);
+        if let Some(second) = second {
+            kill_best_effort(second);
+        }
+        scheduler_result??;
+        Ok(())
+    }
+
+    /// A worker forked by the escapee *after* the leader died is invisible to every
+    /// walk rooted at the leader and to the retained stamps. The pre-`Exited`
+    /// expansion must recover it — through the still-live escapee and its recorded
+    /// group — so shutdown reaps it along with the escapee.
+    #[tokio::test]
+    async fn shutdown_reaps_workers_forked_after_the_leader_died() -> eyre::Result<()> {
+        let fixture_dir = unique_tmp_dir("escaped-descendant-late-fork");
+        fs::create_dir_all(&fixture_dir)?;
+        let mut services = ServiceMap::new();
+        // A wider grace than the sibling tests: the worker must be forked (leader
+        // death observed at a 50ms poll) before the deadline's expansion scan runs.
+        services.insert(
+            "svc".to_string(),
+            escapee_service_with(&fixture_dir, FORKING_LEADER_SCRIPT, Duration::from_secs(1))?,
+        );
+        let harness = spawn_harness(services, None);
+
+        let started: eyre::Result<i32> = async {
+            wait_until(&harness.reader, "svc", |snapshot| {
+                snapshot.run_generation == 1 && snapshot.execution == Execution::Running
+            })
+            .await?;
+            wait_for_escapee(&fixture_dir).await
+        }
+        .await;
+
+        harness.shutdown.cancel();
+        let scheduler_result = harness.handle.await;
+        let escapee = started?;
+        // The worker's pid was recorded during the stop, after the leader died; by the
+        // time shutdown returns it is either on disk or was never forked at all.
+        let worker: Option<i32> = fs::read_to_string(fixture_dir.join("worker"))
+            .ok()
+            .and_then(|contents| contents.trim().parse().ok());
+        let escapee_gone = wait_until_gone(escapee).await;
+        kill_best_effort(escapee);
+        let worker_gone = match worker {
+            Some(worker) => {
+                let gone = wait_until_gone(worker).await;
+                kill_best_effort(worker);
+                gone
+            }
+            None => false,
+        };
+        let _ = fs::remove_dir_all(&fixture_dir);
+        scheduler_result??;
+        eyre::ensure!(escapee_gone, "escapee {escapee} survived session shutdown");
+        eyre::ensure!(
+            worker.is_some(),
+            "the escapee never recorded a late-forked worker; the fixture did not \
+             exercise the expansion"
+        );
+        eyre::ensure!(
+            worker_gone,
+            "late-forked worker {worker:?} survived session shutdown"
+        );
+        Ok(())
+    }
+
+    /// The deadline escalation must run the same expansion as the wait-arm reap: the
+    /// leader survives the whole grace window ignoring TERM, the escapee forks a
+    /// worker and dies on the graceful pass, and by the deadline only the escapee's
+    /// recorded group still names the reparented worker.
+    #[tokio::test]
+    async fn escalation_reaps_workers_of_escapees_that_died_during_grace() -> eyre::Result<()> {
+        let fixture_dir = unique_tmp_dir("escaped-descendant-escalation");
+        fs::create_dir_all(&fixture_dir)?;
+        let mut services = ServiceMap::new();
+        // A wider grace than the sibling tests: the escapee must observe TERM (a 50ms
+        // poll granularity), fork the worker, and exit before the deadline fires.
+        services.insert(
+            "svc".to_string(),
+            escapee_service_with(
+                &fixture_dir,
+                ESCALATING_LEADER_SCRIPT,
+                Duration::from_secs(1),
+            )?,
+        );
+        let harness = spawn_harness(services, None);
+
+        let started: eyre::Result<i32> = async {
+            wait_until(&harness.reader, "svc", |snapshot| {
+                snapshot.run_generation == 1 && snapshot.execution == Execution::Running
+            })
+            .await?;
+            wait_for_escapee(&fixture_dir).await
+        }
+        .await;
+
+        harness.shutdown.cancel();
+        let scheduler_result = harness.handle.await;
+        let escapee = started?;
+        let worker: Option<i32> = fs::read_to_string(fixture_dir.join("worker"))
+            .ok()
+            .and_then(|contents| contents.trim().parse().ok());
+        let escapee_gone = wait_until_gone(escapee).await;
+        kill_best_effort(escapee);
+        let worker_gone = match worker {
+            Some(worker) => {
+                let gone = wait_until_gone(worker).await;
+                kill_best_effort(worker);
+                gone
+            }
+            None => false,
+        };
+        let _ = fs::remove_dir_all(&fixture_dir);
+        scheduler_result??;
+        eyre::ensure!(escapee_gone, "escapee {escapee} survived session shutdown");
+        eyre::ensure!(
+            worker.is_some(),
+            "the escapee never recorded a worker; the fixture did not exercise the \
+             escalation expansion"
+        );
+        eyre::ensure!(
+            worker_gone,
+            "worker {worker:?} of the grace-dead escapee survived the escalation"
+        );
+        Ok(())
+    }
+
+    /// A single-process leader whose TERM handler forks an in-group helper and exits
+    /// leaves an empty retained snapshot: the reap must still recover the helper
+    /// through the leader's own process group before `Exited` lets the drain finish.
+    #[tokio::test]
+    async fn shutdown_reaps_helpers_forked_by_a_childless_leader() -> eyre::Result<()> {
+        let fixture_dir = unique_tmp_dir("leader-helper-fork");
+        fs::create_dir_all(&fixture_dir)?;
+        let mut services = ServiceMap::new();
+        services.insert(
+            "svc".to_string(),
+            escapee_service_with(
+                &fixture_dir,
+                HELPER_FORKING_LEADER_SCRIPT,
+                Duration::from_millis(300),
+            )?,
+        );
+        let harness = spawn_harness(services, None);
+
+        let started: eyre::Result<i32> = async {
+            wait_until(&harness.reader, "svc", |snapshot| {
+                snapshot.run_generation == 1 && snapshot.execution == Execution::Running
+            })
+            .await?;
+            wait_for_escapee(&fixture_dir).await
+        }
+        .await;
+
+        harness.shutdown.cancel();
+        let scheduler_result = harness.handle.await;
+        let leader = started?;
+        let worker: Option<i32> = fs::read_to_string(fixture_dir.join("worker"))
+            .ok()
+            .and_then(|contents| contents.trim().parse().ok());
+        let worker_gone = match worker {
+            Some(worker) => {
+                let gone = wait_until_gone(worker).await;
+                kill_best_effort(worker);
+                gone
+            }
+            None => false,
+        };
+        let _ = fs::remove_dir_all(&fixture_dir);
+        scheduler_result??;
+        eyre::ensure!(
+            worker.is_some(),
+            "the leader {leader} never recorded its TERM-handler helper; the fixture \
+             did not exercise the leader-group recovery"
+        );
+        eyre::ensure!(
+            worker_gone,
+            "helper {worker:?} forked by the terminating leader survived session shutdown"
+        );
+        Ok(())
+    }
+
+    /// A helper performing the leader's graceful cleanup must be granted the
+    /// remaining grace window: discovery through the leader's group must not
+    /// translate into an immediate SIGKILL while the deadline is still ahead.
+    #[tokio::test]
+    async fn shutdown_grants_discovered_helpers_the_remaining_grace() -> eyre::Result<()> {
+        let fixture_dir = unique_tmp_dir("leader-helper-grace");
+        fs::create_dir_all(&fixture_dir)?;
+        let mut services = ServiceMap::new();
+        // The grace comfortably covers the helper's 300ms of cleanup work; a reap
+        // that kills discoveries on sight fails this regardless of the window.
+        services.insert(
+            "svc".to_string(),
+            escapee_service_with(
+                &fixture_dir,
+                CLEANUP_HELPER_LEADER_SCRIPT,
+                Duration::from_secs(2),
+            )?,
+        );
+        let harness = spawn_harness(services, None);
+
+        let started: eyre::Result<i32> = async {
+            wait_until(&harness.reader, "svc", |snapshot| {
+                snapshot.run_generation == 1 && snapshot.execution == Execution::Running
+            })
+            .await?;
+            wait_for_escapee(&fixture_dir).await
+        }
+        .await;
+
+        harness.shutdown.cancel();
+        let scheduler_result = harness.handle.await;
+        let leader = started?;
+        // The reap waits for the helper before `Exited`, so by the time shutdown
+        // returns the marker is either on disk or the helper was killed mid-grace.
+        let done = fixture_dir.join("done").exists();
+        let _ = fs::remove_dir_all(&fixture_dir);
+        scheduler_result??;
+        eyre::ensure!(
+            done,
+            "helper of leader {leader} was killed mid-grace; its cleanup marker never \
+             appeared"
+        );
+        Ok(())
     }
 }
 
