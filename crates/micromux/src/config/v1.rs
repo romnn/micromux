@@ -300,14 +300,25 @@ fn parse_restart_value(value: &yaml_spanned::Spanned<Value>) -> Result<RestartPo
                 .strip_prefix(prefix)
                 .or_else(|| normalized.strip_prefix("on_failure"))
             {
-                let rest = rest.trim_start_matches([':', '=']).trim();
                 // Bare `on-failure` means restart indefinitely on non-zero exit (Compose
                 // semantics); `on-failure:N` caps the number of automatic restarts at N.
+                // The separator is one or more of `:`, `=`, or whitespace — the same
+                // grammar the published schema's `[:=\s]+` states — so `on-failure3`
+                // is rejected on both sides.
                 let max_attempts = if rest.is_empty() {
                     None
                 } else {
+                    let count = rest
+                        .trim_start_matches(|c: char| c == ':' || c == '=' || c.is_whitespace());
+                    if count.len() == rest.len() {
+                        return Err(ConfigError::InvalidValue {
+                            message: format!("invalid restart policy `{raw}`"),
+                            span: value.span().into(),
+                        });
+                    }
                     Some(
-                        rest.parse::<usize>()
+                        count
+                            .parse::<usize>()
                             .map_err(|_| ConfigError::InvalidValue {
                                 message: format!("invalid restart policy `{raw}`"),
                                 span: value.span().into(),
@@ -1461,6 +1472,73 @@ mod tests {
         for rejected in ["SIGSTOP", "SIGKILL", "KILL", "nonsense", "\"SIG TERM\""] {
             let yaml = format!(
                 "version: 1\nservices:\n  app:\n    command: \"true\"\n    stop_signal: {rejected}\n"
+            );
+            let mut diagnostics: Vec<Diagnostic<usize>> = Vec::new();
+            eyre::ensure!(
+                config::from_str(&yaml, Path::new("."), 0, None, &mut diagnostics).is_err(),
+                "schema rejects `{rejected}` but the parser accepts it"
+            );
+
+            let document: serde_json::Value = serde_yaml::from_str(&yaml)?;
+            eyre::ensure!(
+                schema.validate(&document).is_err(),
+                "parser rejects `{rejected}` but the schema accepts it"
+            );
+        }
+        Ok(())
+    }
+
+    /// Every restart spelling the parser accepts must also validate against the
+    /// published schema, and every spelling it rejects must fail schema validation
+    /// too — the same bidirectional contract as `stop_signal`, covering the
+    /// `on-failure` count separator grammar (`[:=\s]+`) in particular.
+    #[test]
+    fn restart_spellings_match_the_published_schema() -> eyre::Result<()> {
+        let schema: serde_json::Value =
+            serde_json::from_str(include_str!("../../../../micromux.schema.json"))?;
+        let schema = jsonschema::options()
+            .with_draft(jsonschema::Draft::Draft7)
+            .build(&schema)?;
+        for accepted in [
+            "always",
+            "Always",
+            "never",
+            "no",
+            "unless-stopped",
+            "unless_stopped",
+            "on-failure",
+            "ON-FAILURE",
+            "on_failure:5",
+            "on-failure:3",
+            "on-failure=3",
+            "\"on-failure: 3\"",
+            "\"on-failure : 3\"",
+            "\" always \"",
+        ] {
+            let yaml = format!(
+                "version: 1\nservices:\n  app:\n    command: \"true\"\n    restart: {accepted}\n"
+            );
+            let mut diagnostics: Vec<Diagnostic<usize>> = Vec::new();
+            config::from_str(&yaml, Path::new("."), 0, None, &mut diagnostics)
+                .map_err(|err| eyre::eyre!("parser rejected `{accepted}`: {err}"))?;
+
+            let document: serde_json::Value = serde_yaml::from_str(&yaml)?;
+            eyre::ensure!(
+                schema.validate(&document).is_ok(),
+                "parser accepts `{accepted}` but the schema rejects it"
+            );
+        }
+
+        // A count needs a separator, a separator needs a count, and unknown policies
+        // fail — on both sides.
+        for rejected in [
+            "on-failure3",
+            "\"on-failure:\"",
+            "on-failure:x",
+            "sometimes",
+        ] {
+            let yaml = format!(
+                "version: 1\nservices:\n  app:\n    command: \"true\"\n    restart: {rejected}\n"
             );
             let mut diagnostics: Vec<Diagnostic<usize>> = Vec::new();
             eyre::ensure!(

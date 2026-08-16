@@ -283,7 +283,7 @@
     },
     "restart": {
       "type": "string",
-      "pattern": "^([Aa][Ll][Ww][Aa][Yy][Ss]|[Uu][Nn][Ll][Ee][Ss][Ss][-_][Ss][Tt][Oo][Pp][Pp][Ee][Dd]|[Nn][Ee][Vv][Ee][Rr]|[Nn][Oo]|[Oo][Nn][-_][Ff][Aa][Ii][Ll][Uu][Rr][Ee]([:=\\s]+[0-9]+)?)$"
+      "pattern": "^\\s*([Aa][Ll][Ww][Aa][Yy][Ss]|[Uu][Nn][Ll][Ee][Ss][Ss][-_][Ss][Tt][Oo][Pp][Pp][Ee][Dd]|[Nn][Ee][Vv][Ee][Rr]|[Nn][Oo]|[Oo][Nn][-_][Ff][Aa][Ii][Ll][Uu][Rr][Ee]([:=\\s]+[0-9]+)?)\\s*$"
     },
     "log_limit": {
       "description": "A positive integer bound, or an explicit unbounded in-memory limit.",
