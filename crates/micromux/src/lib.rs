@@ -653,13 +653,16 @@ services:
             .filter(|diagnostic| diagnostic.severity != ConfigDiagnosticSeverity::Warning)
             .map(|diagnostic| (diagnostic.severity, diagnostic.message.as_str()))
             .collect::<Vec<_>>();
+        let missing_dir = dir.path().canonicalize()?.join("./definitely-missing");
+        // The OS words "not found" differently per platform, so take the text from the same
+        // failed lookup instead of spelling it out.
+        let not_found = std::fs::metadata(&missing_dir)
+            .err()
+            .ok_or_else(|| eyre::eyre!("{} unexpectedly exists", missing_dir.display()))?;
         let no_dir_message = format!(
             "cannot use working_dir of service `no-dir`: failed to access working directory {}: \
-             No such file or directory (os error 2)",
-            dir.path()
-                .canonicalize()?
-                .join("./definitely-missing")
-                .display()
+             {not_found}",
+            missing_dir.display()
         );
         assert_eq!(
             messages,
