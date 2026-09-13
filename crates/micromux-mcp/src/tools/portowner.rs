@@ -95,11 +95,10 @@ pub(crate) fn listening_owner(port: u16) -> Option<PortOwner> {
         let Ok(fds) = std::fs::read_dir(pid_dir.join("fd")) else {
             continue;
         };
-        if fds.flatten().any(|fd| {
-            std::fs::read_link(fd.path())
-                .ok()
-                .is_some_and(|link| link == Path::new(&target))
-        }) {
+        if fds
+            .flatten()
+            .any(|fd| std::fs::read_link(fd.path()).is_ok_and(|link| link == Path::new(&target)))
+        {
             return Some(PortOwner {
                 pid,
                 command: command_for_pid(&pid_dir),

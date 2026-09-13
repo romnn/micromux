@@ -863,6 +863,11 @@ mod tests {
     }
 
     impl RequestConnection for ScriptedConnection {
+        #[expect(
+            clippy::unused_async_trait_impl,
+            reason = "the scripted double mirrors the async trait and, like the real client, records \
+                      the request only when polled"
+        )]
         async fn request(&mut self, request: Request) -> Result<Response, ControlError> {
             self.requests.push(request);
             self.responses.pop_front().ok_or_else(|| {

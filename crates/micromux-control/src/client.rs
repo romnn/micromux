@@ -99,6 +99,7 @@ impl Client {
         not(unix),
         expect(
             clippy::unused_async,
+            clippy::unused_async_trait_impl,
             reason = "Unix has the async transport implementation; unsupported platforms keep the same API shape"
         )
     )]
@@ -130,6 +131,7 @@ impl Client {
         not(unix),
         expect(
             clippy::unused_async,
+            clippy::unused_async_trait_impl,
             reason = "Unix has the async transport implementation; unsupported platforms keep the same API shape"
         )
     )]
@@ -192,6 +194,7 @@ impl Client {
         not(unix),
         expect(
             clippy::unused_async,
+            clippy::unused_async_trait_impl,
             reason = "Unix has the async transport implementation; unsupported platforms keep the same API shape"
         )
     )]
@@ -276,6 +279,7 @@ impl Subscription {
         not(unix),
         expect(
             clippy::unused_async,
+            clippy::unused_async_trait_impl,
             reason = "Unix reads from an async subscription stream; unsupported platforms keep the same API shape"
         )
     )]

@@ -28,12 +28,15 @@ use micromux_control::{
 };
 use regex::{Regex, RegexBuilder};
 use rmcp::{
-    ErrorData, ServerHandler, ServiceExt,
+    ErrorData, RoleServer, ServerHandler, ServiceExt,
     handler::server::{
         router::tool::ToolRouter,
         wrapper::{Json, Parameters},
     },
-    model::{Implementation, ServerCapabilities, ServerInfo},
+    model::{
+        Implementation, ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerInfo,
+    },
+    service::{MaybeSendFuture, RequestContext},
     tool, tool_handler, tool_router,
 };
 use schemars::JsonSchema;
@@ -2883,6 +2886,20 @@ impl Default for McpServer {
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for McpServer {
+    // Defined here so `#[tool_handler]` does not generate it as an `async fn` that never awaits.
+    // Listing tools is synchronous, so the returned future is ready immediately.
+    fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<ListToolsResult, ErrorData>> + MaybeSendFuture + '_ {
+        std::future::ready(Ok(ListToolsResult {
+            tools: self.tool_router.list_all(),
+            meta: None,
+            next_cursor: None,
+        }))
+    }
+
     fn get_info(&self) -> ServerInfo {
         let mut info = ServerInfo::new(ServerCapabilities::builder().enable_tools().build());
         info.server_info = Implementation::from_build_env();
