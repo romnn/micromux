@@ -34,7 +34,8 @@ use rmcp::{
         wrapper::{Json, Parameters},
     },
     model::{
-        Implementation, ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerInfo,
+        CacheScope, Implementation, ListToolsResult, PaginatedRequestParams, ProtocolVersion,
+        ServerCapabilities, ServerInfo,
     },
     service::{MaybeSendFuture, RequestContext},
     tool, tool_handler, tool_router,
@@ -2893,13 +2894,20 @@ impl ServerHandler for McpServer {
     fn list_tools(
         &self,
         _request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<ListToolsResult, ErrorData>> + MaybeSendFuture + '_ {
-        std::future::ready(Ok(ListToolsResult {
-            tools: self.tool_router.list_all(),
-            meta: None,
-            next_cursor: None,
-        }))
+        let result = ListToolsResult::with_all_items(self.tool_router.list_all());
+        // Emit the same cache hints as `#[tool_handler]`; only protocol 2026-07-28 and later
+        // define them.
+        let supports_cache_hints = context
+            .protocol_version()
+            .is_some_and(|version| version >= ProtocolVersion::V_2026_07_28);
+        let result = if supports_cache_hints {
+            result.with_ttl_ms(0).with_cache_scope(CacheScope::Public)
+        } else {
+            result
+        };
+        std::future::ready(Ok(result))
     }
 
     fn get_info(&self) -> ServerInfo {
