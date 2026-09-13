@@ -243,11 +243,12 @@ impl Default for HealthcheckSpec {
     }
 }
 
-impl From<crate::config::HealthCheck> for HealthcheckSpec {
-    fn from(healthcheck: crate::config::HealthCheck) -> Self {
-        let (program, args) = healthcheck.test;
-        let mut test = vec![program.into_inner()];
-        test.extend(args.into_iter().map(yaml_spanned::Spanned::into_inner));
+impl HealthcheckSpec {
+    /// Combine configured probe timing with the already-resolved probe argv.
+    ///
+    /// The argv is a separate argument because the configured `test` still holds unresolved
+    /// `${VAR}` references; only the caller that interpolated them can supply the real command.
+    pub(crate) fn from_config(healthcheck: crate::config::HealthCheck, test: Vec<String>) -> Self {
         Self {
             test,
             start_delay: healthcheck

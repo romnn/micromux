@@ -2970,7 +2970,7 @@ mod escaped_descendants {
     /// unreaped zombie, so the fork happens strictly after the scheduler saw the exit.
     const FORKING_LEADER_SCRIPT: &str = "set -m; export MMX_LEADER_PID=$$; \
         bash -c 'trap \"\" TERM; echo $$ > \"$MMX_ESCAPEE_PID\"; : > \"$MMX_ESCAPEE_READY\"; \
-                 for ((i=0;i<1200;i++)); do kill -0 \"$MMX_LEADER_PID\" 2>/dev/null || break; sleep 0.05; done; \
+                 for ((i=0;i<1200;i++)); do kill -0 \"$$MMX_LEADER_PID\" 2>/dev/null || break; sleep 0.05; done; \
                  sleep 120 & echo $! > \"$MMX_WORKER_PID\"; \
                  for ((i=0;i<120;i++)); do sleep 1; done' & \
         trap 'exit 0' TERM; for ((i=0;i<120;i++)); do sleep 1; done";
@@ -3510,8 +3510,8 @@ async fn stale_log_from_previous_run_is_ignored() -> eyre::Result<()> {
     let script = format!(
         "n=$(cat {marker} 2>/dev/null || echo 0); \
              n=$((n + 1)); \
-             echo \"$n\" > {marker}; \
-             if [ \"$n\" = 1 ]; then \
+             echo \"$$n\" > {marker}; \
+             if [ \"$$n\" = 1 ]; then \
                (trap '' HUP TERM; sleep 0.7; echo stale-from-first-run) & \
                exit 1; \
              else \
@@ -4386,7 +4386,7 @@ async fn unterminated_ansi_strings_recover_across_line_breaks() -> eyre::Result<
     let line_breaks = pty::ANSI_SEQUENCE_PAYLOAD_MAX_BYTES + 1;
     // Disable newline translation so each emitted byte advances the filter's recovery bound once.
     let script = format!(
-        "stty -onlcr; printf '\\033]'; i=0; while [ \"$i\" -lt {line_breaks} ]; do printf '\\n'; i=$((i + 1)); done; printf 'visible\\n'"
+        "stty -onlcr; printf '\\033]'; i=0; while [ \"$$i\" -lt {line_breaks} ]; do printf '\\n'; i=$((i + 1)); done; printf 'visible\\n'"
     );
     services.insert(
         "svc".to_string(),
@@ -4454,7 +4454,7 @@ async fn send_input_reaches_process() -> eyre::Result<()> {
         Service::new(
             "svc",
             config_dir,
-            service_config("svc", ("sh", &["-c", "read line; echo got:$line"])),
+            service_config("svc", ("sh", &["-c", "read line; echo got:$$line"])),
         )?,
     );
     let harness = spawn_harness(services, None);

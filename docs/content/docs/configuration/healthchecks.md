@@ -21,7 +21,7 @@ services:
 
 ## The probe
 
-`test` is the command to run, in the same string-or-array form as a service [`command`]({{< relref "services.md" >}}). The Compose-style `CMD-SHELL` prefix runs the rest through a shell:
+`test` is the command to run, in the same string-or-array form as a service [`command`]({{< relref "services.md" >}}) and with the same [variable interpolation]({{< relref "services.md" >}}#variable-interpolation), so `["curl", "-fsS", "http://localhost:${PORT}/health"]` needs no shell. The Compose-style `CMD-SHELL` prefix runs the rest through a shell:
 
 ```yaml
 test: ["CMD-SHELL", "curl -fsS http://localhost:8080/health || exit 1"]

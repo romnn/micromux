@@ -604,7 +604,7 @@ async fn retained_run_logs_are_queryable_after_restart() -> eyre::Result<()> {
     let dir = unique_dir("run-logs")?;
     let counter = dir.path().join("counter");
     let command = format!(
-        "n=$(cat {} 2>/dev/null || echo 0); n=$((n+1)); echo $n > {}; echo run-$n; sleep 60",
+        "n=$(cat {} 2>/dev/null || echo 0); n=$((n+1)); echo $$n > {}; echo run-$$n; sleep 60",
         counter.display(),
         counter.display()
     );

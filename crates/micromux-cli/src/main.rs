@@ -38,6 +38,9 @@ enum Error {
     Mcp(Box<dyn std::error::Error + Send + Sync>),
     #[error("{0}")]
     Message(String),
+    /// The failure was already explained by diagnostics printed to stderr.
+    #[error("configuration errors were reported")]
+    DiagnosticsEmitted,
 }
 
 fn spawn_shutdown_handler(shutdown: micromux::CancellationToken) {
@@ -151,10 +154,36 @@ fn setup_logging(
     Ok(guard)
 }
 
+/// A parsed config together with the printer that holds its source text, so later stages can
+/// still render diagnostics anchored in the file.
+struct LoadedConfig {
+    config: micromux::ConfigFile<usize>,
+    printer: DiagnosticsPrinter,
+}
+
+/// Build the supervisor, rendering every service definition that cannot be materialized (an
+/// unresolved `${VAR}`, an unreadable env file, an invalid port) as a source diagnostic,
+/// preceded by notes for the optional env files that were skipped.
+fn build_supervisor(
+    config: &micromux::ConfigFile<usize>,
+    printer: &DiagnosticsPrinter,
+) -> Result<micromux::Micromux, Error> {
+    match micromux::Micromux::new(config) {
+        Ok(mux) => Ok(mux),
+        Err(micromux::Error::Services(failure)) => {
+            for diagnostic in failure.to_diagnostics(config.file_id) {
+                printer.emit(&diagnostic)?;
+            }
+            Err(Error::DiagnosticsEmitted)
+        }
+        Err(err) => Err(err.into()),
+    }
+}
+
 async fn load_config(
     options: &options::Options,
     color_choice: termcolor::ColorChoice,
-) -> Result<micromux::ConfigFile<usize>, Error> {
+) -> Result<LoadedConfig, Error> {
     let working_dir = std::env::current_dir()?;
     let config_path = match options.config_path.as_ref() {
         Some(config_path) => Some(config_path.clone()),
@@ -195,14 +224,17 @@ async fn load_config(
     }
 
     let Some(mut config) = config else {
-        return Err(Error::Message("failed to parse config".to_string()));
+        return Err(Error::DiagnosticsEmitted);
     };
     if has_error {
-        return Err(Error::Message("failed to parse config".to_string()));
+        return Err(Error::DiagnosticsEmitted);
     }
 
     config.config_path = Some(config_path);
-    Ok(config)
+    Ok(LoadedConfig {
+        config,
+        printer: diagnostic_printer,
+    })
 }
 
 async fn run() -> Result<(), Error> {
@@ -237,9 +269,9 @@ async fn run() -> Result<(), Error> {
     // thread, after which nothing is written to the log file.
     let _log_guard = setup_logging(&options)?;
 
-    let config = load_config(&options, color_choice).await?;
+    let LoadedConfig { config, printer } = load_config(&options, color_choice).await?;
 
-    let mux = std::sync::Arc::new(micromux::Micromux::new(&config)?);
+    let mux = std::sync::Arc::new(build_supervisor(&config, &printer)?);
     let (runner, handles) = mux.clone().start(shutdown.clone());
 
     // Default-on control plane, opt out via `--no-control` or `control: { enabled: false }`.
@@ -329,9 +361,9 @@ async fn run_headless(options: options::Options) -> Result<(), Error> {
     // Hold the guard for the whole run: dropping it stops the non-blocking log writer.
     let _log_guard = setup_logging(&options)?;
     let color_choice = options.color_choice.unwrap_or(termcolor::ColorChoice::Auto);
-    let config = load_config(&options, color_choice).await?;
+    let LoadedConfig { config, printer } = load_config(&options, color_choice).await?;
 
-    let mux = std::sync::Arc::new(micromux::Micromux::new(&config)?);
+    let mux = std::sync::Arc::new(build_supervisor(&config, &printer)?);
     let (runner, handles) = mux.clone().start(shutdown.clone());
 
     // The control plane is the only way to reach a headless session, so it is mandatory here — the
@@ -364,5 +396,11 @@ async fn run_headless(options: options::Options) -> Result<(), Error> {
 async fn main() -> color_eyre::Result<()> {
     color_eyre::install()?;
     raise_file_descriptor_limit();
-    Ok(run().await?)
+    match run().await {
+        Ok(()) => Ok(()),
+        // The diagnostics already explained the failure; a report with a location and a
+        // backtrace hint would make a config typo read like a crash.
+        Err(Error::DiagnosticsEmitted) => std::process::exit(1),
+        Err(err) => Err(err.into()),
+    }
 }

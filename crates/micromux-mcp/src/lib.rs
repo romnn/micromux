@@ -1426,9 +1426,11 @@ impl McpServer {
     #[tool(
         description = "Validate a micromux config without starting a session. Runs the same parse, \
         service normalization, environment-file/interpolation, port, and dependency-graph checks \
-        used at startup and returns structured plus ANSI-free rendered diagnostics. Environment \
-        interpolation uses the MCP process environment, so unset-variable warnings can differ \
-        from the eventual session environment."
+        used at startup and returns structured plus ANSI-free rendered diagnostics. A `${VAR}` \
+        reference that cannot be resolved is an error naming the service, field, and variable, \
+        and every optional env file that was skipped is reported as a note. Interpolation uses \
+        the MCP process environment, so unset-variable errors and which optional env files are \
+        found can differ from the eventual session environment."
     )]
     async fn validate_config(
         &self,

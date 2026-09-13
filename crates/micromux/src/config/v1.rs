@@ -573,15 +573,19 @@ fn parse_dynamic_roots(
             dynamic.map_or(*default_span, |value| value.span),
         )],
     };
+    // Roots are paths, so like every other configured path they only see the supervisor's own
+    // environment.
+    let environment: std::collections::HashMap<String, String> = std::env::vars().collect();
     roots
         .into_iter()
         .map(|(root, span)| {
-            let path = crate::env::resolve_path(config_dir, &root).map_err(|err| {
-                ConfigError::InvalidValue {
-                    message: err.to_string(),
-                    span: span.into(),
-                }
-            })?;
+            let path =
+                crate::env::resolve_path(config_dir, &root, &environment).map_err(|err| {
+                    ConfigError::InvalidValue {
+                        message: format!("cannot resolve allowed working root `{root}`: {err}"),
+                        span: span.into(),
+                    }
+                })?;
             // With dynamic services disabled the roots are never consulted, so a root that no
             // longer exists on disk must not fail an otherwise valid config.
             if !enabled {
@@ -2237,8 +2241,9 @@ mod tests {
         let result = config::from_str(&yaml, Path::new("/project"), 0usize, None, &mut diagnostics);
 
         assert!(result.is_err_and(|err| {
-            err.to_string().contains("unset environment variables")
-                && err.to_string().contains(&variable)
+            let message = err.to_string();
+            message.contains("cannot resolve allowed working root")
+                && message.contains(&format!("variable `{variable}` is not set"))
         }));
     }
 

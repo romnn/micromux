@@ -41,11 +41,10 @@ const OUTPUT_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_mill
 mod tests {
     use super::*;
     use crate::model::SessionModelReader;
-    use crate::test_util::{initial_model_entry, spanned_string, unique_tmp_dir};
+    use crate::test_util::{initial_model_entry, unique_tmp_dir};
     use color_eyre::eyre;
     use similar_asserts::assert_eq;
     use std::path::PathBuf;
-    use yaml_spanned::Spanned;
 
     struct TempDir(PathBuf);
 
@@ -80,29 +79,16 @@ mod tests {
         let dir = TempDir::new("micromux-hc-timeout")?;
         let pid_path = dir.0.join("pid");
 
-        let hc: crate::HealthcheckSpec = crate::config::HealthCheck {
-            test: (
-                spanned_string("sh"),
-                vec![
-                    spanned_string("-c"),
-                    spanned_string(&format!(
-                        "echo $$ > {} && sleep 5",
-                        pid_path.to_string_lossy()
-                    )),
-                ],
-            ),
-            start_delay: None,
-            interval: None,
-            timeout: Some(Spanned {
-                span: yaml_spanned::spanned::Span::default(),
-                inner: std::time::Duration::from_millis(50),
-            }),
-            retries: Some(Spanned {
-                span: yaml_spanned::spanned::Span::default(),
-                inner: 1,
-            }),
-        }
-        .into();
+        let hc = crate::HealthcheckSpec {
+            test: vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                format!("echo $$ > {} && sleep 5", pid_path.to_string_lossy()),
+            ],
+            timeout: std::time::Duration::from_millis(50),
+            retries: 1,
+            ..crate::HealthcheckSpec::default()
+        };
 
         let (reader, sink) = run_sink("svc", 1);
         let shutdown = CancellationToken::new();
@@ -154,23 +140,12 @@ mod tests {
 
     #[tokio::test]
     async fn terminated_probe_emits_cancelled_finished() -> eyre::Result<()> {
-        let hc: crate::HealthcheckSpec = crate::config::HealthCheck {
-            test: (
-                spanned_string("sh"),
-                vec![spanned_string("-c"), spanned_string("sleep 5")],
-            ),
-            start_delay: None,
-            interval: None,
-            timeout: Some(Spanned {
-                span: yaml_spanned::spanned::Span::default(),
-                inner: std::time::Duration::from_secs(5),
-            }),
-            retries: Some(Spanned {
-                span: yaml_spanned::spanned::Span::default(),
-                inner: 1,
-            }),
-        }
-        .into();
+        let hc = crate::HealthcheckSpec {
+            test: vec!["sh".to_string(), "-c".to_string(), "sleep 5".to_string()],
+            timeout: std::time::Duration::from_secs(5),
+            retries: 1,
+            ..crate::HealthcheckSpec::default()
+        };
 
         let (reader, sink) = run_sink("svc", 1);
         let mut changes = reader.subscribe();
@@ -226,29 +201,19 @@ mod tests {
         let dir = TempDir::new("micromux-hc-bg-stdout")?;
         let pid_path = dir.0.join("pid");
 
-        let hc: crate::HealthcheckSpec = crate::config::HealthCheck {
-            test: (
-                spanned_string("sh"),
-                vec![
-                    spanned_string("-c"),
-                    spanned_string(&format!(
-                        "(trap '' TERM HUP; sleep 5) & echo $! > {}; echo healthy; exit 0",
-                        pid_path.to_string_lossy()
-                    )),
-                ],
-            ),
-            start_delay: None,
-            interval: None,
-            timeout: Some(Spanned {
-                span: yaml_spanned::spanned::Span::default(),
-                inner: std::time::Duration::from_secs(5),
-            }),
-            retries: Some(Spanned {
-                span: yaml_spanned::spanned::Span::default(),
-                inner: 1,
-            }),
-        }
-        .into();
+        let hc = crate::HealthcheckSpec {
+            test: vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                format!(
+                    "(trap '' TERM HUP; sleep 5) & echo $! > {}; echo healthy; exit 0",
+                    pid_path.to_string_lossy()
+                ),
+            ],
+            timeout: std::time::Duration::from_secs(5),
+            retries: 1,
+            ..crate::HealthcheckSpec::default()
+        };
 
         let (_reader, sink) = run_sink("svc", 1);
         let shutdown = CancellationToken::new();
@@ -344,26 +309,13 @@ mod tests {
     }
 
     async fn started_attempts_before_unhealthy(retries: usize) -> eyre::Result<usize> {
-        let hc: crate::HealthcheckSpec = crate::config::HealthCheck {
-            test: (
-                spanned_string("sh"),
-                vec![spanned_string("-c"), spanned_string("exit 1")],
-            ),
-            start_delay: None,
-            interval: Some(Spanned {
-                span: yaml_spanned::spanned::Span::default(),
-                inner: std::time::Duration::from_secs(10),
-            }),
-            timeout: Some(Spanned {
-                span: yaml_spanned::spanned::Span::default(),
-                inner: std::time::Duration::from_millis(500),
-            }),
-            retries: Some(Spanned {
-                span: yaml_spanned::spanned::Span::default(),
-                inner: retries,
-            }),
-        }
-        .into();
+        let hc = crate::HealthcheckSpec {
+            test: vec!["sh".to_string(), "-c".to_string(), "exit 1".to_string()],
+            interval: std::time::Duration::from_secs(10),
+            timeout: std::time::Duration::from_millis(500),
+            retries,
+            ..crate::HealthcheckSpec::default()
+        };
 
         let (events_tx, mut events_rx) = mpsc::channel(64);
         let shutdown = CancellationToken::new();

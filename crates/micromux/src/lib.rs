@@ -36,7 +36,10 @@ pub(crate) mod test_util;
 #[cfg(windows)]
 mod windows_job;
 
-use codespan_reporting::{diagnostic::Severity, files::SimpleFiles};
+use codespan_reporting::{
+    diagnostic::{Diagnostic, Severity},
+    files::SimpleFiles,
+};
 use schemars::JsonSchema;
 use serde::Serialize;
 use std::future::Future;
@@ -51,7 +54,7 @@ pub use config::{
     find_config_file, from_str, read_config_file, read_config_file_async,
 };
 pub use diagnostics::{Printer, ToDiagnostics, render_to_string};
-pub use env::Error as EnvironmentError;
+pub use env::{Error as EnvironmentError, InterpolationError};
 pub use graph::Error as GraphError;
 pub use health_check::Health;
 pub use model::{
@@ -68,7 +71,10 @@ pub use scheduler::{
     SchedulerStopped, ServiceCommandAck, ServiceCommandResult, ServiceControl, ServiceID,
     TerminalControl,
 };
-pub use service::{Error as ServiceError, RestartPolicy};
+pub use service::{
+    Error as ServiceError, RestartPolicy, Site as ServiceSite, SkipReason as EnvFileSkipReason,
+    SkippedEnvFile, WorkingDirectoryError,
+};
 pub use spec::{
     DependencySpec, DynamicOrigin, DynamicServiceParams, HealthcheckSpec, Lease,
     PartialServiceSpec, ServiceOrigin, ServiceSpec, SpecError, SpecField, StopSignal,
@@ -96,9 +102,9 @@ pub enum Error {
     /// Rendering configuration diagnostics failed.
     #[error(transparent)]
     Diagnostics(#[from] codespan_reporting::files::Error),
-    /// A service definition could not be materialized.
+    /// One or more service definitions could not be materialized.
     #[error(transparent)]
-    Service(#[from] ServiceError),
+    Services(#[from] MaterializationFailure),
     /// Service dependencies are invalid.
     #[error(transparent)]
     Graph(#[from] GraphError),
@@ -110,21 +116,106 @@ pub(crate) struct ReloadConfig {
     pub(crate) strict_override: Option<bool>,
 }
 
+/// Service definitions that could not be materialized.
+///
+/// Carries the optional env files skipped while trying, because a skipped file is the usual
+/// explanation for a variable that "is in an env file" yet reports as unset.
+#[derive(Debug, thiserror::Error)]
+#[error("{}", join_messages(errors))]
+pub struct MaterializationFailure {
+    /// One error per failing service, in config order.
+    pub errors: Vec<ServiceError>,
+    /// Every optional env file skipped across all services, in config order.
+    pub skipped_env_files: Vec<SkippedEnvFile>,
+}
+
+fn join_messages(errors: &[ServiceError]) -> String {
+    errors
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+impl ToDiagnostics for MaterializationFailure {
+    fn to_diagnostics<F: Copy + PartialEq>(&self, file_id: F) -> Vec<Diagnostic<F>> {
+        // Notes first: a skipped file explains the error that follows it.
+        self.skipped_env_files
+            .iter()
+            .flat_map(|skipped| skipped.to_diagnostics(file_id))
+            .chain(
+                self.errors
+                    .iter()
+                    .flat_map(|err| err.to_diagnostics(file_id)),
+            )
+            .collect()
+    }
+}
+
+/// The services that materialized, plus what went wrong or was skipped for the rest.
+struct MaterializedServices {
+    services: ServiceMap,
+    errors: Vec<ServiceError>,
+    skipped_env_files: Vec<SkippedEnvFile>,
+}
+
+impl MaterializedServices {
+    fn into_result(self) -> Result<ServiceMap, MaterializationFailure> {
+        let Self {
+            services,
+            errors,
+            skipped_env_files,
+        } = self;
+        if errors.is_empty() {
+            Ok(services)
+        } else {
+            Err(MaterializationFailure {
+                errors,
+                skipped_env_files,
+            })
+        }
+    }
+}
+
+/// Materialize every configured service, keeping the errors of the ones that fail.
+///
+/// Services are independent, so a validation report can name every failing service at once
+/// instead of stopping at the first.
+fn materialize_services<F>(config_file: &config::ConfigFile<F>) -> MaterializedServices {
+    let config_dir = &config_file.config_dir;
+    // One snapshot of the supervisor environment per config load, so every service resolves
+    // against the same values.
+    let supervisor_environment: std::collections::HashMap<String, String> =
+        std::env::vars().collect();
+    let mut services = ServiceMap::new();
+    let mut errors = Vec::new();
+    let mut skipped_env_files = Vec::new();
+    for (name, service_config) in &config_file.config.services {
+        let service_id = name.as_ref().clone();
+        match service::Service::from_config(
+            service_id.clone(),
+            config_dir,
+            service_config.clone(),
+            &supervisor_environment,
+            &mut skipped_env_files,
+        ) {
+            Ok(service) => {
+                services.insert(service_id, service);
+            }
+            Err(err) => errors.push(err),
+        }
+    }
+    MaterializedServices {
+        services,
+        errors,
+        skipped_env_files,
+    }
+}
+
 pub(crate) fn service_map_from_config<F>(
     config_file: &config::ConfigFile<F>,
-) -> Result<ServiceMap, ServiceError> {
-    let config_dir = config_file.config_dir.clone();
-    config_file
-        .config
-        .services
-        .iter()
-        .map(|(name, service_config)| {
-            let service_id = name.as_ref().clone();
-            let service =
-                service::Service::new(name.as_ref().clone(), &config_dir, service_config.clone())?;
-            Ok::<_, ServiceError>((service_id, service))
-        })
-        .collect::<Result<ServiceMap, _>>()
+) -> Result<ServiceMap, MaterializationFailure> {
+    materialize_services(config_file).into_result()
 }
 
 /// Severity of one config-validation diagnostic.
@@ -135,6 +226,8 @@ pub enum ConfigDiagnosticSeverity {
     Error,
     /// The config is usable but should be corrected.
     Warning,
+    /// Informational, such as an optional env file that was skipped.
+    Note,
 }
 
 /// One compact config-validation diagnostic.
@@ -211,19 +304,26 @@ pub fn validate_config_file(
         .any(|diagnostic| diagnostic.severity == Severity::Error)
         && let Some(config) = &parsed
     {
-        match service_map_from_config(config) {
-            Ok(service_map) => {
-                services.extend(service_map.keys().cloned());
-                if let Err(err) = graph::ServiceGraph::new(&service_map) {
-                    source_diagnostics.push(
-                        codespan_reporting::diagnostic::Diagnostic::error()
-                            .with_message(err.to_string()),
-                    );
-                }
-            }
-            Err(err) => source_diagnostics.push(
+        let MaterializedServices {
+            services: service_map,
+            errors,
+            skipped_env_files,
+        } = materialize_services(config);
+        services.extend(service_map.keys().cloned());
+        for skipped in &skipped_env_files {
+            source_diagnostics.extend(skipped.to_diagnostics(file_id));
+        }
+        for err in &errors {
+            source_diagnostics.extend(err.to_diagnostics(file_id));
+        }
+        // The graph is only meaningful once every service materialized: a failed service
+        // would otherwise show up as a missing dependency of its dependents.
+        if errors.is_empty()
+            && let Err(err) = graph::ServiceGraph::new(&service_map)
+        {
+            source_diagnostics.push(
                 codespan_reporting::diagnostic::Diagnostic::error().with_message(err.to_string()),
-            ),
+            );
         }
     }
 
@@ -236,9 +336,8 @@ pub fn validate_config_file(
         .map(|diagnostic| ConfigDiagnostic {
             severity: match diagnostic.severity {
                 Severity::Bug | Severity::Error => ConfigDiagnosticSeverity::Error,
-                Severity::Warning | Severity::Note | Severity::Help => {
-                    ConfigDiagnosticSeverity::Warning
-                }
+                Severity::Warning => ConfigDiagnosticSeverity::Warning,
+                Severity::Note | Severity::Help => ConfigDiagnosticSeverity::Note,
             },
             message: diagnostic.message.clone(),
         })
@@ -513,6 +612,98 @@ services:
                 && diagnostic.message.contains("depends on unknown `missing`")
         }));
         assert!(report.rendered.is_some());
+        Ok(())
+    }
+
+    /// Unresolved references are reported for every failing service, name the site and the
+    /// variable, and point at the offending value in the source.
+    #[test]
+    fn config_validation_points_at_unresolved_variables() -> eyre::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let config_path = dir.path().join("micromux.yaml");
+        std::fs::write(
+            &config_path,
+            r#"version: 1
+services:
+  in-command:
+    command: "echo ${MICROMUX_TEST_UNSET_IN_COMMAND}"
+  in-ports:
+    command: ["sleep", "1"]
+    ports: ["${MICROMUX_TEST_UNSET_IN_PORTS}"]
+  in-script:
+    command: ["sh", "-c", "for f in *; do echo $f; done"]
+    env_file:
+      - path: "${MICROMUX_TEST_UNSET_SHARED_ENV}"
+        optional: true
+  no-dir:
+    command: ["true"]
+    working_dir: ./definitely-missing
+  fine:
+    command: ["true"]
+"#,
+        )?;
+
+        let report = validate_config_file(&config_path, None)?;
+
+        assert!(!report.valid);
+        assert_eq!(report.services, vec!["fine"]);
+        let messages = report
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.severity != ConfigDiagnosticSeverity::Warning)
+            .map(|diagnostic| (diagnostic.severity, diagnostic.message.as_str()))
+            .collect::<Vec<_>>();
+        let no_dir_message = format!(
+            "cannot use working_dir of service `no-dir`: failed to access working directory {}: \
+             No such file or directory (os error 2)",
+            dir.path()
+                .canonicalize()?
+                .join("./definitely-missing")
+                .display()
+        );
+        assert_eq!(
+            messages,
+            vec![
+                (
+                    ConfigDiagnosticSeverity::Note,
+                    "optional env_file[0] of service `in-script` skipped: variable \
+                     `MICROMUX_TEST_UNSET_SHARED_ENV` is not set",
+                ),
+                (
+                    ConfigDiagnosticSeverity::Error,
+                    "cannot resolve command[1] of service `in-command`: variable \
+                     `MICROMUX_TEST_UNSET_IN_COMMAND` is not set",
+                ),
+                (
+                    ConfigDiagnosticSeverity::Error,
+                    "cannot resolve ports[0] of service `in-ports`: variable \
+                     `MICROMUX_TEST_UNSET_IN_PORTS` is not set",
+                ),
+                (
+                    ConfigDiagnosticSeverity::Error,
+                    "cannot resolve command[2] of service `in-script`: variable `f` is not set",
+                ),
+                (ConfigDiagnosticSeverity::Error, no_dir_message.as_str()),
+            ]
+        );
+        let rendered = report
+            .rendered
+            .ok_or_else(|| eyre::eyre!("missing rendered diagnostics"))?;
+        // The rendering quotes the source line and tells the author what to do.
+        assert!(
+            rendered.contains(r#"ports: ["${MICROMUX_TEST_UNSET_IN_PORTS}"]"#),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("${MICROMUX_TEST_UNSET_IN_PORTS:-<default>}"),
+            "{rendered}"
+        );
+        // A shell script leads with the literal escape, since a shell-local variable is the
+        // likely cause there.
+        assert!(
+            rendered.contains("write `$$f` to pass a literal `$f` through to the shell"),
+            "{rendered}"
+        );
         Ok(())
     }
 

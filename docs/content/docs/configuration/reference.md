@@ -29,20 +29,29 @@ Every key in `micromux.yaml`. The machine-readable source of truth is [`micromux
 
 | Key | Type | Description |
 |---|---|---|
-| `command` | string / array | **Required.** Shell-like string or argv array. |
+| `command` | string / array | **Required.** Shell-like string or argv array. Each argument is [interpolated]({{< relref "services.md" >}}#variable-interpolation) after splitting. |
 | `name` | string | Display name for the TUI. |
 | `disabled` | bool | Leave the service disabled when the session starts. |
-| `working_dir` | string | Working directory, relative to the config. Aliases: `cwd`, `directory`. |
-| `environment` | map | Inline environment variables. |
-| `env_file` | string / object / array | `.env` file(s) to load. Long form is `{ path: … }`. |
+| `working_dir` | string | Working directory, relative to the config. Aliases: `cwd`, `directory`. May reference `${VAR}` from micromux's own environment only. |
+| `environment` | map | Inline environment variables. Values may reference `${VAR}`. |
+| `env_file` | string / object / array | `.env` file(s) to load, earlier first. Long form is `{ path: …, optional: … }`; see [`env_file[]`](#env_file). |
 | `depends_on` | array | [Dependencies]({{< relref "dependencies.md" >}}); each a service id or `{ name, condition }`. |
 | `healthcheck` | object | A [probe]({{< relref "healthchecks.md" >}}) with `test` plus timing. |
-| `ports` | array | Ports the service uses (metadata; not bound by micromux). |
+| `ports` | array | Ports the service uses (metadata; not bound by micromux). Entries may reference `${VAR}`. |
 | `restart` | string | [Restart policy]({{< relref "restart-policies.md" >}}) for this service. |
 | `stop_grace_period` | duration | Time between graceful termination and force-kill. Defaults to `10s`; must be greater than zero and no longer than `5m`. |
 | `stop_signal` | string | Signal delivered for the graceful stop request. One of `SIGTERM` (default), `SIGINT`, `SIGHUP`, `SIGQUIT`, `SIGUSR1`, `SIGUSR2`; the `SIG` prefix is optional and matching is case-insensitive. Delivered to the service's process group and — best-effort, via a process-table sweep that cannot guarantee hard containment — to descendants that escaped it, so a non-default choice reaches child processes too. Ignored on Windows. |
 | `logs` | object | [Log retention]({{< relref "logs.md" >}}) for this service. |
 | `color` | bool | Force color handling for this service. |
+
+## `env_file[]`
+
+A bare path or an object:
+
+| Key | Type | Description |
+|---|---|---|
+| `path` | string | **Required.** Path of the dotenv file, relative to the config. May reference `${VAR}` from micromux's own environment. |
+| `optional` | bool | Skip the entry when its path names an unset variable or no file exists there. Defaults to `false`. A present file is always loaded in full. |
 
 ## `depends_on[]`
 

@@ -134,7 +134,7 @@
       ]
     },
     "command": {
-      "description": "Command to execute. Either a shell-like string or an argv-like sequence.",
+      "description": "Command to execute. Either a shell-like string or an argv-like sequence. Each argument is interpolated after splitting: ${VAR} and $VAR resolve against the service's environment, ${VAR:-default} supplies a fallback, $$VAR passes a literal $VAR through, and an unset variable is an error.",
       "anyOf": [
         {
           "type": "string",
@@ -188,6 +188,7 @@
       ]
     },
     "env_file_entry": {
+      "description": "A dotenv file to load. Its path may reference ${VAR} from the environment micromux runs in.",
       "anyOf": [
         {
           "type": "string",
@@ -203,12 +204,18 @@
             "path": {
               "type": "string",
               "minLength": 1
+            },
+            "optional": {
+              "type": "boolean",
+              "default": false,
+              "description": "Skip this entry when its path names an unset variable or no file exists at the path. A present file is always loaded in full."
             }
           }
         }
       ]
     },
     "env_file": {
+      "description": "Dotenv files to load, earlier entries first. Later files override earlier ones and `environment` overrides them all.",
       "anyOf": [
         {
           "$ref": "#/definitions/env_file_entry"
@@ -363,19 +370,23 @@
           "$ref": "#/definitions/command"
         },
         "working_dir": {
-          "type": "string"
+          "type": "string",
+          "description": "Working directory, relative to the config file. May reference ${VAR} from the environment micromux itself runs in; env files are not loaded yet when paths resolve."
         },
         "cwd": {
-          "type": "string"
+          "type": "string",
+          "description": "Alias for working_dir."
         },
         "directory": {
-          "type": "string"
+          "type": "string",
+          "description": "Alias for working_dir."
         },
         "env_file": {
           "$ref": "#/definitions/env_file"
         },
         "environment": {
           "type": "object",
+          "description": "Inline environment variables. Values may reference ${VAR} from the environment micromux runs in, from env files, and from earlier entries; an unset variable is an error.",
           "additionalProperties": {
             "$ref": "#/definitions/scalar"
           }
@@ -391,6 +402,7 @@
         },
         "ports": {
           "type": "array",
+          "description": "Ports the service uses (metadata; not bound by micromux). Entries may reference ${VAR} and must resolve to a number between 0 and 65535.",
           "items": {
             "$ref": "#/definitions/scalar"
           }

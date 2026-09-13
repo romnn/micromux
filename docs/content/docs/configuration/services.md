@@ -57,7 +57,57 @@ services:
       APP_DEBUG: "false"
 ```
 
-`env_file` accepts a single path, an object with `path`, or a list mixing the two. Paths resolve relative to the config file.
+`env_file` accepts a single path, an object with `path`, or a list mixing the two. Paths resolve relative to the config file. Later files override earlier ones, and `environment` overrides them all.
+
+Mark an entry `optional: true` when the file is not present on every machine. An optional file is skipped when its path names a variable that is unset, or when nothing exists at the path; a file that *is* present is loaded in full, so a syntax error in it still fails the service. That makes a machine-level file shared across several checkouts expressible in a committed config:
+
+```yaml
+env_file:
+  - .env
+  - path: "${SHARED_ENV_FILE}"    # only on machines that set the variable
+    optional: true
+  - path: .env.local              # gitignored local overrides win
+    optional: true
+```
+
+## Variable interpolation
+
+Every value that reaches the service process may reference variables: the contents of `env_file`, `environment`, `ports`, `command`, and `healthcheck.test`.
+
+| Form | Meaning |
+|---|---|
+| `${VAR}` or `$VAR` | The value of `VAR`. An error when `VAR` is unset. |
+| `${VAR:-default}` | `default` when `VAR` is unset or empty. |
+| `${VAR-default}` | `default` only when `VAR` is unset. |
+| `$$VAR`, `$${VAR}` | A literal `$VAR` or `${VAR}`, not substituted. |
+
+A `$` is only special directly before `{` or a name. A lone `$$`, `$1`, `$?`, or `$(…)` is left alone.
+
+**What a reference sees.** Values resolve against the environment the process receives (apart from the terminal-color variables micromux sets at spawn): the environment micromux itself runs in, then each `env_file` in order, then `environment`. Entries resolve top to bottom, so an `env_file` line can use earlier lines and earlier files, and an `environment` entry can use every env file and only the entries above it. The exception is paths — `working_dir` and every `env_file` path — which only see micromux's own environment, because they have to be resolved before any file can be loaded.
+
+**Unset variables are errors.** micromux never substitutes an empty string on its own. A reference to an unset variable fails validation and startup with a message naming the service, the field, and the variable, and any optional `env_file` that was skipped is reported alongside it as a note. Write `${VAR:-}` to ask for an empty value explicitly. Because `validate_config` runs in its own process, its environment can differ from the session's; an optional `env_file` found on one machine may be skipped on another.
+
+**Substitution happens per argument.** `command` and `healthcheck.test` are split into arguments first, then each argument is substituted, so a value containing spaces stays one argument and no shell is needed to pass it. For the same reason a default that contains spaces has to be quoted:
+
+```yaml
+command: 'serve --token "${API_TOKEN}" --name "${NAME:-dev box}"'   # argv: serve, --token, <the token>, --name, dev box
+```
+
+**Inside a dotenv file**, single quotes keep a value literal: `PASSWORD='pa$$word'` is taken as written, while unquoted and double-quoted values are interpolated like every other value.
+
+### Shell scripts in `command`
+
+micromux substitutes `$VAR` everywhere, including inside a script handed to `sh -c` or `CMD-SHELL`. Substitution happens once, when the config loads, from micromux's environment, not at run time from the shell's. That has two consequences for an existing script:
+
+- A variable the script defines itself — a loop variable, an assignment, a positional parameter by name — is not set when micromux resolves the command, so it is an error. Escape it with `$$` and the shell keeps it:
+
+  ```yaml
+  command: ["sh", "-c", "for f in *; do echo $$f; done"]
+  ```
+
+- A variable that *is* set in micromux's environment is substituted before the shell ever runs. `$PWD` becomes micromux's directory, not the service's `working_dir`; write `$$PWD` when you want the shell's value.
+
+The substituted text is also expanded a second time by the shell, which mangles values containing `$`, quotes, or backslashes. Prefer dropping the shell when it exists only to get variables expanded; the per-argument substitution above covers that without a wrapper. Where a shell is genuinely needed, `$${VAR}` hands `${VAR}` to the shell, which expands it from the same environment at run time.
 
 ## Ports
 
