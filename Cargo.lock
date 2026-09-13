@@ -418,7 +418,7 @@ source = "git+https://github.com/romnn/clippy-shim.git?branch=main#da77262527376
 
 [[package]]
 name = "clippy-wrapper"
-version = "0.1.4"
+version = "0.2.0"
 dependencies = [
  "clippy-shim",
 ]
@@ -1457,7 +1457,7 @@ checksum = "c2a86d3146ed3995b5913c414f6664344b9617457320782e64f0bb44afd49d74"
 
 [[package]]
 name = "micromux"
-version = "0.1.4"
+version = "0.2.0"
 dependencies = [
  "alacritty_terminal",
  "codespan-reporting",
@@ -1496,7 +1496,7 @@ dependencies = [
 
 [[package]]
 name = "micromux-cli"
-version = "0.1.4"
+version = "0.2.0"
 dependencies = [
  "clap",
  "codespan-reporting",
@@ -1518,7 +1518,7 @@ dependencies = [
 
 [[package]]
 name = "micromux-control"
-version = "0.1.4"
+version = "0.2.0"
 dependencies = [
  "color-eyre",
  "directories",
@@ -1540,7 +1540,7 @@ dependencies = [
 
 [[package]]
 name = "micromux-mcp"
-version = "0.1.4"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "color-eyre",
@@ -1564,7 +1564,7 @@ dependencies = [
 
 [[package]]
 name = "micromux-screenshot"
-version = "0.1.4"
+version = "0.2.0"
 dependencies = [
  "portable-pty",
  "thiserror 2.0.20",
@@ -1573,7 +1573,7 @@ dependencies = [
 
 [[package]]
 name = "micromux-tui"
-version = "0.1.4"
+version = "0.2.0"
 dependencies = [
  "ansi-to-tui",
  "codespan-reporting",
