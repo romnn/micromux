@@ -4721,6 +4721,67 @@ async fn resize_all_changes_stty_size_for_new_service() -> eyre::Result<()> {
     Ok(())
 }
 
+/// A service and its healthcheck without their own `working_dir` run in the config directory.
+#[tokio::test]
+async fn services_without_working_dir_run_in_the_config_directory() -> eyre::Result<()> {
+    let config_dir = unique_tmp_dir("default-working-dir");
+    fs::create_dir_all(&config_dir)?;
+    fs::write(config_dir.join("marker.txt"), "ok")?;
+
+    let mut cfg = service_config("svc", ("sh", &["-c", "pwd; sleep 60"]));
+    cfg.healthcheck = Some(config::HealthCheck {
+        test: (
+            spanned_string("sh"),
+            vec![spanned_string("-c"), spanned_string("test -f marker.txt")],
+        ),
+        ..healthcheck_always_ok()
+    });
+    let mut services: ServiceMap = ServiceMap::new();
+    services.insert("svc".to_string(), Service::new("svc", &config_dir, cfg)?);
+    let harness = spawn_harness(services, None);
+
+    // The process prints the config directory, and the probe finds the marker next to the config.
+    let expected = config_dir.canonicalize()?;
+    wait_for_log(&harness.reader, "svc", expected.to_string_lossy().as_ref()).await?;
+    let attempt = wait_for_finished_health_attempt(&harness.reader, "svc").await?;
+    assert_eq!(attempt.result.map(|result| result.success), Some(true));
+
+    harness.shutdown.cancel();
+    harness.handle.await??;
+    Ok(())
+}
+
+/// A program with a directory part runs from the working directory, the way a shell runs it.
+///
+/// On Linux the spawn works in a descriptor-backed directory whose descriptor the PTY child
+/// closes before exec, so a program resolved below that path would fail to start.
+#[cfg(unix)]
+#[tokio::test]
+async fn programs_with_a_directory_part_run_from_the_working_directory() -> eyre::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let config_dir = unique_tmp_dir("relative-program");
+    let script = config_dir.join("bin").join("hello.sh");
+    fs::create_dir_all(config_dir.join("bin"))?;
+    fs::write(&script, "#!/bin/sh\necho \"hello from $0\"\n")?;
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755))?;
+
+    let mut services: ServiceMap = ServiceMap::new();
+    for (id, program) in [("dot", "./bin/hello.sh"), ("nested", "bin/hello.sh")] {
+        let cfg = service_config(id, (program, &[]));
+        services.insert(id.to_string(), Service::new(id, &config_dir, cfg)?);
+    }
+    let harness = spawn_harness(services, None);
+
+    // Both spellings start the script in the config directory.
+    wait_for_log(&harness.reader, "dot", "hello from").await?;
+    wait_for_log(&harness.reader, "nested", "hello from").await?;
+
+    harness.shutdown.cancel();
+    harness.handle.await??;
+    Ok(())
+}
+
 #[tokio::test]
 async fn working_dir_is_used_for_spawn() -> eyre::Result<()> {
     let base = unique_tmp_dir("working-dir");

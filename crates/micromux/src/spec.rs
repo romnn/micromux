@@ -90,7 +90,10 @@ pub struct ServiceSpec {
     /// Resolved command argv.
     #[serde(default)]
     pub command: Vec<String>,
-    /// Resolved absolute working directory, or the session directory when absent.
+    /// Resolved working directory: the config directory unless the service sets its own.
+    ///
+    /// A live service always carries one.
+    /// `None` only in a dynamic-service request, before the scheduler resolves it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub working_dir: Option<PathBuf>,
     /// Literal environment entries layered over the supervisor process environment.
@@ -164,7 +167,7 @@ impl ServiceSpec {
         Ok(())
     }
 
-    /// The overridden working directory as a display string.
+    /// The working directory as a display string.
     #[must_use]
     pub fn working_dir_display(&self) -> Option<String> {
         self.working_dir
@@ -388,7 +391,7 @@ pub struct PartialServiceSpec {
     /// Command argv override.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<Vec<String>>,
-    /// Working-directory override; `null` restores the session directory.
+    /// Working-directory override; `null` restores the config directory.
     #[serde(default, skip_serializing_if = "SpecField::is_unspecified")]
     #[schemars(with = "Option<PathBuf>")]
     pub working_dir: SpecField<PathBuf>,

@@ -2610,6 +2610,7 @@ pub(super) fn start_service_with_pty_size(
     let working_dir = service
         .spawn_working_directory()
         .map_err(|err| Error::operation("failed to resolve anchored working directory", err))?;
+    let program = working_dir.resolve_program(prog);
 
     let env_vars = env_vars_for_service(service);
     let env_vars = {
@@ -2641,11 +2642,9 @@ pub(super) fn start_service_with_pty_size(
         })
         .map_err(|err| Error::operation("failed to open pty", err))?;
 
-    let mut cmd = CommandBuilder::new(prog);
+    let mut cmd = CommandBuilder::new(&program);
     cmd.args(args);
-    if let Some(dir) = &working_dir {
-        cmd.cwd(dir.as_path());
-    }
+    cmd.cwd(working_dir.as_path());
     for (k, v) in &env_vars {
         cmd.env(k, v);
     }
@@ -2754,7 +2753,7 @@ pub(super) fn start_service_with_pty_size(
                     service_id,
                     run_id,
                     sink,
-                    working_dir,
+                    working_dir: Some(working_dir),
                     environment,
                     events_tx,
                     shutdown,

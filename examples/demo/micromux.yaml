@@ -7,12 +7,10 @@
 # interval, so the UI settles into a stable frame within a second. The set is arranged so one
 # capture shows every lifecycle state at once: healthy, running, completed (exited), unhealthy, and
 # blocked on a dependency. The worker logs structured JSON to show timestamps and hidden fields.
-# Each service sets working_dir so its script path resolves next to this file.
 version: "1"
 services:
   api:
-    command: ["sh", "bin/api.sh"]
-    working_dir: .
+    command: ["./bin/api.sh"]
     ports:
       - 8080
     depends_on:
@@ -27,14 +25,12 @@ services:
       timeout: "2s"
 
   web:
-    command: ["sh", "bin/web.sh"]
-    working_dir: .
+    command: ["./bin/web.sh"]
     ports:
       - 3000
 
   worker:
-    command: ["sh", "bin/worker.sh"]
-    working_dir: .
+    command: ["./bin/worker.sh"]
     depends_on:
       - name: api
         condition: healthy
@@ -43,8 +39,7 @@ services:
       fields: {filename: hide, line_number: hide, span: hide, spans: hide}
 
   postgres:
-    command: ["sh", "bin/postgres.sh"]
-    working_dir: .
+    command: ["./bin/postgres.sh"]
     ports:
       - 5432
     healthcheck:
@@ -54,8 +49,7 @@ services:
       timeout: "2s"
 
   redis:
-    command: ["sh", "bin/redis.sh"]
-    working_dir: .
+    command: ["./bin/redis.sh"]
     ports:
       - 6379
     healthcheck:
@@ -65,13 +59,11 @@ services:
       timeout: "2s"
 
   migrate:
-    command: ["sh", "bin/migrate.sh"]
-    working_dir: .
+    command: ["./bin/migrate.sh"]
     restart: "no"
 
   payments:
-    command: ["sh", "bin/payments.sh"]
-    working_dir: .
+    command: ["./bin/payments.sh"]
     ports:
       - 7070
     healthcheck:
@@ -82,8 +74,7 @@ services:
       retries: 0
 
   checkout:
-    command: ["sh", "bin/checkout.sh"]
-    working_dir: .
+    command: ["./bin/checkout.sh"]
     depends_on:
       - name: payments
         condition: healthy

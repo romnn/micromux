@@ -32,7 +32,7 @@ Every key in `micromux.yaml`. The machine-readable source of truth is [`micromux
 | `command` | string / array | **Required.** Shell-like string or argv array. Each argument is [interpolated]({{< relref "services.md" >}}#variable-interpolation) after splitting. |
 | `name` | string | Display name for the TUI. |
 | `disabled` | bool | Leave the service disabled when the session starts. |
-| `working_dir` | string | Working directory, relative to the config. Aliases: `cwd`, `directory`. May reference `${VAR}` from micromux's own environment only. |
+| `working_dir` | string | Working directory, relative to the config; defaults to the config's directory. Aliases: `cwd`, `directory`. May reference `${VAR}` from micromux's own environment only. |
 | `environment` | map | Inline environment variables. Values may reference `${VAR}`. |
 | `env_file` | string / object / array | `.env` file(s) to load, earlier first. Long form is `{ path: …, optional: … }`; see [`env_file[]`](#env_file). |
 | `depends_on` | array | [Dependencies]({{< relref "dependencies.md" >}}); each a service id or `{ name, condition }`. |

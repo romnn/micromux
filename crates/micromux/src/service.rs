@@ -73,6 +73,18 @@ pub enum Error {
         #[source]
         source: WorkingDirectoryError,
     },
+    /// The config directory, where a service without its own `working_dir` runs, could not be
+    /// opened.
+    #[error("cannot run service `{service}` in the config directory: {source}")]
+    ConfigDirectory {
+        /// Service that runs in the config directory.
+        service: ServiceID,
+        /// Span of the service's name in the config file.
+        span: Span,
+        /// Underlying filesystem error, which names the config directory.
+        #[source]
+        source: WorkingDirectoryError,
+    },
 }
 
 /// A working directory could not be opened or is not a directory.
@@ -316,6 +328,11 @@ impl ToDiagnostics for Error {
                 vec!["ports must resolve to a number between 0 and 65535".to_string()],
             ),
             Self::WorkingDirectory { span, .. } => (span, "working_dir".to_string(), vec![]),
+            Self::ConfigDirectory { span, .. } => (
+                span,
+                "runs in the config directory".to_string(),
+                vec!["set working_dir to run the service in another directory".to_string()],
+            ),
         };
         vec![
             Diagnostic::error()
@@ -341,6 +358,7 @@ mod tests {
     use std::time::Duration;
     use yaml_spanned::Spanned;
 
+    /// A service without its own `working_dir` runs in the config directory.
     #[test]
     fn argv_flattens_program_and_args_and_defaults_working_dir() -> eyre::Result<()> {
         let dir = unique_tmp_dir("argv");
@@ -348,7 +366,59 @@ mod tests {
         let cfg = service_config("ui", ("task", &["tool:rag:ui:run:release"]));
         let service = Service::new("ui", &dir, cfg)?;
         assert_eq!(service.argv(), vec!["task", "tool:rag:ui:run:release"]);
-        assert_eq!(service.working_dir_display(), None);
+        assert_eq!(service.working_dir_display(), dir.display().to_string());
+        Ok(())
+    }
+
+    /// A config directory that cannot be opened fails the service that would run in it.
+    #[test]
+    fn unusable_config_directory_fails_services_without_a_working_dir() {
+        // Never created, so opening it fails.
+        let dir = unique_tmp_dir("config-dir-missing");
+        let cfg = service_config("svc", ("sh", &["-c", "true"]));
+
+        let err = Service::new("svc", &dir, cfg).err();
+
+        assert!(
+            matches!(&err, Some(Error::ConfigDirectory { service, .. }) if service == "svc"),
+            "{err:?}"
+        );
+    }
+
+    /// Programs with a directory part resolve inside the anchored directory, while bare names
+    /// stay for the `PATH` search and absolute paths stay as they are.
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+    #[test]
+    fn programs_with_a_directory_part_resolve_inside_the_anchored_directory() -> eyre::Result<()> {
+        let dir = unique_tmp_dir("resolve-program");
+        let working = dir.join("work");
+        fs::create_dir_all(&working)?;
+        let mut cfg = service_config("svc", ("sh", &["-c", "true"]));
+        cfg.working_dir = Some(spanned_string(working.to_string_lossy().as_ref()));
+        let service = Service::new("svc", &dir, cfg)?;
+
+        // Move the validated directory and put another at its old path; resolution must follow
+        // the directory the service anchored, not whatever the path names now.
+        let moved = dir.join("moved-work");
+        fs::rename(&working, &moved)?;
+        fs::create_dir_all(&working)?;
+        let moved = moved.canonicalize()?;
+        let anchored = service.spawn_working_directory()?;
+
+        assert_eq!(
+            anchored.resolve_program("./bin/api.sh"),
+            moved.join("bin/api.sh")
+        );
+        assert_eq!(
+            anchored.resolve_program("bin/api.sh"),
+            moved.join("bin/api.sh")
+        );
+        assert_eq!(anchored.resolve_program("../tool"), moved.join("../tool"));
+        assert_eq!(anchored.resolve_program("cargo"), PathBuf::from("cargo"));
+        assert_eq!(
+            anchored.resolve_program("/usr/bin/env"),
+            PathBuf::from("/usr/bin/env")
+        );
         Ok(())
     }
 
@@ -464,9 +534,7 @@ mod tests {
         fs::create_dir_all(&working)?;
         fs::write(working.join("identity"), "replacement")?;
 
-        let anchored = service
-            .spawn_working_directory()?
-            .ok_or_else(|| eyre::eyre!("working directory was not anchored"))?;
+        let anchored = service.spawn_working_directory()?;
         assert_eq!(
             fs::read_to_string(anchored.as_path().join("identity"))?,
             "original"
@@ -1097,9 +1165,8 @@ pub struct Service {
     pub enable_color: bool,
     pub log_retention: LogRetention,
     pub log_display: LogDisplay,
-    // Keeps each spawn tied to the directory that passed validation even if its path is replaced.
-    #[cfg(unix)]
-    working_directory: Option<Arc<std::fs::File>>,
+    /// The directory the service runs in, which `spec.working_dir` names as well.
+    working_directory: WorkingDirectory,
 }
 
 /// A spawn path that retains its validated directory identity where the platform supports it.
@@ -1110,6 +1177,9 @@ pub struct Service {
 #[derive(Debug, Clone)]
 pub(crate) struct SpawnWorkingDirectory {
     path: PathBuf,
+    /// Where the directory really is, which stays reachable after a PTY child closes its
+    /// inherited descriptors.
+    real_path: PathBuf,
     #[cfg(unix)]
     #[expect(
         dead_code,
@@ -1122,27 +1192,48 @@ impl SpawnWorkingDirectory {
     pub(crate) fn as_path(&self) -> &Path {
         &self.path
     }
+
+    /// Resolves a program that names a path inside this directory, such as `./bin/api.sh` or
+    /// `bin/api.sh`, to a path a PTY child can still execute.
+    ///
+    /// Bare names such as `cargo` stay as they are for the `PATH` search, and absolute paths need
+    /// no resolution, matching how a shell runs a command.
+    ///
+    /// A PTY spawn closes every inherited descriptor before it executes the program.
+    /// A program path below a descriptor-backed directory such as `/proc/self/fd/N` is gone by
+    /// then, so the result starts from the directory's real path instead.
+    pub(crate) fn resolve_program(&self, program: &str) -> PathBuf {
+        let program = Path::new(program);
+        // A bare name has an empty parent, and `join` keeps an absolute path as it is.
+        let has_directory_part = program
+            .parent()
+            .is_some_and(|parent| !parent.as_os_str().is_empty());
+        if has_directory_part {
+            self.real_path
+                .join(program.strip_prefix(".").unwrap_or(program))
+        } else {
+            program.to_path_buf()
+        }
+    }
 }
 
 impl Service {
+    /// Builds a dynamic service that runs in `working_dir`, which the scheduler resolved and
+    /// checked against its policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `working_dir` cannot be opened or is not a directory.
     pub(crate) fn dynamic(
         id: ServiceID,
-        spec: ServiceSpec,
+        mut spec: ServiceSpec,
+        working_dir: PathBuf,
         origin: ServiceOrigin,
         log_retention: LogRetention,
         log_display: LogDisplay,
     ) -> Result<Self, WorkingDirectoryError> {
-        #[cfg(unix)]
-        let working_directory = spec
-            .working_dir
-            .as_deref()
-            .map(open_working_directory)
-            .transpose()?;
-        #[cfg(not(unix))]
-        spec.working_dir
-            .as_deref()
-            .map(validate_working_directory)
-            .transpose()?;
+        let working_directory = WorkingDirectory::open(working_dir)?;
+        spec.working_dir = Some(working_directory.path.clone());
         Ok(Self {
             id,
             spec,
@@ -1151,7 +1242,6 @@ impl Service {
             enable_color: true,
             log_retention,
             log_display,
-            #[cfg(unix)]
             working_directory,
         })
     }
@@ -1202,7 +1292,8 @@ impl Service {
     /// Returns [`Error::Interpolation`] when a configured value references a variable that
     /// cannot be substituted, [`Error::EnvFile`] when an environment file cannot be loaded,
     /// [`Error::InvalidPort`] when a port does not resolve to a number, and
-    /// [`Error::WorkingDirectory`] when the working directory is not usable.
+    /// [`Error::WorkingDirectory`] when the working directory is not usable, and
+    /// [`Error::ConfigDirectory`] when a service without one cannot use the config directory.
     pub(crate) fn from_config(
         id: impl Into<ServiceID>,
         config_dir: &Path,
@@ -1216,17 +1307,13 @@ impl Service {
             config_dir,
         };
 
-        // Paths: supervisor environment only
-        let resolved_working_dir = config
-            .working_dir
-            .as_ref()
-            .map(|dir| resolver.working_directory(dir, supervisor_environment))
-            .transpose()?;
-        #[cfg(unix)]
-        let working_directory = resolved_working_dir
-            .as_ref()
-            .map(|dir| Arc::clone(&dir.anchor));
-        let working_dir = resolved_working_dir.map(|dir| dir.path);
+        // Paths: supervisor environment only.
+        // A service without its own working_dir runs in the config directory, which every other
+        // relative path in the config resolves against too.
+        let working_directory = match config.working_dir.as_ref() {
+            Some(dir) => resolver.working_directory(dir, supervisor_environment)?,
+            None => resolver.config_directory(&config.name)?,
+        };
 
         // Env files, then inline entries, each layered over everything resolved before it
         let mut environment: indexmap::IndexMap<String, String> = resolver
@@ -1289,7 +1376,7 @@ impl Service {
             spec: ServiceSpec {
                 name: Some(config.name.into_inner()),
                 command,
-                working_dir,
+                working_dir: Some(working_directory.path.clone()),
                 environment,
                 depends_on,
                 healthcheck,
@@ -1303,7 +1390,6 @@ impl Service {
             enable_color: config.color.as_deref().copied().unwrap_or(true),
             log_retention: config.log_retention,
             log_display: config.log_display,
-            #[cfg(unix)]
             working_directory,
         })
     }
@@ -1314,17 +1400,21 @@ impl Service {
         self.spec.command.clone()
     }
 
-    /// The service's overridden working directory as a display string, or `None` when it inherits
-    /// the session's working directory (the directory micromux was launched in).
+    /// The directory the service runs in as a display string.
     #[must_use]
-    pub fn working_dir_display(&self) -> Option<String> {
-        self.spec.working_dir_display()
+    pub fn working_dir_display(&self) -> String {
+        self.working_directory.path.display().to_string()
     }
 
     pub fn display_name(&self) -> &str {
         self.spec.name.as_deref().unwrap_or(&self.id)
     }
 
+    /// The directory a spawn runs in, tied to the directory that passed validation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the anchored directory's current path cannot be read back.
     #[cfg_attr(
         not(unix),
         expect(
@@ -1334,88 +1424,124 @@ impl Service {
     )]
     pub(crate) fn spawn_working_directory(
         &self,
-    ) -> Result<Option<SpawnWorkingDirectory>, WorkingDirectoryError> {
+    ) -> Result<SpawnWorkingDirectory, WorkingDirectoryError> {
         #[cfg(unix)]
         {
-            self.working_directory
-                .as_ref()
-                .map(|directory| {
-                    let path = {
-                        #[cfg(target_vendor = "apple")]
-                        {
-                            use std::ffi::OsString;
-                            use std::os::unix::ffi::OsStringExt as _;
+            let WorkingDirectory {
+                path: configured,
+                anchor,
+            } = &self.working_directory;
 
-                            // macOS exposes `/dev/fd/N` as the directory itself but does not allow
-                            // path traversal below it, so recover the anchored vnode's current path.
-                            let path =
-                                rustix::fs::getpath(directory.as_ref()).map_err(|source| {
-                                    WorkingDirectoryError {
-                                        path: self
-                                            .spec
-                                            .working_dir
-                                            .clone()
-                                            .unwrap_or_else(|| Path::new(".").to_path_buf()),
-                                        source: source.into(),
-                                    }
-                                })?;
-                            PathBuf::from(OsString::from_vec(path.into_bytes()))
-                        }
+            #[cfg(target_vendor = "apple")]
+            let path = {
+                use std::ffi::OsString;
+                use std::os::unix::ffi::OsStringExt as _;
 
-                        #[cfg(not(target_vendor = "apple"))]
-                        {
-                            use std::os::fd::AsRawFd as _;
+                // macOS exposes `/dev/fd/N` as the directory itself but does not allow path
+                // traversal below it, so recover the anchored vnode's current path.
+                let path = rustix::fs::getpath(anchor.as_ref()).map_err(|source| {
+                    WorkingDirectoryError {
+                        path: configured.clone(),
+                        source: source.into(),
+                    }
+                })?;
+                PathBuf::from(OsString::from_vec(path.into_bytes()))
+            };
 
-                            let fd = directory.as_raw_fd().to_string();
-                            #[cfg(target_os = "linux")]
-                            let base = "/proc/self/fd";
-                            #[cfg(not(target_os = "linux"))]
-                            let base = "/dev/fd";
-                            Path::new(base).join(fd)
-                        }
-                    };
-                    Ok(SpawnWorkingDirectory {
-                        path,
-                        directory: Arc::clone(directory),
-                    })
-                })
-                .transpose()
+            #[cfg(not(target_vendor = "apple"))]
+            let path = {
+                use std::os::fd::AsRawFd as _;
+
+                let fd = anchor.as_raw_fd().to_string();
+                #[cfg(target_os = "linux")]
+                let base = "/proc/self/fd";
+                #[cfg(not(target_os = "linux"))]
+                let base = "/dev/fd";
+                Path::new(base).join(fd)
+            };
+
+            // Linux spawns from the descriptor path, so read back where the directory really is
+            // for the program paths a PTY child resolves without it.
+            #[cfg(target_os = "linux")]
+            let real_path = std::fs::read_link(&path).map_err(|source| WorkingDirectoryError {
+                path: configured.clone(),
+                source,
+            })?;
+            // macOS already spawns from the real path, and other Unix systems offer no portable
+            // way to read one back.
+            #[cfg(not(target_os = "linux"))]
+            let real_path = path.clone();
+
+            Ok(SpawnWorkingDirectory {
+                path,
+                real_path,
+                directory: Arc::clone(anchor),
+            })
         }
 
         #[cfg(not(unix))]
         {
-            Ok(self
-                .spec
-                .working_dir
-                .clone()
-                .map(|path| SpawnWorkingDirectory { path }))
+            let path = self.working_directory.path.clone();
+            Ok(SpawnWorkingDirectory {
+                real_path: path.clone(),
+                path,
+            })
         }
     }
 
-    pub(crate) fn replace_spec(&mut self, spec: ServiceSpec) -> Result<(), WorkingDirectoryError> {
-        #[cfg(unix)]
-        {
-            self.working_directory = spec
-                .working_dir
-                .as_deref()
-                .map(open_working_directory)
-                .transpose()?;
-        }
-        #[cfg(not(unix))]
-        spec.working_dir
-            .as_deref()
-            .map(validate_working_directory)
-            .transpose()?;
+    /// Replaces the definition of a dynamic service, which runs in `working_dir` from its next
+    /// start.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `working_dir` cannot be opened or is not a directory.
+    pub(crate) fn replace_spec(
+        &mut self,
+        mut spec: ServiceSpec,
+        working_dir: PathBuf,
+    ) -> Result<(), WorkingDirectoryError> {
+        let working_directory = WorkingDirectory::open(working_dir)?;
+        spec.working_dir = Some(working_directory.path.clone());
+        self.working_directory = working_directory;
         self.spec = spec;
         Ok(())
     }
 }
 
-/// A configured working directory that resolved and exists.
+/// A working directory that resolved and exists.
+#[derive(Debug, Clone)]
 struct WorkingDirectory {
     path: PathBuf,
+    /// Keeps each spawn tied to the directory that passed validation even if its path is
+    /// replaced.
     #[cfg(unix)]
     anchor: Arc<std::fs::File>,
+}
+
+impl WorkingDirectory {
+    fn open(path: PathBuf) -> Result<Self, WorkingDirectoryError> {
+        let error = |source| WorkingDirectoryError {
+            path: path.clone(),
+            source,
+        };
+        #[cfg(unix)]
+        let anchor = std::fs::File::open(&path).map_err(error)?;
+        #[cfg(unix)]
+        let metadata = anchor.metadata().map_err(error)?;
+        #[cfg(not(unix))]
+        let metadata = std::fs::metadata(&path).map_err(error)?;
+        if !metadata.is_dir() {
+            return Err(error(std::io::Error::new(
+                std::io::ErrorKind::NotADirectory,
+                "path is not a directory",
+            )));
+        }
+        Ok(Self {
+            path,
+            #[cfg(unix)]
+            anchor: Arc::new(anchor),
+        })
+    }
 }
 
 /// Labels every failure of one service's configured values with its site and span.
@@ -1455,19 +1581,31 @@ impl Resolver<'_> {
         environment: &HashMap<String, String>,
     ) -> Result<WorkingDirectory, Error> {
         let path = self.resolve_path(Site::WorkingDir, value, environment)?;
-        let error = |source| Error::WorkingDirectory {
+        WorkingDirectory::open(path).map_err(|source| Error::WorkingDirectory {
             service: self.service.clone(),
             span: value.span.into(),
             source,
+        })
+    }
+
+    /// The config directory, where a service without its own `working_dir` runs.
+    ///
+    /// Failures point at the service's name because there is no `working_dir` value to blame.
+    fn config_directory(
+        &self,
+        name: &yaml_spanned::Spanned<String>,
+    ) -> Result<WorkingDirectory, Error> {
+        // A config path given as a bare file name has an empty parent, meaning the current
+        // directory.
+        let path = if self.config_dir.as_os_str().is_empty() {
+            PathBuf::from(".")
+        } else {
+            self.config_dir.to_path_buf()
         };
-        #[cfg(unix)]
-        let anchor = open_working_directory(&path).map_err(error)?;
-        #[cfg(not(unix))]
-        validate_working_directory(&path).map_err(error)?;
-        Ok(WorkingDirectory {
-            path,
-            #[cfg(unix)]
-            anchor,
+        WorkingDirectory::open(path).map_err(|source| Error::ConfigDirectory {
+            service: self.service.clone(),
+            span: name.span.into(),
+            source,
         })
     }
 
@@ -1583,35 +1721,4 @@ impl Resolver<'_> {
         }
         Ok(loaded)
     }
-}
-
-#[cfg(unix)]
-fn open_working_directory(path: &Path) -> Result<Arc<std::fs::File>, WorkingDirectoryError> {
-    let error = |source| WorkingDirectoryError {
-        path: path.to_path_buf(),
-        source,
-    };
-    let directory = std::fs::File::open(path).map_err(error)?;
-    if !directory.metadata().map_err(error)?.is_dir() {
-        return Err(error(std::io::Error::new(
-            std::io::ErrorKind::NotADirectory,
-            "path is not a directory",
-        )));
-    }
-    Ok(Arc::new(directory))
-}
-
-#[cfg(not(unix))]
-fn validate_working_directory(path: &Path) -> Result<(), WorkingDirectoryError> {
-    let error = |source| WorkingDirectoryError {
-        path: path.to_path_buf(),
-        source,
-    };
-    if !std::fs::metadata(path).map_err(error)?.is_dir() {
-        return Err(error(std::io::Error::new(
-            std::io::ErrorKind::NotADirectory,
-            "path is not a directory",
-        )));
-    }
-    Ok(())
 }

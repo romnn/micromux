@@ -235,7 +235,7 @@ impl Drop for RunningService {
 #[derive(Clone, PartialEq, Eq)]
 pub(super) struct RunConfig {
     command: Vec<String>,
-    working_dir: Option<String>,
+    working_dir: String,
     advertised_ports: Vec<u16>,
     healthcheck: Option<HealthcheckConfig>,
     stop_grace_period: Duration,
@@ -674,7 +674,7 @@ pub(super) fn project_snapshot(
         restart_state,
         last_exit_code: runtime.last_exit_code,
         command: run_config.command.clone(),
-        working_dir: run_config.working_dir.clone(),
+        working_dir: Some(run_config.working_dir.clone()),
         uptime: None,
         restart_policy: service.spec.restart.clone(),
         log_display: service.log_display.clone(),
@@ -921,6 +921,14 @@ struct IdempotencyRecord {
     service: ServiceID,
     revision: u64,
     ack: DynamicServiceAck,
+}
+
+/// A dynamic service definition whose working directory passed policy and whose lease is decided.
+struct MaterializedSpec {
+    spec: ServiceSpec,
+    /// Canonical directory the service runs in, which [`Service`] records in the spec as well.
+    working_dir: PathBuf,
+    lifetime: Option<Duration>,
 }
 
 impl SchedulerRuntime {
@@ -1321,7 +1329,7 @@ impl SchedulerRuntime {
         &self,
         services: &ServiceMap,
         params: &DynamicServiceParams,
-    ) -> Result<(ServiceSpec, Option<Duration>), CommandRejection> {
+    ) -> Result<MaterializedSpec, CommandRejection> {
         let base = if let Some(from_service) = &params.from_service {
             services
                 .get(from_service)
@@ -1366,8 +1374,11 @@ impl SchedulerRuntime {
                 working_dir.display()
             )));
         }
-        spec.working_dir = Some(working_dir);
-        Ok((spec, self.effective_lifetime(params.expires_after)))
+        Ok(MaterializedSpec {
+            spec,
+            working_dir,
+            lifetime: self.effective_lifetime(params.expires_after),
+        })
     }
 
     fn validate_candidate(
@@ -1380,12 +1391,7 @@ impl SchedulerRuntime {
             // check and `Service` anchoring it.
             let working_dir = candidate
                 .spawn_working_directory()
-                .map_err(|err| CommandRejection::InvalidSpec(err.to_string()))?
-                .ok_or_else(|| {
-                    CommandRejection::InvalidSpec(
-                        "dynamic service has no resolved working directory".to_string(),
-                    )
-                })?;
+                .map_err(|err| CommandRejection::InvalidSpec(err.to_string()))?;
             let working_dir = std::fs::canonicalize(working_dir.as_path()).map_err(|err| {
                 CommandRejection::InvalidSpec(format!(
                     "anchored working directory `{}` cannot be resolved: {err}",
@@ -1494,7 +1500,11 @@ impl SchedulerRuntime {
         }
         self.require_dynamic_slot(services)?;
 
-        let (spec, lifetime) = self.materialize_spec(services, &params)?;
+        let MaterializedSpec {
+            spec,
+            working_dir,
+            lifetime,
+        } = self.materialize_spec(services, &params)?;
         let (expires_at, expires_at_unix_ms) = Self::lease_deadlines(lifetime)?;
         let now = unix_now_ms().unwrap_or_default();
         let origin = DynamicOrigin {
@@ -1505,7 +1515,8 @@ impl SchedulerRuntime {
         };
         let service = Service::dynamic(
             params.service.clone(),
-            spec.clone(),
+            spec,
+            working_dir,
             ServiceOrigin::Dynamic(origin),
             self.default_log_retention,
             self.default_log_display.clone(),
@@ -1534,7 +1545,7 @@ impl SchedulerRuntime {
             1,
             0,
             expires_at_unix_ms,
-            &spec,
+            &service.spec,
             false,
             false,
         );
@@ -1587,7 +1598,11 @@ impl SchedulerRuntime {
                 "service `{service_id}` has exhausted its revision counter"
             ))
         })?;
-        let (spec, lifetime) = self.materialize_spec(services, &params)?;
+        let MaterializedSpec {
+            spec,
+            working_dir,
+            lifetime,
+        } = self.materialize_spec(services, &params)?;
         let (expires_at, expires_at_unix_ms) = Self::lease_deadlines(lifetime)?;
         let origin = DynamicOrigin {
             created_at_unix_ms,
@@ -1597,7 +1612,7 @@ impl SchedulerRuntime {
         };
         let mut candidate = current.clone();
         candidate
-            .replace_spec(spec.clone())
+            .replace_spec(spec, working_dir)
             .map_err(|err| CommandRejection::InvalidSpec(err.to_string()))?;
         candidate.origin = ServiceOrigin::Dynamic(origin.clone());
         self.validate_candidate(services, &candidate)?;
@@ -1610,8 +1625,17 @@ impl SchedulerRuntime {
         runtime.retired = None;
         runtime.retired_at_unix_ms = None;
         runtime.expires_at = expires_at;
-        runtime.reconfigure(&spec.restart);
+        runtime.reconfigure(&candidate.spec.restart);
         runtime.request_restart();
+        let ack = DynamicServiceAck::new(
+            service_id.clone(),
+            revision,
+            observed_generation,
+            expires_at_unix_ms,
+            &candidate.spec,
+            false,
+            false,
+        );
         let service = services
             .get_mut(service_id)
             .ok_or(CommandRejection::UnknownService)?;
@@ -1626,15 +1650,6 @@ impl SchedulerRuntime {
             ),
         );
 
-        let ack = DynamicServiceAck::new(
-            service_id.clone(),
-            revision,
-            observed_generation,
-            expires_at_unix_ms,
-            &spec,
-            false,
-            false,
-        );
         self.remember_idempotent(params.idempotency_key, digest, &ack);
         Ok(ack)
     }

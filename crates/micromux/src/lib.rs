@@ -375,7 +375,7 @@ pub(crate) fn initial_model_entries(services: &ServiceMap) -> Vec<(ServiceSnapsh
                     .map(HealthcheckConfig::from),
                 service.spec.restart.clone(),
                 service.argv(),
-                service.working_dir_display(),
+                Some(service.working_dir_display()),
             );
             snapshot.stop_grace_period = service.spec.stop_grace_period;
             snapshot.stop_signal = service.spec.stop_signal;

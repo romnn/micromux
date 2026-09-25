@@ -394,7 +394,7 @@
         },
         "working_dir": {
           "type": "string",
-          "description": "Working directory, relative to the config file. May reference ${VAR} from the environment micromux itself runs in; env files are not loaded yet when paths resolve."
+          "description": "Working directory, relative to the config file (default: the config file's directory). May reference ${VAR} from the environment micromux itself runs in; env files are not loaded yet when paths resolve."
         },
         "cwd": {
           "type": "string",

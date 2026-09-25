@@ -239,8 +239,9 @@ pub struct ServiceSnapshot {
     /// debugged without reopening the config.
     #[serde(default)]
     pub command: Vec<String>,
-    /// The service's overridden working directory, if any; `None` means it inherits the session's
-    /// working directory (the directory micromux was launched in).
+    /// The directory the service runs in: its `working_dir`, else the config directory.
+    ///
+    /// `None` only in a placeholder snapshot a client builds before the session reports one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub working_dir: Option<String>,
     /// Time since the current run started, refreshed at read time. `None` when not running.

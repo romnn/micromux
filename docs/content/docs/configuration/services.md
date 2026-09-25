@@ -31,9 +31,11 @@ command: ["sh", "-c", "npm run dev"]       # exec form, no shell parsing
 
 Use the array form when arguments contain spaces or quoting you don't want re-parsed, or when you want a specific interpreter (`["sh", "-c", "…"]`). micromux runs the process in its own process group so restarts and shutdown tear down child processes too.
 
+As in a shell, a program with a directory part, such as `./bin/api.sh` or `bin/api.sh`, runs from the service's working directory, while a bare name such as `npm` is looked up on `PATH`.
+
 ## Working directory
 
-By default a service runs in the directory the config was loaded from. Override it with `working_dir` (aliases: `cwd`, `directory`), resolved relative to the config file:
+By default a service and its healthcheck run in the directory the config was loaded from. Override it with `working_dir` (aliases: `cwd`, `directory`), resolved relative to the config file:
 
 ```yaml
 services:
