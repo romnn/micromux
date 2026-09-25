@@ -37,7 +37,7 @@ A dev stack is rarely one process. It's an API, a worker, a database, a frontend
 <div class="mm-cards">
   <div class="mm-card">
     <h3>Service lifecycle</h3>
-    <p>Each process has a tracked state — pending, starting, running, healthy, unhealthy, exited, disabled — shown in one aggregated sidebar.</p>
+    <p>Each process has a tracked state — pending, blocked, starting, running, healthy, unhealthy, exited, disabled — shown in one aggregated sidebar.</p>
   </div>
   <div class="mm-card">
     <h3>Dependencies &amp; health</h3>

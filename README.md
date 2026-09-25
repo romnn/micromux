@@ -278,7 +278,7 @@ phase. Windows named-pipe support is planned (`ControlEndpoint::WindowsNamedPipe
  tmux/screen are **terminal multiplexers**.
  
  Micromux adds “service awareness”:
- - **Structured service lifecycle** (pending/starting/running/healthy/unhealthy/exited/disabled)
+ - **Structured service lifecycle** (pending/blocked/starting/running/healthy/unhealthy/exited/disabled)
  - **Restart policies** (`always`, `unless-stopped`, `on-failure[:N]`)
  - **Healthchecks and dependency conditions**
  - **Single aggregated UI** for selecting services and viewing logs
