@@ -1,5 +1,16 @@
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
+use std::sync::LazyLock;
+
+/// The release version followed by the control protocol version, which decides whether this
+/// binary can talk to a running session or an MCP proxy built from another release.
+static VERSION: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "{} (protocol {})",
+        env!("CARGO_PKG_VERSION"),
+        micromux_control::PROTOCOL_VERSION
+    )
+});
 
 /// Logging flags to `#[command(flatten)]` into your CLI
 #[derive(clap::Args, Debug, Clone, Copy, Default)]
@@ -27,7 +38,7 @@ pub struct Verbosity {
 }
 
 #[derive(Debug, Parser)]
-#[command(author, version)]
+#[command(author, version = VERSION.as_str())]
 pub struct Options {
     #[clap(
         short = 'c',
@@ -109,8 +120,21 @@ pub enum Command {
 #[cfg(test)]
 mod tests {
     use super::{Command, Options};
-    use clap::Parser;
+    use clap::{CommandFactory as _, Parser};
     use similar_asserts::assert_eq;
+
+    /// `--version` names the control protocol next to the release, so a mismatch between a
+    /// session and a client can be read off both binaries.
+    #[test]
+    fn version_names_the_control_protocol() {
+        let version = Options::command().render_version();
+        let expected = format!(
+            " {} (protocol {})",
+            env!("CARGO_PKG_VERSION"),
+            micromux_control::PROTOCOL_VERSION
+        );
+        assert!(version.trim_end().ends_with(&expected), "{version}");
+    }
 
     #[test]
     fn attach_accepts_optional_selector_and_global_config_override() -> Result<(), clap::Error> {

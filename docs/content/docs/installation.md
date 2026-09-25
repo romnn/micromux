@@ -36,6 +36,8 @@ micromux --version
 micromux --help
 ```
 
+`micromux --version` prints the release followed by the control protocol version, such as `0.2.0 (protocol 3.10)`. Clients and sessions built from different releases work together as long as their protocol major matches.
+
 `micromux --help` lists the subcommands:
 
 {{< terminal name="help" >}}

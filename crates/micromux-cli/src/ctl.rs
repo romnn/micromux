@@ -272,13 +272,14 @@ fn diagnostic_context(
     working_dir: &Path,
 ) -> String {
     format!(
-        "executable: {} (version {})\n\
+        "executable: {} (version {}, protocol {})\n\
          cwd: {}\n\
          config_path: {}\n\
          XDG_RUNTIME_DIR: {}\n\
          runtime_dirs:\n  {}",
         current_exe_label(),
         env!("CARGO_PKG_VERSION"),
+        micromux_control::PROTOCOL_VERSION,
         working_dir.display(),
         config_path.display(),
         std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "<unset>".to_string()),
