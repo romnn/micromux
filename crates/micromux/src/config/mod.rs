@@ -12,6 +12,7 @@ pub mod v1;
 use crate::diagnostics::{DiagnosticExt, Span, ToDiagnostics};
 use crate::model::LogRetention;
 use crate::service::{RestartPolicy, StartupMode};
+use crate::structured_log::LogDisplay;
 use codespan_reporting::diagnostic::{Diagnostic, Label};
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
@@ -253,6 +254,8 @@ pub struct Config {
     pub control: ControlConfig,
     /// Retention limits for service logs exposed to the TUI/control plane/MCP.
     pub log_retention: LogRetention,
+    /// Default viewer presentation for service logs, inherited by services and dynamic services.
+    pub log_display: LogDisplay,
     /// Default restart policy inherited by services that do not set `restart`.
     pub restart_policy: RestartPolicy,
     /// Default healthcheck timing inherited by services that configure a healthcheck test.
@@ -360,6 +363,8 @@ pub struct Service {
     pub color: Option<Spanned<bool>>,
     /// Effective log retention after applying global defaults and this service's overrides.
     pub log_retention: LogRetention,
+    /// Effective viewer presentation after applying global defaults and this service's overrides.
+    pub log_display: LogDisplay,
 }
 
 /// Healthcheck timing defaults shared by services that define a healthcheck test.

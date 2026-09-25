@@ -5,6 +5,7 @@ use crate::{
     model::LogRetention,
     scheduler::ServiceID,
     spec::{DependencySpec, HealthcheckSpec, ServiceOrigin, ServiceSpec},
+    structured_log::LogDisplay,
 };
 use codespan_reporting::diagnostic::{Diagnostic, Label};
 use std::collections::HashMap;
@@ -1095,6 +1096,7 @@ pub struct Service {
     pub startup_mode: StartupMode,
     pub enable_color: bool,
     pub log_retention: LogRetention,
+    pub log_display: LogDisplay,
     // Keeps each spawn tied to the directory that passed validation even if its path is replaced.
     #[cfg(unix)]
     working_directory: Option<Arc<std::fs::File>>,
@@ -1128,6 +1130,7 @@ impl Service {
         spec: ServiceSpec,
         origin: ServiceOrigin,
         log_retention: LogRetention,
+        log_display: LogDisplay,
     ) -> Result<Self, WorkingDirectoryError> {
         #[cfg(unix)]
         let working_directory = spec
@@ -1147,6 +1150,7 @@ impl Service {
             startup_mode: StartupMode::Enabled,
             enable_color: true,
             log_retention,
+            log_display,
             #[cfg(unix)]
             working_directory,
         })
@@ -1298,6 +1302,7 @@ impl Service {
             startup_mode: config.startup_mode,
             enable_color: config.color.as_deref().copied().unwrap_or(true),
             log_retention: config.log_retention,
+            log_display: config.log_display,
             #[cfg(unix)]
             working_directory,
         })

@@ -4,7 +4,7 @@ use super::{
 };
 use crate::diagnostics::DiagnosticExt;
 use crate::{
-    DiskLogRetention, LogLimit, LogRetention,
+    DiskLogRetention, LogDisplay, LogLimit, LogRetention, StructuredLogLevel,
     config::InvalidCommandReason,
     service::{RestartPolicy, StartupMode},
 };
@@ -677,6 +677,10 @@ fn parse_log_retention<F: Copy>(
             "max_lines",
             "max_bytes",
             "memory",
+            "level",
+            "timestamps",
+            "filter_fields",
+            "fields",
         ],
         "logs",
         file_id,
@@ -730,6 +734,80 @@ fn parse_log_retention<F: Copy>(
     }
 
     Ok(retention)
+}
+
+/// Parse the viewer settings of a `logs` config block over the inherited `base`.
+///
+/// `level`, `timestamps`, and `filter_fields` replace the inherited value.
+/// `fields` merges into it key by key, so a service lists only the fields it treats differently.
+fn parse_log_display(
+    value: Option<&yaml_spanned::Spanned<Value>>,
+    base: &LogDisplay,
+) -> Result<LogDisplay, ConfigError> {
+    let Some(value) = value else {
+        return Ok(base.clone());
+    };
+    let (_span, mapping) = expect_mapping(value, "logs config must be a mapping".into())?;
+    let level = match mapping.get("level") {
+        Some(value) => parse_log_level_threshold(value)?,
+        None => base.level,
+    };
+    let timestamps = parse_optional::<bool>(mapping.get("timestamps"))?
+        .map_or(base.timestamps, Spanned::into_inner);
+    let filter_fields = parse_optional::<bool>(mapping.get("filter_fields"))?
+        .map_or(base.filter_fields, Spanned::into_inner);
+    let mut hide_fields = base.hide_fields.clone();
+    if let Some(fields) = mapping.get("fields") {
+        let (_span, fields) = expect_mapping(fields, "logs.fields must be a mapping".into())?;
+        for (key, mode) in fields {
+            let key = parse::<String>(key)?.into_inner();
+            let hide = parse_field_mode(mode)?;
+            hide_fields.retain(|hidden| *hidden != key);
+            if hide {
+                hide_fields.push(key);
+            }
+        }
+    }
+    Ok(LogDisplay {
+        level,
+        timestamps,
+        filter_fields,
+        hide_fields,
+    })
+}
+
+/// Parse a `logs.fields` value, returning whether the field is hidden.
+fn parse_field_mode(value: &yaml_spanned::Spanned<Value>) -> Result<bool, ConfigError> {
+    let (span, raw) = expect_string(value, Some("logs.fields values must be hide or show"))?;
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "hide" => Ok(true),
+        "show" => Ok(false),
+        _ => Err(ConfigError::InvalidValue {
+            message: format!("unknown field mode `{raw}`; expected hide or show"),
+            span: span.into(),
+        }),
+    }
+}
+
+/// Parse a viewer level threshold; `all` and `trace` both mean every level.
+fn parse_log_level_threshold(
+    value: &yaml_spanned::Spanned<Value>,
+) -> Result<Option<StructuredLogLevel>, ConfigError> {
+    let (span, raw) = expect_string(value, Some("logs.level must be a string"))?;
+    if raw.trim().eq_ignore_ascii_case("all") {
+        return Ok(None);
+    }
+    match StructuredLogLevel::parse(raw) {
+        // Lines without a level always show, so a trace threshold hides nothing.
+        Some(StructuredLogLevel::Trace) => Ok(None),
+        Some(level) => Ok(Some(level)),
+        None => Err(ConfigError::InvalidValue {
+            message: format!(
+                "unknown log level `{raw}`; expected all, trace, debug, info, warn, error, or fatal"
+            ),
+            span: span.into(),
+        }),
+    }
 }
 
 fn invalid_empty_command(raw_command: &str, span: yaml_spanned::spanned::Span) -> ConfigError {
@@ -1054,6 +1132,7 @@ fn parse_healthcheck_defaults<F: Copy>(
 #[derive(Clone, Copy)]
 struct ServiceDefaults<'a> {
     log_retention: LogRetention,
+    log_display: &'a LogDisplay,
     restart_policy: &'a RestartPolicy,
     healthcheck: &'a HealthCheckDefaults,
 }
@@ -1127,6 +1206,7 @@ fn parse_service<F: Copy>(
         strict,
         diagnostics,
     )?;
+    let log_display = parse_log_display(mapping.get("logs"), defaults.log_display)?;
 
     Ok(Service {
         name,
@@ -1144,6 +1224,7 @@ fn parse_service<F: Copy>(
         stop_signal,
         color,
         log_retention,
+        log_display,
     })
 }
 
@@ -1261,10 +1342,12 @@ pub fn parse_config<F: Copy + PartialEq>(
         strict,
         diagnostics,
     )?;
+    let log_display = parse_log_display(value.get("logs"), &LogDisplay::default())?;
     let services = parse_services(
         value,
         ServiceDefaults {
             log_retention,
+            log_display: &log_display,
             restart_policy: &restart_policy,
             healthcheck: &healthcheck_defaults,
         },
@@ -1277,6 +1360,7 @@ pub fn parse_config<F: Copy + PartialEq>(
         ui_config,
         control,
         log_retention,
+        log_display,
         restart_policy,
         healthcheck_defaults,
         services,
@@ -1287,7 +1371,7 @@ pub fn parse_config<F: Copy + PartialEq>(
 mod tests {
 
     use crate::service::StartupMode;
-    use crate::{LogLimit, LogRetention, config};
+    use crate::{LogDisplay, LogLimit, LogRetention, StructuredLogLevel, config};
     use codespan_reporting::diagnostic::Diagnostic;
     use color_eyre::eyre;
     use indoc::indoc;
@@ -1863,6 +1947,120 @@ mod tests {
         assert_eq!(worker.restart_policy, crate::service::RestartPolicy::Never);
         assert_eq!(worker.healthcheck, None);
         Ok(())
+    }
+
+    #[test]
+    fn log_display_defaults_are_inherited_and_merged_per_service() -> eyre::Result<()> {
+        let yaml = indoc! {r#"
+            version: 1
+            logs:
+              level: debug
+              timestamps: false
+              fields: {filename: hide, line_number: hide, span: hide}
+            services:
+              inherits:
+                command: ["sh", "-c", "true"]
+              overrides:
+                command: ["sh", "-c", "true"]
+                logs:
+                  level: WARNING
+                  timestamps: true
+                  filter_fields: false
+                  fields:
+                    span: Show
+                    latency: hide
+              shows_everything:
+                command: ["sh", "-c", "true"]
+                logs:
+                  level: trace
+                  timestamps: true
+                  fields: {filename: show, line_number: show, span: show}
+        "#};
+
+        let mut diagnostics: Vec<Diagnostic<usize>> = vec![];
+        let parsed = config::from_str(yaml, Path::new("."), 0, Some(true), &mut diagnostics)?;
+
+        // The keys are known, so even strict mode reports nothing.
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let top_level = LogDisplay {
+            level: Some(StructuredLogLevel::Debug),
+            timestamps: false,
+            filter_fields: true,
+            hide_fields: vec![
+                "filename".to_string(),
+                "line_number".to_string(),
+                "span".to_string(),
+            ],
+        };
+        assert_eq!(parsed.config.log_display, top_level);
+        // A service without its own settings inherits the top-level defaults.
+        assert_eq!(
+            get_service(&parsed.config, "inherits")?.log_display,
+            top_level
+        );
+        // Scalars replace the defaults, while fields merge key by key: the service un-hides one
+        // inherited field and hides one more.
+        // Level names and field modes accept any case.
+        assert_eq!(
+            get_service(&parsed.config, "overrides")?.log_display,
+            LogDisplay {
+                level: Some(StructuredLogLevel::Warn),
+                timestamps: true,
+                filter_fields: false,
+                hide_fields: vec![
+                    "filename".to_string(),
+                    "line_number".to_string(),
+                    "latency".to_string(),
+                ],
+            }
+        );
+        // Showing every inherited field and a trace threshold, which hides nothing, restore the
+        // plain defaults.
+        assert_eq!(
+            get_service(&parsed.config, "shows_everything")?.log_display,
+            LogDisplay::default()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn unknown_field_mode_is_an_error() {
+        let yaml = indoc! {r#"
+            version: 1
+            logs:
+              fields: {span: prefix}
+            services:
+              app:
+                command: ["sh", "-c", "true"]
+        "#};
+
+        let mut diagnostics: Vec<Diagnostic<usize>> = vec![];
+        let result = config::from_str(yaml, Path::new("."), 0, None, &mut diagnostics);
+
+        assert!(
+            matches!(result, Err(config::ConfigError::InvalidValue { ref message, .. }) if message.contains("prefix")),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn unknown_log_level_is_an_error() {
+        let yaml = indoc! {r#"
+            version: 1
+            services:
+              app:
+                command: ["sh", "-c", "true"]
+                logs:
+                  level: loud
+        "#};
+
+        let mut diagnostics: Vec<Diagnostic<usize>> = vec![];
+        let result = config::from_str(yaml, Path::new("."), 0, None, &mut diagnostics);
+
+        assert!(
+            matches!(result, Err(config::ConfigError::InvalidValue { ref message, .. }) if message.contains("loud")),
+            "{result:?}"
+        );
     }
 
     #[test]

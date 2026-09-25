@@ -80,9 +80,10 @@ pub use spec::{
     PartialServiceSpec, ServiceOrigin, ServiceSpec, SpecError, SpecField, StopSignal,
 };
 pub use structured_log::{
-    FIELDS_KEY, MESSAGE_KEYS, StructuredLogLevel, find_fields_object, find_key,
-    is_structured_log_level_key, key_matches, render_scalar, sanitize_text,
-    structured_log_level_in_object, structured_log_level_in_record,
+    FIELDS_KEY, LogDisplay, MESSAGE_KEYS, RecordTimestamp, StructuredLogLevel, TIMESTAMP_KEYS,
+    find_fields_object, find_key, is_structured_log_level_key, is_timestamp_key, key_matches,
+    numeric_timestamp_to_unix_ms, render_scalar, sanitize_text, structured_log_level_in_object,
+    structured_log_level_in_record, structured_log_timestamp_in_record,
 };
 
 pub(crate) type ServiceMap = indexmap::IndexMap<ServiceID, service::Service>;
@@ -382,6 +383,7 @@ pub(crate) fn initial_model_entries(services: &ServiceMap) -> Vec<(ServiceSnapsh
                 service::StartupMode::Enabled => Desired::Enabled,
                 service::StartupMode::Disabled => Desired::Disabled,
             };
+            snapshot.log_display = service.log_display.clone();
             (snapshot, service.log_retention)
         })
         .collect()
@@ -394,6 +396,7 @@ pub struct Micromux {
     config_dir: PathBuf,
     dynamic_policy: DynamicServicesPolicy,
     default_log_retention: LogRetention,
+    default_log_display: LogDisplay,
 }
 
 /// Capability handles returned by [`Micromux::start`].
@@ -482,6 +485,7 @@ impl Micromux {
             config_dir: config_file.config_dir.clone(),
             dynamic_policy,
             default_log_retention: config_file.config.log_retention,
+            default_log_display: config_file.config.log_display.clone(),
         })
     }
 
@@ -523,6 +527,7 @@ impl Micromux {
                 config_dir: self.config_dir.clone(),
                 dynamic_policy: self.dynamic_policy.clone(),
                 default_log_retention: self.default_log_retention,
+                default_log_display: self.default_log_display.clone(),
             })
             .await?;
             tracing::info!("exiting");

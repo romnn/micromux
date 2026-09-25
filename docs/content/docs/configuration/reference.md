@@ -84,6 +84,10 @@ One of `always`, `unless-stopped`, `on-failure` (or `on-failure:N`), `no` (synon
 | `memory.max_lines` | integer / `unbounded` | — | In-memory tail line bound. |
 | `memory.max_bytes` | integer / `unbounded` | — | In-memory tail byte bound. |
 | `max_lines`, `max_bytes` | — | — | Shorthand for the `memory.*` fields. |
+| `level` | string | `all` | Initial TUI level threshold for structured JSON logs: `all`, `trace` (same as `all`), `debug`, `info`, `warn`, `error`, or `fatal`. Lines without a structured level always show. |
+| `timestamps` | bool | `true` | Lead structured JSON log lines with their local time in the TUI; toggle per service with `T`. |
+| `filter_fields` | bool | `true` | Leave out the fields that `fields` hides in the TUI; toggle per service with `F`. |
+| `fields` | map of field name to `hide` / `show` | `{}` | How the TUI displays structured JSON fields. A service's map merges into the inherited one key by key. |
 
 ## `ui`
 

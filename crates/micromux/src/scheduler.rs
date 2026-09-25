@@ -1,6 +1,6 @@
 use crate::{
-    DynamicOrigin, DynamicServiceParams, DynamicServicesPolicy, Lease, ReloadConfig, ServiceMap,
-    ServiceOrigin, ServiceSpec,
+    DynamicOrigin, DynamicServiceParams, DynamicServicesPolicy, Lease, LogDisplay, ReloadConfig,
+    ServiceMap, ServiceOrigin, ServiceSpec,
     graph::ServiceGraph,
     health_check::Health,
     model::{
@@ -677,6 +677,7 @@ pub(super) fn project_snapshot(
         working_dir: run_config.working_dir.clone(),
         uptime: None,
         restart_policy: service.spec.restart.clone(),
+        log_display: service.log_display.clone(),
     };
     (snapshot, runtime.uptime_started_at)
 }
@@ -896,6 +897,7 @@ struct SchedulerRuntime {
     config_dir: PathBuf,
     dynamic_policy: DynamicServicesPolicy,
     default_log_retention: LogRetention,
+    default_log_display: LogDisplay,
     idempotency: VecDeque<IdempotencyRecord>,
 }
 
@@ -909,6 +911,7 @@ struct SchedulerResources {
     config_dir: PathBuf,
     dynamic_policy: DynamicServicesPolicy,
     default_log_retention: LogRetention,
+    default_log_display: LogDisplay,
 }
 
 #[derive(Clone)]
@@ -941,6 +944,7 @@ impl SchedulerRuntime {
             config_dir,
             dynamic_policy,
             default_log_retention,
+            default_log_display,
         } = resources;
 
         Self {
@@ -960,6 +964,7 @@ impl SchedulerRuntime {
             config_dir,
             dynamic_policy,
             default_log_retention,
+            default_log_display,
             idempotency: VecDeque::new(),
         }
     }
@@ -1503,6 +1508,7 @@ impl SchedulerRuntime {
             spec.clone(),
             ServiceOrigin::Dynamic(origin),
             self.default_log_retention,
+            self.default_log_display.clone(),
         )
         .map_err(|err| CommandRejection::InvalidSpec(err.to_string()))?;
         self.validate_candidate(services, &service)?;
@@ -1956,6 +1962,9 @@ impl SchedulerRuntime {
             }
             if current.log_retention != updated_service.log_retention {
                 changed.push("log retention");
+            }
+            if current.log_display != updated_service.log_display {
+                changed.push("log display");
             }
             if current.enable_color != updated_service.enable_color {
                 changed.push("color");
@@ -2712,6 +2721,7 @@ pub(crate) struct SchedulerInput {
     pub(crate) config_dir: PathBuf,
     pub(crate) dynamic_policy: DynamicServicesPolicy,
     pub(crate) default_log_retention: LogRetention,
+    pub(crate) default_log_display: LogDisplay,
 }
 
 pub(crate) async fn scheduler(input: SchedulerInput) -> Result<(), crate::graph::Error> {
@@ -2729,6 +2739,7 @@ pub(crate) async fn scheduler(input: SchedulerInput) -> Result<(), crate::graph:
         config_dir,
         dynamic_policy,
         default_log_retention,
+        default_log_display,
     } = input;
     ServiceGraph::new(&services)?;
     #[cfg(test)]
@@ -2751,6 +2762,7 @@ pub(crate) async fn scheduler(input: SchedulerInput) -> Result<(), crate::graph:
             config_dir,
             dynamic_policy,
             default_log_retention,
+            default_log_display,
         },
     );
 

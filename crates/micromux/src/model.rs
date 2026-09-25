@@ -27,6 +27,7 @@ use tokio::sync::broadcast;
 use crate::health_check::Health;
 use crate::scheduler::{LogUpdateKind, OutputStream, ServiceID};
 use crate::service::RestartPolicy;
+use crate::structured_log::LogDisplay;
 
 const KIB: usize = 1024;
 const MIB: usize = 1024 * KIB;
@@ -249,6 +250,11 @@ pub struct ServiceSnapshot {
     /// The configured restart policy.
     #[serde(default)]
     pub restart_policy: RestartPolicy,
+    /// Configured viewer presentation for this service's logs.
+    ///
+    /// Unlike the run-captured fields, a config reload applies it immediately without a restart.
+    #[serde(default, skip_serializing_if = "LogDisplay::is_default")]
+    pub log_display: LogDisplay,
 }
 
 impl ServiceSnapshot {
@@ -289,6 +295,7 @@ impl ServiceSnapshot {
             working_dir,
             uptime: None,
             restart_policy,
+            log_display: LogDisplay::default(),
         }
     }
 }

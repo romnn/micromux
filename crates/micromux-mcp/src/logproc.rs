@@ -11,16 +11,13 @@ use std::collections::{BTreeMap, VecDeque};
 
 use micromux::{
     FIELDS_KEY, LogLine, MESSAGE_KEYS, StructuredLogLevel, find_fields_object, find_key,
-    is_structured_log_level_key, key_matches, render_scalar as render_value, sanitize_text,
-    structured_log_level_in_record,
+    is_structured_log_level_key, is_timestamp_key, key_matches, render_scalar as render_value,
+    sanitize_text, structured_log_level_in_record, structured_log_timestamp_in_record,
 };
 use regex::Regex;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-
-/// Object keys, matched case-insensitively, under which structured loggers carry timestamps.
-const TIMESTAMP_KEYS: &[&str] = &["@timestamp", "timestamp", "time", "ts", "datetime", "date"];
 
 /// Severity ranks for structured-log filtering.
 pub type Level = StructuredLogLevel;
@@ -128,93 +125,8 @@ fn push_plain_segment(segments: &mut Vec<RecordSegment>, text: &str) {
     });
 }
 
-fn source_timestamp_in_object(object: &Map<String, Value>) -> Option<u64> {
-    object
-        .iter()
-        .filter(|(key, _)| {
-            TIMESTAMP_KEYS
-                .iter()
-                .any(|candidate| key.eq_ignore_ascii_case(candidate))
-        })
-        .find_map(|(_, value)| source_timestamp_of_value(value))
-}
-
-fn source_timestamp_of_value(value: &Value) -> Option<u64> {
-    if let Some(text) = value.as_str() {
-        let text = text.trim();
-        if let Ok(number) = text.parse::<u64>() {
-            return numeric_timestamp_to_unix_ms(number);
-        }
-        if let Some(timestamp) = decimal_timestamp_to_unix_ms(text) {
-            return Some(timestamp);
-        }
-        return chrono::DateTime::parse_from_rfc3339(text)
-            .ok()
-            .and_then(|datetime| u64::try_from(datetime.timestamp_millis()).ok());
-    }
-    match value {
-        Value::Number(number) => number
-            .as_u64()
-            .and_then(numeric_timestamp_to_unix_ms)
-            .or_else(|| decimal_timestamp_to_unix_ms(&number.to_string())),
-        Value::Null | Value::Bool(_) | Value::String(_) | Value::Array(_) | Value::Object(_) => {
-            None
-        }
-    }
-}
-
-pub(crate) fn numeric_timestamp_to_unix_ms(value: u64) -> Option<u64> {
-    if value >= 1_000_000_000_000_000_000 {
-        Some(value / 1_000_000)
-    } else if value >= 1_000_000_000_000_000 {
-        Some(value / 1_000)
-    } else if value >= 1_000_000_000_000 {
-        Some(value)
-    } else if value >= 1_000_000_000 {
-        value.checked_mul(1000)
-    } else {
-        None
-    }
-}
-
-fn decimal_timestamp_to_unix_ms(raw: &str) -> Option<u64> {
-    let (whole, fraction) = raw.split_once('.')?;
-    if whole.is_empty() || !whole.chars().all(|ch| ch.is_ascii_digit()) {
-        return None;
-    }
-    if !fraction.chars().all(|ch| ch.is_ascii_digit()) {
-        return None;
-    }
-    let whole = whole.parse::<u64>().ok()?;
-    if whole >= 1_000_000_000_000 {
-        return numeric_timestamp_to_unix_ms(whole);
-    }
-    if whole < 1_000_000_000 {
-        return None;
-    }
-
-    let mut millis = whole.checked_mul(1_000)?;
-    let mut fraction_millis = 0_u64;
-    let mut scale = 100_u64;
-    for digit in fraction.chars().take(3) {
-        fraction_millis += u64::from(digit.to_digit(10)?) * scale;
-        scale /= 10;
-    }
-    millis = millis.checked_add(fraction_millis)?;
-    Some(millis)
-}
-
-fn is_timestamp_key(key: &str) -> bool {
-    key_matches(key, TIMESTAMP_KEYS)
-}
-
 fn level_in_object(object: &Map<String, Value>) -> Option<Level> {
     structured_log_level_in_record(object)
-}
-
-fn source_timestamp(object: &Map<String, Value>) -> Option<u64> {
-    source_timestamp_in_object(object)
-        .or_else(|| find_fields_object(object).and_then(source_timestamp_in_object))
 }
 
 fn message_in_object(object: &Map<String, Value>) -> Option<String> {
@@ -434,7 +346,11 @@ fn push_shaped_segment(
         return;
     }
     let level = segment.json.as_ref().and_then(level_in_object);
-    let source_timestamp_unix_ms = segment.json.as_ref().and_then(source_timestamp);
+    let source_timestamp_unix_ms = segment
+        .json
+        .as_ref()
+        .and_then(structured_log_timestamp_in_record)
+        .map(|timestamp| timestamp.unix_ms);
     let effective_timestamp = source_timestamp_unix_ms.unwrap_or(record.timestamp_unix_ms);
     if let Some(since) = options.since_unix_ms
         && effective_timestamp < since

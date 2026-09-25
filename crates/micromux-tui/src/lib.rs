@@ -6,6 +6,7 @@
 
 mod event;
 mod json_log;
+mod level;
 mod remote;
 mod render;
 mod source;
@@ -41,6 +42,19 @@ fn format_byte_limit(bytes: usize) -> String {
     }
 }
 
+/// Initial presentation of service logs in the TUI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LogViewOptions {
+    /// Render structured JSON logs as compact colored lines instead of raw JSON.
+    pub pretty_json: bool,
+}
+
+impl Default for LogViewOptions {
+    fn default() -> Self {
+        Self { pretty_json: true }
+    }
+}
+
 /// Errors from running or rendering the terminal interface.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -73,6 +87,8 @@ pub struct App {
     healthcheck_view: crate::render::log_view::LogView,
     show_healthcheck_pane: bool,
     pretty_json_logs: bool,
+    level_picker: Option<level::LevelPicker>,
+    show_help: bool,
     pty_input_mode: bool,
     focus: Focus,
     terminal_cols: u16,
@@ -98,7 +114,7 @@ impl App {
         source: SessionSource,
         input: Option<TerminalControl>,
         shutdown: micromux::CancellationToken,
-        pretty_json_logs: bool,
+        log_view_options: LogViewOptions,
     ) -> Self {
         let changes = source.subscribe();
         let snapshots = source.services();
@@ -131,7 +147,9 @@ impl App {
             log_view,
             healthcheck_view,
             show_healthcheck_pane: false,
-            pretty_json_logs,
+            pretty_json_logs: log_view_options.pretty_json,
+            level_picker: None,
+            show_help: false,
             pty_input_mode: false,
             focus: Focus::Services,
             terminal_cols: 80,
@@ -153,12 +171,14 @@ impl App {
             height: self.terminal_rows,
         };
 
+        let chrome = self.chrome_rows(self.terminal_cols);
         let [_header_area, main_area, _footer_area] = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(1), // header (must match render's vertical layout)
+                // Must match the vertical layout the renderer draws.
+                Constraint::Length(chrome.header),
                 Constraint::Min(0),
-                Constraint::Length(1),
+                Constraint::Length(chrome.footer),
             ])
             .spacing(0)
             .areas(area);
@@ -440,6 +460,9 @@ impl App {
             if needs_resync {
                 self.resync();
             }
+            // Header and footer rows follow their wrapped content, so any state change can move
+            // the pane size the service PTYs must match.
+            self.maybe_resize_pty();
             let frame_deadline = last_frame + FRAME_INTERVAL;
             if tokio::time::Instant::now() < frame_deadline {
                 tokio::time::sleep_until(frame_deadline).await;
@@ -598,6 +621,17 @@ impl App {
         if key.modifiers != KeyModifiers::NONE && key.modifiers != KeyModifiers::SHIFT {
             return;
         }
+        if self.show_help {
+            // The overlay swallows every other key, so a stray press cannot act behind it.
+            if matches!(key.code, KeyCode::Esc | KeyCode::Char('?')) {
+                self.show_help = false;
+            }
+            return;
+        }
+        if self.level_picker.is_some() {
+            self.handle_key_press_level_picker(key.code);
+            return;
+        }
 
         match key.code {
             // Quit
@@ -648,8 +682,55 @@ impl App {
 
             // Toggle automatic tailing for log viewer
             KeyCode::Char('t') => self.toggle_tail(),
+
+            KeyCode::Char('?') => self.show_help = true,
+
+            // Log presentation
+            KeyCode::Char('L') => self.open_level_picker(),
+            KeyCode::Char('T') => {
+                if let Some(service) = self.state.current_service_mut() {
+                    service.timestamps_override = Some(!service.shows_timestamps());
+                }
+            }
+            KeyCode::Char('F') => {
+                if let Some(service) = self.state.current_service_mut() {
+                    service.filter_fields_override = Some(!service.filters_fields());
+                }
+            }
             _ => {}
         }
+    }
+
+    fn open_level_picker(&mut self) {
+        let Some(service) = self.state.current_service() else {
+            return;
+        };
+        self.level_picker = Some(level::LevelPicker::open(
+            service.snapshot.id.clone(),
+            service.min_level(),
+        ));
+    }
+
+    fn handle_key_press_level_picker(&mut self, code: crossterm::event::KeyCode) {
+        use crossterm::event::KeyCode;
+
+        let Some(mut picker) = self.level_picker.take() else {
+            return;
+        };
+        match code {
+            KeyCode::Char('k') | KeyCode::Up => picker.up(),
+            KeyCode::Char('j') | KeyCode::Down => picker.down(),
+            KeyCode::Enter => {
+                let min_level = picker.selected();
+                if let Some(service) = self.service_mut(&picker.service_id) {
+                    service.level_override = Some(level::LevelOverride { min_level });
+                }
+                return;
+            }
+            KeyCode::Esc | KeyCode::Char('q' | 'L') => return,
+            _ => {}
+        }
+        self.level_picker = Some(picker);
     }
 
     fn handle_key_press_pty_input_mode(&mut self, key: crossterm::event::KeyEvent) {
@@ -753,8 +834,12 @@ impl App {
     }
 
     fn log_viewport_height(&self) -> u16 {
-        // total rows minus header (1) minus footer (1) minus logs block borders (2)
-        self.terminal_rows.saturating_sub(4)
+        // Total rows minus the header, the footer, and the logs block borders.
+        let chrome = self.chrome_rows(self.terminal_cols);
+        self.terminal_rows
+            .saturating_sub(chrome.header)
+            .saturating_sub(chrome.footer)
+            .saturating_sub(2)
     }
 
     fn scroll_logs_up(&mut self, lines: u16) {
@@ -1017,7 +1102,7 @@ mod tests {
             SessionSource::Local(LocalSource::new(handles.reader, handles.commands.clone())),
             Some(handles.terminal.clone()),
             shutdown.clone(),
-            true,
+            LogViewOptions::default(),
         );
         let key = |code, modifiers| KeyEvent {
             code,
@@ -1040,6 +1125,217 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn log_presentation_keys_pick_a_level_and_toggle_timestamps_and_fields()
+    -> eyre::Result<()> {
+        let yaml = indoc! {r#"
+            version: 1
+            services:
+              svc:
+                command: ["true"]
+                logs:
+                  level: warn
+                  fields: {filename: hide}
+              other:
+                command: ["true"]
+                logs:
+                  filter_fields: false
+                  fields: {filename: hide}
+        "#};
+        let mut diagnostics = Vec::new();
+        let parsed = micromux::from_str(yaml, Path::new("."), 0usize, None, &mut diagnostics)?;
+        let mux = std::sync::Arc::new(micromux::Micromux::new(&parsed)?);
+        let shutdown = micromux::CancellationToken::new();
+        let (_runner, handles) = mux.start(shutdown.clone());
+        let mut app = App::new(
+            SessionSource::Local(LocalSource::new(handles.reader, handles.commands.clone())),
+            Some(handles.terminal),
+            shutdown.clone(),
+            LogViewOptions::default(),
+        );
+        let press = |app: &mut App, code| {
+            app.handle_key_press(KeyEvent {
+                code,
+                modifiers: KeyModifiers::NONE,
+                kind: KeyEventKind::Press,
+                state: KeyEventState::NONE,
+            });
+        };
+        let render = |app: &mut App| {
+            let area = ratatui::layout::Rect::new(0, 0, 200, 24);
+            let mut buffer = ratatui::buffer::Buffer::empty(area);
+            app.render(area, &mut buffer);
+            buffer
+                .content()
+                .iter()
+                .map(ratatui::buffer::Cell::symbol)
+                .collect::<String>()
+        };
+
+        // The configured threshold and hidden fields are active before any key press.
+        let initial = render(&mut app);
+        // The filters sit in the pane's top-right corner, apart from the pane name.
+        assert!(initial.contains("┌Logs─"));
+        assert!(initial.contains("─ level ≥ WARN · 1 field hidden ┐"));
+        assert!(initial.contains("Level:WARN"));
+
+        // The picker opens on the configured threshold, and `q` closes it instead of quitting.
+        press(&mut app, KeyCode::Char('L'));
+        assert!(render(&mut app).contains("Level · svc"));
+        press(&mut app, KeyCode::Char('q'));
+        assert!(app.level_picker.is_none());
+        assert!(app.running);
+
+        // Moving up from WARN and confirming overrides the configured threshold with INFO.
+        press(&mut app, KeyCode::Char('L'));
+        press(&mut app, KeyCode::Up);
+        press(&mut app, KeyCode::Enter);
+        assert!(app.level_picker.is_none());
+        assert_eq!(
+            app.state
+                .current_service()
+                .map(crate::state::Service::min_level),
+            Some(Some(micromux::StructuredLogLevel::Info))
+        );
+
+        // Timestamps start from the config, and both they and the hidden fields toggle for the
+        // selected service.
+        assert!(render(&mut app).contains("Time:ON"));
+        press(&mut app, KeyCode::Char('T'));
+        assert_eq!(
+            app.state
+                .current_service()
+                .map(crate::state::Service::shows_timestamps),
+            Some(false)
+        );
+        press(&mut app, KeyCode::Char('F'));
+        let toggled = render(&mut app);
+        assert!(toggled.contains("Time:OFF"));
+        assert!(toggled.contains("Fields:ALL"));
+        assert!(toggled.contains("─ level ≥ INFO ┐"));
+        assert!(!toggled.contains("field hidden"));
+
+        // Another service keeps its own configured level, timestamps, and field filtering, which
+        // it starts with off.
+        press(&mut app, KeyCode::Down);
+        let other = render(&mut app);
+        assert!(other.contains("Level:ALL"));
+        assert!(other.contains("Time:ON"));
+        assert!(other.contains("Fields:ALL"));
+        assert!(!other.contains("field hidden"));
+        press(&mut app, KeyCode::Char('F'));
+        assert!(render(&mut app).contains("─ 1 field hidden ┐"));
+
+        // The help overlay ignores other keys, even quit, until Esc closes it.
+        press(&mut app, KeyCode::Char('?'));
+        assert!(render(&mut app).contains("Log level threshold"));
+        press(&mut app, KeyCode::Char('q'));
+        assert!(app.show_help);
+        assert!(app.running);
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.show_help);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn narrow_terminals_wrap_every_key_hint_and_shrink_the_pty() -> eyre::Result<()> {
+        let yaml = indoc! {r#"
+            version: 1
+            services:
+              svc:
+                command: ["true"]
+        "#};
+        let mut diagnostics = Vec::new();
+        let parsed = micromux::from_str(yaml, Path::new("."), 0usize, None, &mut diagnostics)?;
+        let mux = std::sync::Arc::new(micromux::Micromux::new(&parsed)?);
+        let (_runner, handles) = mux.start(micromux::CancellationToken::new());
+        let mut app = App::new(
+            SessionSource::Local(LocalSource::new(handles.reader, handles.commands.clone())),
+            Some(handles.terminal),
+            micromux::CancellationToken::new(),
+            LogViewOptions::default(),
+        );
+
+        // A wide terminal fits the status and the view controls on one header row and every action
+        // on one footer row.
+        app.terminal_cols = 240;
+        app.terminal_rows = 40;
+        let wide = app.chrome_rows(app.terminal_cols);
+        assert_eq!((wide.header, wide.footer), (1, 1));
+        let (_, wide_pty_rows) = app.desired_pty_size();
+
+        // A narrow one wraps both rows instead of cutting hints off.
+        app.terminal_cols = 60;
+        let narrow = app.chrome_rows(app.terminal_cols);
+        assert!(narrow.header > 1 && narrow.footer > 1, "{narrow:?}");
+        let area = ratatui::layout::Rect::new(0, 0, app.terminal_cols, app.terminal_rows);
+        let mut buffer = ratatui::buffer::Buffer::empty(area);
+        (&mut app).render(area, &mut buffer);
+        let rendered = buffer
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        for hint in [
+            "micromux v",
+            "Level:ALL",
+            "Health:OFF",
+            "? Help",
+            "d Disable",
+            "PTY input",
+            "q Quit",
+        ] {
+            assert!(rendered.contains(hint), "missing {hint:?}");
+        }
+        // The extra chrome rows come out of the service PTY, keeping it the size of the pane.
+        let (_, narrow_pty_rows) = app.desired_pty_size();
+        assert_eq!(
+            wide_pty_rows - narrow_pty_rows,
+            narrow.header + narrow.footer - 2
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn header_status_lines_up_with_the_services_title() -> eyre::Result<()> {
+        let yaml = indoc! {r#"
+            version: 1
+            services:
+              svc:
+                command: ["true"]
+        "#};
+        let mut diagnostics = Vec::new();
+        let parsed = micromux::from_str(yaml, Path::new("."), 0usize, None, &mut diagnostics)?;
+        let mux = std::sync::Arc::new(micromux::Micromux::new(&parsed)?);
+        let (_runner, handles) = mux.start(micromux::CancellationToken::new());
+        let mut app = App::new(
+            SessionSource::Local(LocalSource::new(handles.reader, handles.commands.clone())),
+            Some(handles.terminal),
+            micromux::CancellationToken::new(),
+            LogViewOptions::default(),
+        );
+        let area = ratatui::layout::Rect::new(0, 0, 200, 24);
+        let mut buffer = ratatui::buffer::Buffer::empty(area);
+        (&mut app).render(area, &mut buffer);
+        let row = |y: u16| {
+            (0..area.width)
+                .filter_map(|x| buffer.cell((x, y)).map(ratatui::buffer::Cell::symbol))
+                .collect::<String>()
+        };
+
+        // Columns, not byte offsets: the box-drawing border characters are multi-byte.
+        let column = |row: &str, needle: &str| {
+            row.find(needle)
+                .and_then(|byte| row.get(..byte))
+                .map(|prefix| prefix.chars().count())
+        };
+
+        assert_eq!(column(&row(0), "micromux"), Some(1));
+        assert_eq!(column(&row(1), "Services"), Some(1));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn terminal_eof_is_visible_without_stopping_the_session() -> eyre::Result<()> {
         let mut diagnostics = Vec::new();
         let parsed = micromux::from_str(
@@ -1056,7 +1352,7 @@ mod tests {
             SessionSource::Local(LocalSource::new(handles.reader, handles.commands.clone())),
             Some(handles.terminal),
             shutdown.clone(),
-            true,
+            LogViewOptions::default(),
         );
 
         app.handle_input_event(crate::event::Input::Closed);
@@ -1098,7 +1394,7 @@ mod tests {
             SessionSource::Local(LocalSource::new(handles.reader, handles.commands.clone())),
             Some(handles.terminal.clone()),
             micromux::CancellationToken::new(),
-            true,
+            LogViewOptions::default(),
         );
         app.show_healthcheck_pane = true;
         let area = ratatui::layout::Rect::new(0, 0, 120, 30);
@@ -1197,7 +1493,7 @@ mod tests {
             SessionSource::Local(LocalSource::new(handles.reader, handles.commands.clone())),
             Some(handles.terminal),
             shutdown.clone(),
-            true,
+            LogViewOptions::default(),
         );
 
         app.enqueue_pty_input("svc".to_string(), b"first".to_vec());
@@ -1235,7 +1531,7 @@ mod tests {
             SessionSource::Local(LocalSource::new(handles.reader, handles.commands.clone())),
             Some(handles.terminal),
             micromux::CancellationToken::new(),
-            true,
+            LogViewOptions::default(),
         );
 
         app.handle_crossterm_event(&crossterm::event::Event::Paste("Rq".to_string()));
@@ -1269,7 +1565,7 @@ mod tests {
             SessionSource::Local(LocalSource::new(handles.reader, handles.commands.clone())),
             Some(handles.terminal),
             shutdown.clone(),
-            true,
+            LogViewOptions::default(),
         );
         let paste = vec![b'x'; micromux::MAX_PTY_INPUT_BATCH_BYTES + 17];
 
@@ -1307,7 +1603,7 @@ mod tests {
             SessionSource::Local(LocalSource::new(handles.reader, handles.commands.clone())),
             Some(handles.terminal.clone()),
             micromux::CancellationToken::new(),
-            true,
+            LogViewOptions::default(),
         );
         let paste = vec![b'x'; micromux::MAX_PTY_PASTE_BYTES + 1];
 
@@ -1373,7 +1669,7 @@ mod tests {
             SessionSource::Local(LocalSource::new(handles.reader, handles.commands.clone())),
             Some(handles.terminal),
             shutdown.clone(),
-            true,
+            LogViewOptions::default(),
         );
         let runner = tokio::spawn(runner);
 
@@ -1440,7 +1736,7 @@ mod tests {
             ),
             Some(handles.terminal),
             micromux::CancellationToken::new(),
-            true,
+            LogViewOptions::default(),
         );
         app.input_notice = Some("input warning".to_string());
         app.terminal_input_closed = true;
@@ -1486,7 +1782,7 @@ mod tests {
             )),
             Some(handles.terminal.clone()),
             shutdown,
-            true,
+            LogViewOptions::default(),
         );
         app.focus = Focus::Services;
         app.show_healthcheck_pane = false;
@@ -1527,7 +1823,7 @@ mod tests {
             SessionSource::Local(LocalSource::new(handles.reader, commands_tx)),
             None,
             shutdown,
-            true,
+            LogViewOptions::default(),
         );
         let key = |code| KeyEvent {
             code,
@@ -1556,8 +1852,8 @@ mod tests {
             .iter()
             .map(ratatui::buffer::Cell::symbol)
             .collect::<String>();
-        assert!(!rendered.contains("PTY Input"));
-        assert!(!rendered.contains("Exit input"));
+        assert!(!rendered.contains("PTY input"));
+        assert!(!rendered.contains("Exit PTY input"));
         Ok(())
     }
 
@@ -1586,7 +1882,7 @@ mod tests {
             )),
             Some(handles.terminal),
             shutdown,
-            true,
+            LogViewOptions::default(),
         );
         if let Some(service) = app.state.current_service_mut() {
             service.snapshot.desired = micromux::Desired::Disabled;
@@ -1635,7 +1931,7 @@ mod tests {
             )),
             Some(handles.terminal),
             shutdown,
-            true,
+            LogViewOptions::default(),
         );
         let stop_key = KeyEvent {
             code: KeyCode::Char('s'),
@@ -1707,7 +2003,7 @@ mod tests {
             SessionSource::Local(LocalSource::new(initial.reader, initial.commands.clone())),
             Some(initial.terminal),
             shutdown,
-            true,
+            LogViewOptions::default(),
         );
         app.state.selected_service = 1;
         if let Some(service) = app.state.current_service_mut() {

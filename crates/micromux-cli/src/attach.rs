@@ -34,7 +34,9 @@ pub(crate) async fn run(options: &Options, raw_session: Option<&str>) -> Result<
         micromux_tui::SessionSource::Remote(remote),
         None,
         shutdown,
-        !options.no_pretty_json_logs,
+        micromux_tui::LogViewOptions {
+            pretty_json: !options.no_pretty_json_logs,
+        },
     );
     Ok(app.render().await?)
 }

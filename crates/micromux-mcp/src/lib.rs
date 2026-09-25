@@ -2997,7 +2997,7 @@ fn parse_since_text(raw: &str) -> Result<u64, ErrorData> {
 }
 
 fn user_timestamp_to_unix_ms(value: u64) -> u64 {
-    logproc::numeric_timestamp_to_unix_ms(value).unwrap_or_else(|| value.saturating_mul(1000))
+    micromux::numeric_timestamp_to_unix_ms(value).unwrap_or_else(|| value.saturating_mul(1000))
 }
 
 fn parse_relative_duration(raw: &str) -> Option<Duration> {

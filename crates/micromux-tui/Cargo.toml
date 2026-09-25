@@ -39,6 +39,9 @@ micromux-control = { path = "../micromux-control/" }
 # serde
 serde_json.workspace = true
 
+# log timestamps in local time
+chrono = { workspace = true, features = ["clock"] }
+
 # tui
 ratatui = { version = "=0.30.2", features = ["unstable-rendered-line-info"] }
 ansi-to-tui = "8"

@@ -3,6 +3,7 @@ use crate::config;
 use crate::service::Service;
 use crate::test_util::{service_config, spanned_string, unique_tmp_dir};
 use color_eyre::eyre;
+use indoc::indoc;
 use std::assert_matches;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -37,6 +38,7 @@ async fn run_test_scheduler(
         config_dir: Path::new(".").to_path_buf(),
         dynamic_policy: DynamicServicesPolicy::default(),
         default_log_retention: crate::LogRetention::default(),
+        default_log_display: crate::LogDisplay::default(),
     })
     .await
 }
@@ -117,6 +119,7 @@ fn spawn_harness_with_policy(
                 config_dir,
                 dynamic_policy,
                 default_log_retention: crate::LogRetention::default(),
+                default_log_display: crate::LogDisplay::default(),
             })
             .await
         }
@@ -148,6 +151,7 @@ async fn config_reload_wait_keeps_draining_process_events() -> eyre::Result<()> 
             config_dir: PathBuf::new(),
             dynamic_policy: DynamicServicesPolicy::default(),
             default_log_retention: LogRetention::default(),
+            default_log_display: crate::LogDisplay::default(),
         },
     );
     events_tx
@@ -200,6 +204,7 @@ async fn config_reload_wait_yields_to_session_shutdown() -> eyre::Result<()> {
             config_dir: PathBuf::new(),
             dynamic_policy: DynamicServicesPolicy::default(),
             default_log_retention: LogRetention::default(),
+            default_log_display: crate::LogDisplay::default(),
         },
     );
     shutdown.cancel();
@@ -1870,6 +1875,79 @@ services:
     )?;
     let dry_run = assert_reconcile_dry_run(&harness, &before_x, &before_y).await?;
     apply_reconcile_and_assert(&harness, &config_path, &before_x, &before_y, &dry_run).await?;
+
+    harness.shutdown.cancel();
+    harness.handle.await??;
+    Ok(())
+}
+
+/// Viewer log settings reach the snapshot on reconcile without restarting the running process.
+#[tokio::test]
+async fn reconcile_applies_log_display_without_a_restart() -> eyre::Result<()> {
+    use crate::{LogDisplay, StructuredLogLevel};
+
+    let dir = tempfile::tempdir()?;
+    let config_path = dir.path().join("micromux.yaml");
+    fs::write(
+        &config_path,
+        indoc! {r#"
+            version: 1
+            services:
+              svc:
+                command: ["sh", "-c", "echo ready; sleep 60"]
+                logs:
+                  level: warn
+        "#},
+    )?;
+    let services = services_from_config_path(&config_path)?;
+    let harness = spawn_harness(
+        services,
+        Some(ReloadConfig {
+            config_path: config_path.clone(),
+            strict_override: None,
+        }),
+    );
+    wait_for_log(&harness.reader, "svc", "ready").await?;
+    let before = harness
+        .reader
+        .service("svc")
+        .ok_or_else(|| eyre::eyre!("missing svc"))?;
+    // The configured settings are visible from the first snapshot on.
+    assert_eq!(before.log_display.level, Some(StructuredLogLevel::Warn));
+
+    fs::write(
+        &config_path,
+        indoc! {r#"
+            version: 1
+            logs:
+              fields: {filename: hide}
+            services:
+              svc:
+                command: ["sh", "-c", "echo ready; sleep 60"]
+                logs:
+                  level: info
+        "#},
+    )?;
+    let applied = reconcile_accepted(harness.control.reconcile_config(false).await)?;
+    let [action] = applied.actions.as_slice() else {
+        eyre::bail!("expected one reconcile action, got {:?}", applied.actions);
+    };
+    assert_eq!(action.action, ReconcileActionKind::Changed);
+    assert_eq!(action.detail, "changed log display");
+
+    let expected = LogDisplay {
+        level: Some(StructuredLogLevel::Info),
+        hide_fields: vec!["filename".to_string()],
+        ..LogDisplay::default()
+    };
+    let after = wait_until(&harness.reader, "svc", |snapshot| {
+        snapshot.log_display == expected
+    })
+    .await?;
+    // The same process keeps running and is not flagged for a restart.
+    assert_eq!(after.run_generation, before.run_generation);
+    assert_eq!(after.pid, before.pid);
+    assert!(!after.config_stale);
 
     harness.shutdown.cancel();
     harness.handle.await??;

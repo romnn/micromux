@@ -321,7 +321,9 @@ async fn run() -> Result<(), Error> {
         micromux_tui::SessionSource::Local(source),
         Some(input),
         shutdown.clone(),
-        config.config.ui_config.pretty_json_logs && !options.no_pretty_json_logs,
+        micromux_tui::LogViewOptions {
+            pretty_json: config.config.ui_config.pretty_json_logs && !options.no_pretty_json_logs,
+        },
     );
 
     let tui_handle = tokio::task::spawn(async move { tui.render().await });

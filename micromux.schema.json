@@ -321,7 +321,7 @@
     "logs": {
       "type": "object",
       "additionalProperties": false,
-      "description": "Log retention settings. Disk run logs retain the newest bounded segment of each retained run.",
+      "description": "Log retention and TUI presentation settings. Top-level values are defaults that each service's logs block overrides. Disk run logs retain the newest bounded segment of each retained run.",
       "properties": {
         "retained_runs": {
           "type": "integer",
@@ -348,6 +348,29 @@
         "max_bytes": {
           "$ref": "#/definitions/log_limit",
           "description": "Alias for memory.max_bytes."
+        },
+        "level": {
+          "type": "string",
+          "description": "Least severe structured JSON log level the TUI shows initially (default all). Lines without a recognizable level, such as build output and panics, always show. Change it at runtime with L; agents always read every level.",
+          "enum": ["all", "trace", "debug", "info", "warn", "error", "fatal"]
+        },
+        "timestamps": {
+          "type": "boolean",
+          "default": true,
+          "description": "Lead structured JSON log lines with their timestamp in local time in the TUI. Toggle per service at runtime with T."
+        },
+        "filter_fields": {
+          "type": "boolean",
+          "default": true,
+          "description": "Leave out the fields that `fields` hides in the TUI. Toggle per service at runtime with F."
+        },
+        "fields": {
+          "type": "object",
+          "description": "How the TUI displays structured JSON log fields, keyed by field name and matched exactly against top-level keys and keys of a nested tracing-style fields object. A service's map merges into the top-level one key by key, so `show` undoes an inherited `hide`. Agents always read every field.",
+          "additionalProperties": {
+            "type": "string",
+            "enum": ["hide", "show"]
+          }
         }
       }
     },

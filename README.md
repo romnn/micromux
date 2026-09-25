@@ -98,7 +98,8 @@ from the TUI or with the control plane.
  - **Disable/enable**: `d`
  - **PTY input mode (send input)**: `a` (exit input mode with `Alt+Esc`)
  - **Toggle panes/focus**: `Tab`, healthchecks pane: `H`
- - **Logs**: wrap `w`, follow-tail `t`
+ - **Logs**: wrap `w`, follow-tail `t`, level threshold `L`, timestamps `T`, hidden fields `F`
+ - **All keys**: `?`
  - **Quit**: `q` (or `Esc`)
 
 ## Attach to a running session
@@ -168,6 +169,27 @@ colored log lines by default. Opt out per run with `--no-pretty-json-logs`, or f
 ```yaml
 ui:
   pretty_json_logs: false
+```
+
+Pretty JSON lines lead with their timestamp in local time (`logs.timestamps: false` starts without
+them; `T` toggles them per service). Services can log verbosely while the TUI shows less:
+`logs.level` sets the initial level threshold (change it per service with `L`), and `logs.fields`
+hides noisy fields from the display (show them again with `F`). Top-level settings are defaults; a
+service overrides `level`, `timestamps`, and `filter_fields` and merges `fields` key by key, so
+`show` undoes an inherited `hide`. Lines without a structured level, such as build output and panics, always show,
+and agents always read every level and field:
+
+```yaml
+logs:
+  level: debug
+  fields: {filename: hide, line_number: hide, span: hide, spans: hide}
+
+services:
+  api:
+    command: ["sh", "-c", "RUST_LOG=trace ./run-api"]
+    logs:
+      fields:
+        span: show
 ```
 
 Retain bounded disk-backed logs for recent runs so agents can inspect crash output after restarts.

@@ -7,15 +7,15 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     prelude::*,
     style::{Color, Modifier, Style, Styled, palette::tailwind},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Widget},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Widget},
 };
 
 #[cfg(test)]
 mod tests {
     use super::{
         lease_phrase,
-        log_view::{LogView, RenderedLineIndex, window_text},
-        service_detail_line, shell_join, state_name,
+        log_view::{LogView, PaneBorders, RenderedLineIndex, window_text},
+        service_detail, shell_join, short_local_time, state_name,
     };
     use ratatui::{
         buffer::Buffer,
@@ -46,7 +46,17 @@ mod tests {
             width: log_area.width.saturating_add(scrollbar_area.width),
             height: log_area.height,
         };
-        view.render(area, &index, &text, "Logs", None, buf)
+        view.render(
+            area,
+            &index,
+            &text,
+            PaneBorders {
+                title: Line::raw("Logs"),
+                status: None,
+                detail: None,
+            },
+            buf,
+        )
     }
 
     fn count_thumb(buf: &Buffer, area: Rect) -> usize {
@@ -73,6 +83,32 @@ mod tests {
             }
         }
         out
+    }
+
+    #[test]
+    fn key_hints_wrap_whole_hints_within_the_width() {
+        use super::{KeyHint, pack_key_hints};
+
+        let hints = [
+            KeyHint::new("?", "Help"),
+            KeyHint::toggle("Tab", "Focus", "SERVICES"),
+            KeyHint::new("r", "Restart"),
+        ];
+
+        let one_row = pack_key_hints(&hints, 80);
+        let wrapped = pack_key_hints(&hints, 24);
+        let rows = |lines: &[Line<'_>]| lines.iter().map(Line::to_string).collect::<Vec<_>>();
+
+        assert_eq!(
+            rows(&one_row),
+            vec![" ? Help  Tab Focus:SERVICES  r Restart"]
+        );
+        // Each hint moves to the next row whole instead of splitting between key and label.
+        assert_eq!(
+            rows(&wrapped),
+            vec![" ? Help", " Tab Focus:SERVICES", " r Restart"]
+        );
+        assert!(wrapped.iter().all(|line| line.width() <= 24));
     }
 
     #[test]
@@ -112,7 +148,7 @@ mod tests {
     }
 
     #[test]
-    fn detail_command_is_capped_so_bounded_facts_survive_pathological_commands() {
+    fn border_detail_shortens_the_command_to_keep_the_facts_whole() {
         let mut snapshot = micromux::ServiceSnapshot::initial(
             "svc".to_string(),
             "svc".to_string(),
@@ -123,14 +159,43 @@ mod tests {
             None,
         );
         snapshot.run_generation = 1;
+        let mut view = LogView::default();
+        let area = Rect::new(0, 0, 60, 4);
+        let mut buf = Buffer::empty(area);
+        let text = Text::default();
+        let mut index = RenderedLineIndex::default();
+        index.rebuild(&text, false, 56);
 
-        let line = service_detail_line(&snapshot, 1_000)
-            .map(|line| line.to_string())
-            .unwrap_or_default();
+        view.render(
+            area,
+            &index,
+            &text,
+            PaneBorders {
+                title: Line::raw("Logs"),
+                status: None,
+                detail: Some(service_detail(&snapshot, 1_000)),
+            },
+            &mut buf,
+        );
 
-        assert!(line.contains('…'));
-        assert!(line.ends_with(" gen 1 "));
-        assert!(line.chars().count() < 100);
+        // The generation ends at the bottom-right corner, and the command fills what is left up to
+        // a gap of plain border.
+        let bottom = row_text(&buf, 0, 3, 59);
+        assert!(bottom.ends_with("xxx ... ────────── gen 1 ┘"), "{bottom}");
+        assert!(bottom.starts_with("└ $ sh -c xxx"), "{bottom}");
+    }
+
+    #[test]
+    fn truncation_ends_with_spaced_dots_within_the_limit() {
+        use super::truncate_with_dots;
+
+        // Text that fits stays as it is.
+        assert_eq!(truncate_with_dots(" $ run --fast ", 20), " $ run --fast ");
+        // A cut drops the whitespace before it and marks it with three dots set off by spaces.
+        let cut = truncate_with_dots(" $ run --listen 127.0.0.1:8080 --verbose", 22);
+        assert_eq!(cut, " $ run --listen 1 ... ");
+        assert!(cut.chars().count() <= 22);
+        assert_eq!(truncate_with_dots(" $ run --listen x", 12), " $ run ... ");
     }
 
     #[test]
@@ -155,10 +220,19 @@ mod tests {
             None,
         );
         snapshot.run_generation = 3;
-        let configured = service_detail_line(&snapshot, 1_000)
-            .map(|line| line.to_string())
-            .unwrap_or_default();
-        assert_eq!(configured, r#" $ sh -c "sleep 60"  gen 3 "#);
+        let configured = service_detail(&snapshot, 1_000);
+        assert_eq!(configured.left.content, r#" $ sh -c "sleep 60" "#);
+        assert_eq!(configured.right.to_string(), " gen 3 ");
+
+        // A running service also shows when its current run started, next to the generation.
+        let started_at_unix_ms = 1_790_342_949_000;
+        snapshot.started_at_unix_ms = Some(started_at_unix_ms);
+        let started = short_local_time(started_at_unix_ms).unwrap_or_default();
+        assert_eq!(
+            service_detail(&snapshot, 1_000).right.to_string(),
+            format!(" started {started} · gen 3 ")
+        );
+        snapshot.started_at_unix_ms = None;
 
         snapshot.origin = micromux::OriginKind::Dynamic;
         snapshot.dynamic = Some(micromux::DynamicServiceInfo {
@@ -167,23 +241,16 @@ mod tests {
             owner: Some("agent".to_string()),
             revision: 2,
         });
-        let dynamic = service_detail_line(&snapshot, 1_000)
-            .map(|line| line.to_string())
-            .unwrap_or_default();
+        let dynamic = service_detail(&snapshot, 1_000).right.to_string();
         assert_eq!(
             dynamic,
-            r#" $ sh -c "sleep 60"  gen 3  dynamic · rev 2 · expires in ~1m · owner agent "#
+            " dynamic · rev 2 · expires in ~1m · owner agent · gen 3 "
         );
 
         // A countdown on a dead lease would only mislead; retirement owns the status column.
         snapshot.retired = Some(micromux::RetiredReason::Expired);
-        let retired = service_detail_line(&snapshot, 1_000)
-            .map(|line| line.to_string())
-            .unwrap_or_default();
-        assert_eq!(
-            retired,
-            r#" $ sh -c "sleep 60"  gen 3  dynamic · rev 2 · owner agent "#
-        );
+        let retired = service_detail(&snapshot, 1_000).right.to_string();
+        assert_eq!(retired, " dynamic · rev 2 · owner agent · gen 3 ");
     }
 
     #[test]
@@ -588,17 +655,310 @@ fn shell_join(argv: &[String]) -> String {
         .join(" ")
 }
 
-/// Longest command rendered in the detail line. An unbounded command would push the bounded
-/// facts (generation, revision, lease) off the border; the full command stays available through
-/// `ctl ls` and the MCP snapshot.
-const DETAIL_COMMAND_MAX_CHARS: usize = 80;
+/// One key binding shown in the header or footer.
+struct KeyHint {
+    keys: &'static str,
+    description: String,
+    /// Current state of a toggle, emphasized after the description.
+    value: Option<String>,
+}
 
-fn truncate_chars(text: &str, max_chars: usize) -> String {
+impl KeyHint {
+    fn new(keys: &'static str, description: impl Into<String>) -> Self {
+        Self {
+            keys,
+            description: description.into(),
+            value: None,
+        }
+    }
+
+    /// A hint for a toggle, rendered as `keys label:value`.
+    fn toggle(keys: &'static str, label: &str, value: impl Into<String>) -> Self {
+        Self {
+            keys,
+            description: format!("{label}:"),
+            value: Some(value.into()),
+        }
+    }
+}
+
+/// Space between a popup's border and its content.
+const POPUP_PADDING: ratatui::widgets::Padding = ratatui::widgets::Padding::symmetric(3, 1);
+
+/// A popup centered in `area`, sized for `content_width` columns and `content_rows` rows of
+/// content plus its border and padding, and capped at the area.
+fn centered_popup(area: Rect, content_width: usize, content_rows: usize) -> Rect {
+    let horizontal_chrome = POPUP_PADDING.left + POPUP_PADDING.right + 2;
+    let vertical_chrome = POPUP_PADDING.top + POPUP_PADDING.bottom + 2;
+    let width = rows_u16(content_width)
+        .saturating_add(horizontal_chrome)
+        .min(area.width);
+    let height = rows_u16(content_rows)
+        .saturating_add(vertical_chrome)
+        .min(area.height);
+    Rect {
+        x: area.x.saturating_add(area.width.saturating_sub(width) / 2),
+        y: area
+            .y
+            .saturating_add(area.height.saturating_sub(height) / 2),
+        width,
+        height,
+    }
+}
+
+/// Heights of the header and footer rows around the panes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ChromeRows {
+    pub header: u16,
+    pub footer: u16,
+}
+
+fn rows_u16(rows: usize) -> u16 {
+    u16::try_from(rows).unwrap_or(u16::MAX)
+}
+
+/// Packs key hints into rows no wider than `width`, never splitting a hint across rows.
+///
+/// A hint wider than `width` gets a row of its own and is truncated when drawn.
+fn pack_key_hints(hints: &[KeyHint], width: usize) -> Vec<Line<'static>> {
+    const FIRST_GAP: usize = 1;
+    const GAP: usize = 2;
+
+    let mut rows: Vec<Vec<Span<'static>>> = Vec::new();
+    let mut row_width = 0;
+    for KeyHint {
+        keys,
+        description,
+        value,
+    } in hints
+    {
+        let mut hint = vec![
+            keys.fg(tailwind::YELLOW.c500).bold(),
+            format!(" {description}").fg(tailwind::GRAY.c500),
+        ];
+        if let Some(value) = value {
+            hint.push(value.clone().fg(tailwind::GRAY.c500).bold());
+        }
+        let hint_width = hint.iter().map(Span::width).sum::<usize>();
+        match rows.last_mut() {
+            Some(row) if row_width + GAP + hint_width <= width => {
+                row.push(" ".repeat(GAP).into());
+                row.extend(hint);
+                row_width += GAP + hint_width;
+            }
+            _ => {
+                let mut row = vec![" ".repeat(FIRST_GAP).into()];
+                row.extend(hint);
+                rows.push(row);
+                row_width = FIRST_GAP + hint_width;
+            }
+        }
+    }
+    rows.into_iter().map(Line::from).collect()
+}
+
+/// A group of key bindings in the help overlay.
+struct HelpSection {
+    title: &'static str,
+    keys: &'static [HelpKey],
+}
+
+struct HelpKey {
+    keys: &'static str,
+    description: &'static str,
+}
+
+/// Every key binding, grouped for the help overlay and laid out in two columns so it fits a
+/// standard 80x24 terminal.
+///
+/// View keys change only what the panes show; the others move around the TUI or act on services
+/// and the session.
+const HELP_COLUMNS: [&[HelpSection]; 2] = [
+    &[
+        HelpSection {
+            title: "View",
+            keys: &[
+                HelpKey {
+                    keys: "L",
+                    description: "Log level threshold",
+                },
+                HelpKey {
+                    keys: "T",
+                    description: "Timestamps on JSON lines",
+                },
+                HelpKey {
+                    keys: "F",
+                    description: "Fields hidden by config",
+                },
+                HelpKey {
+                    keys: "w",
+                    description: "Line wrapping",
+                },
+                HelpKey {
+                    keys: "t",
+                    description: "Follow tail",
+                },
+                HelpKey {
+                    keys: "H",
+                    description: "Healthcheck pane",
+                },
+            ],
+        },
+        HelpSection {
+            title: "Navigate",
+            keys: &[
+                HelpKey {
+                    keys: "↑/↓ j/k",
+                    description: "Select or scroll",
+                },
+                HelpKey {
+                    keys: "g / G",
+                    description: "Top / bottom",
+                },
+                HelpKey {
+                    keys: "←/→ h/l",
+                    description: "Resize sidebar",
+                },
+                HelpKey {
+                    keys: "Tab",
+                    description: "Switch pane focus",
+                },
+            ],
+        },
+    ],
+    &[HelpSection {
+        title: "Act",
+        keys: &[
+            HelpKey {
+                keys: "r",
+                description: "Restart service",
+            },
+            HelpKey {
+                keys: "R",
+                description: "Restart all services",
+            },
+            HelpKey {
+                keys: "d",
+                description: "Disable / enable service",
+            },
+            HelpKey {
+                keys: "s",
+                description: "Stop dynamic service",
+            },
+            HelpKey {
+                keys: "a",
+                description: "PTY input (Alt+Esc exits)",
+            },
+            HelpKey {
+                keys: "q",
+                description: "Quit / detach",
+            },
+            HelpKey {
+                keys: "?",
+                description: "This help (Esc closes)",
+            },
+        ],
+    }],
+];
+
+fn help_column_rows(sections: &[HelpSection]) -> Vec<Line<'static>> {
+    let mut rows = Vec::new();
+    for section in sections {
+        if !rows.is_empty() {
+            rows.push(Line::default());
+        }
+        rows.push(Line::from(section.title.bold().fg(App::HEADER_COLOR)));
+        for HelpKey { keys, description } in section.keys {
+            rows.push(Line::from(vec![
+                format!("  {keys:<9}").fg(tailwind::YELLOW.c500).bold(),
+                description.fg(tailwind::GRAY.c300),
+            ]));
+        }
+    }
+    rows
+}
+
+/// Places the help columns side by side, padding each row of a column to its widest row.
+fn help_rows() -> Vec<Line<'static>> {
+    const COLUMN_GAP: usize = 4;
+
+    let columns = HELP_COLUMNS.map(help_column_rows);
+    let height = columns.iter().map(Vec::len).max().unwrap_or_default();
+    let widths = columns
+        .each_ref()
+        .map(|rows| rows.iter().map(Line::width).max().unwrap_or_default());
+    (0..height)
+        .map(|index| {
+            let mut spans = Vec::new();
+            for (rows, width) in columns.iter().zip(widths) {
+                if !spans.is_empty() {
+                    spans.push(" ".repeat(COLUMN_GAP).into());
+                }
+                let row = rows.get(index).cloned().unwrap_or_default();
+                let padding = width.saturating_sub(row.width());
+                spans.extend(row.spans);
+                spans.push(" ".repeat(padding).into());
+            }
+            Line::from(spans)
+        })
+        .collect()
+}
+
+/// The active logs filters for the pane's top-right corner, or `None` when nothing is hidden.
+fn logs_filters(format: &crate::json_log::LineFormat) -> Option<Line<'static>> {
+    let mut filters = Vec::new();
+    if format.min_level.is_some() {
+        filters.push(format!(
+            "level ≥ {}",
+            crate::level::threshold_label(format.min_level)
+        ));
+    }
+    match format.hidden_fields.len() {
+        0 => {}
+        1 => filters.push("1 field hidden".to_string()),
+        hidden => filters.push(format!("{hidden} fields hidden")),
+    }
+    (!filters.is_empty()).then(|| {
+        border_facts(
+            filters
+                .into_iter()
+                .map(|filter| filter.fg(tailwind::GRAY.c500)),
+        )
+    })
+}
+
+/// Joins facts drawn into a border with white dots, padded by a space on either end.
+fn border_facts(facts: impl IntoIterator<Item = Span<'static>>) -> Line<'static> {
+    let mut spans = vec![Span::raw(" ")];
+    spans.extend(intersperse(facts, " · ".fg(Color::White)));
+    spans.push(Span::raw(" "));
+    Line::from(spans)
+}
+
+fn level_color(min_level: Option<micromux::StructuredLogLevel>) -> Color {
+    match min_level {
+        None => tailwind::GRAY.c200,
+        Some(micromux::StructuredLogLevel::Trace) => tailwind::GRAY.c500,
+        Some(micromux::StructuredLogLevel::Debug) => tailwind::CYAN.c400,
+        Some(micromux::StructuredLogLevel::Info) => tailwind::GREEN.c400,
+        Some(micromux::StructuredLogLevel::Warn) => tailwind::YELLOW.c400,
+        Some(micromux::StructuredLogLevel::Error) => tailwind::RED.c400,
+        Some(micromux::StructuredLogLevel::Fatal) => tailwind::FUCHSIA.c400,
+    }
+}
+
+/// Shortens `text` to at most `max_chars`, ending a cut with a spaced `...` so it reads apart
+/// from the border line that follows.
+fn truncate_with_dots(text: &str, max_chars: usize) -> String {
+    const MARKER: &str = " ... ";
+
     if text.chars().count() <= max_chars {
         return text.to_string();
     }
-    let mut truncated: String = text.chars().take(max_chars.saturating_sub(1)).collect();
-    truncated.push('…');
+    let kept = max_chars.saturating_sub(MARKER.len());
+    let mut truncated = text.chars().take(kept).collect::<String>();
+    truncated.truncate(truncated.trim_end().len());
+    truncated.push_str(MARKER);
     truncated
 }
 
@@ -632,46 +992,78 @@ fn lease_phrase(expires_at_unix_ms: Option<u64>, now_unix_ms: u64) -> String {
     }
 }
 
-/// One-line identity of the selected service for the logs pane frame: the resolved command it
-/// runs, its run generation, and for dynamic services the definition revision plus the lease and
-/// ownership facts an operator needs at a glance.
-fn service_detail_line(
+/// Color of the command in the logs pane's bottom border.
+const BORDER_COMMAND_COLOR: Color = tailwind::GRAY.c400;
+/// Color of the run facts in the logs pane's bottom border.
+const BORDER_RUN_FACTS_COLOR: Color = tailwind::FUCHSIA.c400;
+
+/// Identity of the selected service for the logs pane frame.
+///
+/// The command it runs goes on the left, where the border shortens it to fit.
+/// The bounded facts go on the right in full: for dynamic services the definition revision plus
+/// the lease and ownership facts, then when the current run started and its generation.
+fn service_detail(
     snapshot: &micromux::ServiceSnapshot,
     now_unix_ms: u64,
-) -> Option<Line<'static>> {
-    let mut spans: Vec<Span<'static>> = Vec::new();
+) -> log_view::BorderDetail {
     let command = shell_join(&snapshot.command);
-    if !command.is_empty() {
-        let command = truncate_chars(&command, DETAIL_COMMAND_MAX_CHARS);
-        spans.push(format!(" $ {command} ").fg(tailwind::GRAY.c400));
-    }
-    spans.push(format!(" gen {} ", snapshot.run_generation).fg(tailwind::GRAY.c400));
+    let left = if command.is_empty() {
+        Span::default()
+    } else {
+        format!(" $ {command} ").fg(BORDER_COMMAND_COLOR)
+    };
+
+    let mut facts: Vec<Span<'static>> = Vec::new();
     if snapshot.origin == micromux::OriginKind::Dynamic {
-        let mut facts = vec!["dynamic".to_string()];
+        let mut dynamic_facts = vec!["dynamic".to_string()];
         if let Some(dynamic) = &snapshot.dynamic {
-            facts.push(format!("rev {}", dynamic.revision));
+            dynamic_facts.push(format!("rev {}", dynamic.revision));
             // Retirement already owns the status column; a countdown on a dead lease would only
             // mislead.
             if snapshot.retired.is_none() {
-                facts.push(lease_phrase(dynamic.expires_at_unix_ms, now_unix_ms));
+                dynamic_facts.push(lease_phrase(dynamic.expires_at_unix_ms, now_unix_ms));
             }
             if let Some(owner) = &dynamic.owner {
-                facts.push(format!("owner {owner}"));
+                dynamic_facts.push(format!("owner {owner}"));
             }
         }
-        spans.push(format!(" {} ", facts.join(" · ")).fg(tailwind::YELLOW.c500));
+        facts.extend(
+            dynamic_facts
+                .into_iter()
+                .map(|fact| fact.fg(tailwind::YELLOW.c500)),
+        );
     }
-    (!spans.is_empty()).then(|| Line::from(spans))
+    if let Some(started) = snapshot.started_at_unix_ms.and_then(short_local_time) {
+        facts.push(format!("started {started}").fg(BORDER_RUN_FACTS_COLOR));
+    }
+    facts.push(format!("gen {}", snapshot.run_generation).fg(BORDER_RUN_FACTS_COLOR));
+    log_view::BorderDetail {
+        left,
+        right: border_facts(facts),
+    }
+}
+
+/// Formats a Unix millisecond timestamp as a short local date and time, such as `Sep 25 13:29:09`.
+fn short_local_time(unix_ms: u64) -> Option<String> {
+    let timestamp = chrono::DateTime::from_timestamp_millis(i64::try_from(unix_ms).ok()?)?;
+    Some(
+        timestamp
+            .with_timezone(&chrono::Local)
+            .format("%b %-d %H:%M:%S")
+            .to_string(),
+    )
 }
 
 impl Widget for &mut App {
     fn render(self, area: Rect, buf: &mut Buffer) {
+        let header = self.header_lines(area.width);
+        let footer = self.footer_lines(area.width);
         let [header_area, main_area, footer_area] = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(1), // header
-                Constraint::Min(0),    // main area
-                Constraint::Length(1), // footer
+                Constraint::Length(rows_u16(header.len())),
+                Constraint::Min(0),
+                Constraint::Length(rows_u16(footer.len())),
             ])
             .spacing(0)
             .areas(area);
@@ -696,22 +1088,17 @@ impl Widget for &mut App {
             [main_right_area, Rect::default()]
         };
 
-        let header = self
-            .attachment_header()
-            .or_else(|| self.local_warning_header())
-            .unwrap_or_else(|| {
-                format!("micromux v{}", env!("CARGO_PKG_VERSION"))
-                    .bold()
-                    .fg(App::HEADER_COLOR)
-                    .into_centered_line()
-            });
         Paragraph::new(header).render(header_area, buf);
         self.render_services(services_area, buf);
         self.render_logs(logs_area, buf);
         if self.show_healthcheck_pane {
             self.render_healthchecks(health_area, buf);
         }
-        self.render_footer(footer_area, buf);
+        Paragraph::new(footer).render(footer_area, buf);
+        self.render_level_picker(logs_area, buf);
+        if self.show_help {
+            App::render_help(main_area, buf);
+        }
     }
 }
 
@@ -733,7 +1120,7 @@ impl App {
         if let Some(notice) = status.notice.as_deref().or_else(|| self.terminal_notice()) {
             spans.extend([" — ".into(), notice.to_string().fg(tailwind::RED.c400)]);
         }
-        Some(Line::from(spans).centered())
+        Some(Line::from(spans))
     }
 
     fn local_warning_header(&self) -> Option<Line<'static>> {
@@ -741,16 +1128,139 @@ impl App {
             .source
             .local_notice()
             .or_else(|| self.terminal_notice())?;
-        Some(
-            Line::from(vec![
-                format!("micromux v{}", env!("CARGO_PKG_VERSION"))
-                    .bold()
-                    .fg(App::HEADER_COLOR),
-                " — WARNING: ".fg(tailwind::RED.c400).bold(),
-                notice.to_string().fg(tailwind::RED.c400),
-            ])
-            .centered(),
-        )
+        Some(Line::from(vec![
+            format!("micromux v{}", env!("CARGO_PKG_VERSION"))
+                .bold()
+                .fg(App::HEADER_COLOR),
+            " — WARNING: ".fg(tailwind::RED.c400).bold(),
+            notice.to_string().fg(tailwind::RED.c400),
+        ]))
+    }
+
+    fn status_line(&self) -> Line<'static> {
+        let mut status = self
+            .attachment_header()
+            .or_else(|| self.local_warning_header())
+            .unwrap_or_else(|| {
+                Line::from(
+                    format!("micromux v{}", env!("CARGO_PKG_VERSION"))
+                        .bold()
+                        .fg(App::HEADER_COLOR),
+                )
+            });
+        // Indent one column to line up with the pane titles drawn inside their borders.
+        status.spans.insert(0, " ".into());
+        status
+    }
+
+    /// The header rows at `width`: the session status with the view controls beside it.
+    ///
+    /// When the controls do not fit beside the status, they wrap onto right-aligned rows below
+    /// it, so warnings and attach state always keep the first row.
+    pub(crate) fn header_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let width = usize::from(width);
+        let status = self.status_line();
+        let mut controls = pack_key_hints(&self.view_key_hints(), width);
+        if let [single_row] = controls.as_mut_slice()
+            && status.width() + 1 + single_row.width() <= width
+        {
+            let gap = width - status.width() - single_row.width();
+            let mut spans = status.spans;
+            spans.push(" ".repeat(gap).into());
+            spans.append(&mut single_row.spans);
+            return vec![Line::from(spans)];
+        }
+        std::iter::once(status)
+            .chain(controls.into_iter().map(Line::right_aligned))
+            .collect()
+    }
+
+    /// The footer rows at `width`, wrapping whole key hints onto further rows as needed.
+    pub(crate) fn footer_lines(&self, width: u16) -> Vec<Line<'static>> {
+        pack_key_hints(&self.action_key_hints(), usize::from(width))
+    }
+
+    /// Header and footer heights at `width`; the panes get the rows in between.
+    pub(crate) fn chrome_rows(&self, width: u16) -> ChromeRows {
+        ChromeRows {
+            header: rows_u16(self.header_lines(width).len()),
+            footer: rows_u16(self.footer_lines(width).len()),
+        }
+    }
+
+    /// Keys that change only what the log panes show, each with its current state.
+    fn view_key_hints(&self) -> Vec<KeyHint> {
+        let on_off = |enabled: bool| if enabled { "ON" } else { "OFF" };
+        let current = self.state.current_service();
+        let level = current
+            .map(|service| crate::level::threshold_label(service.min_level()))
+            .unwrap_or_default();
+        let timestamps = current.is_some_and(crate::state::Service::shows_timestamps);
+        let fields = if current.is_some_and(crate::state::Service::filters_fields) {
+            "FILTERED"
+        } else {
+            "ALL"
+        };
+        vec![
+            KeyHint::toggle("L", "Level", level),
+            KeyHint::toggle("T", "Time", on_off(timestamps)),
+            KeyHint::toggle("F", "Fields", fields),
+            KeyHint::toggle("w", "Wrap", on_off(self.log_view.wrap)),
+            KeyHint::toggle("t", "Tail", on_off(self.log_view.follow_tail)),
+            KeyHint::toggle("H", "Health", on_off(self.show_healthcheck_pane)),
+        ]
+    }
+
+    /// Keys that move around the TUI or act on services and the session.
+    fn action_key_hints(&self) -> Vec<KeyHint> {
+        let focus = match self.focus {
+            crate::Focus::Services => "SERVICES",
+            crate::Focus::Logs => "LOGS",
+            crate::Focus::Healthcheck => "HEALTH",
+        };
+        let selected = self
+            .state
+            .current_service()
+            .map(|service| &service.snapshot);
+        let mut hints = vec![
+            KeyHint::new("?", "Help"),
+            KeyHint::new("↑/↓", "Move"),
+            KeyHint::new("←/→", "Resize"),
+            KeyHint::toggle("Tab", "Focus", focus),
+            KeyHint::new("r", "Restart"),
+            KeyHint::new("R", "Restart all"),
+            KeyHint::new(
+                "d",
+                if selected.is_some_and(|snapshot| snapshot.desired == micromux::Desired::Disabled)
+                {
+                    "Enable"
+                } else {
+                    "Disable"
+                },
+            ),
+        ];
+        // Stopping only applies to a live dynamic service, so the hint appears only then.
+        if selected.is_some_and(|snapshot| {
+            snapshot.origin == micromux::OriginKind::Dynamic && snapshot.retired.is_none()
+        }) {
+            hints.push(KeyHint::new("s", "Stop"));
+        }
+        if self.input.is_some() {
+            if self.pty_input_mode {
+                hints.push(KeyHint::new("Alt+Esc", "Exit PTY input"));
+            } else {
+                hints.push(KeyHint::new("a", "PTY input"));
+            }
+        }
+        hints.push(KeyHint::new(
+            "q",
+            if self.source.attachment_status().is_some() {
+                "Detach"
+            } else {
+                "Quit"
+            },
+        ));
+        hints
     }
 
     fn terminal_notice(&self) -> Option<&str> {
@@ -815,47 +1325,16 @@ impl App {
     }
 
     fn render_logs(&mut self, area: Rect, buf: &mut Buffer) {
-        let Some(current_id) = self
-            .state
-            .current_service()
-            .map(|service| service.snapshot.id.clone())
-        else {
+        let Some(service) = self.state.current_service_mut() else {
             return;
         };
-        let dirty = self
-            .state
-            .current_service()
-            .is_some_and(|service| service.logs_dirty);
-        if dirty {
-            let after = self
-                .state
-                .current_service()
-                .and_then(|service| service.cached_lines.back())
-                .map_or(0, |(seq, _)| seq.saturating_sub(1));
-            let (first_retained, new_lines) = self.source.logs_since(&current_id, after);
-            if let Some(service) = self.state.current_service_mut() {
-                match first_retained {
-                    None => service.cached_lines.clear(),
-                    Some(first) => {
-                        while service
-                            .cached_lines
-                            .front()
-                            .is_some_and(|(seq, _)| *seq < first)
-                        {
-                            service.cached_lines.pop_front();
-                        }
-                    }
-                }
-                for line in new_lines {
-                    let formatted = crate::json_log::format_line(&line.line, self.pretty_json_logs);
-                    match service.cached_lines.back_mut() {
-                        Some((seq, cached)) if *seq == line.seq => *cached = formatted,
-                        _ => service.cached_lines.push_back((line.seq, formatted)),
-                    }
-                }
-                service.text_dirty = true;
-                service.logs_dirty = false;
-            }
+        let format = service.line_format(self.pretty_json_logs);
+        service.use_format(&format);
+        if service.logs_dirty {
+            let (first_retained, records) = self
+                .source
+                .logs_since(&service.snapshot.id, service.log_read_cursor());
+            service.apply_log_records(first_retained, &records, &format);
         }
 
         let wrap = self.log_view.wrap;
@@ -889,7 +1368,7 @@ impl App {
             return;
         };
         let text = &current_service.cached_text;
-        let detail = service_detail_line(&current_service.snapshot, now_unix_ms());
+        let detail = service_detail(&current_service.snapshot, now_unix_ms());
         tracing::trace!(
             service_id = current_service.snapshot.id,
             num_lines = current_service.cached_line_index.total_lines(),
@@ -900,8 +1379,11 @@ impl App {
             area,
             &current_service.cached_line_index,
             text,
-            "Logs",
-            detail,
+            log_view::PaneBorders {
+                title: Line::raw("Logs"),
+                status: logs_filters(&format),
+                detail: Some(detail),
+            },
             buf,
         );
     }
@@ -961,88 +1443,81 @@ impl App {
             area,
             &service.healthcheck_cached_line_index,
             &service.healthcheck_cached_text,
-            "Healthcheck",
-            None,
+            log_view::PaneBorders {
+                title: Line::raw("Healthcheck"),
+                status: None,
+                detail: None,
+            },
             buf,
         );
     }
 
-    fn render_footer(&self, area: Rect, buf: &mut Buffer) {
-        #[derive(Debug)]
-        struct Keys<'a> {
-            keys: &'a str,
-            description: String,
-        }
-
-        impl<'a> Keys<'a> {
-            fn new(keys: &'a str, description: impl Into<String>) -> Self {
-                Self {
-                    keys,
-                    description: description.into(),
+    fn render_level_picker(&self, area: Rect, buf: &mut Buffer) {
+        let Some(picker) = &self.level_picker else {
+            return;
+        };
+        let current = self
+            .state
+            .services
+            .iter()
+            .find(|service| service.snapshot.id == picker.service_id)
+            .map(crate::state::Service::min_level);
+        let items = crate::level::LEVEL_CHOICES
+            .iter()
+            .map(|choice| {
+                let label = crate::level::threshold_label(*choice);
+                let mut spans = vec![format!("{label:<6}").fg(level_color(*choice))];
+                if current == Some(*choice) {
+                    spans.push(" (current)".fg(tailwind::GRAY.c500));
                 }
-            }
-        }
+                ListItem::new(Line::from(spans))
+            })
+            .collect::<Vec<_>>();
 
-        let tail = if self.log_view.follow_tail {
-            "ON"
-        } else {
-            "OFF"
-        };
-        let wrap = if self.log_view.wrap { "ON" } else { "OFF" };
-        let pty_input = if self.pty_input_mode { "ON" } else { "OFF" };
-        let focus = match self.focus {
-            crate::Focus::Services => "SERVICES",
-            crate::Focus::Logs => "LOGS",
-            crate::Focus::Healthcheck => "HEALTH",
-        };
+        let title = format!(" Level · {} ", picker.service_id);
+        let hint = " ↵ select · Esc cancel ";
+        let widest_item = items.iter().map(ListItem::width).max().unwrap_or_default();
+        let content_width = title
+            .chars()
+            .count()
+            .max(hint.chars().count())
+            // The highlight symbol shares the row with each item.
+            .max(widest_item.saturating_add(3));
+        let popup = centered_popup(area, content_width, items.len());
 
-        let mut footer_text = vec![
-            Keys::new("↑/↓", "Navigate"),
-            Keys::new("←/→", "Resize"),
-            Keys::new("Tab", format!("Focus:{focus}")),
-        ];
-        if self.input.is_some() {
-            footer_text.extend([
-                Keys::new("a", format!("PTY Input:{pty_input}")),
-                Keys::new("Alt+Esc", "Exit input"),
-            ]);
-        }
-        footer_text.extend([
-            Keys::new("H", "Health"),
-            Keys::new("w", format!("Wrap:{wrap}")),
-            Keys::new("t", format!("Tail:{tail}")),
-            Keys::new("r", "Restart"),
-            Keys::new("R", "Restart All"),
-            Keys::new("d", "Disable/Enable"),
-            Keys::new("s", "Stop dynamic"),
-            Keys::new(
-                "q",
-                if self.source.attachment_status().is_some() {
-                    "Detach"
-                } else {
-                    "Quit"
-                },
-            ),
-        ]);
-
-        let widget = Paragraph::new(
-            Line::from(
-                footer_text
-                    .iter()
-                    .flat_map(|Keys { keys, description }| {
-                        [
-                            "   ".into(),
-                            keys.fg(tailwind::YELLOW.c500).bold(),
-                            format!(" {description}").fg(tailwind::GRAY.c500),
-                        ]
-                    })
-                    .collect::<Vec<_>>(),
+        let list = List::new(items)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .padding(POPUP_PADDING)
+                    .title(title)
+                    .title_bottom(hint.fg(tailwind::GRAY.c500)),
             )
-            .left_aligned(),
-        )
-        .wrap(ratatui::widgets::Wrap { trim: false });
+            .highlight_style(
+                Style::default()
+                    .bg(Self::HIGHLIGHT_COLOR)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .highlight_symbol(" > ");
+        let mut state = ListState::default();
+        state.select(Some(picker.cursor));
+        Clear.render(popup, buf);
+        StatefulWidget::render(&list, popup, buf, &mut state);
+    }
 
-        Widget::render(&widget, area, buf);
+    fn render_help(area: Rect, buf: &mut Buffer) {
+        let rows = help_rows();
+        let content_width = rows.iter().map(Line::width).max().unwrap_or_default();
+        let popup = centered_popup(area, content_width, rows.len());
+        let help = Paragraph::new(rows).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .padding(POPUP_PADDING)
+                .title(" Keys ")
+                .title_bottom(" Esc closes ".fg(tailwind::GRAY.c500)),
+        );
+        Clear.render(popup, buf);
+        Widget::render(&help, popup, buf);
     }
 
     /// Run the application in the terminal.
@@ -1082,6 +1557,34 @@ pub mod log_view {
             Wrap,
         },
     };
+
+    /// Narrowest left border text worth drawing; below it the truncation marker would crowd out
+    /// the text itself.
+    const MIN_BORDER_DETAIL_LEFT_WIDTH: usize = 12;
+
+    /// Border columns kept free between the left text and the right facts, so the two never read
+    /// as one run.
+    const BORDER_DETAIL_GAP: usize = 10;
+
+    /// Text drawn into a pane's border.
+    #[derive(Debug, Clone)]
+    pub struct PaneBorders<'a> {
+        /// Pane name at the top left.
+        pub title: ratatui::text::Line<'a>,
+        /// Pane state at the top right, such as the filters that currently hide content.
+        pub status: Option<ratatui::text::Line<'static>>,
+        /// Identity facts along the bottom border.
+        pub detail: Option<BorderDetail>,
+    }
+
+    /// Facts drawn into a pane's bottom border.
+    #[derive(Debug, Clone)]
+    pub struct BorderDetail {
+        /// Left-aligned text, shortened with an ellipsis to the width the right side leaves.
+        pub left: ratatui::text::Span<'static>,
+        /// Right-aligned facts, always drawn in full.
+        pub right: ratatui::text::Line<'static>,
+    }
 
     /// Maps logical text lines to their first rendered row for one wrap configuration.
     #[derive(Debug, Default)]
@@ -1170,16 +1673,19 @@ pub mod log_view {
         /// can clamp keyboard scrolling consistently with the scrollbar/follow-tail behavior.
         ///
         /// `line_index` must describe `text` under this view's current wrap configuration.
-        /// `detail` is drawn into the bottom border as the selected service's identity line.
         pub fn render(
             &mut self,
             area: Rect,
             line_index: &RenderedLineIndex,
             text: &ratatui::text::Text<'_>,
-            title: &'static str,
-            detail: Option<ratatui::text::Line<'static>>,
+            borders: PaneBorders<'_>,
             buf: &mut Buffer,
         ) -> usize {
+            let PaneBorders {
+                title,
+                status,
+                detail,
+            } = borders;
             let num_lines = line_index.total_lines();
             let [log_area, scrollbar_area] = Layout::default()
                 .direction(Direction::Horizontal)
@@ -1220,8 +1726,20 @@ pub mod log_view {
             }
 
             let mut block = Block::default().borders(Borders::ALL).title(title);
-            if let Some(detail) = detail {
-                block = block.title_bottom(detail);
+            if let Some(status) = status {
+                block = block.title(status.right_aligned());
+            }
+            if let Some(BorderDetail { left, right }) = detail {
+                // The corners take a column each, and the gap keeps the two sides apart.
+                let left_width = usize::from(log_area.width)
+                    .saturating_sub(right.width() + 2 + BORDER_DETAIL_GAP);
+                if left_width >= MIN_BORDER_DETAIL_LEFT_WIDTH {
+                    block = block.title_bottom(ratatui::text::Span::styled(
+                        super::truncate_with_dots(&left.content, left_width),
+                        left.style,
+                    ));
+                }
+                block = block.title_bottom(right.right_aligned());
             }
             let paragraph = paragraph.block(block).scroll((paragraph_offset, 0));
 

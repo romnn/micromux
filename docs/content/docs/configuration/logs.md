@@ -61,4 +61,29 @@ ui:
   pretty_json_logs: false
 ```
 
+## Viewing structured logs
+
+Let a service log verbosely and decide in the TUI how much of it to see. `level` sets the initial level threshold, `timestamps` whether lines lead with their local time, `fields` which field keys to leave out of the display, and `filter_fields` whether they start out left out. Top-level values are defaults for every service:
+
+```yaml
+logs:
+  level: debug            # all, debug, info, warn, or error; trace means all
+  timestamps: true        # the default
+  filter_fields: true     # the default; false starts with every field shown
+  fields: {filename: hide, line_number: hide, span: hide, spans: hide}
+
+services:
+  api:
+    command: "RUST_LOG=trace ./run-api"
+    logs:
+      timestamps: false   # level, timestamps, and filter_fields replace the default
+      fields:             # fields merge into the default key by key
+        span: show        # undo an inherited hide
+        latency: hide     # hide one more
+```
+
+Lines without a structured level, such as build output and panic messages, are never hidden. `fields` keys match top-level keys and the keys of a tracing-style nested `fields` object exactly. In the TUI, `L` changes the threshold, `T` toggles the timestamps, and `F` shows the hidden fields again, each for the selected service. A config reload applies new `logs` display settings without restarting the service.
+
+These settings affect only the TUI. Agents reading logs always get every record, field, and timestamp.
+
 Over [MCP]({{< relref "../agent-control/_index.md" >}}), JSON logs can be filtered by structured level (`min_level`) and returned in a token-efficient `compact` form; each entry carries its detected level, timestamps, message, and typed fields.

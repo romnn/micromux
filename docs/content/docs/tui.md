@@ -17,6 +17,8 @@ Running `micromux` with no subcommand opens the TUI for the current project. It'
 
 ## Keybindings
 
+The header's right side lists the view keys, which change only what the panes show, with their current state. The footer lists the keys that move around and act on services. Both wrap onto extra rows when the terminal is too narrow.
+
 | Key | Action |
 |---|---|
 | `j` / `k`, `↓` / `↑` | Move the selection |
@@ -28,9 +30,23 @@ Running `micromux` with no subcommand opens the TUI for the current project. It'
 | `H` | Toggle the healthcheck pane |
 | `w` | Toggle log wrapping |
 | `t` | Toggle follow-tail (stick to the newest logs) |
+| `L` | Pick the selected service's log level threshold (`ALL`, `DEBUG`, `INFO`, `WARN`, `ERROR`) |
+| `T` | Toggle timestamps on the selected service's structured JSON log lines |
+| `F` | Toggle the selected service's fields that `logs.fields` hides |
+| `?` | Show every key binding (close with `Esc`) |
 | `q` / `Esc` | Quit |
 
 Restart, disable, and enable all go through the [control plane]({{< relref "agent-control/control-plane.md" >}}), so they respect dependency gating and restart policy.
+
+## Filtering structured logs
+
+For services that emit JSON logs, the log pane can show less than the service emits without losing anything:
+
+- **Level threshold** — `L` opens a picker for the selected service. Structured records below the chosen level are hidden; lines without a recognizable level, such as build output and panics, always show. The initial threshold comes from [`logs.level`]({{< relref "configuration/logs.md#viewing-structured-logs" >}}).
+- **Timestamps** — `T` toggles a local-time timestamp at the start of each structured line of the selected service. Records without their own timestamp show when micromux captured them. The initial state comes from `logs.timestamps`.
+- **Hidden fields** — `F` shows or hides the fields that `logs.fields` hides for the selected service. The initial state comes from `logs.filter_fields`.
+
+The logs pane's top-right corner names any active filter, such as `level ≥ INFO · 4 fields hidden`. These settings only shape the display: `micromux ctl logs` and the MCP log tools always return every record and field.
 
 ## Sending input to a service
 
