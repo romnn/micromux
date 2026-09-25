@@ -95,6 +95,14 @@ const SCENARIOS: &[Scenario] = &[
         rows: 44,
         keys: &[b"j" as &[u8], b"d"],
     },
+    // Structured logs: select `worker` (two rows below `api`), whose JSON records lead with their
+    // timestamps while the fields its config hides stay out of the pane.
+    Scenario {
+        name: "structured-logs",
+        cols: 200,
+        rows: 44,
+        keys: &[b"jj" as &[u8]],
+    },
 ];
 
 fn main() -> Result<(), Error> {
@@ -188,6 +196,9 @@ fn capture(micromux: &Path, example_dir: &Path, scenario: &Scenario) -> Result<S
     let mut cmd = CommandBuilder::new(micromux);
     cmd.cwd(example_dir);
     cmd.env("TERM", "xterm-256color");
+    // The TUI shows log timestamps in local time, so pin the zone to render the demo records'
+    // fixed timestamps identically on every machine.
+    cmd.env("TZ", "UTC");
     // micromux discovers `micromux.yaml` in its working directory, so no --config is needed.
 
     let mut child = pair

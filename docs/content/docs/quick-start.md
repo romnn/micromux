@@ -52,7 +52,7 @@ micromux starts every enabled service, honoring `depends_on` — here `worker` w
 
 The sidebar lists your services; each row shows its lifecycle state. Selecting a service shows its live log output in the main pane.
 
-{{< figure src="images/overview.png" alt="The micromux sidebar with services in different states next to a log pane" caption="Each row carries a service's state: healthy, running, exited (completed), unhealthy, or pending." >}}
+{{< figure src="images/overview.png" alt="The micromux sidebar with services in different states next to a log pane" caption="Each row carries a service's state: healthy, running, exited (completed), unhealthy, or blocked on a dependency." >}}
 
 Move with `j`/`k` (or the arrow keys), restart the selected service with `r`, and toggle it disabled with `d`. When a healthcheck is failing, open the healthcheck pane with `H` to see the probe command and its output:
 

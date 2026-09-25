@@ -66,6 +66,7 @@ tasks:
     sources:
       - crates/micromux-screenshot/src/**/*.rs
       - examples/demo/micromux.yaml
+      - examples/demo/bin/*.sh
     generates:
       - docs/static/images/*.png
     cmds:
@@ -80,6 +81,7 @@ tasks:
       - scripts/terminals.sh
       - crates/micromux-cli/src/**/*.rs
       - examples/demo/micromux.yaml
+      - examples/demo/bin/*.sh
     generates:
       - docs/assets/terminals/*.html
     cmds:

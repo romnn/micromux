@@ -192,6 +192,12 @@ services:
         span: show
 ```
 
+<p align="center">
+  <img src="https://raw.githubusercontent.com/romnn/micromux/main/docs/static/images/structured-logs.png" alt="micromux showing structured JSON logs with timestamps and hidden fields" width="820" />
+  <br />
+  <sub>Structured JSON logs led by their timestamps, with the fields the config hides left out.</sub>
+</p>
+
 Retain bounded disk-backed logs for recent runs so agents can inspect crash output after restarts.
 The in-memory TUI/default log stream stays bounded and fast; each disk run log preserves its newest
 64 MiB segment and old runs rotate by run count. `get_logs` returns a bounded tail; use

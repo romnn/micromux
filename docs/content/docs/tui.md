@@ -48,6 +48,8 @@ For services that emit JSON logs, the log pane can show less than the service em
 
 The logs pane's top-right corner names any active filter, such as `level ≥ INFO · 4 fields hidden`. These settings only shape the display: `micromux ctl logs` and the MCP log tools always return every record and field.
 
+{{< figure src="images/structured-logs.png" alt="Structured JSON log lines led by their timestamps, with the pane's top-right corner reading 4 fields hidden" caption="A service's JSON logs with timestamps, minus the source location and span fields its config hides." >}}
+
 ## Sending input to a service
 
 Some processes want input — a REPL, a prompt, a dev server waiting on a keypress. Press `a` to enter **input mode**: keystrokes are forwarded to the selected service's PTY until you leave input mode with `Alt+Esc`.
