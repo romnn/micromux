@@ -1857,6 +1857,100 @@ mod tests {
         Ok(())
     }
 
+    /// A disabled service's log pane keeps its ANSI shapes but shows them in gray.
+    #[tokio::test]
+    async fn disabled_service_logs_render_in_gray() -> eyre::Result<()> {
+        let yaml = indoc! {r#"
+            version: 1
+            services:
+              svc:
+                command: ["sh", "-c", "true"]
+        "#};
+        let mut diagnostics: Vec<Diagnostic<usize>> = vec![];
+        let parsed = micromux::from_str(yaml, Path::new("."), 0usize, None, &mut diagnostics)
+            .map_err(|err| eyre::eyre!(err.to_string()))?;
+        let mux = std::sync::Arc::new(
+            micromux::Micromux::new(&parsed).map_err(|err| eyre::eyre!(err.to_string()))?,
+        );
+        let shutdown = micromux::CancellationToken::new();
+        let (_runner, handles) = mux.start(shutdown.clone());
+        let (commands_tx, _commands_rx) = mpsc::channel(4);
+        let mut app = App::new(
+            SessionSource::Local(LocalSource::new(handles.reader.clone(), commands_tx)),
+            Some(handles.terminal),
+            shutdown,
+            LogViewOptions::default(),
+        );
+
+        // Hand the viewer one red, bold line as if the service had printed it.
+        // Recording the format first keeps the render from rebuilding the lines from the empty
+        // log.
+        let pretty_json_logs = app.pretty_json_logs;
+        let service = app
+            .state
+            .current_service_mut()
+            .ok_or_else(|| eyre::eyre!("no current service"))?;
+        let format = service.line_format(pretty_json_logs);
+        service.use_format(&format);
+        service.apply_log_records(
+            None,
+            &[micromux::LogLine {
+                seq: 1,
+                run_generation: 1,
+                timestamp_unix_ms: 0,
+                line: "\x1b[1;31mfrozen\x1b[0m".to_string(),
+            }],
+            &format,
+        );
+
+        let area = ratatui::layout::Rect::new(0, 0, 120, 12);
+        let render = |app: &mut App| -> eyre::Result<ratatui::buffer::Cell> {
+            let mut buffer = ratatui::buffer::Buffer::empty(area);
+            app.render(area, &mut buffer);
+            // Find the first cell of the word inside the log pane.
+            let rows = area
+                .rows()
+                .map(|row| {
+                    row.columns()
+                        .filter_map(|column| buffer.cell(column).map(ratatui::buffer::Cell::symbol))
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>();
+            let (y, offset) = rows
+                .iter()
+                .zip(0u16..)
+                .find_map(|(text, y)| {
+                    // The border glyphs before the word are multi-byte, so count columns.
+                    let byte = text.find("frozen")?;
+                    Some((y, text[..byte].chars().count()))
+                })
+                .ok_or_else(|| eyre::eyre!("log line not rendered:\n{}", rows.join("\n")))?;
+            let x = u16::try_from(offset)?;
+            buffer
+                .cell((x, y))
+                .cloned()
+                .ok_or_else(|| eyre::eyre!("log cell missing"))
+        };
+
+        // Live, the line keeps its red.
+        let live = render(&mut app)?;
+        assert_eq!(live.fg, ratatui::style::Color::Red);
+        assert!(live.modifier.contains(ratatui::style::Modifier::BOLD));
+
+        // Disabled, the same line is a gray that still carries its bold.
+        if let Some(service) = app.state.current_service_mut() {
+            service.snapshot.desired = micromux::Desired::Disabled;
+        }
+        let frozen = render(&mut app)?;
+        assert!(
+            matches!(frozen.fg, ratatui::style::Color::Rgb(red, green, blue) if red == green && green == blue),
+            "{:?}",
+            frozen.fg
+        );
+        assert!(frozen.modifier.contains(ratatui::style::Modifier::BOLD));
+        Ok(())
+    }
+
     #[tokio::test]
     async fn restart_key_on_disabled_service_does_not_send_enable() -> eyre::Result<()> {
         let yaml = indoc! {r#"

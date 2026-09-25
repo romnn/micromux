@@ -1386,6 +1386,11 @@ impl App {
             },
             buf,
         );
+        // A stopped service's logs are a record, not a live view, so the whole pane goes gray
+        // without losing the shapes its colors drew.
+        if crate::style::is_frozen(&current_service.snapshot) {
+            crate::style::freeze(buf, area);
+        }
     }
 
     fn render_healthchecks(&mut self, area: Rect, buf: &mut Buffer) {

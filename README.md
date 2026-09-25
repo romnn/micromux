@@ -31,7 +31,7 @@
  <p align="center">
    <img src="https://raw.githubusercontent.com/romnn/micromux/main/docs/static/images/disable.png" alt="micromux with a service disabled" width="820" />
    <br />
-   <sub>Disable a service on the fly — it stops and its row turns gray.</sub>
+   <sub>Disable a service on the fly — it stops, and its row and its logs turn gray.</sub>
  </p>
 
  
