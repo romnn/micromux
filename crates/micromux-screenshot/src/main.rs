@@ -265,7 +265,7 @@ fn capture(micromux: &Path, example_dir: &Path, scenario: &Scenario) -> Result<S
 ///
 /// ratatui only writes the cell diff on each redraw, so a stable UI produces no further output —
 /// but periodic ticks can still emit tiny updates. Rather than wait for byte silence we wait for
-/// the formatted screen contents to hold steady for [`STABLE_FOR`], bounded by [`MAX_WAIT`].
+/// the formatted screen contents to hold steady for `STABLE_FOR`, bounded by `MAX_WAIT`.
 fn settle(rx: &mpsc::Receiver<Vec<u8>>, parser: &mut vt100::Parser) {
     const POLL: Duration = Duration::from_millis(100);
     const STABLE_FOR: Duration = Duration::from_millis(600);
