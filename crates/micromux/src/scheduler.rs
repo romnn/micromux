@@ -772,14 +772,10 @@ fn project_execution(running: bool, state: &State, ran_before: bool, blocked: bo
 fn load_services_from_disk(reload: &ReloadConfig) -> Result<ServiceMap, String> {
     let raw = crate::config::read_config_file(&reload.config_path)
         .map_err(|err| format!("read {}: {err}", reload.config_path.display()))?;
-    let config_dir = reload
-        .config_path
-        .parent()
-        .ok_or_else(|| format!("{} has no parent directory", reload.config_path.display()))?;
     let mut diagnostics = Vec::new();
     let config = crate::config::from_str(
         &raw,
-        config_dir,
+        &reload.config_dir,
         0usize,
         reload.strict_override,
         &mut diagnostics,

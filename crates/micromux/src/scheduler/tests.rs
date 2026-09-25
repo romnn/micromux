@@ -1660,6 +1660,18 @@ services:
     ))
 }
 
+/// Reloads `config_path` against its own directory, the way a session started from it does.
+fn reload_config(config_path: &Path) -> eyre::Result<ReloadConfig> {
+    let config_dir = config_path
+        .parent()
+        .ok_or_else(|| eyre::eyre!("missing config parent"))?;
+    Ok(ReloadConfig {
+        config_path: config_path.to_path_buf(),
+        config_dir: config_dir.to_path_buf(),
+        strict_override: None,
+    })
+}
+
 fn services_from_config_path(config_path: &Path) -> eyre::Result<ServiceMap> {
     let raw = fs::read_to_string(config_path)?;
     let config_dir = config_path
@@ -1685,10 +1697,7 @@ services:
 "#
         )
     };
-    let reload = ReloadConfig {
-        config_path: config_path.clone(),
-        strict_override: None,
-    };
+    let reload = reload_config(&config_path)?;
 
     fs::write(&config_path, yaml("false"))?;
     load_services_from_disk(&reload).map_err(eyre::Report::msg)?;
@@ -1842,13 +1851,7 @@ services:
 "#,
     )?;
     let services = services_from_config_path(&config_path)?;
-    let harness = spawn_harness(
-        services,
-        Some(ReloadConfig {
-            config_path: config_path.clone(),
-            strict_override: None,
-        }),
-    );
+    let harness = spawn_harness(services, Some(reload_config(&config_path)?));
     wait_for_log(&harness.reader, "x", "x-old").await?;
     wait_for_log(&harness.reader, "y", "y-old").await?;
     let before_x = harness
@@ -1900,13 +1903,7 @@ async fn reconcile_applies_log_display_without_a_restart() -> eyre::Result<()> {
         "#},
     )?;
     let services = services_from_config_path(&config_path)?;
-    let harness = spawn_harness(
-        services,
-        Some(ReloadConfig {
-            config_path: config_path.clone(),
-            strict_override: None,
-        }),
-    );
+    let harness = spawn_harness(services, Some(reload_config(&config_path)?));
     wait_for_log(&harness.reader, "svc", "ready").await?;
     let before = harness
         .reader
@@ -1963,10 +1960,7 @@ async fn reconcile_rejects_dynamic_dependencies_collisions_and_invalid_files_wit
     let services = services_from_config_path(&config_path)?;
     let harness = spawn_harness_with_policy(
         services,
-        Some(ReloadConfig {
-            config_path: config_path.clone(),
-            strict_override: None,
-        }),
+        Some(reload_config(&config_path)?),
         dir.path().to_path_buf(),
         enabled_dynamic_policy(dir.path())?,
     );
@@ -2079,13 +2073,7 @@ async fn reconcile_add_honors_disabled_startup_mode() -> eyre::Result<()> {
     let config_path = dir.path().join("micromux.yaml");
     fs::write(&config_path, "version: 1\nservices: {}\n")?;
     let services = services_from_config_path(&config_path)?;
-    let harness = spawn_harness(
-        services,
-        Some(ReloadConfig {
-            config_path: config_path.clone(),
-            strict_override: None,
-        }),
-    );
+    let harness = spawn_harness(services, Some(reload_config(&config_path)?));
     fs::write(
         &config_path,
         r#"version: 1
@@ -2117,13 +2105,7 @@ async fn restart_reloads_latest_service_config_before_spawning() -> eyre::Result
     let config_path = dir.path().join("micromux.yaml");
     fs::write(&config_path, reload_test_yaml("old-config"))?;
     let services = services_from_config_path(&config_path)?;
-    let harness = spawn_harness(
-        services,
-        Some(ReloadConfig {
-            config_path: config_path.clone(),
-            strict_override: None,
-        }),
-    );
+    let harness = spawn_harness(services, Some(reload_config(&config_path)?));
     let id = "svc".to_string();
 
     wait_for_log(&harness.reader, "svc", "old-config").await?;
@@ -2154,10 +2136,7 @@ async fn reload_preserves_dynamic_roster_and_rejects_collisions() -> eyre::Resul
     let services = services_from_config_path(&config_path)?;
     let harness = spawn_harness_with_policy(
         services,
-        Some(ReloadConfig {
-            config_path: config_path.clone(),
-            strict_override: None,
-        }),
+        Some(reload_config(&config_path)?),
         dir.path().to_path_buf(),
         enabled_dynamic_policy(dir.path())?,
     );
@@ -2213,13 +2192,7 @@ async fn restart_rejects_invalid_reloaded_config_without_killing_current_run() -
     let config_path = dir.path().join("micromux.yaml");
     fs::write(&config_path, reload_test_yaml("still-running"))?;
     let services = services_from_config_path(&config_path)?;
-    let harness = spawn_harness(
-        services,
-        Some(ReloadConfig {
-            config_path: config_path.clone(),
-            strict_override: None,
-        }),
-    );
+    let harness = spawn_harness(services, Some(reload_config(&config_path)?));
     let id = "svc".to_string();
 
     wait_for_log(&harness.reader, "svc", "still-running").await?;
@@ -2263,13 +2236,7 @@ async fn automatic_restart_reloads_latest_service_config_before_spawning() -> ey
         auto_reload_test_yaml("echo old-auto; sleep 1; exit 1")?,
     )?;
     let services = services_from_config_path(&config_path)?;
-    let harness = spawn_harness(
-        services,
-        Some(ReloadConfig {
-            config_path: config_path.clone(),
-            strict_override: None,
-        }),
-    );
+    let harness = spawn_harness(services, Some(reload_config(&config_path)?));
 
     wait_for_log(&harness.reader, "svc", "old-auto").await?;
     fs::write(
@@ -2297,13 +2264,7 @@ async fn reload_does_not_rewrite_snapshot_for_unrestarted_run() -> eyre::Result<
         reload_two_service_yaml("echo old-b; sleep 60", 3000)?,
     )?;
     let services = services_from_config_path(&config_path)?;
-    let harness = spawn_harness(
-        services,
-        Some(ReloadConfig {
-            config_path: config_path.clone(),
-            strict_override: None,
-        }),
-    );
+    let harness = spawn_harness(services, Some(reload_config(&config_path)?));
     let a = "a".to_string();
     let b = "b".to_string();
 
@@ -2560,13 +2521,7 @@ services:
     fs::write(&config_path, yaml("before"))?;
 
     let services = services_from_config_path(&config_path)?;
-    let harness = spawn_harness(
-        services,
-        Some(ReloadConfig {
-            config_path: config_path.clone(),
-            strict_override: None,
-        }),
-    );
+    let harness = spawn_harness(services, Some(reload_config(&config_path)?));
     let initial = wait_for_finished_health_attempt(&harness.reader, "svc").await?;
     assert_eq!(initial.result.map(|result| result.success), Some(true));
 

@@ -111,9 +111,17 @@ pub enum Error {
     Graph(#[from] GraphError),
 }
 
+/// Where a session re-reads its config from, and how it interprets the file.
 #[derive(Debug, Clone)]
 pub(crate) struct ReloadConfig {
     pub(crate) config_path: PathBuf,
+    /// The directory the session first parsed its config against.
+    ///
+    /// A reload resolves relative paths against it rather than against the config path's parent.
+    /// The two can name one directory differently, such as through a symlinked temp directory,
+    /// and every service's working directory is resolved from it, so only the original spelling
+    /// makes an unchanged file reload to identical services.
+    pub(crate) config_dir: PathBuf,
     pub(crate) strict_override: Option<bool>,
 }
 
@@ -467,6 +475,7 @@ impl Micromux {
             .clone()
             .map(|config_path| ReloadConfig {
                 config_path,
+                config_dir: config_file.config_dir.clone(),
                 strict_override: config_file.strict_override,
             });
 
@@ -568,6 +577,53 @@ mod tests {
         assert_eq!(snapshot.desired, Desired::Disabled);
         assert_eq!(snapshot.execution, Execution::Pending);
         assert_eq!(snapshot.run_generation, 0);
+        Ok(())
+    }
+
+    /// Reconciling an unchanged config plans nothing, even when the session parsed it through
+    /// another spelling of its directory than the config path records.
+    ///
+    /// On macOS the temp directory is a symlink into `/private`, so a caller that canonicalizes
+    /// only the config path hits exactly this split.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reconciling_an_unchanged_config_through_a_symlink_plans_nothing() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let real = directory.path().join("real");
+        std::fs::create_dir_all(real.join("work"))?;
+        let link = directory.path().join("link");
+        std::os::unix::fs::symlink(&real, &link)?;
+        let raw = indoc::indoc! {r#"
+            version: 1
+            services:
+              default-dir:
+                command: ["sh", "-c", "sleep 60"]
+              own-dir:
+                command: ["sh", "-c", "sleep 60"]
+                working_dir: work
+        "#};
+        std::fs::write(real.join("micromux.yaml"), raw)?;
+
+        // Parse through the symlink, but record the config file's canonical path.
+        let mut diagnostics = Vec::new();
+        let mut config = from_str(raw, &link, 0usize, None, &mut diagnostics)?;
+        config.config_path = Some(real.join("micromux.yaml").canonicalize()?);
+        let mux = Arc::new(Micromux::new(&config)?);
+        let shutdown = CancellationToken::new();
+        let (runner, handles) = mux.start(shutdown.clone());
+        let runner = tokio::spawn(runner);
+
+        let receipt = handles
+            .service_control()
+            .reconcile_config(true)
+            .await?
+            .map_err(|rejection| eyre::eyre!("reconcile rejected: {rejection:?}"))?;
+
+        // Neither the default directory nor a relative working_dir reads as a change.
+        assert_eq!(receipt.actions, Vec::new());
+
+        shutdown.cancel();
+        runner.await??;
         Ok(())
     }
 
