@@ -4315,7 +4315,7 @@ async fn emits_log_lines() -> eyre::Result<()> {
 
 #[tokio::test]
 async fn non_alt_screen_control_sequences_keep_raw_log_records() -> eyre::Result<()> {
-    let json = r#"{"timestamp":"2026-07-01T22:22:21.512105Z","level":"INFO","fields":{"message":"connecting to qdrant","connection_uri":"http://localhost:6334"},"target":"airtype_api_service::setup","filename":"services/airtype-api-service/src/setup.rs","line_number":234}"#;
+    let json = r#"{"timestamp":"2026-07-01T22:22:21.512105Z","level":"INFO","fields":{"message":"connecting to qdrant","connection_uri":"http://localhost:6334"},"target":"demo_api_service::setup","filename":"services/demo-api-service/src/setup.rs","line_number":234}"#;
     let command = format!("printf '\\033[2Kbuilding\\r'; printf '%s\\n' '{json}'");
     let config_dir = Path::new(".");
     let mut services: ServiceMap = ServiceMap::new();

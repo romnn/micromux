@@ -240,7 +240,7 @@ mod tests {
 
     #[test]
     fn tracing_fields_message_is_promoted_and_other_fields_are_flattened() {
-        let line = r#"{"timestamp":"2026-07-01T17:28:02Z","fields":{"severity":"INFO","message":"setup tracer","name":"airtype_api_service"},"filename":"trace.rs","line_number":379,"target":"telemetry::trace"}"#;
+        let line = r#"{"timestamp":"2026-07-01T17:28:02Z","fields":{"severity":"INFO","message":"setup tracer","name":"demo_api_service"},"filename":"trace.rs","line_number":379,"target":"telemetry::trace"}"#;
 
         let out = format_line(line, true);
 
@@ -248,7 +248,7 @@ mod tests {
         assert!(!out.contains("fields="));
         assert!(!out.contains("message="));
         assert!(!out.contains("severity="));
-        assert!(out.contains("\x1b[34mname\x1b[0m=\x1b[90mairtype_api_service\x1b[0m"));
+        assert!(out.contains("\x1b[34mname\x1b[0m=\x1b[90mdemo_api_service\x1b[0m"));
         assert!(out.contains("\x1b[34mfilename\x1b[0m=\x1b[90mtrace.rs\x1b[0m"));
         assert!(out.contains("\x1b[34mline_number\x1b[0m=\x1b[90m379\x1b[0m"));
         assert!(out.contains("\x1b[34mtarget\x1b[0m=\x1b[90mtelemetry::trace\x1b[0m"));

@@ -633,7 +633,7 @@ mod tests {
         fs::create_dir_all(&dir)?;
         fs::write(
             dir.join(".env"),
-            "SPICEDB_PORT=50051\nAIRTYPE_API_SPICEDB_ENDPOINT=\"http://0.0.0.0:${SPICEDB_PORT}\"\n",
+            "SPICEDB_PORT=50051\nDEMO_API_SPICEDB_ENDPOINT=\"http://0.0.0.0:${SPICEDB_PORT}\"\n",
         )?;
 
         let mut cfg = service_config("svc", ("sh", &["-c", "true"]));
@@ -646,7 +646,7 @@ mod tests {
         assert_eq!(
             svc.spec
                 .environment
-                .get("AIRTYPE_API_SPICEDB_ENDPOINT")
+                .get("DEMO_API_SPICEDB_ENDPOINT")
                 .map(String::as_str),
             Some("http://0.0.0.0:50051")
         );
