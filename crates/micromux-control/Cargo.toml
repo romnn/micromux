@@ -43,7 +43,6 @@ tracing.workspace = true
 # runtime dir + ownership lock
 directories.workspace = true
 fs2 = "0.4"
-sha2 = "0.11.0"
 
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true, features = ["fs", "user"] }

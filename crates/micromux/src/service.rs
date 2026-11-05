@@ -1,3 +1,4 @@
+use crate::session::SessionEnvironment;
 use crate::{
     config::{self},
     diagnostics::{Span, ToDiagnostics},
@@ -468,6 +469,7 @@ mod tests {
             config_dir,
             config,
             supervisor_environment,
+            &SessionEnvironment::default(),
             &mut Vec::new(),
         )
     }
@@ -591,6 +593,57 @@ mod tests {
             svc.spec.environment.get("FOO").map(String::as_str),
             Some("from_config")
         );
+        Ok(())
+    }
+
+    /// Session variables beat every configured definition of the same name, and later entries
+    /// and the command see the pinned value rather than the shadowed one.
+    #[test]
+    fn pinned_session_variables_override_env_files_and_inline_entries() -> eyre::Result<()> {
+        let dir = unique_tmp_dir("env-pinned");
+        fs::create_dir_all(&dir)?;
+        let env_path = dir.join("svc.env");
+        // The shadowed line references an unset variable: it must be skipped, not expanded.
+        fs::write(
+            &env_path,
+            "API_PORT=${UNSET_IN_TEST}\nAPI_URL=http://127.0.0.1:${API_PORT}\n",
+        )?;
+
+        let mut cfg = service_config("svc", ("echo", &["${API_PORT}", "${MICROMUX_SESSION}"]));
+        cfg.env_file = vec![config::EnvFile {
+            path: spanned_string(env_path.to_string_lossy().as_ref()),
+            optional: false,
+        }];
+        cfg.environment
+            .insert(spanned_string("API_PORT"), spanned_string("9540"));
+        cfg.ports.push(spanned_string("${API_PORT}"));
+
+        let pinned =
+            SessionEnvironment::from_pairs(&[("MICROMUX_SESSION", "luup2"), ("API_PORT", "20001")]);
+        let svc = Service::from_config(
+            "svc",
+            &dir,
+            cfg,
+            &base_environment(&[("API_PORT", "1")]),
+            &pinned,
+            &mut Vec::new(),
+        )?;
+
+        let environment = &svc.spec.environment;
+        assert_eq!(
+            environment.get("API_PORT").map(String::as_str),
+            Some("20001")
+        );
+        assert_eq!(
+            environment.get("API_URL").map(String::as_str),
+            Some("http://127.0.0.1:20001")
+        );
+        assert_eq!(
+            environment.get("MICROMUX_SESSION").map(String::as_str),
+            Some("luup2")
+        );
+        assert_eq!(svc.spec.command, vec!["echo", "20001", "luup2"]);
+        assert_eq!(svc.spec.ports, vec![20001]);
         Ok(())
     }
 
@@ -1045,7 +1098,14 @@ mod tests {
             .insert(spanned_string("NEEDS"), spanned_string("${FROM_SHARED}"));
 
         let mut skipped = Vec::new();
-        let result = Service::from_config("svc", &dir, cfg, &base_environment(&[]), &mut skipped);
+        let result = Service::from_config(
+            "svc",
+            &dir,
+            cfg,
+            &base_environment(&[]),
+            &SessionEnvironment::default(),
+            &mut skipped,
+        );
 
         assert_eq!(
             unset_site(result)?,
@@ -1266,6 +1326,7 @@ impl Service {
             config_dir,
             config,
             &std::env::vars().collect(),
+            &SessionEnvironment::default(),
             &mut Vec::new(),
         )
     }
@@ -1283,6 +1344,10 @@ impl Service {
     /// - `ports`, `command`, and `healthcheck.test` see the complete environment the service
     ///   process receives.
     ///
+    /// The `pinned` session variables count as part of `supervisor_environment`, and every
+    /// `env_file` line or `environment` entry of the same name is ignored, so the pinned value is
+    /// what each layer and the process see.
+    ///
     /// Every `optional` env file that was not loaded is appended to `skipped_env_files`, on
     /// success and on failure alike, because a skipped file often explains a later unset
     /// variable.
@@ -1299,13 +1364,18 @@ impl Service {
         config_dir: &Path,
         config: config::Service,
         supervisor_environment: &HashMap<String, String>,
+        pinned: &SessionEnvironment,
         skipped_env_files: &mut Vec<SkippedEnvFile>,
     ) -> Result<Self, Error> {
         let id: ServiceID = id.into();
         let resolver = Resolver {
             service: &id,
             config_dir,
+            pinned,
         };
+        // Session variables are part of the base every value sees, and no definition can
+        // replace them.
+        let supervisor_environment = &pinned.layered_over(supervisor_environment);
 
         // Paths: supervisor environment only.
         // A service without its own working_dir runs in the config directory, which every other
@@ -1323,6 +1393,9 @@ impl Service {
         let mut service_environment = supervisor_environment.clone();
         service_environment.extend(environment.clone());
         for (key, value) in &config.environment {
+            if pinned.pins(key.as_ref()) {
+                continue;
+            }
             let site = Site::Environment {
                 key: key.as_ref().clone(),
             };
@@ -1330,6 +1403,8 @@ impl Service {
             environment.insert(key.as_ref().clone(), expanded.clone());
             service_environment.insert(key.as_ref().clone(), expanded);
         }
+
+        pinned.apply_to(&mut environment);
 
         // Everything else: the environment the process receives
         let ports = config
@@ -1548,6 +1623,7 @@ impl WorkingDirectory {
 struct Resolver<'a> {
     service: &'a ServiceID,
     config_dir: &'a Path,
+    pinned: &'a SessionEnvironment,
 }
 
 impl Resolver<'_> {
@@ -1707,15 +1783,16 @@ impl Resolver<'_> {
                         source,
                     }
                 })?;
-            let expanded = env::expand_env_values(&parsed, &current).map_err(|err| {
-                let env::ValueError { key, source } = err;
-                let site = Site::EnvFileValue {
-                    index,
-                    path: path.clone().into_boxed_path(),
-                    key,
-                };
-                self.interpolation_error(site, &entry.path, source)
-            })?;
+            let expanded = env::expand_env_values(&parsed, &current, &|key| self.pinned.pins(key))
+                .map_err(|err| {
+                    let env::ValueError { key, source } = err;
+                    let site = Site::EnvFileValue {
+                        index,
+                        path: path.clone().into_boxed_path(),
+                        key,
+                    };
+                    self.interpolation_error(site, &entry.path, source)
+                })?;
             current.extend(expanded.clone());
             loaded.extend(expanded);
         }

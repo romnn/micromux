@@ -401,7 +401,16 @@ services:
         eyre::bail!("expected dynamic-service receipt, got {created:?}");
     };
     assert_eq!(created.revision, 1);
-    assert_eq!(created.env_keys, vec!["CLONED_SECRET", "PRIVATE_VALUE"]);
+    // Every service carries the session variables next to its own.
+    assert_eq!(
+        created.env_keys,
+        vec![
+            "CLONED_SECRET",
+            "MICROMUX_SESSION",
+            "MICROMUX_SESSION_DOMAIN",
+            "PRIVATE_VALUE"
+        ]
+    );
     assert_eq!(
         created.command.last().map(String::as_str),
         Some("clone-arg")
@@ -592,7 +601,7 @@ services:
     let Response::Events { events: later, .. } = paged else {
         eyre::bail!("expected an event list, got {paged:?}");
     };
-    assert!(!later.is_empty());
+    assert_ne!(later, [] as [micromux::ServiceEvent; 0]);
     assert!(later.iter().all(|event| event.seq > first_seq));
 
     session.shutdown.cancel();

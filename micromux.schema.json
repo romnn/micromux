@@ -112,6 +112,39 @@
     "logs": {
       "$ref": "#/definitions/logs"
     },
+    "session": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Session identity used for hostnames and the MICROMUX_SESSION variables. Changes require a session restart.",
+      "properties": {
+        "name": {
+          "type": "string",
+          "pattern": "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$",
+          "description": "Session name, a lowercase hostname label. Defaults to the config directory's name, slugified to [a-z0-9-]."
+        },
+        "domain": {
+          "type": "string",
+          "pattern": "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$",
+          "default": "localhost",
+          "description": "Parent domain of the session's hostnames."
+        }
+      }
+    },
+    "allocate_ports": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "pattern": "^[A-Za-z_][A-Za-z0-9_]*$",
+        "not": {
+          "anyOf": [
+            { "pattern": "^[Mm][Ii][Cc][Rr][Oo][Mm][Uu][Xx]_" },
+            { "enum": ["TERM", "CLICOLOR", "CLICOLOR_FORCE", "FORCE_COLOR"] }
+          ]
+        }
+      },
+      "description": "Environment variable names that each receive a free TCP port, stable across restarts of this session and never shared with another live session. The values override env_file and environment definitions of the same names. Changes require a session restart."
+    },
     "services": {
       "type": "object",
       "additionalProperties": {

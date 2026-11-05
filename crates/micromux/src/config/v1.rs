@@ -1,6 +1,6 @@
 use super::{
     Config, ConfigError, ControlConfig, DynamicServicesPolicy, HealthCheckDefaults, Service,
-    UiConfig, parse, parse_duration, parse_optional,
+    SessionConfig, UiConfig, parse, parse_duration, parse_optional,
 };
 use crate::diagnostics::DiagnosticExt;
 use crate::{
@@ -63,6 +63,8 @@ const KNOWN_CONFIG_KEYS: &[&str] = &[
     "restart",
     "healthcheck",
     "logs",
+    "session",
+    "allocate_ports",
     "services",
 ];
 
@@ -1343,6 +1345,7 @@ pub fn parse_config<F: Copy + PartialEq>(
         diagnostics,
     )?;
     let log_display = parse_log_display(value.get("logs"), &LogDisplay::default())?;
+    let session = parse_session(value, file_id, strict, diagnostics)?;
     let services = parse_services(
         value,
         ServiceDefaults {
@@ -1363,8 +1366,82 @@ pub fn parse_config<F: Copy + PartialEq>(
         log_display,
         restart_policy,
         healthcheck_defaults,
+        session,
         services,
     })
+}
+
+/// Parse the top-level `session` mapping and `allocate_ports` list.
+fn parse_session<F: Copy>(
+    value: &yaml_spanned::Spanned<Value>,
+    file_id: F,
+    strict: bool,
+    diagnostics: &mut Vec<Diagnostic<F>>,
+) -> Result<SessionConfig, ConfigError> {
+    let mut session = SessionConfig::default();
+    if let Some(mapping) = value.get("session") {
+        let (_span, mapping) = expect_mapping(mapping, "session must be a mapping".into())?;
+        warn_unknown_keys(
+            mapping,
+            &["name", "domain"],
+            "session",
+            file_id,
+            strict,
+            diagnostics,
+        );
+        session.name = parse_optional::<String>(mapping.get("name"))?;
+        if let Some(name) = &session.name
+            && !crate::session::is_hostname_label(name)
+        {
+            return Err(ConfigError::InvalidValue {
+                message: format!(
+                    "session.name `{}` must be a lowercase hostname label (a-z, 0-9, inner \
+                     hyphens, at most 63 characters)",
+                    name.inner
+                ),
+                span: name.span.into(),
+            });
+        }
+        session.domain = parse_optional::<String>(mapping.get("domain"))?;
+        if let Some(domain) = &session.domain
+            && !crate::session::is_hostname(domain)
+        {
+            return Err(ConfigError::InvalidValue {
+                message: format!(
+                    "session.domain `{}` must be a lowercase hostname such as `localhost`",
+                    domain.inner
+                ),
+                span: domain.span.into(),
+            });
+        }
+    }
+    if let Some(names) = value.get("allocate_ports") {
+        let names = expect_sequence(
+            names,
+            Some("allocate_ports must be a list of environment variable names"),
+        )?;
+        for name in names {
+            let name = parse::<String>(name)?;
+            if let Some(problem) = crate::session::allocation_name_problem(&name) {
+                return Err(ConfigError::InvalidValue {
+                    message: format!("allocate_ports entry `{}` {problem}", name.inner),
+                    span: name.span.into(),
+                });
+            }
+            if session
+                .allocate_ports
+                .iter()
+                .any(|existing| existing.inner.eq_ignore_ascii_case(&name.inner))
+            {
+                return Err(ConfigError::InvalidValue {
+                    message: format!("allocate_ports lists `{}` more than once", name.inner),
+                    span: name.span.into(),
+                });
+            }
+            session.allocate_ports.push(name);
+        }
+    }
+    Ok(session)
 }
 
 #[cfg(test)]
@@ -1409,7 +1486,7 @@ mod tests {
             get_service(&parsed.config, "worker")?.startup_mode,
             StartupMode::Enabled
         );
-        assert!(diagnostics.is_empty());
+        assert_eq!(diagnostics, Vec::new());
         Ok(())
     }
 
@@ -1513,7 +1590,7 @@ mod tests {
             get_service(&parsed.config, "plain")?.stop_signal.inner,
             crate::spec::StopSignal::Term
         );
-        assert!(diagnostics.is_empty());
+        assert_eq!(diagnostics, Vec::new());
         Ok(())
     }
 
@@ -2443,6 +2520,76 @@ mod tests {
             message.contains("cannot resolve allowed working root")
                 && message.contains(&format!("variable `{variable}` is not set"))
         }));
+    }
+
+    #[test]
+    fn parses_session_settings_and_allocated_ports() -> eyre::Result<()> {
+        let yaml = indoc! {r#"
+            version: 1
+            session:
+              name: luup2
+              domain: dev.localhost
+            allocate_ports: [API_PORT, db_port]
+            services:
+              app:
+                command: ["true"]
+        "#};
+        let mut diagnostics = Vec::new();
+
+        let config = config::from_str(yaml, Path::new("."), 0usize, None, &mut diagnostics)?;
+
+        let session = &config.config.session;
+        assert_eq!(
+            session.name.as_ref().map(|name| name.inner.as_str()),
+            Some("luup2")
+        );
+        assert_eq!(
+            session.domain.as_ref().map(|domain| domain.inner.as_str()),
+            Some("dev.localhost")
+        );
+        let names = session
+            .allocate_ports
+            .iter()
+            .map(|name| name.inner.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["API_PORT", "db_port"]);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        Ok(())
+    }
+
+    /// Invalid session names and allocation names are errors that point at the offending value
+    /// instead of being rewritten silently.
+    #[test]
+    fn rejects_invalid_session_settings() {
+        for (yaml, expected) in [
+            (
+                "session: { name: Luup_2 }",
+                "must be a lowercase hostname label",
+            ),
+            (
+                "session: { domain: 'a..b' }",
+                "must be a lowercase hostname",
+            ),
+            (
+                "allocate_ports: [2PORT]",
+                "must be an environment variable name",
+            ),
+            (
+                "allocate_ports: [MICROMUX_X]",
+                "MICROMUX_ prefix is reserved",
+            ),
+            (
+                "allocate_ports: [TERM]",
+                "sets this variable on every service",
+            ),
+            ("allocate_ports: [PORT, port]", "more than once"),
+        ] {
+            let yaml = format!("version: 1\n{yaml}\nservices:\n  app:\n    command: [\"true\"]\n");
+            let mut diagnostics = Vec::new();
+            let result = config::from_str(&yaml, Path::new("."), 0usize, None, &mut diagnostics);
+            let message = result.err().map(|err| err.to_string()).unwrap_or_default();
+            assert!(message.contains(expected), "{yaml}: {message}");
+        }
     }
 
     #[test]

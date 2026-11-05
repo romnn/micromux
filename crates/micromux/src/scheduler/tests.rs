@@ -37,6 +37,7 @@ async fn run_test_scheduler(
         shutdown,
         config_dir: Path::new(".").to_path_buf(),
         dynamic_policy: DynamicServicesPolicy::default(),
+        session_environment: crate::SessionEnvironment::default(),
         default_log_retention: crate::LogRetention::default(),
         default_log_display: crate::LogDisplay::default(),
     })
@@ -118,6 +119,7 @@ fn spawn_harness_with_policy(
                 shutdown,
                 config_dir,
                 dynamic_policy,
+                session_environment: crate::SessionEnvironment::default(),
                 default_log_retention: crate::LogRetention::default(),
                 default_log_display: crate::LogDisplay::default(),
             })
@@ -150,6 +152,7 @@ async fn config_reload_wait_keeps_draining_process_events() -> eyre::Result<()> 
             shutdown: CancellationToken::new(),
             config_dir: PathBuf::new(),
             dynamic_policy: DynamicServicesPolicy::default(),
+            session_environment: crate::SessionEnvironment::default(),
             default_log_retention: LogRetention::default(),
             default_log_display: crate::LogDisplay::default(),
         },
@@ -203,6 +206,7 @@ async fn config_reload_wait_yields_to_session_shutdown() -> eyre::Result<()> {
             shutdown: shutdown.clone(),
             config_dir: PathBuf::new(),
             dynamic_policy: DynamicServicesPolicy::default(),
+            session_environment: crate::SessionEnvironment::default(),
             default_log_retention: LogRetention::default(),
             default_log_display: crate::LogDisplay::default(),
         },
@@ -1669,6 +1673,7 @@ fn reload_config(config_path: &Path) -> eyre::Result<ReloadConfig> {
         config_path: config_path.to_path_buf(),
         config_dir: config_dir.to_path_buf(),
         strict_override: None,
+        session: std::sync::Arc::new(crate::session::SessionContext::unconfigured()),
     })
 }
 
@@ -1679,7 +1684,10 @@ fn services_from_config_path(config_path: &Path) -> eyre::Result<ServiceMap> {
         .ok_or_else(|| eyre::eyre!("missing config parent"))?;
     let mut diagnostics = Vec::new();
     let config = crate::config::from_str(&raw, config_dir, 0usize, None, &mut diagnostics)?;
-    Ok(crate::service_map_from_config(&config)?)
+    Ok(crate::service_map_from_config(
+        &config,
+        &crate::SessionEnvironment::default(),
+    )?)
 }
 
 #[test]

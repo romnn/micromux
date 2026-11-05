@@ -4,11 +4,8 @@
 //! the proxy derive the identical name from the same input and the common one-session-per-project
 //! case needs no enumeration.
 
-use std::borrow::Cow;
 use std::fmt;
 use std::path::{Path, PathBuf};
-
-use sha2::{Digest, Sha256};
 
 /// A control endpoint, keyed by filesystem path / pipe name. The supported transports are a closed
 /// set: no network transport, ever.
@@ -123,26 +120,7 @@ pub fn endpoint_hash(config_path: &CanonicalConfigPath) -> String {
 /// Raw digest of an arbitrary path's bytes. Crate-private: the typed [`endpoint_hash`] is the
 /// public entrypoint, so endpoint names are only ever derived from canonical config paths.
 pub(crate) fn hash_path(path: &Path) -> String {
-    let input = endpoint_hash_input(path);
-    let digest = Sha256::digest(input.as_ref());
-    let mut out = String::with_capacity(16);
-    for byte in digest.iter().take(8) {
-        use std::fmt::Write as _;
-        let _ = write!(out, "{byte:02x}");
-    }
-    out
-}
-
-#[cfg(unix)]
-fn endpoint_hash_input(config_path: &Path) -> Cow<'_, [u8]> {
-    use std::os::unix::ffi::OsStrExt;
-
-    Cow::Borrowed(config_path.as_os_str().as_bytes())
-}
-
-#[cfg(not(unix))]
-fn endpoint_hash_input(config_path: &Path) -> Cow<'_, [u8]> {
-    Cow::Owned(config_path.to_string_lossy().into_owned().into_bytes())
+    micromux::session::config_path_key(path)
 }
 
 /// Resolve the per-user runtime directory for micromux endpoints, creating it with restrictive

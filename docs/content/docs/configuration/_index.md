@@ -34,6 +34,7 @@ Add the `$schema` comment at the top and an editor with the YAML language server
 | `logs` | Default [log retention]({{< relref "logs.md" >}}) inherited by services. |
 | `ui` | Terminal-UI options — see below. |
 | `control` | The [agent control plane]({{< relref "../agent-control/_index.md" >}}) and runtime-service policy. |
+| `session`, `allocate_ports` | The session's name and its [allocated ports]({{< relref "sessions.md" >}}). |
 
 ## In this section
 
@@ -42,6 +43,7 @@ Add the `$schema` comment at the top and an editor with the YAML language server
 - **[Healthchecks]({{< relref "healthchecks.md" >}})** — probes, timing, retries, and inherited defaults.
 - **[Restart policies]({{< relref "restart-policies.md" >}})** — `always`, `unless-stopped`, `on-failure[:N]`, `no`.
 - **[Logs]({{< relref "logs.md" >}})** — in-memory tail versus retained disk runs, and structured JSON.
+- **[Sessions and ports]({{< relref "sessions.md" >}})** — session names, allocated ports, and the variables micromux injects.
 - **[Configuration reference]({{< relref "reference.md" >}})** — every key, and the JSON schema.
 
 ## Inheritance

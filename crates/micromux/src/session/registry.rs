@@ -1,0 +1,579 @@
+//! The per-user registry of session-allocated ports.
+//!
+//! Each session that allocates ports owns two files in the registry directory, keyed by the
+//! digest of its canonical config path:
+//!
+//! - `<key>.json` persists the assignment, so a restart gets the same ports back.
+//! - `<key>.lock` is held with an exclusive lock for the session's whole lifetime.
+//!
+//! The kernel releases a lock when its holder dies, SIGKILL included, so a lock that can be taken
+//! proves its owner is gone; a missing or stale record proves nothing.
+//! Every read, liveness probe, and write happens under the registry-wide `registry.lock`, which
+//! serializes allocation between sessions starting at the same time.
+//! Lock files are never removed: replacing one would let two processes hold "the" lock at once.
+
+use std::collections::HashSet;
+use std::fs::{File, OpenOptions, TryLockError};
+use std::io::Write as _;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener};
+use std::ops::RangeInclusive;
+use std::path::{Path, PathBuf};
+
+use indexmap::IndexMap;
+use serde::{Deserialize, Serialize};
+
+use super::{SessionError, config_path_key};
+
+/// Ports handed out to sessions.
+///
+/// The range sits below the ephemeral ranges of Linux (32768+) and macOS (49152+), so outgoing
+/// connections never take a port a session has been promised.
+pub(crate) const PORT_RANGE: RangeInclusive<u16> = 20000..=32767;
+
+const REGISTRY_LOCK: &str = "registry.lock";
+
+/// Persisted port assignment of one session.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Record {
+    /// Canonical config path, for humans and conflict messages.
+    config_path: String,
+    /// Session name, which must be unique among live sessions.
+    session_name: String,
+    /// Allocated port per variable name.
+    ports: IndexMap<String, u16>,
+}
+
+/// Keeps a session's ports reserved while held.
+#[derive(Debug)]
+pub(crate) struct Lease {
+    #[expect(
+        dead_code,
+        reason = "held for RAII: the exclusive lock marks this session live in the registry"
+    )]
+    instance: File,
+}
+
+/// Where the per-user port registry lives.
+#[derive(Debug, Clone, Default)]
+pub struct PortRegistry {
+    directory: Option<PathBuf>,
+}
+
+impl PortRegistry {
+    /// The current user's registry, located when first used.
+    #[must_use]
+    pub fn user() -> Self {
+        Self::default()
+    }
+
+    /// A registry in `directory`, for tests and isolated setups.
+    #[must_use]
+    pub fn at(directory: impl Into<PathBuf>) -> Self {
+        Self {
+            directory: Some(directory.into()),
+        }
+    }
+
+    fn directory(&self) -> Result<PathBuf, SessionError> {
+        let directory = match &self.directory {
+            Some(directory) => directory.clone(),
+            None => user_registry_directory().ok_or(SessionError::NoStateDirectory)?,
+        };
+        create_private_dir(&directory).map_err(|source| SessionError::Io {
+            path: directory.clone(),
+            source,
+        })?;
+        Ok(directory)
+    }
+
+    /// The assignment persisted for `config_path`, read without locking or reserving anything.
+    ///
+    /// Records are replaced atomically, so an unlocked read sees either the old or the new one.
+    pub(crate) fn persisted(&self, config_path: &Path) -> Option<IndexMap<String, u16>> {
+        let directory = match &self.directory {
+            Some(directory) => directory.clone(),
+            None => user_registry_directory()?,
+        };
+        let path = directory.join(format!("{}.json", config_path_key(config_path)));
+        read_record(&path).ok().flatten().map(|record| record.ports)
+    }
+
+    /// Reserves a port for every name in `names`, reusing this session's persisted assignment.
+    ///
+    /// The returned lease marks the session live until it is dropped.
+    pub(crate) fn acquire(
+        &self,
+        config_path: &Path,
+        session_name: &str,
+        names: &[String],
+        excluded: &[u16],
+    ) -> Result<(IndexMap<String, u16>, Lease), SessionError> {
+        let directory = self.directory()?;
+        let io = |path: &Path| {
+            let path = path.to_path_buf();
+            move |source| SessionError::Io { path, source }
+        };
+
+        // Serialize with every other session's allocation
+        let registry_lock_path = directory.join(REGISTRY_LOCK);
+        let registry_lock = open_lock_file(&registry_lock_path, true)
+            .map_err(io(&registry_lock_path))?
+            .ok_or_else(|| SessionError::Io {
+                path: registry_lock_path.clone(),
+                source: std::io::ErrorKind::NotFound.into(),
+            })?;
+        registry_lock.lock().map_err(io(&registry_lock_path))?;
+
+        // Claim this session's own instance lock
+        let key = config_path_key(config_path);
+        let instance_path = directory.join(format!("{key}.lock"));
+        let instance = open_lock_file(&instance_path, true)
+            .map_err(io(&instance_path))?
+            .ok_or_else(|| SessionError::Io {
+                path: instance_path.clone(),
+                source: std::io::ErrorKind::NotFound.into(),
+            })?;
+        match instance.try_lock() {
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => {
+                return Err(SessionError::AlreadyRunning {
+                    config_path: config_path.to_path_buf(),
+                });
+            }
+            Err(TryLockError::Error(source)) => {
+                return Err(SessionError::Io {
+                    path: instance_path,
+                    source,
+                });
+            }
+        }
+
+        // Survey the other sessions
+        let survey = survey(&directory, &key, session_name)?;
+
+        // Assign ports
+        let record_path = directory.join(format!("{key}.json"));
+        let persisted = match read_record(&record_path) {
+            Ok(record) => record.map(|record| record.ports).unwrap_or_default(),
+            Err(message) => {
+                tracing::warn!(path = %record_path.display(), message, "ignoring unreadable port record");
+                IndexMap::new()
+            }
+        };
+        let mut ports = IndexMap::new();
+        let mut taken: HashSet<u16> = survey.live.clone();
+        taken.extend(excluded.iter().copied());
+        for name in names {
+            let port = match persisted.get(name).copied() {
+                Some(port) if excluded.contains(&port) => {
+                    return Err(SessionError::PortReserved {
+                        variable: name.clone(),
+                        port,
+                        record: record_path,
+                    });
+                }
+                Some(port)
+                    if !survey.live.contains(&port) && !ports.values().any(|p| *p == port) =>
+                {
+                    if !port_is_free(port) {
+                        return Err(SessionError::PortBusy {
+                            variable: name.clone(),
+                            port,
+                        });
+                    }
+                    port
+                }
+                _ => pick_port(&key, name, &taken, &survey.dormant)?,
+            };
+            taken.insert(port);
+            ports.insert(name.clone(), port);
+        }
+
+        // Commit before any service can start using the ports
+        let record = Record {
+            config_path: config_path.display().to_string(),
+            session_name: session_name.to_string(),
+            ports: ports.clone(),
+        };
+        write_record(&directory, &record_path, &record).map_err(io(&record_path))?;
+        drop(registry_lock);
+        Ok((ports, Lease { instance }))
+    }
+}
+
+/// Ports claimed by other sessions.
+struct Survey {
+    /// Ports of sessions whose instance lock is held.
+    live: HashSet<u16>,
+    /// Ports persisted by sessions that are not running, reused only as a last resort so their
+    /// next start finds its assignment intact.
+    dormant: HashSet<u16>,
+}
+
+fn survey(directory: &Path, own_key: &str, session_name: &str) -> Result<Survey, SessionError> {
+    let mut survey = Survey {
+        live: HashSet::new(),
+        dormant: HashSet::new(),
+    };
+    let entries = std::fs::read_dir(directory).map_err(|source| SessionError::Io {
+        path: directory.to_path_buf(),
+        source,
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|source| SessionError::Io {
+            path: directory.to_path_buf(),
+            source,
+        })?;
+        let path = entry.path();
+        let Some(key) = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_suffix(".json"))
+        else {
+            continue;
+        };
+        if key == own_key {
+            continue;
+        }
+        let lock_path = directory.join(format!("{key}.lock"));
+        let live = owner_is_live(&lock_path).map_err(|source| SessionError::Io {
+            path: lock_path,
+            source,
+        })?;
+        let record = match read_record(&path) {
+            Ok(Some(record)) => record,
+            Ok(None) => continue,
+            Err(message) if live => {
+                return Err(SessionError::UnreadableRecord { path, message });
+            }
+            Err(message) => {
+                tracing::warn!(path = %path.display(), message, "ignoring unreadable port record");
+                continue;
+            }
+        };
+        if live {
+            if record.session_name == session_name {
+                return Err(SessionError::NameInUse {
+                    name: session_name.to_string(),
+                    other_config: record.config_path,
+                });
+            }
+            survey.live.extend(record.ports.values().copied());
+        } else {
+            survey.dormant.extend(record.ports.values().copied());
+        }
+    }
+    Ok(survey)
+}
+
+/// Picks a free port for `name`, preferring ports no other session has ever been assigned.
+///
+/// The scan starts at an offset derived from the session and the variable, so a session tends to
+/// get the same ports again even after its record is deleted.
+fn pick_port(
+    key: &str,
+    name: &str,
+    taken: &HashSet<u16>,
+    dormant: &HashSet<u16>,
+) -> Result<u16, SessionError> {
+    let start = *PORT_RANGE.start();
+    let len = u32::from(*PORT_RANGE.end() - start) + 1;
+    let seed = config_path_key(Path::new(&format!("{key}/{name}")));
+    let offset = u32::from_str_radix(seed.get(..8).unwrap_or("0"), 16).unwrap_or(0) % len;
+    let candidates = || {
+        (0..len).filter_map(move |step| {
+            u16::try_from((offset + step) % len)
+                .ok()
+                .map(|index| start + index)
+        })
+    };
+    for avoid_dormant in [true, false] {
+        if let Some(port) = candidates().find(|port| {
+            let reserved = avoid_dormant && dormant.contains(port);
+            !taken.contains(port) && !reserved && port_is_free(*port)
+        }) {
+            return Ok(port);
+        }
+    }
+    Err(SessionError::Exhausted {
+        variable: name.to_string(),
+    })
+}
+
+/// Whether nothing currently listens on `port`, probed by binding the loopback and wildcard
+/// addresses.
+///
+/// Probing both matters on macOS, where a specific-address bind can succeed next to a wildcard
+/// listener and vice versa.
+/// IPv6 being unavailable does not make a port busy.
+fn port_is_free(port: u16) -> bool {
+    let ipv4 = [Ipv4Addr::LOCALHOST, Ipv4Addr::UNSPECIFIED]
+        .into_iter()
+        .all(|address| TcpListener::bind(SocketAddr::from((address, port))).is_ok());
+    let ipv6 = match TcpListener::bind(SocketAddr::from((Ipv6Addr::LOCALHOST, port))) {
+        Ok(_) => true,
+        Err(err) => err.kind() != std::io::ErrorKind::AddrInUse,
+    };
+    ipv4 && ipv6
+}
+
+/// Whether some process holds the instance lock at `path`.
+///
+/// Only called under the registry lock, which every session also holds while claiming its own
+/// instance lock, so the brief probe lock can never make a starting session look like a
+/// duplicate.
+fn owner_is_live(path: &Path) -> std::io::Result<bool> {
+    let Some(file) = open_lock_file(path, false)? else {
+        return Ok(false);
+    };
+    match file.try_lock() {
+        Ok(()) => {
+            file.unlock()?;
+            Ok(false)
+        }
+        Err(TryLockError::WouldBlock) => Ok(true),
+        Err(TryLockError::Error(err)) => Err(err),
+    }
+}
+
+fn open_lock_file(path: &Path, create: bool) -> std::io::Result<Option<File>> {
+    match OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(create)
+        .truncate(false)
+        .open(path)
+    {
+        Ok(file) => Ok(Some(file)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound && !create => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
+/// Reads a record, `Ok(None)` when there is none, and a message when it cannot be parsed.
+fn read_record(path: &Path) -> Result<Option<Record>, String> {
+    match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(|err| err.to_string()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err.to_string()),
+    }
+}
+
+/// Replaces a record atomically and durably: a crash leaves either the old or the new record.
+fn write_record(directory: &Path, path: &Path, record: &Record) -> std::io::Result<()> {
+    let bytes = serde_json::to_vec_pretty(record).map_err(std::io::Error::other)?;
+    let mut temporary = tempfile::NamedTempFile::new_in(directory)?;
+    temporary.write_all(&bytes)?;
+    temporary.as_file().sync_all()?;
+    temporary.persist(path).map_err(|err| err.error)?;
+    #[cfg(unix)]
+    File::open(directory)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn create_private_dir(directory: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt as _;
+
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(directory)
+}
+
+#[cfg(not(unix))]
+fn create_private_dir(directory: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(directory)
+}
+
+/// The current user's registry directory.
+///
+/// On Unix it derives from the account's home directory in the password database rather than
+/// `$HOME` or `$XDG_STATE_HOME`, so sessions started from differently configured shells, agents,
+/// or services still share one registry.
+#[cfg(unix)]
+fn user_registry_directory() -> Option<PathBuf> {
+    let user = nix::unistd::User::from_uid(nix::unistd::Uid::current())
+        .ok()
+        .flatten()?;
+    let state = if cfg!(target_os = "macos") {
+        user.dir
+            .join("Library/Application Support/com.romnn.micromux")
+    } else {
+        user.dir.join(".local/state/micromux")
+    };
+    Some(state.join("ports"))
+}
+
+#[cfg(not(unix))]
+fn user_registry_directory() -> Option<PathBuf> {
+    crate::project_dir().map(|directories| directories.data_local_dir().join("ports"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use color_eyre::eyre;
+    use similar_asserts::assert_eq;
+
+    fn names(names: &[&str]) -> Vec<String> {
+        names.iter().map(ToString::to_string).collect()
+    }
+
+    /// A restarted session gets back exactly the ports it had, and a second live session never
+    /// receives one of them.
+    #[test]
+    fn assignments_are_stable_and_disjoint() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let registry = PortRegistry::at(directory.path());
+        let first = Path::new("/projects/one/micromux.yaml");
+        let second = Path::new("/projects/two/micromux.yaml");
+
+        let (ports, lease) = registry.acquire(first, "one", &names(&["A", "B"]), &[])?;
+        assert_eq!(ports.len(), 2);
+        assert!(ports.values().all(|port| PORT_RANGE.contains(port)));
+        assert_ne!(ports.get("A"), ports.get("B"));
+
+        // A concurrent session avoids every port the live one holds.
+        let (other, other_lease) = registry.acquire(second, "two", &names(&["A", "B"]), &[])?;
+        assert!(
+            other
+                .values()
+                .all(|port| !ports.values().any(|p| p == port))
+        );
+
+        // Restarting the first session reproduces its assignment.
+        drop(lease);
+        let (again, _lease) = registry.acquire(first, "one", &names(&["A", "B"]), &[])?;
+        assert_eq!(again, ports);
+        drop(other_lease);
+        Ok(())
+    }
+
+    /// The instance lock makes a second supervisor for the same config fail instead of sharing
+    /// its ports.
+    #[test]
+    fn second_instance_of_the_same_config_is_rejected() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let registry = PortRegistry::at(directory.path());
+        let config = Path::new("/projects/one/micromux.yaml");
+
+        let (_ports, _lease) = registry.acquire(config, "one", &names(&["A"]), &[])?;
+        let result = registry.acquire(config, "one", &names(&["A"]), &[]);
+
+        assert!(matches!(result, Err(SessionError::AlreadyRunning { .. })));
+        Ok(())
+    }
+
+    /// Two live sessions with one name would serve the same hostnames, so the second fails; once
+    /// the first stops, the name is free again.
+    #[test]
+    fn live_sessions_need_distinct_names() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let registry = PortRegistry::at(directory.path());
+
+        let (_ports, lease) = registry.acquire(
+            Path::new("/a/app/micromux.yaml"),
+            "app",
+            &names(&["A"]),
+            &[],
+        )?;
+        let result = registry.acquire(
+            Path::new("/b/app/micromux.yaml"),
+            "app",
+            &names(&["A"]),
+            &[],
+        );
+        assert!(matches!(result, Err(SessionError::NameInUse { .. })));
+
+        drop(lease);
+        registry.acquire(
+            Path::new("/b/app/micromux.yaml"),
+            "app",
+            &names(&["A"]),
+            &[],
+        )?;
+        Ok(())
+    }
+
+    /// A persisted port that a foreign process now holds fails the start rather than pointing the
+    /// session at that process.
+    #[test]
+    fn busy_persisted_port_fails_startup() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let registry = PortRegistry::at(directory.path());
+        let config = Path::new("/projects/one/micromux.yaml");
+        let (ports, lease) = registry.acquire(config, "one", &names(&["A"]), &[])?;
+        drop(lease);
+        let port = *ports.get("A").ok_or_else(|| eyre::eyre!("no port"))?;
+
+        let _foreign = TcpListener::bind((Ipv4Addr::LOCALHOST, port))?;
+        let result = registry.acquire(config, "one", &names(&["A"]), &[]);
+
+        assert!(
+            matches!(&result, Err(SessionError::PortBusy { variable, port: busy }) if variable == "A" && *busy == port),
+            "{result:?}"
+        );
+        Ok(())
+    }
+
+    /// Excluded ports are never assigned, and a persisted assignment that became reserved is an
+    /// error instead of a silent change.
+    #[test]
+    fn excluded_ports_are_never_assigned() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let registry = PortRegistry::at(directory.path());
+        let config = Path::new("/projects/one/micromux.yaml");
+        let (ports, lease) = registry.acquire(config, "one", &names(&["A"]), &[])?;
+        drop(lease);
+        let port = *ports.get("A").ok_or_else(|| eyre::eyre!("no port"))?;
+
+        let result = registry.acquire(config, "one", &names(&["A"]), &[port]);
+        assert!(matches!(result, Err(SessionError::PortReserved { .. })));
+
+        let other = Path::new("/projects/two/micromux.yaml");
+        let (fresh, _lease) = registry.acquire(other, "two", &names(&["A"]), &[port])?;
+        assert_ne!(fresh.get("A"), Some(&port));
+        Ok(())
+    }
+
+    /// Validation reads the persisted assignment without taking the session's lock.
+    #[test]
+    fn persisted_assignment_is_readable_while_live() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let registry = PortRegistry::at(directory.path());
+        let config = Path::new("/projects/one/micromux.yaml");
+        let (ports, _lease) = registry.acquire(config, "one", &names(&["A"]), &[])?;
+
+        assert_eq!(registry.persisted(config), Some(ports));
+        Ok(())
+    }
+
+    /// A live session whose record cannot be read has unknown ports, so allocation refuses to
+    /// guess.
+    #[test]
+    fn unreadable_record_of_a_live_session_is_an_error() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let registry = PortRegistry::at(directory.path());
+        let first = Path::new("/projects/one/micromux.yaml");
+        let (_ports, _lease) = registry.acquire(first, "one", &names(&["A"]), &[])?;
+        std::fs::write(
+            directory
+                .path()
+                .join(format!("{}.json", config_path_key(first))),
+            "{",
+        )?;
+
+        let result = registry.acquire(
+            Path::new("/projects/two/micromux.yaml"),
+            "two",
+            &names(&["A"]),
+            &[],
+        );
+
+        assert!(matches!(result, Err(SessionError::UnreadableRecord { .. })));
+        Ok(())
+    }
+}

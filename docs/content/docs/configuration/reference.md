@@ -1,6 +1,6 @@
 ---
 title: Configuration reference
-weight: 6
+weight: 7
 ---
 
 # Configuration reference
@@ -24,6 +24,8 @@ Every key in `micromux.yaml`. The machine-readable source of truth is [`micromux
 | `logs` | object | — | Default [log retention]({{< relref "logs.md" >}}). |
 | `ui` | object | — | Terminal-UI options. |
 | `control` | object | — | [Control plane]({{< relref "../agent-control/_index.md" >}}) and dynamic-service policy. |
+| `session` | object | — | [Session]({{< relref "sessions.md" >}}) `name` (default: the config directory's name, slugified) and `domain` (default `localhost`). |
+| `allocate_ports` | array | — | Environment variable names that each receive a [session-allocated port]({{< relref "sessions.md" >}}#allocated-ports). |
 
 ## `services.<id>`
 
