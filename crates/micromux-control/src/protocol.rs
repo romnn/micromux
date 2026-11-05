@@ -608,7 +608,7 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(minimal.expires_at_unix_ms, None);
-        assert!(minimal.ports.is_empty());
+        assert_eq!(minimal.ports, [] as [u16; 0]);
         assert!(!minimal.already_retired);
     }
 

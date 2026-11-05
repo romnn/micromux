@@ -3073,10 +3073,16 @@ mod tests {
             let root_stamp = crate::process_tree::stamp(root)
                 .ok_or_else(|| eyre::eyre!("expected a stamp for the live shell"))?;
 
-            // Wait for the escaped sleep to fork.
+            // Wait for the escaped sleep to fork and move into its own group: bash calls
+            // `setpgid` after `fork`, so a walk in between still sees the leader's group.
             let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            let left_group = |escapees: &[crate::process_tree::Descendant]| {
+                escapees
+                    .iter()
+                    .any(|descendant| descendant.process_group.is_some_and(|group| group != root))
+            };
             let mut escapees = crate::process_tree::descendants(root_stamp);
-            while escapees.is_empty() && std::time::Instant::now() < deadline {
+            while !left_group(&escapees) && std::time::Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(25));
                 escapees = crate::process_tree::descendants(root_stamp);
             }

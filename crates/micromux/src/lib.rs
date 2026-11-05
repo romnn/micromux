@@ -29,6 +29,7 @@ mod model;
 mod process_tree;
 mod scheduler;
 mod service;
+pub mod session;
 mod spec;
 pub mod structured_log;
 #[cfg(test)]
@@ -75,6 +76,7 @@ pub use service::{
     Error as ServiceError, RestartPolicy, Site as ServiceSite, SkipReason as EnvFileSkipReason,
     SkippedEnvFile, WorkingDirectoryError,
 };
+pub use session::{PortRegistry, Session, SessionEnvironment, SessionError, SessionIdentity};
 pub use spec::{
     DependencySpec, DynamicOrigin, DynamicServiceParams, HealthcheckSpec, Lease,
     PartialServiceSpec, ServiceOrigin, ServiceSpec, SpecError, SpecField, StopSignal,
@@ -109,6 +111,9 @@ pub enum Error {
     /// Service dependencies are invalid.
     #[error(transparent)]
     Graph(#[from] GraphError),
+    /// The session's identity or allocated ports could not be established.
+    #[error(transparent)]
+    Session(#[from] SessionError),
 }
 
 /// Where a session re-reads its config from, and how it interprets the file.
@@ -123,6 +128,8 @@ pub(crate) struct ReloadConfig {
     /// makes an unchanged file reload to identical services.
     pub(crate) config_dir: PathBuf,
     pub(crate) strict_override: Option<bool>,
+    /// The session latched at startup, which every reload resolves against.
+    pub(crate) session: Arc<session::SessionContext>,
 }
 
 /// Service definitions that could not be materialized.
@@ -190,7 +197,10 @@ impl MaterializedServices {
 ///
 /// Services are independent, so a validation report can name every failing service at once
 /// instead of stopping at the first.
-fn materialize_services<F>(config_file: &config::ConfigFile<F>) -> MaterializedServices {
+fn materialize_services<F>(
+    config_file: &config::ConfigFile<F>,
+    pinned: &SessionEnvironment,
+) -> MaterializedServices {
     let config_dir = &config_file.config_dir;
     // One snapshot of the supervisor environment per config load, so every service resolves
     // against the same values.
@@ -206,6 +216,7 @@ fn materialize_services<F>(config_file: &config::ConfigFile<F>) -> MaterializedS
             config_dir,
             service_config.clone(),
             &supervisor_environment,
+            pinned,
             &mut skipped_env_files,
         ) {
             Ok(service) => {
@@ -223,8 +234,9 @@ fn materialize_services<F>(config_file: &config::ConfigFile<F>) -> MaterializedS
 
 pub(crate) fn service_map_from_config<F>(
     config_file: &config::ConfigFile<F>,
+    pinned: &SessionEnvironment,
 ) -> Result<ServiceMap, MaterializationFailure> {
-    materialize_services(config_file).into_result()
+    materialize_services(config_file, pinned).into_result()
 }
 
 /// Severity of one config-validation diagnostic.
@@ -313,11 +325,23 @@ pub fn validate_config_file(
         .any(|diagnostic| diagnostic.severity == Severity::Error)
         && let Some(config) = &parsed
     {
+        // Validation never reserves ports: it shows the persisted assignment, or provisional
+        // values for names a session has not been assigned yet.
+        let session = Session::preview(config, &PortRegistry::user());
+        if !session.provisional_ports().is_empty() {
+            source_diagnostics.push(
+                codespan_reporting::diagnostic::Diagnostic::note().with_message(format!(
+                    "no port is assigned yet to {}; validated with provisional values, the \
+                     session assigns real ones when it starts",
+                    session.provisional_ports().join(", ")
+                )),
+            );
+        }
         let MaterializedServices {
             services: service_map,
             errors,
             skipped_env_files,
-        } = materialize_services(config);
+        } = materialize_services(config, &session.environment());
         services.extend(service_map.keys().cloned());
         for skipped in &skipped_env_files {
             source_diagnostics.extend(skipped.to_diagnostics(file_id));
@@ -400,6 +424,7 @@ pub(crate) fn initial_model_entries(services: &ServiceMap) -> Vec<(ServiceSnapsh
 /// Main entry point to run a micromux session.
 pub struct Micromux {
     services: ServiceMap,
+    session: Arc<session::SessionContext>,
     reload_config: Option<ReloadConfig>,
     config_dir: PathBuf,
     dynamic_policy: DynamicServicesPolicy,
@@ -451,12 +476,34 @@ fn memory_retention_is_unbounded(retention: LogRetention) -> bool {
 impl Micromux {
     /// Construct a new [`Micromux`] instance from a parsed [`ConfigFile`].
     ///
+    /// The session is established against the current user's [`PortRegistry`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the session cannot be established (see [`Session::establish`]) or a
+    /// service definition in the configuration cannot be normalized (e.g. invalid environment
+    /// interpolation, invalid port parsing, etc.).
+    pub fn new(config_file: &config::ConfigFile<diagnostics::FileId>) -> Result<Self, Error> {
+        let session = Session::establish(config_file, &PortRegistry::user())?;
+        Self::with_session(config_file, session)
+    }
+
+    /// Construct a new [`Micromux`] instance for an already established [`Session`].
+    ///
+    /// The session is latched: its variables are injected into every service, and a config
+    /// reload that changes the session settings is rejected.
+    /// Its allocated ports stay reserved until the returned value is dropped.
+    ///
     /// # Errors
     ///
     /// Returns an error if a service definition in the configuration cannot be normalized
     /// (e.g. invalid environment interpolation, invalid port parsing, etc.).
-    pub fn new(config_file: &config::ConfigFile<diagnostics::FileId>) -> Result<Self, Error> {
-        let services = service_map_from_config(config_file)?;
+    pub fn with_session(
+        config_file: &config::ConfigFile<diagnostics::FileId>,
+        session: Session,
+    ) -> Result<Self, Error> {
+        let session = Arc::new(session.into_context());
+        let services = service_map_from_config(config_file, &session.environment)?;
         let unbounded_services = services
             .values()
             .filter(|service| memory_retention_is_unbounded(service.log_retention))
@@ -477,6 +524,7 @@ impl Micromux {
                 config_path,
                 config_dir: config_file.config_dir.clone(),
                 strict_override: config_file.strict_override,
+                session: session.clone(),
             });
 
         graph::ServiceGraph::new(&services)?;
@@ -490,12 +538,25 @@ impl Micromux {
 
         Ok(Self {
             services,
+            session,
             reload_config,
             config_dir: config_file.config_dir.clone(),
             dynamic_policy,
             default_log_retention: config_file.config.log_retention,
             default_log_display: config_file.config.log_display.clone(),
         })
+    }
+
+    /// The latched session's name and domain.
+    #[must_use]
+    pub fn session_identity(&self) -> &SessionIdentity {
+        &self.session.identity
+    }
+
+    /// The port allocated to every `allocate_ports` name, in config order.
+    #[must_use]
+    pub fn allocated_ports(&self) -> &indexmap::IndexMap<String, u16> {
+        &self.session.ports
     }
 
     /// Start the scheduler, returning the runner future and the capability [`Handles`].
@@ -535,6 +596,7 @@ impl Micromux {
                 shutdown: shutdown.clone(),
                 config_dir: self.config_dir.clone(),
                 dynamic_policy: self.dynamic_policy.clone(),
+                session: self.session.clone(),
                 default_log_retention: self.default_log_retention,
                 default_log_display: self.default_log_display.clone(),
             })
@@ -573,7 +635,7 @@ mod tests {
             .service("worker")
             .ok_or_else(|| eyre::eyre!("missing worker snapshot"))?;
 
-        assert!(diagnostics.is_empty());
+        assert_eq!(diagnostics, Vec::new());
         assert_eq!(snapshot.desired, Desired::Disabled);
         assert_eq!(snapshot.execution, Execution::Pending);
         assert_eq!(snapshot.run_generation, 0);
@@ -624,6 +686,110 @@ mod tests {
 
         shutdown.cancel();
         runner.await??;
+        Ok(())
+    }
+
+    /// Allocated ports and the session name reach every service, shadow configured values, and
+    /// stay latched: a reload that changes the session settings is refused.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn session_variables_reach_services_and_are_latched() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let project = directory.path().join("My Project");
+        std::fs::create_dir_all(&project)?;
+        let config_path = project.join("micromux.yaml");
+        let raw = indoc::indoc! {r#"
+            version: 1
+            allocate_ports: [APP_PORT]
+            services:
+              app:
+                command: ["sh", "-c", "sleep 60"]
+                environment:
+                  APP_PORT: "9540"
+                  APP_URL: "http://app.${MICROMUX_SESSION_DOMAIN}:${APP_PORT}"
+        "#};
+        std::fs::write(&config_path, raw)?;
+        let mut diagnostics = Vec::new();
+        let mut config = from_str(raw, &project, 0usize, None, &mut diagnostics)?;
+        config.config_path = Some(config_path.canonicalize()?);
+
+        let registry = PortRegistry::at(directory.path().join("registry"));
+        let session = Session::establish(&config, &registry)?;
+        let mux = Arc::new(Micromux::with_session(&config, session)?);
+
+        // The default name is the slugified directory name, and the allocation wins over the
+        // inline value.
+        assert_eq!(mux.session_identity().name, "my-project");
+        let port = mux
+            .allocated_ports()
+            .get("APP_PORT")
+            .copied()
+            .ok_or_else(|| eyre::eyre!("APP_PORT was not allocated"))?;
+        let environment = &mux
+            .services
+            .get("app")
+            .ok_or_else(|| eyre::eyre!("missing app"))?
+            .spec
+            .environment;
+        assert_eq!(environment.get("APP_PORT"), Some(&port.to_string()));
+        assert_eq!(
+            environment.get("APP_URL"),
+            Some(&format!("http://app.my-project.localhost:{port}"))
+        );
+        assert_eq!(
+            environment.get("MICROMUX_SESSION").map(String::as_str),
+            Some("my-project")
+        );
+
+        // A reload that adds an allocation is refused instead of half-applied.
+        std::fs::write(
+            &config_path,
+            raw.replace("[APP_PORT]", "[APP_PORT, OTHER_PORT]"),
+        )?;
+        let shutdown = CancellationToken::new();
+        let (runner, handles) = mux.start(shutdown.clone());
+        let runner = tokio::spawn(runner);
+        let result = handles.service_control().reconcile_config(true).await?;
+        let rejection = result.err().map(|rejection| rejection.to_string());
+        assert!(
+            rejection
+                .as_deref()
+                .is_some_and(|message| message.contains("restart the session")),
+            "{rejection:?}"
+        );
+
+        shutdown.cancel();
+        runner.await??;
+        Ok(())
+    }
+
+    /// Every session loaded from a file is registered, so two live sessions never share a name
+    /// even when neither allocates ports.
+    #[test]
+    fn live_sessions_without_allocations_still_need_distinct_names() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let registry = PortRegistry::at(directory.path().join("registry"));
+        let raw = "version: 1\nsession: { name: qa }\nservices: {}\n";
+        let mut configs = Vec::new();
+        for project in ["one", "two"] {
+            let project = directory.path().join(project);
+            std::fs::create_dir_all(&project)?;
+            std::fs::write(project.join("micromux.yaml"), raw)?;
+            let mut config = from_str(raw, &project, 0usize, None, &mut Vec::new())?;
+            config.config_path = Some(project.join("micromux.yaml").canonicalize()?);
+            configs.push(config);
+        }
+        let [one, two] = configs.as_slice() else {
+            eyre::bail!("expected two configs");
+        };
+
+        let _first = Session::establish(one, &registry)?;
+        let second = Session::establish(two, &registry);
+
+        assert!(
+            matches!(second, Err(SessionError::NameInUse { .. })),
+            "{second:?}"
+        );
         Ok(())
     }
 

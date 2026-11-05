@@ -793,7 +793,20 @@ fn load_services_from_disk(reload: &ReloadConfig) -> Result<ServiceMap, String> 
             errors.join("; ")
         ));
     }
-    let services = crate::service_map_from_config(&config)
+    // The running services already received values derived from the session settings, so a
+    // change would leave them inconsistent with anything started afterwards.
+    if !config
+        .config
+        .session
+        .same_settings(&reload.session.settings)
+    {
+        return Err(format!(
+            "the session settings (`session`, `allocate_ports`) in {} changed; restart the \
+             session to apply them",
+            reload.config_path.display()
+        ));
+    }
+    let services = crate::service_map_from_config(&config, &reload.session.environment)
         .map_err(|err| format!("normalize {}: {err}", reload.config_path.display()))?;
     ServiceGraph::new(&services)
         .map_err(|err| format!("validate {}: {err}", reload.config_path.display()))?;
@@ -892,6 +905,9 @@ struct SchedulerRuntime {
     shutdown: CancellationToken,
     config_dir: PathBuf,
     dynamic_policy: DynamicServicesPolicy,
+    /// The latched session; holding it keeps the session registered until the scheduler has
+    /// drained every service.
+    session: std::sync::Arc<crate::session::SessionContext>,
     default_log_retention: LogRetention,
     default_log_display: LogDisplay,
     idempotency: VecDeque<IdempotencyRecord>,
@@ -906,6 +922,9 @@ struct SchedulerResources {
     shutdown: CancellationToken,
     config_dir: PathBuf,
     dynamic_policy: DynamicServicesPolicy,
+    /// The latched session; holding it keeps the session registered until the scheduler has
+    /// drained every service.
+    session: std::sync::Arc<crate::session::SessionContext>,
     default_log_retention: LogRetention,
     default_log_display: LogDisplay,
 }
@@ -947,6 +966,7 @@ impl SchedulerRuntime {
             shutdown,
             config_dir,
             dynamic_policy,
+            session,
             default_log_retention,
             default_log_display,
         } = resources;
@@ -967,6 +987,7 @@ impl SchedulerRuntime {
             shutdown,
             config_dir,
             dynamic_policy,
+            session,
             default_log_retention,
             default_log_display,
             idempotency: VecDeque::new(),
@@ -1342,6 +1363,8 @@ impl SchedulerRuntime {
         spec.normalize()
             .map_err(|err| CommandRejection::InvalidSpec(err.to_string()))?;
         spec.command.extend(params.extra_args.clone());
+        // Dynamic services see the session variables too, and cannot shadow them.
+        self.session.environment.apply_to(&mut spec.environment);
 
         let working_dir = spec
             .working_dir
@@ -2731,6 +2754,7 @@ pub(crate) struct SchedulerInput {
     pub(crate) shutdown: CancellationToken,
     pub(crate) config_dir: PathBuf,
     pub(crate) dynamic_policy: DynamicServicesPolicy,
+    pub(crate) session: std::sync::Arc<crate::session::SessionContext>,
     pub(crate) default_log_retention: LogRetention,
     pub(crate) default_log_display: LogDisplay,
 }
@@ -2749,6 +2773,7 @@ pub(crate) async fn scheduler(input: SchedulerInput) -> Result<(), crate::graph:
         shutdown,
         config_dir,
         dynamic_policy,
+        session,
         default_log_retention,
         default_log_display,
     } = input;
@@ -2772,6 +2797,7 @@ pub(crate) async fn scheduler(input: SchedulerInput) -> Result<(), crate::graph:
             shutdown: shutdown.clone(),
             config_dir,
             dynamic_policy,
+            session,
             default_log_retention,
             default_log_display,
         },

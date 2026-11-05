@@ -359,6 +359,8 @@ pub fn load_env_files_sync(paths: &[PathBuf]) -> Result<RawEnvMap, Error> {
 /// Each value sees `base` plus the already-expanded entries before it, so a file can build on
 /// its own earlier lines but never on later ones.
 /// Literal (single-quoted) values are copied through untouched.
+/// Entries for which `is_pinned` holds are dropped unexpanded, so the value `base` already pins
+/// stays visible to later lines.
 ///
 /// # Errors
 ///
@@ -366,11 +368,15 @@ pub fn load_env_files_sync(paths: &[PathBuf]) -> Result<RawEnvMap, Error> {
 pub fn expand_env_values(
     env: &RawEnvMap,
     base: &HashMap<String, String>,
+    is_pinned: &dyn Fn(&str) -> bool,
 ) -> Result<EnvMap, ValueError> {
     let mut current: HashMap<String, String> = base.clone();
     let mut out = EnvMap::new();
 
     for (key, raw) in &env.inner {
+        if is_pinned(key) {
+            continue;
+        }
         let expanded = match raw {
             RawValue::Literal(value) => value.clone(),
             RawValue::Expandable(value) => {
@@ -720,7 +726,7 @@ mod tests {
         env.insert("A", RawValue::Expandable("${X}-a".to_string()));
         env.insert("B", RawValue::Expandable("${A}-b".to_string()));
 
-        let out = expand_env_values(&env, &base)?;
+        let out = expand_env_values(&env, &base, &|_| false)?;
         assert_eq!(out.inner.get("A").map(String::as_str), Some("base-a"));
         assert_eq!(out.inner.get("B").map(String::as_str), Some("base-a-b"));
         Ok(())
@@ -735,7 +741,7 @@ mod tests {
         env.insert("A", RawValue::Expandable("a".to_string()));
 
         assert_eq!(
-            expand_env_values(&env, &HashMap::new()),
+            expand_env_values(&env, &HashMap::new(), &|_| false),
             Err(ValueError {
                 key: "B".to_string(),
                 source: InterpolationError::Unset {
@@ -774,7 +780,7 @@ mod tests {
     #[test]
     fn single_quoted_values_are_literal_after_expansion() -> eyre::Result<()> {
         let env = parse_dotenv("PASS='s3cr$t!'\nLIT='${X}'\nDOLLARS='$$'\n")?;
-        let out = expand_env_values(&env, &HashMap::new())?;
+        let out = expand_env_values(&env, &HashMap::new(), &|_| false)?;
         assert_eq!(out.inner.get("PASS").map(String::as_str), Some("s3cr$t!"));
         assert_eq!(out.inner.get("LIT").map(String::as_str), Some("${X}"));
         assert_eq!(out.inner.get("DOLLARS").map(String::as_str), Some("$$"));
@@ -786,7 +792,7 @@ mod tests {
         let mut base = HashMap::new();
         base.insert("X".to_string(), "world".to_string());
         let env = parse_dotenv("GREETING=\"hello ${X}\"\n")?;
-        let out = expand_env_values(&env, &base)?;
+        let out = expand_env_values(&env, &base, &|_| false)?;
         assert_eq!(
             out.inner.get("GREETING").map(String::as_str),
             Some("hello world")

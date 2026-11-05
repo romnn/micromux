@@ -1227,7 +1227,10 @@ mod tests {
             }],
         );
 
-        assert!(reconcile_services(&store, vec![snapshot("svc", 1)]).is_empty());
+        assert_eq!(
+            reconcile_services(&store, vec![snapshot("svc", 1)]),
+            [] as [std::string::String; 0]
+        );
         assert_eq!(store.read().services["svc"].logs.len(), 1);
 
         assert_eq!(

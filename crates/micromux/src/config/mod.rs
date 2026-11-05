@@ -260,8 +260,43 @@ pub struct Config {
     pub restart_policy: RestartPolicy,
     /// Default healthcheck timing inherited by services that configure a healthcheck test.
     pub healthcheck_defaults: HealthCheckDefaults,
+    /// Session identity and allocated ports, latched when a session starts.
+    pub session: SessionConfig,
     /// Service definitions keyed by service name.
     pub services: IndexMap<Spanned<String>, Service>,
+}
+
+/// Session identity and port-allocation settings from the `session` and `allocate_ports` keys.
+///
+/// These settings are read once when a session starts.
+/// A config reload that changes them is rejected, because running services already received the
+/// values derived from them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionConfig {
+    /// Explicit session name, already validated as a hostname label.
+    pub name: Option<Spanned<String>>,
+    /// Explicit parent domain, already validated as a hostname.
+    pub domain: Option<Spanned<String>>,
+    /// Environment variable names that each receive a session-allocated TCP port.
+    pub allocate_ports: Vec<Spanned<String>>,
+}
+
+impl SessionConfig {
+    /// Whether two settings would produce the same session, ignoring source locations.
+    #[must_use]
+    pub fn same_settings(&self, other: &Self) -> bool {
+        let inner =
+            |value: &Option<Spanned<String>>| value.as_ref().map(|value| value.inner.clone());
+        let names = |names: &[Spanned<String>]| {
+            names
+                .iter()
+                .map(|name| name.inner.clone())
+                .collect::<Vec<_>>()
+        };
+        inner(&self.name) == inner(&other.name)
+            && inner(&self.domain) == inner(&other.domain)
+            && names(&self.allocate_ports) == names(&other.allocate_ports)
+    }
 }
 
 /// A parsed config file together with its origin metadata.
@@ -800,7 +835,7 @@ mod tests {
 
         let mut diagnostics = vec![];
         let parsed = super::from_str(yaml, Path::new("."), 0usize, None, &mut diagnostics)?;
-        assert!(diagnostics.is_empty());
+        assert_eq!(diagnostics, Vec::new());
 
         // Find services without indexing (clippy::indexing_slicing is denied)
         let app = parsed
@@ -889,7 +924,7 @@ mod tests {
         let mut diagnostics = vec![];
         let parsed = super::from_str(yaml, Path::new("."), 0usize, None, &mut diagnostics)?;
 
-        assert!(diagnostics.is_empty());
+        assert_eq!(diagnostics, Vec::new());
         assert_eq!(parsed.config.ui_config.width.as_deref().copied(), Some(80));
         assert!(!parsed.config.ui_config.pretty_json_logs);
         Ok(())
