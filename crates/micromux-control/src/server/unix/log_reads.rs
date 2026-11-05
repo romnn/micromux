@@ -182,15 +182,27 @@ impl BlockingLogReadPool {
     }
 
     fn reserve_queue_slot(&self) -> Option<QueuePermit> {
-        self.health
-            .queued
-            .try_update(Ordering::AcqRel, Ordering::Relaxed, |queued| {
-                (queued < self.queue_capacity).then_some(queued + 1)
-            })
-            .ok()
-            .map(|_| QueuePermit {
-                health: Arc::clone(&self.health),
-            })
+        // A plain compare-exchange loop: `fetch_update` is deprecated on current toolchains and
+        // its replacement `try_update` is not stable on the older ones release builds use.
+        let mut queued = self.health.queued.load(Ordering::Relaxed);
+        loop {
+            if queued >= self.queue_capacity {
+                return None;
+            }
+            match self.health.queued.compare_exchange_weak(
+                queued,
+                queued + 1,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    return Some(QueuePermit {
+                        health: Arc::clone(&self.health),
+                    });
+                }
+                Err(current) => queued = current,
+            }
+        }
     }
 
     fn saturated_response(&self) -> Response {
