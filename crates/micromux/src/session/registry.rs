@@ -601,6 +601,38 @@ mod tests {
         Ok(())
     }
 
+    /// A config that cannot be checked, here for lack of permission, keeps its record.
+    #[cfg(unix)]
+    #[test]
+    fn records_of_inaccessible_projects_are_kept() -> eyre::Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir()?;
+        let registry = PortRegistry::at(directory.path().join("registry"));
+        let project = directory.path().join("locked");
+        std::fs::create_dir_all(&project)?;
+        let config = project.join("micromux.yaml");
+        std::fs::write(&config, "")?;
+        let (_ports, lease) = registry.acquire(&config, "locked", &names(&["A"]), &[])?;
+        drop(lease);
+        let record = directory
+            .path()
+            .join("registry")
+            .join(format!("{}.json", config_path_key(&config)));
+
+        std::fs::set_permissions(&project, std::fs::Permissions::from_mode(0o000))?;
+        // Root ignores the permission, so the premise only holds for ordinary users.
+        let premise = config.try_exists().is_err();
+        let result = registry.acquire(Path::new("/projects/two/micromux.yaml"), "two", &[], &[]);
+        std::fs::set_permissions(&project, std::fs::Permissions::from_mode(0o755))?;
+        result?;
+
+        if premise {
+            assert!(record.exists());
+        }
+        Ok(())
+    }
+
     /// Excluded ports are never assigned, and a persisted assignment that became reserved is an
     /// error instead of a silent change.
     #[test]

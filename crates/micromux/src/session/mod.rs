@@ -537,6 +537,24 @@ mod tests {
         );
     }
 
+    /// Windows folds environment names by case, so a differently cased definition must not
+    /// survive next to the pinned one.
+    #[cfg(windows)]
+    #[test]
+    fn pinned_variables_replace_differently_cased_definitions_on_windows() {
+        let pinned = SessionEnvironment::from_pairs(&[("API_PORT", "20001")]);
+        let mut environment = IndexMap::new();
+        environment.insert("api_port".to_string(), "9540".to_string());
+
+        pinned.apply_to(&mut environment);
+
+        assert_eq!(environment.len(), 1);
+        assert_eq!(
+            environment.get("API_PORT").map(String::as_str),
+            Some("20001")
+        );
+    }
+
     /// Pinned variables replace configured definitions of the same name and keep their order.
     #[test]
     fn pinned_variables_override_configured_ones() {
