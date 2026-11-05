@@ -186,17 +186,11 @@ impl SessionEnvironment {
 
     /// Whether a configured definition of `key` is overridden by a pinned variable.
     ///
-    /// Windows treats environment names case-insensitively, so a differently cased definition
-    /// would clash with the pinned one there.
+    /// Names compare exactly, as interpolation looks them up, so a pinned value and the
+    /// references to it always agree.
     #[must_use]
     pub fn pins(&self, key: &str) -> bool {
-        if cfg!(windows) {
-            self.variables
-                .keys()
-                .any(|pinned| pinned.eq_ignore_ascii_case(key))
-        } else {
-            self.variables.contains_key(key)
-        }
+        self.variables.contains_key(key)
     }
 
     /// Overlays the pinned variables onto a process environment.
@@ -228,18 +222,20 @@ pub struct Session {
 }
 
 impl Session {
-    /// Resolves the session for `config` and reserves its allocated ports.
+    /// Resolves the session for `config`, registers it as live, and reserves its allocated ports.
     ///
-    /// A config without `allocate_ports` never touches the registry.
-    /// Otherwise the ports are reserved until the returned session (and every
-    /// [`crate::Micromux`] built from it) is dropped.
+    /// A config loaded from a file is registered until the returned session (and every
+    /// [`crate::Micromux`] built from it) is dropped, which keeps session names unique among live
+    /// sessions and reserves the allocated ports.
+    /// A config without a file path is not registered and cannot allocate ports.
     ///
     /// # Errors
     ///
     /// Returns [`SessionError::AlreadyRunning`] when another micromux runs the same config,
     /// [`SessionError::NameInUse`] when another live session has the same name,
-    /// [`SessionError::PortBusy`] when a persisted port is held by a foreign process, and an I/O
-    /// variant when the registry cannot be accessed.
+    /// [`SessionError::PortBusy`] when a persisted port is held by a foreign process,
+    /// [`SessionError::NoConfigPath`] when a config without a file path allocates ports, and an
+    /// I/O variant when the registry cannot be accessed.
     pub fn establish<F>(
         config: &ConfigFile<F>,
         registry: &PortRegistry,
@@ -260,7 +256,10 @@ impl Session {
     ) -> Result<Self, SessionError> {
         let settings = config.config.session.clone();
         let identity = SessionIdentity::resolve(&settings, &config.config_dir);
-        if settings.allocate_ports.is_empty() {
+        let Some(config_path) = config.config_path.as_deref() else {
+            if !settings.allocate_ports.is_empty() {
+                return Err(SessionError::NoConfigPath);
+            }
             return Ok(Self {
                 identity,
                 settings,
@@ -268,11 +267,7 @@ impl Session {
                 provisional: Vec::new(),
                 lease: None,
             });
-        }
-        let config_path = config
-            .config_path
-            .as_deref()
-            .ok_or(SessionError::NoConfigPath)?;
+        };
         let names = settings
             .allocate_ports
             .iter()
@@ -292,8 +287,8 @@ impl Session {
     ///
     /// Names with a persisted assignment use it; every other name gets a distinct provisional
     /// port, listed by [`Self::provisional_ports`].
-    #[must_use]
-    pub fn preview<F>(config: &ConfigFile<F>, registry: &PortRegistry) -> Self {
+    /// Crate-private because a preview holds no reservation and must never run services.
+    pub(crate) fn preview<F>(config: &ConfigFile<F>, registry: &PortRegistry) -> Self {
         let settings = config.config.session.clone();
         let identity = SessionIdentity::resolve(&settings, &config.config_dir);
         let persisted = config
@@ -336,8 +331,7 @@ impl Session {
     }
 
     /// Names whose port in a [`Self::preview`] is made up because none was assigned yet.
-    #[must_use]
-    pub fn provisional_ports(&self) -> &[String] {
+    pub(crate) fn provisional_ports(&self) -> &[String] {
         &self.provisional
     }
 

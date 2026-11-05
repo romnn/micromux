@@ -1,6 +1,6 @@
 use crate::{
     DynamicOrigin, DynamicServiceParams, DynamicServicesPolicy, Lease, LogDisplay, ReloadConfig,
-    ServiceMap, ServiceOrigin, ServiceSpec, SessionEnvironment,
+    ServiceMap, ServiceOrigin, ServiceSpec,
     graph::ServiceGraph,
     health_check::Health,
     model::{
@@ -905,7 +905,9 @@ struct SchedulerRuntime {
     shutdown: CancellationToken,
     config_dir: PathBuf,
     dynamic_policy: DynamicServicesPolicy,
-    session_environment: SessionEnvironment,
+    /// The latched session; holding it keeps the session registered until the scheduler has
+    /// drained every service.
+    session: std::sync::Arc<crate::session::SessionContext>,
     default_log_retention: LogRetention,
     default_log_display: LogDisplay,
     idempotency: VecDeque<IdempotencyRecord>,
@@ -920,7 +922,9 @@ struct SchedulerResources {
     shutdown: CancellationToken,
     config_dir: PathBuf,
     dynamic_policy: DynamicServicesPolicy,
-    session_environment: SessionEnvironment,
+    /// The latched session; holding it keeps the session registered until the scheduler has
+    /// drained every service.
+    session: std::sync::Arc<crate::session::SessionContext>,
     default_log_retention: LogRetention,
     default_log_display: LogDisplay,
 }
@@ -962,7 +966,7 @@ impl SchedulerRuntime {
             shutdown,
             config_dir,
             dynamic_policy,
-            session_environment,
+            session,
             default_log_retention,
             default_log_display,
         } = resources;
@@ -983,7 +987,7 @@ impl SchedulerRuntime {
             shutdown,
             config_dir,
             dynamic_policy,
-            session_environment,
+            session,
             default_log_retention,
             default_log_display,
             idempotency: VecDeque::new(),
@@ -1360,7 +1364,7 @@ impl SchedulerRuntime {
             .map_err(|err| CommandRejection::InvalidSpec(err.to_string()))?;
         spec.command.extend(params.extra_args.clone());
         // Dynamic services see the session variables too, and cannot shadow them.
-        self.session_environment.apply_to(&mut spec.environment);
+        self.session.environment.apply_to(&mut spec.environment);
 
         let working_dir = spec
             .working_dir
@@ -2750,7 +2754,7 @@ pub(crate) struct SchedulerInput {
     pub(crate) shutdown: CancellationToken,
     pub(crate) config_dir: PathBuf,
     pub(crate) dynamic_policy: DynamicServicesPolicy,
-    pub(crate) session_environment: SessionEnvironment,
+    pub(crate) session: std::sync::Arc<crate::session::SessionContext>,
     pub(crate) default_log_retention: LogRetention,
     pub(crate) default_log_display: LogDisplay,
 }
@@ -2769,7 +2773,7 @@ pub(crate) async fn scheduler(input: SchedulerInput) -> Result<(), crate::graph:
         shutdown,
         config_dir,
         dynamic_policy,
-        session_environment,
+        session,
         default_log_retention,
         default_log_display,
     } = input;
@@ -2793,7 +2797,7 @@ pub(crate) async fn scheduler(input: SchedulerInput) -> Result<(), crate::graph:
             shutdown: shutdown.clone(),
             config_dir,
             dynamic_policy,
-            session_environment,
+            session,
             default_log_retention,
             default_log_display,
         },

@@ -596,7 +596,7 @@ impl Micromux {
                 shutdown: shutdown.clone(),
                 config_dir: self.config_dir.clone(),
                 dynamic_policy: self.dynamic_policy.clone(),
-                session_environment: self.session.environment.clone(),
+                session: self.session.clone(),
                 default_log_retention: self.default_log_retention,
                 default_log_display: self.default_log_display.clone(),
             })
@@ -760,6 +760,36 @@ mod tests {
 
         shutdown.cancel();
         runner.await??;
+        Ok(())
+    }
+
+    /// Every session loaded from a file is registered, so two live sessions never share a name
+    /// even when neither allocates ports.
+    #[test]
+    fn live_sessions_without_allocations_still_need_distinct_names() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let registry = PortRegistry::at(directory.path().join("registry"));
+        let raw = "version: 1\nsession: { name: qa }\nservices: {}\n";
+        let mut configs = Vec::new();
+        for project in ["one", "two"] {
+            let project = directory.path().join(project);
+            std::fs::create_dir_all(&project)?;
+            std::fs::write(project.join("micromux.yaml"), raw)?;
+            let mut config = from_str(raw, &project, 0usize, None, &mut Vec::new())?;
+            config.config_path = Some(project.join("micromux.yaml").canonicalize()?);
+            configs.push(config);
+        }
+        let [one, two] = configs.as_slice() else {
+            eyre::bail!("expected two configs");
+        };
+
+        let _first = Session::establish(one, &registry)?;
+        let second = Session::establish(two, &registry);
+
+        assert!(
+            matches!(second, Err(SessionError::NameInUse { .. })),
+            "{second:?}"
+        );
         Ok(())
     }
 

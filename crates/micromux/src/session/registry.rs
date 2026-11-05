@@ -10,7 +10,9 @@
 //! proves its owner is gone; a missing or stale record proves nothing.
 //! Every read, liveness probe, and write happens under the registry-wide `registry.lock`, which
 //! serializes allocation between sessions starting at the same time.
-//! Lock files are never removed: replacing one would let two processes hold "the" lock at once.
+//! A lock file is only removed together with the record of a dead session whose config file no
+//! longer exists, and only under the registry lock: replacing a lock file someone could still
+//! open outside it would let two processes hold "the" lock at once.
 
 use std::collections::HashSet;
 use std::fs::{File, OpenOptions, TryLockError};
@@ -251,6 +253,14 @@ fn survey(directory: &Path, own_key: &str, session_name: &str) -> Result<Survey,
                 continue;
             }
         };
+        if !live && !Path::new(&record.config_path).exists() {
+            // The project is gone, so nobody can restart this session; drop its reservation.
+            // Removing the lock file is safe here: instance locks are only ever taken under the
+            // registry lock this function runs under, and this one is free.
+            let _ = std::fs::remove_file(&path);
+            let _ = std::fs::remove_file(directory.join(format!("{key}.lock")));
+            continue;
+        }
         if live {
             if record.session_name == session_name {
                 return Err(SessionError::NameInUse {
@@ -301,20 +311,42 @@ fn pick_port(
 }
 
 /// Whether nothing currently listens on `port`, probed by binding the loopback and wildcard
-/// addresses.
+/// addresses of both families.
 ///
-/// Probing both matters on macOS, where a specific-address bind can succeed next to a wildcard
-/// listener and vice versa.
-/// IPv6 being unavailable does not make a port busy.
+/// Every address matters: with `SO_REUSEADDR`, macOS lets a specific-address bind succeed next to
+/// a wildcard listener and vice versa, and Windows reports an exclusive wildcard listener as
+/// "access denied".
+/// Any failure therefore counts as busy, except IPv6 being unavailable on this host.
 fn port_is_free(port: u16) -> bool {
     let ipv4 = [Ipv4Addr::LOCALHOST, Ipv4Addr::UNSPECIFIED]
         .into_iter()
         .all(|address| TcpListener::bind(SocketAddr::from((address, port))).is_ok());
-    let ipv6 = match TcpListener::bind(SocketAddr::from((Ipv6Addr::LOCALHOST, port))) {
-        Ok(_) => true,
-        Err(err) => err.kind() != std::io::ErrorKind::AddrInUse,
-    };
+    let ipv6 = [Ipv6Addr::LOCALHOST, Ipv6Addr::UNSPECIFIED]
+        .into_iter()
+        .all(
+            |address| match TcpListener::bind(SocketAddr::from((address, port))) {
+                Ok(_) => true,
+                Err(err) => ipv6_unavailable(&err),
+            },
+        );
     ipv4 && ipv6
+}
+
+/// Whether binding failed because the host has no usable IPv6, rather than because the port is
+/// taken.
+fn ipv6_unavailable(err: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    let unsupported = [
+        nix::errno::Errno::EAFNOSUPPORT as i32,
+        nix::errno::Errno::EPROTONOSUPPORT as i32,
+    ];
+    // WSAEAFNOSUPPORT and WSAEPROTONOSUPPORT
+    #[cfg(not(unix))]
+    let unsupported = [10047, 10043];
+    err.kind() == std::io::ErrorKind::AddrNotAvailable
+        || err
+            .raw_os_error()
+            .is_some_and(|code| unsupported.contains(&code))
 }
 
 /// Whether some process holds the instance lock at `path`.
@@ -504,7 +536,7 @@ mod tests {
     fn busy_persisted_port_fails_startup() -> eyre::Result<()> {
         let directory = tempfile::tempdir()?;
         let registry = PortRegistry::at(directory.path());
-        let config = Path::new("/projects/one/micromux.yaml");
+        let config = Path::new("/projects/ipv4-busy/micromux.yaml");
         let (ports, lease) = registry.acquire(config, "one", &names(&["A"]), &[])?;
         drop(lease);
         let port = *ports.get("A").ok_or_else(|| eyre::eyre!("no port"))?;
@@ -516,6 +548,54 @@ mod tests {
             matches!(&result, Err(SessionError::PortBusy { variable, port: busy }) if variable == "A" && *busy == port),
             "{result:?}"
         );
+        Ok(())
+    }
+
+    /// A listener on the IPv6 wildcard alone also makes a persisted port busy.
+    #[test]
+    fn busy_ipv6_wildcard_port_fails_startup() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let registry = PortRegistry::at(directory.path());
+        let config = Path::new("/projects/ipv6-busy/micromux.yaml");
+        let (ports, lease) = registry.acquire(config, "one", &names(&["A"]), &[])?;
+        drop(lease);
+        let port = *ports.get("A").ok_or_else(|| eyre::eyre!("no port"))?;
+
+        let Ok(_foreign) = TcpListener::bind((Ipv6Addr::UNSPECIFIED, port)) else {
+            // No IPv6 on this host: nothing to probe.
+            return Ok(());
+        };
+        let result = registry.acquire(config, "one", &names(&["A"]), &[]);
+
+        assert!(
+            matches!(&result, Err(SessionError::PortBusy { .. })),
+            "{result:?}"
+        );
+        Ok(())
+    }
+
+    /// A stopped session whose project was deleted gives up its record, so temporary checkouts
+    /// do not reserve ports forever.
+    #[test]
+    fn records_of_deleted_projects_are_pruned() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let registry = PortRegistry::at(directory.path().join("registry"));
+        let project = directory.path().join("gone");
+        std::fs::create_dir_all(&project)?;
+        let config = project.join("micromux.yaml");
+        std::fs::write(&config, "")?;
+        let (_ports, lease) = registry.acquire(&config, "gone", &names(&["A"]), &[])?;
+        drop(lease);
+        let record = directory
+            .path()
+            .join("registry")
+            .join(format!("{}.json", config_path_key(&config)));
+        assert!(record.exists());
+
+        std::fs::remove_dir_all(&project)?;
+        registry.acquire(Path::new("/projects/two/micromux.yaml"), "two", &[], &[])?;
+
+        assert!(!record.exists());
         Ok(())
     }
 

@@ -32,7 +32,7 @@ Every name under `allocate_ports` becomes an environment variable holding a free
 - Ports come from `20000`–`32767`, below the ephemeral port ranges of Linux and macOS, so outgoing connections never take one.
 - A port a session is assigned for the first time is checked to be free. If a port the session had before is now held by some other process, the session **fails to start** and names the variable and the port, rather than pointing your services at a stranger. Stop that process (often a leftover of an earlier run) and start again.
 
-Only one micromux can run a given config file while it allocates ports; a second one fails to start.
+Only one micromux can run a given config file at a time; a second one fails to start.
 
 Names must be environment variable names. `MICROMUX_*` names and the variables micromux sets on every service itself (`TERM`, `CLICOLOR`, `CLICOLOR_FORCE`, `FORCE_COLOR`) are reserved.
 
