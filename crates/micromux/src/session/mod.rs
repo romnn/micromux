@@ -7,6 +7,7 @@
 //! inline `environment` definition of the same name.
 
 mod registry;
+mod routes;
 
 use std::path::{Path, PathBuf};
 
@@ -16,6 +17,8 @@ use crate::config::{ConfigFile, SessionConfig};
 
 pub use registry::PortRegistry;
 pub(crate) use registry::{Lease, PORT_RANGE};
+pub(crate) use routes::resolve as resolve_routes;
+pub use routes::{CATCH_ALL_HOST, Route, RouteError};
 
 /// Parent domain of every session when the config does not name one.
 pub const DEFAULT_DOMAIN: &str = "localhost";
@@ -35,6 +38,12 @@ pub const SESSION_VARIABLE: &str = "MICROMUX_SESSION";
 /// Environment variable carrying `<session>.<domain>`.
 pub const SESSION_DOMAIN_VARIABLE: &str = "MICROMUX_SESSION_DOMAIN";
 
+/// Environment variable carrying the port the shared proxy listens on.
+pub const PROXY_PORT_VARIABLE: &str = "MICROMUX_PROXY_PORT";
+
+/// Environment variable carrying what follows `<route>.` in a browser URL.
+pub const HOST_SUFFIX_VARIABLE: &str = "MICROMUX_HOST_SUFFIX";
+
 /// Variables micromux sets on every spawned service itself, which an allocation must not shadow.
 const SPAWN_OWNED_VARIABLES: &[&str] = &["TERM", "CLICOLOR", "CLICOLOR_FORCE", "FORCE_COLOR"];
 
@@ -53,8 +62,9 @@ pub enum SessionError {
     /// No per-user state directory could be determined for the port registry.
     #[error("cannot determine a per-user state directory for the port registry")]
     NoStateDirectory,
-    /// Allocation needs the config file's path, which identifies the session across restarts.
-    #[error("allocate_ports needs a config loaded from a file")]
+    /// Allocations and routes need the config file's path, which identifies the session across
+    /// restarts.
+    #[error("allocate_ports and routes need a config loaded from a file")]
     NoConfigPath,
     /// Another micromux already runs this config.
     #[error(
@@ -230,6 +240,7 @@ pub struct Session {
     settings: SessionConfig,
     ports: IndexMap<String, u16>,
     provisional: Vec<String>,
+    proxy_port: u16,
     lease: Option<Lease>,
 }
 
@@ -239,37 +250,27 @@ impl Session {
     /// A config loaded from a file is registered until the returned session (and every
     /// [`crate::Micromux`] built from it) is dropped, which keeps session names unique among live
     /// sessions and reserves the allocated ports.
-    /// A config without a file path is not registered and cannot allocate ports.
+    /// A config without a file path is not registered and can use neither `allocate_ports` nor
+    /// `routes`.
+    /// No allocated port ever equals the configured proxy ports.
     ///
     /// # Errors
     ///
     /// Returns [`SessionError::AlreadyRunning`] when another micromux runs the same config,
     /// [`SessionError::NameInUse`] when another live session has the same name,
     /// [`SessionError::PortBusy`] when a persisted port is held by a foreign process,
-    /// [`SessionError::NoConfigPath`] when a config without a file path allocates ports, and an
-    /// I/O variant when the registry cannot be accessed.
+    /// [`SessionError::PortReserved`] when a persisted port became a proxy port,
+    /// [`SessionError::NoConfigPath`] when a config without a file path allocates ports or has
+    /// routes, and an I/O variant when the registry cannot be accessed.
     pub fn establish<F>(
         config: &ConfigFile<F>,
         registry: &PortRegistry,
     ) -> Result<Self, SessionError> {
-        Self::establish_excluding(config, registry, &[])
-    }
-
-    /// Like [`Self::establish`], but never assigns any port in `excluded`.
-    ///
-    /// # Errors
-    ///
-    /// Same as [`Self::establish`], plus [`SessionError::PortReserved`] when a persisted port is
-    /// in `excluded`.
-    pub fn establish_excluding<F>(
-        config: &ConfigFile<F>,
-        registry: &PortRegistry,
-        excluded: &[u16],
-    ) -> Result<Self, SessionError> {
         let settings = config.config.session.clone();
         let identity = SessionIdentity::resolve(&settings, &config.config_dir);
+        let proxy_port = settings.proxy.port();
         let Some(config_path) = config.config_path.as_deref() else {
-            if !settings.allocate_ports.is_empty() {
+            if settings.needs_config_path() {
                 return Err(SessionError::NoConfigPath);
             }
             return Ok(Self {
@@ -277,6 +278,7 @@ impl Session {
                 settings,
                 ports: IndexMap::new(),
                 provisional: Vec::new(),
+                proxy_port,
                 lease: None,
             });
         };
@@ -285,12 +287,16 @@ impl Session {
             .iter()
             .map(|name| name.inner.clone())
             .collect::<Vec<_>>();
-        let (ports, lease) = registry.acquire(config_path, &identity.name, &names, excluded)?;
+        let excluded = std::iter::once(proxy_port)
+            .chain(settings.proxy.fallback_port())
+            .collect::<Vec<_>>();
+        let (ports, lease) = registry.acquire(config_path, &identity.name, &names, &excluded)?;
         Ok(Self {
             identity,
             settings,
             ports,
             provisional: Vec::new(),
+            proxy_port,
             lease: Some(lease),
         })
     }
@@ -323,6 +329,7 @@ impl Session {
         }
         Self {
             identity,
+            proxy_port: settings.proxy.port(),
             settings,
             ports,
             provisional,
@@ -342,6 +349,29 @@ impl Session {
         &self.ports
     }
 
+    /// Whether the session has routes and therefore needs the shared proxy.
+    #[must_use]
+    pub fn has_routes(&self) -> bool {
+        !self.settings.routes.is_empty()
+    }
+
+    /// The configured proxy port preference: the preferred port and the optional fallback.
+    #[must_use]
+    pub fn proxy_preference(&self) -> (u16, Option<u16>) {
+        (
+            self.settings.proxy.port(),
+            self.settings.proxy.fallback_port(),
+        )
+    }
+
+    /// Latches the port the shared proxy actually listens on, which the injected
+    /// `MICROMUX_PROXY_PORT` and `MICROMUX_HOST_SUFFIX` report.
+    ///
+    /// Without a call, the configured preferred port is assumed.
+    pub fn set_proxy_port(&mut self, port: u16) {
+        self.proxy_port = port;
+    }
+
     /// Names whose port in a [`Self::preview`] is made up because none was assigned yet.
     pub(crate) fn provisional_ports(&self) -> &[String] {
         &self.provisional
@@ -356,6 +386,11 @@ impl Session {
             SESSION_DOMAIN_VARIABLE.to_string(),
             self.identity.session_domain(),
         );
+        variables.insert(PROXY_PORT_VARIABLE.to_string(), self.proxy_port.to_string());
+        variables.insert(
+            HOST_SUFFIX_VARIABLE.to_string(),
+            host_suffix(&self.identity, self.proxy_port),
+        );
         for (name, port) in &self.ports {
             variables.insert(name.clone(), port.to_string());
         }
@@ -368,6 +403,7 @@ impl Session {
             identity: self.identity,
             settings: self.settings,
             ports: self.ports,
+            proxy_port: self.proxy_port,
             lease: self.lease,
         }
     }
@@ -380,6 +416,7 @@ pub(crate) struct SessionContext {
     pub(crate) settings: SessionConfig,
     pub(crate) environment: SessionEnvironment,
     pub(crate) ports: IndexMap<String, u16>,
+    pub(crate) proxy_port: u16,
     #[expect(
         dead_code,
         reason = "held for RAII: the registry lease keeps the allocated ports reserved"
@@ -399,8 +436,20 @@ impl SessionContext {
             settings: SessionConfig::default(),
             environment: SessionEnvironment::default(),
             ports: IndexMap::new(),
+            proxy_port: 80,
             lease: None,
         }
+    }
+}
+
+/// What follows `<route>.` in a browser URL: the session domain, plus the proxy port unless it is
+/// the HTTP default.
+#[must_use]
+pub fn host_suffix(identity: &SessionIdentity, proxy_port: u16) -> String {
+    if proxy_port == 80 {
+        identity.session_domain()
+    } else {
+        format!("{}:{proxy_port}", identity.session_domain())
     }
 }
 

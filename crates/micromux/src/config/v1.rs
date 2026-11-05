@@ -65,6 +65,8 @@ const KNOWN_CONFIG_KEYS: &[&str] = &[
     "logs",
     "session",
     "allocate_ports",
+    "routes",
+    "proxy",
     "services",
 ];
 
@@ -1441,7 +1443,106 @@ fn parse_session<F: Copy>(
             session.allocate_ports.push(name);
         }
     }
+    session.routes = parse_routes(value, file_id, strict, diagnostics)?;
+    session.proxy = parse_proxy(value, file_id, strict, diagnostics)?;
     Ok(session)
+}
+
+/// Parse the top-level `routes` list.
+fn parse_routes<F: Copy>(
+    value: &yaml_spanned::Spanned<Value>,
+    file_id: F,
+    strict: bool,
+    diagnostics: &mut Vec<Diagnostic<F>>,
+) -> Result<Vec<super::RouteConfig>, ConfigError> {
+    let Some(routes_value) = value.get("routes") else {
+        return Ok(Vec::new());
+    };
+    let entries = expect_sequence(routes_value, Some("routes must be a list of {host, port}"))?;
+    if cfg!(windows) && !entries.is_empty() {
+        return Err(ConfigError::InvalidValue {
+            message: "routes are not supported on Windows, which has no micromux proxy".to_string(),
+            span: routes_value.span().into(),
+        });
+    }
+    let mut routes: Vec<super::RouteConfig> = Vec::new();
+    for entry in entries {
+        let (span, mapping) = expect_mapping(entry, "each route must be a mapping".into())?;
+        warn_unknown_keys(
+            mapping,
+            &["host", "port"],
+            "route",
+            file_id,
+            strict,
+            diagnostics,
+        );
+        let missing = |key: &str| ConfigError::MissingKey {
+            key: key.to_string(),
+            message: format!("route is missing `{key}`"),
+            span: (*span).into(),
+        };
+        let host = parse::<String>(mapping.get("host").ok_or_else(|| missing("host"))?)?;
+        if host.inner != "*" && !crate::session::is_hostname(&host.inner) {
+            return Err(ConfigError::InvalidValue {
+                message: format!(
+                    "route host `{}` must be `*` or lowercase hostname labels such as `app` or \
+                     `email.internal`",
+                    host.inner
+                ),
+                span: host.span.into(),
+            });
+        }
+        if routes.iter().any(|route| route.host.inner == host.inner) {
+            return Err(ConfigError::InvalidValue {
+                message: format!("route host `{}` is listed more than once", host.inner),
+                span: host.span.into(),
+            });
+        }
+        let port_value = mapping.get("port").ok_or_else(|| missing("port"))?;
+        let port = Spanned {
+            span: port_value.span,
+            inner: parse_string_value(port_value, "route port must be a number or a ${VAR}")?,
+        };
+        routes.push(super::RouteConfig { host, port });
+    }
+    Ok(routes)
+}
+
+/// Parse the top-level `proxy` mapping.
+fn parse_proxy<F: Copy>(
+    value: &yaml_spanned::Spanned<Value>,
+    file_id: F,
+    strict: bool,
+    diagnostics: &mut Vec<Diagnostic<F>>,
+) -> Result<super::ProxyConfig, ConfigError> {
+    let Some(proxy) = value.get("proxy") else {
+        return Ok(super::ProxyConfig::default());
+    };
+    let (_span, mapping) = expect_mapping(proxy, "proxy must be a mapping".into())?;
+    warn_unknown_keys(
+        mapping,
+        &["port", "fallback_port"],
+        "proxy",
+        file_id,
+        strict,
+        diagnostics,
+    );
+    let nonzero = |key: &str| -> Result<Option<Spanned<u16>>, ConfigError> {
+        let port = parse_optional::<u16>(mapping.get(key))?;
+        if let Some(port) = &port
+            && port.inner == 0
+        {
+            return Err(ConfigError::InvalidValue {
+                message: format!("proxy.{key} must not be 0"),
+                span: port.span.into(),
+            });
+        }
+        Ok(port)
+    };
+    Ok(super::ProxyConfig {
+        port: nonzero("port")?,
+        fallback_port: nonzero("fallback_port")?,
+    })
 }
 
 #[cfg(test)]
@@ -2555,6 +2656,65 @@ mod tests {
         assert_eq!(names, vec!["API_PORT", "db_port"]);
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
         Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parses_routes_and_proxy_settings() -> eyre::Result<()> {
+        let yaml = indoc! {r#"
+            version: 1
+            proxy: { port: 8081, fallback_port: 8080 }
+            routes:
+              - host: app
+                port: ${APP_PORT}
+              - host: email.internal
+                port: 8025
+              - host: "*"
+                port: 9000
+            services:
+              app:
+                command: ["true"]
+        "#};
+        let config = config::from_str(yaml, Path::new("."), 0usize, None, &mut Vec::new())?;
+
+        let session = &config.config.session;
+        let routes = session
+            .routes
+            .iter()
+            .map(|route| (route.host.inner.as_str(), route.port.inner.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            routes,
+            vec![
+                ("app", "${APP_PORT}"),
+                ("email.internal", "8025"),
+                ("*", "9000")
+            ]
+        );
+        assert_eq!(session.proxy.port(), 8081);
+        assert_eq!(session.proxy.fallback_port(), Some(8080));
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_invalid_routes() {
+        for (yaml, expected) in [
+            (
+                "routes: [{host: App, port: 1}]",
+                "must be `*` or lowercase hostname labels",
+            ),
+            (
+                "routes: [{host: a, port: 1}, {host: a, port: 2}]",
+                "more than once",
+            ),
+            ("routes: [{port: 1}]", "missing `host`"),
+            ("proxy: {port: 0}", "must not be 0"),
+        ] {
+            let yaml = format!("version: 1\n{yaml}\nservices:\n  app:\n    command: [\"true\"]\n");
+            let result = config::from_str(&yaml, Path::new("."), 0usize, None, &mut Vec::new());
+            let message = result.err().map(|err| err.to_string()).unwrap_or_default();
+            assert!(message.contains(expected), "{yaml}: {message}");
+        }
     }
 
     /// Invalid session names and allocation names are errors that point at the offending value

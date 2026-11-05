@@ -195,12 +195,27 @@ fn per_user_fallback_dir() -> PathBuf {
     std::env::temp_dir().join(format!("micromux-{uid}"))
 }
 
+/// The fixed, private per-user directory for files every micromux process of the user must agree
+/// on, such as session locks and the shared proxy's socket.
+///
+/// It deliberately ignores `$TMPDIR` and `$XDG_RUNTIME_DIR`, which differ between shells, agents,
+/// and services of the same user, and stays short enough for socket paths on macOS.
+///
+/// # Errors
+///
+/// Returns an error when the directory cannot be created, is not a directory, or is owned by
+/// another user.
 #[cfg(unix)]
-pub(crate) fn project_lock_path(config_path: &CanonicalConfigPath) -> std::io::Result<PathBuf> {
+pub fn coordination_dir() -> std::io::Result<PathBuf> {
     let uid = nix::unistd::Uid::current();
     let directory = Path::new("/tmp").join(format!("micromux-{uid}"));
     ensure_private_dir(&directory)?;
-    Ok(directory.join(format!("{}.session.lock", endpoint_hash(config_path))))
+    Ok(directory)
+}
+
+#[cfg(unix)]
+pub(crate) fn project_lock_path(config_path: &CanonicalConfigPath) -> std::io::Result<PathBuf> {
+    Ok(coordination_dir()?.join(format!("{}.session.lock", endpoint_hash(config_path))))
 }
 
 #[cfg(not(unix))]

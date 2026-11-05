@@ -406,6 +406,8 @@ services:
         created.env_keys,
         vec![
             "CLONED_SECRET",
+            "MICROMUX_HOST_SUFFIX",
+            "MICROMUX_PROXY_PORT",
             "MICROMUX_SESSION",
             "MICROMUX_SESSION_DOMAIN",
             "PRIVATE_VALUE"
