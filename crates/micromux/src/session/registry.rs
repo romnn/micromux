@@ -253,7 +253,9 @@ fn survey(directory: &Path, own_key: &str, session_name: &str) -> Result<Survey,
                 continue;
             }
         };
-        if !live && !Path::new(&record.config_path).exists() {
+        // Only a definite "not found" prunes: a config that cannot be checked, say for lack of
+        // permission, may well still exist.
+        if !live && matches!(Path::new(&record.config_path).try_exists(), Ok(false)) {
             // The project is gone, so nobody can restart this session; drop its reservation.
             // Removing the lock file is safe here: instance locks are only ever taken under the
             // registry lock this function runs under, and this one is free.

@@ -194,8 +194,20 @@ impl SessionEnvironment {
     }
 
     /// Overlays the pinned variables onto a process environment.
+    ///
+    /// Windows folds environment names by case when it builds the child's environment, so there a
+    /// differently cased definition is removed too; otherwise it could replace the pinned value.
     pub(crate) fn apply_to(&self, environment: &mut IndexMap<String, String>) {
-        environment.retain(|key, _| !self.pins(key));
+        environment.retain(|key, _| {
+            if cfg!(windows) {
+                !self
+                    .variables
+                    .keys()
+                    .any(|pinned| pinned.eq_ignore_ascii_case(key))
+            } else {
+                !self.pins(key)
+            }
+        });
         environment.extend(self.variables.clone());
     }
 
