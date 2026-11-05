@@ -200,7 +200,7 @@ mod tests {
         let owner = listening_owner(port)
             .ok_or_else(|| std::io::Error::other("listener owner was not found"))?;
         assert_eq!(owner.pid, std::process::id());
-        assert!(!owner.command.is_empty());
+        assert_ne!(owner.command, "");
         Ok(())
     }
 }

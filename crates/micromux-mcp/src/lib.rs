@@ -3733,7 +3733,7 @@ services:
             .await
             .map_err(|err| eyre::eyre!(err.message))?;
         assert!(dry_run.dry_run);
-        assert!(!dry_run.session_ref.id.is_empty());
+        assert_ne!(dry_run.session_ref.id, "");
         assert_eq!(dry_run.actions.len(), 1);
         assert_eq!(dry_run.actions[0].service, "added");
         assert_eq!(

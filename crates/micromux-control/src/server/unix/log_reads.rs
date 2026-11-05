@@ -184,7 +184,7 @@ impl BlockingLogReadPool {
     fn reserve_queue_slot(&self) -> Option<QueuePermit> {
         self.health
             .queued
-            .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |queued| {
+            .try_update(Ordering::AcqRel, Ordering::Relaxed, |queued| {
                 (queued < self.queue_capacity).then_some(queued + 1)
             })
             .ok()

@@ -800,7 +800,7 @@ mod tests {
         child.kill()?;
         child.wait()?;
 
-        assert!(descendants(root).is_empty());
+        assert_eq!(descendants(root), Vec::new());
         Ok(())
     }
 }
