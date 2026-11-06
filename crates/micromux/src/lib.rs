@@ -20,6 +20,7 @@
 //! ```
 
 mod config;
+pub mod containment;
 mod diagnostics;
 mod env;
 mod graph;

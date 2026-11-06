@@ -1958,6 +1958,16 @@ impl TerminationTarget {
         // A last walk while the leader may still be alive picks up anything forked
         // since the graceful pass that is still reachable through it.
         self.refresh_retained().await;
+        // Kill the escapees before the leader's group: under containment the leader is the shim,
+        // which cleans everything up itself should the supervisor die during this escalation.
+        let leader_group = self.leader_group();
+        let escapees = self
+            .retained
+            .iter()
+            .filter(|descendant| leader_group.is_none() || descendant.process_group != leader_group)
+            .map(|descendant| descendant.stamp)
+            .collect::<Vec<_>>();
+        signal_stamps(escapees, Signal::SIGKILL).await;
         let delivery = self.signal_leader(Signal::SIGKILL);
         if delivery == LeaderSignal::Missed {
             self.kill_with_backend();
@@ -2642,8 +2652,21 @@ pub(super) fn start_service_with_pty_size(
         })
         .map_err(|err| Error::operation("failed to open pty", err))?;
 
-    let mut cmd = CommandBuilder::new(&program);
-    cmd.args(args);
+    // Under containment the shim is the PTY's session leader and starts the command itself.
+    let mut cmd = if let Some((shim, shim_args)) = crate::containment::wrap(
+        &program,
+        args,
+        service.spec.stop_signal,
+        service.spec.stop_grace_period,
+    ) {
+        let mut cmd = CommandBuilder::new(shim);
+        cmd.args(shim_args);
+        cmd
+    } else {
+        let mut cmd = CommandBuilder::new(&program);
+        cmd.args(args);
+        cmd
+    };
     cmd.cwd(working_dir.as_path());
     for (k, v) in &env_vars {
         cmd.env(k, v);

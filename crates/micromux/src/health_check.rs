@@ -37,6 +37,9 @@ pub enum Health {
 /// How long to wait for stdout/stderr readers to flush after the probe process exits.
 const OUTPUT_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
 
+/// How long a probe's processes get to stop when the supervisor dies mid-probe.
+const PROBE_CLEANUP_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -877,9 +880,23 @@ async fn run(
 
     params.sink.start_health_attempt(attempt, command.clone());
 
-    let mut cmd = Command::new(prog);
-    cmd.args(args)
-        .envs(params.environment.iter())
+    // Under containment a shim starts the probe, so a probe still running when the supervisor
+    // dies is cleaned up too.
+    let mut cmd = if let Some((shim, shim_args)) = crate::containment::wrap(
+        std::path::Path::new(prog),
+        args,
+        crate::spec::StopSignal::Term,
+        PROBE_CLEANUP_GRACE,
+    ) {
+        let mut cmd = Command::new(shim);
+        cmd.args(shim_args);
+        cmd
+    } else {
+        let mut cmd = Command::new(prog);
+        cmd.args(args);
+        cmd
+    };
+    cmd.envs(params.environment.iter())
         .kill_on_drop(true)
         .stderr(Stdio::piped())
         .stdout(Stdio::piped());
