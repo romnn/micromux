@@ -126,6 +126,27 @@ pub(crate) fn wrap(
     locate(program, path, cwd)?;
     #[cfg(not(unix))]
     let _ = (path, cwd);
+    Ok(Some(under(
+        shim,
+        program,
+        args,
+        StopPolicy {
+            signal: stop_signal,
+            grace,
+        },
+    )))
+}
+
+/// The command line that runs `program` with `args` under the shim at `shim`.
+fn under(
+    shim: &Path,
+    program: &Path,
+    args: &[String],
+    StopPolicy {
+        signal: stop_signal,
+        grace,
+    }: StopPolicy,
+) -> Wrapped {
     let shim_args: Vec<OsString> = vec![
         SHIM_COMMAND.into(),
         "--supervisor-pid".into(),
@@ -140,11 +161,11 @@ pub(crate) fn wrap(
         .enumerate()
         .map(|(index, arg)| (format!("{COMMAND_VARIABLE_PREFIX}{index}"), arg))
         .collect();
-    Ok(Some(Wrapped {
-        program: shim.clone(),
+    Wrapped {
+        program: shim.to_path_buf(),
         args: shim_args,
         env,
-    }))
+    }
 }
 
 /// Finds the executable `program` names the way `execvp` does: a path with a directory part
@@ -659,16 +680,12 @@ mod tests {
 
     #[test]
     fn wrapped_commands_stay_out_of_the_shim_argv() -> Result<(), String> {
-        let _ = SHIM.set(PathBuf::from("/bin/micromux"));
-        let Ok(Some(wrapped)) = wrap(
+        let wrapped = under(
+            Path::new("/bin/micromux"),
             Path::new("sh"),
             &["-c".to_string(), "next dev".to_string()],
             StopPolicy::default(),
-            std::env::var_os("PATH").as_deref(),
-            Path::new("."),
-        ) else {
-            return Err("containment is on and `sh` exists".to_string());
-        };
+        );
         assert!(
             !wrapped
                 .args
