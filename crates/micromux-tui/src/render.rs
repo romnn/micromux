@@ -1163,7 +1163,7 @@ impl App {
     /// it, so warnings and attach state always keep the first row.
     pub(crate) fn header_lines(&self, width: u16) -> Vec<Line<'static>> {
         let width = usize::from(width);
-        let urls = self.urls_lines(width);
+        let urls = self.urls_lines();
         let status = self.status_line();
         let mut controls = pack_key_hints(&self.view_key_hints(), width);
         if let [single_row] = controls.as_mut_slice()
@@ -1181,50 +1181,45 @@ impl App {
             .collect()
     }
 
-    /// The session's browser URLs, wrapped to `width` on at most [`MAX_URL_ROWS`] rows, and why
-    /// the proxy does not serve them right now on a row of its own.
+    /// The session's browser URLs, one per row and starting at the first column so every URL that
+    /// fits the terminal is shown whole, followed by why the proxy does not serve them right now.
     ///
-    /// A URL never shares a row it does not fit on, so a long session name cannot push the port
-    /// out of view, and URLs beyond the row budget are counted instead of crowding out the panes.
-    fn urls_lines(&self, width: usize) -> Vec<Line<'static>> {
+    /// At most [`MAX_URL_ROWS`] rows go to URLs; beyond that the last row counts the rest instead
+    /// of crowding out the panes.
+    fn urls_lines(&self) -> Vec<Line<'static>> {
         let Some(session) = self.source.session_summary() else {
             return Vec::new();
         };
-        if session.routes.is_empty() {
-            return Vec::new();
-        }
-        let mut rows: Vec<Vec<Span<'static>>> = vec![vec![format!(" {}:", session.name).bold()]];
-        let mut row_width = session.name.chars().count() + 2;
-        let mut shown = 0;
-        for route in &session.routes {
-            let url = route.url.trim_end_matches('/').to_string();
-            let url_width = 1 + url.chars().count();
-            if row_width + url_width > width && row_width > 1 {
-                if rows.len() == MAX_URL_ROWS {
-                    break;
-                }
-                rows.push(Vec::new());
-                row_width = 0;
-            }
-            if let Some(row) = rows.last_mut() {
-                row.push(" ".into());
-                row.push(url.fg(tailwind::CYAN.c400));
-            }
-            row_width += url_width;
-            shown += 1;
-        }
+        let shown = if session.routes.len() > MAX_URL_ROWS {
+            MAX_URL_ROWS - 1
+        } else {
+            session.routes.len()
+        };
+        let mut lines = session
+            .routes
+            .iter()
+            .take(shown)
+            .map(|route| {
+                Line::from(
+                    route
+                        .url
+                        .trim_end_matches('/')
+                        .to_string()
+                        .fg(tailwind::CYAN.c400),
+                )
+            })
+            .collect::<Vec<_>>();
         let hidden = session.routes.len() - shown;
-        if hidden > 0
-            && let Some(row) = rows.last_mut()
-        {
-            row.push(
-                format!(" +{hidden} more, see `micromux ctl describe`").fg(tailwind::GRAY.c400),
-            );
-        }
-        let mut lines = rows.into_iter().map(Line::from).collect::<Vec<_>>();
-        if let Some(micromux::RoutingStatus::Unavailable { reason }) = &session.routing {
+        if hidden > 0 {
             lines.push(Line::from(
-                format!(" routing unavailable: {reason}").fg(tailwind::RED.c400),
+                format!("+{hidden} more: micromux ctl describe").fg(tailwind::GRAY.c400),
+            ));
+        }
+        if !session.routes.is_empty()
+            && let Some(micromux::RoutingStatus::Unavailable { reason }) = &session.routing
+        {
+            lines.push(Line::from(
+                format!("routing unavailable: {reason}").fg(tailwind::RED.c400),
             ));
         }
         lines

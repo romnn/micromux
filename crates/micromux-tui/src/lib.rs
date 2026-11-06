@@ -1417,12 +1417,15 @@ mod tests {
             assert!(!rows.contains("unavailable"), "{rows}");
         }
 
-        // When the URLs need more than their row budget, each shown URL stays whole, so no port
-        // is cut off, and the rest are counted instead of crowding out the panes.
-        let narrow = header(&mut app, 34);
-        assert!(narrow.contains("http://app.tui.localhost:8080"), "{narrow}");
-        assert!(narrow.contains("http://api.tui.localhost:8080"), "{narrow}");
-        assert!(narrow.contains("+1"), "{narrow}");
+        // Every URL starts its own row at the first column, so one that fits the terminal is
+        // never cut, even when it fills it exactly.
+        let exact = "http://admin.tui.localhost:8080".len();
+        let rows = header(&mut app, u16::try_from(exact)?);
+        assert!(
+            rows.lines()
+                .any(|row| row == "http://admin.tui.localhost:8080"),
+            "{rows}"
+        );
 
         // A routing problem wakes the event loop and gets a row of its own.
         let wake = app
