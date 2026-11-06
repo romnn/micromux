@@ -21,7 +21,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use micromux::{Desired, Execution, Health, HealthAttempt, ServiceSnapshot};
+use micromux::{DependencyFailure, Desired, Execution, Health, HealthAttempt, ServiceSnapshot};
 use micromux_control::{
     Client, ControlEndpoint, ControlError, ErrorCode, Request, Response, SessionInfo, endpoint_for,
     runtime_dir_statuses, transport_supported, usable_runtime_dirs,
@@ -828,6 +828,8 @@ struct WaitResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     latest_healthcheck: Option<Nullable<HealthAttempt>>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    dependency_failure: Option<DependencyFailure>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     hint: Option<&'static str>,
 }
 
@@ -836,6 +838,7 @@ struct WaitResult {
 enum WaitStatus {
     Healthy,
     Exited,
+    DependencyFailed,
     Timeout,
 }
 
@@ -868,6 +871,9 @@ impl WaitResult {
             WaitConclusion::Exited(snapshot) => {
                 Self::exited(service, snapshot.last_exit_code, snapshot.run_generation)
             }
+            WaitConclusion::DependencyFailed { snapshot, failure } => {
+                Self::dependency_failed(service, snapshot, failure.clone())
+            }
             WaitConclusion::Timeout {
                 snapshot,
                 latest_healthcheck,
@@ -893,6 +899,7 @@ impl WaitResult {
             health: None,
             uptime_secs: None,
             latest_healthcheck: None,
+            dependency_failure: None,
             hint: None,
         }
     }
@@ -910,7 +917,33 @@ impl WaitResult {
             health: None,
             uptime_secs: None,
             latest_healthcheck: None,
+            dependency_failure: None,
             hint: Some("the run exited before becoming healthy — inspect get_logs for why"),
+        }
+    }
+
+    fn dependency_failed(
+        service: String,
+        snapshot: &ServiceSnapshot,
+        failure: DependencyFailure,
+    ) -> Self {
+        Self {
+            status: WaitStatus::DependencyFailed,
+            service,
+            generation: None,
+            exit_code: None,
+            waited_secs: None,
+            execution: Some(snapshot.execution),
+            run_generation: Some(snapshot.run_generation),
+            healthcheck_configured: None,
+            health: None,
+            uptime_secs: None,
+            latest_healthcheck: None,
+            dependency_failure: Some(failure),
+            hint: Some(
+                "the service is blocked behind a dependency that cannot meet its condition — \
+                 restart or enable the dependency named in dependency_failure",
+            ),
         }
     }
 
@@ -932,6 +965,7 @@ impl WaitResult {
             health: Some(Nullable(snapshot.health)),
             uptime_secs: Some(Nullable(snapshot.uptime.map(|uptime| uptime.as_secs()))),
             latest_healthcheck: Some(Nullable(latest_healthcheck)),
+            dependency_failure: None,
             hint: Some(timeout_hint(snapshot)),
         }
     }
@@ -2656,6 +2690,9 @@ impl McpServer {
                 return Err(error_data(enrich_unknown_service(&args.service, err).await));
             }
         };
+        if let WaitConclusion::DependencyFailed { failure, .. } = conclusion {
+            return Err(error_data(dependency_failed_error(&args.service, failure)));
+        }
         Ok(Json(WaitResult::from_conclusion(
             args.service,
             timeout,
@@ -3142,7 +3179,7 @@ mod tests {
     use super::{
         DynamicServiceArgs, EnsureAction, EnsureActionKind, EnsureReadyArgs, LogFilterArgs,
         LogsArgs, ReconcileConfigArgs, RenewDynamicServiceArgs, ReplaceDynamicServiceArgs,
-        ServiceArgs, ServiceEventsArgs, ServiceEventsResult, SessionArgs,
+        RestartAndWaitArgs, ServiceArgs, ServiceEventsArgs, ServiceEventsResult, SessionArgs,
         SessionServiceEventsResult, StartDynamicAndWaitArgs, WaitArgs, WaitForExitArgs, WaitStatus,
         capture_mutation_cursor,
     };
@@ -4012,7 +4049,7 @@ services:
         let exit = server
             .wait_for_exit(Parameters(WaitForExitArgs {
                 service: "api".to_string(),
-                session: Some(selector),
+                session: Some(selector.clone()),
                 after_generation: None,
                 timeout_secs: Some(30),
                 log_limit: Some(1),
@@ -4020,6 +4057,34 @@ services:
             .await
             .err()
             .ok_or_else(|| eyre::eyre!("an exit wait behind a failed dependency resolved"))?;
+        // A bundle reports the failure as its outcome, keeping what its mutation did.
+        let Json(bundle) = server
+            .restart_service_and_wait(Parameters(RestartAndWaitArgs {
+                service: "api".to_string(),
+                session: Some(selector.clone()),
+                timeout_secs: Some(30),
+                log_limit: Some(1),
+            }))
+            .await
+            .map_err(|err| eyre::eyre!(err.message))?;
+        assert!(matches!(
+            bundle.outcome.status,
+            WaitStatus::DependencyFailed
+        ));
+        assert_eq!(
+            bundle
+                .outcome
+                .dependency_failure
+                .as_ref()
+                .map(|failure| (failure.service.as_str(), failure.exit_code)),
+            Some(("seed", Some(4)))
+        );
+        assert!(
+            bundle
+                .events
+                .iter()
+                .any(|event| event.kind == micromux::ServiceEventKind::DependencyFailed)
+        );
         assert!(started.elapsed() < Duration::from_secs(10));
         for error in [healthy, exit] {
             assert!(

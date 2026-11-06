@@ -65,7 +65,7 @@ If a dependency never becomes healthy (its probe keeps failing), the dependent s
 
 ### Dependencies that cannot recover
 
-Some blocks are permanent: a dependency exited and its [restart policy]({{< relref "restart-policies.md" >}}) will not start it again (`restart: "no"`, or `on-failure` with its retries spent), or it is disabled or retired. Micromux marks a dependent blocked by such a dependency as failed, transitively: if `api` waits for `worker`, which waits for a `seed` that exited with status 1 under `restart: "no"`, both `worker` and `api` name `seed` as the cause.
+Some blocks are permanent: a dependency exited and its [restart policy]({{< relref "restart-policies.md" >}}) will not start it again (`restart: "no"`, or `on-failure` with its retries spent), or it is disabled or retired, or it is waited on as `healthy` without a healthcheck. Micromux marks a dependent blocked by such a dependency as failed, transitively: if `api` waits for `worker`, which waits for a `seed` that exited with status 1 under `restart: "no"`, both `worker` and `api` name `seed` as the cause.
 
 ```
 ======== dependency `seed` exited with code 1 and will not restart, so it cannot complete successfully ========

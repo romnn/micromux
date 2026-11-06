@@ -50,6 +50,11 @@ pub(crate) struct ServiceDiagnosis {
 pub(crate) enum WaitConclusion {
     Healthy(ServiceSnapshot),
     Exited(ServiceSnapshot),
+    /// The service is blocked behind a dependency that cannot meet its condition.
+    DependencyFailed {
+        snapshot: ServiceSnapshot,
+        failure: DependencyFailure,
+    },
     Timeout {
         snapshot: ServiceSnapshot,
         latest_healthcheck: Option<HealthAttempt>,
@@ -59,14 +64,18 @@ pub(crate) enum WaitConclusion {
 impl WaitConclusion {
     pub(crate) fn snapshot(&self) -> &ServiceSnapshot {
         match self {
-            Self::Healthy(snapshot) | Self::Exited(snapshot) | Self::Timeout { snapshot, .. } => {
-                snapshot
-            }
+            Self::Healthy(snapshot)
+            | Self::Exited(snapshot)
+            | Self::DependencyFailed { snapshot, .. }
+            | Self::Timeout { snapshot, .. } => snapshot,
         }
     }
 
     pub(crate) fn needs_diagnosis(&self) -> bool {
-        matches!(self, Self::Exited(_) | Self::Timeout { .. })
+        matches!(
+            self,
+            Self::Exited(_) | Self::DependencyFailed { .. } | Self::Timeout { .. }
+        )
     }
 }
 
@@ -520,7 +529,7 @@ pub(crate) async fn wait_for_health(
                 format!("service `{service}` is disabled and will not become healthy")
             })),
             WaitVerdict::DependencyFailed(failure) => {
-                Err(dependency_failed_error(service, failure))
+                Ok(WaitConclusion::DependencyFailed { snapshot, failure })
             }
         },
         SnapshotWait::Timeout(snapshot) => {

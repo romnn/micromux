@@ -119,6 +119,8 @@ pub enum DependencyFailureReason {
     Retired,
     /// It is not part of the session.
     Missing,
+    /// The condition is `healthy`, but it has no healthcheck to become healthy by.
+    NoHealthcheck,
     /// A newer peer sent a reason this binary does not know yet.
     #[serde(other)]
     Unknown,
@@ -159,6 +161,7 @@ impl DependencyFailure {
             (DependencyFailureReason::Disabled, _) => "is disabled".to_string(),
             (DependencyFailureReason::Retired, _) => "is retired".to_string(),
             (DependencyFailureReason::Missing, _) => "is not part of the session".to_string(),
+            (DependencyFailureReason::NoHealthcheck, _) => "has no healthcheck".to_string(),
             (DependencyFailureReason::Unknown, _) => "cannot meet its condition".to_string(),
         };
         let condition = match self.condition {

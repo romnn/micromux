@@ -936,6 +936,23 @@ impl TestEventSink {
     }
 }
 
+/// A command's acknowledgement, held back until the scheduling pass the command triggers has run.
+enum Reply {
+    Service(Option<CommandAck>, ServiceCommandResult),
+    Dynamic(Option<control::DynamicCommandAck>, DynamicServiceResult),
+    Reconcile(control::ReconcileCommandAck, ReconcileResult),
+}
+
+impl Reply {
+    fn send(self) {
+        match self {
+            Self::Service(ack, result) => SchedulerRuntime::reply(ack, result),
+            Self::Dynamic(ack, result) => SchedulerRuntime::reply_dynamic(ack, result),
+            Self::Reconcile(ack, result) => ack.send(result),
+        }
+    }
+}
+
 struct SchedulerRuntime {
     services: HashMap<ServiceID, ServiceRuntime>,
     reload_config: Option<ReloadConfig>,
@@ -1043,31 +1060,6 @@ impl SchedulerRuntime {
             (services.get(service_id), self.services.get(service_id))
         {
             sync_model(&self.writer, service, runtime);
-        }
-    }
-
-    /// Forget recorded dependency failures that the command just handled resolved, for example by
-    /// restarting or enabling the failed dependency.
-    ///
-    /// The command is acknowledged before the next scheduling pass re-records blocks, so without
-    /// this a caller that waits on a dependent right after the acknowledgement could still read
-    /// the failure and give up on a dependency that is already starting again.
-    fn clear_resolved_dependency_failures(&mut self, services: &ServiceMap) {
-        let resolved = services
-            .values()
-            .filter(|service| {
-                self.services
-                    .get(&service.id)
-                    .is_some_and(|runtime| runtime.dependency_failure.is_some())
-                    && schedule::dependency_failure(services, &self.services, service).is_none()
-            })
-            .map(|service| service.id.clone())
-            .collect::<Vec<_>>();
-        for service_id in resolved {
-            if let Some(runtime) = self.services.get_mut(&service_id) {
-                runtime.dependency_failure = None;
-            }
-            self.sync(services, &service_id);
         }
     }
 
@@ -1206,7 +1198,15 @@ impl SchedulerRuntime {
                     let Some(command) = command else {
                         break;
                     };
-                    self.handle_command(services, events_rx, command).await
+                    if let Some(reply) = self.handle_command(services, events_rx, command).await {
+                        // Acknowledge only once the pass the command triggers has run, so a caller
+                        // that reads the session right after the reply sees the command's effects,
+                        // such as a restarted dependency's dependents no longer failed.
+                        self.evict_retired(services);
+                        self.schedule_pass(services, events_rx).await;
+                        reply.send();
+                    }
+                    false
                 }
                 input = async {
                     if pty_input_closed {
@@ -2517,25 +2517,16 @@ impl SchedulerRuntime {
         services: &mut ServiceMap,
         events_rx: &mut mpsc::Receiver<ProcessEvent>,
         command: Command,
-    ) -> bool {
-        match command {
+    ) -> Option<Reply> {
+        let reply = match command {
             Command::Restart { service, ack } => {
-                let result = self.apply_restart(services, events_rx, &service).await;
-                self.clear_resolved_dependency_failures(services);
-                Self::reply(ack, result);
-                true
+                Reply::Service(ack, self.apply_restart(services, events_rx, &service).await)
             }
             Command::Enable { service, ack } => {
-                let result = self.apply_enable(services, events_rx, &service).await;
-                self.clear_resolved_dependency_failures(services);
-                Self::reply(ack, result);
-                true
+                Reply::Service(ack, self.apply_enable(services, events_rx, &service).await)
             }
             Command::RestartAll { ack } => {
-                let result = self.apply_restart_all(services, events_rx).await;
-                self.clear_resolved_dependency_failures(services);
-                Self::reply(ack, result);
-                true
+                Reply::Service(ack, self.apply_restart_all(services, events_rx).await)
             }
             Command::Disable { service, ack } => {
                 let result = self.apply_disable(services, &service);
@@ -2543,46 +2534,35 @@ impl SchedulerRuntime {
                 if result.is_ok() {
                     self.test_events.forward(Event::Disabled(service.clone()));
                 }
-                Self::reply(ack, result);
-                true
+                Reply::Service(ack, result)
             }
-            Command::ReconcileConfig { dry_run, ack } => {
-                let result = self.reconcile_config(services, events_rx, dry_run).await;
-                self.clear_resolved_dependency_failures(services);
-                ack.send(result);
-                true
-            }
+            Command::ReconcileConfig { dry_run, ack } => Reply::Reconcile(
+                ack,
+                self.reconcile_config(services, events_rx, dry_run).await,
+            ),
             Command::StartDynamic { params, ack } => {
-                let result = self.start_dynamic(services, params);
-                Self::reply_dynamic(ack, result);
-                true
+                Reply::Dynamic(ack, self.start_dynamic(services, params))
             }
             Command::ReplaceDynamic {
                 service,
                 expected_revision,
                 params,
                 ack,
-            } => {
-                let result = self.replace_dynamic(services, &service, expected_revision, params);
-                self.clear_resolved_dependency_failures(services);
-                Self::reply_dynamic(ack, result);
-                true
-            }
+            } => Reply::Dynamic(
+                ack,
+                self.replace_dynamic(services, &service, expected_revision, params),
+            ),
             Command::RenewDynamic {
                 service,
                 expected_revision,
                 expires_after,
                 ack,
-            } => {
-                let result =
-                    self.renew_dynamic(services, &service, expected_revision, expires_after);
-                Self::reply_dynamic(ack, result);
-                true
-            }
+            } => Reply::Dynamic(
+                ack,
+                self.renew_dynamic(services, &service, expected_revision, expires_after),
+            ),
             Command::StopDynamic { service, ack } => {
-                let result = self.stop_dynamic(services, &service);
-                Self::reply_dynamic(ack, result);
-                true
+                Reply::Dynamic(ack, self.stop_dynamic(services, &service))
             }
             Command::ResizeAll { cols, rows } => {
                 self.current_pty_size = portable_pty::PtySize {
@@ -2596,9 +2576,10 @@ impl SchedulerRuntime {
                         running.pty.resize(service_id, self.current_pty_size);
                     }
                 }
-                false
+                return None;
             }
-        }
+        };
+        Some(reply)
     }
 
     fn handle_health_event(

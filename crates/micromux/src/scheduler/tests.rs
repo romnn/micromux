@@ -5241,7 +5241,10 @@ fn seed_worker_api(marker: &Path) -> eyre::Result<ServiceMap> {
 
 /// A dependency that exited and will not restart fails its dependents, and the dependents of
 /// those, until a restart revives it; the restart's acknowledgement already clears the failure.
-#[tokio::test]
+///
+/// The test runs the scheduler on another worker thread, so a reply sent before the scheduling
+/// pass the restart triggers would let the reads below race that pass.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_dependency_that_will_not_restart_fails_its_dependents_transitively() -> eyre::Result<()>
 {
     let dir = unique_tmp_dir("dependency-failure");
@@ -5314,6 +5317,14 @@ async fn a_dependency_that_will_not_restart_fails_its_dependents_transitively() 
 
     fs::write(&marker, "")?;
     accepted(harness.control.restart(&"seed".to_string()).await)?;
+    assert_eq!(
+        harness
+            .reader
+            .service("seed")
+            .map(|snapshot| snapshot.run_generation),
+        Some(2),
+        "the restart was acknowledged before the pass that starts it"
+    );
     for service in ["worker", "api"] {
         assert_eq!(
             harness
@@ -5337,7 +5348,7 @@ async fn a_dependency_that_will_not_restart_fails_its_dependents_transitively() 
 
 /// A dependency that can still restart on its own is not a failure, and neither is a disabled
 /// dependency's dependent once the dependency is enabled again.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn only_dependencies_that_cannot_recover_on_their_own_fail_their_dependents()
 -> eyre::Result<()> {
     let config_dir = Path::new(".");
@@ -5417,6 +5428,42 @@ async fn only_dependencies_that_cannot_recover_on_their_own_fail_their_dependent
         snapshot.execution == Execution::Running
     })
     .await?;
+
+    harness.shutdown.cancel();
+    harness.handle.await??;
+    Ok(())
+}
+
+/// A `healthy` condition on a dependency without a healthcheck can never be met.
+#[tokio::test]
+async fn a_healthy_condition_on_a_dependency_without_a_healthcheck_fails() -> eyre::Result<()> {
+    let config_dir = Path::new(".");
+    let mut services = ServiceMap::new();
+    services.insert(
+        "db".to_string(),
+        Service::new(
+            "db",
+            config_dir,
+            service_config("db", ("sh", &["-c", "sleep 60"])),
+        )?,
+    );
+    let mut api_cfg = service_config("api", ("sh", &["-c", "sleep 60"]));
+    api_cfg.depends_on = vec![depends_on("db", config::DependencyCondition::Healthy)];
+    services.insert("api".to_string(), Service::new("api", config_dir, api_cfg)?);
+    let harness = spawn_harness(services, None);
+
+    let api = wait_until(&harness.reader, "api", |snapshot| {
+        snapshot.dependency_failure.is_some()
+    })
+    .await?;
+    assert_eq!(
+        api.dependency_failure
+            .map(|failure| (failure.service, failure.reason)),
+        Some((
+            "db".to_string(),
+            crate::DependencyFailureReason::NoHealthcheck
+        ))
+    );
 
     harness.shutdown.cancel();
     harness.handle.await??;

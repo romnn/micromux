@@ -138,6 +138,12 @@ fn unmeetable_dependency(
             runtime.last_exit_code,
         ));
     }
+    if dependency.condition == DependencyCondition::Healthy && service.spec.healthcheck.is_none() {
+        return Some(failure(
+            DependencyFailureReason::NoHealthcheck,
+            runtime.last_exit_code,
+        ));
+    }
     if runtime.running.is_some() {
         return None;
     }

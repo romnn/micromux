@@ -124,6 +124,7 @@ fn dependency_failure_label(service: &micromux::ServiceSnapshot) -> String {
         micromux::DependencyFailureReason::Disabled => "disabled",
         micromux::DependencyFailureReason::Retired => "retired",
         micromux::DependencyFailureReason::Missing => "missing",
+        micromux::DependencyFailureReason::NoHealthcheck => "no_healthcheck",
         micromux::DependencyFailureReason::Unknown => "unknown",
     };
     let exit_code = failure
