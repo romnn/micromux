@@ -26,11 +26,11 @@ use serde::{Deserialize, Serialize};
 
 use super::{SessionError, config_path_key};
 
-/// Ports handed out to sessions.
+/// Ports handed out to sessions that configure no `session.port_range`.
 ///
 /// The range sits below the ephemeral ranges of Linux (32768+) and macOS (49152+), so outgoing
 /// connections never take a port a session has been promised.
-pub(crate) const PORT_RANGE: RangeInclusive<u16> = 20000..=32767;
+pub(crate) const DEFAULT_PORT_RANGE: RangeInclusive<u16> = 20000..=32767;
 
 const REGISTRY_LOCK: &str = "registry.lock";
 
@@ -100,7 +100,8 @@ impl PortRegistry {
         read_record(&path).ok().flatten().map(|record| record.ports)
     }
 
-    /// Reserves a port for every name in `names`, reusing this session's persisted assignment.
+    /// Reserves a port in `range` for every name in `names`, reusing this session's persisted
+    /// assignment where it still lies in `range`.
     ///
     /// The returned lease marks the session live until it is dropped.
     pub(crate) fn acquire(
@@ -109,6 +110,7 @@ impl PortRegistry {
         session_name: &str,
         names: &[String],
         excluded: &[u16],
+        range: &RangeInclusive<u16>,
     ) -> Result<(IndexMap<String, u16>, Lease), SessionError> {
         let directory = self.directory()?;
         let io = |path: &Path| {
@@ -167,6 +169,10 @@ impl PortRegistry {
         taken.extend(excluded.iter().copied());
         for name in names {
             let port = match persisted.get(name).copied() {
+                // A range changed since the assignment: a new one in the range replaces it.
+                Some(port) if !range.contains(&port) => {
+                    pick_port(&key, name, range, &taken, &survey.dormant)?
+                }
                 Some(port) if excluded.contains(&port) => {
                     return Err(SessionError::PortReserved {
                         variable: name.clone(),
@@ -185,7 +191,7 @@ impl PortRegistry {
                     }
                     port
                 }
-                _ => pick_port(&key, name, &taken, &survey.dormant)?,
+                _ => pick_port(&key, name, range, &taken, &survey.dormant)?,
             };
             taken.insert(port);
             ports.insert(name.clone(), port);
@@ -278,18 +284,20 @@ fn survey(directory: &Path, own_key: &str, session_name: &str) -> Result<Survey,
     Ok(survey)
 }
 
-/// Picks a free port for `name`, preferring ports no other session has ever been assigned.
+/// Picks a free port in `range` for `name`, preferring ports no other session has ever been
+/// assigned.
 ///
 /// The scan starts at an offset derived from the session and the variable, so a session tends to
 /// get the same ports again even after its record is deleted.
 fn pick_port(
     key: &str,
     name: &str,
+    range: &RangeInclusive<u16>,
     taken: &HashSet<u16>,
     dormant: &HashSet<u16>,
 ) -> Result<u16, SessionError> {
-    let start = *PORT_RANGE.start();
-    let len = u32::from(*PORT_RANGE.end() - start) + 1;
+    let start = *range.start();
+    let len = u32::from(range.end().saturating_sub(start)) + 1;
     let seed = config_path_key(Path::new(&format!("{key}/{name}")));
     let offset = u32::from_str_radix(seed.get(..8).unwrap_or("0"), 16).unwrap_or(0) % len;
     let candidates = || {
@@ -309,6 +317,8 @@ fn pick_port(
     }
     Err(SessionError::Exhausted {
         variable: name.to_string(),
+        start,
+        end: *range.end(),
     })
 }
 
@@ -465,13 +475,15 @@ mod tests {
         let first = Path::new("/projects/one/micromux.yaml");
         let second = Path::new("/projects/two/micromux.yaml");
 
-        let (ports, lease) = registry.acquire(first, "one", &names(&["A", "B"]), &[])?;
+        let (ports, lease) =
+            registry.acquire(first, "one", &names(&["A", "B"]), &[], &DEFAULT_PORT_RANGE)?;
         assert_eq!(ports.len(), 2);
-        assert!(ports.values().all(|port| PORT_RANGE.contains(port)));
+        assert!(ports.values().all(|port| DEFAULT_PORT_RANGE.contains(port)));
         assert_ne!(ports.get("A"), ports.get("B"));
 
         // A concurrent session avoids every port the live one holds.
-        let (other, other_lease) = registry.acquire(second, "two", &names(&["A", "B"]), &[])?;
+        let (other, other_lease) =
+            registry.acquire(second, "two", &names(&["A", "B"]), &[], &DEFAULT_PORT_RANGE)?;
         assert!(
             other
                 .values()
@@ -480,9 +492,51 @@ mod tests {
 
         // Restarting the first session reproduces its assignment.
         drop(lease);
-        let (again, _lease) = registry.acquire(first, "one", &names(&["A", "B"]), &[])?;
+        let (again, _lease) =
+            registry.acquire(first, "one", &names(&["A", "B"]), &[], &DEFAULT_PORT_RANGE)?;
         assert_eq!(again, ports);
         drop(other_lease);
+        Ok(())
+    }
+
+    /// A persisted port outside a newly configured range is replaced by one inside it, and the
+    /// replacement persists; ports already inside are kept.
+    #[test]
+    fn assignments_outside_the_range_are_replaced() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let registry = PortRegistry::at(directory.path());
+        let config = Path::new("/projects/one/micromux.yaml");
+
+        let (before, lease) =
+            registry.acquire(config, "one", &names(&["A"]), &[], &DEFAULT_PORT_RANGE)?;
+        drop(lease);
+        let range = 40000..=40999;
+        let (after, lease) = registry.acquire(config, "one", &names(&["A"]), &[], &range)?;
+        drop(lease);
+        let (again, _lease) = registry.acquire(config, "one", &names(&["A"]), &[], &range)?;
+
+        assert!(before.values().all(|port| !range.contains(port)));
+        assert!(after.values().all(|port| range.contains(port)), "{after:?}");
+        assert_eq!(again, after);
+        Ok(())
+    }
+
+    /// A range too small for the names reports the range it ran out of.
+    #[test]
+    fn exhausted_ranges_are_reported() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let registry = PortRegistry::at(directory.path());
+        let config = Path::new("/projects/one/micromux.yaml");
+        // Hold the only port, so the range is exhausted whatever else runs on this machine.
+        let holder = std::net::TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0))?;
+        let port = holder.local_addr()?.port();
+
+        let result = registry.acquire(config, "one", &names(&["A"]), &[], &(port..=port));
+
+        assert!(
+            matches!(result, Err(SessionError::Exhausted { start, end, .. }) if start == port && end == port),
+            "{result:?}"
+        );
         Ok(())
     }
 
@@ -494,8 +548,9 @@ mod tests {
         let registry = PortRegistry::at(directory.path());
         let config = Path::new("/projects/one/micromux.yaml");
 
-        let (_ports, _lease) = registry.acquire(config, "one", &names(&["A"]), &[])?;
-        let result = registry.acquire(config, "one", &names(&["A"]), &[]);
+        let (_ports, _lease) =
+            registry.acquire(config, "one", &names(&["A"]), &[], &DEFAULT_PORT_RANGE)?;
+        let result = registry.acquire(config, "one", &names(&["A"]), &[], &DEFAULT_PORT_RANGE);
 
         assert!(matches!(result, Err(SessionError::AlreadyRunning { .. })));
         Ok(())
@@ -513,12 +568,14 @@ mod tests {
             "app",
             &names(&["A"]),
             &[],
+            &DEFAULT_PORT_RANGE,
         )?;
         let result = registry.acquire(
             Path::new("/b/app/micromux.yaml"),
             "app",
             &names(&["A"]),
             &[],
+            &DEFAULT_PORT_RANGE,
         );
         assert!(matches!(result, Err(SessionError::NameInUse { .. })));
 
@@ -528,6 +585,7 @@ mod tests {
             "app",
             &names(&["A"]),
             &[],
+            &DEFAULT_PORT_RANGE,
         )?;
         Ok(())
     }
@@ -539,12 +597,13 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let registry = PortRegistry::at(directory.path());
         let config = Path::new("/projects/ipv4-busy/micromux.yaml");
-        let (ports, lease) = registry.acquire(config, "one", &names(&["A"]), &[])?;
+        let (ports, lease) =
+            registry.acquire(config, "one", &names(&["A"]), &[], &DEFAULT_PORT_RANGE)?;
         drop(lease);
         let port = *ports.get("A").ok_or_else(|| eyre::eyre!("no port"))?;
 
         let _foreign = TcpListener::bind((Ipv4Addr::LOCALHOST, port))?;
-        let result = registry.acquire(config, "one", &names(&["A"]), &[]);
+        let result = registry.acquire(config, "one", &names(&["A"]), &[], &DEFAULT_PORT_RANGE);
 
         assert!(
             matches!(&result, Err(SessionError::PortBusy { variable, port: busy }) if variable == "A" && *busy == port),
@@ -559,7 +618,8 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let registry = PortRegistry::at(directory.path());
         let config = Path::new("/projects/ipv6-busy/micromux.yaml");
-        let (ports, lease) = registry.acquire(config, "one", &names(&["A"]), &[])?;
+        let (ports, lease) =
+            registry.acquire(config, "one", &names(&["A"]), &[], &DEFAULT_PORT_RANGE)?;
         drop(lease);
         let port = *ports.get("A").ok_or_else(|| eyre::eyre!("no port"))?;
 
@@ -567,7 +627,7 @@ mod tests {
             // No IPv6 on this host: nothing to probe.
             return Ok(());
         };
-        let result = registry.acquire(config, "one", &names(&["A"]), &[]);
+        let result = registry.acquire(config, "one", &names(&["A"]), &[], &DEFAULT_PORT_RANGE);
 
         assert!(
             matches!(&result, Err(SessionError::PortBusy { .. })),
@@ -586,7 +646,8 @@ mod tests {
         std::fs::create_dir_all(&project)?;
         let config = project.join("micromux.yaml");
         std::fs::write(&config, "")?;
-        let (_ports, lease) = registry.acquire(&config, "gone", &names(&["A"]), &[])?;
+        let (_ports, lease) =
+            registry.acquire(&config, "gone", &names(&["A"]), &[], &DEFAULT_PORT_RANGE)?;
         drop(lease);
         let record = directory
             .path()
@@ -595,7 +656,13 @@ mod tests {
         assert!(record.exists());
 
         std::fs::remove_dir_all(&project)?;
-        registry.acquire(Path::new("/projects/two/micromux.yaml"), "two", &[], &[])?;
+        registry.acquire(
+            Path::new("/projects/two/micromux.yaml"),
+            "two",
+            &[],
+            &[],
+            &DEFAULT_PORT_RANGE,
+        )?;
 
         assert!(!record.exists());
         Ok(())
@@ -613,7 +680,8 @@ mod tests {
         std::fs::create_dir_all(&project)?;
         let config = project.join("micromux.yaml");
         std::fs::write(&config, "")?;
-        let (_ports, lease) = registry.acquire(&config, "locked", &names(&["A"]), &[])?;
+        let (_ports, lease) =
+            registry.acquire(&config, "locked", &names(&["A"]), &[], &DEFAULT_PORT_RANGE)?;
         drop(lease);
         let record = directory
             .path()
@@ -623,7 +691,13 @@ mod tests {
         std::fs::set_permissions(&project, std::fs::Permissions::from_mode(0o000))?;
         // Root ignores the permission, so the premise only holds for ordinary users.
         let premise = config.try_exists().is_err();
-        let result = registry.acquire(Path::new("/projects/two/micromux.yaml"), "two", &[], &[]);
+        let result = registry.acquire(
+            Path::new("/projects/two/micromux.yaml"),
+            "two",
+            &[],
+            &[],
+            &DEFAULT_PORT_RANGE,
+        );
         std::fs::set_permissions(&project, std::fs::Permissions::from_mode(0o755))?;
         result?;
 
@@ -640,15 +714,17 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let registry = PortRegistry::at(directory.path());
         let config = Path::new("/projects/one/micromux.yaml");
-        let (ports, lease) = registry.acquire(config, "one", &names(&["A"]), &[])?;
+        let (ports, lease) =
+            registry.acquire(config, "one", &names(&["A"]), &[], &DEFAULT_PORT_RANGE)?;
         drop(lease);
         let port = *ports.get("A").ok_or_else(|| eyre::eyre!("no port"))?;
 
-        let result = registry.acquire(config, "one", &names(&["A"]), &[port]);
+        let result = registry.acquire(config, "one", &names(&["A"]), &[port], &DEFAULT_PORT_RANGE);
         assert!(matches!(result, Err(SessionError::PortReserved { .. })));
 
         let other = Path::new("/projects/two/micromux.yaml");
-        let (fresh, _lease) = registry.acquire(other, "two", &names(&["A"]), &[port])?;
+        let (fresh, _lease) =
+            registry.acquire(other, "two", &names(&["A"]), &[port], &DEFAULT_PORT_RANGE)?;
         assert_ne!(fresh.get("A"), Some(&port));
         Ok(())
     }
@@ -659,7 +735,8 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let registry = PortRegistry::at(directory.path());
         let config = Path::new("/projects/one/micromux.yaml");
-        let (ports, _lease) = registry.acquire(config, "one", &names(&["A"]), &[])?;
+        let (ports, _lease) =
+            registry.acquire(config, "one", &names(&["A"]), &[], &DEFAULT_PORT_RANGE)?;
 
         assert_eq!(registry.persisted(config), Some(ports));
         Ok(())
@@ -672,7 +749,8 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let registry = PortRegistry::at(directory.path());
         let first = Path::new("/projects/one/micromux.yaml");
-        let (_ports, _lease) = registry.acquire(first, "one", &names(&["A"]), &[])?;
+        let (_ports, _lease) =
+            registry.acquire(first, "one", &names(&["A"]), &[], &DEFAULT_PORT_RANGE)?;
         std::fs::write(
             directory
                 .path()
@@ -685,6 +763,7 @@ mod tests {
             "two",
             &names(&["A"]),
             &[],
+            &DEFAULT_PORT_RANGE,
         );
 
         assert!(matches!(result, Err(SessionError::UnreadableRecord { .. })));

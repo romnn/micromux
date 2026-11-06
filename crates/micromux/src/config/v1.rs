@@ -1391,7 +1391,7 @@ fn parse_session<F: Copy>(
         let (_span, mapping) = expect_mapping(mapping, "session must be a mapping".into())?;
         warn_unknown_keys(
             mapping,
-            &["name", "domain"],
+            &["name", "domain", "port_range"],
             "session",
             file_id,
             strict,
@@ -1422,6 +1422,8 @@ fn parse_session<F: Copy>(
                 span: domain.span.into(),
             });
         }
+        session.port_range =
+            parse_port_range(mapping.get("port_range"), file_id, strict, diagnostics)?;
     }
     if let Some(names) = value.get("allocate_ports") {
         let names = expect_sequence(
@@ -1457,7 +1459,88 @@ fn parse_session<F: Copy>(
     }
     session.routes = parse_routes(value, file_id, strict, diagnostics)?;
     session.proxy = parse_proxy(value, file_id, strict, diagnostics)?;
+    if let Some(range) = &session.port_range {
+        // The proxy's ports are never allocated, so they take no room.
+        let proxy_ports = [Some(session.proxy.port()), session.proxy.fallback_port()]
+            .into_iter()
+            .flatten()
+            .collect::<std::collections::HashSet<_>>();
+        let room = (range.start.inner..=range.end.inner).len().saturating_sub(
+            proxy_ports
+                .iter()
+                .filter(|port| (range.start.inner..=range.end.inner).contains(port))
+                .count(),
+        );
+        if room < session.allocate_ports.len() {
+            return Err(ConfigError::InvalidValue {
+                message: format!(
+                    "session.port_range {}-{} has room for {room} ports, but allocate_ports lists \
+                     {}",
+                    range.start.inner,
+                    range.end.inner,
+                    session.allocate_ports.len()
+                ),
+                span: range.start.span.into(),
+            });
+        }
+    }
     Ok(session)
+}
+
+/// Lowest port `session.port_range` may include: lower ports need privileges on most systems.
+const MIN_ALLOCATED_PORT: u16 = 1024;
+
+/// Parse `session.port_range`, an inclusive `{start, end}` mapping.
+fn parse_port_range<F: Copy>(
+    value: Option<&yaml_spanned::Spanned<Value>>,
+    file_id: F,
+    strict: bool,
+    diagnostics: &mut Vec<Diagnostic<F>>,
+) -> Result<Option<super::PortRangeConfig>, ConfigError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let (span, mapping) = expect_mapping(
+        value,
+        "session.port_range must be a mapping such as { start: 30000, end: 32767 }".into(),
+    )?;
+    warn_unknown_keys(
+        mapping,
+        &["start", "end"],
+        "session.port_range",
+        file_id,
+        strict,
+        diagnostics,
+    );
+    let bound = |key: &str| -> Result<Spanned<u16>, ConfigError> {
+        let port = parse::<u16>(mapping.get(key).ok_or_else(|| ConfigError::MissingKey {
+            key: key.to_string(),
+            message: format!("session.port_range is missing `{key}`"),
+            span: (*span).into(),
+        })?)?;
+        if port.inner < MIN_ALLOCATED_PORT {
+            return Err(ConfigError::InvalidValue {
+                message: format!(
+                    "session.port_range.{key} must be at least {MIN_ALLOCATED_PORT}, below which \
+                     ports need privileges"
+                ),
+                span: port.span.into(),
+            });
+        }
+        Ok(port)
+    };
+    let start = bound("start")?;
+    let end = bound("end")?;
+    if start.inner > end.inner {
+        return Err(ConfigError::InvalidValue {
+            message: format!(
+                "session.port_range.start {} is above its end {}",
+                start.inner, end.inner
+            ),
+            span: start.span.into(),
+        });
+    }
+    Ok(Some(super::PortRangeConfig { start, end }))
 }
 
 /// Parse the top-level `routes` list.
@@ -2648,6 +2731,7 @@ mod tests {
             session:
               name: luup2
               domain: dev.localhost
+              port_range: { start: 30000, end: 32767 }
             allocate_ports: [API_PORT, db_port]
             services:
               app:
@@ -2672,6 +2756,7 @@ mod tests {
             .map(|name| name.inner.as_str())
             .collect::<Vec<_>>();
         assert_eq!(names, vec!["API_PORT", "db_port"]);
+        assert_eq!(session.port_range(), 30000..=32767);
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
         Ok(())
     }
@@ -2769,12 +2854,37 @@ mod tests {
             ),
             ("allocate_ports: [PORT, port]", "more than once"),
             (&long_name, "longer than 128 characters"),
+            (
+                "session: { port_range: { start: 1000, end: 2000 } }",
+                "must be at least 1024",
+            ),
+            (
+                "session: { port_range: { start: 31000, end: 30000 } }",
+                "is above its end",
+            ),
+            ("session: { port_range: { start: 30000 } }", "missing `end`"),
+            ("session: { port_range: 30000 }", "must be a mapping"),
+            ("session: { port_range: { start: 30000, end: 70000 } }", ""),
+            (
+                "session: { port_range: { start: 30000, end: 30001 } }\nallocate_ports: [A, B, C]",
+                "has room for 2 ports, but allocate_ports lists 3",
+            ),
+            (
+                "session: { port_range: { start: 30000, end: 30001 } }\nproxy: { port: 30000 }\n\
+                 allocate_ports: [A, B]",
+                "has room for 1 ports",
+            ),
         ] {
             let yaml = format!("version: 1\n{yaml}\nservices:\n  app:\n    command: [\"true\"]\n");
             let mut diagnostics = Vec::new();
             let result = config::from_str(&yaml, Path::new("."), 0usize, None, &mut diagnostics);
-            let message = result.err().map(|err| err.to_string()).unwrap_or_default();
-            assert!(message.contains(expected), "{yaml}: {message}");
+            let message = result.map(|_| String::new()).map_err(|err| err.to_string());
+            assert!(
+                message
+                    .as_ref()
+                    .is_err_and(|message| message.contains(expected)),
+                "{yaml}: {message:?}"
+            );
         }
     }
 
