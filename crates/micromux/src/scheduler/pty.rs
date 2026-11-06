@@ -2653,12 +2653,11 @@ pub(super) fn start_service_with_pty_size(
         .map_err(|err| Error::operation("failed to open pty", err))?;
 
     // Under containment the shim is the PTY's session leader and starts the command itself.
-    let mut cmd = if let Some((shim, shim_args)) = crate::containment::wrap(
-        &program,
-        args,
-        service.spec.stop_signal,
-        service.spec.stop_grace_period,
-    ) {
+    let stop = crate::containment::StopPolicy {
+        signal: service.spec.stop_signal,
+        grace: service.spec.stop_grace_period,
+    };
+    let mut cmd = if let Some((shim, shim_args)) = crate::containment::wrap(&program, args, stop) {
         let mut cmd = CommandBuilder::new(shim);
         cmd.args(shim_args);
         cmd
@@ -2781,6 +2780,7 @@ pub(super) fn start_service_with_pty_size(
                     events_tx,
                     shutdown,
                     terminate,
+                    stop,
                 },
             )
             .await;

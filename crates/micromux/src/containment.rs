@@ -7,6 +7,9 @@
 //!
 //! - It compares its parent with the supervisor's pid before starting the command and every
 //!   [`POLL_INTERVAL`] afterwards; a different parent means the supervisor is gone.
+//!   When the command ends while its terminal has been hung up, the supervisor is gone or is
+//!   tearing the service down: a dying supervisor closes the terminal before the kernel
+//!   re-parents the shim, so the hangup can end the command first.
 //! - Once the supervisor is gone it sends the service's stop signal to every descendant, waits
 //!   up to the grace period, then SIGKILLs whatever is left, and exits.
 //! - On Linux it is a child subreaper, so descendants that detach into their own session (as
@@ -19,6 +22,10 @@
 //! sweeps escaped descendants itself, and a terminal-generated signal reaches the foreground
 //! group directly.
 //! When the command exits on its own, the shim exits with the same status.
+//!
+//! What stays outside: a process that detaches in the milliseconds between a forced stop's last
+//! process walk and its group kill, if the supervisor dies right then, and descendants of a probe
+//! that already detached when its timeout kills it.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -31,14 +38,6 @@ pub const SHIM_COMMAND: &str = "__shim";
 /// How often the shim checks whether the supervisor still lives.
 #[cfg(unix)]
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
-
-/// How long the shim waits after a terminal hangup before trusting that the supervisor lives.
-///
-/// The kernel closes a dying supervisor's descriptors, which hangs up the services' terminals,
-/// before it re-parents the shim, so a command can die of the hangup while the shim still sees
-/// the supervisor as its parent.
-#[cfg(unix)]
-const HANGUP_SETTLE: Duration = Duration::from_millis(500);
 
 /// Exit status of a shim whose command could not be started, as a shell reports it.
 #[cfg(unix)]
@@ -61,12 +60,31 @@ pub fn enable(executable: PathBuf) {
     }
 }
 
+/// How the shim stops a command's processes once the supervisor is gone: the owning service's
+/// `stop_signal` and `stop_grace_period`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct StopPolicy {
+    pub(crate) signal: crate::spec::StopSignal,
+    pub(crate) grace: Duration,
+}
+
+impl Default for StopPolicy {
+    fn default() -> Self {
+        Self {
+            signal: crate::spec::StopSignal::default(),
+            grace: crate::spec::DEFAULT_STOP_GRACE_PERIOD,
+        }
+    }
+}
+
 /// The argv that runs `program` with `args` under the shim, or `None` when containment is off.
 pub(crate) fn wrap(
     program: &Path,
     args: &[String],
-    stop_signal: crate::spec::StopSignal,
-    grace: Duration,
+    StopPolicy {
+        signal: stop_signal,
+        grace,
+    }: StopPolicy,
 ) -> Option<(PathBuf, Vec<OsString>)> {
     let shim = SHIM.get()?;
     let mut shim_args: Vec<OsString> = vec![
@@ -181,19 +199,17 @@ mod shim {
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
-    use nix::errno::Errno;
     use nix::sys::signal::Signal;
-    use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
-    use nix::unistd::Pid;
+    use rustix::process::{Pid, WaitOptions, WaitStatus};
 
-    use super::{EXIT_CANNOT_RUN, HANGUP_SETTLE, POLL_INTERVAL, ShimArgs};
-    use crate::process_tree;
+    use super::{EXIT_CANNOT_RUN, POLL_INTERVAL, ShimArgs};
+    use crate::process_tree::{self, Descendant};
 
-    /// How the main command ended.
+    /// How the main command ended, with the raw signal number so real-time signals survive.
     #[derive(Debug, Clone, Copy)]
     enum Ended {
         Exited(i32),
-        Signaled(Signal),
+        Signaled(i32),
     }
 
     pub(super) fn run(args: &ShimArgs) -> i32 {
@@ -228,30 +244,30 @@ mod shim {
                 return EXIT_CANNOT_RUN;
             }
         };
-        let child = Pid::from_raw(i32::try_from(child.id()).unwrap_or(i32::MAX));
+        let child = i32::try_from(child.id()).ok().and_then(Pid::from_raw);
 
         let mut ended = None;
-        let mut hangup_at: Option<Instant> = None;
+        // When the supervisor's own graceful stop reached the shim, so cleanup neither repeats
+        // the signal nor restarts the grace period.
+        let mut stop_requested: Option<Instant> = None;
         loop {
             match events.recv_timeout(POLL_INTERVAL) {
-                Ok(Signal::SIGHUP) => hangup_at = Some(Instant::now()),
+                Ok(signal) if signal == args.stop_signal => {
+                    stop_requested.get_or_insert_with(Instant::now);
+                }
                 Ok(_) | Err(mpsc::RecvTimeoutError::Timeout) => {}
                 // The watcher thread ended; keep polling at the same pace.
                 Err(mpsc::RecvTimeoutError::Disconnected) => std::thread::sleep(POLL_INTERVAL),
             }
             reap(child, &mut ended);
 
-            // Supervisor death wins over the command's own exit: its hangup may be what ended
-            // the command.
-            if !supervisor_alive(args.supervisor) {
-                clean_up(args);
+            let supervisor_gone = !supervisor_alive(args.supervisor);
+            if supervisor_gone || (ended.is_some() && terminal_hung_up()) {
+                clean_up(args, stop_requested);
                 return status(ended);
             }
             if ended.is_some() {
-                let settling = hangup_at.is_some_and(|at| at.elapsed() < HANGUP_SETTLE);
-                if !settling {
-                    return status(ended);
-                }
+                return status(ended);
             }
         }
     }
@@ -284,59 +300,108 @@ mod shim {
         })
     }
 
+    /// Whether the terminal on standard input has been hung up, which a closed PTY master does.
+    fn terminal_hung_up() -> bool {
+        use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+        use std::os::fd::AsFd as _;
+
+        let stdin = std::io::stdin();
+        let mut fds = [PollFd::new(stdin.as_fd(), PollFlags::empty())];
+        poll(&mut fds, PollTimeout::ZERO).is_ok()
+            && fds[0]
+                .revents()
+                .is_some_and(|events| events.contains(PollFlags::POLLHUP))
+    }
+
     /// Reaps every exited child, recording the main command's status.
-    fn reap(child: Pid, ended: &mut Option<Ended>) {
-        loop {
-            match waitpid(None, Some(WaitPidFlag::WNOHANG)) {
-                Ok(WaitStatus::Exited(pid, code)) => {
-                    if pid == child {
-                        *ended = Some(Ended::Exited(code));
-                    }
-                }
-                Ok(WaitStatus::Signaled(pid, signal, _)) => {
-                    if pid == child {
-                        *ended = Some(Ended::Signaled(signal));
-                    }
-                }
-                Ok(WaitStatus::StillAlive) | Err(_) => return,
-                Ok(_) => {}
+    fn reap(child: Option<Pid>, ended: &mut Option<Ended>) {
+        while let Ok(Some((pid, status))) = rustix::process::waitpid(None, WaitOptions::NOHANG) {
+            if Some(pid) != child {
+                continue;
             }
+            *ended = exit_of(status).or(*ended);
         }
     }
 
-    /// Stops every descendant: the stop signal first, then SIGKILL after the grace period, until
-    /// none is left.
-    fn clean_up(args: &ShimArgs) {
+    fn exit_of(status: WaitStatus) -> Option<Ended> {
+        status
+            .exit_status()
+            .map(Ended::Exited)
+            .or_else(|| status.terminating_signal().map(Ended::Signaled))
+    }
+
+    /// Stops every descendant: the stop signal (unless the supervisor's graceful stop already
+    /// delivered it), then SIGKILL after the grace period, until none is left.
+    ///
+    /// Every process seen is remembered: a process whose parent exits is re-parented away from
+    /// the shim on macOS, where only its recorded identity and group still reach it.
+    fn clean_up(args: &ShimArgs, stop_requested: Option<Instant>) {
         let Some(own) = process_tree::stamp(std::process::id()) else {
             return;
         };
         let own_group = u32::try_from(rustix::process::getpgrp().as_raw_nonzero().get()).ok();
+        let mut retained: Vec<Descendant> = Vec::new();
+        let observe = |retained: &mut Vec<Descendant>| {
+            for descendant in process_tree::descendants(own) {
+                if !retained.iter().any(|seen| seen.stamp == descendant.stamp) {
+                    retained.push(descendant);
+                }
+            }
+        };
 
         // Graceful pass: one signal per process. The group signal reaches the members of the
         // shim's own group, so they are skipped individually; the shim only observes its copy.
-        if let Some(group) = own_group.and_then(|group| i32::try_from(group).ok()) {
-            let _ = nix::sys::signal::killpg(Pid::from_raw(group), args.stop_signal);
-        }
-        for descendant in process_tree::descendants(own) {
-            if descendant.process_group.is_none() || descendant.process_group != own_group {
-                let _ = process_tree::send_signal(descendant.stamp, args.stop_signal);
+        observe(&mut retained);
+        let deadline = if let Some(requested) = stop_requested {
+            requested + args.grace
+        } else {
+            if let Some(group) = own_group.and_then(|group| i32::try_from(group).ok()) {
+                let _ =
+                    nix::sys::signal::killpg(nix::unistd::Pid::from_raw(group), args.stop_signal);
             }
-        }
-        let deadline = Instant::now() + args.grace;
-        while Instant::now() < deadline && !process_tree::descendants(own).is_empty() {
+            for descendant in &retained {
+                if descendant.process_group.is_none() || descendant.process_group != own_group {
+                    let _ = process_tree::send_signal(descendant.stamp, args.stop_signal);
+                }
+            }
+            Instant::now() + args.grace
+        };
+        while Instant::now() < deadline {
+            observe(&mut retained);
             reap_all();
+            if retained
+                .iter()
+                .all(|descendant| !process_tree::is_alive(descendant.stamp))
+            {
+                break;
+            }
             std::thread::sleep(Duration::from_millis(20));
         }
 
         // Forced pass: one process at a time, never the group, so the shim survives to reap and
         // to catch processes forked in the meantime.
         for _ in 0..1000 {
-            let remaining = process_tree::descendants(own);
-            if remaining.is_empty() && no_children_left() {
+            observe(&mut retained);
+            let stamps = retained
+                .iter()
+                .map(|descendant| descendant.stamp)
+                .collect::<Vec<_>>();
+            // The shim's own group is scanned too, for members whose parent already exited; the
+            // shim itself is the one member spared.
+            let groups = retained
+                .iter()
+                .filter_map(|descendant| descendant.process_group)
+                .chain(own_group)
+                .collect();
+            let survivors = process_tree::expand_survivors(&stamps, &groups)
+                .into_iter()
+                .filter(|survivor| survivor.pid != own.pid)
+                .collect::<Vec<_>>();
+            if survivors.is_empty() && no_children_left() {
                 return;
             }
-            for descendant in remaining {
-                let _ = process_tree::send_signal(descendant.stamp, Signal::SIGKILL);
+            for survivor in survivors {
+                let _ = process_tree::send_signal(survivor, Signal::SIGKILL);
             }
             reap_all();
             std::thread::sleep(Duration::from_millis(10));
@@ -345,18 +410,14 @@ mod shim {
 
     /// Reaps every exited child; after the supervisor died their statuses no longer matter.
     fn reap_all() {
-        while let Ok(status) = waitpid(None, Some(WaitPidFlag::WNOHANG)) {
-            if status == WaitStatus::StillAlive {
-                return;
-            }
-        }
+        while let Ok(Some(_)) = rustix::process::waitpid(None, WaitOptions::NOHANG) {}
     }
 
-    /// Whether the shim has no child left to reap, which on Linux also covers adopted orphans.
+    /// Whether the shim has no child left, which on Linux also covers adopted orphans.
     fn no_children_left() -> bool {
         matches!(
-            waitpid(None, Some(WaitPidFlag::WNOHANG)),
-            Err(Errno::ECHILD)
+            rustix::process::waitpid(None, WaitOptions::NOHANG),
+            Err(rustix::io::Errno::CHILD)
         )
     }
 
@@ -366,8 +427,8 @@ mod shim {
             Some(Ended::Exited(code)) => code,
             Some(Ended::Signaled(signal)) => {
                 // Die of the same signal, so the supervisor sees what the command saw.
-                let _ = signal_hook::low_level::emulate_default_handler(signal as i32);
-                128 + signal as i32
+                let _ = signal_hook::low_level::emulate_default_handler(signal);
+                128 + signal
             }
             None => 1,
         }

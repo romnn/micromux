@@ -37,9 +37,6 @@ pub enum Health {
 /// How long to wait for stdout/stderr readers to flush after the probe process exits.
 const OUTPUT_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
 
-/// How long a probe's processes get to stop when the supervisor dies mid-probe.
-const PROBE_CLEANUP_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
-
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -108,6 +105,7 @@ mod tests {
                 sink,
                 shutdown,
                 terminate,
+                stop: crate::containment::StopPolicy::default(),
             },
         )
         .await;
@@ -167,6 +165,7 @@ mod tests {
                         sink,
                         shutdown,
                         terminate,
+                        stop: crate::containment::StopPolicy::default(),
                     },
                 )
                 .await
@@ -234,6 +233,7 @@ mod tests {
                     sink,
                     shutdown,
                     terminate,
+                    stop: crate::containment::StopPolicy::default(),
                 },
             ),
         )
@@ -341,6 +341,7 @@ mod tests {
                         events_tx,
                         shutdown,
                         terminate,
+                        stop: crate::containment::StopPolicy::default(),
                     },
                 )
                 .await;
@@ -398,6 +399,8 @@ struct RunParams<'a> {
     pub sink: RunSink,
     pub shutdown: CancellationToken,
     pub terminate: CancellationToken,
+    /// How a containment shim stops the probe's processes if the supervisor dies mid-probe.
+    pub stop: crate::containment::StopPolicy,
 }
 
 pub(crate) struct RunLoopParams {
@@ -409,6 +412,8 @@ pub(crate) struct RunLoopParams {
     pub events_tx: mpsc::Sender<ProcessEvent>,
     pub shutdown: CancellationToken,
     pub terminate: CancellationToken,
+    /// The owning service's stop policy, which the probe's containment shim applies.
+    pub stop: crate::containment::StopPolicy,
 }
 
 enum Completion {
@@ -541,6 +546,7 @@ pub async fn run_loop(health_check: crate::HealthcheckSpec, params: RunLoopParam
                 sink: params.sink.clone(),
                 shutdown: params.shutdown.clone(),
                 terminate: params.terminate.clone(),
+                stop: params.stop,
             },
         )
         .await;
@@ -882,12 +888,9 @@ async fn run(
 
     // Under containment a shim starts the probe, so a probe still running when the supervisor
     // dies is cleaned up too.
-    let mut cmd = if let Some((shim, shim_args)) = crate::containment::wrap(
-        std::path::Path::new(prog),
-        args,
-        crate::spec::StopSignal::Term,
-        PROBE_CLEANUP_GRACE,
-    ) {
+    let mut cmd = if let Some((shim, shim_args)) =
+        crate::containment::wrap(std::path::Path::new(prog), args, params.stop)
+    {
         let mut cmd = Command::new(shim);
         cmd.args(shim_args);
         cmd

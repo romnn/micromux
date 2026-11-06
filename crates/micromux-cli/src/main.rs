@@ -188,6 +188,19 @@ fn build_supervisor(
     Err(Error::DiagnosticsEmitted)
 }
 
+/// The executable that runs the containment shim: this very binary.
+///
+/// On Linux `/proc/self/exe`, resolved by each child before it execs, names the running image
+/// even after the installed binary was moved or replaced by an upgrade, so a long-running
+/// session keeps starting the shim it was built with.
+fn shim_executable() -> Result<std::path::PathBuf, Error> {
+    if cfg!(target_os = "linux") {
+        Ok(std::path::PathBuf::from("/proc/self/exe"))
+    } else {
+        Ok(std::env::current_exe()?)
+    }
+}
+
 /// A supervisor whose session is established and whose routes are registered, ready to start
 /// services.
 struct Supervisor {
@@ -205,7 +218,7 @@ async fn start_supervisor(
 ) -> Result<Supervisor, Error> {
     // Every service and healthcheck runs under the containment shim, so their process trees die
     // with this supervisor even when it is SIGKILLed.
-    micromux::containment::enable(std::env::current_exe()?);
+    micromux::containment::enable(shim_executable()?);
     let mut session = micromux::Session::establish(config, &micromux::PortRegistry::user())?;
     proxy::latch_port(&mut session).await?;
     let mux = build_supervisor(config, printer, session)?;
