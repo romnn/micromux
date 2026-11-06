@@ -138,7 +138,13 @@ fn unmeetable_dependency(
             runtime.last_exit_code,
         ));
     }
-    if dependency.condition == DependencyCondition::Healthy && service.spec.healthcheck.is_none() {
+    // A live run keeps the healthcheck it started with; the configured one applies to the next
+    // run, including one a pending restart is about to start.
+    let has_healthcheck = match (&runtime.running, &runtime.run_config) {
+        (Some(_), Some(run_config)) if !runtime.start_requested => run_config.healthcheck.is_some(),
+        _ => service.spec.healthcheck.is_some(),
+    };
+    if dependency.condition == DependencyCondition::Healthy && !has_healthcheck {
         return Some(failure(
             DependencyFailureReason::NoHealthcheck,
             runtime.last_exit_code,

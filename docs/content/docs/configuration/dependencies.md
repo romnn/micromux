@@ -71,7 +71,7 @@ Some blocks are permanent: a dependency exited and its [restart policy]({{< relr
 ======== dependency `seed` exited with code 1 and will not restart, so it cannot complete successfully ========
 ```
 
-`micromux ctl ls` shows the cause as `failed_dependency=seed(exited,exit_code=1)`, and [`micromux ctl wait`]({{< relref "../agent-control/control-plane.md" >}}#waiting-from-a-script) and the MCP waits fail at once instead of running into their timeout. Restarting or enabling the dependency clears the failure, and its dependents start as soon as it meets its condition.
+`micromux ctl ls` shows the cause as `failed_dependency=seed(exited,exit_code=1)`, and [`micromux ctl wait`]({{< relref "../agent-control/control-plane.md" >}}#waiting-from-a-script) and the MCP waits fail at once instead of running into their timeout. Restarting or enabling the dependency clears the failure (after giving it a healthcheck, for the last case), and its dependents start as soon as it meets its condition.
 
 ## Restarts respect dependencies
 

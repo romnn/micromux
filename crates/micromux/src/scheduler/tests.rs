@@ -5469,3 +5469,67 @@ async fn a_healthy_condition_on_a_dependency_without_a_healthcheck_fails() -> ey
     harness.handle.await??;
     Ok(())
 }
+
+/// A running dependency keeps the healthcheck it started with, so adding one to its config does
+/// not clear the failure until the dependency restarts with it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_missing_healthcheck_is_judged_by_the_running_process() -> eyre::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let config_path = dir.path().join("micromux.yaml");
+    let yaml = |healthcheck: &str| {
+        format!(
+            r#"version: "1"
+services:
+  db:
+    command: ["sh", "-c", "sleep 60"]{healthcheck}
+  api:
+    command: ["sh", "-c", "sleep 60"]
+    depends_on:
+      - name: db
+        condition: healthy
+"#
+        )
+    };
+    fs::write(&config_path, yaml(""))?;
+    let harness = spawn_harness(
+        services_from_config_path(&config_path)?,
+        Some(reload_config(&config_path)?),
+    );
+    let reason = |harness: &Harness| {
+        harness
+            .reader
+            .service("api")
+            .and_then(|snapshot| snapshot.dependency_failure)
+            .map(|failure| failure.reason)
+    };
+    wait_until(&harness.reader, "api", |snapshot| {
+        snapshot.dependency_failure.is_some()
+    })
+    .await?;
+    assert_eq!(
+        reason(&harness),
+        Some(crate::DependencyFailureReason::NoHealthcheck)
+    );
+
+    fs::write(
+        &config_path,
+        yaml("\n    healthcheck:\n      test: [\"CMD\", \"true\"]\n      interval: 100ms"),
+    )?;
+    reconcile_accepted(harness.control.reconcile_config(false).await)?;
+    assert_eq!(
+        reason(&harness),
+        Some(crate::DependencyFailureReason::NoHealthcheck),
+        "the running db has no probe, whatever its config says now"
+    );
+
+    accepted(harness.control.restart(&"db".to_string()).await)?;
+    assert_eq!(reason(&harness), None);
+    wait_until(&harness.reader, "api", |snapshot| {
+        snapshot.execution == Execution::Running
+    })
+    .await?;
+
+    harness.shutdown.cancel();
+    harness.handle.await??;
+    Ok(())
+}

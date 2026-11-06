@@ -109,7 +109,7 @@ pub fn dependency_failure_message(service: &str, failure: &DependencyFailure) ->
         DependencyFailureReason::Exited => format!("fix it and restart `{}`", failure.service),
         DependencyFailureReason::Disabled => format!("enable `{}`", failure.service),
         DependencyFailureReason::NoHealthcheck => format!(
-            "give `{}` a healthcheck or depend on it with `condition: started`",
+            "give `{}` a healthcheck and restart it, or depend on it with `condition: started`",
             failure.service
         ),
         DependencyFailureReason::Retired
