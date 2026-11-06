@@ -1102,6 +1102,9 @@ impl Widget for &mut App {
     }
 }
 
+/// Most header rows the session's URLs take, so the panes keep their room.
+const MAX_URL_ROWS: usize = 3;
+
 impl App {
     const HEADER_COLOR: Color = tailwind::YELLOW.c500;
     const HIGHLIGHT_COLOR: Color = tailwind::GRAY.c900;
@@ -1178,8 +1181,11 @@ impl App {
             .collect()
     }
 
-    /// The session's browser URLs, wrapped to `width`, and why the proxy does not serve them
-    /// right now on a row of its own.
+    /// The session's browser URLs, wrapped to `width` on at most [`MAX_URL_ROWS`] rows, and why
+    /// the proxy does not serve them right now on a row of its own.
+    ///
+    /// A URL never shares a row it does not fit on, so a long session name cannot push the port
+    /// out of view, and URLs beyond the row budget are counted instead of crowding out the panes.
     fn urls_lines(&self, width: usize) -> Vec<Line<'static>> {
         let Some(session) = self.source.session_summary() else {
             return Vec::new();
@@ -1187,26 +1193,35 @@ impl App {
         if session.routes.is_empty() {
             return Vec::new();
         }
-        let label = format!(" {} ", session.name);
-        let indent = " ".repeat(label.chars().count());
-        let mut lines = Vec::new();
-        let mut row: Vec<Span<'static>> = vec![label.bold()];
-        let mut row_width = indent.len();
-        let mut row_has_url = false;
+        let mut rows: Vec<Vec<Span<'static>>> = vec![vec![format!(" {}:", session.name).bold()]];
+        let mut row_width = session.name.chars().count() + 2;
+        let mut shown = 0;
         for route in &session.routes {
             let url = route.url.trim_end_matches('/').to_string();
             let url_width = 1 + url.chars().count();
-            if row_has_url && row_width + url_width > width {
-                lines.push(Line::from(std::mem::take(&mut row)));
-                row.push(indent.clone().into());
-                row_width = indent.len();
+            if row_width + url_width > width && row_width > 1 {
+                if rows.len() == MAX_URL_ROWS {
+                    break;
+                }
+                rows.push(Vec::new());
+                row_width = 0;
             }
-            row.push(" ".into());
-            row.push(url.fg(tailwind::CYAN.c400));
+            if let Some(row) = rows.last_mut() {
+                row.push(" ".into());
+                row.push(url.fg(tailwind::CYAN.c400));
+            }
             row_width += url_width;
-            row_has_url = true;
+            shown += 1;
         }
-        lines.push(Line::from(row));
+        let hidden = session.routes.len() - shown;
+        if hidden > 0
+            && let Some(row) = rows.last_mut()
+        {
+            row.push(
+                format!(" +{hidden} more, see `micromux ctl describe`").fg(tailwind::GRAY.c400),
+            );
+        }
+        let mut lines = rows.into_iter().map(Line::from).collect::<Vec<_>>();
         if let Some(micromux::RoutingStatus::Unavailable { reason }) = &session.routing {
             lines.push(Line::from(
                 format!(" routing unavailable: {reason}").fg(tailwind::RED.c400),

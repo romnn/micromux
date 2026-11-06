@@ -1417,6 +1417,13 @@ mod tests {
             assert!(!rows.contains("unavailable"), "{rows}");
         }
 
+        // When the URLs need more than their row budget, each shown URL stays whole, so no port
+        // is cut off, and the rest are counted instead of crowding out the panes.
+        let narrow = header(&mut app, 34);
+        assert!(narrow.contains("http://app.tui.localhost:8080"), "{narrow}");
+        assert!(narrow.contains("http://api.tui.localhost:8080"), "{narrow}");
+        assert!(narrow.contains("+1"), "{narrow}");
+
         // A routing problem wakes the event loop and gets a row of its own.
         let wake = app
             .summary_changes
