@@ -185,6 +185,63 @@ mod tests {
         assert!(bottom.starts_with("└ $ sh -c xxx"), "{bottom}");
     }
 
+    /// A retired dynamic service says why it retired and drops its dead lease, and a run whose
+    /// config changed since it started says a restart applies it.
+    #[test]
+    fn service_info_reports_retirement_ownership_and_stale_config() {
+        let mut snapshot = micromux::ServiceSnapshot::initial(
+            "job".to_string(),
+            "job".to_string(),
+            Vec::new(),
+            None,
+            micromux::RestartPolicy::Never,
+            Vec::new(),
+            None,
+        );
+        snapshot.origin = micromux::OriginKind::Dynamic;
+        snapshot.retired = Some(micromux::RetiredReason::Expired);
+        snapshot.config_stale = true;
+        snapshot.dynamic = Some(micromux::DynamicServiceInfo {
+            revision: 2,
+            expires_at_unix_ms: Some(5_000_000),
+            owner: Some("agent-7".to_string()),
+            created_at_unix_ms: 0,
+        });
+
+        let rows = super::service_info_rows(&snapshot, None, None, 1_000)
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rows.contains("RETIRED  lease expired"), "{rows}");
+        assert!(
+            rows.contains("Config      changed since this run started"),
+            "{rows}"
+        );
+        assert!(rows.contains("Dynamic     rev 2, owner agent-7"), "{rows}");
+    }
+
+    #[test]
+    fn info_rows_wrap_under_their_value_column() {
+        let row = Line::from(vec![
+            ratatui::text::Span::raw("Command     "),
+            ratatui::text::Span::raw("x".repeat(30)),
+        ]);
+        let rows = super::wrap_info_row(row, 24)
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rows,
+            vec![
+                format!("Command     {}", "x".repeat(12)),
+                format!("{}{}", " ".repeat(12), "x".repeat(12)),
+                format!("{}{}", " ".repeat(12), "x".repeat(6)),
+            ]
+        );
+    }
+
     #[test]
     fn home_relative_paths_shorten_only_the_home_directory_itself() {
         use super::home_relative;
@@ -655,6 +712,40 @@ fn info_rows<V: Into<Line<'static>>>(label: &str, values: Vec<V>) -> Vec<Line<'s
     .collect()
 }
 
+/// Splits an info popup row wider than `width` into rows of at most `width` columns, continuing
+/// under the value column.
+fn wrap_info_row(row: Line<'static>, width: usize) -> Vec<Line<'static>> {
+    let indent = INFO_LABEL_WIDTH.min(width / 2);
+    if width == 0 || row.width() <= width {
+        return vec![row];
+    }
+    let mut rows = Vec::new();
+    let mut current: Vec<Span<'static>> = Vec::new();
+    let mut used = 0;
+    for span in row.spans {
+        let mut text = String::new();
+        for character in span.content.chars() {
+            if used == width {
+                if !text.is_empty() {
+                    current.push(Span::styled(std::mem::take(&mut text), span.style));
+                }
+                rows.push(Line::from(std::mem::take(&mut current)));
+                current.push(" ".repeat(indent).into());
+                used = indent;
+            }
+            text.push(character);
+            used += 1;
+        }
+        if !text.is_empty() {
+            current.push(Span::styled(text, span.style));
+        }
+    }
+    if !current.is_empty() {
+        rows.push(Line::from(current));
+    }
+    rows
+}
+
 /// Everything known about one service, for its details popup.
 fn service_info_rows(
     snapshot: &micromux::ServiceSnapshot,
@@ -663,6 +754,15 @@ fn service_info_rows(
     now_unix_ms: u64,
 ) -> Vec<Line<'static>> {
     let mut state = vec![state_name(snapshot).set_style(crate::style::service_style(snapshot))];
+    if let Some(reason) = snapshot.retired {
+        let reason = match reason {
+            micromux::RetiredReason::Stopped => "stopped",
+            micromux::RetiredReason::Expired => "lease expired",
+            micromux::RetiredReason::Removed => "removed from the config",
+            micromux::RetiredReason::Unknown => "unknown reason",
+        };
+        state.push(format!("  {reason}").fg(tailwind::GRAY.c400));
+    }
     if let Some(pid) = snapshot.pid {
         state.push(format!("  pid {pid}").fg(tailwind::GRAY.c400));
     }
@@ -701,6 +801,12 @@ fn service_info_rows(
     );
 
     let mut rows = info_rows("State", vec![Line::from(state)]);
+    if snapshot.config_stale {
+        rows.extend(info_rows(
+            "Config",
+            vec!["changed since this run started; restart to apply".fg(tailwind::YELLOW.c500)],
+        ));
+    }
     rows.extend(info_rows("URLs", urls));
     rows.extend(info_rows("Ports", port_rows(snapshot, session)));
     rows.extend(info_rows("Command", vec![shell_join(&snapshot.command)]));
@@ -724,14 +830,15 @@ fn service_info_rows(
         rows.extend(info_rows("Cleanup", vec![cleanup_phrase(cleanup)]));
     }
     if let Some(dynamic) = &snapshot.dynamic {
-        rows.extend(info_rows(
-            "Dynamic",
-            vec![format!(
-                "rev {}, {}",
-                dynamic.revision,
-                lease_phrase(dynamic.expires_at_unix_ms, now_unix_ms)
-            )],
-        ));
+        let mut facts = vec![format!("rev {}", dynamic.revision)];
+        // A retired service's lease no longer means anything.
+        if snapshot.retired.is_none() {
+            facts.push(lease_phrase(dynamic.expires_at_unix_ms, now_unix_ms));
+        }
+        if let Some(owner) = &dynamic.owner {
+            facts.push(format!("owner {owner}"));
+        }
+        rows.extend(info_rows("Dynamic", vec![facts.join(", ")]));
     }
     rows
 }
@@ -870,8 +977,16 @@ fn session_info_rows(session: Option<&micromux::SessionSummary>) -> Vec<Line<'st
                 .iter()
                 .map(|route| {
                     let url = route.url.trim_end_matches('/');
-                    let service = route.service.as_deref().unwrap_or("?");
-                    Span::raw(format!("{url:<width$}  → :{}  {service}", route.port))
+                    let service = route.service.as_deref().unwrap_or("no single service");
+                    let catch_all = if route.host == micromux::session::CATCH_ALL_HOST {
+                        "  (catch-all)"
+                    } else {
+                        ""
+                    };
+                    Span::raw(format!(
+                        "{url:<width$}  → :{}  {service}{catch_all}",
+                        route.port
+                    ))
                 })
                 .collect(),
         ));
@@ -1222,7 +1337,9 @@ fn logs_title(urls: &[String], width: usize) -> Line<'static> {
     let separator = || " · ".fg(Color::White);
     let more = |hidden: usize| format!("+{hidden} more").fg(tailwind::GRAY.c400);
     let mut spans = vec![Span::raw("Logs")];
-    let mut used = "Logs".len();
+    // A trailing space keeps the border dashes out of the last URL, which terminals that detect
+    // links would otherwise take as part of it.
+    let mut used = "Logs".len() + 1;
     for (shown, url) in urls.iter().enumerate() {
         let hidden_after = urls.len() - shown - 1;
         // A URL fits when the count of the ones after it still fits behind it.
@@ -1237,10 +1354,13 @@ fn logs_title(urls: &[String], width: usize) -> Line<'static> {
             if used + 3 + more(hidden).width() <= width {
                 spans.extend([separator(), more(hidden)]);
             }
-            return Line::from(spans);
+            break;
         }
         spans.extend([separator(), url.clone().fg(tailwind::CYAN.c400)]);
         used += url_width;
+    }
+    if spans.len() > 1 {
+        spans.push(Span::raw(" "));
     }
     Line::from(spans)
 }
@@ -1877,7 +1997,7 @@ impl App {
         StatefulWidget::render(&list, popup, buf, &mut state);
     }
 
-    fn render_info(&self, view: crate::InfoView, area: Rect, buf: &mut Buffer) {
+    fn render_info(&mut self, view: crate::InfoView, area: Rect, buf: &mut Buffer) {
         let session = self.source.session_summary();
         let (title, rows) = match view {
             crate::InfoView::Service => {
@@ -1909,15 +2029,37 @@ impl App {
             crate::InfoView::Service => "i",
             crate::InfoView::Session => "u",
         };
+        // Rows wider than the popup can grow wrap under their value column, and rows beyond its
+        // height scroll, so nothing is cut off silently.
+        let horizontal_chrome = usize::from(POPUP_PADDING.left + POPUP_PADDING.right + 2);
+        let vertical_chrome = usize::from(POPUP_PADDING.top + POPUP_PADDING.bottom + 2);
+        let wrap_width = usize::from(area.width).saturating_sub(horizontal_chrome);
+        let rows = rows
+            .into_iter()
+            .flat_map(|row| wrap_info_row(row, wrap_width))
+            .collect::<Vec<_>>();
         let content_width = rows.iter().map(Line::width).max().unwrap_or_default();
         let popup = centered_popup(area, content_width, rows.len());
-        let info = Paragraph::new(rows).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .padding(POPUP_PADDING)
-                .title(title)
-                .title_bottom(format!(" {key} or Esc closes ").fg(tailwind::GRAY.c500)),
-        );
+        let visible = usize::from(popup.height).saturating_sub(vertical_chrome);
+        let max_scroll = rows.len().saturating_sub(visible);
+        self.info_scroll = self.info_scroll.min(max_scroll);
+        let mut block = Block::default()
+            .borders(Borders::ALL)
+            .padding(POPUP_PADDING)
+            .title(title)
+            .title_bottom(format!(" {key} or Esc closes ").fg(tailwind::GRAY.c500));
+        if max_scroll > 0 {
+            let first = self.info_scroll + 1;
+            let last = (self.info_scroll + visible).min(rows.len());
+            block = block.title_bottom(
+                format!(" ↑/↓ scroll · {first}-{last} of {} ", rows.len())
+                    .fg(tailwind::GRAY.c500)
+                    .into_right_aligned_line(),
+            );
+        }
+        let info = Paragraph::new(rows)
+            .block(block)
+            .scroll((rows_u16(self.info_scroll), 0));
         Clear.render(popup, buf);
         Widget::render(&info, popup, buf);
     }

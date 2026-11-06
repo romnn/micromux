@@ -93,6 +93,8 @@ pub struct App {
     show_help: bool,
     /// The details popup on screen, if any.
     info: Option<InfoView>,
+    /// First row of the details popup on screen, clamped when it renders.
+    info_scroll: usize,
     pty_input_mode: bool,
     focus: Focus,
     terminal_cols: u16,
@@ -166,6 +168,7 @@ impl App {
             level_picker: None,
             show_help: false,
             info: None,
+            info_scroll: 0,
             pty_input_mode: false,
             focus: Focus::Services,
             terminal_cols: 80,
@@ -657,14 +660,24 @@ impl App {
             return;
         }
         if let Some(view) = self.info {
-            // Like help, the popup swallows every other key; its own key or the other popup's
-            // switches, Esc closes.
-            self.info = match key.code {
-                KeyCode::Esc => None,
-                KeyCode::Char('i') => (view != InfoView::Service).then_some(InfoView::Service),
-                KeyCode::Char('u') => (view != InfoView::Session).then_some(InfoView::Session),
-                _ => Some(view),
-            };
+            // Like help, the popup swallows every other key: its own key or Esc closes it, the
+            // other popup's key switches, and the movement keys scroll it.
+            const PAGE: usize = 10;
+            match key.code {
+                KeyCode::Esc => self.info = None,
+                KeyCode::Char('i') => self.toggle_info(view, InfoView::Service),
+                KeyCode::Char('u') => self.toggle_info(view, InfoView::Session),
+                KeyCode::Char('k') | KeyCode::Up => {
+                    self.info_scroll = self.info_scroll.saturating_sub(1);
+                }
+                KeyCode::Char('j') | KeyCode::Down => self.info_scroll += 1,
+                KeyCode::PageUp => self.info_scroll = self.info_scroll.saturating_sub(PAGE),
+                KeyCode::PageDown => self.info_scroll += PAGE,
+                KeyCode::Char('g') => self.info_scroll = 0,
+                // Rendering clamps it to the last page.
+                KeyCode::Char('G') => self.info_scroll = usize::MAX,
+                _ => {}
+            }
             return;
         }
         if self.level_picker.is_some() {
@@ -723,8 +736,11 @@ impl App {
             KeyCode::Char('t') => self.toggle_tail(),
 
             KeyCode::Char('?') => self.show_help = true,
-            KeyCode::Char('i') => self.info = Some(InfoView::Service),
-            KeyCode::Char('u') => self.info = Some(InfoView::Session),
+            // Without a selected service there is nothing to describe.
+            KeyCode::Char('i') if self.state.current_service().is_some() => {
+                self.open_info(InfoView::Service);
+            }
+            KeyCode::Char('u') => self.open_info(InfoView::Session),
 
             // Log presentation
             KeyCode::Char('L') => self.open_level_picker(),
@@ -739,6 +755,20 @@ impl App {
                 }
             }
             _ => {}
+        }
+    }
+
+    fn open_info(&mut self, view: InfoView) {
+        self.info = Some(view);
+        self.info_scroll = 0;
+    }
+
+    /// Closes `target` when it is the popup on screen, and opens it otherwise.
+    fn toggle_info(&mut self, current: InfoView, target: InfoView) {
+        if current == target {
+            self.info = None;
+        } else if target == InfoView::Session || self.state.current_service().is_some() {
+            self.open_info(target);
         }
     }
 
@@ -1460,7 +1490,7 @@ mod tests {
         assert!(
             title.starts_with(
                 "┌Logs · http://app.tui.localhost:8080 · http://api.tui.localhost:8080 · \
-                 http://admin.tui.localhost:8080──"
+                 http://admin.tui.localhost:8080 ─"
             ),
             "{title}"
         );
@@ -1470,10 +1500,10 @@ mod tests {
         for (width, expected) in [
             (
                 140,
-                "┌Logs · http://app.tui.localhost:8080 · http://api.tui.localhost:8080 · +1 more─",
+                "┌Logs · http://app.tui.localhost:8080 · http://api.tui.localhost:8080 · +1 more ─",
             ),
-            (110, "┌Logs · http://app.tui.localhost:8080 · +2 more─"),
-            (100, "┌Logs · +3 more─"),
+            (110, "┌Logs · http://app.tui.localhost:8080 · +2 more ─"),
+            (100, "┌Logs · +3 more ─"),
             (70, "┌Logs─"),
         ] {
             let (_, _, title) = render(&mut app, width);
@@ -1505,6 +1535,22 @@ mod tests {
             "{rows:#?}"
         );
         Ok(())
+    }
+
+    /// The whole screen the app renders at `width` × `height`, one line per row.
+    #[cfg(unix)]
+    fn screen_text(app: &mut App, width: u16, height: u16) -> String {
+        let area = ratatui::layout::Rect::new(0, 0, width, height);
+        let mut buffer = ratatui::buffer::Buffer::empty(area);
+        ratatui::widgets::Widget::render(&mut *app, area, &mut buffer);
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .filter_map(|x| buffer.cell((x, y)).map(ratatui::buffer::Cell::symbol))
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     /// `i` describes the selected service and `u` the session in a popup; each key toggles its
@@ -1542,19 +1588,7 @@ mod tests {
                 state: KeyEventState::NONE,
             });
         };
-        let screen = |app: &mut App| {
-            let area = ratatui::layout::Rect::new(0, 0, 160, 40);
-            let mut buffer = ratatui::buffer::Buffer::empty(area);
-            ratatui::widgets::Widget::render(&mut *app, area, &mut buffer);
-            (0..area.height)
-                .map(|y| {
-                    (0..area.width)
-                        .filter_map(|x| buffer.cell((x, y)).map(ratatui::buffer::Cell::symbol))
-                        .collect::<String>()
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
-        };
+        let screen = |app: &mut App| screen_text(app, 160, 40);
         app.state.selected_service = 1;
 
         let closed = screen(&mut app);
@@ -1582,20 +1616,33 @@ mod tests {
             "Session     tui.localhost",
             "Proxy       :8080",
             &format!("Routes      http://app.tui.localhost:8080  → :{port}  web"),
-            "http://tui.localhost:8080      → :9999  ?",
+            "http://tui.localhost:8080      → :9999  no single service  (catch-all)",
             &format!("Ports       :{port}  WEB_PORT"),
         ] {
             assert!(session.contains(expected), "{expected}\n{session}");
         }
 
         // The popup swallows other keys, its own key closes it, and Esc closes the other one.
-        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('k'));
         assert_eq!(app.state.selected_service, 1);
         press(&mut app, KeyCode::Char('u'));
         assert!(!screen(&mut app).contains("Session · tui"));
         press(&mut app, KeyCode::Char('i'));
         press(&mut app, KeyCode::Esc);
         assert!(!screen(&mut app).contains("Service · web"));
+
+        // A popup taller than the terminal scrolls instead of cutting rows off.
+        press(&mut app, KeyCode::Char('i'));
+        let small = |app: &mut App| screen_text(app, 70, 14);
+        let top = small(&mut app);
+        assert!(top.contains("State"), "{top}");
+        assert!(top.contains("↑/↓ scroll · 1-"), "{top}");
+        assert!(!top.contains("Run "), "{top}");
+        press(&mut app, KeyCode::Char('G'));
+        let bottom = small(&mut app);
+        assert!(bottom.contains("Run "), "{bottom}");
+        assert!(!bottom.contains("State"), "{bottom}");
+        press(&mut app, KeyCode::Esc);
 
         press(&mut app, KeyCode::Char('?'));
         let help = screen(&mut app);
@@ -1623,6 +1670,15 @@ mod tests {
             shutdown.clone(),
             LogViewOptions::default(),
         );
+
+        // With no service to describe, `i` opens nothing that would swallow later keys.
+        app.handle_key_press(KeyEvent {
+            code: KeyCode::Char('i'),
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        });
+        assert!(app.info.is_none());
 
         app.handle_input_event(crate::event::Input::Closed);
         // Successful input clears transient notices; terminal EOF must remain visible through that
