@@ -81,6 +81,21 @@ pub fn service_id_is_valid(id: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
+/// How long a service's cleanup command may run when its config sets no `timeout`.
+pub const DEFAULT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Longest `cleanup.timeout` a config may set.
+pub const MAX_CLEANUP_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+
+/// A resolved cleanup command: what runs after each of a service's processes exits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CleanupSpec {
+    /// Resolved command argv.
+    pub command: Vec<String>,
+    /// How long it may run before it is stopped.
+    pub timeout: Duration,
+}
+
 /// The normalized, origin-independent definition of one supervised service.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ServiceSpec {
@@ -120,6 +135,12 @@ pub struct ServiceSpec {
     /// Signal delivered for the graceful stop request.
     #[serde(default)]
     pub stop_signal: StopSignal,
+    /// Command run to completion after each of the service's processes exits.
+    ///
+    /// Only configured services have one; it never crosses the wire.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub cleanup: Option<CleanupSpec>,
 }
 
 impl Default for ServiceSpec {
@@ -135,6 +156,7 @@ impl Default for ServiceSpec {
             restart: RestartPolicy::default(),
             stop_grace_period: DEFAULT_STOP_GRACE_PERIOD,
             stop_signal: StopSignal::default(),
+            cleanup: None,
         }
     }
 }

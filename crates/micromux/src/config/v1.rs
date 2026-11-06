@@ -31,6 +31,7 @@ const KNOWN_SERVICE_KEYS: &[&str] = &[
     "restart",
     "stop_grace_period",
     "stop_signal",
+    "cleanup",
     "color",
     "logs",
 ];
@@ -1209,6 +1210,7 @@ fn parse_service<F: Copy>(
         inner: crate::spec::StopSignal::default(),
         span: *span,
     });
+    let cleanup = parse_cleanup(mapping.get("cleanup"), file_id, strict, diagnostics)?;
     let log_retention = parse_log_retention(
         mapping.get("logs"),
         defaults.log_retention,
@@ -1232,10 +1234,59 @@ fn parse_service<F: Copy>(
         restart_policy,
         stop_grace_period,
         stop_signal,
+        cleanup,
         color,
         log_retention,
         log_display,
     })
+}
+
+/// Parse a service's `cleanup` mapping: `{ command, timeout }`.
+fn parse_cleanup<F: Copy>(
+    value: Option<&yaml_spanned::Spanned<Value>>,
+    file_id: F,
+    strict: bool,
+    diagnostics: &mut Vec<Diagnostic<F>>,
+) -> Result<Option<super::Cleanup>, ConfigError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let (span, mapping) = expect_mapping(
+        value,
+        "cleanup must be a mapping such as { command: ..., timeout: 2m }".into(),
+    )?;
+    warn_unknown_keys(
+        mapping,
+        &["command", "timeout"],
+        "cleanup",
+        file_id,
+        strict,
+        diagnostics,
+    );
+    let command =
+        parse_command(
+            mapping
+                .get("command")
+                .ok_or_else(|| ConfigError::MissingKey {
+                    key: "command".to_string(),
+                    message: "cleanup is missing `command`".to_string(),
+                    span: (*span).into(),
+                })?,
+        )?;
+    let timeout =
+        parse_positive_duration(parse_duration(mapping.get("timeout"))?, "cleanup timeout")?;
+    if let Some(timeout) = &timeout
+        && **timeout > crate::spec::MAX_CLEANUP_TIMEOUT
+    {
+        return Err(ConfigError::InvalidValue {
+            message: "cleanup timeout must not exceed 1h".to_string(),
+            span: timeout.span.into(),
+        });
+    }
+    Ok(Some(super::Cleanup {
+        command,
+        timeout: timeout.map_or(crate::spec::DEFAULT_CLEANUP_TIMEOUT, Spanned::into_inner),
+    }))
 }
 
 fn parse_services<F: Copy>(

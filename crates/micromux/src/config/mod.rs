@@ -469,12 +469,23 @@ pub struct Service {
     pub stop_grace_period: Spanned<Duration>,
     /// Signal delivered for the graceful stop request.
     pub stop_signal: Spanned<crate::spec::StopSignal>,
+    /// Command run to completion after each of the service's processes exits.
+    pub cleanup: Option<Cleanup>,
     /// Whether this service should be rendered in color.
     pub color: Option<Spanned<bool>>,
     /// Effective log retention after applying global defaults and this service's overrides.
     pub log_retention: LogRetention,
     /// Effective viewer presentation after applying global defaults and this service's overrides.
     pub log_display: LogDisplay,
+}
+
+/// A service's `cleanup` mapping.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Cleanup {
+    /// Command to execute and its arguments, before interpolation.
+    pub command: (Spanned<String>, Vec<Spanned<String>>),
+    /// How long the command may run before it is stopped.
+    pub timeout: Duration,
 }
 
 /// Healthcheck timing defaults shared by services that define a healthcheck test.
