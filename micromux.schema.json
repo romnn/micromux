@@ -457,6 +457,23 @@
         }
       }
     },
+    "cleanup": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "command"
+      ],
+      "description": "Command run to completion after each of the service's processes exits, however it exited, in the service's environment and working directory. The service is reported stopped, and restarts, only once it finished; a failure is reported but never blocks the session.",
+      "properties": {
+        "command": {
+          "$ref": "#/definitions/command"
+        },
+        "timeout": {
+          "$ref": "#/definitions/duration",
+          "description": "How long the cleanup may run before it gets the service's stop_signal and, 5s later, SIGKILL (default 60s, maximum 1h)."
+        }
+      }
+    },
     "service": {
       "type": "object",
       "additionalProperties": true,
@@ -524,6 +541,9 @@
           "type": "string",
           "pattern": "^\\s*([Ss][Ii][Gg])?([Tt][Ee][Rr][Mm]|[Ii][Nn][Tt]|[Hh][Uu][Pp]|[Qq][Uu][Ii][Tt]|[Uu][Ss][Rr]1|[Uu][Ss][Rr]2)\\s*$",
           "description": "Signal delivered for the graceful stop request (default SIGTERM). The SIG prefix is optional and matching is case-insensitive. Ignored on Windows."
+        },
+        "cleanup": {
+          "$ref": "#/definitions/cleanup"
         },
         "color": {
           "type": "boolean"

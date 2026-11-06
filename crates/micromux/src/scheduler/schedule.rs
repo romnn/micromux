@@ -220,6 +220,7 @@ fn finish_service_start(
                 log_reader: Some(started.log_reader),
                 pty: started.handles,
                 since: tokio::time::Instant::now(),
+                exited_at: None,
             });
             sync_model(ctx.writer, service, runtime);
             let mut event = service_event(

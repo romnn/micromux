@@ -778,8 +778,10 @@ async fn wait_for_exit_without_reaping(pid: i32) -> std::io::Result<()> {
     }
 }
 
+/// Waits for a child that leads its own process group, then kills what is left of the group
+/// before reaping the leader, while its pid still names the group.
 #[cfg(unix)]
-async fn wait_for_probe_status(
+pub(crate) async fn wait_for_probe_status(
     process: &mut tokio::process::Child,
 ) -> Result<std::process::ExitStatus, std::io::Error> {
     let Some(pid) = process.id().and_then(|pid| i32::try_from(pid).ok()) else {
@@ -899,6 +901,7 @@ async fn run(
         std::path::Path::new(prog),
         args,
         params.stop,
+        None,
         path.as_deref(),
         cwd,
     );

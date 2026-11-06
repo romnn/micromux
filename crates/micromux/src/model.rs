@@ -225,8 +225,8 @@ pub struct ServiceSnapshot {
     /// Graceful-stop signal captured for this run.
     #[serde(default)]
     pub stop_signal: crate::spec::StopSignal,
-    /// Whether the current command, working directory, ports, healthcheck timing, stop grace, or
-    /// stop signal differs from the configuration captured for this run.
+    /// Whether the current command, working directory, ports, healthcheck timing, stop grace, stop
+    /// signal, or cleanup differs from the configuration captured for this run.
     #[serde(default)]
     pub config_stale: bool,
     /// Active automatic-restart backoff, if the scheduler is delaying the next attempt.
@@ -256,6 +256,24 @@ pub struct ServiceSnapshot {
     /// Unlike the run-captured fields, a config reload applies it immediately without a restart.
     #[serde(default, skip_serializing_if = "LogDisplay::is_default")]
     pub log_display: LogDisplay,
+    /// How the most recent `cleanup` command ended, once one has run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_cleanup: Option<CleanupStatus>,
+}
+
+/// How a service's most recent `cleanup` command ended.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct CleanupStatus {
+    /// The run whose exit the cleanup followed.
+    pub run_generation: u64,
+    /// Whether the cleanup exited with status 0 within its timeout.
+    pub success: bool,
+    /// The cleanup's exit status; `None` when it timed out, was killed, or could not start.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    /// Whether the cleanup ran past its timeout and was stopped.
+    #[serde(default)]
+    pub timed_out: bool,
 }
 
 impl ServiceSnapshot {
@@ -297,6 +315,7 @@ impl ServiceSnapshot {
             uptime: None,
             restart_policy,
             log_display: LogDisplay::default(),
+            last_cleanup: None,
         }
     }
 }
@@ -503,7 +522,10 @@ impl ServiceEvent {
             | ServiceEventKind::DependencyReady
             | ServiceEventKind::InputDropped
             | ServiceEventKind::Replaced
-            | ServiceEventKind::Retired => Some(banner_line(&self.detail)),
+            | ServiceEventKind::Retired
+            | ServiceEventKind::CleanupStarted
+            | ServiceEventKind::CleanupFinished
+            | ServiceEventKind::CleanupFailed => Some(banner_line(&self.detail)),
             ServiceEventKind::ConfigReloaded
             | ServiceEventKind::Spawned
             | ServiceEventKind::Healthy
@@ -574,6 +596,12 @@ pub enum ServiceEventKind {
     LeaseRenewed,
     /// A service was retired after an explicit stop, lease expiry, or config removal.
     Retired,
+    /// A run's process exited and the service's `cleanup` command started.
+    CleanupStarted,
+    /// A `cleanup` command exited with status 0 within its timeout.
+    CleanupFinished,
+    /// A `cleanup` command failed, timed out, or could not start.
+    CleanupFailed,
     /// A newer peer sent an event kind this binary does not know yet.
     #[serde(other)]
     Unknown,

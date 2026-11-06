@@ -31,6 +31,7 @@ pub(crate) enum SignalKind {
     CrashLoop,
     HealthcheckTimeout,
     PortUnavailable,
+    CleanupFailed,
 }
 
 #[derive(Serialize, JsonSchema)]
@@ -93,6 +94,15 @@ pub(crate) fn bounded_attempt(mut attempt: HealthAttempt) -> HealthAttempt {
 }
 
 pub(crate) fn service_needs_diagnosis(snapshot: &ServiceSnapshot) -> bool {
+    // A failed cleanup can leave resources behind whatever the service's state, a disabled
+    // service's included.
+    if snapshot
+        .last_cleanup
+        .as_ref()
+        .is_some_and(|cleanup| !cleanup.success)
+    {
+        return true;
+    }
     if snapshot.desired == micromux::Desired::Disabled {
         return false;
     }
@@ -186,6 +196,30 @@ fn crash_loop_signal(snapshot: &ServiceSnapshot) -> Option<Signal> {
             restart.backoff_delay
         ),
         next_probe: "inspect the exit signal and retained logs before the next restart attempt",
+    })
+}
+
+fn cleanup_signal(snapshot: &ServiceSnapshot) -> Option<Signal> {
+    let cleanup = snapshot
+        .last_cleanup
+        .as_ref()
+        .filter(|cleanup| !cleanup.success)?;
+    let how = if cleanup.timed_out {
+        "timed out".to_string()
+    } else {
+        cleanup.exit_code.map_or_else(
+            || "was killed or could not start".to_string(),
+            |code| format!("exited with status {code}"),
+        )
+    };
+    Some(Signal {
+        kind: SignalKind::CleanupFailed,
+        detail: format!(
+            "the cleanup after run {} {how}; what it should have removed may still be there",
+            cleanup.run_generation
+        ),
+        next_probe: "inspect the [cleanup] lines of that run with get_logs and the \
+                     CleanupFailed event with get_service_events",
     })
 }
 
@@ -355,6 +389,7 @@ pub(crate) async fn supervisor_signals(
         exit_signal(snapshot),
         crash_loop_signal(snapshot),
         healthcheck_signal(snapshot, latest_healthcheck),
+        cleanup_signal(snapshot),
     ]
     .into_iter()
     .flatten()
@@ -729,6 +764,51 @@ mod tests {
                 "missing `{expected}` for exit code {exit_code}"
             );
         }
+    }
+
+    /// A failed cleanup needs a diagnosis even for a running or a disabled service, and its
+    /// signal says how the cleanup ended; a successful one changes nothing.
+    #[test]
+    fn failed_cleanups_need_a_diagnosis() {
+        let failed = micromux::CleanupStatus {
+            run_generation: 3,
+            success: false,
+            exit_code: Some(5),
+            timed_out: false,
+        };
+        let mut running = snapshot(Execution::Running);
+        running.last_cleanup = Some(failed.clone());
+        assert!(service_needs_diagnosis(&running));
+        let signal = cleanup_signal(&running);
+        assert_eq!(
+            signal.as_ref().map(|signal| signal.kind),
+            Some(SignalKind::CleanupFailed)
+        );
+        assert!(signal.is_some_and(|signal| {
+            signal.detail.contains("run 3") && signal.detail.contains("status 5")
+        }));
+
+        let mut disabled = snapshot(Execution::Exited);
+        disabled.desired = micromux::Desired::Disabled;
+        disabled.last_cleanup = Some(micromux::CleanupStatus {
+            exit_code: None,
+            timed_out: true,
+            ..failed
+        });
+        assert!(service_needs_diagnosis(&disabled));
+        assert!(
+            cleanup_signal(&disabled).is_some_and(|signal| signal.detail.contains("timed out"))
+        );
+
+        let mut cleaned = snapshot(Execution::Running);
+        cleaned.last_cleanup = Some(micromux::CleanupStatus {
+            run_generation: 3,
+            success: true,
+            exit_code: Some(0),
+            timed_out: false,
+        });
+        assert!(!service_needs_diagnosis(&cleaned));
+        assert!(cleanup_signal(&cleaned).is_none());
     }
 
     #[test]

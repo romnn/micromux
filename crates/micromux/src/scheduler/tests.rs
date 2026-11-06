@@ -709,6 +709,7 @@ fn start_dummy_run(runtime: &mut ServiceRuntime) -> eyre::Result<RunId> {
         log_reader: Some(pty::LogReaderHandle::test_dummy()),
         pty: pty::PtyHandles::test_dummy()?,
         since: tokio::time::Instant::now(),
+        exited_at: None,
     });
     Ok(run_id)
 }
@@ -4775,5 +4776,426 @@ async fn working_dir_is_used_for_spawn() -> eyre::Result<()> {
 
     harness.shutdown.cancel();
     harness.handle.await??;
+    Ok(())
+}
+
+/// A service in `dir` running `command`, whose `cleanup` runs `script` under `sh -c` and keeps
+/// its log and lock in `state`.
+fn service_with_cleanup(
+    dir: &Path,
+    command: &str,
+    script: &str,
+    timeout: Duration,
+    state: &Path,
+) -> eyre::Result<Service> {
+    let mut cfg = service_config("svc", ("sh", &["-c", command]));
+    cfg.working_dir = Some(spanned_string(dir.to_string_lossy().as_ref()));
+    cfg.environment.insert(
+        spanned_string("CLEANUP_MARKER"),
+        spanned_string("from-service"),
+    );
+    cfg.cleanup = Some(config::Cleanup {
+        command: (
+            spanned_string("sh"),
+            vec![spanned_string("-c"), spanned_string(script)],
+        ),
+        timeout,
+    });
+    let mut service = Service::new("svc", dir, cfg)?;
+    let cleanup = service
+        .spec
+        .cleanup
+        .as_mut()
+        .ok_or_else(|| eyre::eyre!("the cleanup did not survive normalization"))?;
+    cleanup.files = Some(crate::cleanup::files_in(state, "svc"));
+    Ok(service)
+}
+
+/// Waits up to `limit` for `predicate` to hold for the snapshot of `svc`.
+async fn wait_longer_until<F>(
+    reader: &crate::model::SessionModelReader,
+    limit: Duration,
+    mut predicate: F,
+) -> eyre::Result<crate::model::ServiceSnapshot>
+where
+    F: FnMut(&crate::model::ServiceSnapshot) -> bool,
+{
+    let deadline = tokio::time::Instant::now() + limit;
+    loop {
+        if let Some(snapshot) = reader.service("svc")
+            && predicate(&snapshot)
+        {
+            return Ok(snapshot);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            eyre::bail!("timed out waiting for a condition on `svc`");
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+fn event_kinds(reader: &crate::model::SessionModelReader) -> Vec<ServiceEventKind> {
+    reader
+        .events("svc", None, None)
+        .0
+        .into_iter()
+        .map(|event| event.kind)
+        .collect()
+}
+
+fn pid_from(path: &Path) -> eyre::Result<i32> {
+    Ok(fs::read_to_string(path)?.trim().parse()?)
+}
+
+/// Disabling a service runs its cleanup after the process exits and before the service is
+/// reported stopped: in the service's environment and working directory, with its output in the
+/// run's log and in the cleanup log.
+#[tokio::test]
+async fn stopping_a_service_runs_its_cleanup_before_reporting_it_stopped() -> eyre::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let state = tempfile::tempdir()?;
+    let service = service_with_cleanup(
+        dir.path(),
+        "exec sleep 60",
+        "echo cleaning $$CLEANUP_MARKER; sleep 0.5; echo $$CLEANUP_MARKER > cleaned",
+        Duration::from_secs(30),
+        state.path(),
+    )?;
+    let mut services = ServiceMap::new();
+    services.insert("svc".to_string(), service);
+    let harness = spawn_harness(services, None);
+    wait_until(&harness.reader, "svc", |snapshot| {
+        snapshot.execution == Execution::Running
+    })
+    .await?;
+
+    accepted(harness.control.disable(&"svc".to_string()).await)?;
+    // While the cleanup runs the process is gone, so the run reports no pid, but the service is
+    // still stopping.
+    let cleaning = wait_until(&harness.reader, "svc", |snapshot| {
+        snapshot.execution == Execution::Stopping && snapshot.pid.is_none()
+    })
+    .await?;
+    assert!(cleaning.last_exit_code.is_some());
+    let stopped = wait_until(&harness.reader, "svc", |snapshot| {
+        snapshot.execution == Execution::Exited
+    })
+    .await?;
+
+    // The cleanup finished before the stop was reported, and saw the service's environment and
+    // working directory.
+    assert_eq!(
+        fs::read_to_string(dir.path().join("cleaned"))?,
+        "from-service\n"
+    );
+    assert_eq!(
+        stopped.last_cleanup,
+        Some(crate::model::CleanupStatus {
+            run_generation: 1,
+            success: true,
+            exit_code: Some(0),
+            timed_out: false,
+        })
+    );
+    // Its output reached the run's log, and the cleanup log frames it with a header and footer.
+    assert!(
+        harness
+            .reader
+            .logs("svc", None)
+            .iter()
+            .any(|line| line.line == "[cleanup] cleaning from-service"),
+        "{:?}",
+        harness.reader.logs("svc", None)
+    );
+    let log = fs::read_to_string(state.path().join("svc.log"))?;
+    let lines = log.lines().collect::<Vec<_>>();
+    assert!(
+        lines
+            .first()
+            .is_some_and(|header| header.contains("after run 1")),
+        "{log}"
+    );
+    assert_eq!(lines.get(1), Some(&"cleaning from-service"));
+    assert_eq!(lines.last(), Some(&"micromux: cleanup exited with 0"));
+    // The timeline orders the cleanup between the process exit and the reported exit.
+    let kinds = event_kinds(&harness.reader);
+    let started = kinds
+        .iter()
+        .position(|kind| *kind == ServiceEventKind::CleanupStarted)
+        .ok_or_else(|| eyre::eyre!("cleanup-started event missing: {kinds:?}"))?;
+    assert_eq!(
+        kinds.get(started..started + 3),
+        Some(
+            [
+                ServiceEventKind::CleanupStarted,
+                ServiceEventKind::CleanupFinished,
+                ServiceEventKind::Exited,
+            ]
+            .as_slice()
+        )
+    );
+
+    harness.shutdown.cancel();
+    harness.handle.await??;
+    Ok(())
+}
+
+/// A restart starts the next run only after the previous run's cleanup finished.
+#[tokio::test]
+async fn restarts_wait_for_the_cleanup() -> eyre::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let state = tempfile::tempdir()?;
+    let service = service_with_cleanup(
+        dir.path(),
+        "if [ -e cleaned ]; then echo cleaned >> starts; else echo fresh >> starts; fi; \
+         exec sleep 60",
+        "sleep 0.5; touch cleaned",
+        Duration::from_secs(30),
+        state.path(),
+    )?;
+    let mut services = ServiceMap::new();
+    services.insert("svc".to_string(), service);
+    let harness = spawn_harness(services, None);
+    wait_until(&harness.reader, "svc", |snapshot| {
+        snapshot.execution == Execution::Running
+    })
+    .await?;
+
+    accepted(harness.control.restart(&"svc".to_string()).await)?;
+    wait_until(&harness.reader, "svc", |snapshot| {
+        snapshot.run_generation == 2 && snapshot.execution == Execution::Running
+    })
+    .await?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while fs::read_to_string(dir.path().join("starts"))?
+        .lines()
+        .count()
+        < 2
+    {
+        eyre::ensure!(
+            tokio::time::Instant::now() < deadline,
+            "the second run never started"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // The second run found the marker the first run's cleanup left.
+    assert_eq!(
+        fs::read_to_string(dir.path().join("starts"))?,
+        "fresh\ncleaned\n"
+    );
+
+    harness.shutdown.cancel();
+    harness.handle.await??;
+    Ok(())
+}
+
+/// A process that fails on its own still gets its cleanup, and the run keeps reporting the
+/// process's own exit code.
+#[tokio::test]
+async fn failing_processes_are_cleaned_up_too() -> eyre::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let state = tempfile::tempdir()?;
+    let service = service_with_cleanup(
+        dir.path(),
+        "exit 3",
+        "touch cleaned",
+        Duration::from_secs(30),
+        state.path(),
+    )?;
+    let mut services = ServiceMap::new();
+    services.insert("svc".to_string(), service);
+    let harness = spawn_harness(services, None);
+
+    let exited = wait_until(&harness.reader, "svc", |snapshot| {
+        snapshot.execution == Execution::Exited
+    })
+    .await?;
+    assert_eq!(exited.last_exit_code, Some(3));
+    assert_eq!(
+        exited
+            .last_cleanup
+            .map(|cleanup| (cleanup.run_generation, cleanup.success)),
+        Some((1, true))
+    );
+    assert!(dir.path().join("cleaned").exists());
+    let exit = harness
+        .reader
+        .events("svc", None, None)
+        .0
+        .into_iter()
+        .find(|event| event.kind == ServiceEventKind::Exited)
+        .ok_or_else(|| eyre::eyre!("exit event missing"))?;
+    assert_eq!(exit.exit_code, Some(3));
+
+    harness.shutdown.cancel();
+    harness.handle.await??;
+    Ok(())
+}
+
+/// A failing cleanup is reported with its exit code and never holds back the next run.
+#[tokio::test]
+async fn failing_cleanups_are_reported_and_do_not_block_a_restart() -> eyre::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let state = tempfile::tempdir()?;
+    let service = service_with_cleanup(
+        dir.path(),
+        "exec sleep 60",
+        "echo cannot clean up >&2; exit 5",
+        Duration::from_secs(30),
+        state.path(),
+    )?;
+    let mut services = ServiceMap::new();
+    services.insert("svc".to_string(), service);
+    let harness = spawn_harness(services, None);
+    wait_until(&harness.reader, "svc", |snapshot| {
+        snapshot.execution == Execution::Running
+    })
+    .await?;
+
+    accepted(harness.control.restart(&"svc".to_string()).await)?;
+    let restarted = wait_until(&harness.reader, "svc", |snapshot| {
+        snapshot.run_generation == 2 && snapshot.execution == Execution::Running
+    })
+    .await?;
+
+    assert_eq!(
+        restarted.last_cleanup,
+        Some(crate::model::CleanupStatus {
+            run_generation: 1,
+            success: false,
+            exit_code: Some(5),
+            timed_out: false,
+        })
+    );
+    let failed = harness
+        .reader
+        .events("svc", None, None)
+        .0
+        .into_iter()
+        .find(|event| event.kind == ServiceEventKind::CleanupFailed)
+        .ok_or_else(|| eyre::eyre!("cleanup-failed event missing"))?;
+    assert_eq!(failed.exit_code, Some(5));
+    assert_eq!(failed.detail, "cleanup failed with exit code 5");
+
+    harness.shutdown.cancel();
+    harness.handle.await??;
+    Ok(())
+}
+
+/// A cleanup that ignores the stop signal past its timeout is killed with everything it
+/// started, and reported as timed out.
+#[tokio::test]
+async fn cleanups_past_their_timeout_are_killed() -> eyre::Result<()> {
+    use nix::errno::Errno;
+    use nix::sys::signal::kill;
+    use nix::unistd::Pid;
+
+    let dir = tempfile::tempdir()?;
+    let state = tempfile::tempdir()?;
+    let service = service_with_cleanup(
+        dir.path(),
+        "exec sleep 60",
+        "trap '' TERM; echo $$ > cleanup.pid; sleep 60 & echo $! > child.pid; wait",
+        Duration::from_millis(300),
+        state.path(),
+    )?;
+    let mut services = ServiceMap::new();
+    services.insert("svc".to_string(), service);
+    let harness = spawn_harness(services, None);
+    wait_until(&harness.reader, "svc", |snapshot| {
+        snapshot.execution == Execution::Running
+    })
+    .await?;
+
+    accepted(harness.control.disable(&"svc".to_string()).await)?;
+    // The timeout, the stop grace, and slack for a loaded machine.
+    let stopped = wait_longer_until(&harness.reader, Duration::from_secs(20), |snapshot| {
+        snapshot.execution == Execution::Exited
+    })
+    .await?;
+
+    assert_eq!(
+        stopped.last_cleanup,
+        Some(crate::model::CleanupStatus {
+            run_generation: 1,
+            success: false,
+            exit_code: None,
+            timed_out: true,
+        })
+    );
+    for name in ["cleanup.pid", "child.pid"] {
+        let pid = pid_from(&dir.path().join(name))?;
+        assert_eq!(
+            kill(Pid::from_raw(pid), None),
+            Err(Errno::ESRCH),
+            "{name} survived its cleanup's timeout"
+        );
+    }
+    let log = fs::read_to_string(state.path().join("svc.log"))?;
+    assert_eq!(
+        log.lines().last(),
+        Some("micromux: cleanup timed out after 300ms")
+    );
+
+    harness.shutdown.cancel();
+    harness.handle.await??;
+    Ok(())
+}
+
+/// A slow cleanup does not count as uptime: a crash-looping `on-failure` service whose
+/// cleanup outlasts the stability threshold still exhausts its restart budget, while a process
+/// that itself ran that long still resets it.
+#[tokio::test]
+async fn slow_cleanups_do_not_make_crash_loops_look_stable() -> eyre::Result<()> {
+    let policy = crate::service::RestartPolicy::OnFailure {
+        max_attempts: Some(2),
+    };
+    let new_runtime = || {
+        ServiceRuntime::new(ServiceRuntimeInit {
+            restart_policy: &policy,
+            startup_mode: StartupMode::Enabled,
+        })
+    };
+    // Moves the whole run into the past, as if `by` passed since it started.
+    let age = |runtime: &mut ServiceRuntime, by: Duration| -> eyre::Result<()> {
+        let running = runtime
+            .running
+            .as_mut()
+            .ok_or_else(|| eyre::eyre!("no running run"))?;
+        let earlier = |instant: tokio::time::Instant| {
+            instant
+                .checked_sub(by)
+                .ok_or_else(|| eyre::eyre!("the clock cannot go back {by:?}"))
+        };
+        running.since = earlier(running.since)?;
+        running.exited_at = running.exited_at.map(earlier).transpose()?;
+        Ok(())
+    };
+    let slow = RESTART_BACKOFF_RESET * 3;
+
+    // Processes that crash at once, with cleanups that take longer than the threshold
+    let mut crashing = new_runtime();
+    for _ in 0..2 {
+        start_dummy_run(&mut crashing)?;
+        crashing.mark_cleanup_started(1);
+        age(&mut crashing, slow)?;
+        crashing.finish_current_run(&policy, 1);
+        // The scheduling pass spends one attempt on the automatic restart.
+        assert!(crashing.will_auto_restart(&policy, 1));
+        crashing.restart.decrement_failure_restart(&policy);
+    }
+    assert!(!crashing.will_auto_restart(&policy, 1));
+
+    // Processes that themselves run past the threshold, cleanup or not
+    let mut stable = new_runtime();
+    for _ in 0..2 {
+        start_dummy_run(&mut stable)?;
+        age(&mut stable, slow)?;
+        stable.mark_cleanup_started(1);
+        stable.finish_current_run(&policy, 1);
+        stable.restart.decrement_failure_restart(&policy);
+    }
+    assert!(stable.will_auto_restart(&policy, 1));
     Ok(())
 }

@@ -19,6 +19,7 @@
 //! # Ok(()) }
 //! ```
 
+mod cleanup;
 mod config;
 pub mod containment;
 mod diagnostics;
@@ -51,6 +52,7 @@ use tokio::sync::mpsc;
 
 pub use tokio_util::sync::CancellationToken;
 
+pub use cleanup::{CleanupWaitCancelled, cleanup_state_directory, wait_for_previous_cleanups};
 pub use config::{
     ConfigError, ConfigFile, ControlConfig, DynamicServicesPolicy, MAX_CONFIG_FILE_BYTES,
     config_file_names, find_config_file, from_str, read_config_file, read_config_file_async,
@@ -60,10 +62,10 @@ pub use env::{Error as EnvironmentError, InterpolationError};
 pub use graph::Error as GraphError;
 pub use health_check::Health;
 pub use model::{
-    ChangeKind, Desired, DiskLogRetention, DynamicServiceInfo, EVENT_HISTORY, Execution,
-    HealthAttempt, HealthLine, HealthResult, HealthcheckConfig, LogLimit, LogLine, LogRetention,
-    LogRun, LogRunReadError, LogRunSummary, MemoryLogRetention, OriginKind, RestartState,
-    RetiredReason, ServiceEvent, ServiceEventKind, ServiceSnapshot, SessionChange,
+    ChangeKind, CleanupStatus, Desired, DiskLogRetention, DynamicServiceInfo, EVENT_HISTORY,
+    Execution, HealthAttempt, HealthLine, HealthResult, HealthcheckConfig, LogLimit, LogLine,
+    LogRetention, LogRun, LogRunReadError, LogRunSummary, MemoryLogRetention, OriginKind,
+    RestartState, RetiredReason, ServiceEvent, ServiceEventKind, ServiceSnapshot, SessionChange,
     SessionModelReader, trim_to_last_bytes,
 };
 pub use scheduler::{
@@ -230,6 +232,13 @@ fn materialize_services<F>(
     // against the same values.
     let supervisor_environment: std::collections::HashMap<String, String> =
         std::env::vars().collect();
+    let cleanup_directory = config_file
+        .config
+        .services
+        .values()
+        .any(|service| service.cleanup.is_some())
+        .then(|| cleanup::cleanup_state_directory(cleanup::config_key_path(config_file)))
+        .flatten();
     let mut services = ServiceMap::new();
     let mut errors = Vec::new();
     let mut skipped_env_files = Vec::new();
@@ -243,7 +252,12 @@ fn materialize_services<F>(
             pinned,
             &mut skipped_env_files,
         ) {
-            Ok(service) => {
+            Ok(mut service) => {
+                if let (Some(cleanup), Some(directory)) =
+                    (&mut service.spec.cleanup, &cleanup_directory)
+                {
+                    cleanup.files = Some(cleanup::files_in(directory, &service_id));
+                }
                 services.insert(service_id, service);
             }
             Err(err) => errors.push(err),

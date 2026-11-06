@@ -424,8 +424,37 @@ fn write_record(directory: &Path, path: &Path, record: &Record) -> std::io::Resu
     Ok(())
 }
 
+/// The current user's registry directory.
+fn user_registry_directory() -> Option<PathBuf> {
+    user_state_directory().map(|state| state.join("ports"))
+}
+
+/// The current user's micromux state directory, shared by every session of that user.
+///
+/// On Unix it derives from the account's home directory in the password database rather than
+/// `$HOME` or `$XDG_STATE_HOME`, so sessions started from differently configured shells, agents,
+/// or services still share one registry and find each other's cleanup locks.
 #[cfg(unix)]
-fn create_private_dir(directory: &Path) -> std::io::Result<()> {
+pub(crate) fn user_state_directory() -> Option<PathBuf> {
+    let user = nix::unistd::User::from_uid(nix::unistd::Uid::current())
+        .ok()
+        .flatten()?;
+    Some(if cfg!(target_os = "macos") {
+        user.dir
+            .join("Library/Application Support/com.romnn.micromux")
+    } else {
+        user.dir.join(".local/state/micromux")
+    })
+}
+
+#[cfg(not(unix))]
+pub(crate) fn user_state_directory() -> Option<PathBuf> {
+    crate::project_dir().map(|directories| directories.data_local_dir().to_path_buf())
+}
+
+/// Creates `directory` and its missing parents, readable by the current user only.
+#[cfg(unix)]
+pub(crate) fn create_private_dir(directory: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::DirBuilderExt as _;
 
     std::fs::DirBuilder::new()
@@ -435,32 +464,8 @@ fn create_private_dir(directory: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(not(unix))]
-fn create_private_dir(directory: &Path) -> std::io::Result<()> {
+pub(crate) fn create_private_dir(directory: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(directory)
-}
-
-/// The current user's registry directory.
-///
-/// On Unix it derives from the account's home directory in the password database rather than
-/// `$HOME` or `$XDG_STATE_HOME`, so sessions started from differently configured shells, agents,
-/// or services still share one registry.
-#[cfg(unix)]
-fn user_registry_directory() -> Option<PathBuf> {
-    let user = nix::unistd::User::from_uid(nix::unistd::Uid::current())
-        .ok()
-        .flatten()?;
-    let state = if cfg!(target_os = "macos") {
-        user.dir
-            .join("Library/Application Support/com.romnn.micromux")
-    } else {
-        user.dir.join(".local/state/micromux")
-    };
-    Some(state.join("ports"))
-}
-
-#[cfg(not(unix))]
-fn user_registry_directory() -> Option<PathBuf> {
-    crate::project_dir().map(|directories| directories.data_local_dir().join("ports"))
 }
 
 #[cfg(test)]

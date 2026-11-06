@@ -768,6 +768,7 @@ mod tests {
                 cleanup: Some(crate::spec::CleanupSpec {
                     command: vec!["down".to_string(), "--port=1023".to_string()],
                     timeout: Duration::from_secs(120),
+                    files: None,
                 }),
             }
         );
@@ -1438,37 +1439,31 @@ impl Service {
             .enumerate()
             .map(|(index, port)| resolver.port(index, port, &service_environment))
             .collect::<Result<Vec<_>, _>>()?;
-        let (program, args) = &config.command;
-        let shell = is_shell_program(program.as_ref());
-        let command = resolver.argv(
-            |index| Site::Command { index, shell },
-            std::iter::once(program).chain(args),
+        let command = resolver.command(
+            |index, shell| Site::Command { index, shell },
+            &config.command,
             &service_environment,
         )?;
         let cleanup = config
             .cleanup
             .map(|cleanup| {
-                let (program, args) = &cleanup.command;
-                let shell = is_shell_program(program.as_ref());
-                let command = resolver.argv(
-                    |index| Site::CleanupCommand { index, shell },
-                    std::iter::once(program).chain(args),
-                    &service_environment,
-                )?;
                 Ok::<_, Error>(crate::spec::CleanupSpec {
-                    command,
+                    command: resolver.command(
+                        |index, shell| Site::CleanupCommand { index, shell },
+                        &cleanup.command,
+                        &service_environment,
+                    )?,
                     timeout: cleanup.timeout,
+                    files: None,
                 })
             })
             .transpose()?;
         let healthcheck = config
             .healthcheck
             .map(|healthcheck| {
-                let (program, args) = &healthcheck.test;
-                let shell = is_shell_program(program.as_ref());
-                let test = resolver.argv(
-                    |index| Site::HealthcheckTest { index, shell },
-                    std::iter::once(program).chain(args),
+                let test = resolver.command(
+                    |index, shell| Site::HealthcheckTest { index, shell },
+                    &healthcheck.test,
                     &service_environment,
                 )?;
                 Ok::<_, Error>(HealthcheckSpec::from_config(healthcheck, test))
@@ -1753,15 +1748,22 @@ impl Resolver<'_> {
         })
     }
 
-    fn argv<'v>(
+    /// Interpolates every argument of a split command, telling each argument's site whether the
+    /// program is a shell, whose script expands the text again.
+    fn command(
         &self,
-        site: impl Fn(usize) -> Site,
-        parts: impl Iterator<Item = &'v yaml_spanned::Spanned<String>>,
+        site: impl Fn(usize, bool) -> Site,
+        (program, args): &(
+            yaml_spanned::Spanned<String>,
+            Vec<yaml_spanned::Spanned<String>>,
+        ),
         environment: &HashMap<String, String>,
     ) -> Result<Vec<String>, Error> {
-        parts
+        let shell = is_shell_program(program.as_ref());
+        std::iter::once(program)
+            .chain(args)
             .enumerate()
-            .map(|(index, part)| self.interpolate(site(index), part, environment))
+            .map(|(index, part)| self.interpolate(site(index, shell), part, environment))
             .collect()
     }
 

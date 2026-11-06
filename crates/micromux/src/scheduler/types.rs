@@ -1,6 +1,7 @@
 //! Scheduler command and lifecycle types.
 
 use super::control::{CommandAck, DynamicCommandAck, ReconcileCommandAck};
+use crate::cleanup::CleanupOutcome;
 use crate::health_check::Health;
 use crate::{DynamicServiceParams, Lease};
 
@@ -49,10 +50,18 @@ pub(crate) enum ProcessEvent {
         service_id: ServiceID,
         run_id: RunId,
     },
+    /// The run's process exited and its cleanup started; `Exited` follows once it ends.
+    CleanupStarted {
+        service_id: ServiceID,
+        run_id: RunId,
+        exit_code: i32,
+    },
     Exited {
         service_id: ServiceID,
         run_id: RunId,
         exit_code: i32,
+        /// How the run's cleanup ended, for a service with one.
+        cleanup: Option<CleanupOutcome>,
     },
     LogReaderFinished {
         service_id: ServiceID,
@@ -78,6 +87,7 @@ impl ProcessEvent {
     pub(crate) fn service_id(&self) -> &ServiceID {
         match self {
             Self::Killed { service_id, .. }
+            | Self::CleanupStarted { service_id, .. }
             | Self::Exited { service_id, .. }
             | Self::LogReaderFinished { service_id, .. }
             | Self::Healthy { service_id, .. }
@@ -89,6 +99,7 @@ impl ProcessEvent {
     pub(crate) fn run_id(&self) -> RunId {
         match self {
             Self::Killed { run_id, .. }
+            | Self::CleanupStarted { run_id, .. }
             | Self::Exited { run_id, .. }
             | Self::LogReaderFinished { run_id, .. }
             | Self::Healthy { run_id, .. }
@@ -101,6 +112,7 @@ impl ProcessEvent {
     pub(crate) fn to_test_event(&self) -> Event {
         match self {
             Self::Killed { service_id, .. } => Event::Killed(service_id.clone()),
+            Self::CleanupStarted { service_id, .. } => Event::CleanupStarted(service_id.clone()),
             Self::Exited {
                 service_id,
                 exit_code,
@@ -133,6 +145,8 @@ pub(crate) enum Event {
     },
     /// A service was killed.
     Killed(ServiceID),
+    /// A service's process exited and its cleanup started.
+    CleanupStarted(ServiceID),
     /// A service exited.
     Exited(ServiceID, i32),
     /// A service's PTY reader drained and exited.
@@ -181,6 +195,7 @@ impl std::fmt::Display for Event {
         match self {
             Self::Started { service_id, .. } => write!(f, "Started({service_id})"),
             Self::Killed(service_id) => write!(f, "Killed({service_id})"),
+            Self::CleanupStarted(service_id) => write!(f, "CleanupStarted({service_id})"),
             Self::Exited(service_id, _) => write!(f, "Exited({service_id})"),
             Self::LogReaderFinished(service_id) => write!(f, "LogReaderFinished({service_id})"),
             Self::Healthy(service_id) => write!(f, "Healthy({service_id})"),

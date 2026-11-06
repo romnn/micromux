@@ -479,3 +479,270 @@ fn shim_does_not_forward_signals_from_its_own_group() -> eyre::Result<()> {
     );
     Ok(())
 }
+
+/// Removes a test session's cleanup files from the user's state directory when dropped.
+struct CleanupState(Option<std::path::PathBuf>);
+
+impl CleanupState {
+    /// The cleanup state of the session whose config is `micromux.yaml` in `directory`.
+    fn of(directory: &Path) -> eyre::Result<Self> {
+        let config = directory.join("micromux.yaml").canonicalize()?;
+        Ok(Self(micromux::cleanup_state_directory(&config)))
+    }
+
+    fn file(&self, name: &str) -> eyre::Result<std::path::PathBuf> {
+        Ok(self
+            .0
+            .as_ref()
+            .ok_or_else(|| eyre::eyre!("no state directory"))?
+            .join(name))
+    }
+
+    fn lock(&self, service: &str) -> eyre::Result<std::path::PathBuf> {
+        self.file(&format!("{service}.lock"))
+    }
+
+    fn log(&self, service: &str) -> eyre::Result<std::path::PathBuf> {
+        self.file(&format!("{service}.log"))
+    }
+}
+
+impl Drop for CleanupState {
+    fn drop(&mut self) {
+        if let Some(directory) = &self.0 {
+            let _ = std::fs::remove_dir_all(directory);
+        }
+    }
+}
+
+/// Waits until `path` holds at least `lines` lines, and returns its contents.
+fn read_lines(path: &Path, lines: usize, timeout: Duration) -> eyre::Result<String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let text = std::fs::read_to_string(path).unwrap_or_default();
+        if text.lines().count() >= lines {
+            return Ok(text);
+        }
+        eyre::ensure!(
+            Instant::now() < deadline,
+            "{} has {:?} instead of {lines} lines",
+            path.display(),
+            text
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// A supervisor killed with `SIGKILL` while its service runs leaves the cleanup to the service's
+/// shim, which runs it exactly once, after the service's processes are gone, in the service's
+/// environment and working directory.
+#[test]
+fn sigkilled_supervisor_runs_the_cleanup_exactly_once() -> eyre::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let work = directory.path().join("work");
+    std::fs::create_dir(&work)?;
+    std::fs::write(
+        directory.path().join("micromux.yaml"),
+        r#"version: 1
+services:
+  svc:
+    command: ["sh", "-c", "echo $$ > svc.pid; exec sleep 300"]
+    working_dir: work
+    environment:
+      CLEANUP_MARKER: from-service
+    cleanup:
+      command: ["sh", "-c", "echo $$CLEANUP_MARKER >> cleanups"]
+"#,
+    )?;
+    let state = CleanupState::of(directory.path())?;
+
+    let mut supervisor = serve(Path::new(MICROMUX), directory.path())?;
+    let pids = read_pids(&work, &["svc.pid"], &mut supervisor)?;
+    supervisor.kill()?;
+    supervisor.wait()?;
+
+    let survivors = survivors_after(&pids, Duration::from_secs(20));
+    eyre::ensure!(
+        survivors.is_empty(),
+        "survived the supervisor: {survivors:?}"
+    );
+    // The cleanup ran in `work` with the service's variable, and only once even after settling.
+    read_lines(&work.join("cleanups"), 1, Duration::from_secs(20))?;
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(
+        std::fs::read_to_string(work.join("cleanups"))?,
+        "from-service\n"
+    );
+    // The shim framed the cleanup's log itself, having no run to name.
+    let log = std::fs::read_to_string(state.log("svc")?)?;
+    let lines = log.lines().collect::<Vec<_>>();
+    assert!(
+        lines
+            .first()
+            .is_some_and(|header| header.contains("after micromux exited")),
+        "{log}"
+    );
+    assert_eq!(lines.last(), Some(&"micromux: cleanup exited with 0"));
+    Ok(())
+}
+
+/// A cleanup the supervisor started finishes, exactly once and within its timeout, when the
+/// supervisor is killed while it runs.
+#[test]
+fn cleanup_outlives_a_supervisor_killed_during_it() -> eyre::Result<()> {
+    let directory = tempfile::tempdir()?;
+    std::fs::write(
+        directory.path().join("micromux.yaml"),
+        r#"version: 1
+services:
+  svc:
+    command: ["sh", "-c", "echo $$ > svc.pid; exec sleep 300"]
+    cleanup:
+      command: ["sh", "-c", "echo started >> cleanups; sleep 2; echo done >> cleanups"]
+      timeout: 30s
+"#,
+    )?;
+    let state = CleanupState::of(directory.path())?;
+    let mut supervisor = serve(Path::new(MICROMUX), directory.path())?;
+    let pids = read_pids(directory.path(), &["svc.pid"], &mut supervisor)?;
+
+    // Stopping the service starts its cleanup; the supervisor dies while it runs.
+    let disabled = Command::new(MICROMUX)
+        .args(["ctl", "disable", "svc"])
+        .current_dir(directory.path())
+        .stdout(Stdio::null())
+        .status()?;
+    let started = read_lines(
+        &directory.path().join("cleanups"),
+        1,
+        Duration::from_secs(20),
+    );
+    supervisor.kill()?;
+    supervisor.wait()?;
+    started?;
+
+    let cleanups = read_lines(
+        &directory.path().join("cleanups"),
+        2,
+        Duration::from_secs(20),
+    )?;
+    std::thread::sleep(Duration::from_secs(1));
+    assert!(disabled.success());
+    assert_eq!(cleanups, "started\ndone\n");
+    assert_eq!(
+        std::fs::read_to_string(directory.path().join("cleanups"))?,
+        "started\ndone\n"
+    );
+    assert_eq!(
+        survivors_after(&pids, Duration::from_secs(1)),
+        Vec::<i32>::new()
+    );
+    // The cleanup's shim exited, releasing the lock that would hold back a restarted session.
+    let lock = std::fs::File::open(state.lock("svc")?)?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while lock.try_lock().is_err() {
+        eyre::ensure!(Instant::now() < deadline, "the cleanup's shim never exited");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    Ok(())
+}
+
+/// A cleanup-only shim stops a cleanup that ignores the stop signal past its timeout with
+/// `SIGKILL` after the stop grace, kills it, and reports the timeout as status 124.
+#[test]
+fn cleanup_only_shim_kills_a_cleanup_past_its_timeout() -> eyre::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let log = directory.path().join("cleanup.log");
+    let started = Instant::now();
+    let mut shim = Command::new(MICROMUX)
+        .args([
+            "__shim",
+            "--cleanup-only",
+            "--stop-signal",
+            "TERM",
+            "--cleanup-timeout-ms",
+            "500",
+            "--cleanup-log",
+        ])
+        .arg(&log)
+        .env("MICROMUX_SHIM_ARG_0", "sh")
+        .env("MICROMUX_SHIM_ARG_1", "-c")
+        .env(
+            "MICROMUX_SHIM_ARG_2",
+            "trap '' TERM; echo $$ > cleanup.pid; exec sleep 60",
+        )
+        .current_dir(directory.path())
+        // A closed stdin starts the cleanup at once, as the death of a supervisor does.
+        .stdin(Stdio::null())
+        .process_group(0)
+        .spawn()?;
+
+    // The timeout, the stop grace, and slack for a loaded machine
+    let deadline = started + Duration::from_millis(500) + Duration::from_secs(5 + 5);
+    let status = loop {
+        if let Some(status) = shim.try_wait()? {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = kill(Pid::from_raw(-i32::try_from(shim.id())?), Signal::SIGKILL);
+            let _ = shim.wait();
+            eyre::bail!("the cleanup-only shim outlived its cleanup's timeout");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let pid = read_pid(
+        &directory.path().join("cleanup.pid"),
+        Instant::now() + Duration::from_secs(1),
+    )?;
+
+    assert_eq!(status.code(), Some(124));
+    assert_eq!(
+        survivors_after(&[pid], Duration::from_secs(1)),
+        Vec::<i32>::new()
+    );
+    assert_eq!(
+        std::fs::read_to_string(&log)?.lines().last(),
+        Some("micromux: cleanup timed out after 500ms")
+    );
+    Ok(())
+}
+
+/// A session waits to start its services while an earlier session's cleanup still holds its
+/// cleanup lock, even for a service the config no longer has.
+#[test]
+fn sessions_wait_for_a_previous_sessions_cleanup() -> eyre::Result<()> {
+    let directory = tempfile::tempdir()?;
+    std::fs::write(
+        directory.path().join("micromux.yaml"),
+        "version: 1\nservices:\n  svc:\n    command: [\"sh\", \"-c\", \"echo $$ > svc.pid; exec sleep 300\"]\n",
+    )?;
+    let state = CleanupState::of(directory.path())?;
+    let lock_path = state.lock("removed")?;
+    if let Some(parent) = lock_path.parent() {
+        use std::os::unix::fs::DirBuilderExt as _;
+
+        // As private as micromux creates it, since it lives in the user's state directory.
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(parent)?;
+    }
+    let lock = std::fs::File::create(&lock_path)?;
+    lock.lock()?;
+
+    let mut supervisor = serve(Path::new(MICROMUX), directory.path())?;
+    std::thread::sleep(Duration::from_secs(2));
+    let started_early = directory.path().join("svc.pid").exists();
+    drop(lock);
+    let pids = read_pids(directory.path(), &["svc.pid"], &mut supervisor);
+    supervisor.kill()?;
+    supervisor.wait()?;
+
+    let pids = pids?;
+    assert!(
+        !started_early,
+        "the service started while the lock was held"
+    );
+    let _ = survivors_after(&pids, Duration::from_secs(20));
+    Ok(())
+}
