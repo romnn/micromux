@@ -2657,7 +2657,14 @@ pub(super) fn start_service_with_pty_size(
         signal: service.spec.stop_signal,
         grace: service.spec.stop_grace_period,
     };
-    let mut cmd = if let Some((shim, shim_args)) = crate::containment::wrap(&program, args, stop) {
+    let path = env_vars
+        .get("PATH")
+        .map(std::ffi::OsString::from)
+        .or_else(|| std::env::var_os("PATH"));
+    let wrapped =
+        crate::containment::wrap(&program, args, stop, path.as_deref(), working_dir.as_path())
+            .map_err(|err| Error::operation("failed to spawn in pty", err))?;
+    let mut cmd = if let Some((shim, shim_args)) = wrapped {
         let mut cmd = CommandBuilder::new(shim);
         cmd.args(shim_args);
         cmd

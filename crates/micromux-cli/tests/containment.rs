@@ -305,3 +305,150 @@ fn shim_reports_real_time_signal_deaths() -> eyre::Result<()> {
     );
     Ok(())
 }
+
+/// Waits for every pid to exit, SIGKILLs the survivors, and returns them.
+fn survivors_after(pids: &[i32], timeout: Duration) -> Vec<i32> {
+    let deadline = Instant::now() + timeout;
+    while pids.iter().copied().any(alive) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let survivors = pids
+        .iter()
+        .copied()
+        .filter(|pid| alive(*pid))
+        .collect::<Vec<_>>();
+    for pid in &survivors {
+        let _ = kill(Pid::from_raw(*pid), Signal::SIGKILL);
+    }
+    survivors
+}
+
+/// A service stopped with `SIGHUP` gets it once from the shim when the supervisor dies, although
+/// the terminal's own hangup reaches only the shim.
+#[test]
+fn sigkilled_supervisor_hangs_up_hup_services_once() -> eyre::Result<()> {
+    let directory = tempfile::tempdir()?;
+    std::fs::write(
+        directory.path().join("hup.sh"),
+        r"trap 'echo hup >> hangups; exit 0' HUP
+echo $$ > svc.pid
+while :; do sleep 0.05; done
+",
+    )?;
+    std::fs::write(
+        directory.path().join("micromux.yaml"),
+        "version: 1\nservices:\n  svc:\n    command: [\"sh\", \"./hup.sh\"]\n    stop_signal: SIGHUP\n    stop_grace_period: 60s\n",
+    )?;
+    let mut supervisor = serve(Path::new(MICROMUX), directory.path())?;
+    let pids = read_pids(directory.path(), &["svc.pid"], &mut supervisor)?;
+    supervisor.kill()?;
+    supervisor.wait()?;
+
+    // Well within the grace period, so the service ended on the signal, not the SIGKILL.
+    let survivors = survivors_after(&pids, Duration::from_secs(20));
+    eyre::ensure!(
+        survivors.is_empty(),
+        "survived the supervisor: {survivors:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(directory.path().join("hangups"))?,
+        "hup\n"
+    );
+    Ok(())
+}
+
+/// A signal another process sends to the pid Micromux shows for a service reaches the command.
+#[test]
+fn shim_forwards_signals_from_other_processes() -> eyre::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let mut shim = Command::new(MICROMUX)
+        .args([
+            "__shim",
+            "--supervisor-pid",
+            &std::process::id().to_string(),
+            "--",
+            "sh",
+            "-c",
+            "trap 'echo usr1 > got; exit 3' USR1; touch ready; while :; do sleep 0.05; done",
+        ])
+        .current_dir(directory.path())
+        .stdin(Stdio::null())
+        .spawn()?;
+    let ready = directory.path().join("ready");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !ready.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // `kill(1)` is a sender other than the supervisor, which this test plays.
+    let sent = Command::new("kill")
+        .args(["-USR1", &shim.id().to_string()])
+        .status()?;
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = shim.try_wait()? {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = shim.kill();
+            let _ = shim.wait();
+            eyre::bail!("the command never saw the forwarded signal");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(sent.success());
+    assert_eq!(status.code(), Some(3));
+    assert_eq!(
+        std::fs::read_to_string(directory.path().join("got"))?,
+        "usr1\n"
+    );
+    Ok(())
+}
+
+/// A shim that does not lead its process group cleans up only its own descendants, never the
+/// rest of the group it was started in.
+#[test]
+fn shim_spares_a_process_group_it_does_not_lead() -> eyre::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let mut canary = Command::new("sleep")
+        .arg("60")
+        .stdin(Stdio::null())
+        .process_group(0)
+        .spawn()?;
+    let group = i32::try_from(canary.id())?;
+    // The shell starts the shim in the background and exits, so the shim outlives its
+    // supervisor inside the canary's group.
+    let started = Command::new("sh")
+        .args([
+            "-c",
+            r#""$0" __shim --supervisor-pid $$ --grace-ms 200 -- sh -c 'echo $$ > command.pid; exec sleep 60' &
+echo $! > shim.pid
+while [ ! -s command.pid ]; do sleep 0.02; done"#,
+            MICROMUX,
+        ])
+        .current_dir(directory.path())
+        .stdin(Stdio::null())
+        .process_group(group)
+        .status();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let pids = ["shim.pid", "command.pid"]
+        .iter()
+        .map(|name| read_pid(&directory.path().join(name), deadline))
+        .collect::<eyre::Result<Vec<_>>>();
+    let survivors = pids
+        .as_ref()
+        .map(|pids| survivors_after(pids, Duration::from_secs(10)))
+        .unwrap_or_default();
+    let canary_alive = alive(group);
+    let _ = canary.kill();
+    let _ = canary.wait();
+
+    assert!(started?.success());
+    pids?;
+    eyre::ensure!(
+        survivors.is_empty(),
+        "survived the shim's cleanup: {survivors:?}"
+    );
+    assert!(canary_alive, "the shim signaled a group it does not lead");
+    Ok(())
+}

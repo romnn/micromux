@@ -888,9 +888,31 @@ async fn run(
 
     // Under containment a shim starts the probe, so a probe still running when the supervisor
     // dies is cleaned up too.
-    let mut cmd = if let Some((shim, shim_args)) =
-        crate::containment::wrap(std::path::Path::new(prog), args, params.stop)
-    {
+    let path = params
+        .environment
+        .get("PATH")
+        .map(std::ffi::OsString::from)
+        .or_else(|| std::env::var_os("PATH"));
+    // Without a working directory the probe runs in the supervisor's, which `.` names.
+    let cwd = params.working_dir.unwrap_or(std::path::Path::new("."));
+    let wrapped = crate::containment::wrap(
+        std::path::Path::new(prog),
+        args,
+        params.stop,
+        path.as_deref(),
+        cwd,
+    );
+    let wrapped = match wrapped {
+        Ok(wrapped) => wrapped,
+        Err(source) => {
+            emit_spawn_failed(&params.sink, attempt, &source);
+            return Err(Error {
+                command,
+                source: ErrorReason::Spawn(source),
+            });
+        }
+    };
+    let mut cmd = if let Some((shim, shim_args)) = wrapped {
         let mut cmd = Command::new(shim);
         cmd.args(shim_args);
         cmd
@@ -901,6 +923,7 @@ async fn run(
     };
     cmd.envs(params.environment.iter())
         .kill_on_drop(true)
+        .stdin(Stdio::null())
         .stderr(Stdio::piped())
         .stdout(Stdio::piped());
     #[cfg(unix)]
