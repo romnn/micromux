@@ -539,12 +539,23 @@ mod tests {
             registry.acquire(config, "one", &names(&["A", "B"]), &[], &DEFAULT_PORT_RANGE)?;
         drop(lease);
         let (a, b) = (before["A"], before["B"]);
-        // A two-port range around B that leaves A outside, so A's new port competes with B's.
-        let range = if b.checked_add(1) == Some(a) {
-            b - 1..=b
-        } else {
-            b..=b + 1
-        };
+        // A two-port range of B and a free neighbor other than A, so A's new port competes with
+        // B's; other processes on the machine may hold either neighbor.
+        let range = [
+            b.checked_add(1).map(|next| b..=next),
+            b.checked_sub(1).map(|prev| prev..=b),
+        ]
+        .into_iter()
+        .flatten()
+        .find(|range| {
+            let neighbor = if *range.start() == b {
+                *range.end()
+            } else {
+                *range.start()
+            };
+            neighbor != a && port_is_free(neighbor)
+        })
+        .ok_or_else(|| eyre::eyre!("both neighbors of port {b} are in use"))?;
         let (after, _lease) = registry.acquire(config, "one", &names(&["A", "B"]), &[], &range)?;
 
         assert_eq!(after["B"], b);
