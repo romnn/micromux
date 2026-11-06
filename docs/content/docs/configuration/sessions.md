@@ -11,6 +11,7 @@ Several checkouts of one project, such as git worktrees, can each run their own 
 session:
   name: luup2          # optional; defaults to the config directory's name, slugified
   domain: localhost    # optional; defaults to "localhost"
+  port_range: { start: 30000, end: 32767 }   # optional; defaults to 20000-32767
 
 allocate_ports:
   - API_PORT
@@ -29,10 +30,23 @@ Every name under `allocate_ports` becomes an environment variable holding a free
 
 - The port **stays the same across restarts** of the session. Assignments are stored per config file in micromux's state directory (`~/.local/state/micromux/ports` on Linux, `~/Library/Application Support/com.romnn.micromux/ports` on macOS).
 - **No two live sessions of the same user share a port.** A session holds its assignment while it runs; a stopped session's ports are only handed to another session when no other port is left.
-- Ports come from `20000`–`32767`, below the ephemeral port ranges of Linux and macOS, so outgoing connections never take one.
+- Ports come from `session.port_range`, by default `20000`–`32767`, below the ephemeral port ranges of Linux (`32768`+) and macOS (`49152`+), so outgoing connections never take one. See [choosing a port range](#choosing-a-port-range).
 - A port a session is assigned for the first time is checked to be free. If a port the session had before is now held by some other process, the session **fails to start** and names the variable and the port, rather than pointing your services at a stranger. Stop that process (often a leftover of an earlier run) and start again.
 
 Only one micromux can run a given config file at a time; a second one fails to start.
+
+### Choosing a port range
+
+A port is checked to be free when micromux assigns it, but nothing reserves it at the operating-system level until your service binds it. Other tools that hand out ports the same way can take it in between. Test harnesses are the usual culprit: testcontainers setups that give containers fixed host ports often pick them below the ephemeral range too, for the same reason micromux does, and a busy test run can then grab a port moments before your `docker compose up` binds it ("address already in use").
+
+If such a tool runs on the machine, give micromux a range of its own that does not overlap:
+
+```yaml
+session:
+  port_range: { start: 30000, end: 32767 }
+```
+
+`start` and `end` are inclusive, at least `1024`, and the range must have room for every `allocate_ports` name (the proxy's ports inside it do not count). Staying below `32768` keeps it clear of Linux's ephemeral ports. `30000`–`32767` is also the default Kubernetes NodePort range: if a Kubernetes distribution runs directly on the host (k3s, microk8s, rke2), it can intercept connections to those ports even though nothing listens on them, so pick another range there. When the range changes, a session's next start keeps the ports already inside the new range and assigns new ones for the rest.
 
 Names must be environment variable names. `MICROMUX_*` names and the variables micromux sets on every service itself (`TERM`, `CLICOLOR`, `CLICOLOR_FORCE`, `FORCE_COLOR`) are reserved.
 
@@ -89,6 +103,6 @@ A session joins a proxy that is already running only if it listens on `port` or 
 
 ## Restarting to apply changes
 
-`session`, `allocate_ports`, `routes`, and `proxy` are read once, when the session starts. A config reload — [`reconcile_config`]({{< relref "../agent-control/control-plane.md" >}}), or a restart that re-reads the config — that changes any of them is rejected; restart the session to apply the change.
+`session` (including `port_range`), `allocate_ports`, `routes`, and `proxy` are read once, when the session starts. A config reload — [`reconcile_config`]({{< relref "../agent-control/control-plane.md" >}}), or a restart that re-reads the config — that changes any of them is rejected; restart the session to apply the change.
 
 `validate_config` never reserves anything. It uses the assignment a session already has, or provisional values for names that were never assigned, and says so in a note.

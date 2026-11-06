@@ -17,7 +17,7 @@ use indexmap::IndexMap;
 use crate::config::{ConfigFile, SessionConfig};
 
 pub use registry::PortRegistry;
-pub(crate) use registry::{Lease, PORT_RANGE};
+pub(crate) use registry::{DEFAULT_PORT_RANGE, Lease};
 pub(crate) use routes::resolve as resolve_routes;
 pub use routes::{CATCH_ALL_HOST, Route, RouteError};
 pub use status::{RoutingStatus, SessionStatus, SessionSummary};
@@ -118,10 +118,14 @@ pub enum SessionError {
         record: PathBuf,
     },
     /// Every port in the allocation range is taken.
-    #[error("no free port is left in {}-{} for `{variable}`", PORT_RANGE.start(), PORT_RANGE.end())]
+    #[error("no free port is left in {start}-{end} for `{variable}`; widen `session.port_range`")]
     Exhausted {
         /// The variable that could not be assigned.
         variable: String,
+        /// Lowest port of the allocation range.
+        start: u16,
+        /// Highest port of the allocation range.
+        end: u16,
     },
     /// The registry record of a live session cannot be read, so its ports are unknown.
     #[error("cannot read the port registry record {}: {message}", path.display())]
@@ -295,7 +299,13 @@ impl Session {
         let excluded = std::iter::once(proxy_port)
             .chain(settings.proxy.fallback_port())
             .collect::<Vec<_>>();
-        let (ports, lease) = registry.acquire(config_path, &identity.name, &names, &excluded)?;
+        let (ports, lease) = registry.acquire(
+            config_path,
+            &identity.name,
+            &names,
+            &excluded,
+            &settings.port_range(),
+        )?;
         Ok(Self {
             identity,
             settings,
@@ -308,8 +318,9 @@ impl Session {
 
     /// Resolves the session for validation without reserving anything.
     ///
-    /// Names with a persisted assignment use it; every other name gets a distinct provisional
-    /// port, listed by [`Self::provisional_ports`].
+    /// Names with a persisted assignment in the port range use it; every other name gets a
+    /// distinct provisional port, listed by [`Self::provisional_ports`], since the next start
+    /// assigns it anew.
     /// Crate-private because a preview holds no reservation and must never run services.
     pub(crate) fn preview<F>(config: &ConfigFile<F>, registry: &PortRegistry) -> Self {
         let settings = config.config.session.clone();
@@ -321,14 +332,19 @@ impl Session {
             .unwrap_or_default();
         let mut ports = IndexMap::new();
         let mut provisional = Vec::new();
-        let mut next = *PORT_RANGE.start();
+        let range = settings.port_range();
+        let mut next = *range.start();
         for name in &settings.allocate_ports {
-            let port = if let Some(port) = persisted.get(&name.inner) {
+            let port = if let Some(port) = persisted
+                .get(&name.inner)
+                .filter(|port| range.contains(port))
+            {
                 *port
             } else {
                 provisional.push(name.inner.clone());
+                let port = next;
                 next = next.saturating_add(1);
-                next
+                port
             };
             ports.insert(name.inner.clone(), port);
         }
@@ -583,6 +599,49 @@ mod tests {
         assert!(allocation_name_problem("MICROMUX_SESSION").is_some());
         assert!(allocation_name_problem("micromux_x").is_some());
         assert!(allocation_name_problem("force_color").is_some());
+    }
+
+    fn session_config(yaml: &str) -> color_eyre::eyre::Result<ConfigFile<usize>> {
+        let yaml = format!("version: 1\n{yaml}\nservices:\n  app:\n    command: [\"true\"]\n");
+        let mut config = crate::config::from_str(
+            &yaml,
+            Path::new("/projects/one"),
+            0usize,
+            None,
+            &mut Vec::new(),
+        )?;
+        config.config_path = Some(PathBuf::from("/projects/one/micromux.yaml"));
+        Ok(config)
+    }
+
+    /// A port range change reassigns ports at the next start, and validation shows the ports it
+    /// will replace as provisional values from the new range.
+    #[test]
+    fn port_range_changes_reassign_ports() -> color_eyre::eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let registry = PortRegistry::at(directory.path());
+        let default = session_config("allocate_ports: [A]")?;
+        let ranged = session_config(
+            "session: { port_range: { start: 40000, end: 40999 } }\nallocate_ports: [A]",
+        )?;
+
+        drop(Session::establish(&default, &registry)?);
+        let preview = Session::preview(&ranged, &registry);
+        let established = Session::establish(&ranged, &registry)?;
+
+        assert_eq!(preview.provisional_ports(), ["A".to_string()]);
+        assert_eq!(preview.ports().get("A"), Some(&40000));
+        assert!(
+            established
+                .ports()
+                .values()
+                .all(|port| (40000..=40999).contains(port))
+        );
+        assert!(
+            !default.config.session.same_settings(&ranged.config.session),
+            "a changed range must not pass as the latched settings"
+        );
+        Ok(())
     }
 
     /// The digest is part of persisted file names and control endpoints, so it must never change.

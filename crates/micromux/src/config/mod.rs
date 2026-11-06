@@ -283,6 +283,17 @@ pub struct SessionConfig {
     pub routes: Vec<RouteConfig>,
     /// Port preference for the shared proxy.
     pub proxy: ProxyConfig,
+    /// Ports `allocate_ports` draws from, when not the default range.
+    pub port_range: Option<PortRangeConfig>,
+}
+
+/// The `session.port_range` mapping: the inclusive range `allocate_ports` draws from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PortRangeConfig {
+    /// Lowest port of the range.
+    pub start: Spanned<u16>,
+    /// Highest port of the range.
+    pub end: Spanned<u16>,
 }
 
 /// One `routes` entry: a hostname under the session domain and the local port serving it.
@@ -319,6 +330,16 @@ impl ProxyConfig {
 }
 
 impl SessionConfig {
+    /// The inclusive range `allocate_ports` draws from.
+    #[must_use]
+    pub fn port_range(&self) -> std::ops::RangeInclusive<u16> {
+        self.port_range
+            .as_ref()
+            .map_or(crate::session::DEFAULT_PORT_RANGE, |range| {
+                range.start.inner..=range.end.inner
+            })
+    }
+
     /// Whether two settings would produce the same session, ignoring source locations.
     #[must_use]
     pub fn same_settings(&self, other: &Self) -> bool {
@@ -342,6 +363,7 @@ impl SessionConfig {
             && routes(&self.routes) == routes(&other.routes)
             && self.proxy.port() == other.proxy.port()
             && self.proxy.fallback_port() == other.proxy.fallback_port()
+            && self.port_range() == other.port_range()
     }
 
     /// Whether the settings need the config's file path, which keys allocated ports and route
