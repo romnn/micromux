@@ -232,6 +232,13 @@ mod tests {
             .iter()
             .map(Line::to_string)
             .collect::<Vec<_>>();
+        // A wide character that would straddle the edge moves to the next row whole.
+        let wide = Line::from(format!("{}{}", "x".repeat(23), "界界"));
+        let wide_rows = super::wrap_info_row(wide, 24)
+            .iter()
+            .map(Line::width)
+            .collect::<Vec<_>>();
+        assert_eq!(wide_rows, vec![23, 12 + 4]);
         assert_eq!(
             rows,
             vec![
@@ -725,7 +732,9 @@ fn wrap_info_row(row: Line<'static>, width: usize) -> Vec<Line<'static>> {
     for span in row.spans {
         let mut text = String::new();
         for character in span.content.chars() {
-            if used == width {
+            // Columns, not characters: a wide character takes two.
+            let columns = Span::raw(character.to_string()).width();
+            if used + columns > width && used > indent {
                 if !text.is_empty() {
                     current.push(Span::styled(std::mem::take(&mut text), span.style));
                 }
@@ -734,7 +743,7 @@ fn wrap_info_row(row: Line<'static>, width: usize) -> Vec<Line<'static>> {
                 used = indent;
             }
             text.push(character);
-            used += 1;
+            used += columns;
         }
         if !text.is_empty() {
             current.push(Span::styled(text, span.style));
@@ -2001,7 +2010,10 @@ impl App {
         let session = self.source.session_summary();
         let (title, rows) = match view {
             crate::InfoView::Service => {
+                // The service can vanish under the popup, as when an attached session restarts;
+                // an invisible popup must not keep swallowing keys.
                 let Some(service) = self.state.current_service() else {
+                    self.info = None;
                     return;
                 };
                 let attempts = self.source.healthchecks(&service.snapshot.id);

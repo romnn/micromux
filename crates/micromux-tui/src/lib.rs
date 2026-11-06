@@ -670,9 +670,11 @@ impl App {
                 KeyCode::Char('k') | KeyCode::Up => {
                     self.info_scroll = self.info_scroll.saturating_sub(1);
                 }
-                KeyCode::Char('j') | KeyCode::Down => self.info_scroll += 1,
+                KeyCode::Char('j') | KeyCode::Down => {
+                    self.info_scroll = self.info_scroll.saturating_add(1);
+                }
                 KeyCode::PageUp => self.info_scroll = self.info_scroll.saturating_sub(PAGE),
-                KeyCode::PageDown => self.info_scroll += PAGE,
+                KeyCode::PageDown => self.info_scroll = self.info_scroll.saturating_add(PAGE),
                 KeyCode::Char('g') => self.info_scroll = 0,
                 // Rendering clamps it to the last page.
                 KeyCode::Char('G') => self.info_scroll = usize::MAX,
