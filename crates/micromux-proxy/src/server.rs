@@ -101,20 +101,21 @@ pub async fn serve(
         }),
     });
     let stop = shutdown.child_token();
+    let mut acceptors = Vec::new();
     for listener in bound.listeners {
         let listener = tokio::net::TcpListener::from_std(listener).map_err(io(&paths.socket))?;
-        tokio::spawn(accept_http(
+        acceptors.push(tokio::spawn(accept_http(
             listener,
             bound.wildcard,
             shared.clone(),
             stop.clone(),
-        ));
+        )));
     }
-    tokio::spawn(accept_registrations(
+    acceptors.push(tokio::spawn(accept_registrations(
         registrations,
         shared.clone(),
         stop.clone(),
-    ));
+    )));
     tracing::info!(port, "micromux proxy listening");
     on_ready(port);
 
@@ -137,6 +138,10 @@ pub async fn serve(
     stop.cancel();
     shared.end_all_registrations();
     let _ = std::fs::remove_file(&paths.socket);
+    // The acceptors own the listeners; the port is only free for a successor once they are gone.
+    for acceptor in acceptors {
+        let _ = acceptor.await;
+    }
     drop(lock);
     Ok(())
 }

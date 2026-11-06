@@ -171,7 +171,10 @@ fn bind_one(address: SocketAddr) -> Result<TcpListener, BindError> {
     Ok(socket.into())
 }
 
-/// Whether something already accepts connections on `port` over IPv4 or IPv6 loopback.
+/// Whether something may already listen on `port` over IPv4 or IPv6 loopback.
+///
+/// Only a refused connection, or an address family the host lacks, proves nobody listens: a
+/// listener with a full accept queue can leave the probe unanswered until it times out.
 fn is_accepting(port: u16) -> bool {
     [
         SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
@@ -179,7 +182,12 @@ fn is_accepting(port: u16) -> bool {
     ]
     .iter()
     .any(|address| {
-        std::net::TcpStream::connect_timeout(address, std::time::Duration::from_millis(250)).is_ok()
+        match std::net::TcpStream::connect_timeout(address, std::time::Duration::from_millis(250)) {
+            Ok(_) => true,
+            Err(err) => {
+                err.kind() != std::io::ErrorKind::ConnectionRefused && !ipv6_unavailable(&err)
+            }
+        }
     })
 }
 
@@ -273,6 +281,35 @@ mod tests {
 
         let result = bind(PortPreference {
             port,
+            fallback_port: None,
+        });
+
+        assert!(matches!(result, Err(BindError::InUse { .. })), "{result:?}");
+        Ok(())
+    }
+
+    /// A listener too busy to answer still owns its port: an unanswered probe is not proof that
+    /// the port is free.
+    #[test]
+    fn saturated_listener_makes_the_port_taken() -> eyre::Result<()> {
+        let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
+        socket.bind(&SocketAddr::from((Ipv4Addr::LOCALHOST, 0)).into())?;
+        socket.listen(0)?;
+        let listener: TcpListener = socket.into();
+        let address = listener.local_addr()?;
+        // Fill the accept queue; nothing ever accepts.
+        let _queued = (0..8)
+            .filter_map(|_| {
+                std::net::TcpStream::connect_timeout(
+                    &address,
+                    std::time::Duration::from_millis(100),
+                )
+                .ok()
+            })
+            .collect::<Vec<_>>();
+
+        let result = bind(PortPreference {
+            port: address.port(),
             fallback_port: None,
         });
 

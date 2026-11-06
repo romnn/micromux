@@ -472,3 +472,32 @@ async fn stopping_the_proxy_ends_its_registrations() -> eyre::Result<()> {
     .await??;
     Ok(())
 }
+
+/// A stopped proxy has released its port by the time `serve` returns, so a successor can bind it
+/// right away.
+#[tokio::test(flavor = "current_thread")]
+async fn a_stopped_proxy_frees_its_port_immediately() -> eyre::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let paths = ProxyPaths::in_dir(directory.path());
+    let port = TcpListener::bind(("127.0.0.1", 0))
+        .await?
+        .local_addr()?
+        .port();
+    let options = ServeOptions {
+        paths,
+        preference: PortPreference {
+            port,
+            fallback_port: None,
+        },
+        idle_timeout: Duration::from_secs(60),
+    };
+
+    let shutdown = CancellationToken::new();
+    let stop = shutdown.clone();
+    serve(options.clone(), shutdown, move |_| stop.cancel()).await?;
+
+    let shutdown = CancellationToken::new();
+    let stop = shutdown.clone();
+    serve(options, shutdown, move |_| stop.cancel()).await?;
+    Ok(())
+}
