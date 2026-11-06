@@ -8,6 +8,8 @@ use micromux_control::{
     runtime_dir_statuses, unique_answering_session_probes, usable_runtime_dirs,
 };
 
+use micromux_control::wait::{self, ChangeWaker, WaitFor, WaitVerdict};
+
 use crate::options::CtlAction;
 
 fn request_for(action: &CtlAction) -> Request {
@@ -49,6 +51,10 @@ fn request_for(action: &CtlAction) -> Request {
             service,
             history: true,
         } => Request::GetHealthHistory {
+            service: service.clone(),
+        },
+        // A wait polls the service; `wait` drives the loop.
+        CtlAction::Wait { service, .. } => Request::GetService {
             service: service.clone(),
         },
         CtlAction::Describe => Request::Describe,
@@ -108,13 +114,35 @@ fn print_session(session: &micromux::SessionSummary) {
     }
 }
 
+/// Suffix naming the dependency that holds a blocked service back for good.
+fn dependency_failure_label(service: &micromux::ServiceSnapshot) -> String {
+    let Some(failure) = &service.dependency_failure else {
+        return String::new();
+    };
+    let reason = match failure.reason {
+        micromux::DependencyFailureReason::Exited => "exited",
+        micromux::DependencyFailureReason::Disabled => "disabled",
+        micromux::DependencyFailureReason::Retired => "retired",
+        micromux::DependencyFailureReason::Missing => "missing",
+        micromux::DependencyFailureReason::Unknown => "unknown",
+    };
+    let exit_code = failure
+        .exit_code
+        .map(|code| format!(",exit_code={code}"))
+        .unwrap_or_default();
+    format!(
+        " failed_dependency={}({reason}{exit_code})",
+        failure.service
+    )
+}
+
 fn print_services(services: &[micromux::ServiceSnapshot]) {
     for service in services {
         let health = service
             .health
             .map_or_else(|| "-".to_string(), |health| health.to_string());
         println!(
-            "{:<20} id={} origin={} desired={:?} execution={:?} health={} generation={}{}",
+            "{:<20} id={} origin={} desired={:?} execution={:?} health={} generation={}{}{}",
             service.name,
             service.id,
             service_origin_label(service),
@@ -122,7 +150,8 @@ fn print_services(services: &[micromux::ServiceSnapshot]) {
             service.execution,
             health,
             service.run_generation,
-            service_retired_label(service)
+            service_retired_label(service),
+            dependency_failure_label(service)
         );
     }
 }
@@ -382,7 +411,7 @@ async fn connect_project_session(
     runtime_dirs: &[PathBuf],
     working_dir: &Path,
     config_path: &micromux_control::CanonicalConfigPath,
-) -> Result<Client, crate::Error> {
+) -> Result<(ControlEndpoint, Client), crate::Error> {
     let endpoints = runtime_dirs
         .iter()
         .map(|runtime_dir| endpoint_for(runtime_dir, config_path))
@@ -410,7 +439,7 @@ async fn connect_project_session(
                 continue;
             }
             match Client::connect(&endpoint).await {
-                Ok(client) => return Ok(client),
+                Ok(client) => return Ok((endpoint, client)),
                 Err(err) => failed_probes.push(EndpointProbe {
                     endpoint,
                     result: EndpointProbeResult::Unreachable(format!(
@@ -454,11 +483,140 @@ pub async fn run(action: CtlAction, config_path: Option<&Path>) -> Result<(), cr
             &working_dir,
         )));
     }
-    let mut client =
+    let (endpoint, mut client) =
         connect_project_session(&dir_statuses, &runtime_dirs, &working_dir, &config_path).await?;
+
+    if let CtlAction::Wait {
+        exit,
+        timeout,
+        after_generation,
+        ..
+    } = &action
+    {
+        let wait_for = if *exit {
+            WaitFor::Exit
+        } else {
+            WaitFor::Healthy
+        };
+        return wait(
+            &endpoint,
+            &mut client,
+            &request_for(&action),
+            wait_for,
+            *timeout,
+            *after_generation,
+        )
+        .await;
+    }
 
     let response = client.request(request_for(&action)).await?;
     print_response(&response)
+}
+
+/// Poll a service with `request` until the wait resolves or `timeout` elapses.
+async fn wait(
+    endpoint: &ControlEndpoint,
+    client: &mut Client,
+    request: &Request,
+    wait_for: WaitFor,
+    timeout: std::time::Duration,
+    after_generation: Option<u64>,
+) -> Result<(), crate::Error> {
+    let Request::GetService { service } = request else {
+        return Err(crate::Error::Message(format!(
+            "a wait polls with a service query, not {request:?}"
+        )));
+    };
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut waker = ChangeWaker::subscribe(endpoint, service, WAIT_POLL).await;
+    loop {
+        let snapshot = match client.request(request.clone()).await? {
+            Response::Service(snapshot) => *snapshot,
+            Response::Error { code, message } => {
+                return Err(crate::Error::Message(format!("{code:?}: {message}")));
+            }
+            other => {
+                return Err(crate::Error::Message(format!(
+                    "unexpected response to a service query: {other:?}"
+                )));
+            }
+        };
+        if let Some(verdict) = wait::evaluate(&snapshot, wait_for, after_generation) {
+            return report_wait(&snapshot, wait_for, &verdict);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            eprintln!(
+                "timed out after {} waiting for {}; it is {:?} at generation {}{}",
+                humantime::format_duration(timeout),
+                snapshot.id,
+                snapshot.execution,
+                snapshot.run_generation,
+                snapshot
+                    .health
+                    .map(|health| format!(" ({health})"))
+                    .unwrap_or_default()
+            );
+            return Err(crate::Error::WaitUnmet(WAIT_TIMED_OUT));
+        }
+        waker.sleep(deadline).await;
+    }
+}
+
+/// Longest a `ctl wait` sleeps between polls when no change notification wakes it.
+const WAIT_POLL: std::time::Duration = std::time::Duration::from_millis(500);
+/// Exit code of a `ctl wait` whose run exited instead of meeting the condition.
+const WAIT_EXITED: i32 = 3;
+/// Exit code of a `ctl wait` on a service blocked behind a failed dependency.
+const WAIT_DEPENDENCY_FAILED: i32 = 4;
+/// Exit code of a `ctl wait` on a disabled or retired service.
+const WAIT_UNAVAILABLE: i32 = 5;
+/// Exit code of a `ctl wait` that timed out, as `timeout(1)` uses.
+const WAIT_TIMED_OUT: i32 = 124;
+
+/// Print how a `ctl wait` resolved and map it to the process exit code.
+fn report_wait(
+    snapshot: &micromux::ServiceSnapshot,
+    wait_for: WaitFor,
+    verdict: &WaitVerdict,
+) -> Result<(), crate::Error> {
+    let service = &snapshot.id;
+    let generation = snapshot.run_generation;
+    let exit_code = |code: Option<i32>| {
+        code.map_or_else(
+            || "an unknown status".to_string(),
+            |code| format!("code {code}"),
+        )
+    };
+    match (verdict, wait_for) {
+        (WaitVerdict::Healthy, _) => {
+            println!("{service} is healthy (generation {generation})");
+            Ok(())
+        }
+        (WaitVerdict::Exited(Some(0)), WaitFor::Exit) => {
+            println!("{service} exited with code 0 (generation {generation})");
+            Ok(())
+        }
+        (WaitVerdict::Exited(code), _) => {
+            eprintln!(
+                "{service} exited with {} (generation {generation})",
+                exit_code(*code)
+            );
+            Err(crate::Error::WaitUnmet(WAIT_EXITED))
+        }
+        (WaitVerdict::DependencyFailed(failure), _) => {
+            eprintln!("{}", wait::dependency_failure_message(service, failure));
+            Err(crate::Error::WaitUnmet(WAIT_DEPENDENCY_FAILED))
+        }
+        (WaitVerdict::Unavailable, _) => {
+            let state = if snapshot.retired.is_some() {
+                "retired"
+            } else {
+                "disabled"
+            };
+            eprintln!("{service} is {state} and has no run in flight to wait for");
+            Err(crate::Error::WaitUnmet(WAIT_UNAVAILABLE))
+        }
+    }
 }
 
 #[cfg(test)]

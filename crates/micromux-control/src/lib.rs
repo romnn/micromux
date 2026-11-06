@@ -12,6 +12,7 @@ mod endpoint;
 mod protocol;
 mod select;
 mod server;
+pub mod wait;
 
 use std::time::Duration;
 

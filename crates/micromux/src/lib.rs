@@ -54,19 +54,20 @@ pub use tokio_util::sync::CancellationToken;
 
 pub use cleanup::{CleanupWaitCancelled, cleanup_state_directory, wait_for_previous_cleanups};
 pub use config::{
-    ConfigError, ConfigFile, ControlConfig, DynamicServicesPolicy, MAX_CONFIG_FILE_BYTES,
-    config_file_names, find_config_file, from_str, read_config_file, read_config_file_async,
+    ConfigError, ConfigFile, ControlConfig, DependencyCondition, DynamicServicesPolicy,
+    MAX_CONFIG_FILE_BYTES, config_file_names, find_config_file, from_str, read_config_file,
+    read_config_file_async,
 };
 pub use diagnostics::{Printer, ToDiagnostics, render_to_string};
 pub use env::{Error as EnvironmentError, InterpolationError};
 pub use graph::Error as GraphError;
 pub use health_check::Health;
 pub use model::{
-    ChangeKind, CleanupStatus, Desired, DiskLogRetention, DynamicServiceInfo, EVENT_HISTORY,
-    Execution, HealthAttempt, HealthLine, HealthResult, HealthcheckConfig, LogLimit, LogLine,
-    LogRetention, LogRun, LogRunReadError, LogRunSummary, MemoryLogRetention, OriginKind,
-    RestartState, RetiredReason, ServiceEvent, ServiceEventKind, ServiceSnapshot, SessionChange,
-    SessionModelReader, trim_to_last_bytes,
+    ChangeKind, CleanupStatus, DependencyFailure, DependencyFailureReason, Desired,
+    DiskLogRetention, DynamicServiceInfo, EVENT_HISTORY, Execution, HealthAttempt, HealthLine,
+    HealthResult, HealthcheckConfig, LogLimit, LogLine, LogRetention, LogRun, LogRunReadError,
+    LogRunSummary, MemoryLogRetention, OriginKind, RestartState, RetiredReason, ServiceEvent,
+    ServiceEventKind, ServiceSnapshot, SessionChange, SessionModelReader, trim_to_last_bytes,
 };
 pub use scheduler::{
     Command, CommandRejection, DynamicServiceAck, DynamicServiceResult, MAX_PTY_INPUT_BATCH_BYTES,

@@ -59,6 +59,7 @@ futures.workspace = true
 
 # parse cli arguments
 clap = { version = "4", features = ["derive", "env"] }
+humantime = "2"
 
 [target.'cfg(unix)'.dependencies]
 rustix = { workspace = true, features = ["process"] }

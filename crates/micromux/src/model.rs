@@ -24,6 +24,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
+use crate::config::DependencyCondition;
 use crate::health_check::Health;
 use crate::scheduler::{LogUpdateKind, OutputStream, ServiceID};
 use crate::service::RestartPolicy;
@@ -105,6 +106,82 @@ pub enum RetiredReason {
     /// A newer peer sent a retirement reason this binary does not know yet.
     #[serde(other)]
     Unknown,
+}
+
+/// Why a dependency cannot meet its condition until someone intervenes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub enum DependencyFailureReason {
+    /// It exited and its restart policy will not start it again.
+    Exited,
+    /// It is disabled.
+    Disabled,
+    /// It was retired: stopped, expired, or removed from the configuration.
+    Retired,
+    /// It is not part of the session.
+    Missing,
+    /// A newer peer sent a reason this binary does not know yet.
+    #[serde(other)]
+    Unknown,
+}
+
+/// A dependency, direct or transitive, that holds a blocked service back for good.
+///
+/// The scheduler sets it on a blocked service whose dependency cannot meet its condition without
+/// an intervention such as a restart or an enable, so a wait on the service can fail at once
+/// instead of running into its timeout.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct DependencyFailure {
+    /// The dependency that cannot meet its condition.
+    pub service: ServiceID,
+    /// The condition its dependent waits for.
+    pub condition: DependencyCondition,
+    /// Why the condition cannot be met.
+    pub reason: DependencyFailureReason,
+    /// Exit code of the dependency's most recent run, if it ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    /// The blocked dependencies in between, starting with the blocked service's direct
+    /// dependency; empty when `service` is itself a direct dependency.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub via: Vec<ServiceID>,
+}
+
+impl DependencyFailure {
+    /// Describe the failure in one sentence, such as "dependency `seed` exited with code 1 and
+    /// will not restart, so it cannot complete successfully".
+    #[must_use]
+    pub fn describe(&self) -> String {
+        let state = match (self.reason, self.exit_code) {
+            (DependencyFailureReason::Exited, Some(code)) => {
+                format!("exited with code {code} and will not restart")
+            }
+            (DependencyFailureReason::Exited, None) => "exited and will not restart".to_string(),
+            (DependencyFailureReason::Disabled, _) => "is disabled".to_string(),
+            (DependencyFailureReason::Retired, _) => "is retired".to_string(),
+            (DependencyFailureReason::Missing, _) => "is not part of the session".to_string(),
+            (DependencyFailureReason::Unknown, _) => "cannot meet its condition".to_string(),
+        };
+        let condition = match self.condition {
+            DependencyCondition::Started => "start",
+            DependencyCondition::Healthy => "become healthy",
+            DependencyCondition::CompletedSuccessfully => "complete successfully",
+        };
+        let via = if self.via.is_empty() {
+            String::new()
+        } else {
+            let chain = self
+                .via
+                .iter()
+                .map(|service| format!("`{service}`"))
+                .collect::<Vec<_>>()
+                .join(" -> ");
+            format!(" (through {chain})")
+        };
+        format!(
+            "dependency `{}`{via} {state}, so it cannot {condition}",
+            self.service
+        )
+    }
 }
 
 /// Public provenance and lifecycle metadata for a dynamic service.
@@ -259,6 +336,11 @@ pub struct ServiceSnapshot {
     /// How the most recent `cleanup` command ended, once one has run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_cleanup: Option<CleanupStatus>,
+    /// The dependency that keeps this blocked service from ever starting on its own, if any.
+    ///
+    /// Set only while `execution` is `Blocked`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dependency_failure: Option<DependencyFailure>,
 }
 
 /// How a service's most recent `cleanup` command ended.
@@ -316,6 +398,7 @@ impl ServiceSnapshot {
             restart_policy,
             log_display: LogDisplay::default(),
             last_cleanup: None,
+            dependency_failure: None,
         }
     }
 }
@@ -520,6 +603,7 @@ impl ServiceEvent {
             | ServiceEventKind::BackoffScheduled
             | ServiceEventKind::DependencyBlocked
             | ServiceEventKind::DependencyReady
+            | ServiceEventKind::DependencyFailed
             | ServiceEventKind::InputDropped
             | ServiceEventKind::Replaced
             | ServiceEventKind::Retired
@@ -586,6 +670,8 @@ pub enum ServiceEventKind {
     DependencyBlocked,
     /// Previously blocking dependencies became ready.
     DependencyReady,
+    /// A dependency can no longer meet its condition without an intervention.
+    DependencyFailed,
     /// Terminal input was discarded before reaching the service.
     InputDropped,
     /// A service was created or added to the live roster.

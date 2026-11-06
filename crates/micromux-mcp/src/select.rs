@@ -38,6 +38,14 @@ pub enum ToolError {
     /// The command is invalid in the service's current state.
     #[error("invalid state: {0}")]
     InvalidState(String),
+    /// The service is blocked behind a dependency that cannot meet its condition.
+    #[error("dependency failed: {message}")]
+    DependencyFailed {
+        /// What failed and how to resolve it.
+        message: String,
+        /// The failed dependency.
+        failure: Box<micromux::DependencyFailure>,
+    },
     /// The latest micromux config could not be reloaded before a command.
     #[error("config reload failed: {0}")]
     ConfigReload(String),

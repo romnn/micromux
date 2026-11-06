@@ -234,6 +234,28 @@ pub enum CtlAction {
         #[arg(long)]
         history: bool,
     },
+    /// Wait until a service is healthy, or until its run exits with `--exit`.
+    ///
+    /// Exits 0 once the condition holds (with `--exit`, once the run exits with status 0), 3 when
+    /// the run exited instead (with `--exit`, with a non-zero status), 4 when the service is
+    /// blocked behind a dependency that can no longer meet its condition, 5 when the service is
+    /// disabled or retired, and 124 when the timeout elapses.
+    Wait {
+        /// The service to wait for.
+        service: String,
+        /// Wait until the service is up, and healthy if it has a healthcheck (the default).
+        #[arg(long, conflicts_with = "exit")]
+        healthy: bool,
+        /// Wait until the service's run exits, as a one-shot job does.
+        #[arg(long)]
+        exit: bool,
+        /// Give up after this long, such as `90s` or `5m`.
+        #[arg(long, default_value = "60s", value_parser = humantime::parse_duration)]
+        timeout: std::time::Duration,
+        /// Accept only a run newer than this generation, such as the one `restart` printed.
+        #[arg(long)]
+        after_generation: Option<u64>,
+    },
     /// Show the session identity.
     Describe,
     /// Stop the session: stop all services and exit, freeing its ports.

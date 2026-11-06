@@ -4,8 +4,9 @@ use std::net::{Ipv4Addr, SocketAddrV4};
 use std::time::Duration;
 
 use micromux::{
-    ChangeKind, Execution, Health, HealthAttempt, ServiceEvent, ServiceSnapshot, SessionChange,
+    DependencyFailure, Execution, Health, HealthAttempt, ServiceEvent, ServiceSnapshot,
 };
+use micromux_control::wait::{self, ChangeWaker, WaitFor, WaitVerdict};
 use micromux_control::{Client, ControlEndpoint, ErrorCode, Request};
 use schemars::JsonSchema;
 use serde::Serialize;
@@ -53,12 +54,6 @@ pub(crate) enum WaitConclusion {
         snapshot: ServiceSnapshot,
         latest_healthcheck: Option<HealthAttempt>,
     },
-}
-
-enum HealthVerdict {
-    Healthy,
-    Exited,
-    InvalidState,
 }
 
 impl WaitConclusion {
@@ -461,8 +456,6 @@ pub(crate) enum SnapshotWait<V> {
 
 /// Wait for a service snapshot accepted by a caller-defined classifier.
 ///
-/// Subscription notifications are best-effort wakeups; polling remains the lossless fallback.
-///
 /// # Errors
 ///
 /// Returns a [`ToolError`] when the service snapshot cannot be fetched.
@@ -474,53 +467,37 @@ pub(crate) async fn wait_for_snapshot<V>(
     classify: impl Fn(&ServiceSnapshot) -> Option<V>,
 ) -> Result<SnapshotWait<V>, ToolError> {
     let deadline = tokio::time::Instant::now() + timeout;
-    // Best-effort wakeup; `None` (subscribe failed or stream ended) degrades to pure polling.
-    let mut subscription = Client::subscribe(endpoint).await.ok();
-
+    let mut waker = ChangeWaker::subscribe(endpoint, service, WAIT_POLL_FLOOR).await;
     loop {
         let snapshot = service_snapshot(conn, service).await?;
         if let Some(verdict) = classify(&snapshot) {
             return Ok(SnapshotWait::Matched { snapshot, verdict });
         }
-
-        let now = tokio::time::Instant::now();
-        if now >= deadline {
+        if tokio::time::Instant::now() >= deadline {
             return Ok(SnapshotWait::Timeout(snapshot));
         }
-        let wait = deadline.saturating_duration_since(now).min(WAIT_POLL_FLOOR);
+        waker.sleep(deadline).await;
+    }
+}
 
-        // Wake on a relevant change (this service, or a session-wide invalidation synthesized
-        // after broadcast loss; ignore log appends, which don't affect snapshots), but never wait
-        // longer than the poll floor before re-polling. Drop the subscription if its stream ends —
-        // polling still converges.
-        let drop_subscription = if let Some(stream) = subscription.as_mut() {
-            let relevant = tokio::time::timeout(wait, async {
-                loop {
-                    match stream.recv().await {
-                        Ok(Some(change))
-                            if (change.service_id == service
-                                || change.service_id == SessionChange::SESSION_WIDE)
-                                && !matches!(
-                                    change.kind,
-                                    ChangeKind::Logs | ChangeKind::Heartbeat
-                                ) =>
-                        {
-                            return true;
-                        }
-                        Ok(Some(_)) => {}
-                        Ok(None) | Err(_) => return false,
-                    }
-                }
-            })
-            .await;
-            matches!(relevant, Ok(false))
-        } else {
-            tokio::time::sleep(wait).await;
-            false
-        };
-        if drop_subscription {
-            subscription = None;
-        }
+/// The error for a wait that can never be satisfied: the service is disabled or retired, or
+/// blocked behind a dependency that cannot meet its condition.
+pub(crate) fn unavailable_error(
+    service: &str,
+    snapshot: &ServiceSnapshot,
+    disabled_message: impl FnOnce() -> String,
+) -> ToolError {
+    ToolError::InvalidState(match snapshot.retired {
+        Some(reason) => retired_service_message(service, reason),
+        None => disabled_message(),
+    })
+}
+
+/// The error for a wait on a service blocked behind a dependency that cannot meet its condition.
+pub(crate) fn dependency_failed_error(service: &str, failure: DependencyFailure) -> ToolError {
+    ToolError::DependencyFailed {
+        message: wait::dependency_failure_message(service, &failure),
+        failure: Box::new(failure),
     }
 }
 
@@ -531,38 +508,21 @@ pub(crate) async fn wait_for_health(
     after_generation: Option<u64>,
     timeout: Duration,
 ) -> Result<WaitConclusion, ToolError> {
-    match wait_for_snapshot(
-        endpoint,
-        conn,
-        service,
-        timeout,
-        |snapshot| match convert::evaluate(snapshot, after_generation) {
-            convert::WaitOutcome::Pending => None,
-            convert::WaitOutcome::Healthy => Some(HealthVerdict::Healthy),
-            convert::WaitOutcome::Exited(_) => Some(HealthVerdict::Exited),
-            convert::WaitOutcome::InvalidState => Some(HealthVerdict::InvalidState),
+    let waited = wait_for_snapshot(endpoint, conn, service, timeout, |snapshot| {
+        wait::evaluate(snapshot, WaitFor::Healthy, after_generation)
+    })
+    .await?;
+    match waited {
+        SnapshotWait::Matched { snapshot, verdict } => match verdict {
+            WaitVerdict::Healthy => Ok(WaitConclusion::Healthy(snapshot)),
+            WaitVerdict::Exited(_) => Ok(WaitConclusion::Exited(snapshot)),
+            WaitVerdict::Unavailable => Err(unavailable_error(service, &snapshot, || {
+                format!("service `{service}` is disabled and will not become healthy")
+            })),
+            WaitVerdict::DependencyFailed(failure) => {
+                Err(dependency_failed_error(service, failure))
+            }
         },
-    )
-    .await?
-    {
-        SnapshotWait::Matched {
-            snapshot,
-            verdict: HealthVerdict::Healthy,
-        } => Ok(WaitConclusion::Healthy(snapshot)),
-        SnapshotWait::Matched {
-            snapshot,
-            verdict: HealthVerdict::Exited,
-        } => Ok(WaitConclusion::Exited(snapshot)),
-        SnapshotWait::Matched {
-            snapshot,
-            verdict: HealthVerdict::InvalidState,
-        } => {
-            let message = match snapshot.retired {
-                Some(reason) => retired_service_message(service, reason),
-                None => format!("service `{service}` is disabled and will not become healthy"),
-            };
-            Err(ToolError::InvalidState(message))
-        }
         SnapshotWait::Timeout(snapshot) => {
             let latest_healthcheck = latest_health_for_snapshot(conn, &snapshot)
                 .await

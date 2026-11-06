@@ -5,9 +5,9 @@ use crate::{
     graph::ServiceGraph,
     health_check::Health,
     model::{
-        CleanupStatus, Desired, DynamicServiceInfo, Execution, HealthcheckConfig, LogRetention,
-        OriginKind, RestartState, RetiredReason, ServiceEvent, ServiceEventKind, ServiceSnapshot,
-        SessionModelWriter,
+        CleanupStatus, DependencyFailure, Desired, DynamicServiceInfo, Execution,
+        HealthcheckConfig, LogRetention, OriginKind, RestartState, RetiredReason, ServiceEvent,
+        ServiceEventKind, ServiceSnapshot, SessionModelWriter,
     },
     service::{self, Service, StartupMode},
 };
@@ -299,6 +299,10 @@ pub(super) struct ServiceRuntime {
     /// start. Non-empty exactly while the service is held back by them, so the projection can report
     /// a blocked service as such instead of leaving it at its pre-start state.
     blocked_on: Vec<ServiceID>,
+    /// The blocker among `blocked_on`, possibly reached through further blocked services, that
+    /// cannot meet its condition without an intervention. `Some` only while `blocked_on` is not
+    /// empty.
+    dependency_failure: Option<DependencyFailure>,
     input_drops: InputDropThrottle,
 }
 
@@ -400,6 +404,7 @@ impl ServiceRuntime {
             retired_at_unix_ms: None,
             expires_at: None,
             blocked_on: Vec::new(),
+            dependency_failure: None,
             input_drops: InputDropThrottle::default(),
         }
     }
@@ -708,6 +713,11 @@ pub(super) fn project_snapshot(
         restart_policy: service.spec.restart.clone(),
         log_display: service.log_display.clone(),
         last_cleanup: runtime.last_cleanup.clone(),
+        dependency_failure: if execution == Execution::Blocked {
+            runtime.dependency_failure.clone()
+        } else {
+            None
+        },
     };
     (snapshot, runtime.uptime_started_at)
 }
@@ -1033,6 +1043,31 @@ impl SchedulerRuntime {
             (services.get(service_id), self.services.get(service_id))
         {
             sync_model(&self.writer, service, runtime);
+        }
+    }
+
+    /// Forget recorded dependency failures that the command just handled resolved, for example by
+    /// restarting or enabling the failed dependency.
+    ///
+    /// The command is acknowledged before the next scheduling pass re-records blocks, so without
+    /// this a caller that waits on a dependent right after the acknowledgement could still read
+    /// the failure and give up on a dependency that is already starting again.
+    fn clear_resolved_dependency_failures(&mut self, services: &ServiceMap) {
+        let resolved = services
+            .values()
+            .filter(|service| {
+                self.services
+                    .get(&service.id)
+                    .is_some_and(|runtime| runtime.dependency_failure.is_some())
+                    && schedule::dependency_failure(services, &self.services, service).is_none()
+            })
+            .map(|service| service.id.clone())
+            .collect::<Vec<_>>();
+        for service_id in resolved {
+            if let Some(runtime) = self.services.get_mut(&service_id) {
+                runtime.dependency_failure = None;
+            }
+            self.sync(services, &service_id);
         }
     }
 
@@ -2486,16 +2521,19 @@ impl SchedulerRuntime {
         match command {
             Command::Restart { service, ack } => {
                 let result = self.apply_restart(services, events_rx, &service).await;
+                self.clear_resolved_dependency_failures(services);
                 Self::reply(ack, result);
                 true
             }
             Command::Enable { service, ack } => {
                 let result = self.apply_enable(services, events_rx, &service).await;
+                self.clear_resolved_dependency_failures(services);
                 Self::reply(ack, result);
                 true
             }
             Command::RestartAll { ack } => {
                 let result = self.apply_restart_all(services, events_rx).await;
+                self.clear_resolved_dependency_failures(services);
                 Self::reply(ack, result);
                 true
             }
@@ -2510,6 +2548,7 @@ impl SchedulerRuntime {
             }
             Command::ReconcileConfig { dry_run, ack } => {
                 let result = self.reconcile_config(services, events_rx, dry_run).await;
+                self.clear_resolved_dependency_failures(services);
                 ack.send(result);
                 true
             }
@@ -2525,6 +2564,7 @@ impl SchedulerRuntime {
                 ack,
             } => {
                 let result = self.replace_dynamic(services, &service, expected_revision, params);
+                self.clear_resolved_dependency_failures(services);
                 Self::reply_dynamic(ack, result);
                 true
             }
