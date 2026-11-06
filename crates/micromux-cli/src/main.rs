@@ -188,6 +188,19 @@ fn build_supervisor(
     Err(Error::DiagnosticsEmitted)
 }
 
+/// The executable that runs the containment shim: this very binary.
+///
+/// On Linux `/proc/self/exe`, resolved by each child before it execs, names the running image
+/// even after the installed binary was moved or replaced by an upgrade, so a long-running
+/// session keeps starting the shim it was built with.
+fn shim_executable() -> Result<std::path::PathBuf, Error> {
+    if cfg!(target_os = "linux") {
+        Ok(std::path::PathBuf::from("/proc/self/exe"))
+    } else {
+        Ok(std::env::current_exe()?)
+    }
+}
+
 /// A supervisor whose session is established and whose routes are registered, ready to start
 /// services.
 struct Supervisor {
@@ -203,6 +216,9 @@ async fn start_supervisor(
     printer: &DiagnosticsPrinter,
     shutdown: &micromux::CancellationToken,
 ) -> Result<Supervisor, Error> {
+    // Every service and healthcheck runs under the containment shim, so their process trees die
+    // with this supervisor even when it is SIGKILLed.
+    micromux::containment::enable(shim_executable()?);
     let mut session = micromux::Session::establish(config, &micromux::PortRegistry::user())?;
     proxy::latch_port(&mut session).await?;
     let mux = build_supervisor(config, printer, session)?;
@@ -451,8 +467,17 @@ async fn run_headless(options: options::Options) -> Result<(), Error> {
     Ok(())
 }
 
-#[tokio::main]
-async fn main() -> color_eyre::Result<()> {
+fn main() -> color_eyre::Result<()> {
+    // The containment shim wraps every service and healthcheck command, so it starts before any
+    // runtime, logging, or argument parsing: one small single-threaded process per command.
+    let mut args = std::env::args_os();
+    if args.nth(1).as_deref() == Some(std::ffi::OsStr::new(micromux::containment::SHIM_COMMAND)) {
+        std::process::exit(micromux::containment::run_shim(args));
+    }
+    tokio::runtime::Runtime::new()?.block_on(async_main())
+}
+
+async fn async_main() -> color_eyre::Result<()> {
     color_eyre::install()?;
     raise_file_descriptor_limit();
     match run().await {

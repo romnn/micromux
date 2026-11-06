@@ -1564,6 +1564,7 @@ dependencies = [
  "sha2 0.11.0",
  "shellexpand",
  "shlex",
+ "signal-hook 0.4.4",
  "similar-asserts",
  "strum",
  "tempfile",
@@ -1589,8 +1590,10 @@ dependencies = [
  "micromux-mcp",
  "micromux-proxy",
  "micromux-tui",
+ "nix 0.31.3",
  "rustix",
  "similar-asserts",
+ "tempfile",
  "termcolor",
  "thiserror 2.0.20",
  "tokio",
@@ -2707,6 +2710,7 @@ version = "0.4.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b2a0c28ca5908dbdbcd52e6fdaa00358ab88637f8ab33e1f188dd510eb44b53d"
 dependencies = [
+ "cc",
  "libc",
  "signal-hook-registry",
 ]

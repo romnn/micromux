@@ -105,6 +105,7 @@ mod tests {
                 sink,
                 shutdown,
                 terminate,
+                stop: crate::containment::StopPolicy::default(),
             },
         )
         .await;
@@ -164,6 +165,7 @@ mod tests {
                         sink,
                         shutdown,
                         terminate,
+                        stop: crate::containment::StopPolicy::default(),
                     },
                 )
                 .await
@@ -231,6 +233,7 @@ mod tests {
                     sink,
                     shutdown,
                     terminate,
+                    stop: crate::containment::StopPolicy::default(),
                 },
             ),
         )
@@ -338,6 +341,7 @@ mod tests {
                         events_tx,
                         shutdown,
                         terminate,
+                        stop: crate::containment::StopPolicy::default(),
                     },
                 )
                 .await;
@@ -395,6 +399,8 @@ struct RunParams<'a> {
     pub sink: RunSink,
     pub shutdown: CancellationToken,
     pub terminate: CancellationToken,
+    /// How a containment shim stops the probe's processes if the supervisor dies mid-probe.
+    pub stop: crate::containment::StopPolicy,
 }
 
 pub(crate) struct RunLoopParams {
@@ -406,6 +412,8 @@ pub(crate) struct RunLoopParams {
     pub events_tx: mpsc::Sender<ProcessEvent>,
     pub shutdown: CancellationToken,
     pub terminate: CancellationToken,
+    /// The owning service's stop policy, which the probe's containment shim applies.
+    pub stop: crate::containment::StopPolicy,
 }
 
 enum Completion {
@@ -538,6 +546,7 @@ pub async fn run_loop(health_check: crate::HealthcheckSpec, params: RunLoopParam
                 sink: params.sink.clone(),
                 shutdown: params.shutdown.clone(),
                 terminate: params.terminate.clone(),
+                stop: params.stop,
             },
         )
         .await;
@@ -877,10 +886,45 @@ async fn run(
 
     params.sink.start_health_attempt(attempt, command.clone());
 
-    let mut cmd = Command::new(prog);
-    cmd.args(args)
-        .envs(params.environment.iter())
+    // Under containment a shim starts the probe, so a probe still running when the supervisor
+    // dies is cleaned up too.
+    let path = params
+        .environment
+        .get("PATH")
+        .map(std::ffi::OsString::from)
+        .or_else(|| std::env::var_os("PATH"));
+    // Without a working directory the probe runs in the supervisor's, which `.` names.
+    let cwd = params.working_dir.unwrap_or(std::path::Path::new("."));
+    let wrapped = crate::containment::wrap(
+        std::path::Path::new(prog),
+        args,
+        params.stop,
+        path.as_deref(),
+        cwd,
+    );
+    let wrapped = match wrapped {
+        Ok(wrapped) => wrapped,
+        Err(source) => {
+            emit_spawn_failed(&params.sink, attempt, &source);
+            return Err(Error {
+                command,
+                source: ErrorReason::Spawn(source),
+            });
+        }
+    };
+    let (mut cmd, carriers) = if let Some(wrapped) = wrapped {
+        let mut cmd = Command::new(wrapped.program);
+        cmd.args(wrapped.args);
+        (cmd, wrapped.env)
+    } else {
+        let mut cmd = Command::new(prog);
+        cmd.args(args);
+        (cmd, Vec::new())
+    };
+    cmd.envs(params.environment.iter())
+        .envs(carriers)
         .kill_on_drop(true)
+        .stdin(Stdio::null())
         .stderr(Stdio::piped())
         .stdout(Stdio::piped());
     #[cfg(unix)]

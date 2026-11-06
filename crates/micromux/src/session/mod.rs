@@ -429,7 +429,7 @@ pub(crate) struct SessionContext {
     pub(crate) lease: Option<Lease>,
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 impl SessionContext {
     /// A session that injects nothing, matching services materialized without a session.
     pub(crate) fn unconfigured() -> Self {
