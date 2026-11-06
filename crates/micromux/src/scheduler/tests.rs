@@ -5199,3 +5199,43 @@ async fn slow_cleanups_do_not_make_crash_loops_look_stable() -> eyre::Result<()>
     assert!(stable.will_auto_restart(&policy, 1));
     Ok(())
 }
+
+/// A dynamic service cloned from a configured one never runs the original's cleanup, which would
+/// tear down what the original still uses.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dynamic_clones_do_not_inherit_the_cleanup() -> eyre::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let state = tempfile::tempdir()?;
+    let service = service_with_cleanup(
+        dir.path(),
+        "exec sleep 60",
+        "touch cleaned",
+        Duration::from_secs(30),
+        state.path(),
+    )?;
+    let mut services = ServiceMap::new();
+    services.insert("svc".to_string(), service);
+    let harness = spawn_harness_with_policy(
+        services,
+        None,
+        dir.path().to_path_buf(),
+        enabled_dynamic_policy(dir.path())?,
+    );
+    let mut params = dynamic_params("clone", &["sh", "-c", "exec sleep 60"]);
+    params.from_service = Some("svc".to_string());
+
+    dynamic_accepted(harness.control.start_dynamic(params).await)?;
+    wait_until(&harness.reader, "clone", |snapshot| {
+        snapshot.execution == Execution::Running
+    })
+    .await?;
+    dynamic_accepted(harness.control.stop_dynamic(&"clone".to_string()).await)?;
+    let stopped = wait_until(&harness.reader, "clone", |snapshot| {
+        snapshot.execution == Execution::Exited
+    })
+    .await?;
+
+    assert_eq!(stopped.last_cleanup, None);
+    assert!(!dir.path().join("cleaned").exists());
+    Ok(())
+}
