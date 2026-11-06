@@ -70,6 +70,12 @@ const KNOWN_CONFIG_KEYS: &[&str] = &[
     "services",
 ];
 
+/// Most `allocate_ports` names or `routes` one session may list.
+///
+/// Together with the length limits on names and hosts, this keeps a session's description within
+/// one control-protocol frame, so the session stays discoverable.
+const MAX_SESSION_ENTRIES: usize = 256;
+
 /// Warn (or, in strict mode, error) about mapping keys that the parser does not recognize.
 fn warn_unknown_keys<F: Copy>(
     mapping: &Mapping,
@@ -1422,6 +1428,12 @@ fn parse_session<F: Copy>(
             names,
             Some("allocate_ports must be a list of environment variable names"),
         )?;
+        if names.len() > MAX_SESSION_ENTRIES {
+            return Err(ConfigError::InvalidValue {
+                message: format!("allocate_ports lists more than {MAX_SESSION_ENTRIES} names"),
+                span: value.span().into(),
+            });
+        }
         for name in names {
             let name = parse::<String>(name)?;
             if let Some(problem) = crate::session::allocation_name_problem(&name) {
@@ -1459,6 +1471,12 @@ fn parse_routes<F: Copy>(
         return Ok(Vec::new());
     };
     let entries = expect_sequence(routes_value, Some("routes must be a list of {host, port}"))?;
+    if entries.len() > MAX_SESSION_ENTRIES {
+        return Err(ConfigError::InvalidValue {
+            message: format!("routes lists more than {MAX_SESSION_ENTRIES} entries"),
+            span: routes_value.span().into(),
+        });
+    }
     if cfg!(windows) && !entries.is_empty() {
         return Err(ConfigError::InvalidValue {
             message: "routes are not supported on Windows, which has no micromux proxy".to_string(),
@@ -2727,6 +2745,7 @@ mod tests {
     /// instead of being rewritten silently.
     #[test]
     fn rejects_invalid_session_settings() {
+        let long_name = format!("allocate_ports: [{}]", "P".repeat(129));
         for (yaml, expected) in [
             (
                 "session: { name: Luup_2 }",
@@ -2749,6 +2768,7 @@ mod tests {
                 "sets this variable on every service",
             ),
             ("allocate_ports: [PORT, port]", "more than once"),
+            (&long_name, "longer than 128 characters"),
         ] {
             let yaml = format!("version: 1\n{yaml}\nservices:\n  app:\n    command: [\"true\"]\n");
             let mut diagnostics = Vec::new();

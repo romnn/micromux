@@ -8,6 +8,7 @@
 
 mod registry;
 mod routes;
+mod status;
 
 use std::path::{Path, PathBuf};
 
@@ -19,6 +20,7 @@ pub use registry::PortRegistry;
 pub(crate) use registry::{Lease, PORT_RANGE};
 pub(crate) use routes::resolve as resolve_routes;
 pub use routes::{CATCH_ALL_HOST, Route, RouteError};
+pub use status::{RoutingStatus, SessionStatus, SessionSummary};
 
 /// Parent domain of every session when the config does not name one.
 pub const DEFAULT_DOMAIN: &str = "localhost";
@@ -43,6 +45,9 @@ pub const PROXY_PORT_VARIABLE: &str = "MICROMUX_PROXY_PORT";
 
 /// Environment variable carrying what follows `<route>.` in a browser URL.
 pub const HOST_SUFFIX_VARIABLE: &str = "MICROMUX_HOST_SUFFIX";
+
+/// Longest `allocate_ports` name, which keeps a session's description small.
+const MAX_ALLOCATION_NAME_LEN: usize = 128;
 
 /// Variables micromux sets on every spawned service itself, which an allocation must not shadow.
 const SPAWN_OWNED_VARIABLES: &[&str] = &["TERM", "CLICOLOR", "CLICOLOR_FORCE", "FORCE_COLOR"];
@@ -500,6 +505,9 @@ pub fn allocation_name_problem(name: &str) -> Option<&'static str> {
         && bytes.all(|byte| byte == b'_' || byte.is_ascii_alphanumeric());
     if !valid {
         return Some("must be an environment variable name ([A-Za-z_][A-Za-z0-9_]*)");
+    }
+    if name.len() > MAX_ALLOCATION_NAME_LEN {
+        return Some("is longer than 128 characters");
     }
     if name.to_ascii_uppercase().starts_with("MICROMUX_") {
         return Some("the MICROMUX_ prefix is reserved for variables micromux injects");

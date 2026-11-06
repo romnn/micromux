@@ -78,6 +78,8 @@ pub struct App {
     source: SessionSource,
     /// Liveness-only change notifications; the TUI re-queries the model for content.
     changes: broadcast::Receiver<SessionChange>,
+    /// Changes to the local session's URLs and routing status, which the model does not carry.
+    summary_changes: Option<tokio::sync::watch::Receiver<micromux::SessionSummary>>,
     /// Event handler
     input_event_handler: event::InputHandler,
     /// Current state
@@ -117,6 +119,7 @@ impl App {
         log_view_options: LogViewOptions,
     ) -> Self {
         let changes = source.subscribe();
+        let summary_changes = source.summary_changes();
         let snapshots = source.services();
         let event_cursors = snapshots
             .iter()
@@ -142,6 +145,7 @@ impl App {
             shutdown,
             source,
             changes,
+            summary_changes,
             input_event_handler: event::InputHandler::new(),
             state: state::State::new(services),
             log_view,
@@ -395,6 +399,8 @@ impl App {
             /// The change broadcast lagged (or this is the initial draw): re-read everything.
             Resync,
             PendingInput,
+            /// The session's URLs or routing status changed; only the header needs a redraw.
+            Summary,
         }
 
         let area = terminal.size()?;
@@ -428,6 +434,15 @@ impl App {
                         std::future::pending::<()>().await;
                     }
                 } => Some(Wake::PendingInput),
+                () = async {
+                    let changed = match self.summary_changes.as_mut() {
+                        Some(summary) => summary.changed().await.is_ok(),
+                        None => false,
+                    };
+                    if !changed {
+                        std::future::pending::<()>().await;
+                    }
+                } => Some(Wake::Summary),
             };
 
             let mut needs_resync = false;
@@ -436,6 +451,7 @@ impl App {
                 Some(Wake::Change(change)) => needs_resync |= self.apply_change(&change),
                 Some(Wake::Resync) => needs_resync = true,
                 Some(Wake::PendingInput) => self.flush_pending_pty_input(),
+                Some(Wake::Summary) => {}
                 None => {
                     self.running = false;
                     continue;
@@ -1332,6 +1348,101 @@ mod tests {
 
         assert_eq!(column(&row(0), "micromux"), Some(1));
         assert_eq!(column(&row(1), "Services"), Some(1));
+        Ok(())
+    }
+
+    /// A session with routes shows its URLs under the status row, wrapped to the terminal width,
+    /// and says when the proxy does not serve them.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn header_shows_session_urls_and_routing_problems() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let yaml = indoc! {r#"
+            version: 1
+            session: { name: tui }
+            proxy: { port: 8080 }
+            routes:
+              - host: app
+                port: 9997
+              - host: api
+                port: 9998
+              - host: admin
+                port: 9999
+            services:
+              svc:
+                command: ["true"]
+        "#};
+        let config_path = directory.path().join("micromux.yaml");
+        std::fs::write(&config_path, yaml)?;
+        let mut parsed = micromux::from_str(yaml, directory.path(), 0usize, None, &mut Vec::new())?;
+        parsed.config_path = Some(config_path.canonicalize()?);
+        let registry = micromux::PortRegistry::at(directory.path().join("registry"));
+        let session = micromux::Session::establish(&parsed, &registry)?;
+        let mux = std::sync::Arc::new(micromux::Micromux::with_session(&parsed, session)?);
+        let (_runner, handles) = mux.start(micromux::CancellationToken::new());
+        let mut app = App::new(
+            SessionSource::Local(
+                LocalSource::new(handles.reader, handles.commands.clone())
+                    .with_session(handles.session.clone()),
+            ),
+            Some(handles.terminal),
+            micromux::CancellationToken::new(),
+            LogViewOptions::default(),
+        );
+        // The rows above the panes, joined.
+        let header = |app: &mut App, width: u16| {
+            let area = ratatui::layout::Rect::new(0, 0, width, 24);
+            let mut buffer = ratatui::buffer::Buffer::empty(area);
+            ratatui::widgets::Widget::render(&mut *app, area, &mut buffer);
+            (0..app.chrome_rows(width).header)
+                .map(|y| {
+                    (0..width)
+                        .filter_map(|x| buffer.cell((x, y)).map(ratatui::buffer::Cell::symbol))
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        // Every URL stays visible, also on a narrow terminal where they need several rows.
+        for width in [200, 60] {
+            let rows = header(&mut app, width);
+            for url in [
+                "http://app.tui.localhost:8080",
+                "http://api.tui.localhost:8080",
+                "http://admin.tui.localhost:8080",
+            ] {
+                assert!(rows.contains(url), "{width} columns:\n{rows}");
+            }
+            assert!(!rows.contains("unavailable"), "{rows}");
+        }
+
+        // Every URL starts its own row at the first column, so one that fits the terminal is
+        // never cut, even when it fills it exactly.
+        let exact = "http://admin.tui.localhost:8080".len();
+        let rows = header(&mut app, u16::try_from(exact)?);
+        assert!(
+            rows.lines()
+                .any(|row| row == "http://admin.tui.localhost:8080"),
+            "{rows}"
+        );
+
+        // A routing problem wakes the event loop and gets a row of its own.
+        let wake = app
+            .summary_changes
+            .clone()
+            .ok_or_else(|| eyre::eyre!("a local session with routes has no summary feed"))?;
+        handles
+            .session
+            .set_routing(micromux::RoutingStatus::Unavailable {
+                reason: "the proxy stopped answering".to_string(),
+            });
+        assert!(wake.has_changed()?);
+        let rows = header(&mut app, 80);
+        assert!(
+            rows.contains("routing unavailable: the proxy stopped answering"),
+            "{rows}"
+        );
         Ok(())
     }
 

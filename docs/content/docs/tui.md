@@ -17,7 +17,7 @@ Running `micromux` with no subcommand opens the TUI for the current project. It'
 
 ## Keybindings
 
-The header's right side lists the view keys, which change only what the panes show, with their current state. The footer lists the keys that move around and act on services. Both wrap onto extra rows when the terminal is too narrow.
+The header's right side lists the view keys, which change only what the panes show, with their current state. A session with [routes]({{< relref "configuration/sessions.md" >}}#hostnames) shows its browser URLs below the status row (up to three rows, then a count), and says so in red when the shared proxy does not serve them right now. The footer lists the keys that move around and act on services. Both wrap onto extra rows when the terminal is too narrow.
 
 | Key | Action |
 |---|---|

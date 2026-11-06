@@ -1102,6 +1102,9 @@ impl Widget for &mut App {
     }
 }
 
+/// Most header rows the session's URLs take, so the panes keep their room.
+const MAX_URL_ROWS: usize = 3;
+
 impl App {
     const HEADER_COLOR: Color = tailwind::YELLOW.c500;
     const HIGHLIGHT_COLOR: Color = tailwind::GRAY.c900;
@@ -1153,12 +1156,14 @@ impl App {
         status
     }
 
-    /// The header rows at `width`: the session status with the view controls beside it.
+    /// The header rows at `width`: the session status with the view controls beside it, then the
+    /// session's URLs when it has routes.
     ///
     /// When the controls do not fit beside the status, they wrap onto right-aligned rows below
     /// it, so warnings and attach state always keep the first row.
     pub(crate) fn header_lines(&self, width: u16) -> Vec<Line<'static>> {
         let width = usize::from(width);
+        let urls = self.urls_lines();
         let status = self.status_line();
         let mut controls = pack_key_hints(&self.view_key_hints(), width);
         if let [single_row] = controls.as_mut_slice()
@@ -1168,11 +1173,56 @@ impl App {
             let mut spans = status.spans;
             spans.push(" ".repeat(gap).into());
             spans.append(&mut single_row.spans);
-            return vec![Line::from(spans)];
+            return std::iter::once(Line::from(spans)).chain(urls).collect();
         }
         std::iter::once(status)
+            .chain(urls)
             .chain(controls.into_iter().map(Line::right_aligned))
             .collect()
+    }
+
+    /// The session's browser URLs, one per row and starting at the first column so every URL that
+    /// fits the terminal is shown whole, followed by why the proxy does not serve them right now.
+    ///
+    /// At most [`MAX_URL_ROWS`] rows go to URLs; beyond that the last row counts the rest instead
+    /// of crowding out the panes.
+    fn urls_lines(&self) -> Vec<Line<'static>> {
+        let Some(session) = self.source.session_summary() else {
+            return Vec::new();
+        };
+        let shown = if session.routes.len() > MAX_URL_ROWS {
+            MAX_URL_ROWS - 1
+        } else {
+            session.routes.len()
+        };
+        let mut lines = session
+            .routes
+            .iter()
+            .take(shown)
+            .map(|route| {
+                Line::from(
+                    route
+                        .url
+                        .trim_end_matches('/')
+                        .to_string()
+                        .fg(tailwind::CYAN.c400),
+                )
+            })
+            .collect::<Vec<_>>();
+        let hidden = session.routes.len() - shown;
+        if hidden > 0 {
+            lines.push(Line::from(
+                format!("+{hidden} more: micromux ctl describe").fg(tailwind::GRAY.c400),
+            ));
+        }
+        if !session.routes.is_empty()
+            && let Some(micromux::RoutingStatus::Unavailable { reason }) = &session.routing
+        {
+            lines.push(Line::from(
+                format!("routing unavailable: {reason}").fg(tailwind::RED.c400),
+            ));
+        }
+        lines
     }
 
     /// The footer rows at `width`, wrapping whole key hints onto further rows as needed.

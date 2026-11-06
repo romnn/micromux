@@ -79,6 +79,35 @@ fn service_retired_label(service: &micromux::ServiceSnapshot) -> String {
     }
 }
 
+/// Prints the session's hostnames and allocated ports.
+fn print_session(session: &micromux::SessionSummary) {
+    println!("  session: {}", session.name);
+    if !session.routes.is_empty() {
+        let routing = match &session.routing {
+            Some(micromux::RoutingStatus::Unavailable { reason }) => {
+                format!(" (unavailable: {reason})")
+            }
+            Some(micromux::RoutingStatus::Pending) => " (not registered yet)".to_string(),
+            Some(micromux::RoutingStatus::Registered) | None => String::new(),
+        };
+        println!("  urls:{routing}");
+        for route in &session.routes {
+            let service = route
+                .service
+                .as_deref()
+                .map(|service| format!(" ({service})"))
+                .unwrap_or_default();
+            println!("    - {} -> 127.0.0.1:{}{service}", route.url, route.port);
+        }
+    }
+    if !session.allocated_ports.is_empty() {
+        println!("  ports:");
+        for (name, port) in &session.allocated_ports {
+            println!("    - {name}={port}");
+        }
+    }
+}
+
 fn print_services(services: &[micromux::ServiceSnapshot]) {
     for service in services {
         let health = service
@@ -167,6 +196,9 @@ fn print_response(response: &Response) -> Result<(), crate::Error> {
             println!("  config:  {}", info.config_path);
             println!("  cwd:     {}", info.working_dir);
             println!("  version: {}", info.micromux_version);
+            if let Some(session) = &info.session {
+                print_session(session);
+            }
             println!("  services:");
             for service in &info.services {
                 println!("    - {} ({})", service.name, service.id);

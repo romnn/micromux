@@ -321,11 +321,11 @@ async fn run() -> Result<(), Error> {
 
     let LoadedConfig { config, printer } = load_config(&options, color_choice).await?;
 
-    let Supervisor {
-        mux,
-        routes: _routes,
-    } = start_supervisor(&config, &printer, &shutdown).await?;
+    let Supervisor { mux, routes } = start_supervisor(&config, &printer, &shutdown).await?;
     let (runner, handles) = mux.clone().start(shutdown.clone());
+    if let Some(routes) = &routes {
+        routes.report_to(handles.session.clone(), shutdown.clone());
+    }
 
     // Default-on control plane, opt out via `--no-control` or `control: { enabled: false }`.
     let mut control_warning = None;
@@ -366,7 +366,8 @@ async fn run() -> Result<(), Error> {
 
     let input = handles.terminal.clone();
     let mut source =
-        micromux_tui::LocalSource::new(handles.reader.clone(), handles.commands.clone());
+        micromux_tui::LocalSource::new(handles.reader.clone(), handles.commands.clone())
+            .with_session(handles.session.clone());
     if let Some(warning) = control_warning {
         source = source.with_notice(warning);
     }
@@ -418,11 +419,11 @@ async fn run_headless(options: options::Options) -> Result<(), Error> {
     let color_choice = options.color_choice.unwrap_or(termcolor::ColorChoice::Auto);
     let LoadedConfig { config, printer } = load_config(&options, color_choice).await?;
 
-    let Supervisor {
-        mux,
-        routes: _routes,
-    } = start_supervisor(&config, &printer, &shutdown).await?;
+    let Supervisor { mux, routes } = start_supervisor(&config, &printer, &shutdown).await?;
     let (runner, handles) = mux.clone().start(shutdown.clone());
+    if let Some(routes) = &routes {
+        routes.report_to(handles.session.clone(), shutdown.clone());
+    }
 
     // The control plane is the only way to reach a headless session, so it is mandatory here — the
     // `--no-control` / `control.enabled` opt-out applies to the TUI, not to `serve`.

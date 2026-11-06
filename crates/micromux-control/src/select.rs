@@ -402,7 +402,14 @@ async fn resolve_name(
         dir_statuses,
         &format!("name `{name}`"),
         "use pid: or hash: to disambiguate",
-        |info| info.name == name,
+        // The routing name is what services see as `MICROMUX_SESSION`, so it selects too.
+        |info| {
+            info.name == name
+                || info
+                    .session
+                    .as_ref()
+                    .is_some_and(|session| session.name == name)
+        },
     )
     .await
 }

@@ -77,7 +77,8 @@ pub use service::{
     SkippedEnvFile, WorkingDirectoryError,
 };
 pub use session::{
-    PortRegistry, Route, RouteError, Session, SessionEnvironment, SessionError, SessionIdentity,
+    PortRegistry, Route, RouteError, RoutingStatus, Session, SessionEnvironment, SessionError,
+    SessionIdentity, SessionStatus, SessionSummary,
 };
 pub use spec::{
     DependencySpec, DynamicOrigin, DynamicServiceParams, HealthcheckSpec, Lease,
@@ -491,6 +492,8 @@ pub struct Handles {
     pub terminal: TerminalControl,
     /// Dynamic-service limits latched when the session started.
     pub dynamic_services: DynamicServicesPolicy,
+    /// The session's name, URLs, and allocated ports, with the live routing status.
+    pub session: SessionStatus,
 }
 
 impl Handles {
@@ -607,6 +610,23 @@ impl Micromux {
         &self.routes
     }
 
+    /// The session's name, URLs, and allocated ports as latched at startup.
+    ///
+    /// The routing status starts as [`RoutingStatus::Pending`] for a session with routes; a
+    /// running session reports updates through [`Handles::session`].
+    #[must_use]
+    pub fn session_summary(&self) -> SessionSummary {
+        SessionSummary {
+            name: self.session.identity.name.clone(),
+            domain: self.session.identity.session_domain(),
+            host_suffix: self.host_suffix(),
+            proxy_port: self.session.proxy_port,
+            routes: self.routes.clone(),
+            allocated_ports: self.session.ports.clone(),
+            routing: (!self.routes.is_empty()).then_some(RoutingStatus::Pending),
+        }
+    }
+
     /// The port the shared proxy listens on, as latched when the session was established.
     #[must_use]
     pub fn proxy_port(&self) -> u16 {
@@ -643,6 +663,7 @@ impl Micromux {
             commands: commands_tx,
             terminal,
             dynamic_services: self.dynamic_policy.clone(),
+            session: SessionStatus::new(self.session_summary()),
         };
 
         let runner = async move {

@@ -802,6 +802,10 @@ fn describe(server: &ControlServer) -> SessionInfo {
         services,
         services_truncated: false,
         micromux_version: server.identity.micromux_version.clone(),
+        session: server
+            .session
+            .as_ref()
+            .map(|status| Box::new(status.current())),
         capabilities: Some(crate::SessionCapabilities {
             dynamic_services,
             disk_log_reads: Some(log_reads::health()),
@@ -1408,6 +1412,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let info = SessionInfo {
+            session: None,
             protocol_version: PROTOCOL_VERSION,
             id: "session-id".to_string(),
             pid: 42,

@@ -25,7 +25,7 @@ micromux ctl restart-all
 micromux ctl enable worker            # enable (and start)
 micromux ctl disable worker
 micromux ctl health payments          # latest healthcheck attempt (--history for all)
-micromux ctl describe                 # session identity
+micromux ctl describe                 # session identity, browser URLs, allocated ports
 micromux ctl stop                     # stop the whole session, freeing its ports
 ```
 
@@ -66,4 +66,4 @@ Reconciliation **adds** newly-defined services, **retires** removed ones, and **
 
 ## Protocol compatibility
 
-Protocol 3 peers accept additive fields from newer minor revisions. Revision 3.8 changed transient disk-log rotation and reader saturation failures from `LimitExceeded` to the retryable `Busy` code. Revision 3.9 distinguishes an uninitialized disk-reader pool and reports reads that still occupy workers after their callers leave.
+Protocol 3 peers accept additive fields from newer minor revisions. Revision 3.8 changed transient disk-log rotation and reader saturation failures from `LimitExceeded` to the retryable `Busy` code. Revision 3.9 distinguishes an uninitialized disk-reader pool and reports reads that still occupy workers after their callers leave. Revision 3.11 adds `session` to the session description: its name, [browser URLs and allocated ports]({{< relref "../configuration/sessions.md" >}}), and whether the shared proxy serves its routes.

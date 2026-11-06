@@ -52,7 +52,7 @@ name: my-project
 
 The tools cover the full lifecycle:
 
-- **Discovery** — `list_sessions`, `list_services`, `find_service` (locate a service across every running session).
+- **Discovery** — `list_sessions`, `list_services`, `find_service` (locate a service across every running session), and `get_session_urls` (a session's browser URLs such as `http://app.luup2.localhost`, its [allocated ports]({{< relref "../configuration/sessions.md" >}}), and whether the proxy serves them).
 - **Logs** — `get_logs`, `follow_logs`, `follow_all_logs`, `list_log_runs`, with `grep`, time, trace-id, and — for JSON logs — structured `min_level` filters and a token-efficient `compact` format.
 - **Health & forensics** — `get_health`, `get_health_history`, `wait_for_healthy`, `get_service_events`, `diagnose` (a one-shot summary of exited or unhealthy services with likely-cause log lines).
 - **Mutations** — `restart_service`, `enable_service`, `disable_service`, `restart_all`; `restart_service`/`enable_service` return a run **generation** to pass to `wait_for_healthy(after_generation=…)` so you wait for the *new* run, not the old one.

@@ -64,12 +64,15 @@ fn build_session_yaml(dir: &Path, yaml: &str) -> eyre::Result<Session> {
     let endpoint = micromux_control::endpoint_for(dir, &config_path);
     let guard = bind(&endpoint)?.ok_or_else(|| eyre::eyre!("failed to acquire endpoint lock"))?;
     let identity = SessionIdentity::new("test".to_string(), dir, &config_path);
-    let server = Arc::new(ControlServer::new(
-        handles.reader.clone(),
-        handles.service_control(),
-        identity,
-        handles.dynamic_services.clone(),
-    ));
+    let server = Arc::new(
+        ControlServer::new(
+            handles.reader.clone(),
+            handles.service_control(),
+            identity,
+            handles.dynamic_services.clone(),
+        )
+        .with_session_status(handles.session.clone()),
+    );
     tokio::spawn({
         let shutdown = shutdown.clone();
         async move { server.serve(guard, shutdown).await }
@@ -81,6 +84,37 @@ fn build_session_yaml(dir: &Path, yaml: &str) -> eyre::Result<Session> {
         shutdown,
         _runner: runner,
     })
+}
+
+/// `Describe` reports the session's name and allocated ports, which MCP's `list_sessions` and
+/// `get_session_urls` pass on to agents.
+#[tokio::test]
+async fn describe_reports_the_session_name_and_allocated_ports() -> eyre::Result<()> {
+    let dir = unique_dir("describe-session")?;
+    let session = build_session_yaml(
+        dir.path(),
+        "version: 1\nsession: { name: described }\nallocate_ports: [APP_PORT]\nservices: {}\n",
+    )?;
+
+    let mut client = Client::connect(&session.endpoint).await?;
+    let Response::Description(info) = client.request(Request::Describe).await? else {
+        eyre::bail!("expected a description");
+    };
+    let summary = info
+        .session
+        .ok_or_else(|| eyre::eyre!("the description carries no session"))?;
+
+    assert_eq!(summary.name, "described");
+    assert_eq!(summary.domain, "described.localhost");
+    let port = summary
+        .allocated_ports
+        .get("APP_PORT")
+        .ok_or_else(|| eyre::eyre!("APP_PORT is missing"))?;
+    assert!((20000..=32767).contains(port), "{port}");
+    assert_eq!(summary.routing, None);
+
+    session.shutdown.cancel();
+    Ok(())
 }
 
 #[tokio::test]
