@@ -597,7 +597,7 @@ pub(crate) mod tests {
         }
     }
 
-    /// Exact routes win over catch-alls, and a catch-all serves the bare domain and every
+    /// Exact routes win over the catch-all route, which serves the bare domain and every
     /// deeper name under it.
     #[test]
     fn lookup_prefers_exact_routes_then_the_catch_all() -> Result<(), Refusal> {
