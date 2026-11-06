@@ -115,6 +115,19 @@ pub enum Command {
     /// Run the supervisor headless (no TUI), serving the control plane until stopped. Intended for
     /// agent-managed sessions — see the MCP `start_session`/`stop_session` tools.
     Serve,
+    /// Run the shared HTTP proxy serving every session's `routes`. Sessions with routes start it
+    /// automatically; it exits once no session has been registered for the idle timeout.
+    Proxy {
+        /// Port to listen on.
+        #[arg(long, default_value_t = 80)]
+        port: u16,
+        /// Port to use instead when `--port` needs privileges or is taken.
+        #[arg(long)]
+        fallback_port: Option<u16>,
+        /// Seconds to keep running without any registered session.
+        #[arg(long, default_value_t = 60)]
+        idle_timeout_secs: u64,
+    },
 }
 
 #[cfg(test)]

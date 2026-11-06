@@ -12,6 +12,7 @@ mod logging;
 #[cfg(feature = "mcp")]
 mod mcp;
 mod options;
+mod proxy;
 
 use clap::Parser;
 use codespan_reporting::diagnostic::Diagnostic;
@@ -27,6 +28,11 @@ enum Error {
     Tui(#[from] micromux_tui::Error),
     #[error(transparent)]
     Control(#[from] micromux_control::ControlError),
+    #[error(transparent)]
+    Session(#[from] micromux::SessionError),
+    #[cfg(unix)]
+    #[error(transparent)]
+    Proxy(#[from] micromux_proxy::ClientError),
     #[error(transparent)]
     Diagnostics(#[from] codespan_reporting::files::Error),
     #[error(transparent)]
@@ -162,22 +168,52 @@ struct LoadedConfig {
 }
 
 /// Build the supervisor, rendering every service definition that cannot be materialized (an
-/// unresolved `${VAR}`, an unreadable env file, an invalid port) as a source diagnostic,
-/// preceded by notes for the optional env files that were skipped.
+/// unresolved `${VAR}`, an unreadable env file, an invalid port) and every route that cannot be
+/// resolved as a source diagnostic, preceded by notes for the optional env files that were
+/// skipped.
 fn build_supervisor(
     config: &micromux::ConfigFile<usize>,
     printer: &DiagnosticsPrinter,
+    session: micromux::Session,
 ) -> Result<micromux::Micromux, Error> {
-    match micromux::Micromux::new(config) {
-        Ok(mux) => Ok(mux),
-        Err(micromux::Error::Services(failure)) => {
-            for diagnostic in failure.to_diagnostics(config.file_id) {
-                printer.emit(&diagnostic)?;
-            }
-            Err(Error::DiagnosticsEmitted)
-        }
-        Err(err) => Err(err.into()),
+    let diagnostics = match micromux::Micromux::with_session(config, session) {
+        Ok(mux) => return Ok(mux),
+        Err(micromux::Error::Services(failure)) => failure.to_diagnostics(config.file_id),
+        Err(micromux::Error::Routes(failure)) => failure.to_diagnostics(config.file_id),
+        Err(err) => return Err(err.into()),
+    };
+    for diagnostic in diagnostics {
+        printer.emit(&diagnostic)?;
     }
+    Err(Error::DiagnosticsEmitted)
+}
+
+/// A supervisor whose session is established and whose routes are registered, ready to start
+/// services.
+struct Supervisor {
+    mux: std::sync::Arc<micromux::Micromux>,
+    /// Held so the routes stay registered while the session runs.
+    routes: Option<proxy::RouteRegistration>,
+}
+
+/// Establishes the session (identity, allocated ports, and the proxy port), builds the
+/// supervisor, and registers its routes before any service starts.
+async fn start_supervisor(
+    config: &micromux::ConfigFile<usize>,
+    printer: &DiagnosticsPrinter,
+    shutdown: &micromux::CancellationToken,
+) -> Result<Supervisor, Error> {
+    let mut session = micromux::Session::establish(config, &micromux::PortRegistry::user())?;
+    proxy::latch_port(&mut session).await?;
+    let mux = build_supervisor(config, printer, session)?;
+    let routes = match config.config_path.as_deref() {
+        Some(config_path) => proxy::register(&mux, config_path, shutdown).await?,
+        None => None,
+    };
+    Ok(Supervisor {
+        mux: std::sync::Arc::new(mux),
+        routes,
+    })
 }
 
 async fn load_config(
@@ -237,28 +273,42 @@ async fn load_config(
     })
 }
 
+/// Runs a subcommand; without one, micromux runs the TUI.
+async fn run_command(command: options::Command, options: options::Options) -> Result<(), Error> {
+    match command {
+        options::Command::Attach { session } => attach::run(&options, session.as_deref()).await,
+        options::Command::Ctl { action } => ctl::run(action, options.config_path.as_deref()).await,
+        #[cfg(feature = "mcp")]
+        options::Command::Mcp {
+            allow_session_start,
+        } => {
+            // Logs go to a file (never stdout — stdout is the JSON-RPC channel).
+            let _log_guard = setup_logging(&options).ok();
+            mcp::run(allow_session_start).await
+        }
+        options::Command::Serve => run_headless(options).await,
+        options::Command::Proxy {
+            port,
+            fallback_port,
+            idle_timeout_secs,
+        } => {
+            // Logs go to a file: a session that started the proxy reads only its startup errors.
+            let _log_guard = setup_logging(&options).ok();
+            proxy::run(
+                port,
+                fallback_port,
+                std::time::Duration::from_secs(idle_timeout_secs),
+            )
+            .await
+        }
+    }
+}
+
 async fn run() -> Result<(), Error> {
     let mut options = options::Options::parse();
 
-    match options.command.take() {
-        Some(options::Command::Attach { session }) => {
-            return attach::run(&options, session.as_deref()).await;
-        }
-        Some(options::Command::Ctl { action }) => {
-            return ctl::run(action, options.config_path.as_deref()).await;
-        }
-        #[cfg(feature = "mcp")]
-        Some(options::Command::Mcp {
-            allow_session_start,
-        }) => {
-            // Logs go to a file (never stdout — stdout is the JSON-RPC channel).
-            let _log_guard = setup_logging(&options).ok();
-            return mcp::run(allow_session_start).await;
-        }
-        Some(options::Command::Serve) => {
-            return run_headless(options).await;
-        }
-        None => {}
+    if let Some(command) = options.command.take() {
+        return run_command(command, options).await;
     }
 
     let shutdown = micromux::CancellationToken::new();
@@ -271,7 +321,10 @@ async fn run() -> Result<(), Error> {
 
     let LoadedConfig { config, printer } = load_config(&options, color_choice).await?;
 
-    let mux = std::sync::Arc::new(build_supervisor(&config, &printer)?);
+    let Supervisor {
+        mux,
+        routes: _routes,
+    } = start_supervisor(&config, &printer, &shutdown).await?;
     let (runner, handles) = mux.clone().start(shutdown.clone());
 
     // Default-on control plane, opt out via `--no-control` or `control: { enabled: false }`.
@@ -365,7 +418,10 @@ async fn run_headless(options: options::Options) -> Result<(), Error> {
     let color_choice = options.color_choice.unwrap_or(termcolor::ColorChoice::Auto);
     let LoadedConfig { config, printer } = load_config(&options, color_choice).await?;
 
-    let mux = std::sync::Arc::new(build_supervisor(&config, &printer)?);
+    let Supervisor {
+        mux,
+        routes: _routes,
+    } = start_supervisor(&config, &printer, &shutdown).await?;
     let (runner, handles) = mux.clone().start(shutdown.clone());
 
     // The control plane is the only way to reach a headless session, so it is mandatory here — the

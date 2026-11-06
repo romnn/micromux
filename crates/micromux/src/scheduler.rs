@@ -801,8 +801,8 @@ fn load_services_from_disk(reload: &ReloadConfig) -> Result<ServiceMap, String> 
         .same_settings(&reload.session.settings)
     {
         return Err(format!(
-            "the session settings (`session`, `allocate_ports`) in {} changed; restart the \
-             session to apply them",
+            "the session settings (`session`, `allocate_ports`, `routes`, `proxy`) in {} changed; \
+             restart the session to apply them",
             reload.config_path.display()
         ));
     }

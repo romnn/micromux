@@ -279,6 +279,43 @@ pub struct SessionConfig {
     pub domain: Option<Spanned<String>>,
     /// Environment variable names that each receive a session-allocated TCP port.
     pub allocate_ports: Vec<Spanned<String>>,
+    /// Hostname routes registered with the shared proxy while the session runs.
+    pub routes: Vec<RouteConfig>,
+    /// Port preference for the shared proxy.
+    pub proxy: ProxyConfig,
+}
+
+/// One `routes` entry: a hostname under the session domain and the local port serving it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteConfig {
+    /// Hostname labels below the session domain, such as `app` or `email.internal`, or `*`
+    /// for the catch-all.
+    pub host: Spanned<String>,
+    /// Upstream port on 127.0.0.1, before interpolation.
+    pub port: Spanned<String>,
+}
+
+/// The `proxy` mapping: which port the shared proxy listens on.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProxyConfig {
+    /// Preferred listening port, 80 when unset.
+    pub port: Option<Spanned<u16>>,
+    /// Port used instead when `port` cannot be bound.
+    pub fallback_port: Option<Spanned<u16>>,
+}
+
+impl ProxyConfig {
+    /// The preferred listening port.
+    #[must_use]
+    pub fn port(&self) -> u16 {
+        self.port.as_ref().map_or(80, |port| port.inner)
+    }
+
+    /// The fallback listening port, if any.
+    #[must_use]
+    pub fn fallback_port(&self) -> Option<u16> {
+        self.fallback_port.as_ref().map(|port| port.inner)
+    }
 }
 
 impl SessionConfig {
@@ -293,9 +330,25 @@ impl SessionConfig {
                 .map(|name| name.inner.clone())
                 .collect::<Vec<_>>()
         };
+        let routes = |routes: &[RouteConfig]| {
+            routes
+                .iter()
+                .map(|route| (route.host.inner.clone(), route.port.inner.clone()))
+                .collect::<Vec<_>>()
+        };
         inner(&self.name) == inner(&other.name)
             && inner(&self.domain) == inner(&other.domain)
             && names(&self.allocate_ports) == names(&other.allocate_ports)
+            && routes(&self.routes) == routes(&other.routes)
+            && self.proxy.port() == other.proxy.port()
+            && self.proxy.fallback_port() == other.proxy.fallback_port()
+    }
+
+    /// Whether the settings need the config's file path, which keys allocated ports and route
+    /// registrations across restarts.
+    #[must_use]
+    pub fn needs_config_path(&self) -> bool {
+        !self.allocate_ports.is_empty() || !self.routes.is_empty()
     }
 }
 

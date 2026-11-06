@@ -32,6 +32,8 @@ pub use client::{
     probe_endpoint, probe_endpoints, probe_runtime_dir, probe_runtime_dirs,
     unique_answering_session_probes,
 };
+#[cfg(unix)]
+pub use endpoint::coordination_dir;
 pub use endpoint::{
     CanonicalConfigPath, ControlEndpoint, RuntimeDirStatus, endpoint_for, endpoint_from_hash,
     endpoint_hash, runtime_dir, runtime_dir_statuses, transport_supported, usable_runtime_dirs,

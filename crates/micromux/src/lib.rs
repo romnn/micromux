@@ -76,7 +76,9 @@ pub use service::{
     Error as ServiceError, RestartPolicy, Site as ServiceSite, SkipReason as EnvFileSkipReason,
     SkippedEnvFile, WorkingDirectoryError,
 };
-pub use session::{PortRegistry, Session, SessionEnvironment, SessionError, SessionIdentity};
+pub use session::{
+    PortRegistry, Route, RouteError, Session, SessionEnvironment, SessionError, SessionIdentity,
+};
 pub use spec::{
     DependencySpec, DynamicOrigin, DynamicServiceParams, HealthcheckSpec, Lease,
     PartialServiceSpec, ServiceOrigin, ServiceSpec, SpecError, SpecField, StopSignal,
@@ -114,6 +116,26 @@ pub enum Error {
     /// The session's identity or allocated ports could not be established.
     #[error(transparent)]
     Session(#[from] SessionError),
+    /// One or more routes could not be resolved.
+    #[error(transparent)]
+    Routes(#[from] RouteFailure),
+}
+
+/// Routes whose ports could not be resolved.
+#[derive(Debug, thiserror::Error)]
+#[error("{}", self.errors.iter().map(ToString::to_string).collect::<Vec<_>>().join("; "))]
+pub struct RouteFailure {
+    /// One error per failing route, in config order.
+    pub errors: Vec<RouteError>,
+}
+
+impl ToDiagnostics for RouteFailure {
+    fn to_diagnostics<F: Copy + PartialEq>(&self, file_id: F) -> Vec<Diagnostic<F>> {
+        self.errors
+            .iter()
+            .flat_map(|err| err.to_diagnostics(file_id))
+            .collect()
+    }
 }
 
 /// Where a session re-reads its config from, and how it interprets the file.
@@ -325,39 +347,7 @@ pub fn validate_config_file(
         .any(|diagnostic| diagnostic.severity == Severity::Error)
         && let Some(config) = &parsed
     {
-        // Validation never reserves ports: it shows the persisted assignment, or provisional
-        // values for names a session has not been assigned yet.
-        let session = Session::preview(config, &PortRegistry::user());
-        if !session.provisional_ports().is_empty() {
-            source_diagnostics.push(
-                codespan_reporting::diagnostic::Diagnostic::note().with_message(format!(
-                    "no port is assigned yet to {}; validated with provisional values, the \
-                     session assigns real ones when it starts",
-                    session.provisional_ports().join(", ")
-                )),
-            );
-        }
-        let MaterializedServices {
-            services: service_map,
-            errors,
-            skipped_env_files,
-        } = materialize_services(config, &session.environment());
-        services.extend(service_map.keys().cloned());
-        for skipped in &skipped_env_files {
-            source_diagnostics.extend(skipped.to_diagnostics(file_id));
-        }
-        for err in &errors {
-            source_diagnostics.extend(err.to_diagnostics(file_id));
-        }
-        // The graph is only meaningful once every service materialized: a failed service
-        // would otherwise show up as a missing dependency of its dependents.
-        if errors.is_empty()
-            && let Err(err) = graph::ServiceGraph::new(&service_map)
-        {
-            source_diagnostics.push(
-                codespan_reporting::diagnostic::Diagnostic::error().with_message(err.to_string()),
-            );
-        }
+        services = validate_materialization(config, file_id, &mut source_diagnostics);
     }
 
     let valid = parsed.is_some()
@@ -390,6 +380,60 @@ pub fn validate_config_file(
         diagnostics,
         rendered: (!rendered.is_empty()).then_some(rendered),
     })
+}
+
+/// Materializes the services and routes of a parsed config the way a session would, appending
+/// what goes wrong to `diagnostics`, and returns the ids of the services that materialized.
+///
+/// Validation never reserves ports: it shows the persisted assignment, or provisional values for
+/// names a session has not been assigned yet.
+fn validate_materialization(
+    config: &config::ConfigFile<usize>,
+    file_id: usize,
+    diagnostics: &mut Vec<Diagnostic<usize>>,
+) -> Vec<ServiceID> {
+    let session = Session::preview(config, &PortRegistry::user());
+    if !session.provisional_ports().is_empty() {
+        diagnostics.push(
+            codespan_reporting::diagnostic::Diagnostic::note().with_message(format!(
+                "no port is assigned yet to {}; validated with provisional values, the \
+                 session assigns real ones when it starts",
+                session.provisional_ports().join(", ")
+            )),
+        );
+    }
+    let MaterializedServices {
+        services: service_map,
+        errors,
+        skipped_env_files,
+    } = materialize_services(config, &session.environment());
+    if errors.is_empty()
+        && let Err(route_errors) = session::resolve_routes(
+            &session.into_context(),
+            &service_map,
+            &std::env::vars().collect(),
+        )
+    {
+        for err in &route_errors {
+            diagnostics.extend(err.to_diagnostics(file_id));
+        }
+    }
+    for skipped in &skipped_env_files {
+        diagnostics.extend(skipped.to_diagnostics(file_id));
+    }
+    for err in &errors {
+        diagnostics.extend(err.to_diagnostics(file_id));
+    }
+    // The graph is only meaningful once every service materialized: a failed service
+    // would otherwise show up as a missing dependency of its dependents.
+    if errors.is_empty()
+        && let Err(err) = graph::ServiceGraph::new(&service_map)
+    {
+        diagnostics.push(
+            codespan_reporting::diagnostic::Diagnostic::error().with_message(err.to_string()),
+        );
+    }
+    service_map.keys().cloned().collect()
 }
 
 pub(crate) fn initial_model_entries(services: &ServiceMap) -> Vec<(ServiceSnapshot, LogRetention)> {
@@ -425,6 +469,7 @@ pub(crate) fn initial_model_entries(services: &ServiceMap) -> Vec<(ServiceSnapsh
 pub struct Micromux {
     services: ServiceMap,
     session: Arc<session::SessionContext>,
+    routes: Vec<Route>,
     reload_config: Option<ReloadConfig>,
     config_dir: PathBuf,
     dynamic_policy: DynamicServicesPolicy,
@@ -504,6 +549,8 @@ impl Micromux {
     ) -> Result<Self, Error> {
         let session = Arc::new(session.into_context());
         let services = service_map_from_config(config_file, &session.environment)?;
+        let routes = session::resolve_routes(&session, &services, &std::env::vars().collect())
+            .map_err(|errors| RouteFailure { errors })?;
         let unbounded_services = services
             .values()
             .filter(|service| memory_retention_is_unbounded(service.log_retention))
@@ -539,6 +586,7 @@ impl Micromux {
         Ok(Self {
             services,
             session,
+            routes,
             reload_config,
             config_dir: config_file.config_dir.clone(),
             dynamic_policy,
@@ -551,6 +599,24 @@ impl Micromux {
     #[must_use]
     pub fn session_identity(&self) -> &SessionIdentity {
         &self.session.identity
+    }
+
+    /// The session's routes with their ports resolved, in config order.
+    #[must_use]
+    pub fn routes(&self) -> &[Route] {
+        &self.routes
+    }
+
+    /// The port the shared proxy listens on, as latched when the session was established.
+    #[must_use]
+    pub fn proxy_port(&self) -> u16 {
+        self.session.proxy_port
+    }
+
+    /// What follows `<route>.` in this session's browser URLs, such as `luup2.localhost:8080`.
+    #[must_use]
+    pub fn host_suffix(&self) -> String {
+        session::host_suffix(&self.session.identity, self.session.proxy_port)
     }
 
     /// The port allocated to every `allocate_ports` name, in config order.
@@ -790,6 +856,121 @@ mod tests {
             matches!(second, Err(SessionError::NameInUse { .. })),
             "{second:?}"
         );
+        Ok(())
+    }
+
+    /// Routes resolve against the session variables, name the service listing their port, and
+    /// the proxy variables describe the latched proxy port.
+    #[cfg(unix)]
+    #[test]
+    fn routes_resolve_against_the_session_and_its_proxy_port() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let project = directory.path().join("luup2");
+        std::fs::create_dir_all(&project)?;
+        let raw = indoc::indoc! {r#"
+            version: 1
+            proxy: { fallback_port: 8080 }
+            allocate_ports: [APP_PORT]
+            routes:
+              - host: app
+                port: ${APP_PORT}
+              - host: "*"
+                port: 9999
+            services:
+              web:
+                command: ["sh", "-c", "sleep 60"]
+                ports: ["${APP_PORT}"]
+                environment:
+                  APP_URL: "http://app.${MICROMUX_HOST_SUFFIX}"
+        "#};
+        std::fs::write(project.join("micromux.yaml"), raw)?;
+        let mut config = from_str(raw, &project, 0usize, None, &mut Vec::new())?;
+        config.config_path = Some(project.join("micromux.yaml").canonicalize()?);
+
+        let registry = PortRegistry::at(directory.path().join("registry"));
+        let mut session = Session::establish(&config, &registry)?;
+        session.set_proxy_port(8080);
+        let mux = Micromux::with_session(&config, session)?;
+
+        let port = *mux
+            .allocated_ports()
+            .get("APP_PORT")
+            .ok_or_else(|| eyre::eyre!("APP_PORT was not allocated"))?;
+        assert_eq!(mux.host_suffix(), "luup2.localhost:8080");
+        assert_eq!(
+            mux.routes(),
+            &[
+                Route {
+                    host: "app".to_string(),
+                    url: "http://app.luup2.localhost:8080/".to_string(),
+                    port,
+                    service: Some("web".to_string()),
+                },
+                Route {
+                    host: "*".to_string(),
+                    url: "http://luup2.localhost:8080/".to_string(),
+                    port: 9999,
+                    service: None,
+                },
+            ]
+        );
+        let environment = &mux
+            .services
+            .get("web")
+            .ok_or_else(|| eyre::eyre!("missing web"))?
+            .spec
+            .environment;
+        assert_eq!(
+            environment.get("APP_URL").map(String::as_str),
+            Some("http://app.luup2.localhost:8080")
+        );
+        assert_eq!(
+            environment.get("MICROMUX_PROXY_PORT").map(String::as_str),
+            Some("8080")
+        );
+        Ok(())
+    }
+
+    /// A route pointing back at the proxy, or at a value that is no port, is a config error.
+    #[cfg(unix)]
+    #[test]
+    fn routes_reject_the_proxy_port_and_non_ports() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let raw = indoc::indoc! {r"
+            version: 1
+            routes:
+              - host: loop
+                port: 80
+              - host: words
+                port: http
+              - host: unset
+                port: ${MICROMUX_TEST_UNSET_ROUTE_PORT}
+            services: {}
+        "};
+        std::fs::write(directory.path().join("micromux.yaml"), raw)?;
+        let mut config = from_str(raw, directory.path(), 0usize, None, &mut Vec::new())?;
+        config.config_path = Some(directory.path().join("micromux.yaml").canonicalize()?);
+        let registry = PortRegistry::at(directory.path().join("registry"));
+
+        let result = Micromux::with_session(&config, Session::establish(&config, &registry)?);
+
+        let Err(Error::Routes(failure)) = result else {
+            eyre::bail!("expected route errors");
+        };
+        let hosts = failure
+            .errors
+            .iter()
+            .map(|err| match err {
+                RouteError::ProxyPort { host, .. }
+                | RouteError::InvalidPort { host, .. }
+                | RouteError::Interpolation { host, .. } => host.as_str(),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(hosts, vec!["loop", "words", "unset"]);
+        assert!(matches!(
+            failure.errors.first(),
+            Some(RouteError::ProxyPort { port: 80, .. })
+        ));
         Ok(())
     }
 

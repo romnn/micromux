@@ -6,6 +6,7 @@ members = [
 	"crates/micromux-control",
 	"crates/micromux-mcp",
 	"crates/micromux-tui",
+	"crates/micromux-proxy",
 	"crates/micromux-cli",
 	"crates/micromux-screenshot",
 ]

@@ -145,6 +145,46 @@
       },
       "description": "Environment variable names that each receive a free TCP port, stable across restarts of this session and never shared with another live session. The values override env_file and environment definitions of the same names. Changes require a session restart."
     },
+    "routes": {
+      "type": "array",
+      "description": "Hostnames served by the shared micromux proxy while the session runs, as http://<host>.<session>.<domain>. Not supported on Windows. Changes require a session restart.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["host", "port"],
+        "properties": {
+          "host": {
+            "type": "string",
+            "pattern": "^(\\*|[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*)$",
+            "description": "Hostname labels below the session domain, such as app or email.internal, or * for every other hostname under the session domain."
+          },
+          "port": {
+            "$ref": "#/definitions/scalar",
+            "description": "Upstream port on 127.0.0.1. May reference micromux's own environment and the session variables, such as an allocate_ports name, but not service env files."
+          }
+        }
+      }
+    },
+    "proxy": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Port of the shared micromux proxy. Changes require a session restart.",
+      "properties": {
+        "port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535,
+          "default": 80,
+          "description": "Port the proxy listens on."
+        },
+        "fallback_port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535,
+          "description": "Port used instead when port needs privileges or is taken. Never chosen silently otherwise."
+        }
+      }
+    },
     "services": {
       "type": "object",
       "additionalProperties": {

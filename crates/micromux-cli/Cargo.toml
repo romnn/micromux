@@ -50,6 +50,7 @@ codespan-reporting.workspace = true
 micromux = { path = "../micromux/" }
 micromux-tui = { path = "../micromux-tui/" }
 micromux-control = { path = "../micromux-control/" }
+micromux-proxy = { path = "../micromux-proxy/" }
 micromux-mcp = { path = "../micromux-mcp/", optional = true }
 
 # async runtime
