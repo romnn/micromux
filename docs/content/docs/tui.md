@@ -17,7 +17,7 @@ Running `micromux` with no subcommand opens the TUI for the current project. It'
 
 ## Keybindings
 
-The header's right side lists the view keys, which change only what the panes show, with their current state. A session with [routes]({{< relref "configuration/sessions.md" >}}#hostnames) shows its browser URLs below the status row (up to three rows, then a count), and says so in red when the shared proxy does not serve them right now. The footer lists the keys that move around and act on services. Both wrap onto extra rows when the terminal is too narrow.
+The header's right side lists the view keys, which change only what the panes show, with their current state. With [routes]({{< relref "configuration/sessions.md" >}}#hostnames), the Logs pane's title lists the browser URLs of the selected service, the routes whose port is in its `ports` list, as many as fit, then a count of the rest; the header says so in red when the shared proxy does not serve them right now. The footer lists the keys that move around and act on services. Both wrap onto extra rows when the terminal is too narrow.
 
 | Key | Action |
 |---|---|
@@ -33,8 +33,12 @@ The header's right side lists the view keys, which change only what the panes sh
 | `L` | Pick the selected service's log level threshold (`ALL`, `DEBUG`, `INFO`, `WARN`, `ERROR`) |
 | `T` | Toggle timestamps on the selected service's structured JSON log lines |
 | `F` | Toggle the selected service's fields that `logs.fields` hides |
+| `i` | Show everything about the selected service: URLs, ports by variable, command, directory, dependencies, restart and stop policy, the last healthcheck, the current run, and the last cleanup (close with `i` or `Esc`) |
+| `u` | Show the session: its domain, the proxy port, every route with its port and service, and the allocated ports (close with `u` or `Esc`) |
 | `?` | Show every key binding (close with `Esc`) |
 | `q` / `Esc` | Quit |
+
+{{< figure src="images/service-details.png" alt="The service details popup over the log pane, listing the api service's state, ports, command, directory, dependencies, restart and stop policy, last healthcheck, and current run" caption="`i` describes the selected service in full; `u` shows the session's routes and ports the same way." >}}
 
 Restart, disable, and enable all go through the [control plane]({{< relref "agent-control/control-plane.md" >}}), so they respect dependency gating and restart policy.
 

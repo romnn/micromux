@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// Bump the minor for additive changes (new optional/defaulted fields, new tools that reuse
 /// existing requests), and bump the major for incompatible request/response semantics.
-pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(3, 12);
+pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(3, 13);
 
 pub(crate) const fn supports_versioned_subscriptions(version: ProtocolVersion) -> bool {
     version.major() == PROTOCOL_VERSION.major() && version.minor() >= 7
@@ -506,7 +506,7 @@ mod tests {
             ProtocolVersion::new(1, 0)
         );
 
-        assert!(PROTOCOL_VERSION.is_compatible_with(ProtocolVersion::new(3, 13)));
+        assert!(PROTOCOL_VERSION.is_compatible_with(ProtocolVersion::new(3, 14)));
         assert!(!PROTOCOL_VERSION.is_compatible_with(ProtocolVersion::new(2, 9)));
         assert!(!supports_versioned_subscriptions(ProtocolVersion::new(
             3, 6

@@ -186,6 +186,19 @@ mod tests {
     }
 
     #[test]
+    fn home_relative_paths_shorten_only_the_home_directory_itself() {
+        use super::home_relative;
+        use std::ffi::OsStr;
+
+        let home = Some(OsStr::new("/home/ada"));
+        assert_eq!(home_relative("/home/ada/work/app", home), "~/work/app");
+        assert_eq!(home_relative("/home/ada", home), "~");
+        assert_eq!(home_relative("/home/adam/app", home), "/home/adam/app");
+        assert_eq!(home_relative("/srv/app", home), "/srv/app");
+        assert_eq!(home_relative("/srv/app", None), "/srv/app");
+    }
+
+    #[test]
     fn truncation_ends_with_spaced_dots_within_the_limit() {
         use super::truncate_with_dots;
 
@@ -617,6 +630,264 @@ fn build_healthcheck_text(configured: bool, attempts: &[micromux::HealthAttempt]
     out
 }
 
+/// Width of the label column in the info popups.
+const INFO_LABEL_WIDTH: usize = 12;
+
+/// One labelled row of an info popup; further values continue on rows of their own, aligned
+/// under the first.
+fn info_rows<V: Into<Line<'static>>>(label: &str, values: Vec<V>) -> Vec<Line<'static>> {
+    let mut values = values.into_iter().map(Into::into);
+    let first = values
+        .next()
+        .unwrap_or_else(|| Line::from("—".fg(tailwind::GRAY.c500)));
+    let indent = |label: Span<'static>, line: Line<'static>| {
+        let mut spans = vec![label];
+        spans.extend(line.spans);
+        Line::from(spans)
+    };
+    std::iter::once(indent(
+        format!("{label:<INFO_LABEL_WIDTH$}")
+            .fg(App::HEADER_COLOR)
+            .bold(),
+        first,
+    ))
+    .chain(values.map(|line| indent(" ".repeat(INFO_LABEL_WIDTH).into(), line)))
+    .collect()
+}
+
+/// Everything known about one service, for its details popup.
+fn service_info_rows(
+    snapshot: &micromux::ServiceSnapshot,
+    session: Option<&micromux::SessionSummary>,
+    last_healthcheck: Option<&micromux::HealthAttempt>,
+    now_unix_ms: u64,
+) -> Vec<Line<'static>> {
+    let mut state = vec![state_name(snapshot).set_style(crate::style::service_style(snapshot))];
+    if let Some(pid) = snapshot.pid {
+        state.push(format!("  pid {pid}").fg(tailwind::GRAY.c400));
+    }
+    let urls = service_urls(session, &snapshot.id)
+        .into_iter()
+        .map(|url| url.fg(tailwind::CYAN.c400))
+        .collect();
+    let depends_on = snapshot
+        .depends_on
+        .iter()
+        .map(|dependency| {
+            let condition = match dependency.condition {
+                micromux::DependencyCondition::Started => "started",
+                micromux::DependencyCondition::Healthy => "healthy",
+                micromux::DependencyCondition::CompletedSuccessfully => "completed",
+            };
+            Span::raw(format!("{} ({condition})", dependency.service))
+        })
+        .collect();
+    let stop = format!(
+        "{}, then SIGKILL after {}s",
+        snapshot.stop_signal,
+        snapshot.stop_grace_period.as_secs()
+    );
+    let mut run = vec![format!("generation {}", snapshot.run_generation)];
+    run.extend(
+        snapshot
+            .started_at_unix_ms
+            .and_then(short_local_time)
+            .map(|started| format!("started {started}")),
+    );
+    run.extend(
+        snapshot
+            .last_exit_code
+            .map(|code| format!("last exit code {code}")),
+    );
+
+    let mut rows = info_rows("State", vec![Line::from(state)]);
+    rows.extend(info_rows("URLs", urls));
+    rows.extend(info_rows("Ports", port_rows(snapshot, session)));
+    rows.extend(info_rows("Command", vec![shell_join(&snapshot.command)]));
+    rows.extend(info_rows(
+        "Directory",
+        snapshot
+            .working_dir
+            .iter()
+            .map(|dir| home_relative(dir, std::env::var_os("HOME").as_deref()))
+            .collect(),
+    ));
+    rows.extend(info_rows("Depends on", depends_on));
+    rows.extend(info_rows("Restart", restart_rows(snapshot)));
+    rows.extend(info_rows("Stop", vec![stop]));
+    rows.extend(info_rows(
+        "Healthcheck",
+        healthcheck_rows(snapshot, last_healthcheck),
+    ));
+    rows.extend(info_rows("Run", run));
+    if let Some(cleanup) = &snapshot.last_cleanup {
+        rows.extend(info_rows("Cleanup", vec![cleanup_phrase(cleanup)]));
+    }
+    if let Some(dynamic) = &snapshot.dynamic {
+        rows.extend(info_rows(
+            "Dynamic",
+            vec![format!(
+                "rev {}, {}",
+                dynamic.revision,
+                lease_phrase(dynamic.expires_at_unix_ms, now_unix_ms)
+            )],
+        ));
+    }
+    rows
+}
+
+/// `path` with a leading `home` directory written as `~`, as a shell prompt shows it.
+fn home_relative(path: &str, home: Option<&std::ffi::OsStr>) -> String {
+    let rest = home
+        .and_then(std::ffi::OsStr::to_str)
+        .filter(|home| !home.is_empty() && *home != "/")
+        .and_then(|home| path.strip_prefix(home.trim_end_matches('/')))
+        .filter(|rest| rest.is_empty() || rest.starts_with('/'));
+    rest.map_or_else(|| path.to_string(), |rest| format!("~{rest}"))
+}
+
+/// The service's advertised ports, each with the allocated variables that hold it.
+fn port_rows(
+    snapshot: &micromux::ServiceSnapshot,
+    session: Option<&micromux::SessionSummary>,
+) -> Vec<String> {
+    let allocated = session.map(|session| &session.allocated_ports);
+    snapshot
+        .advertised_ports
+        .iter()
+        .map(|port| {
+            let names = allocated
+                .into_iter()
+                .flatten()
+                .filter(|(_, allocated)| *allocated == port)
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>();
+            if names.is_empty() {
+                format!(":{port}")
+            } else {
+                format!(":{port}  {}", names.join(", "))
+            }
+        })
+        .collect()
+}
+
+/// The restart policy and any backoff in progress.
+fn restart_rows(snapshot: &micromux::ServiceSnapshot) -> Vec<Span<'static>> {
+    let policy = match &snapshot.restart_policy {
+        micromux::RestartPolicy::Always => "always".to_string(),
+        micromux::RestartPolicy::UnlessStopped => "unless stopped".to_string(),
+        micromux::RestartPolicy::Never => "never".to_string(),
+        micromux::RestartPolicy::OnFailure { max_attempts: None } => "on failure".to_string(),
+        micromux::RestartPolicy::OnFailure {
+            max_attempts: Some(max),
+        } => format!("on failure, at most {max} times"),
+    };
+    let mut rows = vec![Span::raw(policy)];
+    if let Some(state) = &snapshot.restart_state {
+        let left = state
+            .restarts_remaining
+            .map(|remaining| format!(", {remaining} left"))
+            .unwrap_or_default();
+        rows.push(
+            format!(
+                "backing off {}s before the next attempt{left}",
+                state.backoff_delay.as_secs()
+            )
+            .fg(tailwind::GRAY.c400),
+        );
+    }
+    rows
+}
+
+/// How the latest healthcheck attempt went and what it ran.
+fn healthcheck_rows(
+    snapshot: &micromux::ServiceSnapshot,
+    last: Option<&micromux::HealthAttempt>,
+) -> Vec<Span<'static>> {
+    match (&snapshot.healthcheck, last) {
+        (None, _) => Vec::new(),
+        (Some(_), None) => vec!["no attempt yet".fg(tailwind::GRAY.c400)],
+        (Some(_), Some(attempt)) => {
+            let outcome = match attempt.result {
+                None => "running".to_string(),
+                Some(result) if result.cancelled => "cancelled".to_string(),
+                Some(result) if result.success => "ok".to_string(),
+                Some(result) => format!("failed with exit code {}", result.exit_code),
+            };
+            vec![
+                Span::raw(format!("last attempt {outcome}")),
+                format!("$ {}", attempt.command).fg(tailwind::GRAY.c400),
+            ]
+        }
+    }
+}
+
+/// How the latest cleanup command ended.
+fn cleanup_phrase(cleanup: &micromux::CleanupStatus) -> String {
+    let outcome = if cleanup.timed_out {
+        "timed out".to_string()
+    } else if cleanup.success {
+        "succeeded".to_string()
+    } else {
+        cleanup.exit_code.map_or_else(
+            || "failed".to_string(),
+            |code| format!("failed with exit code {code}"),
+        )
+    };
+    format!("{outcome} (generation {})", cleanup.run_generation)
+}
+
+/// The session's name, proxy and every route, for the session popup.
+fn session_info_rows(session: Option<&micromux::SessionSummary>) -> Vec<Line<'static>> {
+    let Some(session) = session else {
+        return vec![Line::raw("This session reports no session details.")];
+    };
+    let mut rows = info_rows("Session", vec![Span::raw(session.domain.clone())]);
+    let routing = match &session.routing {
+        None => String::new(),
+        Some(micromux::RoutingStatus::Pending) => "  registering".to_string(),
+        Some(micromux::RoutingStatus::Registered) => "  serving".to_string(),
+        Some(micromux::RoutingStatus::Unavailable { reason }) => format!("  unavailable: {reason}"),
+    };
+    rows.extend(info_rows(
+        "Proxy",
+        vec![Span::raw(format!(":{}{routing}", session.proxy_port))],
+    ));
+    rows.push(Line::default());
+    if session.routes.is_empty() {
+        rows.extend(info_rows("Routes", Vec::<Line<'static>>::new()));
+    } else {
+        let width = session
+            .routes
+            .iter()
+            .map(|route| route.url.trim_end_matches('/').chars().count())
+            .max()
+            .unwrap_or_default();
+        rows.extend(info_rows(
+            "Routes",
+            session
+                .routes
+                .iter()
+                .map(|route| {
+                    let url = route.url.trim_end_matches('/');
+                    let service = route.service.as_deref().unwrap_or("?");
+                    Span::raw(format!("{url:<width$}  → :{}  {service}", route.port))
+                })
+                .collect(),
+        ));
+    }
+    rows.push(Line::default());
+    rows.extend(info_rows(
+        "Ports",
+        session
+            .allocated_ports
+            .iter()
+            .map(|(name, port)| Span::raw(format!(":{port}  {name}")))
+            .collect(),
+    ));
+    rows
+}
+
 fn state_name(snapshot: &micromux::ServiceSnapshot) -> &'static str {
     if snapshot.retired.is_some() {
         return "RETIRED";
@@ -826,39 +1097,54 @@ const HELP_COLUMNS: [&[HelpSection]; 2] = [
             ],
         },
     ],
-    &[HelpSection {
-        title: "Act",
-        keys: &[
-            HelpKey {
-                keys: "r",
-                description: "Restart service",
-            },
-            HelpKey {
-                keys: "R",
-                description: "Restart all services",
-            },
-            HelpKey {
-                keys: "d",
-                description: "Disable / enable service",
-            },
-            HelpKey {
-                keys: "s",
-                description: "Stop dynamic service",
-            },
-            HelpKey {
-                keys: "a",
-                description: "PTY input (Alt+Esc exits)",
-            },
-            HelpKey {
-                keys: "q",
-                description: "Quit / detach",
-            },
-            HelpKey {
-                keys: "?",
-                description: "This help (Esc closes)",
-            },
-        ],
-    }],
+    &[
+        HelpSection {
+            title: "Inspect",
+            keys: &[
+                HelpKey {
+                    keys: "i",
+                    description: "Service details",
+                },
+                HelpKey {
+                    keys: "u",
+                    description: "Session URLs and ports",
+                },
+            ],
+        },
+        HelpSection {
+            title: "Act",
+            keys: &[
+                HelpKey {
+                    keys: "r",
+                    description: "Restart service",
+                },
+                HelpKey {
+                    keys: "R",
+                    description: "Restart all services",
+                },
+                HelpKey {
+                    keys: "d",
+                    description: "Disable / enable service",
+                },
+                HelpKey {
+                    keys: "s",
+                    description: "Stop dynamic service",
+                },
+                HelpKey {
+                    keys: "a",
+                    description: "PTY input (Alt+Esc exits)",
+                },
+                HelpKey {
+                    keys: "q",
+                    description: "Quit / detach",
+                },
+                HelpKey {
+                    keys: "?",
+                    description: "This help (Esc closes)",
+                },
+            ],
+        },
+    ],
 ];
 
 fn help_column_rows(sections: &[HelpSection]) -> Vec<Line<'static>> {
@@ -925,6 +1211,52 @@ fn logs_filters(format: &crate::json_log::LineFormat) -> Option<Line<'static>> {
                 .map(|filter| filter.fg(tailwind::GRAY.c500)),
         )
     })
+}
+
+/// Fewest border dashes kept between the Logs title and the filters on the right.
+const LOGS_TITLE_GAP: usize = 2;
+
+/// The Logs pane title: "Logs", then the browser URLs of the routes the service serves, as many
+/// as fit in `width` columns, with the rest counted.
+fn logs_title(urls: &[String], width: usize) -> Line<'static> {
+    let separator = || " · ".fg(Color::White);
+    let more = |hidden: usize| format!("+{hidden} more").fg(tailwind::GRAY.c400);
+    let mut spans = vec![Span::raw("Logs")];
+    let mut used = "Logs".len();
+    for (shown, url) in urls.iter().enumerate() {
+        let hidden_after = urls.len() - shown - 1;
+        // A URL fits when the count of the ones after it still fits behind it.
+        let count_width = if hidden_after == 0 {
+            0
+        } else {
+            3 + more(hidden_after).width()
+        };
+        let url_width = 3 + url.chars().count();
+        if used + url_width + count_width > width {
+            let hidden = urls.len() - shown;
+            if used + 3 + more(hidden).width() <= width {
+                spans.extend([separator(), more(hidden)]);
+            }
+            return Line::from(spans);
+        }
+        spans.extend([separator(), url.clone().fg(tailwind::CYAN.c400)]);
+        used += url_width;
+    }
+    Line::from(spans)
+}
+
+/// The browser URLs of the routes whose port belongs to `service`, in config order.
+fn service_urls(session: Option<&micromux::SessionSummary>, service: &str) -> Vec<String> {
+    session
+        .map(|session| {
+            session
+                .routes
+                .iter()
+                .filter(|route| route.service.as_deref() == Some(service))
+                .map(|route| route.url.trim_end_matches('/').to_string())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Joins facts drawn into a border with white dots, padded by a space on either end.
@@ -1096,14 +1428,14 @@ impl Widget for &mut App {
         }
         Paragraph::new(footer).render(footer_area, buf);
         self.render_level_picker(logs_area, buf);
+        if let Some(view) = self.info {
+            self.render_info(view, main_area, buf);
+        }
         if self.show_help {
             App::render_help(main_area, buf);
         }
     }
 }
-
-/// Most header rows the session's URLs take, so the panes keep their room.
-const MAX_URL_ROWS: usize = 3;
 
 impl App {
     const HEADER_COLOR: Color = tailwind::YELLOW.c500;
@@ -1156,14 +1488,14 @@ impl App {
         status
     }
 
-    /// The header rows at `width`: the session status with the view controls beside it, then the
-    /// session's URLs when it has routes.
+    /// The header rows at `width`: the session status with the view controls beside it, then why
+    /// the proxy does not serve the session's URLs, if it does not.
     ///
     /// When the controls do not fit beside the status, they wrap onto right-aligned rows below
     /// it, so warnings and attach state always keep the first row.
     pub(crate) fn header_lines(&self, width: u16) -> Vec<Line<'static>> {
         let width = usize::from(width);
-        let urls = self.urls_lines();
+        let urls = self.routing_problem_line();
         let status = self.status_line();
         let mut controls = pack_key_hints(&self.view_key_hints(), width);
         if let [single_row] = controls.as_mut_slice()
@@ -1181,48 +1513,20 @@ impl App {
             .collect()
     }
 
-    /// The session's browser URLs, one per row and starting at the first column so every URL that
-    /// fits the terminal is shown whole, followed by why the proxy does not serve them right now.
+    /// Why the proxy does not serve the session's URLs right now, if it does not.
     ///
-    /// At most [`MAX_URL_ROWS`] rows go to URLs; beyond that the last row counts the rest instead
-    /// of crowding out the panes.
-    fn urls_lines(&self) -> Vec<Line<'static>> {
-        let Some(session) = self.source.session_summary() else {
-            return Vec::new();
-        };
-        let shown = if session.routes.len() > MAX_URL_ROWS {
-            MAX_URL_ROWS - 1
-        } else {
-            session.routes.len()
-        };
-        let mut lines = session
-            .routes
-            .iter()
-            .take(shown)
-            .map(|route| {
-                Line::from(
-                    route
-                        .url
-                        .trim_end_matches('/')
-                        .to_string()
-                        .fg(tailwind::CYAN.c400),
-                )
-            })
-            .collect::<Vec<_>>();
-        let hidden = session.routes.len() - shown;
-        if hidden > 0 {
-            lines.push(Line::from(
-                format!("+{hidden} more: micromux ctl describe").fg(tailwind::GRAY.c400),
-            ));
+    /// The URLs themselves sit in the Logs pane title of the service they belong to.
+    fn routing_problem_line(&self) -> Option<Line<'static>> {
+        let session = self.source.session_summary()?;
+        if session.routes.is_empty() {
+            return None;
         }
-        if !session.routes.is_empty()
-            && let Some(micromux::RoutingStatus::Unavailable { reason }) = &session.routing
-        {
-            lines.push(Line::from(
-                format!("routing unavailable: {reason}").fg(tailwind::RED.c400),
-            ));
-        }
-        lines
+        let Some(micromux::RoutingStatus::Unavailable { reason }) = session.routing else {
+            return None;
+        };
+        Some(Line::from(
+            format!("routing unavailable: {reason}").fg(tailwind::RED.c400),
+        ))
     }
 
     /// The footer rows at `width`, wrapping whole key hints onto further rows as needed.
@@ -1274,6 +1578,8 @@ impl App {
             .map(|service| &service.snapshot);
         let mut hints = vec![
             KeyHint::new("?", "Help"),
+            KeyHint::new("i", "Info"),
+            KeyHint::new("u", "URLs"),
             KeyHint::new("↑/↓", "Move"),
             KeyHint::new("←/→", "Resize"),
             KeyHint::toggle("Tab", "Focus", focus),
@@ -1375,6 +1681,7 @@ impl App {
     }
 
     fn render_logs(&mut self, area: Rect, buf: &mut Buffer) {
+        let session = self.source.session_summary();
         let Some(service) = self.state.current_service_mut() else {
             return;
         };
@@ -1419,6 +1726,16 @@ impl App {
         };
         let text = &current_service.cached_text;
         let detail = service_detail(&current_service.snapshot, now_unix_ms());
+        let status = logs_filters(&format);
+        // The pane's border spans its width less the scrollbar column and both corners.
+        let title_width = usize::from(area.width)
+            .saturating_sub(3)
+            .saturating_sub(status.as_ref().map_or(0, Line::width))
+            .saturating_sub(LOGS_TITLE_GAP);
+        let title = logs_title(
+            &service_urls(session.as_ref(), &current_service.snapshot.id),
+            title_width,
+        );
         tracing::trace!(
             service_id = current_service.snapshot.id,
             num_lines = current_service.cached_line_index.total_lines(),
@@ -1430,8 +1747,8 @@ impl App {
             &current_service.cached_line_index,
             text,
             log_view::PaneBorders {
-                title: Line::raw("Logs"),
-                status: logs_filters(&format),
+                title,
+                status,
                 detail: Some(detail),
             },
             buf,
@@ -1558,6 +1875,51 @@ impl App {
         state.select(Some(picker.cursor));
         Clear.render(popup, buf);
         StatefulWidget::render(&list, popup, buf, &mut state);
+    }
+
+    fn render_info(&self, view: crate::InfoView, area: Rect, buf: &mut Buffer) {
+        let session = self.source.session_summary();
+        let (title, rows) = match view {
+            crate::InfoView::Service => {
+                let Some(service) = self.state.current_service() else {
+                    return;
+                };
+                let attempts = self.source.healthchecks(&service.snapshot.id);
+                (
+                    format!(" Service · {} ", service.snapshot.id),
+                    service_info_rows(
+                        &service.snapshot,
+                        session.as_ref(),
+                        attempts.last(),
+                        now_unix_ms(),
+                    ),
+                )
+            }
+            crate::InfoView::Session => {
+                let name = session
+                    .as_ref()
+                    .map_or_else(|| "no session".to_string(), |session| session.name.clone());
+                (
+                    format!(" Session · {name} "),
+                    session_info_rows(session.as_ref()),
+                )
+            }
+        };
+        let key = match view {
+            crate::InfoView::Service => "i",
+            crate::InfoView::Session => "u",
+        };
+        let content_width = rows.iter().map(Line::width).max().unwrap_or_default();
+        let popup = centered_popup(area, content_width, rows.len());
+        let info = Paragraph::new(rows).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .padding(POPUP_PADDING)
+                .title(title)
+                .title_bottom(format!(" {key} or Esc closes ").fg(tailwind::GRAY.c500)),
+        );
+        Clear.render(popup, buf);
+        Widget::render(&info, popup, buf);
     }
 
     fn render_help(area: Rect, buf: &mut Buffer) {

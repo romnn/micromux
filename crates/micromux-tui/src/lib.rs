@@ -91,12 +91,23 @@ pub struct App {
     pretty_json_logs: bool,
     level_picker: Option<level::LevelPicker>,
     show_help: bool,
+    /// The details popup on screen, if any.
+    info: Option<InfoView>,
     pty_input_mode: bool,
     focus: Focus,
     terminal_cols: u16,
     terminal_rows: u16,
     last_pty_cols: u16,
     last_pty_rows: u16,
+}
+
+/// Which details popup is on screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InfoView {
+    /// Everything about the selected service.
+    Service,
+    /// The session's name, proxy, routes and allocated ports.
+    Session,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -154,6 +165,7 @@ impl App {
             pretty_json_logs: log_view_options.pretty_json,
             level_picker: None,
             show_help: false,
+            info: None,
             pty_input_mode: false,
             focus: Focus::Services,
             terminal_cols: 80,
@@ -644,6 +656,17 @@ impl App {
             }
             return;
         }
+        if let Some(view) = self.info {
+            // Like help, the popup swallows every other key; its own key or the other popup's
+            // switches, Esc closes.
+            self.info = match key.code {
+                KeyCode::Esc => None,
+                KeyCode::Char('i') => (view != InfoView::Service).then_some(InfoView::Service),
+                KeyCode::Char('u') => (view != InfoView::Session).then_some(InfoView::Session),
+                _ => Some(view),
+            };
+            return;
+        }
         if self.level_picker.is_some() {
             self.handle_key_press_level_picker(key.code);
             return;
@@ -700,6 +723,8 @@ impl App {
             KeyCode::Char('t') => self.toggle_tail(),
 
             KeyCode::Char('?') => self.show_help = true,
+            KeyCode::Char('i') => self.info = Some(InfoView::Service),
+            KeyCode::Char('u') => self.info = Some(InfoView::Session),
 
             // Log presentation
             KeyCode::Char('L') => self.open_level_picker(),
@@ -1351,11 +1376,43 @@ mod tests {
         Ok(())
     }
 
-    /// A session with routes shows its URLs under the status row, wrapped to the terminal width,
-    /// and says when the proxy does not serve them.
+    /// A local app for a session established from `yaml` in `directory`, with its live session
+    /// status and allocated ports.
+    #[cfg(unix)]
+    fn routed_app(
+        directory: &Path,
+        yaml: &str,
+    ) -> eyre::Result<(
+        App,
+        micromux::SessionStatus,
+        indexmap::IndexMap<String, u16>,
+    )> {
+        let config_path = directory.join("micromux.yaml");
+        std::fs::write(&config_path, yaml)?;
+        let mut parsed = micromux::from_str(yaml, directory, 0usize, None, &mut Vec::new())?;
+        parsed.config_path = Some(config_path.canonicalize()?);
+        let registry = micromux::PortRegistry::at(directory.join("registry"));
+        let session = micromux::Session::establish(&parsed, &registry)?;
+        let ports = session.ports().clone();
+        let mux = std::sync::Arc::new(micromux::Micromux::with_session(&parsed, session)?);
+        let (_runner, handles) = mux.start(micromux::CancellationToken::new());
+        let app = App::new(
+            SessionSource::Local(
+                LocalSource::new(handles.reader, handles.commands.clone())
+                    .with_session(handles.session.clone()),
+            ),
+            Some(handles.terminal),
+            micromux::CancellationToken::new(),
+            LogViewOptions::default(),
+        );
+        Ok((app, handles.session, ports))
+    }
+
+    /// A session's URLs sit in the Logs title of the service each belongs to, never in the
+    /// header, which only says when the proxy does not serve them.
     #[cfg(unix)]
     #[tokio::test]
-    async fn header_shows_session_urls_and_routing_problems() -> eyre::Result<()> {
+    async fn logs_title_shows_the_selected_services_urls() -> eyre::Result<()> {
         let directory = tempfile::tempdir()?;
         let yaml = indoc! {r#"
             version: 1
@@ -1369,80 +1426,181 @@ mod tests {
               - host: admin
                 port: 9999
             services:
-              svc:
-                command: ["true"]
+              web:
+                command: ["sleep", "30"]
+                ports: [9997, 9998, 9999]
+                logs: { level: warn }
+              worker:
+                command: ["sleep", "30"]
         "#};
-        let config_path = directory.path().join("micromux.yaml");
-        std::fs::write(&config_path, yaml)?;
-        let mut parsed = micromux::from_str(yaml, directory.path(), 0usize, None, &mut Vec::new())?;
-        parsed.config_path = Some(config_path.canonicalize()?);
-        let registry = micromux::PortRegistry::at(directory.path().join("registry"));
-        let session = micromux::Session::establish(&parsed, &registry)?;
-        let mux = std::sync::Arc::new(micromux::Micromux::with_session(&parsed, session)?);
-        let (_runner, handles) = mux.start(micromux::CancellationToken::new());
-        let mut app = App::new(
-            SessionSource::Local(
-                LocalSource::new(handles.reader, handles.commands.clone())
-                    .with_session(handles.session.clone()),
-            ),
-            Some(handles.terminal),
-            micromux::CancellationToken::new(),
-            LogViewOptions::default(),
-        );
-        // The rows above the panes, joined.
-        let header = |app: &mut App, width: u16| {
+        let (mut app, session, _) = routed_app(directory.path(), yaml)?;
+        // Every rendered row, the number of header rows, and the Logs title from its corner on.
+        let render = |app: &mut App, width: u16| {
             let area = ratatui::layout::Rect::new(0, 0, width, 24);
             let mut buffer = ratatui::buffer::Buffer::empty(area);
             ratatui::widgets::Widget::render(&mut *app, area, &mut buffer);
-            (0..app.chrome_rows(width).header)
+            let rows = (0..area.height)
                 .map(|y| {
                     (0..width)
+                        .filter_map(|x| buffer.cell((x, y)).map(ratatui::buffer::Cell::symbol))
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>();
+            let title = rows
+                .iter()
+                .find_map(|row| row.find("┌Logs").and_then(|at| row.get(at..)))
+                .map(str::to_string)
+                .unwrap_or_default();
+            (rows, usize::from(app.chrome_rows(width).header), title)
+        };
+        // The header is the status row alone, and the service's URLs follow the title in order.
+        let (rows, header, title) = render(&mut app, 200);
+        assert_eq!(header, 1, "{rows:#?}");
+        assert!(!rows[0].contains("http://"), "{}", rows[0]);
+        assert!(
+            title.starts_with(
+                "┌Logs · http://app.tui.localhost:8080 · http://api.tui.localhost:8080 · \
+                 http://admin.tui.localhost:8080──"
+            ),
+            "{title}"
+        );
+
+        // A narrower pane shows the URLs that fit whole and counts the rest, on the one title row,
+        // and the filters keep their corner.
+        for (width, expected) in [
+            (
+                140,
+                "┌Logs · http://app.tui.localhost:8080 · http://api.tui.localhost:8080 · +1 more─",
+            ),
+            (110, "┌Logs · http://app.tui.localhost:8080 · +2 more─"),
+            (100, "┌Logs · +3 more─"),
+            (70, "┌Logs─"),
+        ] {
+            let (_, _, title) = render(&mut app, width);
+            assert!(title.starts_with(expected), "{width} columns: {title}");
+            assert!(
+                title.trim_end().ends_with("─ level ≥ WARN ┐"),
+                "{width} columns: {title}"
+            );
+        }
+
+        // A service without routes keeps the plain title.
+        app.state.selected_service = 1;
+        let (_, _, title) = render(&mut app, 200);
+        assert!(title.starts_with("┌Logs─"), "{title}");
+
+        // A routing problem wakes the event loop and gets a header row of its own.
+        let wake = app
+            .summary_changes
+            .clone()
+            .ok_or_else(|| eyre::eyre!("a local session with routes has no summary feed"))?;
+        session.set_routing(micromux::RoutingStatus::Unavailable {
+            reason: "the proxy stopped answering".to_string(),
+        });
+        assert!(wake.has_changed()?);
+        let (rows, header, _) = render(&mut app, 200);
+        assert_eq!(header, 2, "{rows:#?}");
+        assert!(
+            rows[1].contains("routing unavailable: the proxy stopped answering"),
+            "{rows:#?}"
+        );
+        Ok(())
+    }
+
+    /// `i` describes the selected service and `u` the session in a popup; each key toggles its
+    /// own view and switches from the other, and Esc closes either.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn info_popups_describe_the_service_and_the_session() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let yaml = indoc! {r#"
+            version: 1
+            session: { name: tui }
+            proxy: { port: 8080 }
+            allocate_ports: [WEB_PORT]
+            routes:
+              - host: app
+                port: ${WEB_PORT}
+              - host: "*"
+                port: 9999
+            services:
+              db:
+                command: ["sleep", "30"]
+              web:
+                command: ["sh", "-c", "sleep 30"]
+                ports: ["${WEB_PORT}"]
+                depends_on: [db]
+                restart: on-failure
+        "#};
+        let (mut app, _session, ports) = routed_app(directory.path(), yaml)?;
+        let port = ports["WEB_PORT"];
+        let press = |app: &mut App, code| {
+            app.handle_key_press(KeyEvent {
+                code,
+                modifiers: KeyModifiers::NONE,
+                kind: KeyEventKind::Press,
+                state: KeyEventState::NONE,
+            });
+        };
+        let screen = |app: &mut App| {
+            let area = ratatui::layout::Rect::new(0, 0, 160, 40);
+            let mut buffer = ratatui::buffer::Buffer::empty(area);
+            ratatui::widgets::Widget::render(&mut *app, area, &mut buffer);
+            (0..area.height)
+                .map(|y| {
+                    (0..area.width)
                         .filter_map(|x| buffer.cell((x, y)).map(ratatui::buffer::Cell::symbol))
                         .collect::<String>()
                 })
                 .collect::<Vec<_>>()
                 .join("\n")
         };
+        app.state.selected_service = 1;
 
-        // Every URL stays visible, also on a narrow terminal where they need several rows.
-        for width in [200, 60] {
-            let rows = header(&mut app, width);
-            for url in [
-                "http://app.tui.localhost:8080",
-                "http://api.tui.localhost:8080",
-                "http://admin.tui.localhost:8080",
-            ] {
-                assert!(rows.contains(url), "{width} columns:\n{rows}");
-            }
-            assert!(!rows.contains("unavailable"), "{rows}");
+        let closed = screen(&mut app);
+        assert!(closed.contains("i Info"), "{closed}");
+        assert!(closed.contains("u URLs"), "{closed}");
+
+        press(&mut app, KeyCode::Char('i'));
+        let service = screen(&mut app);
+        for expected in [
+            "Service · web",
+            "URLs        http://app.tui.localhost:8080",
+            &format!("Ports       :{port}  WEB_PORT"),
+            "Command     sh -c \"sleep 30\"",
+            "Depends on  db (started)",
+            "Restart     on failure",
+            "i or Esc closes",
+        ] {
+            assert!(service.contains(expected), "{expected}\n{service}");
         }
 
-        // Every URL starts its own row at the first column, so one that fits the terminal is
-        // never cut, even when it fills it exactly.
-        let exact = "http://admin.tui.localhost:8080".len();
-        let rows = header(&mut app, u16::try_from(exact)?);
-        assert!(
-            rows.lines()
-                .any(|row| row == "http://admin.tui.localhost:8080"),
-            "{rows}"
-        );
+        press(&mut app, KeyCode::Char('u'));
+        let session = screen(&mut app);
+        for expected in [
+            "Session · tui",
+            "Session     tui.localhost",
+            "Proxy       :8080",
+            &format!("Routes      http://app.tui.localhost:8080  → :{port}  web"),
+            "http://tui.localhost:8080      → :9999  ?",
+            &format!("Ports       :{port}  WEB_PORT"),
+        ] {
+            assert!(session.contains(expected), "{expected}\n{session}");
+        }
 
-        // A routing problem wakes the event loop and gets a row of its own.
-        let wake = app
-            .summary_changes
-            .clone()
-            .ok_or_else(|| eyre::eyre!("a local session with routes has no summary feed"))?;
-        handles
-            .session
-            .set_routing(micromux::RoutingStatus::Unavailable {
-                reason: "the proxy stopped answering".to_string(),
-            });
-        assert!(wake.has_changed()?);
-        let rows = header(&mut app, 80);
-        assert!(
-            rows.contains("routing unavailable: the proxy stopped answering"),
-            "{rows}"
-        );
+        // The popup swallows other keys, its own key closes it, and Esc closes the other one.
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.state.selected_service, 1);
+        press(&mut app, KeyCode::Char('u'));
+        assert!(!screen(&mut app).contains("Session · tui"));
+        press(&mut app, KeyCode::Char('i'));
+        press(&mut app, KeyCode::Esc);
+        assert!(!screen(&mut app).contains("Service · web"));
+
+        press(&mut app, KeyCode::Char('?'));
+        let help = screen(&mut app);
+        assert!(help.contains("Service details"), "{help}");
+        assert!(help.contains("Session URLs and ports"), "{help}");
         Ok(())
     }
 

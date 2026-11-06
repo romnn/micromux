@@ -708,6 +708,7 @@ pub(super) fn project_snapshot(
         restart_policy: service.spec.restart.clone(),
         log_display: service.log_display.clone(),
         last_cleanup: runtime.last_cleanup.clone(),
+        depends_on: service.spec.depends_on.clone(),
     };
     (snapshot, runtime.uptime_started_at)
 }

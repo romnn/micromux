@@ -54,8 +54,9 @@ pub use tokio_util::sync::CancellationToken;
 
 pub use cleanup::{CleanupWaitCancelled, cleanup_state_directory, wait_for_previous_cleanups};
 pub use config::{
-    ConfigError, ConfigFile, ControlConfig, DynamicServicesPolicy, MAX_CONFIG_FILE_BYTES,
-    config_file_names, find_config_file, from_str, read_config_file, read_config_file_async,
+    ConfigError, ConfigFile, ControlConfig, DependencyCondition, DynamicServicesPolicy,
+    MAX_CONFIG_FILE_BYTES, config_file_names, find_config_file, from_str, read_config_file,
+    read_config_file_async,
 };
 pub use diagnostics::{Printer, ToDiagnostics, render_to_string};
 pub use env::{Error as EnvironmentError, InterpolationError};
@@ -476,6 +477,7 @@ pub(crate) fn initial_model_entries(services: &ServiceMap) -> Vec<(ServiceSnapsh
                 service::StartupMode::Disabled => Desired::Disabled,
             };
             snapshot.log_display = service.log_display.clone();
+            snapshot.depends_on = service.spec.depends_on.clone();
             (snapshot, service.log_retention)
         })
         .collect()

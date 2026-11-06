@@ -259,6 +259,9 @@ pub struct ServiceSnapshot {
     /// How the most recent `cleanup` command ended, once one has run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_cleanup: Option<CleanupStatus>,
+    /// Services this one waits for before it starts, with the condition each must reach.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<crate::spec::DependencySpec>,
 }
 
 /// How a service's most recent `cleanup` command ended.
@@ -316,6 +319,7 @@ impl ServiceSnapshot {
             restart_policy,
             log_display: LogDisplay::default(),
             last_cleanup: None,
+            depends_on: Vec::new(),
         }
     }
 }
