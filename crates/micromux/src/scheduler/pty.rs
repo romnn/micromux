@@ -2664,18 +2664,21 @@ pub(super) fn start_service_with_pty_size(
     let wrapped =
         crate::containment::wrap(&program, args, stop, path.as_deref(), working_dir.as_path())
             .map_err(|err| Error::operation("failed to spawn in pty", err))?;
-    let mut cmd = if let Some((shim, shim_args)) = wrapped {
-        let mut cmd = CommandBuilder::new(shim);
-        cmd.args(shim_args);
-        cmd
+    let (mut cmd, carriers) = if let Some(wrapped) = wrapped {
+        let mut cmd = CommandBuilder::new(wrapped.program);
+        cmd.args(wrapped.args);
+        (cmd, wrapped.env)
     } else {
         let mut cmd = CommandBuilder::new(&program);
         cmd.args(args);
-        cmd
+        (cmd, Vec::new())
     };
     cmd.cwd(working_dir.as_path());
     for (k, v) in &env_vars {
         cmd.env(k, v);
+    }
+    for (name, value) in carriers {
+        cmd.env(name, value);
     }
 
     let child = pair

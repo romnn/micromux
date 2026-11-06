@@ -739,6 +739,10 @@ mod tests {
         let mut child = std::process::Command::new("bash")
             .args(["-c", "set -m; sleep 30 & wait"])
             .process_group(0)
+            // An orphaned sleep that is still exiting must not hold the test's output open.
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .spawn()?;
         let root = child.id();
         let root_stamp = stamp(root).ok_or_eyre("expected a root stamp")?;

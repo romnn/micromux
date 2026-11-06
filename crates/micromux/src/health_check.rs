@@ -912,16 +912,17 @@ async fn run(
             });
         }
     };
-    let mut cmd = if let Some((shim, shim_args)) = wrapped {
-        let mut cmd = Command::new(shim);
-        cmd.args(shim_args);
-        cmd
+    let (mut cmd, carriers) = if let Some(wrapped) = wrapped {
+        let mut cmd = Command::new(wrapped.program);
+        cmd.args(wrapped.args);
+        (cmd, wrapped.env)
     } else {
         let mut cmd = Command::new(prog);
         cmd.args(args);
-        cmd
+        (cmd, Vec::new())
     };
     cmd.envs(params.environment.iter())
+        .envs(carriers)
         .kill_on_drop(true)
         .stdin(Stdio::null())
         .stderr(Stdio::piped())

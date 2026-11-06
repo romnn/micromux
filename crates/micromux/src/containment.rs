@@ -44,6 +44,13 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 #[cfg(unix)]
 const EXIT_CANNOT_RUN: i32 = 127;
 
+/// Prefix of the environment variables that carry the command's argv, one per element, numbered
+/// from zero.
+///
+/// The command stays out of the shim's own argv, so a `pkill -f` pattern that matches the command
+/// does not match the shim too, which would forward the same signal to the command a second time.
+const COMMAND_VARIABLE_PREFIX: &str = "MICROMUX_SHIM_ARG_";
+
 /// Exit status of a shim invoked with arguments it does not understand.
 #[cfg(unix)]
 const EXIT_USAGE: i32 = 2;
@@ -78,7 +85,16 @@ impl Default for StopPolicy {
     }
 }
 
-/// The argv that runs `program` with `args` under the shim, or `None` when containment is off.
+/// How to start a command under the shim: the shim's program and argv, and the environment
+/// variables that carry the command.
+#[derive(Debug)]
+pub(crate) struct Wrapped {
+    pub(crate) program: PathBuf,
+    pub(crate) args: Vec<OsString>,
+    pub(crate) env: Vec<(String, OsString)>,
+}
+
+/// How to run `program` with `args` under the shim, or `None` when containment is off.
 ///
 /// `path` and `cwd` are the command's `PATH` and working directory.
 ///
@@ -86,6 +102,13 @@ impl Default for StopPolicy {
 ///
 /// Returns an error when `program` names no executable, so the command fails to spawn in the
 /// supervisor just as it would without the shim.
+#[cfg_attr(
+    not(unix),
+    expect(
+        clippy::unnecessary_wraps,
+        reason = "only Unix has a shim and the program check that can fail; callers handle both"
+    )
+)]
 pub(crate) fn wrap(
     program: &Path,
     args: &[String],
@@ -95,7 +118,7 @@ pub(crate) fn wrap(
     }: StopPolicy,
     path: Option<&std::ffi::OsStr>,
     cwd: &Path,
-) -> std::io::Result<Option<(PathBuf, Vec<OsString>)>> {
+) -> std::io::Result<Option<Wrapped>> {
     let Some(shim) = SHIM.get() else {
         return Ok(None);
     };
@@ -103,7 +126,7 @@ pub(crate) fn wrap(
     locate(program, path, cwd)?;
     #[cfg(not(unix))]
     let _ = (path, cwd);
-    let mut shim_args: Vec<OsString> = vec![
+    let shim_args: Vec<OsString> = vec![
         SHIM_COMMAND.into(),
         "--supervisor-pid".into(),
         std::process::id().to_string().into(),
@@ -111,11 +134,17 @@ pub(crate) fn wrap(
         stop_signal_name(stop_signal).into(),
         "--grace-ms".into(),
         grace.as_millis().to_string().into(),
-        "--".into(),
-        program.as_os_str().to_owned(),
     ];
-    shim_args.extend(args.iter().map(OsString::from));
-    Ok(Some((shim.clone(), shim_args)))
+    let env = std::iter::once(program.as_os_str().to_owned())
+        .chain(args.iter().map(OsString::from))
+        .enumerate()
+        .map(|(index, arg)| (format!("{COMMAND_VARIABLE_PREFIX}{index}"), arg))
+        .collect();
+    Ok(Some(Wrapped {
+        program: shim.clone(),
+        args: shim_args,
+        env,
+    }))
 }
 
 /// Finds the executable `program` names the way `execvp` does: a path with a directory part
@@ -175,7 +204,7 @@ fn stop_signal_name(signal: crate::spec::StopSignal) -> &'static str {
 #[cfg(unix)]
 #[must_use]
 pub fn run_shim(args: impl Iterator<Item = OsString>) -> i32 {
-    match ShimArgs::parse(args) {
+    match ShimArgs::parse(args, std::env::vars_os()) {
         Ok(args) => shim::run(&args),
         Err(message) => {
             eprintln!("micromux shim: {message}");
@@ -200,25 +229,27 @@ struct ShimArgs {
     grace: Duration,
     program: OsString,
     args: Vec<OsString>,
+    /// The variables that carried the command, which the command does not inherit.
+    carriers: Vec<OsString>,
 }
 
 #[cfg(unix)]
 impl ShimArgs {
-    fn parse(mut args: impl Iterator<Item = OsString>) -> Result<Self, String> {
+    fn parse(
+        args: impl Iterator<Item = OsString>,
+        env: impl Iterator<Item = (OsString, OsString)>,
+    ) -> Result<Self, String> {
+        let mut args = args.peekable();
         let mut supervisor = None;
         let mut stop_signal = nix::sys::signal::Signal::SIGTERM;
         let mut grace = Duration::from_secs(10);
-        loop {
-            let flag = args
-                .next()
-                .ok_or_else(|| "missing `-- <program>`".to_string())?;
+        while let Some(flag) = args.next() {
             let mut value = || {
                 args.next()
                     .and_then(|value| value.into_string().ok())
                     .ok_or_else(|| format!("{} needs a value", flag.to_string_lossy()))
             };
             match flag.to_str() {
-                Some("--") => break,
                 Some("--supervisor-pid") => {
                     supervisor = Some(value()?.parse().map_err(|err| format!("{err}"))?);
                 }
@@ -235,15 +266,42 @@ impl ShimArgs {
                 _ => return Err(format!("unknown argument `{}`", flag.to_string_lossy())),
             }
         }
-        let program = args
-            .next()
-            .ok_or_else(|| "missing the program after `--`".to_string())?;
+
+        let mut command = env
+            .filter_map(|(name, value)| {
+                let index = name
+                    .to_str()?
+                    .strip_prefix(COMMAND_VARIABLE_PREFIX)?
+                    .parse::<usize>()
+                    .ok()?;
+                Some((index, name, value))
+            })
+            .collect::<Vec<_>>();
+        command.sort_by_key(|(index, _, _)| *index);
+        if command
+            .iter()
+            .enumerate()
+            .any(|(position, (index, _, _))| position != *index)
+        {
+            return Err(format!(
+                "{COMMAND_VARIABLE_PREFIX}* is not numbered from zero"
+            ));
+        }
+        let (carriers, mut command): (Vec<_>, Vec<_>) = command
+            .into_iter()
+            .map(|(_, name, value)| (name, value))
+            .unzip();
+        if command.is_empty() {
+            return Err(format!("missing the program in {COMMAND_VARIABLE_PREFIX}0"));
+        }
+        let program = command.remove(0);
         Ok(Self {
             supervisor: supervisor.ok_or_else(|| "missing --supervisor-pid".to_string())?,
             stop_signal,
             grace,
             program,
-            args: args.collect(),
+            args: command,
+            carriers,
         })
     }
 }
@@ -295,10 +353,12 @@ mod shim {
         }
         // Only a terminal hangs up; healthchecks run without one.
         let terminal = std::io::stdin().is_terminal();
-        let child = match std::process::Command::new(&args.program)
-            .args(&args.args)
-            .spawn()
-        {
+        let mut command = std::process::Command::new(&args.program);
+        command.args(&args.args);
+        for carrier in &args.carriers {
+            command.env_remove(carrier);
+        }
+        let child = match command.spawn() {
             Ok(child) => child,
             Err(err) => {
                 eprintln!(
@@ -327,6 +387,7 @@ mod shim {
                         stop_requested.get_or_insert_with(Instant::now);
                     } else if !from_supervisor
                         && sender.is_some_and(|sender| sender != 0 && Some(sender) != own_pid)
+                        && !sender.is_some_and(in_own_group)
                         && signal != Signal::SIGCHLD
                         && ended.is_none()
                         && let Some(child) = child
@@ -381,6 +442,14 @@ mod shim {
             }
         });
         Ok(receiver)
+    }
+
+    /// Whether `sender` shares the shim's process group, whose signals, such as a `kill 0` from
+    /// inside the service, reach the command directly.
+    fn in_own_group(sender: i32) -> bool {
+        Pid::from_raw(sender).is_some_and(|sender| {
+            rustix::process::getpgid(Some(sender)).ok() == Some(rustix::process::getpgrp())
+        })
     }
 
     fn supervisor_alive(supervisor: u32) -> bool {
@@ -544,27 +613,80 @@ mod tests {
             .into_iter()
     }
 
+    fn env(command: &[&str]) -> impl Iterator<Item = (OsString, OsString)> {
+        command
+            .iter()
+            .enumerate()
+            .map(|(index, arg)| {
+                (
+                    OsString::from(format!("{COMMAND_VARIABLE_PREFIX}{index}")),
+                    OsString::from(arg),
+                )
+            })
+            .chain([(OsString::from("HOME"), OsString::from("/home"))])
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+    }
+
     #[test]
     fn shim_arguments_round_trip() -> Result<(), String> {
-        let parsed = ShimArgs::parse(os(&[
-            "--supervisor-pid",
-            "42",
-            "--stop-signal",
-            "INT",
-            "--grace-ms",
-            "1500",
-            "--",
-            "sh",
-            "-c",
-            "echo hi",
-        ]))?;
+        let command = [
+            "sh", "-c", "echo hi", "a", "b", "c", "d", "e", "f", "g", "h", "i",
+        ];
+        let parsed = ShimArgs::parse(
+            os(&[
+                "--supervisor-pid",
+                "42",
+                "--stop-signal",
+                "INT",
+                "--grace-ms",
+                "1500",
+            ]),
+            env(&command),
+        )?;
         assert_eq!(parsed.supervisor, 42);
         assert_eq!(parsed.stop_signal, nix::sys::signal::Signal::SIGINT);
         assert_eq!(parsed.grace, Duration::from_millis(1500));
         assert_eq!(parsed.program, OsString::from("sh"));
         assert_eq!(
             parsed.args,
-            vec![OsString::from("-c"), OsString::from("echo hi")]
+            command[1..].iter().map(OsString::from).collect::<Vec<_>>()
+        );
+        assert_eq!(parsed.carriers.len(), command.len());
+        Ok(())
+    }
+
+    #[test]
+    fn wrapped_commands_stay_out_of_the_shim_argv() -> Result<(), String> {
+        let _ = SHIM.set(PathBuf::from("/bin/micromux"));
+        let Ok(Some(wrapped)) = wrap(
+            Path::new("sh"),
+            &["-c".to_string(), "next dev".to_string()],
+            StopPolicy::default(),
+            std::env::var_os("PATH").as_deref(),
+            Path::new("."),
+        ) else {
+            return Err("containment is on and `sh` exists".to_string());
+        };
+        assert!(
+            !wrapped
+                .args
+                .iter()
+                .any(|arg| arg.to_string_lossy().contains("next")),
+            "{wrapped:?}"
+        );
+        let parsed = ShimArgs::parse(
+            wrapped.args.into_iter().skip(1),
+            wrapped
+                .env
+                .into_iter()
+                .map(|(name, value)| (OsString::from(name), value)),
+        )?;
+        assert_eq!(parsed.program, OsString::from("sh"));
+        assert_eq!(
+            parsed.args,
+            vec![OsString::from("-c"), OsString::from("next dev")]
         );
         Ok(())
     }
@@ -620,8 +742,20 @@ mod tests {
 
     #[test]
     fn shim_arguments_need_a_supervisor_and_a_program() {
-        assert!(ShimArgs::parse(os(&["--", "sh"])).is_err());
-        assert!(ShimArgs::parse(os(&["--supervisor-pid", "1"])).is_err());
-        assert!(ShimArgs::parse(os(&["--supervisor-pid", "1", "--bogus", "--", "sh"])).is_err());
+        assert!(ShimArgs::parse(os(&[]), env(&["sh"])).is_err());
+        assert!(ShimArgs::parse(os(&["--supervisor-pid", "1"]), env(&[])).is_err());
+        assert!(ShimArgs::parse(os(&["--supervisor-pid", "1", "--bogus"]), env(&["sh"])).is_err());
+        // A gap in the numbering would silently drop arguments.
+        let gapped = [
+            (
+                OsString::from(format!("{COMMAND_VARIABLE_PREFIX}0")),
+                OsString::from("sh"),
+            ),
+            (
+                OsString::from(format!("{COMMAND_VARIABLE_PREFIX}2")),
+                OsString::from("x"),
+            ),
+        ];
+        assert!(ShimArgs::parse(os(&["--supervisor-pid", "1"]), gapped.into_iter()).is_err());
     }
 }

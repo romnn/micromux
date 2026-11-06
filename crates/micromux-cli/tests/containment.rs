@@ -13,6 +13,17 @@ use std::os::unix::process::CommandExt as _;
 
 const MICROMUX: &str = env!("CARGO_BIN_EXE_micromux");
 
+/// A `micromux __shim` invocation for `command`, which travels in the environment as the
+/// supervisor passes it.
+fn shim(supervisor: u32, command: &[&str]) -> Command {
+    let mut shim = Command::new(MICROMUX);
+    shim.args(["__shim", "--supervisor-pid", &supervisor.to_string()]);
+    for (index, arg) in command.iter().enumerate() {
+        shim.env(format!("MICROMUX_SHIM_ARG_{index}"), arg);
+    }
+    shim
+}
+
 fn alive(pid: i32) -> bool {
     kill(Pid::from_raw(pid), None).is_ok()
 }
@@ -156,18 +167,11 @@ fn services_restart_after_the_binary_is_removed() -> eyre::Result<()> {
 #[cfg(target_os = "linux")]
 #[test]
 fn shim_starts_commands_with_default_signal_handling() -> eyre::Result<()> {
-    let output = Command::new(MICROMUX)
-        .args([
-            "__shim",
-            "--supervisor-pid",
-            &std::process::id().to_string(),
-            "--",
-            "grep",
-            "-E",
-            "^Sig(Blk|Ign):",
-            "/proc/self/status",
-        ])
-        .output()?;
+    let output = shim(
+        std::process::id(),
+        &["grep", "-E", "^Sig(Blk|Ign):", "/proc/self/status"],
+    )
+    .output()?;
     let status = String::from_utf8(output.stdout)?;
 
     let mask = |name: &str| {
@@ -195,19 +199,20 @@ fn shim_starts_commands_with_default_signal_handling() -> eyre::Result<()> {
 /// shell does.
 #[test]
 fn shim_reports_the_command_status() -> eyre::Result<()> {
-    let shim = |command: &[&str]| -> eyre::Result<Option<i32>> {
-        let supervisor = std::process::id().to_string();
-        let mut args = vec!["__shim", "--supervisor-pid", supervisor.as_str(), "--"];
-        args.extend_from_slice(command);
-        Ok(Command::new(MICROMUX)
-            .args(&args)
+    let run = |command: &[&str]| -> eyre::Result<Option<i32>> {
+        Ok(shim(std::process::id(), command)
             .stderr(Stdio::null())
             .status()?
             .code())
     };
 
-    assert_eq!(shim(&["sh", "-c", "exit 7"])?, Some(7));
-    assert_eq!(shim(&["definitely-not-a-program-micromux"])?, Some(127));
+    assert_eq!(run(&["sh", "-c", "exit 7"])?, Some(7));
+    assert_eq!(run(&["definitely-not-a-program-micromux"])?, Some(127));
+    // The command does not inherit the variables that carried it.
+    assert_eq!(
+        run(&["sh", "-c", "[ -z \"$MICROMUX_SHIM_ARG_0\" ] || exit 9"])?,
+        Some(0)
+    );
     Ok(())
 }
 
@@ -273,17 +278,7 @@ while :; do sleep 0.05; done
 fn shim_reports_real_time_signal_deaths() -> eyre::Result<()> {
     use std::os::unix::process::ExitStatusExt as _;
 
-    let mut shim = Command::new(MICROMUX)
-        .args([
-            "__shim",
-            "--supervisor-pid",
-            &std::process::id().to_string(),
-            "--",
-            "sh",
-            "-c",
-            "kill -s RTMIN+1 $$",
-        ])
-        .spawn()?;
+    let mut shim = shim(std::process::id(), &["sh", "-c", "kill -s RTMIN+1 $$"]).spawn()?;
     let deadline = Instant::now() + Duration::from_secs(10);
     let status = loop {
         if let Some(status) = shim.try_wait()? {
@@ -361,19 +356,19 @@ while :; do sleep 0.05; done
 #[test]
 fn shim_forwards_signals_from_other_processes() -> eyre::Result<()> {
     let directory = tempfile::tempdir()?;
-    let mut shim = Command::new(MICROMUX)
-        .args([
-            "__shim",
-            "--supervisor-pid",
-            &std::process::id().to_string(),
-            "--",
+    let mut shim = shim(
+        std::process::id(),
+        &[
             "sh",
             "-c",
             "trap 'echo usr1 > got; exit 3' USR1; touch ready; while :; do sleep 0.05; done",
-        ])
-        .current_dir(directory.path())
-        .stdin(Stdio::null())
-        .spawn()?;
+        ],
+    )
+    .current_dir(directory.path())
+    .stdin(Stdio::null())
+    // As under the supervisor, the shim leads its group, which the sender is not part of.
+    .process_group(0)
+    .spawn()?;
     let ready = directory.path().join("ready");
     let deadline = Instant::now() + Duration::from_secs(10);
     while !ready.exists() && Instant::now() < deadline {
@@ -421,11 +416,17 @@ fn shim_spares_a_process_group_it_does_not_lead() -> eyre::Result<()> {
     let started = Command::new("sh")
         .args([
             "-c",
-            r#""$0" __shim --supervisor-pid $$ --grace-ms 200 -- sh -c 'echo $$ > command.pid; exec sleep 60' &
+            r#""$0" __shim --supervisor-pid $$ --grace-ms 200 &
 echo $! > shim.pid
 while [ ! -s command.pid ]; do sleep 0.02; done"#,
             MICROMUX,
         ])
+        .env("MICROMUX_SHIM_ARG_0", "sh")
+        .env("MICROMUX_SHIM_ARG_1", "-c")
+        .env(
+            "MICROMUX_SHIM_ARG_2",
+            "echo $$ > command.pid; exec sleep 60",
+        )
         .current_dir(directory.path())
         .stdin(Stdio::null())
         .process_group(group)
@@ -450,5 +451,31 @@ while [ ! -s command.pid ]; do sleep 0.02; done"#,
         "survived the shim's cleanup: {survivors:?}"
     );
     assert!(canary_alive, "the shim signaled a group it does not lead");
+    Ok(())
+}
+
+/// A signal sent to the whole process group from inside the service reaches the command once:
+/// the shim, a member of that group, does not pass it on again.
+#[test]
+fn shim_does_not_forward_signals_from_its_own_group() -> eyre::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let status = shim(
+        std::process::id(),
+        &[
+            "sh",
+            "-c",
+            "trap 'echo usr1 >> got' USR1; kill -USR1 0; sleep 0.5; exit 0",
+        ],
+    )
+    .current_dir(directory.path())
+    .stdin(Stdio::null())
+    .process_group(0)
+    .status()?;
+
+    assert!(status.success(), "{status:?}");
+    assert_eq!(
+        std::fs::read_to_string(directory.path().join("got"))?,
+        "usr1\n"
+    );
     Ok(())
 }
