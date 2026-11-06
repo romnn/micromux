@@ -167,6 +167,13 @@ impl PortRegistry {
         let mut ports = IndexMap::new();
         let mut taken: HashSet<u16> = survey.live.clone();
         taken.extend(excluded.iter().copied());
+        // A name that needs a new port must not take one another name keeps.
+        taken.extend(
+            names
+                .iter()
+                .filter_map(|name| persisted.get(name).copied())
+                .filter(|port| range.contains(port) && !survey.live.contains(port)),
+        );
         for name in names {
             let port = match persisted.get(name).copied() {
                 // A range changed since the assignment: a new one in the range replaces it.
@@ -518,6 +525,31 @@ mod tests {
         assert!(before.values().all(|port| !range.contains(port)));
         assert!(after.values().all(|port| range.contains(port)), "{after:?}");
         assert_eq!(again, after);
+        Ok(())
+    }
+
+    /// A name that needs a new port never takes the port another name keeps.
+    #[test]
+    fn reassigned_names_leave_kept_ports_alone() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let registry = PortRegistry::at(directory.path());
+        let config = Path::new("/projects/one/micromux.yaml");
+
+        let (before, lease) =
+            registry.acquire(config, "one", &names(&["A", "B"]), &[], &DEFAULT_PORT_RANGE)?;
+        drop(lease);
+        let (a, b) = (before["A"], before["B"]);
+        // A two-port range around B that leaves A outside, so A's new port competes with B's.
+        let range = if b.checked_add(1) == Some(a) {
+            b - 1..=b
+        } else {
+            b..=b + 1
+        };
+        let (after, _lease) = registry.acquire(config, "one", &names(&["A", "B"]), &[], &range)?;
+
+        assert_eq!(after["B"], b);
+        assert!(range.contains(&after["A"]), "{after:?}");
+        assert_ne!(after["A"], b);
         Ok(())
     }
 

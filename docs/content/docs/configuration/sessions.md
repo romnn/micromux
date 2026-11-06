@@ -46,7 +46,7 @@ session:
   port_range: { start: 30000, end: 32767 }
 ```
 
-`start` and `end` are inclusive, at least `1024`, and the range must have room for every `allocate_ports` name (the proxy's ports inside it do not count). Staying below `32768` keeps it clear of Linux's ephemeral ports. When the range changes, a session's next start keeps the ports already inside the new range and assigns new ones for the rest.
+`start` and `end` are inclusive, at least `1024`, and the range must have room for every `allocate_ports` name (the proxy's ports inside it do not count). Staying below `32768` keeps it clear of Linux's ephemeral ports. `30000`–`32767` is also the default Kubernetes NodePort range: if a Kubernetes distribution runs directly on the host (k3s, microk8s, rke2), it can intercept connections to those ports even though nothing listens on them, so pick another range there. When the range changes, a session's next start keeps the ports already inside the new range and assigns new ones for the rest.
 
 Names must be environment variable names. `MICROMUX_*` names and the variables micromux sets on every service itself (`TERM`, `CLICOLOR`, `CLICOLOR_FORCE`, `FORCE_COLOR`) are reserved.
 
