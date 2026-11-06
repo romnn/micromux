@@ -6,7 +6,8 @@ use super::{
 use super::{Event, ServiceRuntimeInit, TestEventSink};
 use crate::config::DependencyCondition;
 use crate::model::{DependencyFailure, DependencyFailureReason};
-use crate::{DependencySpec, ServiceEventKind, ServiceMap, health_check::Health};
+use crate::service::StartupMode;
+use crate::{DependencySpec, ServiceEventKind, ServiceKind, ServiceMap, health_check::Health};
 use std::collections::HashMap;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -49,6 +50,35 @@ fn describe_blockers(blocked: &[BlockedDependency]) -> String {
         .join(", ")
 }
 
+/// Whether `target` meets `condition` right now.
+///
+/// A target that is disabled, or whose start was requested, meets nothing until it runs again.
+/// A job meets `started` while it runs and after it completed.
+fn condition_met(
+    condition: DependencyCondition,
+    target: &crate::service::Service,
+    runtime: &ServiceRuntime,
+) -> bool {
+    if runtime.desired == DesiredState::Disabled || runtime.start_requested {
+        return false;
+    }
+    let completed = matches!(runtime.state, State::Exited { exit_code: 0, .. });
+    match condition {
+        DependencyCondition::Started => {
+            matches!(runtime.state, State::Running { .. })
+                || (target.spec.kind == ServiceKind::Job && completed)
+        }
+        DependencyCondition::Healthy => matches!(
+            runtime.state,
+            State::Running {
+                health: Some(Health::Healthy),
+                ..
+            }
+        ),
+        DependencyCondition::CompletedSuccessfully => completed,
+    }
+}
+
 fn blocking_dependencies(
     ctx: &ScheduleContext<'_>,
     service: &crate::service::Service,
@@ -58,33 +88,21 @@ fn blocking_dependencies(
         .depends_on
         .iter()
         .filter_map(|dep| {
-            let condition = dep.condition;
-            let blocked = || BlockedDependency {
+            let Some((target, runtime)) = ctx
+                .services
+                .get(dep.service.as_str())
+                .zip(ctx.runtimes.get(dep.service.as_str()))
+            else {
+                return Some(BlockedDependency {
+                    service: dep.service.clone(),
+                    condition: dep.condition_for(ServiceKind::Service),
+                });
+            };
+            let condition = dep.condition_for(target.spec.kind);
+            (!condition_met(condition, target, runtime)).then(|| BlockedDependency {
                 service: dep.service.clone(),
                 condition,
-            };
-            let Some(runtime) = ctx.runtimes.get(dep.service.as_str()) else {
-                return Some(blocked());
-            };
-
-            if runtime.desired == DesiredState::Disabled || runtime.start_requested {
-                return Some(blocked());
-            }
-
-            let ready = match condition {
-                DependencyCondition::Started => matches!(runtime.state, State::Running { .. }),
-                DependencyCondition::Healthy => matches!(
-                    runtime.state,
-                    State::Running {
-                        health: Some(Health::Healthy),
-                        ..
-                    }
-                ),
-                DependencyCondition::CompletedSuccessfully => {
-                    matches!(runtime.state, State::Exited { exit_code: 0, .. })
-                }
-            };
-            (!ready).then(blocked)
+            })
         })
         .collect()
 }
@@ -113,17 +131,17 @@ fn unmeetable_dependency(
     dependency: &DependencySpec,
     visiting: &mut Vec<ServiceID>,
 ) -> Option<DependencyFailure> {
+    let target = services.get(&dependency.service);
+    let condition =
+        dependency.condition_for(target.map_or(ServiceKind::Service, |target| target.spec.kind));
     let failure = |reason, exit_code| DependencyFailure {
         service: dependency.service.clone(),
-        condition: dependency.condition,
+        condition,
         reason,
         exit_code,
         via: Vec::new(),
     };
-    let (Some(runtime), Some(service)) = (
-        runtimes.get(&dependency.service),
-        services.get(&dependency.service),
-    ) else {
+    let (Some(runtime), Some(service)) = (runtimes.get(&dependency.service), target) else {
         return Some(failure(DependencyFailureReason::Missing, None));
     };
     if runtime.is_retired() {
@@ -144,27 +162,25 @@ fn unmeetable_dependency(
         (Some(_), Some(run_config)) if !runtime.start_requested => run_config.healthcheck.is_some(),
         _ => service.spec.healthcheck.is_some(),
     };
-    if dependency.condition == DependencyCondition::Healthy && !has_healthcheck {
+    if condition == DependencyCondition::Healthy && !has_healthcheck {
         return Some(failure(
             DependencyFailureReason::NoHealthcheck,
             runtime.last_exit_code,
         ));
     }
-    if runtime.running.is_some() {
+    if runtime.running.is_some() || condition_met(condition, service, runtime) {
         return None;
     }
     // A requested start still waits for the dependency's own dependencies.
     match runtime.state {
         _ if runtime.start_requested => {}
         State::Exited { exit_code } => {
-            let completed = dependency.condition == DependencyCondition::CompletedSuccessfully
-                && exit_code == 0;
-            if completed {
-                return None;
-            }
             if !runtime.will_auto_restart(&service.spec.restart, exit_code) {
                 return Some(failure(DependencyFailureReason::Exited, Some(exit_code)));
             }
+        }
+        State::Pending if service.startup_mode == StartupMode::Manual => {
+            return Some(failure(DependencyFailureReason::NotRun, None));
         }
         State::Pending => {}
         State::Starting | State::Running { .. } | State::Killed | State::Disabled => return None,
@@ -214,6 +230,12 @@ fn should_consider_start(
     }
 
     match runtime.state {
+        // A manual job runs only when asked.
+        State::Pending
+            if service.startup_mode == StartupMode::Manual && !runtime.start_requested =>
+        {
+            StartCheck::Skip
+        }
         State::Pending => StartCheck::Consider { exited_code: None },
         State::Starting | State::Running { .. } | State::Killed | State::Disabled => {
             StartCheck::Skip
@@ -364,7 +386,7 @@ fn finish_service_start(
         }
         Err(err) => {
             tracing::error!(?err, service_id, "failed to start service");
-            runtime.finish_failed_start(&service.spec.restart, run_id, -1);
+            runtime.finish_failed_start(&service.spec, run_id, -1);
             sync_model(ctx.writer, service, runtime);
             ctx.writer.append_event(
                 service_id,
@@ -583,10 +605,7 @@ mod tests {
         .into_iter()
         .map(|dependency| crate::DependencySpec {
             service: dependency.name.into_inner(),
-            condition: dependency
-                .condition
-                .map(Spanned::into_inner)
-                .unwrap_or_default(),
+            condition: dependency.condition.map(Spanned::into_inner),
         })
         .collect();
 

@@ -484,6 +484,18 @@
         "name": {
           "type": "string"
         },
+        "kind": {
+          "type": "string",
+          "pattern": "^\\s*([Ss][Ee][Rr][Vv][Ii][Cc][Ee]|[Jj][Oo][Bb])\\s*$",
+          "default": "service",
+          "description": "`service` (the default) runs for as long as the session; `job` runs to completion. A job completes on exit status 0 and fails on any other, never restarts unless it sets `restart: on-failure`, and cannot have a healthcheck. A dependency on a job without a condition waits for it to complete."
+        },
+        "run": {
+          "type": "string",
+          "pattern": "^\\s*([Oo][Nn][-_][Ss][Tt][Aa][Rr][Tt]|[Mm][Aa][Nn][Uu][Aa][Ll])\\s*$",
+          "default": "on-start",
+          "description": "When a job runs: `on-start` (the default) when the session starts, or `manual` only when restarted. Applies only to `kind: job`."
+        },
         "disabled": {
           "type": "boolean",
           "default": false,

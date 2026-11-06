@@ -11,7 +11,7 @@ Running `micromux` with no subcommand opens the TUI for the current project. It'
 
 ## Layout
 
-- **Sidebar** — every service, one row each, showing its lifecycle state: pending, blocked, starting, running, healthy, unhealthy, exited, or disabled. The selected row drives the panes on the right.
+- **Sidebar** — every service, one row each, showing its lifecycle state: pending, blocked, starting, running, healthy, unhealthy, exited, or disabled. A [job]({{< relref "configuration/services.md" >}}#jobs) shows **COMPLETED** once it exited with status 0, grayed out like a disabled service, **FAILED** with its exit code in red, **RETRYING** between attempts, and **IDLE** while a manual job waits to be run. The selected row drives the panes on the right.
 - **Log pane** — the selected service's live output, annotated with the lifecycle transitions that stall it. ANSI color and interactive/redrawing output are supported.
 - **Healthcheck pane** — toggled with `H`, it shows the selected service's latest probe: the command, its exit status, and its output.
 
@@ -22,7 +22,7 @@ The header's right side lists the view keys, which change only what the panes sh
 | Key | Action |
 |---|---|
 | `j` / `k`, `↓` / `↑` | Move the selection |
-| `r` | Restart the selected service |
+| `r` | Restart the selected service, or run the selected job again |
 | `R` | Restart all services |
 | `d` | Disable / enable the selected service |
 | `a` | Enter PTY **input mode** — send keystrokes to the service (exit with `Alt+Esc`) |

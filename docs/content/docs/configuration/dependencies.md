@@ -39,7 +39,7 @@ Each dependency is either a bare service id or an object with a `condition`:
 | `healthy` | reports healthy | a [`healthcheck`]({{< relref "healthchecks.md" >}}) on the dependency |
 | `completed` | exited **successfully** (status 0) | a service that terminates |
 
-A bare string is shorthand for the `started` condition:
+A bare string is shorthand for the `started` condition, or `completed` when the dependency is a [job]({{< relref "services.md" >}}#jobs):
 
 ```yaml
 depends_on:

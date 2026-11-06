@@ -377,7 +377,7 @@ impl<'a> From<&'a Service> for ServiceRuntimeInit<'a> {
 impl ServiceRuntime {
     fn new(init: ServiceRuntimeInit<'_>) -> Self {
         let desired = match init.startup_mode {
-            StartupMode::Enabled => DesiredState::Enabled,
+            StartupMode::Enabled | StartupMode::Manual => DesiredState::Enabled,
             StartupMode::Disabled => DesiredState::Disabled,
         };
         let state = match desired {
@@ -531,6 +531,22 @@ impl ServiceRuntime {
         }
     }
 
+    /// Enable the service without starting it, as a manual job or a completed job waits.
+    fn enable_without_start(&mut self) {
+        self.desired = DesiredState::Enabled;
+        self.start_requested = false;
+        self.clear_logs_on_start = false;
+        self.restart.clear_backoff();
+        self.restart.reset_failure_budget();
+        if matches!(self.state, State::Disabled) && self.running.is_none() {
+            // A job that already completed stays completed rather than pending another run.
+            self.state = match self.last_exit_code {
+                Some(0) => State::Exited { exit_code: 0 },
+                _ => State::Pending,
+            };
+        }
+    }
+
     fn disable(&mut self) {
         self.desired = DesiredState::Disabled;
         self.start_requested = false;
@@ -542,11 +558,11 @@ impl ServiceRuntime {
         }
     }
 
-    fn finish_current_run(&mut self, policy: &service::RestartPolicy, exit_code: i32) {
+    fn finish_current_run(&mut self, spec: &ServiceSpec, exit_code: i32) {
         // Preserve the generation and exit code before dropping the run handle so an exited or
         // disabled service can still be projected with an accurate `run_generation`/`last_exit_code`.
         let Some(running) = self.running.take() else {
-            self.finish_run_state(policy, exit_code, None, false);
+            self.finish_run_state(spec, exit_code, None, false);
             return;
         };
         let (finished_run_id, stable, log_reader) = running.finish();
@@ -557,7 +573,7 @@ impl ServiceRuntime {
                 cancel_at: Some(tokio::time::Instant::now() + POST_EXIT_DRAIN_GRACE),
             });
         }
-        self.finish_run_state(policy, exit_code, Some(finished_run_id), stable);
+        self.finish_run_state(spec, exit_code, Some(finished_run_id), stable);
     }
 
     fn cancel_due_drains(&mut self, service_id: &ServiceID, now: tokio::time::Instant) {
@@ -591,18 +607,13 @@ impl ServiceRuntime {
         }
     }
 
-    fn finish_failed_start(
-        &mut self,
-        policy: &service::RestartPolicy,
-        run_id: RunId,
-        exit_code: i32,
-    ) {
-        self.finish_run_state(policy, exit_code, Some(run_id), false);
+    fn finish_failed_start(&mut self, spec: &ServiceSpec, run_id: RunId, exit_code: i32) {
+        self.finish_run_state(spec, exit_code, Some(run_id), false);
     }
 
     fn finish_run_state(
         &mut self,
-        policy: &service::RestartPolicy,
+        spec: &ServiceSpec,
         exit_code: i32,
         finished_run_id: Option<RunId>,
         stable: bool,
@@ -620,8 +631,11 @@ impl ServiceRuntime {
             self.state = State::Exited { exit_code };
             if self.start_requested {
                 self.restart.clear_backoff();
-            } else if self.will_auto_restart(policy, exit_code) {
-                self.restart.apply_backoff(stable);
+            } else if self.will_auto_restart(&spec.restart, exit_code) {
+                // A job's retries count every failed attempt, however long each ran; only an
+                // explicit restart or enable resets them.
+                self.restart
+                    .apply_backoff(stable && spec.kind == crate::ServiceKind::Service);
             } else {
                 self.restart.clear_backoff();
             }
@@ -662,6 +676,17 @@ pub(super) fn project_snapshot(
         ran_before,
         !runtime.blocked_on.is_empty(),
     );
+    let execution = match (service.spec.kind, execution, runtime.last_exit_code) {
+        (crate::ServiceKind::Job, Execution::Exited, Some(0)) => Execution::Completed,
+        (crate::ServiceKind::Job, Execution::Exited, Some(exit_code))
+            if runtime.desired == DesiredState::Disabled
+                || (!runtime.start_requested
+                    && !runtime.will_auto_restart(&service.spec.restart, exit_code)) =>
+        {
+            Execution::Failed
+        }
+        (_, execution, _) => execution,
+    };
     let health = match (execution, &runtime.state) {
         (Execution::Running, State::Running { health }) => *health,
         _ => None,
@@ -687,6 +712,8 @@ pub(super) fn project_snapshot(
         },
         retired: runtime.retired,
         retired_at_unix_ms: runtime.retired_at_unix_ms,
+        kind: service.spec.kind,
+        manual: service.startup_mode == StartupMode::Manual,
         desired: match runtime.desired {
             DesiredState::Enabled => Desired::Enabled,
             DesiredState::Disabled => Desired::Disabled,
@@ -2187,6 +2214,7 @@ impl SchedulerRuntime {
                             match service.startup_mode {
                                 StartupMode::Enabled => runtime.request_restart(),
                                 StartupMode::Disabled => runtime.disable(),
+                                StartupMode::Manual => runtime.enable_without_start(),
                             }
                         }
                         services.insert(service_id.clone(), service.clone());
@@ -2444,7 +2472,18 @@ impl SchedulerRuntime {
             .get_mut(service_id)
             .ok_or(CommandRejection::UnknownService)?;
         let observed_generation = runtime.run_generation();
-        runtime.request_enable();
+        // Enabling a job never re-runs one that completed, and never runs a manual one: both run
+        // again only on an explicit restart.
+        let waits = services.get(service_id).is_some_and(|service| {
+            service.spec.kind == crate::ServiceKind::Job
+                && (service.startup_mode == StartupMode::Manual
+                    || runtime.last_exit_code == Some(0))
+        });
+        if waits && runtime.running.is_none() {
+            runtime.enable_without_start();
+        } else {
+            runtime.request_enable();
+        }
         self.sync(services, service_id);
         self.append_event(
             service_id,
@@ -2491,6 +2530,12 @@ impl SchedulerRuntime {
                 .services
                 .get_mut(service_id)
                 .filter(|runtime| runtime.desired == DesiredState::Enabled && runtime.is_live())
+                // A manual job runs only when asked for by name.
+                .filter(|_| {
+                    services
+                        .get(service_id)
+                        .is_none_or(|service| service.startup_mode != StartupMode::Manual)
+                })
                 .map(|runtime| {
                     let observed_generation = runtime.run_generation();
                     runtime.request_restart();
@@ -2680,7 +2725,7 @@ impl SchedulerRuntime {
         if let Some(service) = services.get(service_id)
             && let Some(runtime) = self.services.get_mut(service_id)
         {
-            runtime.finish_current_run(&service.spec.restart, exit_code);
+            runtime.finish_current_run(&service.spec, exit_code);
         }
         self.sync(services, service_id);
         let generation = event.run_id().get();

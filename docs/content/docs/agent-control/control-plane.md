@@ -51,10 +51,10 @@ The exit code tells the outcomes apart:
 
 | Code | Meaning |
 |---|---|
-| `0` | The service is healthy; with `--exit`, its run exited with status 0. |
-| `3` | The run exited instead; with `--exit`, it exited with a non-zero status. |
+| `0` | The service is healthy, or the job completed; with `--exit`, its run exited with status 0. |
+| `3` | The run exited instead, or the job failed; with `--exit`, it exited with a non-zero status. |
 | `4` | The service is blocked behind a dependency that failed. |
-| `5` | The service is disabled or retired. |
+| `5` | The service is disabled or retired, or the job finished or is a manual job that has not run, and nothing asked it to run again. |
 | `124` | The timeout elapsed. |
 
 After a restart, pass the generation `ctl restart` printed, so the wait cannot settle on the run the restart replaced:
@@ -93,4 +93,4 @@ Reconciliation **adds** newly-defined services, **retires** removed ones, and **
 
 ## Protocol compatibility
 
-Protocol 3 peers accept additive fields from newer minor revisions. Revision 3.8 changed transient disk-log rotation and reader saturation failures from `LimitExceeded` to the retryable `Busy` code. Revision 3.9 distinguishes an uninitialized disk-reader pool and reports reads that still occupy workers after their callers leave. Revision 3.11 adds `session` to the session description: its name, [browser URLs and allocated ports]({{< relref "../configuration/sessions.md" >}}), and whether the shared proxy serves its routes. Revision 3.12 adds `last_cleanup` to service snapshots and the `CleanupStarted`, `CleanupFinished`, and `CleanupFailed` event kinds for [cleanup commands]({{< relref "../configuration/services.md" >}}#cleanup); older peers read the new kinds as `Unknown`. Revision 3.13 adds `dependency_failure` to service snapshots, naming the dependency that keeps a blocked service from ever starting on its own, and the `DependencyFailed` event kind.
+Protocol 3 peers accept additive fields from newer minor revisions. Revision 3.8 changed transient disk-log rotation and reader saturation failures from `LimitExceeded` to the retryable `Busy` code. Revision 3.9 distinguishes an uninitialized disk-reader pool and reports reads that still occupy workers after their callers leave. Revision 3.11 adds `session` to the session description: its name, [browser URLs and allocated ports]({{< relref "../configuration/sessions.md" >}}), and whether the shared proxy serves its routes. Revision 3.12 adds `last_cleanup` to service snapshots and the `CleanupStarted`, `CleanupFinished`, and `CleanupFailed` event kinds for [cleanup commands]({{< relref "../configuration/services.md" >}}#cleanup); older peers read the new kinds as `Unknown`. Revision 3.13 adds `dependency_failure` to service snapshots, naming the dependency that keeps a blocked service from ever starting on its own, and the `DependencyFailed` event kind. Revision 3.14 adds [jobs]({{< relref "../configuration/services.md" >}}#jobs): `kind` and `manual` on service snapshots and dynamic-service definitions, the `Completed` and `Failed` execution states, and an optional dependency `condition` whose absence means the target's natural condition. Older peers read the new states as `Unknown`, so restart an attached TUI or a running `micromux mcp` after upgrading; an older session ignores `kind` and creates a dynamic job as a service.

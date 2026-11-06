@@ -18,6 +18,7 @@ pub(crate) fn spanned_string(value: &str) -> Spanned<String> {
 pub(crate) fn service_config(name: &str, command: (&str, &[&str])) -> config::Service {
     config::Service {
         name: spanned_string(name),
+        kind: crate::ServiceKind::Service,
         startup_mode: StartupMode::Enabled,
         command: (
             spanned_string(command.0),

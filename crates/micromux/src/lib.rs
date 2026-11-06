@@ -86,7 +86,7 @@ pub use session::{
 };
 pub use spec::{
     DependencySpec, DynamicOrigin, DynamicServiceParams, HealthcheckSpec, Lease,
-    PartialServiceSpec, ServiceOrigin, ServiceSpec, SpecError, SpecField, StopSignal,
+    PartialServiceSpec, ServiceKind, ServiceOrigin, ServiceSpec, SpecError, SpecField, StopSignal,
 };
 pub use structured_log::{
     FIELDS_KEY, LogDisplay, MESSAGE_KEYS, RecordTimestamp, StructuredLogLevel, TIMESTAMP_KEYS,
@@ -473,9 +473,11 @@ pub(crate) fn initial_model_entries(services: &ServiceMap) -> Vec<(ServiceSnapsh
             snapshot.stop_grace_period = service.spec.stop_grace_period;
             snapshot.stop_signal = service.spec.stop_signal;
             snapshot.desired = match service.startup_mode {
-                service::StartupMode::Enabled => Desired::Enabled,
+                service::StartupMode::Enabled | service::StartupMode::Manual => Desired::Enabled,
                 service::StartupMode::Disabled => Desired::Disabled,
             };
+            snapshot.kind = service.spec.kind;
+            snapshot.manual = service.startup_mode == service::StartupMode::Manual;
             snapshot.log_display = service.log_display.clone();
             (snapshot, service.log_retention)
         })

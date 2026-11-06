@@ -137,6 +137,42 @@ mod tests {
     }
 
     #[test]
+    fn job_states_have_their_own_names() {
+        let mut snapshot = micromux::ServiceSnapshot::initial(
+            "seed".to_string(),
+            "seed".to_string(),
+            Vec::new(),
+            None,
+            micromux::RestartPolicy::Never,
+            Vec::new(),
+            None,
+        );
+        snapshot.kind = micromux::ServiceKind::Job;
+        let mut named = |execution, exit_code, manual| {
+            snapshot.execution = execution;
+            snapshot.last_exit_code = exit_code;
+            snapshot.manual = manual;
+            (state_name(&snapshot), crate::style::is_frozen(&snapshot))
+        };
+        assert_eq!(
+            named(micromux::Execution::Completed, Some(0), false),
+            ("COMPLETED".to_string(), true)
+        );
+        assert_eq!(
+            named(micromux::Execution::Failed, Some(137), false),
+            ("FAILED 137".to_string(), false)
+        );
+        assert_eq!(
+            named(micromux::Execution::Exited, Some(1), false),
+            ("RETRYING".to_string(), false)
+        );
+        assert_eq!(
+            named(micromux::Execution::Pending, None, true),
+            ("IDLE".to_string(), false)
+        );
+    }
+
+    #[test]
     fn shell_join_quotes_only_arguments_a_shell_would_split() {
         let argv = vec![
             "sh".to_string(),
@@ -617,15 +653,17 @@ fn build_healthcheck_text(configured: bool, attempts: &[micromux::HealthAttempt]
     out
 }
 
-fn state_name(snapshot: &micromux::ServiceSnapshot) -> &'static str {
+fn state_name(snapshot: &micromux::ServiceSnapshot) -> String {
     if snapshot.retired.is_some() {
-        return "RETIRED";
+        return "RETIRED".to_string();
     }
     if snapshot.desired == micromux::Desired::Disabled {
-        return "DISABLED";
+        return "DISABLED".to_string();
     }
 
-    match snapshot.execution {
+    let job = snapshot.kind == micromux::ServiceKind::Job;
+    let name = match snapshot.execution {
+        micromux::Execution::Pending if snapshot.manual => "IDLE",
         micromux::Execution::Pending => "PENDING",
         micromux::Execution::Blocked => "BLOCKED",
         micromux::Execution::Starting => "STARTING",
@@ -636,9 +674,18 @@ fn state_name(snapshot: &micromux::ServiceSnapshot) -> &'static str {
             None => "RUNNING",
         },
         micromux::Execution::Stopping => "KILLED",
+        // A job's failed run waits for its retry.
+        micromux::Execution::Exited if job => "RETRYING",
         micromux::Execution::Exited => "EXITED",
+        micromux::Execution::Completed => "COMPLETED",
+        micromux::Execution::Failed => {
+            return snapshot
+                .last_exit_code
+                .map_or_else(|| "FAILED".to_string(), |code| format!("FAILED {code}"));
+        }
         micromux::Execution::Unknown => "UNKNOWN",
-    }
+    };
+    name.to_string()
 }
 
 /// Join argv for display, quoting only arguments a shell would split.

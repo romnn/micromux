@@ -49,6 +49,8 @@ pub(crate) struct ServiceDiagnosis {
 
 pub(crate) enum WaitConclusion {
     Healthy(ServiceSnapshot),
+    /// A job's run completed with exit status 0.
+    Completed(ServiceSnapshot),
     Exited(ServiceSnapshot),
     /// The service is blocked behind a dependency that cannot meet its condition.
     DependencyFailed {
@@ -65,6 +67,7 @@ impl WaitConclusion {
     pub(crate) fn snapshot(&self) -> &ServiceSnapshot {
         match self {
             Self::Healthy(snapshot)
+            | Self::Completed(snapshot)
             | Self::Exited(snapshot)
             | Self::DependencyFailed { snapshot, .. }
             | Self::Timeout { snapshot, .. } => snapshot,
@@ -107,7 +110,8 @@ pub(crate) fn service_needs_diagnosis(snapshot: &ServiceSnapshot) -> bool {
     {
         return true;
     }
-    if snapshot.desired == micromux::Desired::Disabled {
+    if snapshot.desired == micromux::Desired::Disabled || snapshot.execution == Execution::Completed
+    {
         return false;
     }
     snapshot.execution != Execution::Running
@@ -134,7 +138,8 @@ pub(crate) fn diagnosis_hint(
     error_log_tail: &[logproc::ProcessedEntry],
 ) -> String {
     match snapshot.execution {
-        Execution::Exited => {
+        Execution::Completed => "job completed with exit status 0".to_string(),
+        Execution::Exited | Execution::Failed => {
             if error_log_tail.is_empty() {
                 "service exited; inspect get_logs for the retained run".to_string()
             } else {
@@ -167,7 +172,7 @@ pub(crate) fn diagnosis_hint(
 }
 
 fn exit_signal(snapshot: &ServiceSnapshot) -> Option<Signal> {
-    if snapshot.execution != Execution::Exited {
+    if !snapshot.execution.has_exited() {
         return None;
     }
     let exit_code = snapshot.last_exit_code?;
@@ -303,7 +308,11 @@ async fn port_signals(snapshot: &ServiceSnapshot) -> Vec<Signal> {
     // a previous run will make the next bind fail.
     if !matches!(
         snapshot.execution,
-        Execution::Pending | Execution::Blocked | Execution::Starting | Execution::Exited
+        Execution::Pending
+            | Execution::Blocked
+            | Execution::Starting
+            | Execution::Exited
+            | Execution::Failed
     ) {
         return Vec::new();
     }
@@ -502,6 +511,18 @@ pub(crate) fn unavailable_error(
     })
 }
 
+/// The error for a wait on a job that will not run again unless asked to.
+pub(crate) fn idle_error(service: &str, snapshot: &ServiceSnapshot) -> ToolError {
+    ToolError::InvalidState(if snapshot.execution == Execution::Pending {
+        format!("manual job `{service}` has not run; run it with restart_service")
+    } else {
+        format!(
+            "job `{service}` has finished and runs again only when restarted; pass the generation \
+             restart_service returns as after_generation"
+        )
+    })
+}
+
 /// The error for a wait on a service blocked behind a dependency that cannot meet its condition.
 pub(crate) fn dependency_failed_error(service: &str, failure: DependencyFailure) -> ToolError {
     ToolError::DependencyFailed {
@@ -524,10 +545,12 @@ pub(crate) async fn wait_for_health(
     match waited {
         SnapshotWait::Matched { snapshot, verdict } => match verdict {
             WaitVerdict::Healthy => Ok(WaitConclusion::Healthy(snapshot)),
+            WaitVerdict::Completed => Ok(WaitConclusion::Completed(snapshot)),
             WaitVerdict::Exited(_) => Ok(WaitConclusion::Exited(snapshot)),
             WaitVerdict::Unavailable => Err(unavailable_error(service, &snapshot, || {
                 format!("service `{service}` is disabled and will not become healthy")
             })),
+            WaitVerdict::Idle => Err(idle_error(service, &snapshot)),
             WaitVerdict::DependencyFailed(failure) => {
                 Ok(WaitConclusion::DependencyFailed { snapshot, failure })
             }
@@ -581,7 +604,12 @@ pub(crate) fn timeout_hint(snapshot: &ServiceSnapshot) -> &'static str {
             "the session reported an unknown service state — inspect list_services"
         }
         Execution::Exited => {
-            "the run has exited — inspect get_logs and the service's last_exit_code"
+            "the run has exited — inspect get_logs and the service's last_exit_code; a job retries \
+             according to its restart policy"
+        }
+        Execution::Completed | Execution::Failed => {
+            "the job has finished and runs again only when restarted — inspect get_logs and the \
+             service's last_exit_code"
         }
     }
 }

@@ -126,12 +126,27 @@ pub struct CleanupFiles {
     pub lock: PathBuf,
 }
 
+/// Whether a service runs for as long as the session does or runs to completion.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+pub enum ServiceKind {
+    /// A long-running process that is restarted according to its policy.
+    #[default]
+    #[serde(alias = "service")]
+    Service,
+    /// A process that runs to completion: exit status 0 completes it, any other status fails it.
+    #[serde(alias = "job")]
+    Job,
+}
+
 /// The normalized, origin-independent definition of one supervised service.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ServiceSpec {
     /// Optional display name. The service id is used when this is absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// Whether the service is long-running or a job that runs to completion.
+    #[serde(default)]
+    pub kind: ServiceKind,
     /// Resolved command argv.
     #[serde(default)]
     pub command: Vec<String>,
@@ -177,6 +192,7 @@ impl Default for ServiceSpec {
     fn default() -> Self {
         Self {
             name: None,
+            kind: ServiceKind::Service,
             command: Vec::new(),
             working_dir: None,
             environment: IndexMap::new(),
@@ -200,6 +216,17 @@ impl ServiceSpec {
     /// stop window is outside the supported range.
     pub fn normalize(&mut self) -> Result<(), SpecError> {
         self.command = normalize_command(&self.command)?;
+        if self.kind == ServiceKind::Job {
+            if self.healthcheck.is_some() {
+                return Err(SpecError::JobHealthcheck);
+            }
+            if matches!(
+                self.restart,
+                RestartPolicy::Always | RestartPolicy::UnlessStopped
+            ) {
+                return Err(SpecError::JobRestartPolicy);
+            }
+        }
         if self.stop_grace_period.is_zero() {
             return Err(SpecError::ZeroStopGracePeriod);
         }
@@ -233,9 +260,21 @@ impl ServiceSpec {
 pub struct DependencySpec {
     /// Target service id.
     pub service: ServiceID,
-    /// State the target must reach.
-    #[serde(default)]
-    pub condition: DependencyCondition,
+    /// State the target must reach; when absent, a job's completion and otherwise a service's
+    /// start.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub condition: Option<DependencyCondition>,
+}
+
+impl DependencySpec {
+    /// The condition this edge waits for on a target of `kind`.
+    #[must_use]
+    pub fn condition_for(&self, kind: ServiceKind) -> DependencyCondition {
+        self.condition.unwrap_or(match kind {
+            ServiceKind::Service => DependencyCondition::Started,
+            ServiceKind::Job => DependencyCondition::CompletedSuccessfully,
+        })
+    }
 }
 
 /// A fully resolved healthcheck definition.
@@ -440,6 +479,9 @@ pub struct PartialServiceSpec {
     #[serde(default, skip_serializing_if = "SpecField::is_unspecified")]
     #[schemars(with = "Option<String>")]
     pub name: SpecField<String>,
+    /// Kind override, such as `Job` for a dynamic one-shot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<ServiceKind>,
     /// Command argv override.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<Vec<String>>,
@@ -484,6 +526,9 @@ impl PartialServiceSpec {
             SpecField::Unspecified => {}
             SpecField::Clear => base.name = None,
             SpecField::Value(name) => base.name = Some(name),
+        }
+        if let Some(kind) = self.kind {
+            base.kind = kind;
         }
         if let Some(command) = self.command {
             base.command = command;
@@ -563,6 +608,12 @@ pub enum SpecError {
     /// An excessive stop grace would make supervisor shutdown unreasonably long.
     #[error("stop grace period must not exceed 5m")]
     StopGracePeriodTooLong,
+    /// A job's readiness is its successful completion, not a probe.
+    #[error("a job cannot have a healthcheck; its dependents wait for it to complete")]
+    JobHealthcheck,
+    /// A job that restarts after it succeeded would be a service.
+    #[error("a job's restart policy must be `no` or `on-failure`")]
+    JobRestartPolicy,
 }
 
 /// Lower a plain argv or Compose-style `CMD`/`CMD-SHELL` form for the current platform.
@@ -708,6 +759,59 @@ mod tests {
             Some(1)
         );
         Ok(())
+    }
+
+    #[test]
+    fn a_dynamic_job_rejects_a_healthcheck_and_restarts_after_success() {
+        let job = ServiceSpec {
+            kind: ServiceKind::Job,
+            command: vec!["true".to_string()],
+            ..ServiceSpec::default()
+        };
+        let mut healthchecked = ServiceSpec {
+            healthcheck: Some(HealthcheckSpec {
+                test: vec!["true".to_string()],
+                ..HealthcheckSpec::default()
+            }),
+            ..job.clone()
+        };
+        assert_eq!(healthchecked.normalize(), Err(SpecError::JobHealthcheck));
+        let mut always = ServiceSpec {
+            restart: RestartPolicy::Always,
+            ..job.clone()
+        };
+        assert_eq!(always.normalize(), Err(SpecError::JobRestartPolicy));
+        let mut retrying = ServiceSpec {
+            restart: RestartPolicy::OnFailure {
+                max_attempts: Some(2),
+            },
+            ..job
+        };
+        assert_eq!(retrying.normalize(), Ok(()));
+    }
+
+    #[test]
+    fn a_bare_dependency_waits_for_a_job_to_complete_and_a_service_to_start() {
+        let bare = DependencySpec {
+            service: "seed".to_string(),
+            condition: None,
+        };
+        assert_eq!(
+            bare.condition_for(ServiceKind::Job),
+            DependencyCondition::CompletedSuccessfully
+        );
+        assert_eq!(
+            bare.condition_for(ServiceKind::Service),
+            DependencyCondition::Started
+        );
+        let healthy = DependencySpec {
+            condition: Some(DependencyCondition::Healthy),
+            ..bare
+        };
+        assert_eq!(
+            healthy.condition_for(ServiceKind::Job),
+            DependencyCondition::Healthy
+        );
     }
 
     #[test]

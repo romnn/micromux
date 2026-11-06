@@ -28,6 +28,7 @@ use crate::config::DependencyCondition;
 use crate::health_check::Health;
 use crate::scheduler::{LogUpdateKind, OutputStream, ServiceID};
 use crate::service::RestartPolicy;
+use crate::spec::ServiceKind;
 use crate::structured_log::LogDisplay;
 
 const KIB: usize = 1024;
@@ -74,11 +75,24 @@ pub enum Execution {
     Running,
     /// A process is live but draining after a restart/disable request.
     Stopping,
-    /// The last process has exited (crash, completion, or stop).
+    /// The last process has exited (crash, completion, or stop); for a job, one whose failed
+    /// run is about to be retried.
     Exited,
+    /// A job's last run exited with status 0.
+    Completed,
+    /// A job's last run exited with a non-zero status and will not be retried.
+    Failed,
     /// A newer peer sent an execution state this binary does not know yet.
     #[serde(other)]
     Unknown,
+}
+
+impl Execution {
+    /// Whether the last run has exited: `Exited`, or a job's `Completed` or `Failed`.
+    #[must_use]
+    pub fn has_exited(self) -> bool {
+        matches!(self, Self::Exited | Self::Completed | Self::Failed)
+    }
 }
 
 /// Origin category exposed on service snapshots.
@@ -121,6 +135,8 @@ pub enum DependencyFailureReason {
     Missing,
     /// The condition is `healthy`, but it has no healthcheck to become healthy by.
     NoHealthcheck,
+    /// It is a manual job that has not been run.
+    NotRun,
     /// A newer peer sent a reason this binary does not know yet.
     #[serde(other)]
     Unknown,
@@ -162,6 +178,7 @@ impl DependencyFailure {
             (DependencyFailureReason::Retired, _) => "is retired".to_string(),
             (DependencyFailureReason::Missing, _) => "is not part of the session".to_string(),
             (DependencyFailureReason::NoHealthcheck, _) => "has no healthcheck".to_string(),
+            (DependencyFailureReason::NotRun, _) => "is a manual job that has not run".to_string(),
             (DependencyFailureReason::Unknown, _) => "cannot meet its condition".to_string(),
         };
         let condition = match self.condition {
@@ -266,6 +283,12 @@ pub struct ServiceSnapshot {
     /// Retirement time in Unix milliseconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retired_at_unix_ms: Option<u64>,
+    /// Whether this is a long-running service or a job that runs to completion.
+    #[serde(default)]
+    pub kind: ServiceKind,
+    /// Whether this is a manual job, which runs only when asked to.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub manual: bool,
     /// Requested state (`Disabled` is a desire, not an execution).
     pub desired: Desired,
     /// Observed lifecycle phase.
@@ -381,6 +404,8 @@ impl ServiceSnapshot {
             dynamic: None,
             retired: None,
             retired_at_unix_ms: None,
+            kind: ServiceKind::Service,
+            manual: false,
             desired: Desired::Enabled,
             execution: Execution::Pending,
             health: None,

@@ -4,7 +4,7 @@ use super::{
 };
 use crate::diagnostics::DiagnosticExt;
 use crate::{
-    DiskLogRetention, LogDisplay, LogLimit, LogRetention, StructuredLogLevel,
+    DiskLogRetention, LogDisplay, LogLimit, LogRetention, ServiceKind, StructuredLogLevel,
     config::InvalidCommandReason,
     service::{RestartPolicy, StartupMode},
 };
@@ -18,6 +18,8 @@ use yaml_spanned::{Mapping, Sequence, Spanned, Value, value::Kind};
 /// about typos that would otherwise silently drop an entire config block.
 const KNOWN_SERVICE_KEYS: &[&str] = &[
     "name",
+    "kind",
+    "run",
     "disabled",
     "command",
     "working_dir",
@@ -1166,11 +1168,15 @@ fn parse_service<F: Copy>(
         diagnostics,
     );
     let name = parse_optional::<String>(mapping.get("name"))?.unwrap_or_else(|| name.clone());
+    let kind = parse_kind(mapping)?;
+    let manual = parse_job_run(mapping, kind)?;
     let disabled = parse_optional::<bool>(mapping.get("disabled"))?
         .map(Spanned::into_inner)
         .unwrap_or(false);
     let startup_mode = if disabled {
         StartupMode::Disabled
+    } else if manual {
+        StartupMode::Manual
     } else {
         StartupMode::Enabled
     };
@@ -1196,9 +1202,14 @@ fn parse_service<F: Copy>(
     let depends_on = parse_depends_on(mapping)?;
     let ports = parse_ports(mapping)?;
     let restart = parse_restart(mapping)?;
-    let restart_policy = restart
-        .clone()
-        .unwrap_or_else(|| defaults.restart_policy.clone());
+    if kind == ServiceKind::Job {
+        validate_job(mapping, restart.as_ref())?;
+    }
+    // The top-level default targets services; a job that sets nothing never restarts.
+    let restart_policy = restart.clone().unwrap_or_else(|| match kind {
+        ServiceKind::Service => defaults.restart_policy.clone(),
+        ServiceKind::Job => RestartPolicy::Never,
+    });
     let stop_grace_period = parse_stop_grace_period(parse_duration(
         mapping.get("stop_grace_period"),
     )?)?
@@ -1222,6 +1233,7 @@ fn parse_service<F: Copy>(
 
     Ok(Service {
         name,
+        kind,
         startup_mode,
         command,
         working_dir,
@@ -1239,6 +1251,66 @@ fn parse_service<F: Copy>(
         log_retention,
         log_display,
     })
+}
+
+/// Parse a service's `kind`: `service` (the default) or `job`.
+fn parse_kind(mapping: &yaml_spanned::Mapping) -> Result<ServiceKind, ConfigError> {
+    let Some(value) = mapping.get("kind") else {
+        return Ok(ServiceKind::Service);
+    };
+    let raw = parse_string_value(value, "kind must be a string")?;
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "service" => Ok(ServiceKind::Service),
+        "job" => Ok(ServiceKind::Job),
+        _ => Err(ConfigError::InvalidValue {
+            message: format!("invalid kind `{raw}`; expected `service` or `job`"),
+            span: value.span().into(),
+        }),
+    }
+}
+
+/// Parse a job's `run`: `on-start` (the default) or `manual`; returns whether it is manual.
+fn parse_job_run(mapping: &yaml_spanned::Mapping, kind: ServiceKind) -> Result<bool, ConfigError> {
+    let Some(value) = mapping.get("run") else {
+        return Ok(false);
+    };
+    if kind != ServiceKind::Job {
+        return Err(ConfigError::InvalidValue {
+            message: "`run` applies only to jobs; set `kind: job` to make this one".to_string(),
+            span: value.span().into(),
+        });
+    }
+    let raw = parse_string_value(value, "run must be a string")?;
+    match raw.trim().to_ascii_lowercase().replace('_', "-").as_str() {
+        "on-start" => Ok(false),
+        "manual" => Ok(true),
+        _ => Err(ConfigError::InvalidValue {
+            message: format!("invalid run `{raw}`; expected `on-start` or `manual`"),
+            span: value.span().into(),
+        }),
+    }
+}
+
+/// Reject the settings a job cannot have: a healthcheck, and a restart after success.
+fn validate_job(
+    mapping: &yaml_spanned::Mapping,
+    restart: Option<&RestartPolicy>,
+) -> Result<(), ConfigError> {
+    if let Some(value) = mapping.get("healthcheck") {
+        return Err(ConfigError::InvalidValue {
+            message: crate::spec::SpecError::JobHealthcheck.to_string(),
+            span: value.span().into(),
+        });
+    }
+    if let (Some(RestartPolicy::Always | RestartPolicy::UnlessStopped), Some(value)) =
+        (restart, mapping.get("restart"))
+    {
+        return Err(ConfigError::InvalidValue {
+            message: crate::spec::SpecError::JobRestartPolicy.to_string(),
+            span: value.span().into(),
+        });
+    }
+    Ok(())
 }
 
 /// Parse a service's `cleanup` mapping: `{ command, timeout }`.
@@ -1741,6 +1813,108 @@ mod tests {
         );
         assert_eq!(diagnostics, Vec::new());
         Ok(())
+    }
+
+    #[test]
+    fn jobs_parse_their_kind_and_run_and_default_to_never_restarting() -> eyre::Result<()> {
+        let yaml = indoc! {r#"
+            version: 1
+            restart: unless-stopped
+            services:
+              seed:
+                kind: job
+                command: ["sh", "-c", "true"]
+              reset:
+                kind: Job
+                run: manual
+                command: ["sh", "-c", "true"]
+              retry:
+                kind: job
+                run: on-start
+                restart: on-failure:3
+                command: ["sh", "-c", "true"]
+              api:
+                command: ["sh", "-c", "true"]
+        "#};
+        let mut diagnostics: Vec<Diagnostic<usize>> = vec![];
+        let parsed = config::from_str(yaml, Path::new("."), 0, None, &mut diagnostics)?;
+
+        let shape = |name| -> eyre::Result<_> {
+            let service = get_service(&parsed.config, name)?;
+            Ok((
+                service.kind,
+                service.startup_mode,
+                service.restart_policy.clone(),
+            ))
+        };
+        assert_eq!(
+            shape("seed")?,
+            (
+                crate::ServiceKind::Job,
+                StartupMode::Enabled,
+                crate::RestartPolicy::Never
+            )
+        );
+        assert_eq!(
+            shape("reset")?,
+            (
+                crate::ServiceKind::Job,
+                StartupMode::Manual,
+                crate::RestartPolicy::Never
+            )
+        );
+        assert_eq!(
+            shape("retry")?,
+            (
+                crate::ServiceKind::Job,
+                StartupMode::Enabled,
+                crate::RestartPolicy::OnFailure {
+                    max_attempts: Some(3)
+                }
+            )
+        );
+        assert_eq!(
+            shape("api")?,
+            (
+                crate::ServiceKind::Service,
+                StartupMode::Enabled,
+                crate::RestartPolicy::UnlessStopped
+            )
+        );
+        assert_eq!(diagnostics, Vec::new());
+        Ok(())
+    }
+
+    #[test]
+    fn jobs_reject_what_only_services_can_have() {
+        let cases = [
+            (
+                "kind: job\n    healthcheck:\n      test: \"true\"",
+                "cannot have a healthcheck",
+            ),
+            (
+                "kind: job\n    restart: always",
+                "must be `no` or `on-failure`",
+            ),
+            (
+                "kind: job\n    restart: unless-stopped",
+                "must be `no` or `on-failure`",
+            ),
+            ("run: manual", "applies only to jobs"),
+            ("kind: cron", "invalid kind"),
+            ("kind: job\n    run: later", "invalid run"),
+        ];
+        for (extra, expected) in cases {
+            let yaml =
+                format!("version: 1\nservices:\n  app:\n    command: \"true\"\n    {extra}\n");
+            let mut diagnostics: Vec<Diagnostic<usize>> = Vec::new();
+            let error = config::from_str(&yaml, Path::new("."), 0, None, &mut diagnostics)
+                .expect_err("a job setting that cannot apply should be rejected");
+            assert!(
+                matches!(&error, config::ConfigError::InvalidValue { message, .. } if message.contains(expected)),
+                "{extra}: {error}"
+            );
+        }
     }
 
     #[test]

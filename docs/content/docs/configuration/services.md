@@ -123,6 +123,50 @@ ports:
   - 5432
 ```
 
+## Jobs
+
+Most entries are **services**: long-running processes that micromux keeps up for as long as the session runs. A **job** runs to completion instead, like a migration, a seed, or a code generator. Mark one with `kind: job`:
+
+```yaml
+services:
+  seed:
+    kind: job
+    command: ./scripts/seed.sh
+    depends_on:
+      - name: postgres
+        condition: healthy
+  api:
+    command: ./run-api
+    depends_on:
+      - seed              # a bare dependency on a job waits for it to complete
+```
+
+| State | Meaning |
+|---|---|
+| `Completed` | The job exited with status 0. The TUI shows it **COMPLETED** and grays it out, like a disabled service. |
+| `Failed` | The job exited with another status and will not be retried. The TUI shows **FAILED** with the exit code, in red. |
+| `Exited` | A failed attempt that `restart: on-failure` is about to retry (**RETRYING** in the TUI). |
+
+- **Dependencies.** A dependency on a job without a `condition` waits for it to complete. `started` is met while the job runs and after it completed. A job has no health, so `condition: healthy` on a job is an error. A failed job makes its dependents [fail fast]({{< relref "dependencies.md" >}}#dependencies-that-cannot-recover).
+- **Restarts.** A job never restarts on its own: it ignores the top-level `restart` default, and may set only `restart: "no"` or `restart: on-failure[:N]`, which retries failures and counts every attempt however long it ran. A job cannot have a `healthcheck`.
+- **Running it again.** Restart it, with `r` in the TUI, `micromux ctl restart <id>`, or `restart_service` over MCP. Enabling a disabled job runs it unless it already completed, and restart-all reruns every job that runs on start.
+- **On demand.** `run: manual` keeps a job from running when the session starts; it shows **IDLE** until you restart it, and restart-all leaves it alone. Use it for jobs you run by hand, such as resetting a database. `run: on-start` is the default.
+- **Waiting.** [`micromux ctl wait`]({{< relref "../agent-control/control-plane.md" >}}#waiting-from-a-script) and the MCP `wait_for_healthy` treat a completed job as ready and a failed one as an exit.
+
+Converting a one-shot service into a job:
+
+```yaml
+# before                                # after
+seed:                                   seed:
+  command: ./seed.sh                      kind: job
+  restart: "no"                           command: ./seed.sh
+api:                                    api:
+  command: ./run-api                      command: ./run-api
+  depends_on:                             depends_on:
+    - name: seed                            - seed
+      condition: completed
+```
+
 ## Disabling a service
 
 Set `disabled: true` to leave a service **disabled when the session starts**. It won't run until you enable it — from the TUI with `d`, or with `micromux ctl enable <id>`:

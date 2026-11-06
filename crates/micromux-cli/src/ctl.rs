@@ -114,6 +114,23 @@ fn print_session(session: &micromux::SessionSummary) {
     }
 }
 
+/// Suffix marking a job, and a manual one.
+fn service_kind_label(service: &micromux::ServiceSnapshot) -> &'static str {
+    match (service.kind, service.manual) {
+        (micromux::ServiceKind::Service, _) => "",
+        (micromux::ServiceKind::Job, false) => " kind=job",
+        (micromux::ServiceKind::Job, true) => " kind=job run=manual",
+    }
+}
+
+/// Suffix with the exit code of a job that failed.
+fn job_exit_label(service: &micromux::ServiceSnapshot) -> String {
+    match (service.execution, service.last_exit_code) {
+        (micromux::Execution::Failed, Some(code)) => format!(" exit_code={code}"),
+        _ => String::new(),
+    }
+}
+
 /// Suffix naming the dependency that holds a blocked service back for good.
 fn dependency_failure_label(service: &micromux::ServiceSnapshot) -> String {
     let Some(failure) = &service.dependency_failure else {
@@ -125,6 +142,7 @@ fn dependency_failure_label(service: &micromux::ServiceSnapshot) -> String {
         micromux::DependencyFailureReason::Retired => "retired",
         micromux::DependencyFailureReason::Missing => "missing",
         micromux::DependencyFailureReason::NoHealthcheck => "no_healthcheck",
+        micromux::DependencyFailureReason::NotRun => "not_run",
         micromux::DependencyFailureReason::Unknown => "unknown",
     };
     let exit_code = failure
@@ -143,12 +161,14 @@ fn print_services(services: &[micromux::ServiceSnapshot]) {
             .health
             .map_or_else(|| "-".to_string(), |health| health.to_string());
         println!(
-            "{:<20} id={} origin={} desired={:?} execution={:?} health={} generation={}{}{}",
+            "{:<20} id={} origin={}{} desired={:?} execution={:?}{} health={} generation={}{}{}",
             service.name,
             service.id,
             service_origin_label(service),
+            service_kind_label(service),
             service.desired,
             service.execution,
+            job_exit_label(service),
             health,
             service.run_generation,
             service_retired_label(service),
@@ -593,6 +613,10 @@ fn report_wait(
             println!("{service} is healthy (generation {generation})");
             Ok(())
         }
+        (WaitVerdict::Completed, _) => {
+            println!("{service} completed (generation {generation})");
+            Ok(())
+        }
         (WaitVerdict::Exited(Some(0)), WaitFor::Exit) => {
             println!("{service} exited with code 0 (generation {generation})");
             Ok(())
@@ -607,6 +631,19 @@ fn report_wait(
         (WaitVerdict::DependencyFailed(failure), _) => {
             eprintln!("{}", wait::dependency_failure_message(service, failure));
             Err(crate::Error::WaitUnmet(WAIT_DEPENDENCY_FAILED))
+        }
+        (WaitVerdict::Idle, _) => {
+            if snapshot.execution == micromux::Execution::Pending {
+                eprintln!(
+                    "{service} is a manual job that has not run; run it with `micromux ctl restart {service}`"
+                );
+            } else {
+                eprintln!(
+                    "{service} finished at generation {generation} and runs again only when restarted; \
+                     pass the generation `ctl restart` prints as --after-generation"
+                );
+            }
+            Err(crate::Error::WaitUnmet(WAIT_UNAVAILABLE))
         }
         (WaitVerdict::Unavailable, _) => {
             let state = if snapshot.retired.is_some() {

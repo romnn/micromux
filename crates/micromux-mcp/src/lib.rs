@@ -47,9 +47,9 @@ use crate::select::ToolError;
 use crate::tools::events::{ServiceEventPage, SessionServiceEvent, merge_service_events};
 use crate::tools::health::{
     ServiceDiagnosis, SnapshotWait, WaitConclusion, bounded_attempt, dependency_failed_error,
-    diagnose_service, health_history, latest_health_for_snapshot, retired_service_message,
-    service_needs_diagnosis, service_snapshot, timeout_hint, unavailable_error, wait_for_health,
-    wait_for_snapshot,
+    diagnose_service, health_history, idle_error, latest_health_for_snapshot,
+    retired_service_message, service_needs_diagnosis, service_snapshot, timeout_hint,
+    unavailable_error, wait_for_health, wait_for_snapshot,
 };
 use crate::tools::logs::{
     FollowGap, ServiceFollowGap, compact_logs_since, current_cursors, current_service_cursor,
@@ -106,7 +106,10 @@ are bounded by session policy unless it explicitly permits `expires_after=\"none
 `renew_dynamic_service` to extend a live lease without restarting. For servers, use \
 `start_dynamic_service_and_wait` for the create/wait/log/events/diagnosis bundle, or compose \
 `start_dynamic_service`, `wait_for_healthy(after_generation=observed_generation)`, and \
-`follow_logs`. Use `wait_for_exit` for one-shot jobs instead of waiting for health. \
+`follow_logs`. A service with `kind: Job` runs to completion: it reports `Completed` (exit 0) or \
+`Failed`, `wait_for_healthy` and `ensure_service_ready` treat completion as ready, and \
+`restart_service` runs it again, a `manual` one included; use `wait_for_exit` when you need the \
+exit code and output of any one-shot run. \
 `ensure_service_ready` can start a missing session, enable a disabled configured service, and wait \
 for readiness in one call. Use `get_service_events` for startup forensics; pass `service=\"*\"` \
 with its per-service cursor map to follow ordering across the session. `restart_service` and \
@@ -837,6 +840,8 @@ struct WaitResult {
 #[serde(rename_all = "snake_case")]
 enum WaitStatus {
     Healthy,
+    /// A job's run completed with exit status 0.
+    Completed,
     Exited,
     DependencyFailed,
     Timeout,
@@ -868,6 +873,12 @@ impl WaitResult {
     fn from_conclusion(service: String, timeout: Duration, conclusion: &WaitConclusion) -> Self {
         match conclusion {
             WaitConclusion::Healthy(snapshot) => Self::healthy(service, snapshot.run_generation),
+            WaitConclusion::Completed(snapshot) => {
+                let mut result = Self::healthy(service, snapshot.run_generation);
+                result.status = WaitStatus::Completed;
+                result.exit_code = Some(Nullable(Some(0)));
+                result
+            }
             WaitConclusion::Exited(snapshot) => {
                 Self::exited(service, snapshot.last_exit_code, snapshot.run_generation)
             }
@@ -2772,11 +2783,17 @@ impl McpServer {
                 return Err(error_data(dependency_failed_error(&args.service, failure)));
             }
             SnapshotWait::Matched {
-                verdict: WaitVerdict::Healthy,
+                snapshot,
+                verdict: WaitVerdict::Idle,
+            } => {
+                return Err(error_data(idle_error(&args.service, &snapshot)));
+            }
+            SnapshotWait::Matched {
+                verdict: WaitVerdict::Healthy | WaitVerdict::Completed,
                 ..
             } => {
                 return Err(error_data(ToolError::Unexpected(
-                    "an exit wait resolved as healthy".to_string(),
+                    "an exit wait resolved without an exit".to_string(),
                 )));
             }
             SnapshotWait::Timeout(snapshot) => (WaitForExitStatus::Timeout, None, snapshot),
@@ -2866,12 +2883,17 @@ impl McpServer {
                 return Err(error_data(enrich_unknown_service(&args.service, err).await));
             }
         };
-        if wait::evaluate(&snapshot, WaitFor::Healthy, None) == Some(WaitVerdict::Healthy) {
+        let ready = match wait::evaluate(&snapshot, WaitFor::Healthy, None) {
+            Some(WaitVerdict::Healthy) => Some(WaitConclusion::Healthy(snapshot.clone())),
+            Some(WaitVerdict::Completed) => Some(WaitConclusion::Completed(snapshot.clone())),
+            _ => None,
+        };
+        if let Some(ready) = ready {
             return Ok(Json(EnsureServiceReadyResult {
                 session_ref: SessionRef::from(&resolved.info),
                 service: args.service.clone(),
                 actions,
-                outcome: WaitResult::healthy(args.service, snapshot.run_generation),
+                outcome: WaitResult::from_conclusion(args.service, Duration::ZERO, &ready),
                 snapshot,
                 diagnosis: None,
             }));
@@ -4025,7 +4047,7 @@ services:
         let mut api = dynamic_params_for("api", &["sh", "-c", "sleep 60"], None);
         api.spec.depends_on = Some(vec![micromux::DependencySpec {
             service: "seed".to_string(),
-            condition: micromux::DependencyCondition::CompletedSuccessfully,
+            condition: Some(micromux::DependencyCondition::CompletedSuccessfully),
         }]);
         server
             .start_dynamic_service(Parameters(DynamicServiceArgs {
