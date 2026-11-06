@@ -47,6 +47,10 @@ enum Error {
     /// The failure was already explained by diagnostics printed to stderr.
     #[error("configuration errors were reported")]
     DiagnosticsEmitted,
+    /// A `ctl wait` ended without its condition and already reported why; the process exits
+    /// with this code.
+    #[error("the wait ended without its condition")]
+    WaitUnmet(i32),
     /// The session was asked to stop before it started.
     #[error(transparent)]
     Interrupted(#[from] micromux::CleanupWaitCancelled),
@@ -576,6 +580,7 @@ async fn async_main() -> color_eyre::Result<()> {
         // backtrace hint would make a config typo read like a crash.
         Err(Error::DiagnosticsEmitted) => std::process::exit(1),
         Err(Error::Interrupted(_)) => std::process::exit(EXIT_INTERRUPTED),
+        Err(Error::WaitUnmet(code)) => std::process::exit(code),
         Err(err) => Err(err.into()),
     }
 }
