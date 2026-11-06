@@ -43,6 +43,10 @@ impl RouteRegistration {
 
     /// Routes do not exist on platforms without a proxy.
     #[cfg(not(unix))]
+    #[expect(
+        clippy::unused_self,
+        reason = "keeps one call shape with the Unix implementation"
+    )]
     pub(crate) fn report_to(
         &self,
         _session: micromux::SessionStatus,
