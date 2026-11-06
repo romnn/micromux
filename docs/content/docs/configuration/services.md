@@ -157,7 +157,7 @@ services:
 
 **Status.** The service's timeline records `CleanupStarted`, then `CleanupFinished` or `CleanupFailed` with the exit code or the timeout, and its status carries `last_cleanup`: the run it followed, whether it succeeded, its exit code, and whether it timed out. The MCP `diagnose` tool reports every service whose last cleanup failed. A failure is only reported: it never blocks a restart or the session.
 
-**When micromux dies.** If micromux is killed, `SIGKILL` included, while a service runs, the service's shim stops the service's processes and then runs the cleanup itself. A cleanup micromux had already started keeps running and finishes, bounded by its timeout. A session started again on the same config waits for such cleanups before it starts any service, and says so: `waiting for the cleanup of infra from the previous session`.
+**When micromux dies.** If micromux is killed, `SIGKILL` included, while a service runs, the service's shim stops the service's processes and then runs the cleanup itself. A cleanup micromux had already started keeps running and finishes, bounded by its timeout. A session started again on the same config waits for such cleanups before it starts any service, and says so: `waiting for the cleanup of infra from the previous session`. A session started through the MCP `start_session` tool may not become reachable within that tool's start timeout while it waits; call `start_session` again once the previous cleanup has finished.
 
 **Exiting at once.** While a session shuts down, micromux names the services whose cleanups it is still waiting for. A second Ctrl-C exits micromux at once, leaving the remaining stops and cleanups to the shims, each still bounded by its stop grace period or timeout.
 

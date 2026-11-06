@@ -586,6 +586,69 @@ services:
     Ok(())
 }
 
+/// A service shim that outlives its supervisor holds the cleanup lock from the moment it starts
+/// tearing the service down, so a restarted session waits for the old tree as well as for its
+/// cleanup.
+#[test]
+fn shims_hold_the_cleanup_lock_through_the_whole_teardown() -> eyre::Result<()> {
+    let directory = tempfile::tempdir()?;
+    std::fs::write(
+        directory.path().join("slow.sh"),
+        "trap 'sleep 3; exit 0' TERM HUP\necho $$ > svc.pid\nwhile :; do sleep 0.05; done\n",
+    )?;
+    std::fs::write(
+        directory.path().join("micromux.yaml"),
+        r#"version: 1
+services:
+  svc:
+    command: ["sh", "./slow.sh"]
+    cleanup:
+      command: ["sh", "-c", "echo done >> cleanups"]
+"#,
+    )?;
+    let state = CleanupState::of(directory.path())?;
+
+    let mut supervisor = serve(Path::new(MICROMUX), directory.path())?;
+    let pids = read_pids(directory.path(), &["svc.pid"], &mut supervisor)?;
+    supervisor.kill()?;
+    supervisor.wait()?;
+
+    // While the service still sits in its slow trap, the cleanup has not run, and its lock is
+    // already taken.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let held = loop {
+        let held = std::fs::File::open(state.lock("svc")?)
+            .is_ok_and(|lock| matches!(lock.try_lock(), Err(std::fs::TryLockError::WouldBlock)));
+        if held || Instant::now() >= deadline {
+            break held;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let cleaned_early = directory.path().join("cleanups").exists();
+    let service_alive = pids.iter().copied().any(alive);
+
+    read_lines(
+        &directory.path().join("cleanups"),
+        1,
+        Duration::from_secs(20),
+    )?;
+    let survivors = survivors_after(&pids, Duration::from_secs(10));
+    assert!(held, "the cleanup lock was free during the teardown");
+    assert!(
+        service_alive,
+        "the service was gone before the lock was checked"
+    );
+    assert!(
+        !cleaned_early,
+        "the cleanup ran before the service was gone"
+    );
+    eyre::ensure!(
+        survivors.is_empty(),
+        "survived the supervisor: {survivors:?}"
+    );
+    Ok(())
+}
+
 /// A cleanup the supervisor started finishes, exactly once and within its timeout, when the
 /// supervisor is killed while it runs.
 #[test]
