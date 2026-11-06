@@ -878,6 +878,7 @@ mod tests {
 
     fn session() -> SessionInfo {
         SessionInfo {
+            session: None,
             protocol_version: micromux_control::PROTOCOL_VERSION,
             id: "session".to_string(),
             pid: 1,

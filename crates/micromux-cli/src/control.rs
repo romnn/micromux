@@ -72,12 +72,15 @@ pub fn spawn(
     };
 
     let identity = SessionIdentity::new(session_name(name, working_dir), working_dir, config_path);
-    let server = Arc::new(ControlServer::new(
-        handles.reader.clone(),
-        handles.service_control(),
-        identity,
-        handles.dynamic_services.clone(),
-    ));
+    let server = Arc::new(
+        ControlServer::new(
+            handles.reader.clone(),
+            handles.service_control(),
+            identity,
+            handles.dynamic_services.clone(),
+        )
+        .with_session_status(handles.session.clone()),
+    );
     tracing::info!(endpoint = ?endpoint, "control plane listening");
 
     tokio::spawn(async move {

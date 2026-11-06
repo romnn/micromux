@@ -244,6 +244,7 @@ pub(crate) async fn already_running_any(
                 pid: None,
                 endpoint: Some(probe.endpoint.to_string()),
                 reason: Some(reason),
+                urls: None,
             }));
         }
     }
@@ -279,6 +280,7 @@ pub(crate) fn start_session_report(info: &SessionInfo, started: bool) -> StartSe
             pid: Some(info.pid),
             endpoint: None,
             reason: None,
+            urls: info.session.as_deref().cloned(),
         }
     } else {
         already_running_report(info)
@@ -296,6 +298,7 @@ fn already_running_report(info: &SessionInfo) -> StartSessionResult {
         pid: Some(info.pid),
         endpoint: None,
         reason: None,
+        urls: info.session.as_deref().cloned(),
     }
 }
 

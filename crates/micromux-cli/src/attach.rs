@@ -132,6 +132,7 @@ mod tests {
         let message = format_ambiguous(&AmbiguousSelection {
             message: "matched two".to_string(),
             candidates: vec![SessionInfo {
+                session: None,
                 protocol_version: PROTOCOL_VERSION,
                 id: "abc123".to_string(),
                 pid: 42,

@@ -485,6 +485,7 @@ mod tests {
 
     fn session(id: &str, pid: u32, start_time: u64, name: &str) -> SessionInfo {
         SessionInfo {
+            session: None,
             protocol_version: PROTOCOL_VERSION,
             id: id.to_string(),
             pid,

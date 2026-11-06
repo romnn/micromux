@@ -94,7 +94,8 @@ const GREP_PATTERN_MAX_BYTES: usize = 64 * 1024;
 
 const INSTRUCTIONS: &str = "Discover and control running micromux sessions. When no `session` is \
 given, tools target the current project's session. Use `find_service` to locate a service across \
-sessions; service-scoped errors also point at matching sibling sessions. Validate a candidate file \
+sessions; service-scoped errors also point at matching sibling sessions. Read a session's browser \
+URLs and allocated ports from `get_session_urls` instead of guessing them. Validate a candidate file \
 with `validate_config`; for an active session's on-disk edits, call `reconcile_config` with \
 `dry_run=true` before applying it. Reconciliation adds, retires, and updates configured services but \
 does not restart changed processes. Before creating a runtime service, use `list_sessions` and check \
@@ -645,6 +646,17 @@ struct StartSessionResult {
     endpoint: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reason: Option<String>,
+    /// The started session's browser URLs and allocated ports.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    urls: Option<micromux::SessionSummary>,
+}
+
+#[derive(Serialize, JsonSchema)]
+struct SessionUrlsResult {
+    config_path: String,
+    /// The session's name, browser URLs, allocated ports, and routing status; absent for a
+    /// session too old to report them.
+    session: Option<micromux::SessionSummary>,
 }
 
 #[derive(Serialize, JsonSchema)]
@@ -1413,14 +1425,35 @@ fn best_effort_mutation_cursor(service: &str, cursor: Result<u64, ToolError>) ->
 impl McpServer {
     #[tool(
         description = "List all micromux sessions currently running for this user, with their \
-        name, pid, config path, working directory, advertised capabilities, and discovery \
-        diagnostics."
+        name, pid, config path, working directory, advertised capabilities, discovery \
+        diagnostics, and under `session` their browser URLs (`routes[].url`), allocated ports, \
+        and routing status."
     )]
     async fn list_sessions(&self) -> ToolResult<SessionListResult> {
         let list = select::list_sessions().await.map_err(error_data)?;
         Ok(Json(SessionListResult {
             sessions: list.sessions,
             diagnostics: list.diagnostics,
+        }))
+    }
+
+    #[tool(
+        description = "Show a session's browser URLs, allocated ports, and whether the shared \
+        proxy serves its routes right now. Open the URLs (such as http://app.<session>.localhost) \
+        in a browser or Playwright; services reach each other on 127.0.0.1:<port> instead, since \
+        only browsers resolve *.localhost everywhere. Read URLs from here instead of guessing them."
+    )]
+    async fn get_session_urls(
+        &self,
+        args: Parameters<SessionArgs>,
+    ) -> ToolResult<SessionUrlsResult> {
+        let Parameters(args) = args;
+        let resolved = select::resolve(&self.cwd, args.session)
+            .await
+            .map_err(error_data)?;
+        Ok(Json(SessionUrlsResult {
+            config_path: resolved.info.config_path,
+            session: resolved.info.session.map(|session| *session),
         }))
     }
 
@@ -3959,6 +3992,7 @@ services:
 
     fn session_info(id: &str, services: &[&str]) -> SessionInfo {
         SessionInfo {
+            session: None,
             protocol_version: PROTOCOL_VERSION,
             id: id.to_string(),
             pid: 4321,

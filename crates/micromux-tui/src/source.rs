@@ -2,6 +2,7 @@
 
 use micromux::{
     Command, HealthAttempt, LogLine, ServiceID, ServiceSnapshot, SessionChange, SessionModelReader,
+    SessionStatus, SessionSummary,
 };
 use tokio::sync::{broadcast, mpsc};
 
@@ -29,6 +30,7 @@ pub struct LocalSource {
     reader: SessionModelReader,
     lifecycle: mpsc::UnboundedSender<Command>,
     notice: Option<String>,
+    session: Option<SessionStatus>,
 }
 
 impl LocalSource {
@@ -47,7 +49,15 @@ impl LocalSource {
             reader,
             lifecycle,
             notice: None,
+            session: None,
         }
+    }
+
+    /// Shows the session's URLs in the header.
+    #[must_use]
+    pub fn with_session(mut self, session: SessionStatus) -> Self {
+        self.session = Some(session);
+        self
     }
 
     /// Attach a persistent operator-visible warning to the local session header.
@@ -192,6 +202,18 @@ impl SessionSource {
         match self {
             Self::Local(_) => None,
             Self::Remote(source) => Some(source.attachment_status()),
+        }
+    }
+
+    /// The session's name, URLs, and ports, when the source knows them.
+    pub(crate) fn session_summary(&self) -> Option<SessionSummary> {
+        match self {
+            Self::Local(source) => source.session.as_ref().map(SessionStatus::current),
+            Self::Remote(source) => source
+                .attachment_status()
+                .session
+                .session
+                .map(|session| *session),
         }
     }
 

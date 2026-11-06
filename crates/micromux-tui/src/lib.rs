@@ -1335,6 +1335,66 @@ mod tests {
         Ok(())
     }
 
+    /// A session with routes shows its URLs under the status row, and says when the proxy does
+    /// not serve them.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn header_shows_session_urls_and_routing_problems() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let yaml = indoc! {r#"
+            version: 1
+            session: { name: tui }
+            proxy: { port: 8080 }
+            routes:
+              - host: app
+                port: 9999
+            services:
+              svc:
+                command: ["true"]
+        "#};
+        let config_path = directory.path().join("micromux.yaml");
+        std::fs::write(&config_path, yaml)?;
+        let mut parsed = micromux::from_str(yaml, directory.path(), 0usize, None, &mut Vec::new())?;
+        parsed.config_path = Some(config_path.canonicalize()?);
+        let registry = micromux::PortRegistry::at(directory.path().join("registry"));
+        let session = micromux::Session::establish(&parsed, &registry)?;
+        let mux = std::sync::Arc::new(micromux::Micromux::with_session(&parsed, session)?);
+        let (_runner, handles) = mux.start(micromux::CancellationToken::new());
+        let mut app = App::new(
+            SessionSource::Local(
+                LocalSource::new(handles.reader, handles.commands.clone())
+                    .with_session(handles.session.clone()),
+            ),
+            Some(handles.terminal),
+            micromux::CancellationToken::new(),
+            LogViewOptions::default(),
+        );
+        let render = |app: &mut App| {
+            let area = ratatui::layout::Rect::new(0, 0, 200, 24);
+            let mut buffer = ratatui::buffer::Buffer::empty(area);
+            ratatui::widgets::Widget::render(&mut *app, area, &mut buffer);
+            (0..area.width)
+                .filter_map(|x| buffer.cell((x, 1)).map(ratatui::buffer::Cell::symbol))
+                .collect::<String>()
+        };
+
+        let urls = render(&mut app);
+        assert!(urls.contains("http://app.tui.localhost:8080"), "{urls}");
+        assert!(!urls.contains("unavailable"), "{urls}");
+
+        handles
+            .session
+            .set_routing(micromux::RoutingStatus::Unavailable {
+                reason: "the proxy stopped answering".to_string(),
+            });
+        let urls = render(&mut app);
+        assert!(
+            urls.contains("routing unavailable: the proxy stopped answering"),
+            "{urls}"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn terminal_eof_is_visible_without_stopping_the_session() -> eyre::Result<()> {
         let mut diagnostics = Vec::new();

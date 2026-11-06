@@ -8,6 +8,7 @@
 
 mod registry;
 mod routes;
+mod status;
 
 use std::path::{Path, PathBuf};
 
@@ -19,6 +20,7 @@ pub use registry::PortRegistry;
 pub(crate) use registry::{Lease, PORT_RANGE};
 pub(crate) use routes::resolve as resolve_routes;
 pub use routes::{CATCH_ALL_HOST, Route, RouteError};
+pub use status::{RoutingStatus, SessionStatus, SessionSummary};
 
 /// Parent domain of every session when the config does not name one.
 pub const DEFAULT_DOMAIN: &str = "localhost";

@@ -8,11 +8,47 @@ use crate::Error;
 /// Keeps a session's routes registered for as long as it is held.
 pub(crate) struct RouteRegistration {
     #[cfg(unix)]
-    #[expect(
-        dead_code,
-        reason = "held for RAII: dropping the registrar unregisters the session's routes"
-    )]
     registrar: micromux_proxy::Registrar,
+}
+
+impl RouteRegistration {
+    /// Reports the registration's status to the session's adapters until `shutdown` fires.
+    #[cfg(unix)]
+    pub(crate) fn report_to(&self, session: micromux::SessionStatus, shutdown: CancellationToken) {
+        let mut status = self.registrar.status();
+        tokio::spawn(async move {
+            loop {
+                let routing = match &*status.borrow_and_update() {
+                    micromux_proxy::RegistrationStatus::Registered => {
+                        micromux::RoutingStatus::Registered
+                    }
+                    micromux_proxy::RegistrationStatus::Unavailable { reason } => {
+                        micromux::RoutingStatus::Unavailable {
+                            reason: reason.clone(),
+                        }
+                    }
+                };
+                session.set_routing(routing);
+                tokio::select! {
+                    () = shutdown.cancelled() => return,
+                    changed = status.changed() => {
+                        if changed.is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    /// Routes do not exist on platforms without a proxy.
+    #[cfg(not(unix))]
+    pub(crate) fn report_to(
+        &self,
+        _session: micromux::SessionStatus,
+        _shutdown: CancellationToken,
+    ) {
+    }
 }
 
 /// Finds or starts the proxy for a session with routes and latches the port it listens on, which

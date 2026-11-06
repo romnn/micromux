@@ -1153,11 +1153,13 @@ impl App {
         status
     }
 
-    /// The header rows at `width`: the session status with the view controls beside it.
+    /// The header rows at `width`: the session status with the view controls beside it, then the
+    /// session's URLs when it has routes.
     ///
     /// When the controls do not fit beside the status, they wrap onto right-aligned rows below
     /// it, so warnings and attach state always keep the first row.
     pub(crate) fn header_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let urls = self.urls_line();
         let width = usize::from(width);
         let status = self.status_line();
         let mut controls = pack_key_hints(&self.view_key_hints(), width);
@@ -1168,11 +1170,35 @@ impl App {
             let mut spans = status.spans;
             spans.push(" ".repeat(gap).into());
             spans.append(&mut single_row.spans);
-            return vec![Line::from(spans)];
+            return std::iter::once(Line::from(spans)).chain(urls).collect();
         }
         std::iter::once(status)
+            .chain(urls)
             .chain(controls.into_iter().map(Line::right_aligned))
             .collect()
+    }
+
+    /// The session's browser URLs, or why the proxy does not serve them right now.
+    fn urls_line(&self) -> Option<Line<'static>> {
+        let session = self.source.session_summary()?;
+        if session.routes.is_empty() {
+            return None;
+        }
+        let mut spans = vec![" ".into(), format!("{} ", session.name).bold()];
+        for route in &session.routes {
+            spans.push(" ".into());
+            spans.push(
+                route
+                    .url
+                    .trim_end_matches('/')
+                    .to_string()
+                    .fg(tailwind::CYAN.c400),
+            );
+        }
+        if let Some(micromux::RoutingStatus::Unavailable { reason }) = &session.routing {
+            spans.push(format!("  routing unavailable: {reason}").fg(tailwind::RED.c400));
+        }
+        Some(Line::from(spans))
     }
 
     /// The footer rows at `width`, wrapping whole key hints onto further rows as needed.

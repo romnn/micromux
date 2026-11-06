@@ -897,6 +897,7 @@ mod tests {
     fn session_listing_dedupes_aliased_sessions() {
         fn info(id: &str, name: &str, pid: u32, start_time: u64) -> SessionInfo {
             SessionInfo {
+                session: None,
                 protocol_version: micromux_control::PROTOCOL_VERSION,
                 id: id.to_string(),
                 pid,
@@ -946,6 +947,7 @@ mod tests {
         let project_dir = tempfile::tempdir()?;
         let config_path = write_config(&project_dir.path().join("micromux.yaml"))?;
         let info = SessionInfo {
+            session: None,
             protocol_version: micromux_control::PROTOCOL_VERSION,
             id: endpoint_hash(&config_path),
             pid: 42,
@@ -979,6 +981,7 @@ mod tests {
             "version: 1\nservices: {}\n",
         )?;
         let info = SessionInfo {
+            session: None,
             protocol_version: micromux_control::PROTOCOL_VERSION,
             id: "live".to_string(),
             pid: 42,
@@ -1016,6 +1019,7 @@ mod tests {
         std::fs::create_dir(&unrelated)?;
 
         let info = SessionInfo {
+            session: None,
             protocol_version: micromux_control::PROTOCOL_VERSION,
             id: "live".to_string(),
             pid: 42,

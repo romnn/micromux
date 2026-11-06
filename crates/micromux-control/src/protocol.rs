@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// Bump the minor for additive changes (new optional/defaulted fields, new tools that reuse
 /// existing requests), and bump the major for incompatible request/response semantics.
-pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(3, 10);
+pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(3, 11);
 
 pub(crate) const fn supports_versioned_subscriptions(version: ProtocolVersion) -> bool {
     version.major() == PROTOCOL_VERSION.major() && version.minor() >= 7
@@ -257,6 +257,9 @@ pub struct SessionInfo {
     /// The micromux version of the session binary.
     #[serde(default)]
     pub micromux_version: String,
+    /// The session's name, browser URLs, allocated ports, and routing status (protocol 3.11+).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<Box<micromux::SessionSummary>>,
     /// Optional capabilities advertised by newer sessions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capabilities: Option<SessionCapabilities>,
@@ -467,6 +470,7 @@ mod tests {
 
     fn session(id: &str, pid: u32, start_time: u64, name: &str) -> SessionInfo {
         SessionInfo {
+            session: None,
             protocol_version: PROTOCOL_VERSION,
             id: id.to_string(),
             pid,
@@ -495,14 +499,14 @@ mod tests {
     fn protocol_version_uses_major_minor_shape_and_accepts_same_major() {
         assert_eq!(
             serde_json::to_value(PROTOCOL_VERSION).unwrap(),
-            json!({ "major": 3, "minor": 10 })
+            json!({ "major": 3, "minor": 11 })
         );
         assert_eq!(
             serde_json::from_value::<ProtocolVersion>(json!({ "major": 1, "minor": 0 })).unwrap(),
             ProtocolVersion::new(1, 0)
         );
 
-        assert!(PROTOCOL_VERSION.is_compatible_with(ProtocolVersion::new(3, 11)));
+        assert!(PROTOCOL_VERSION.is_compatible_with(ProtocolVersion::new(3, 12)));
         assert!(!PROTOCOL_VERSION.is_compatible_with(ProtocolVersion::new(2, 9)));
         assert!(!supports_versioned_subscriptions(ProtocolVersion::new(
             3, 6
@@ -712,7 +716,7 @@ mod tests {
     fn protocol_version_ignores_additive_fields() {
         let version = serde_json::from_value::<ProtocolVersion>(json!({
             "major": 3,
-            "minor": 10,
+            "minor": 11,
             "future_capability": true
         }))
         .unwrap();

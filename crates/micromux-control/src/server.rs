@@ -141,6 +141,7 @@ pub struct ControlServer {
     control: ServiceControl,
     identity: SessionIdentity,
     dynamic_policy: micromux::DynamicServicesPolicy,
+    session: Option<micromux::SessionStatus>,
 }
 
 impl ControlServer {
@@ -157,7 +158,15 @@ impl ControlServer {
             control,
             identity,
             dynamic_policy,
+            session: None,
         }
+    }
+
+    /// Reports the session's name, URLs, and allocated ports in [`crate::Request::Describe`].
+    #[must_use]
+    pub fn with_session_status(mut self, session: micromux::SessionStatus) -> Self {
+        self.session = Some(session);
+        self
     }
 
     /// Accept connections until `shutdown`, then unlink the endpoint (via the guard's `Drop`).
