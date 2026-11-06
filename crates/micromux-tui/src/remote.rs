@@ -24,6 +24,8 @@ const INITIAL_RECONNECT_DELAY: Duration = Duration::from_millis(250);
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(5);
 /// Connected lifetime after which a reconnect is stable enough to reset its backoff.
 const STABLE_CONNECTION_DURATION: Duration = Duration::from_secs(30);
+/// How often an attached TUI re-reads the session description for its URLs and routing status.
+const SESSION_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 
 /// A synchronous mirror of a remote session, maintained by one background task.
 pub struct RemoteSource {
@@ -338,9 +340,22 @@ async fn run_connected(
     commands: &mut mpsc::UnboundedReceiver<RemoteCommand>,
     shutdown: &CancellationToken,
 ) -> ConnectedLoopExit {
+    // The session's routing status changes without any service event, so poll its description.
+    let mut describe = tokio::time::interval(SESSION_REFRESH_INTERVAL);
+    describe.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    describe.reset();
     loop {
         tokio::select! {
             () = shutdown.cancelled() => return ConnectedLoopExit::Shutdown,
+            _ = describe.tick() => {
+                match request.describe().await {
+                    Ok(session) => refresh_summary(store, changes, session),
+                    Err(err) if reconnect_after_refresh_error(&err) => {
+                        return ConnectedLoopExit::Reconnect;
+                    }
+                    Err(err) => record_notice(store, changes, err.to_string()),
+                }
+            }
             command = commands.recv() => {
                 let Some(command) = command else {
                     return ConnectedLoopExit::Shutdown;
@@ -407,6 +422,31 @@ async fn establish(
     store.write().connected = true;
     publish_full_refresh(changes, &service_ids);
     Ok((request, subscription))
+}
+
+/// Takes the session's latest URLs and routing status from a fresh description, waking the TUI
+/// when they changed.
+fn refresh_summary(
+    store: &Arc<RwLock<MirrorStore>>,
+    changes: &broadcast::Sender<SessionChange>,
+    session: SessionInfo,
+) {
+    {
+        let mut guard = store.write();
+        if !guard.session.is_same_instance(&session)
+            || guard.session.session.as_deref() == session.session.as_deref()
+        {
+            return;
+        }
+        guard.session.session = session.session;
+    }
+    publish(
+        changes,
+        SessionChange {
+            service_id: SessionChange::SESSION_WIDE.to_string(),
+            kind: ChangeKind::Status,
+        },
+    );
 }
 
 fn update_session(store: &Arc<RwLock<MirrorStore>>, session: SessionInfo) {
@@ -1102,6 +1142,61 @@ mod tests {
         let (first_retained, lines) = source.logs_since("svc", 2);
         assert_eq!(first_retained, Some(3));
         assert_eq!(lines.len(), 1);
+    }
+
+    /// A periodic description updates the attached view's routing status and wakes the TUI, but
+    /// only when it changed and only for the same session instance.
+    #[test]
+    fn refreshed_descriptions_update_the_session_summary() {
+        let store = store_with(entry_with_log(1, "line"));
+        let (changes, mut received) = broadcast::channel(8);
+        let summary = |routing| micromux::SessionSummary {
+            name: "one".to_string(),
+            domain: "one.localhost".to_string(),
+            host_suffix: "one.localhost".to_string(),
+            proxy_port: 80,
+            routes: Vec::new(),
+            allocated_ports: IndexMap::new(),
+            routing: Some(routing),
+        };
+        let described = |routing| SessionInfo {
+            session: Some(Box::new(summary(routing))),
+            ..session()
+        };
+
+        refresh_summary(
+            &store,
+            &changes,
+            described(micromux::RoutingStatus::Registered),
+        );
+        assert!(received.try_recv().is_ok());
+        refresh_summary(
+            &store,
+            &changes,
+            described(micromux::RoutingStatus::Registered),
+        );
+        assert!(received.try_recv().is_err());
+
+        let unavailable = micromux::RoutingStatus::Unavailable {
+            reason: "gone".to_string(),
+        };
+        refresh_summary(&store, &changes, described(unavailable.clone()));
+        assert_eq!(
+            store
+                .read()
+                .session
+                .session
+                .as_ref()
+                .and_then(|summary| summary.routing.clone()),
+            Some(unavailable)
+        );
+
+        // Another instance's description waits for the reconnect path to replace the mirror.
+        let mut other = described(micromux::RoutingStatus::Registered);
+        other.pid = 2;
+        refresh_summary(&store, &changes, other);
+        assert!(received.try_recv().is_ok());
+        assert!(received.try_recv().is_err());
     }
 
     #[tokio::test]

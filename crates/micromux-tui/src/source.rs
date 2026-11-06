@@ -205,6 +205,15 @@ impl SessionSource {
         }
     }
 
+    /// Follows the local session's URLs and routing status; a remote source reports changes through
+    /// its regular change stream instead.
+    pub(crate) fn summary_changes(&self) -> Option<tokio::sync::watch::Receiver<SessionSummary>> {
+        match self {
+            Self::Local(source) => source.session.as_ref().map(SessionStatus::subscribe),
+            Self::Remote(_) => None,
+        }
+    }
+
     /// The session's name, URLs, and ports, when the source knows them.
     pub(crate) fn session_summary(&self) -> Option<SessionSummary> {
         match self {

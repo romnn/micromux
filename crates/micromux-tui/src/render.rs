@@ -1159,8 +1159,8 @@ impl App {
     /// When the controls do not fit beside the status, they wrap onto right-aligned rows below
     /// it, so warnings and attach state always keep the first row.
     pub(crate) fn header_lines(&self, width: u16) -> Vec<Line<'static>> {
-        let urls = self.urls_line();
         let width = usize::from(width);
+        let urls = self.urls_lines(width);
         let status = self.status_line();
         let mut controls = pack_key_hints(&self.view_key_hints(), width);
         if let [single_row] = controls.as_mut_slice()
@@ -1178,27 +1178,41 @@ impl App {
             .collect()
     }
 
-    /// The session's browser URLs, or why the proxy does not serve them right now.
-    fn urls_line(&self) -> Option<Line<'static>> {
-        let session = self.source.session_summary()?;
+    /// The session's browser URLs, wrapped to `width`, and why the proxy does not serve them
+    /// right now on a row of its own.
+    fn urls_lines(&self, width: usize) -> Vec<Line<'static>> {
+        let Some(session) = self.source.session_summary() else {
+            return Vec::new();
+        };
         if session.routes.is_empty() {
-            return None;
+            return Vec::new();
         }
-        let mut spans = vec![" ".into(), format!("{} ", session.name).bold()];
+        let label = format!(" {} ", session.name);
+        let indent = " ".repeat(label.chars().count());
+        let mut lines = Vec::new();
+        let mut row: Vec<Span<'static>> = vec![label.bold()];
+        let mut row_width = indent.len();
+        let mut row_has_url = false;
         for route in &session.routes {
-            spans.push(" ".into());
-            spans.push(
-                route
-                    .url
-                    .trim_end_matches('/')
-                    .to_string()
-                    .fg(tailwind::CYAN.c400),
-            );
+            let url = route.url.trim_end_matches('/').to_string();
+            let url_width = 1 + url.chars().count();
+            if row_has_url && row_width + url_width > width {
+                lines.push(Line::from(std::mem::take(&mut row)));
+                row.push(indent.clone().into());
+                row_width = indent.len();
+            }
+            row.push(" ".into());
+            row.push(url.fg(tailwind::CYAN.c400));
+            row_width += url_width;
+            row_has_url = true;
         }
+        lines.push(Line::from(row));
         if let Some(micromux::RoutingStatus::Unavailable { reason }) = &session.routing {
-            spans.push(format!("  routing unavailable: {reason}").fg(tailwind::RED.c400));
+            lines.push(Line::from(
+                format!(" routing unavailable: {reason}").fg(tailwind::RED.c400),
+            ));
         }
-        Some(Line::from(spans))
+        lines
     }
 
     /// The footer rows at `width`, wrapping whole key hints onto further rows as needed.
