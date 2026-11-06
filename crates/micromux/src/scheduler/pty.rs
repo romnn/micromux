@@ -1761,6 +1761,8 @@ struct TerminationTaskArgs {
     pty_shutdown: PtyShutdown,
     child: Box<dyn portable_pty::Child + Send + Sync>,
     health_task: Option<tokio::task::JoinHandle<()>>,
+    /// The service's cleanup, which runs once the process exited.
+    cleanup: Option<crate::cleanup::CleanupTask>,
     #[cfg(windows)]
     process_job: win32job::Job,
 }
@@ -1792,20 +1794,6 @@ struct TerminationTarget {
     /// still reach an escapee once the leader is gone.
     #[cfg(unix)]
     retained: Vec<crate::process_tree::Descendant>,
-}
-
-/// Maps the configured graceful-stop signal onto the OS signal to deliver.
-#[cfg(unix)]
-fn stop_signal_to_nix(signal: crate::spec::StopSignal) -> Signal {
-    use crate::spec::StopSignal;
-    match signal {
-        StopSignal::Term => Signal::SIGTERM,
-        StopSignal::Int => Signal::SIGINT,
-        StopSignal::Hup => Signal::SIGHUP,
-        StopSignal::Quit => Signal::SIGQUIT,
-        StopSignal::Usr1 => Signal::SIGUSR1,
-        StopSignal::Usr2 => Signal::SIGUSR2,
-    }
 }
 
 impl TerminationTarget {
@@ -1850,7 +1838,7 @@ impl TerminationTarget {
             // reliably alive, and once it exits its descendants reparent away and
             // become undiscoverable.
             self.refresh_retained().await;
-            let signal = stop_signal_to_nix(stop_signal);
+            let signal = stop_signal.to_nix();
             let delivery = self.signal_leader(signal);
             if delivery == LeaderSignal::Missed {
                 self.kill_with_backend();
@@ -2394,36 +2382,40 @@ async fn verify_reaped(
 }
 
 struct FinishChildExitArgs<'a> {
-    wait_result: Result<io::Result<portable_pty::ExitStatus>, tokio::task::JoinError>,
+    exit_code: i32,
     service_id: &'a ServiceID,
     run_id: RunId,
-    pid: Option<u32>,
     events_tx: &'a mpsc::Sender<ProcessEvent>,
     health_task: &'a mut Option<tokio::task::JoinHandle<()>>,
     pending_killed_notification: Option<tokio::task::JoinHandle<()>>,
+    cleanup: Option<crate::cleanup::PreparedCleanup>,
 }
 
 /// Publishes the exit event once the child wait completes, after the health task and
-/// any pending killed notification wind down.
+/// any pending killed notification wind down and the cleanup ran.
 async fn finish_child_exit(args: FinishChildExitArgs<'_>) {
     let FinishChildExitArgs {
-        wait_result,
+        exit_code,
         service_id,
         run_id,
-        pid,
         events_tx,
         health_task,
         pending_killed_notification,
+        cleanup,
     } = args;
     stop_health_task(service_id, health_task).await;
     if let Some(notification) = pending_killed_notification {
         let _ = notification.await;
     }
-    let code = exit_code_from_wait(wait_result, service_id, run_id, pid);
+    let cleanup = match cleanup {
+        Some(cleanup) => Some(cleanup.run().await),
+        None => None,
+    };
     let event = ProcessEvent::Exited {
         service_id: service_id.clone(),
         run_id,
-        exit_code: code,
+        exit_code,
+        cleanup,
     };
     let _ = events_tx.send(event).await;
 }
@@ -2472,6 +2464,7 @@ fn spawn_termination_task_with_timing(args: TerminationTaskArgs, timing: Termina
             killer,
             mut child,
             mut health_task,
+            mut cleanup,
             #[cfg(windows)]
             process_job,
         } = args;
@@ -2502,6 +2495,19 @@ fn spawn_termination_task_with_timing(args: TerminationTaskArgs, timing: Termina
                 biased;
                 res = &mut wait_handle => {
                     terminate.cancel();
+                    let exit_code = exit_code_from_wait(res, &service_id, run_id, pid);
+                    // Hand the cleanup to its shim first, so a supervisor that dies during the
+                    // reap below still leaves the cleanup to run.
+                    let cleanup = cleanup.take().map(crate::cleanup::CleanupTask::prepare);
+                    if cleanup.is_some() {
+                        let _ = events_tx
+                            .send(ProcessEvent::CleanupStarted {
+                                service_id: service_id.clone(),
+                                run_id,
+                                exit_code,
+                            })
+                            .await;
+                    }
                     // The kill must land before `Exited`: that event frees the scheduler
                     // to start a replacement or finish a shutdown drain, and neither may
                     // outrun live escapees. The writer is released first so the grace
@@ -2524,13 +2530,13 @@ fn spawn_termination_task_with_timing(args: TerminationTaskArgs, timing: Termina
                         to_verify.extend(reaped);
                     }
                     finish_child_exit(FinishChildExitArgs {
-                        wait_result: res,
+                        exit_code,
                         service_id: &service_id,
                         run_id,
-                        pid,
                         events_tx: &events_tx,
                         health_task: &mut health_task,
                         pending_killed_notification: pending_killed_notification.take(),
+                        cleanup,
                     }).await;
                     break;
                 }
@@ -2661,9 +2667,15 @@ pub(super) fn start_service_with_pty_size(
         .get("PATH")
         .map(std::ffi::OsString::from)
         .or_else(|| std::env::var_os("PATH"));
-    let wrapped =
-        crate::containment::wrap(&program, args, stop, path.as_deref(), working_dir.as_path())
-            .map_err(|err| Error::operation("failed to spawn in pty", err))?;
+    let wrapped = crate::containment::wrap(
+        &program,
+        args,
+        stop,
+        service.spec.cleanup.as_ref(),
+        path.as_deref(),
+        working_dir.as_path(),
+    )
+    .map_err(|err| Error::operation("failed to spawn in pty", err))?;
     let (mut cmd, carriers) = if let Some(wrapped) = wrapped {
         let mut cmd = CommandBuilder::new(wrapped.program);
         cmd.args(wrapped.args);
@@ -2766,6 +2778,19 @@ pub(super) fn start_service_with_pty_size(
         pty_size: size.clone(),
     });
 
+    let cleanup = service
+        .spec
+        .cleanup
+        .clone()
+        .map(|spec| crate::cleanup::CleanupTask {
+            spec,
+            run_generation: run_id.get(),
+            stop_signal: service.spec.stop_signal,
+            environment: env_vars.clone(),
+            working_dir: working_dir.clone(),
+            sink: sink.clone(),
+        });
+
     let health_task = service.spec.healthcheck.clone().map(|health_check| {
         let service_id = service_id.clone();
         let working_dir = working_dir.clone();
@@ -2813,6 +2838,7 @@ pub(super) fn start_service_with_pty_size(
             pty_shutdown,
             child,
             health_task,
+            cleanup,
             #[cfg(windows)]
             process_job,
         },
@@ -4304,6 +4330,7 @@ mod tests {
                     pty_shutdown,
                     child: Box::new(child),
                     health_task: None,
+                    cleanup: None,
                 },
                 TerminationTiming {
                     force_kill_after: Duration::from_millis(10),

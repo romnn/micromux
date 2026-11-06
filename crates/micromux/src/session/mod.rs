@@ -17,7 +17,7 @@ use indexmap::IndexMap;
 use crate::config::{ConfigFile, SessionConfig};
 
 pub use registry::PortRegistry;
-pub(crate) use registry::{DEFAULT_PORT_RANGE, Lease};
+pub(crate) use registry::{DEFAULT_PORT_RANGE, Lease, create_private_dir, user_state_directory};
 pub(crate) use routes::resolve as resolve_routes;
 pub use routes::{CATCH_ALL_HOST, Route, RouteError};
 pub use status::{RoutingStatus, SessionStatus, SessionSummary};

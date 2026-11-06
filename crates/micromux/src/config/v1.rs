@@ -31,6 +31,7 @@ const KNOWN_SERVICE_KEYS: &[&str] = &[
     "restart",
     "stop_grace_period",
     "stop_signal",
+    "cleanup",
     "color",
     "logs",
 ];
@@ -1209,6 +1210,7 @@ fn parse_service<F: Copy>(
         inner: crate::spec::StopSignal::default(),
         span: *span,
     });
+    let cleanup = parse_cleanup(mapping.get("cleanup"), file_id, strict, diagnostics)?;
     let log_retention = parse_log_retention(
         mapping.get("logs"),
         defaults.log_retention,
@@ -1232,10 +1234,59 @@ fn parse_service<F: Copy>(
         restart_policy,
         stop_grace_period,
         stop_signal,
+        cleanup,
         color,
         log_retention,
         log_display,
     })
+}
+
+/// Parse a service's `cleanup` mapping: `{ command, timeout }`.
+fn parse_cleanup<F: Copy>(
+    value: Option<&yaml_spanned::Spanned<Value>>,
+    file_id: F,
+    strict: bool,
+    diagnostics: &mut Vec<Diagnostic<F>>,
+) -> Result<Option<super::Cleanup>, ConfigError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let (span, mapping) = expect_mapping(
+        value,
+        "cleanup must be a mapping such as { command: ..., timeout: 2m }".into(),
+    )?;
+    warn_unknown_keys(
+        mapping,
+        &["command", "timeout"],
+        "cleanup",
+        file_id,
+        strict,
+        diagnostics,
+    );
+    let command =
+        parse_command(
+            mapping
+                .get("command")
+                .ok_or_else(|| ConfigError::MissingKey {
+                    key: "command".to_string(),
+                    message: "cleanup is missing `command`".to_string(),
+                    span: (*span).into(),
+                })?,
+        )?;
+    let timeout =
+        parse_positive_duration(parse_duration(mapping.get("timeout"))?, "cleanup timeout")?;
+    if let Some(timeout) = &timeout
+        && **timeout > crate::spec::MAX_CLEANUP_TIMEOUT
+    {
+        return Err(ConfigError::InvalidValue {
+            message: "cleanup timeout must not exceed 1h".to_string(),
+            span: timeout.span.into(),
+        });
+    }
+    Ok(Some(super::Cleanup {
+        command,
+        timeout: timeout.map_or(crate::spec::DEFAULT_CLEANUP_TIMEOUT, Spanned::into_inner),
+    }))
 }
 
 fn parse_services<F: Copy>(
@@ -2067,6 +2118,152 @@ mod tests {
                 Some("echo \"a b\"")
             );
         }
+        Ok(())
+    }
+
+    /// A `cleanup` takes a command in either form and an optional timeout, defaulting to 60s.
+    #[test]
+    fn cleanup_parses_both_command_forms_and_defaults_its_timeout() -> eyre::Result<()> {
+        let yaml = indoc! {r#"
+            version: 1
+            services:
+              infra:
+                command: docker compose up
+                cleanup:
+                  command: docker compose down --remove-orphans
+                  timeout: 2m
+              db:
+                command: ["sh", "-c", "true"]
+                cleanup:
+                  command: ["sh", "-c", "rm -rf data"]
+              plain:
+                command: "true"
+        "#};
+
+        let mut diagnostics: Vec<Diagnostic<usize>> = vec![];
+        let parsed = config::from_str(yaml, Path::new("."), 0, None, &mut diagnostics)?;
+
+        let command = |cleanup: &config::Cleanup| {
+            std::iter::once(&cleanup.command.0)
+                .chain(&cleanup.command.1)
+                .map(|word| word.as_ref().clone())
+                .collect::<Vec<_>>()
+        };
+        let infra = get_service(&parsed.config, "infra")?
+            .cleanup
+            .as_ref()
+            .ok_or_else(|| eyre::eyre!("infra lost its cleanup"))?;
+        assert_eq!(
+            command(infra),
+            ["docker", "compose", "down", "--remove-orphans"]
+        );
+        assert_eq!(infra.timeout, std::time::Duration::from_secs(120));
+        let db = get_service(&parsed.config, "db")?
+            .cleanup
+            .as_ref()
+            .ok_or_else(|| eyre::eyre!("db lost its cleanup"))?;
+        assert_eq!(command(db), ["sh", "-c", "rm -rf data"]);
+        assert_eq!(db.timeout, crate::spec::DEFAULT_CLEANUP_TIMEOUT);
+        assert_eq!(get_service(&parsed.config, "plain")?.cleanup, None);
+        assert_eq!(diagnostics, Vec::new());
+        Ok(())
+    }
+
+    /// A malformed `cleanup` fails the config with an error that names the problem.
+    #[test]
+    fn malformed_cleanups_are_rejected() {
+        let parse = |cleanup: &str| {
+            let yaml = format!(
+                "version: 1\nservices:\n  app:\n    command: \"true\"\n    cleanup: {cleanup}\n"
+            );
+            let mut diagnostics: Vec<Diagnostic<usize>> = Vec::new();
+            config::from_str(&yaml, Path::new("."), 0, None, &mut diagnostics).map(|_| ())
+        };
+
+        // Not a mapping
+        assert!(matches!(
+            parse("docker compose down"),
+            Err(config::ConfigError::UnexpectedType { message, .. }) if message.contains("cleanup must be a mapping")
+        ));
+        // No command
+        assert!(matches!(
+            parse("{ timeout: 2m }"),
+            Err(config::ConfigError::MissingKey { key, .. }) if key == "command"
+        ));
+        // An empty command
+        assert!(parse("{ command: [] }").is_err());
+        // A zero or an excessive timeout
+        assert!(matches!(
+            parse("{ command: \"true\", timeout: 0s }"),
+            Err(config::ConfigError::InvalidValue { message, .. }) if message.contains("cleanup timeout must be greater than zero")
+        ));
+        assert!(matches!(
+            parse("{ command: \"true\", timeout: 61m }"),
+            Err(config::ConfigError::InvalidValue { message, .. }) if message.contains("must not exceed 1h")
+        ));
+        assert!(parse("{ command: \"true\", timeout: 1h }").is_ok());
+        // A timeout that is not a duration
+        assert!(parse("{ command: \"true\", timeout: soon }").is_err());
+    }
+
+    /// An unknown `cleanup` key is a warning, or an error in strict mode.
+    #[test]
+    fn unknown_cleanup_keys_are_diagnosed() -> eyre::Result<()> {
+        let yaml = "version: 1\nservices:\n  app:\n    command: \"true\"\n    cleanup:\n      command: \"true\"\n      retries: 3\n";
+        for strict in [false, true] {
+            let mut diagnostics: Vec<Diagnostic<usize>> = Vec::new();
+            let _ = config::from_str(yaml, Path::new("."), 0, Some(strict), &mut diagnostics)?;
+            let diagnostic = diagnostics
+                .iter()
+                .find(|diagnostic| {
+                    diagnostic
+                        .message
+                        .contains("unknown cleanup field `retries`")
+                })
+                .ok_or_else(|| eyre::eyre!("no diagnostic for the unknown key: {diagnostics:?}"))?;
+            assert_eq!(
+                diagnostic.severity,
+                if strict {
+                    codespan_reporting::diagnostic::Severity::Error
+                } else {
+                    codespan_reporting::diagnostic::Severity::Warning
+                }
+            );
+        }
+        Ok(())
+    }
+
+    /// The published schema accepts the `cleanup` shapes the parser accepts and rejects the ones
+    /// it rejects.
+    #[test]
+    fn cleanup_shapes_match_the_published_schema() -> eyre::Result<()> {
+        let schema: serde_json::Value =
+            serde_json::from_str(include_str!("../../../../micromux.schema.json"))?;
+        let schema = jsonschema::options()
+            .with_draft(jsonschema::Draft::Draft7)
+            .build(&schema)?;
+        let check = |cleanup: &str, accepted: bool| -> eyre::Result<()> {
+            let yaml = format!(
+                "version: 1\nservices:\n  app:\n    command: \"true\"\n    cleanup: {cleanup}\n"
+            );
+            let mut diagnostics: Vec<Diagnostic<usize>> = Vec::new();
+            let parsed = config::from_str(&yaml, Path::new("."), 0, None, &mut diagnostics);
+            let document: serde_json::Value = serde_yaml::from_str(&yaml)?;
+            eyre::ensure!(
+                parsed.is_ok() == accepted,
+                "the parser disagrees about `{cleanup}`"
+            );
+            eyre::ensure!(
+                schema.validate(&document).is_ok() == accepted,
+                "the schema disagrees about `{cleanup}`"
+            );
+            Ok(())
+        };
+        check("{ command: \"docker compose down\" }", true)?;
+        check("{ command: [docker, compose, down], timeout: 2m }", true)?;
+        check("docker compose down", false)?;
+        check("{ timeout: 2m }", false)?;
+        check("{ command: [] }", false)?;
         Ok(())
     }
 

@@ -45,8 +45,16 @@ Every key in `micromux.yaml`. The machine-readable source of truth is [`micromux
 | `restart` | string | [Restart policy]({{< relref "restart-policies.md" >}}) for this service. |
 | `stop_grace_period` | duration | Time between graceful termination and force-kill. Defaults to `10s`; must be greater than zero and no longer than `5m`. |
 | `stop_signal` | string | Signal delivered for the graceful stop request. One of `SIGTERM` (default), `SIGINT`, `SIGHUP`, `SIGQUIT`, `SIGUSR1`, `SIGUSR2`; the `SIG` prefix is optional and matching is case-insensitive. Delivered to the service's process group and — best-effort, via a process-table sweep that cannot guarantee hard containment — to descendants that escaped it, so a non-default choice reaches child processes too. Ignored on Windows. |
+| `cleanup` | object | A [cleanup command]({{< relref "services.md" >}}#cleanup) run after each of the service's processes exits; see [`cleanup`](#cleanup). |
 | `logs` | object | [Log retention]({{< relref "logs.md" >}}) for this service. |
 | `color` | bool | Force color handling for this service. |
+
+## `cleanup`
+
+| Key | Type | Description |
+|---|---|---|
+| `command` | string / array | **Required.** Shell-like string or argv array, [interpolated]({{< relref "services.md" >}}#variable-interpolation) like `command`. Runs in the service's environment and working directory. |
+| `timeout` | duration | How long the cleanup may run before it gets the service's `stop_signal`, and `SIGKILL` 5 seconds later. Defaults to `60s`; must be greater than zero and no longer than `1h`. |
 
 ## `env_file[]`
 

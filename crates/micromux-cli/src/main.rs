@@ -47,9 +47,17 @@ enum Error {
     /// The failure was already explained by diagnostics printed to stderr.
     #[error("configuration errors were reported")]
     DiagnosticsEmitted,
+    /// The session was asked to stop before it started.
+    #[error(transparent)]
+    Interrupted(#[from] micromux::CleanupWaitCancelled),
 }
 
+/// Exit status of a session that an interrupt ended before it could stop cleanly, as a shell
+/// reports `SIGINT`.
+const EXIT_INTERRUPTED: i32 = 130;
+
 fn spawn_shutdown_handler(shutdown: micromux::CancellationToken) {
+    spawn_second_interrupt_handler(shutdown.clone());
     tokio::spawn(async move {
         let ctrl_c = async {
             let _ = tokio::signal::ctrl_c().await;
@@ -97,6 +105,60 @@ fn spawn_shutdown_handler(shutdown: micromux::CancellationToken) {
 
         shutdown.cancel();
     });
+}
+
+/// Exits at once on the first Ctrl-C after the shutdown started, however it started.
+///
+/// The service shims notice the supervisor is gone and finish the remaining stops and cleanups
+/// themselves, each bounded by its stop grace period or cleanup timeout.
+fn spawn_second_interrupt_handler(shutdown: micromux::CancellationToken) {
+    tokio::spawn(async move {
+        shutdown.cancelled().await;
+        if tokio::signal::ctrl_c().await.is_ok() {
+            eprintln!("exiting; service shims finish the remaining stops and cleanups");
+            std::process::exit(EXIT_INTERRUPTED);
+        }
+    });
+}
+
+/// The services of `config` that run a cleanup after each of their processes exits.
+fn services_with_cleanup(config: &micromux::ConfigFile<usize>) -> Vec<micromux::ServiceID> {
+    config
+        .config
+        .services
+        .iter()
+        .filter(|(_, service)| service.cleanup.is_some())
+        .map(|(id, _)| id.as_ref().clone())
+        .collect()
+}
+
+/// Says on stderr which of `with_cleanup` still run a cleanup before the session can exit.
+///
+/// Only services with a live run stop with a cleanup; a run that already ended ran its own.
+fn report_pending_cleanups(
+    with_cleanup: &[micromux::ServiceID],
+    reader: &micromux::SessionModelReader,
+) {
+    let pending = with_cleanup
+        .iter()
+        .filter(|id| {
+            reader.service(id).is_some_and(|snapshot| {
+                matches!(
+                    snapshot.execution,
+                    micromux::Execution::Starting
+                        | micromux::Execution::Running
+                        | micromux::Execution::Stopping
+                )
+            })
+        })
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    if !pending.is_empty() {
+        eprintln!(
+            "stopping; waiting for the cleanup of {} (press Ctrl-C again to exit at once)",
+            pending.join(", ")
+        );
+    }
 }
 
 #[cfg(unix)]
@@ -219,6 +281,15 @@ async fn start_supervisor(
     // Every service and healthcheck runs under the containment shim, so their process trees die
     // with this supervisor even when it is SIGKILLed.
     micromux::containment::enable(shim_executable()?);
+    // A previous session that died may have left cleanups to its shims, which must finish before
+    // this session starts the same services again.
+    micromux::wait_for_previous_cleanups(config, shutdown, |busy| {
+        eprintln!(
+            "waiting for the cleanup of {} from the previous session",
+            busy.join(", ")
+        );
+    })
+    .await?;
     let mut session = micromux::Session::establish(config, &micromux::PortRegistry::user())?;
     proxy::latch_port(&mut session).await?;
     let mux = build_supervisor(config, printer, session)?;
@@ -406,6 +477,8 @@ async fn run() -> Result<(), Error> {
     tokio::select! {
         render_res = &mut tui_handle => {
             shutdown.cancel();
+            // The TUI has given the terminal back, so stderr is readable again.
+            report_pending_cleanups(&services_with_cleanup(&config), &handles.reader);
             let mux_res = mux_handle.await;
             render_res??;
             mux_res??;
@@ -463,6 +536,15 @@ async fn run_headless(options: options::Options) -> Result<(), Error> {
     }
 
     tracing::info!(config = %config_path.display(), "micromux serve: headless supervisor running");
+    tokio::spawn({
+        let shutdown = shutdown.clone();
+        let reader = handles.reader.clone();
+        let with_cleanup = services_with_cleanup(&config);
+        async move {
+            shutdown.cancelled().await;
+            report_pending_cleanups(&with_cleanup, &reader);
+        }
+    });
     tokio::spawn(runner).await??;
     Ok(())
 }
@@ -474,8 +556,16 @@ fn main() -> color_eyre::Result<()> {
     if args.nth(1).as_deref() == Some(std::ffi::OsStr::new(micromux::containment::SHIM_COMMAND)) {
         std::process::exit(micromux::containment::run_shim(args));
     }
-    tokio::runtime::Runtime::new()?.block_on(async_main())
+    let runtime = tokio::runtime::Runtime::new()?;
+    let result = runtime.block_on(async_main());
+    // Dropping the runtime would wait for every blocking task, such as a child wait that never
+    // completes; the session has drained by now, so whatever is left is abandoned.
+    runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
+    result
 }
+
+/// How long the runtime waits for leftover tasks once the session ended.
+const RUNTIME_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 
 async fn async_main() -> color_eyre::Result<()> {
     color_eyre::install()?;
@@ -485,6 +575,7 @@ async fn async_main() -> color_eyre::Result<()> {
         // The diagnostics already explained the failure; a report with a location and a
         // backtrace hint would make a config typo read like a crash.
         Err(Error::DiagnosticsEmitted) => std::process::exit(1),
+        Err(Error::Interrupted(_)) => std::process::exit(EXIT_INTERRUPTED),
         Err(err) => Err(err.into()),
     }
 }

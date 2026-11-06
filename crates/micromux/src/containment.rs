@@ -6,7 +6,7 @@
 //! watches the supervisor:
 //!
 //! - It compares its parent with the supervisor's pid before starting the command and every
-//!   [`POLL_INTERVAL`] afterwards; a different parent means the supervisor is gone.
+//!   `POLL_INTERVAL` afterwards; a different parent means the supervisor is gone.
 //!   A hung-up terminal means the same, or that the supervisor is tearing the service down: a
 //!   dying supervisor closes the terminal before the kernel re-parents the shim, and the hangup
 //!   signal that reaches the shim as session leader starts the cleanup at once.
@@ -24,6 +24,16 @@
 //! command.
 //! When the command exits on its own, the shim exits with the same status.
 //!
+//! A service with a `cleanup` command also hands that command to its shim, which runs it once
+//! it has stopped the service's processes after the supervisor died.
+//! While the supervisor lives, the supervisor runs every cleanup through a second, cleanup-only
+//! shim (`--cleanup-only`).
+//! That shim starts as soon as a run's process exited, waits for the supervisor's go on its
+//! stdin, and finishes the cleanup even if the supervisor dies meanwhile, since a closed stdin
+//! means go as well.
+//! Either shim holds the cleanup lock while it cleans up, so a restarted session can wait for it
+//! (see [`crate::wait_for_previous_cleanups`]).
+//!
 //! What stays outside: a process that detaches in the milliseconds between a forced stop's last
 //! process walk and its group kill, if the supervisor dies right then, and descendants that a
 //! probe detached before it ended.
@@ -40,6 +50,15 @@ pub const SHIM_COMMAND: &str = "__shim";
 #[cfg(unix)]
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
+/// How long a shim whose terminal hung up waits for its supervisor to exit before it concludes
+/// that a live supervisor hung up the terminal to stop the service.
+#[cfg(unix)]
+const SUPERVISOR_EXIT_WAIT: Duration = Duration::from_secs(2);
+
+/// How often a cleanup's shim checks whether the cleanup exited.
+#[cfg(unix)]
+const CLEANUP_POLL_INTERVAL: Duration = Duration::from_millis(25);
+
 /// Exit status of a shim whose command could not be started, as a shell reports it.
 #[cfg(unix)]
 const EXIT_CANNOT_RUN: i32 = 127;
@@ -50,6 +69,10 @@ const EXIT_CANNOT_RUN: i32 = 127;
 /// The command stays out of the shim's own argv, so a `pkill -f` pattern that matches the command
 /// does not match the shim too, which would forward the same signal to the command a second time.
 const COMMAND_VARIABLE_PREFIX: &str = "MICROMUX_SHIM_ARG_";
+
+/// Prefix of the environment variables that carry a service's cleanup command to its shim, like
+/// [`COMMAND_VARIABLE_PREFIX`] does the command itself.
+const CLEANUP_VARIABLE_PREFIX: &str = "MICROMUX_SHIM_CLEANUP_";
 
 /// Exit status of a shim invoked with arguments it does not understand.
 #[cfg(unix)]
@@ -96,6 +119,8 @@ pub(crate) struct Wrapped {
 
 /// How to run `program` with `args` under the shim, or `None` when containment is off.
 ///
+/// `cleanup` is the service's cleanup, which the shim runs itself should the supervisor die;
+/// probes have none.
 /// `path` and `cwd` are the command's `PATH` and working directory.
 ///
 /// # Errors
@@ -112,10 +137,8 @@ pub(crate) struct Wrapped {
 pub(crate) fn wrap(
     program: &Path,
     args: &[String],
-    StopPolicy {
-        signal: stop_signal,
-        grace,
-    }: StopPolicy,
+    stop: StopPolicy,
+    cleanup: Option<&crate::spec::CleanupSpec>,
     path: Option<&std::ffi::OsStr>,
     cwd: &Path,
 ) -> std::io::Result<Option<Wrapped>> {
@@ -126,15 +149,45 @@ pub(crate) fn wrap(
     locate(program, path, cwd)?;
     #[cfg(not(unix))]
     let _ = (path, cwd);
-    Ok(Some(under(
-        shim,
-        program,
+    Ok(Some(under(shim, program, args, stop, cleanup)))
+}
+
+/// How to run `cleanup` under a cleanup-only shim, or `None` when containment is off.
+///
+/// The shim starts the cleanup once it reads a byte from its stdin or the stdin closes, and
+/// enforces the cleanup's timeout itself.
+pub(crate) fn wrap_cleanup(
+    cleanup: &crate::spec::CleanupSpec,
+    stop_signal: crate::spec::StopSignal,
+) -> Option<Wrapped> {
+    SHIM.get()
+        .map(|shim| cleanup_under(shim, cleanup, stop_signal))
+}
+
+/// The command line that runs `cleanup` under a cleanup-only shim at `shim`.
+fn cleanup_under(
+    shim: &Path,
+    cleanup: &crate::spec::CleanupSpec,
+    stop_signal: crate::spec::StopSignal,
+) -> Wrapped {
+    let args = [
+        SHIM_COMMAND,
+        "--cleanup-only",
+        "--stop-signal",
+        stop_signal_name(stop_signal),
+    ]
+    .into_iter()
+    .map(OsString::from)
+    .chain(cleanup_flags(cleanup))
+    .collect();
+    Wrapped {
+        program: shim.to_path_buf(),
         args,
-        StopPolicy {
-            signal: stop_signal,
-            grace,
-        },
-    )))
+        env: carriers(
+            COMMAND_VARIABLE_PREFIX,
+            cleanup.command.iter().map(OsString::from),
+        ),
+    }
 }
 
 /// The command line that runs `program` with `args` under the shim at `shim`.
@@ -146,8 +199,9 @@ fn under(
         signal: stop_signal,
         grace,
     }: StopPolicy,
+    cleanup: Option<&crate::spec::CleanupSpec>,
 ) -> Wrapped {
-    let shim_args: Vec<OsString> = vec![
+    let mut shim_args: Vec<OsString> = vec![
         SHIM_COMMAND.into(),
         "--supervisor-pid".into(),
         std::process::id().to_string().into(),
@@ -156,16 +210,46 @@ fn under(
         "--grace-ms".into(),
         grace.as_millis().to_string().into(),
     ];
-    let env = std::iter::once(program.as_os_str().to_owned())
-        .chain(args.iter().map(OsString::from))
-        .enumerate()
-        .map(|(index, arg)| (format!("{COMMAND_VARIABLE_PREFIX}{index}"), arg))
-        .collect();
+    let mut env = carriers(
+        COMMAND_VARIABLE_PREFIX,
+        std::iter::once(program.as_os_str().to_owned()).chain(args.iter().map(OsString::from)),
+    );
+    if let Some(cleanup) = cleanup {
+        shim_args.extend(cleanup_flags(cleanup));
+        env.extend(carriers(
+            CLEANUP_VARIABLE_PREFIX,
+            cleanup.command.iter().map(OsString::from),
+        ));
+    }
     Wrapped {
         program: shim.to_path_buf(),
         args: shim_args,
         env,
     }
+}
+
+/// The shim flags that describe how to run `cleanup`, apart from its command.
+fn cleanup_flags(cleanup: &crate::spec::CleanupSpec) -> Vec<OsString> {
+    let mut flags: Vec<OsString> = vec![
+        "--cleanup-timeout-ms".into(),
+        cleanup.timeout.as_millis().to_string().into(),
+    ];
+    if let Some(files) = &cleanup.files {
+        flags.extend([
+            "--cleanup-log".into(),
+            files.log.clone().into_os_string(),
+            "--cleanup-lock".into(),
+            files.lock.clone().into_os_string(),
+        ]);
+    }
+    flags
+}
+
+/// The variables that carry `argv`, one per element, named `prefix` plus its position.
+fn carriers(prefix: &str, argv: impl Iterator<Item = OsString>) -> Vec<(String, OsString)> {
+    argv.enumerate()
+        .map(|(index, arg)| (format!("{prefix}{index}"), arg))
+        .collect()
 }
 
 /// Finds the executable `program` names the way `execvp` does: a path with a directory part
@@ -225,8 +309,9 @@ fn stop_signal_name(signal: crate::spec::StopSignal) -> &'static str {
 #[cfg(unix)]
 #[must_use]
 pub fn run_shim(args: impl Iterator<Item = OsString>) -> i32 {
-    match ShimArgs::parse(args, std::env::vars_os()) {
-        Ok(args) => shim::run(&args),
+    match Invocation::parse(args, std::env::vars_os()) {
+        Ok(Invocation::Supervise(args)) => shim::run(&args),
+        Ok(Invocation::CleanupOnly(args)) => shim::run_cleanup_only(&args),
         Err(message) => {
             eprintln!("micromux shim: {message}");
             EXIT_USAGE
@@ -242,6 +327,16 @@ pub fn run_shim(_args: impl Iterator<Item = OsString>) -> i32 {
     2
 }
 
+/// What a shim invocation asks for.
+#[cfg(unix)]
+#[derive(Debug)]
+enum Invocation {
+    /// Run a service or probe command and clean up after it should the supervisor die.
+    Supervise(ShimArgs),
+    /// Run a service's cleanup after one of its processes exited.
+    CleanupOnly(CleanupOnlyArgs),
+}
+
 #[cfg(unix)]
 #[derive(Debug)]
 struct ShimArgs {
@@ -250,94 +345,172 @@ struct ShimArgs {
     grace: Duration,
     program: OsString,
     args: Vec<OsString>,
-    /// The variables that carried the command, which the command does not inherit.
+    /// The service's cleanup, which the shim runs itself once the supervisor is gone.
+    cleanup: Option<Cleanup>,
+    /// The variables that carried the commands, which neither command inherits.
     carriers: Vec<OsString>,
 }
 
 #[cfg(unix)]
-impl ShimArgs {
+#[derive(Debug)]
+struct CleanupOnlyArgs {
+    stop_signal: nix::sys::signal::Signal,
+    cleanup: Cleanup,
+    /// The variables that carried the command, which the command does not inherit.
+    carriers: Vec<OsString>,
+}
+
+/// A cleanup command and how to run it.
+#[cfg(unix)]
+#[derive(Debug)]
+struct Cleanup {
+    /// The program and its arguments; never empty.
+    command: Vec<OsString>,
+    timeout: Duration,
+    log: Option<PathBuf>,
+    lock: Option<PathBuf>,
+}
+
+#[cfg(unix)]
+impl Invocation {
     fn parse(
-        args: impl Iterator<Item = OsString>,
+        mut args: impl Iterator<Item = OsString>,
         env: impl Iterator<Item = (OsString, OsString)>,
     ) -> Result<Self, String> {
-        let mut args = args.peekable();
         let mut supervisor = None;
         let mut stop_signal = nix::sys::signal::Signal::SIGTERM;
         let mut grace = Duration::from_secs(10);
+        let mut cleanup_only = false;
+        let mut cleanup_timeout = None;
+        let mut cleanup_log = None;
+        let mut cleanup_lock = None;
         while let Some(flag) = args.next() {
-            let mut value = || {
-                args.next()
-                    .and_then(|value| value.into_string().ok())
-                    .ok_or_else(|| format!("{} needs a value", flag.to_string_lossy()))
-            };
-            match flag.to_str() {
-                Some("--supervisor-pid") => {
-                    supervisor = Some(value()?.parse().map_err(|err| format!("{err}"))?);
-                }
-                Some("--stop-signal") => {
-                    let name = value()?;
-                    stop_signal = format!("SIG{name}")
+            let name = flag.to_string_lossy().into_owned();
+            match name.as_str() {
+                "--supervisor-pid" => supervisor = Some(number(&mut args, &name)?),
+                "--stop-signal" => {
+                    let signal = text(&mut args, &name)?;
+                    stop_signal = format!("SIG{signal}")
                         .parse()
-                        .map_err(|_| format!("unknown signal `{name}`"))?;
+                        .map_err(|_| format!("unknown signal `{signal}`"))?;
                 }
-                Some("--grace-ms") => {
-                    grace =
-                        Duration::from_millis(value()?.parse().map_err(|err| format!("{err}"))?);
+                "--grace-ms" => grace = Duration::from_millis(number(&mut args, &name)?),
+                "--cleanup-only" => cleanup_only = true,
+                "--cleanup-timeout-ms" => {
+                    cleanup_timeout = Some(Duration::from_millis(number(&mut args, &name)?));
                 }
-                _ => return Err(format!("unknown argument `{}`", flag.to_string_lossy())),
+                "--cleanup-log" => cleanup_log = Some(PathBuf::from(value(&mut args, &name)?)),
+                "--cleanup-lock" => cleanup_lock = Some(PathBuf::from(value(&mut args, &name)?)),
+                _ => return Err(format!("unknown argument `{name}`")),
             }
         }
 
-        let mut command = env
-            .filter_map(|(name, value)| {
-                let index = name
-                    .to_str()?
-                    .strip_prefix(COMMAND_VARIABLE_PREFIX)?
-                    .parse::<usize>()
-                    .ok()?;
-                Some((index, name, value))
-            })
-            .collect::<Vec<_>>();
-        command.sort_by_key(|(index, _, _)| *index);
-        if command
-            .iter()
-            .enumerate()
-            .any(|(position, (index, _, _))| position != *index)
-        {
-            return Err(format!(
-                "{COMMAND_VARIABLE_PREFIX}* is not numbered from zero"
-            ));
-        }
-        let (carriers, mut command): (Vec<_>, Vec<_>) = command
-            .into_iter()
-            .map(|(_, name, value)| (name, value))
-            .unzip();
+        let env = env.collect::<Vec<_>>();
+        let (mut command, mut carriers) = numbered(&env, COMMAND_VARIABLE_PREFIX)?;
+        let (cleanup_command, cleanup_carriers) = numbered(&env, CLEANUP_VARIABLE_PREFIX)?;
+        carriers.extend(cleanup_carriers);
         if command.is_empty() {
             return Err(format!("missing the program in {COMMAND_VARIABLE_PREFIX}0"));
         }
+        let cleanup = |command| {
+            Ok::<_, String>(Cleanup {
+                command,
+                timeout: cleanup_timeout
+                    .ok_or_else(|| "missing --cleanup-timeout-ms".to_string())?,
+                log: cleanup_log.clone(),
+                lock: cleanup_lock.clone(),
+            })
+        };
+        if cleanup_only {
+            return Ok(Self::CleanupOnly(CleanupOnlyArgs {
+                stop_signal,
+                cleanup: cleanup(command)?,
+                carriers,
+            }));
+        }
         let program = command.remove(0);
-        Ok(Self {
+        Ok(Self::Supervise(ShimArgs {
             supervisor: supervisor.ok_or_else(|| "missing --supervisor-pid".to_string())?,
             stop_signal,
             grace,
             program,
             args: command,
+            cleanup: (!cleanup_command.is_empty())
+                .then(|| cleanup(cleanup_command))
+                .transpose()?,
             carriers,
-        })
+        }))
     }
 }
 
 #[cfg(unix)]
+fn value(args: &mut impl Iterator<Item = OsString>, flag: &str) -> Result<OsString, String> {
+    args.next().ok_or_else(|| format!("{flag} needs a value"))
+}
+
+#[cfg(unix)]
+fn text(args: &mut impl Iterator<Item = OsString>, flag: &str) -> Result<String, String> {
+    value(args, flag)?
+        .into_string()
+        .map_err(|_| format!("{flag} needs a UTF-8 value"))
+}
+
+#[cfg(unix)]
+fn number<T: std::str::FromStr<Err: std::fmt::Display>>(
+    args: &mut impl Iterator<Item = OsString>,
+    flag: &str,
+) -> Result<T, String> {
+    text(args, flag)?
+        .parse()
+        .map_err(|err| format!("{flag}: {err}"))
+}
+
+/// The values of the variables named `prefix` plus a number, in order, and the variables' names.
+#[cfg(unix)]
+fn numbered(
+    env: &[(OsString, OsString)],
+    prefix: &str,
+) -> Result<(Vec<OsString>, Vec<OsString>), String> {
+    let mut entries = env
+        .iter()
+        .filter_map(|(name, value)| {
+            let index = name.to_str()?.strip_prefix(prefix)?.parse::<usize>().ok()?;
+            Some((index, name.clone(), value.clone()))
+        })
+        .collect::<Vec<_>>();
+    entries.sort_by_key(|(index, _, _)| *index);
+    // A gap in the numbering would silently drop arguments.
+    if entries
+        .iter()
+        .enumerate()
+        .any(|(position, (index, _, _))| position != *index)
+    {
+        return Err(format!("{prefix}* is not numbered from zero"));
+    }
+    Ok(entries
+        .into_iter()
+        .map(|(_, name, value)| (value, name))
+        .unzip())
+}
+
+#[cfg(unix)]
 mod shim {
-    use std::io::IsTerminal as _;
+    use std::ffi::OsString;
+    use std::fs::File;
+    use std::io::{IsTerminal as _, Read as _, Write as _};
     use std::os::fd::{AsFd as _, BorrowedFd};
+    use std::process::Stdio;
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
     use nix::sys::signal::Signal;
     use rustix::process::{Pid, WaitOptions, WaitStatus};
 
-    use super::{EXIT_CANNOT_RUN, POLL_INTERVAL, ShimArgs};
+    use super::{
+        CLEANUP_POLL_INTERVAL, Cleanup, CleanupOnlyArgs, EXIT_CANNOT_RUN, POLL_INTERVAL,
+        SUPERVISOR_EXIT_WAIT, ShimArgs,
+    };
+    use crate::cleanup::{CLEANUP_STOP_GRACE, EXIT_TIMED_OUT, Ending};
     use crate::process_tree::{self, Descendant};
 
     /// How the main command ended, with the raw signal number so real-time signals survive.
@@ -425,13 +598,204 @@ mod shim {
             }
             let _ = reap(child, &mut ended);
 
-            if !supervisor_alive(args.supervisor) || hung_up() {
-                clean_up(args, stop_requested, child, &mut ended);
+            let supervisor_gone = !supervisor_alive(args.supervisor);
+            if supervisor_gone || hung_up() {
+                // Claim the cleanup's lock before the teardown, so a restarted session waits for
+                // all of it, not just for the cleanup command.
+                let lock = args
+                    .cleanup
+                    .as_ref()
+                    .and_then(|cleanup| cleanup.lock.as_deref())
+                    .and_then(crate::cleanup::try_lock);
+                clean_up(
+                    args.stop_signal,
+                    args.grace,
+                    stop_requested,
+                    child,
+                    &mut ended,
+                );
+                // A live supervisor that hung up the terminal runs the cleanup itself once it
+                // reaps this shim, and exiting releases the lock before it can.
+                if let Some(cleanup) = &args.cleanup
+                    && (supervisor_gone || supervisor_exits(args.supervisor))
+                {
+                    let _ = run_cleanup(cleanup, args.stop_signal, &args.carriers, true, lock);
+                }
                 return status(ended);
             }
             if ended.is_some() {
                 return status(ended);
             }
+        }
+    }
+
+    /// Runs a cleanup once the supervisor says go on stdin, or once the stdin closes because the
+    /// supervisor died, and returns the cleanup's status.
+    ///
+    /// The supervisor already started the log with a header for the run.
+    pub(super) fn run_cleanup_only(args: &CleanupOnlyArgs) -> i32 {
+        // Adopt the cleanup's orphans, so a timeout still reaches what it detached.
+        #[cfg(target_os = "linux")]
+        if let Err(err) = rustix::process::set_child_subreaper(Some(rustix::process::getpid())) {
+            eprintln!("micromux shim: cannot become a subreaper: {err}");
+        }
+        // Absorbs the stop signal that stopping the cleanup sends to the shim's own group.
+        let signals = match watch_signals() {
+            Ok(signals) => signals,
+            Err(err) => {
+                eprintln!("micromux shim: cannot watch signals: {err}");
+                return EXIT_CANNOT_RUN;
+            }
+        };
+        let lock = args.cleanup.lock.as_deref().and_then(lock_or_report);
+        let mut go = [0u8; 1];
+        while let Err(err) = std::io::stdin().read(&mut go) {
+            if err.kind() != std::io::ErrorKind::Interrupted {
+                break;
+            }
+        }
+        let status = run_cleanup(&args.cleanup, args.stop_signal, &args.carriers, false, lock);
+        drop(signals);
+        status
+    }
+
+    /// Whether the supervisor exits within [`SUPERVISOR_EXIT_WAIT`].
+    ///
+    /// A dying supervisor hangs up the terminal before the kernel re-parents the shim, while a
+    /// live one hangs it up only to stop a service that ignores its signals.
+    fn supervisor_exits(supervisor: u32) -> bool {
+        let deadline = Instant::now() + SUPERVISOR_EXIT_WAIT;
+        loop {
+            if !supervisor_alive(supervisor) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(POLL_INTERVAL);
+        }
+    }
+
+    /// Takes the cleanup lock at `path`, waiting for its holder, or reports why it cannot.
+    fn lock_or_report(path: &std::path::Path) -> Option<File> {
+        crate::cleanup::lock(path)
+            .inspect_err(|err| {
+                eprintln!(
+                    "micromux shim: cannot lock {}: {err}; running the cleanup unlocked",
+                    path.display()
+                );
+            })
+            .ok()
+    }
+
+    /// Runs `cleanup` to completion in the shim's own process group and returns its status, 124
+    /// once it ran past its timeout.
+    ///
+    /// Its output goes to the cleanup log, which `fresh` truncates and opens with a header, and
+    /// which gets a footer saying how it ended.
+    /// `lock` is the cleanup lock when the caller already holds it; otherwise it is taken here.
+    /// Whatever the cleanup leaves behind is stopped with it, and a cleanup past its timeout gets
+    /// the stop signal and [`CLEANUP_STOP_GRACE`] before it is killed.
+    ///
+    /// The caller has watched its signals, so the stop signal sent to the shim's own group does
+    /// not end the shim, and on Linux it is a subreaper, so detached processes stay reachable.
+    fn run_cleanup(
+        cleanup: &Cleanup,
+        stop_signal: Signal,
+        carriers: &[OsString],
+        fresh: bool,
+        lock: Option<File>,
+    ) -> i32 {
+        let lock = lock.or_else(|| cleanup.lock.as_deref().and_then(lock_or_report));
+        let mut log = cleanup.log.as_deref().and_then(|path| {
+            crate::cleanup::open_log(path, fresh)
+                .inspect_err(|err| {
+                    eprintln!("micromux shim: cannot open {}: {err}", path.display());
+                })
+                .ok()
+        });
+        if fresh && let Some(log) = &mut log {
+            let _ = writeln!(log, "{}", crate::cleanup::header(None, &cleanup.command));
+        }
+        let output = |log: &Option<File>| {
+            log.as_ref()
+                .and_then(|log| log.try_clone().ok())
+                .map_or_else(Stdio::null, Stdio::from)
+        };
+
+        let spawned = match cleanup.command.split_first() {
+            Some((program, args)) => {
+                let mut command = std::process::Command::new(program);
+                command
+                    .args(args)
+                    .stdin(Stdio::null())
+                    .stdout(output(&log))
+                    .stderr(output(&log));
+                for carrier in carriers {
+                    command.env_remove(carrier);
+                }
+                command
+                    .spawn()
+                    .map_err(|err| Ending::CannotRun(err.to_string()))
+            }
+            None => Err(Ending::CannotRun("the command is empty".to_string())),
+        };
+        let (ending, status) = match spawned {
+            Ok(child) => wait_for_cleanup(
+                i32::try_from(child.id()).ok().and_then(Pid::from_raw),
+                cleanup.timeout,
+                stop_signal,
+            ),
+            Err(ending) => (ending, EXIT_CANNOT_RUN),
+        };
+        if let Some(log) = &mut log {
+            let _ = writeln!(log, "{}", crate::cleanup::footer(&ending));
+        }
+        drop(lock);
+        status
+    }
+
+    /// Waits for the cleanup `child` up to `timeout`, stops what it leaves behind, and returns how
+    /// it ended with the shim's exit status for it.
+    fn wait_for_cleanup(
+        child: Option<Pid>,
+        timeout: Duration,
+        stop_signal: Signal,
+    ) -> (Ending, i32) {
+        let deadline = Instant::now() + timeout;
+        let mut ended = None;
+        let timed_out = loop {
+            let _ = reap(child, &mut ended);
+            if ended.is_some() {
+                break false;
+            }
+            if Instant::now() >= deadline {
+                break true;
+            }
+            std::thread::sleep(CLEANUP_POLL_INTERVAL);
+        };
+        // Stop all of a cleanup past its timeout, and whatever a finished one left behind.
+        let grace = if timed_out {
+            CLEANUP_STOP_GRACE
+        } else {
+            Duration::ZERO
+        };
+        clean_up(stop_signal, grace, None, child, &mut ended);
+
+        match ended {
+            _ if timed_out => (Ending::TimedOut(timeout), EXIT_TIMED_OUT),
+            Some(Ended::Exited(code)) => (Ending::Exited(code), code),
+            Some(Ended::Signaled(signal)) => {
+                let name = Signal::try_from(signal).map_or_else(
+                    |_| format!("signal {signal}"),
+                    |signal| signal.as_str().to_string(),
+                );
+                (Ending::Signaled(name), 128 + signal)
+            }
+            None => (
+                Ending::CannotRun("it could not be waited for".to_string()),
+                1,
+            ),
         }
     }
 
@@ -515,14 +879,17 @@ mod shim {
             .or_else(|| status.terminating_signal().map(Ended::Signaled))
     }
 
-    /// Stops every descendant: the stop signal (unless the supervisor's graceful stop already
-    /// delivered it within the grace period), then SIGKILL after the grace period, until none is
-    /// left.
+    /// Stops every descendant: `stop_signal` (unless the supervisor's graceful stop already
+    /// delivered it within `grace`), then SIGKILL after `grace`, until none is left.
     ///
     /// Every process seen is remembered: a process whose parent exits is re-parented away from
     /// the shim on macOS, where only its recorded identity and group still reach it.
+    ///
+    /// The caller has watched its signals: a shim that leads its process group signals that group,
+    /// itself included.
     fn clean_up(
-        args: &ShimArgs,
+        stop_signal: Signal,
+        grace: Duration,
         stop_requested: Option<Instant>,
         child: Option<Pid>,
         ended: &mut Option<Ended>,
@@ -550,20 +917,18 @@ mod shim {
         // interrupt typed into the terminal is not.
         observe(&mut retained);
         let deadline = match stop_requested {
-            Some(requested) if requested.elapsed() < args.grace => requested + args.grace,
+            Some(requested) if requested.elapsed() < grace => requested + grace,
             _ => {
                 if let Some(group) = own_group.and_then(|group| i32::try_from(group).ok()) {
-                    let _ = nix::sys::signal::killpg(
-                        nix::unistd::Pid::from_raw(group),
-                        args.stop_signal,
-                    );
+                    let _ =
+                        nix::sys::signal::killpg(nix::unistd::Pid::from_raw(group), stop_signal);
                 }
                 for descendant in &retained {
                     if descendant.process_group.is_none() || descendant.process_group != own_group {
-                        let _ = process_tree::send_signal(descendant.stamp, args.stop_signal);
+                        let _ = process_tree::send_signal(descendant.stamp, stop_signal);
                     }
                 }
-                Instant::now() + args.grace
+                Instant::now() + grace
             }
         };
         while Instant::now() < deadline {
@@ -650,12 +1015,54 @@ mod tests {
             .rev()
     }
 
+    fn supervise(
+        args: impl Iterator<Item = OsString>,
+        env: impl Iterator<Item = (OsString, OsString)>,
+    ) -> Result<ShimArgs, String> {
+        match Invocation::parse(args, env)? {
+            Invocation::Supervise(args) => Ok(args),
+            Invocation::CleanupOnly(args) => Err(format!("parsed as cleanup-only: {args:?}")),
+        }
+    }
+
+    fn cleanup_only(
+        args: impl Iterator<Item = OsString>,
+        env: impl Iterator<Item = (OsString, OsString)>,
+    ) -> Result<CleanupOnlyArgs, String> {
+        match Invocation::parse(args, env)? {
+            Invocation::CleanupOnly(args) => Ok(args),
+            Invocation::Supervise(args) => Err(format!("parsed as supervising: {args:?}")),
+        }
+    }
+
+    fn wrapped_env(wrapped: Wrapped) -> impl Iterator<Item = (OsString, OsString)> {
+        wrapped
+            .env
+            .into_iter()
+            .map(|(name, value)| (OsString::from(name), value))
+    }
+
+    fn cleanup_spec(files: bool) -> crate::spec::CleanupSpec {
+        crate::spec::CleanupSpec {
+            command: vec![
+                "docker".to_string(),
+                "compose".to_string(),
+                "down".to_string(),
+            ],
+            timeout: Duration::from_secs(120),
+            files: files.then(|| crate::spec::CleanupFiles {
+                log: PathBuf::from("/state/cleanup/key/infra.log"),
+                lock: PathBuf::from("/state/cleanup/key/infra.lock"),
+            }),
+        }
+    }
+
     #[test]
     fn shim_arguments_round_trip() -> Result<(), String> {
         let command = [
             "sh", "-c", "echo hi", "a", "b", "c", "d", "e", "f", "g", "h", "i",
         ];
-        let parsed = ShimArgs::parse(
+        let parsed = supervise(
             os(&[
                 "--supervisor-pid",
                 "42",
@@ -685,6 +1092,7 @@ mod tests {
             Path::new("sh"),
             &["-c".to_string(), "next dev".to_string()],
             StopPolicy::default(),
+            None,
         );
         assert!(
             !wrapped
@@ -693,13 +1101,9 @@ mod tests {
                 .any(|arg| arg.to_string_lossy().contains("next")),
             "{wrapped:?}"
         );
-        let parsed = ShimArgs::parse(
-            wrapped.args.into_iter().skip(1),
-            wrapped
-                .env
-                .into_iter()
-                .map(|(name, value)| (OsString::from(name), value)),
-        )?;
+        let args = wrapped.args.clone();
+        let parsed = supervise(args.into_iter().skip(1), wrapped_env(wrapped))?;
+        assert!(parsed.cleanup.is_none());
         assert_eq!(parsed.program, OsString::from("sh"));
         assert_eq!(
             parsed.args,
@@ -759,9 +1163,9 @@ mod tests {
 
     #[test]
     fn shim_arguments_need_a_supervisor_and_a_program() {
-        assert!(ShimArgs::parse(os(&[]), env(&["sh"])).is_err());
-        assert!(ShimArgs::parse(os(&["--supervisor-pid", "1"]), env(&[])).is_err());
-        assert!(ShimArgs::parse(os(&["--supervisor-pid", "1", "--bogus"]), env(&["sh"])).is_err());
+        assert!(supervise(os(&[]), env(&["sh"])).is_err());
+        assert!(supervise(os(&["--supervisor-pid", "1"]), env(&[])).is_err());
+        assert!(supervise(os(&["--supervisor-pid", "1", "--bogus"]), env(&["sh"])).is_err());
         // A gap in the numbering would silently drop arguments.
         let gapped = [
             (
@@ -773,6 +1177,80 @@ mod tests {
                 OsString::from("x"),
             ),
         ];
-        assert!(ShimArgs::parse(os(&["--supervisor-pid", "1"]), gapped.into_iter()).is_err());
+        assert!(supervise(os(&["--supervisor-pid", "1"]), gapped.into_iter()).is_err());
+        // A cleanup needs its timeout, and a cleanup-only shim needs no supervisor.
+        assert!(cleanup_only(os(&["--cleanup-only"]), env(&["sh"])).is_err());
+        assert!(
+            cleanup_only(
+                os(&["--cleanup-only", "--cleanup-timeout-ms", "10"]),
+                env(&["sh"])
+            )
+            .is_ok()
+        );
+    }
+
+    /// A service shim receives its service's cleanup next to the command, and neither command
+    /// inherits the variables that carried them.
+    #[test]
+    fn service_cleanups_travel_to_the_shim() -> Result<(), String> {
+        let cleanup = cleanup_spec(true);
+        let wrapped = under(
+            Path::new("/bin/micromux"),
+            Path::new("docker"),
+            &["compose".to_string(), "up".to_string()],
+            StopPolicy::default(),
+            Some(&cleanup),
+        );
+        assert!(
+            !wrapped
+                .args
+                .iter()
+                .any(|arg| arg.to_string_lossy().contains("down")),
+            "{wrapped:?}"
+        );
+        let args = wrapped.args.clone();
+        let parsed = supervise(args.into_iter().skip(1), wrapped_env(wrapped))?;
+        let parsed_cleanup = parsed
+            .cleanup
+            .ok_or_else(|| "the cleanup was lost".to_string())?;
+        assert_eq!(
+            parsed_cleanup.command,
+            ["docker", "compose", "down"].map(OsString::from).to_vec()
+        );
+        assert_eq!(parsed_cleanup.timeout, cleanup.timeout);
+        assert_eq!(
+            parsed_cleanup.log.as_deref(),
+            Some(Path::new("/state/cleanup/key/infra.log"))
+        );
+        assert_eq!(
+            parsed_cleanup.lock.as_deref(),
+            Some(Path::new("/state/cleanup/key/infra.lock"))
+        );
+        // Both commands' carriers, three each, are kept out of either command's environment.
+        assert_eq!(parsed.carriers.len(), 6);
+        Ok(())
+    }
+
+    /// A cleanup-only shim gets the cleanup as its command and the service's stop signal, and runs
+    /// without a log or a lock when the user has no state directory.
+    #[test]
+    fn cleanup_only_shims_carry_the_cleanup() -> Result<(), String> {
+        let wrapped = cleanup_under(
+            Path::new("/bin/micromux"),
+            &cleanup_spec(false),
+            crate::spec::StopSignal::Int,
+        );
+        let args = wrapped.args.clone();
+        let parsed = cleanup_only(args.into_iter().skip(1), wrapped_env(wrapped))?;
+        assert_eq!(parsed.stop_signal, nix::sys::signal::Signal::SIGINT);
+        assert_eq!(
+            parsed.cleanup.command,
+            ["docker", "compose", "down"].map(OsString::from).to_vec()
+        );
+        assert_eq!(parsed.cleanup.timeout, Duration::from_secs(120));
+        assert_eq!(parsed.cleanup.log, None);
+        assert_eq!(parsed.cleanup.lock, None);
+        assert_eq!(parsed.carriers.len(), 3);
+        Ok(())
     }
 }

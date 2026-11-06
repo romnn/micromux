@@ -58,6 +58,22 @@ pub enum StopSignal {
     Usr2,
 }
 
+impl StopSignal {
+    /// The OS signal to deliver.
+    #[cfg(unix)]
+    pub(crate) fn to_nix(self) -> nix::sys::signal::Signal {
+        use nix::sys::signal::Signal;
+        match self {
+            Self::Term => Signal::SIGTERM,
+            Self::Int => Signal::SIGINT,
+            Self::Hup => Signal::SIGHUP,
+            Self::Quit => Signal::SIGQUIT,
+            Self::Usr1 => Signal::SIGUSR1,
+            Self::Usr2 => Signal::SIGUSR2,
+        }
+    }
+}
+
 impl std::fmt::Display for StopSignal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let name = match self {
@@ -79,6 +95,35 @@ pub fn service_id_is_valid(id: &str) -> bool {
         && id
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+/// How long a service's cleanup command may run when its config sets no `timeout`.
+pub const DEFAULT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Longest `cleanup.timeout` a config may set.
+pub const MAX_CLEANUP_TIMEOUT: Duration = Duration::from_hours(1);
+
+/// A resolved cleanup command: what runs after each of a service's processes exits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CleanupSpec {
+    /// Resolved command argv.
+    pub command: Vec<String>,
+    /// How long it may run before it is stopped.
+    pub timeout: Duration,
+    /// Where the cleanup keeps its output and its lock.
+    ///
+    /// `None` when there is no per-user state directory: the output is then discarded and no
+    /// lock is taken.
+    pub files: Option<CleanupFiles>,
+}
+
+/// The per-service files of a cleanup, in the user's state directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CleanupFiles {
+    /// The output of the most recent cleanup run, framed by a header and a footer line.
+    pub log: PathBuf,
+    /// Held exclusively while a cleanup runs, so a restarted session can wait for it.
+    pub lock: PathBuf,
 }
 
 /// The normalized, origin-independent definition of one supervised service.
@@ -120,6 +165,12 @@ pub struct ServiceSpec {
     /// Signal delivered for the graceful stop request.
     #[serde(default)]
     pub stop_signal: StopSignal,
+    /// Command run to completion after each of the service's processes exits.
+    ///
+    /// Only configured services have one; it never crosses the wire.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub cleanup: Option<CleanupSpec>,
 }
 
 impl Default for ServiceSpec {
@@ -135,6 +186,7 @@ impl Default for ServiceSpec {
             restart: RestartPolicy::default(),
             stop_grace_period: DEFAULT_STOP_GRACE_PERIOD,
             stop_signal: StopSignal::default(),
+            cleanup: None,
         }
     }
 }

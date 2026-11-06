@@ -43,6 +43,7 @@ pub(crate) fn service_config(name: &str, command: (&str, &[&str])) -> config::Se
             span: yaml_spanned::spanned::Span::default(),
             inner: crate::spec::StopSignal::default(),
         },
+        cleanup: None,
         color: None,
         log_retention: LogRetention::default(),
         log_display: crate::LogDisplay::default(),

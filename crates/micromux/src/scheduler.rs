@@ -1,11 +1,12 @@
+use crate::cleanup::CleanupOutcome;
 use crate::{
     DynamicOrigin, DynamicServiceParams, DynamicServicesPolicy, Lease, LogDisplay, ReloadConfig,
     ServiceMap, ServiceOrigin, ServiceSpec,
     graph::ServiceGraph,
     health_check::Health,
     model::{
-        Desired, DynamicServiceInfo, Execution, HealthcheckConfig, LogRetention, OriginKind,
-        RestartState, RetiredReason, ServiceEvent, ServiceEventKind, ServiceSnapshot,
+        CleanupStatus, Desired, DynamicServiceInfo, Execution, HealthcheckConfig, LogRetention,
+        OriginKind, RestartState, RetiredReason, ServiceEvent, ServiceEventKind, ServiceSnapshot,
         SessionModelWriter,
     },
     service::{self, Service, StartupMode},
@@ -172,6 +173,8 @@ pub(super) struct RunningService {
     log_reader: Option<pty::LogReaderHandle>,
     pty: pty::PtyHandles,
     since: tokio::time::Instant,
+    /// When the process exited, while its cleanup still holds the run open.
+    exited_at: Option<tokio::time::Instant>,
 }
 
 impl RunningService {
@@ -183,8 +186,13 @@ impl RunningService {
         self.terminate.cancel();
     }
 
+    /// Whether the process ran long enough to reset the restart backoff.
+    ///
+    /// The uptime ends when the process exits, not when its cleanup does, so a slow cleanup
+    /// cannot make a crash-looping service look stable.
     fn stable(&self) -> bool {
-        self.since.elapsed() >= RESTART_BACKOFF_RESET
+        let ended = self.exited_at.unwrap_or_else(tokio::time::Instant::now);
+        ended.saturating_duration_since(self.since) >= RESTART_BACKOFF_RESET
     }
 
     fn finish(mut self) -> (RunId, bool, Option<pty::LogReaderHandle>) {
@@ -240,6 +248,7 @@ pub(super) struct RunConfig {
     healthcheck: Option<HealthcheckConfig>,
     stop_grace_period: Duration,
     stop_signal: crate::spec::StopSignal,
+    cleanup: Option<crate::spec::CleanupSpec>,
 }
 
 impl From<&Service> for RunConfig {
@@ -255,6 +264,7 @@ impl From<&Service> for RunConfig {
                 .map(HealthcheckConfig::from),
             stop_grace_period: service.spec.stop_grace_period,
             stop_signal: service.spec.stop_signal,
+            cleanup: service.spec.cleanup.clone(),
         }
     }
 }
@@ -277,6 +287,8 @@ pub(super) struct ServiceRuntime {
     started_at_unix_ms: Option<u64>,
     /// Exit code of the most recently finished run.
     last_exit_code: Option<i32>,
+    /// How the most recent cleanup ended.
+    last_cleanup: Option<CleanupStatus>,
     /// Fields that describe the most recent run rather than the current config.
     run_config: Option<RunConfig>,
     draining_log_readers: Vec<DrainingLogReader>,
@@ -381,6 +393,7 @@ impl ServiceRuntime {
             uptime_started_at: None,
             started_at_unix_ms: None,
             last_exit_code: None,
+            last_cleanup: None,
             run_config: None,
             draining_log_readers: Vec::new(),
             retired: None,
@@ -455,6 +468,22 @@ impl ServiceRuntime {
         if self.desired == DesiredState::Enabled {
             self.state = State::Killed;
         }
+    }
+
+    /// Note that the run's process exited and its cleanup started.
+    ///
+    /// The run stays open, reported as stopping, until the cleanup ends; the process itself is
+    /// gone, so the run no longer reports a pid or an uptime.
+    fn mark_cleanup_started(&mut self, exit_code: i32) {
+        let Some(running) = &mut self.running else {
+            return;
+        };
+        running.exited_at = Some(tokio::time::Instant::now());
+        running.pid = None;
+        self.uptime_started_at = None;
+        self.started_at_unix_ms = None;
+        self.last_exit_code = Some(exit_code);
+        self.mark_killed();
     }
 
     fn allocate_run_id(&mut self) -> RunId {
@@ -678,6 +707,7 @@ pub(super) fn project_snapshot(
         uptime: None,
         restart_policy: service.spec.restart.clone(),
         log_display: service.log_display.clone(),
+        last_cleanup: runtime.last_cleanup.clone(),
     };
     (snapshot, runtime.uptime_started_at)
 }
@@ -773,7 +803,7 @@ fn load_services_from_disk(reload: &ReloadConfig) -> Result<ServiceMap, String> 
     let raw = crate::config::read_config_file(&reload.config_path)
         .map_err(|err| format!("read {}: {err}", reload.config_path.display()))?;
     let mut diagnostics = Vec::new();
-    let config = crate::config::from_str(
+    let mut config = crate::config::from_str(
         &raw,
         &reload.config_dir,
         0usize,
@@ -781,6 +811,8 @@ fn load_services_from_disk(reload: &ReloadConfig) -> Result<ServiceMap, String> 
         &mut diagnostics,
     )
     .map_err(|err| format!("parse {}: {err}", reload.config_path.display()))?;
+    // The config path keys per-session state such as the cleanup files, which a reload must keep.
+    config.config_path = Some(reload.config_path.clone());
     let errors = diagnostics
         .iter()
         .filter(|diagnostic| diagnostic.severity == Severity::Error)
@@ -2551,13 +2583,79 @@ impl SchedulerRuntime {
         true
     }
 
+    fn handle_cleanup_started(
+        &mut self,
+        services: &ServiceMap,
+        event: &ProcessEvent,
+        exit_code: i32,
+    ) {
+        let service_id = event.service_id();
+        let command = self.services.get_mut(service_id).and_then(|runtime| {
+            runtime.mark_cleanup_started(exit_code);
+            runtime
+                .run_config
+                .as_ref()
+                .and_then(|config| config.cleanup.as_ref())
+                .map(|cleanup| crate::cleanup::display_command(&cleanup.command))
+        });
+        self.sync(services, service_id);
+        self.writer.append_event(
+            service_id,
+            service_event(
+                event.run_id().get(),
+                ServiceEventKind::CleanupStarted,
+                command.map_or_else(
+                    || "cleanup".to_string(),
+                    |command| format!("cleanup: {command}"),
+                ),
+            ),
+        );
+    }
+
+    /// Records how a run's cleanup ended, before the run's exit is handled.
+    fn record_cleanup(&mut self, service_id: &ServiceID, run_id: RunId, outcome: &CleanupOutcome) {
+        let Some(runtime) = self.services.get_mut(service_id) else {
+            return;
+        };
+        let timeout = runtime
+            .run_config
+            .as_ref()
+            .and_then(|config| config.cleanup.as_ref())
+            .map(|cleanup| cleanup.timeout);
+        let success = outcome.succeeded();
+        runtime.last_cleanup = Some(CleanupStatus {
+            run_generation: run_id.get(),
+            success,
+            exit_code: outcome.exit_code,
+            timed_out: outcome.timed_out,
+        });
+        if let Some(error) = &outcome.error {
+            tracing::warn!(%service_id, run_id = run_id.get(), error, "cleanup failed");
+        }
+        let mut event = service_event(
+            run_id.get(),
+            if success {
+                ServiceEventKind::CleanupFinished
+            } else {
+                ServiceEventKind::CleanupFailed
+            },
+            outcome.describe(timeout),
+        );
+        event.exit_code = outcome.exit_code;
+        self.writer.append_event(service_id, event);
+    }
+
     fn handle_exit_event(
         &mut self,
         services: &ServiceMap,
         event: &ProcessEvent,
         exit_code: i32,
+        cleanup: Option<&CleanupOutcome>,
     ) -> bool {
         let service_id = event.service_id();
+        if let Some(cleanup) = cleanup {
+            self.record_cleanup(service_id, event.run_id(), cleanup);
+        }
         if let Some(service) = services.get(service_id)
             && let Some(runtime) = self.services.get_mut(service_id)
         {
@@ -2642,9 +2740,15 @@ impl SchedulerRuntime {
                 self.test_events.forward(event.to_test_event());
                 true
             }
-            ProcessEvent::Exited { exit_code, .. } => {
-                self.handle_exit_event(services, event, *exit_code)
+            ProcessEvent::CleanupStarted { exit_code, .. } => {
+                self.handle_cleanup_started(services, event, *exit_code);
+                #[cfg(test)]
+                self.test_events.forward(event.to_test_event());
+                false
             }
+            ProcessEvent::Exited {
+                exit_code, cleanup, ..
+            } => self.handle_exit_event(services, event, *exit_code, cleanup.as_ref()),
             ProcessEvent::LogReaderFinished { run_id, .. } => {
                 if let Some(runtime) = self.services.get_mut(&service_id) {
                     runtime.finish_log_reader(*run_id);
@@ -2717,10 +2821,24 @@ impl SchedulerRuntime {
             .unwrap_or(crate::spec::DEFAULT_STOP_GRACE_PERIOD);
         // Healthcheck teardown and final event delivery begin only after the child wait completes,
         // so their budget is separate from the PTY-close window.
-        let drain_budget = max_stop_grace
+        let mut drain_budget = max_stop_grace
             .saturating_add(pty::PTY_HANGUP_AFTER_ESCALATION)
             .saturating_add(pty::HEALTH_TASK_STOP_TIMEOUT)
             .saturating_add(Duration::from_secs(2));
+        // A cleanup runs after its process exits and ignores the shutdown, bounded by its timeout,
+        // the stop grace of a timed-out cleanup, and some slack.
+        if let Some(cleanup_timeout) = self
+            .services
+            .values()
+            .filter(|runtime| runtime.running.is_some())
+            .filter_map(|runtime| runtime.run_config.as_ref()?.cleanup.as_ref())
+            .map(|cleanup| cleanup.timeout)
+            .max()
+        {
+            drain_budget = drain_budget
+                .saturating_add(cleanup_timeout)
+                .saturating_add(Duration::from_secs(10));
+        }
         let now = tokio::time::Instant::now();
         let deadline = now.checked_add(drain_budget).unwrap_or(now);
         while self.running_count() > 0 {
