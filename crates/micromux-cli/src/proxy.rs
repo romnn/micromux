@@ -74,6 +74,7 @@ pub(crate) async fn register(
         session_domain: identity.session_domain(),
         config_path: config_path.display().to_string(),
         pid: std::process::id(),
+        proxy_port: mux.proxy_port(),
         routes: mux
             .routes()
             .iter()

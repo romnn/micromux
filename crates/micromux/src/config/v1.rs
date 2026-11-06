@@ -2696,20 +2696,26 @@ mod tests {
         Ok(())
     }
 
+    /// Invalid routes are config errors, and Windows, which has no proxy, rejects routes at all.
     #[test]
     fn rejects_invalid_routes() {
-        for (yaml, expected) in [
-            (
-                "routes: [{host: App, port: 1}]",
-                "must be `*` or lowercase hostname labels",
-            ),
-            (
-                "routes: [{host: a, port: 1}, {host: a, port: 2}]",
-                "more than once",
-            ),
-            ("routes: [{port: 1}]", "missing `host`"),
-            ("proxy: {port: 0}", "must not be 0"),
-        ] {
+        let mut cases = vec![("proxy: {port: 0}", "must not be 0")];
+        if cfg!(unix) {
+            cases.extend([
+                (
+                    "routes: [{host: App, port: 1}]",
+                    "must be `*` or lowercase hostname labels",
+                ),
+                (
+                    "routes: [{host: a, port: 1}, {host: a, port: 2}]",
+                    "more than once",
+                ),
+                ("routes: [{port: 1}]", "missing `host`"),
+            ]);
+        } else {
+            cases.push(("routes: [{host: app, port: 1}]", "not supported on Windows"));
+        }
+        for (yaml, expected) in cases {
             let yaml = format!("version: 1\n{yaml}\nservices:\n  app:\n    command: [\"true\"]\n");
             let result = config::from_str(&yaml, Path::new("."), 0usize, None, &mut Vec::new());
             let message = result.err().map(|err| err.to_string()).unwrap_or_default();

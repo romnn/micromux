@@ -51,6 +51,7 @@ async fn start_proxy(idle_timeout: Duration) -> eyre::Result<Proxy> {
 
 fn registration(session: &str, routes: &[(&str, u16, Option<&str>)]) -> Registration {
     Registration {
+        proxy_port: 0,
         session: session.to_string(),
         session_domain: format!("{session}.localhost"),
         config_path: format!("/projects/{session}/micromux.yaml"),
@@ -378,5 +379,96 @@ async fn streaming_responses_are_not_buffered() -> eyre::Result<()> {
 
     proxy.shutdown.cancel();
     proxy.task.await??;
+    Ok(())
+}
+
+/// A chunked request body of unknown length reaches the upstream intact, whatever the method.
+#[tokio::test]
+async fn chunked_request_bodies_are_forwarded() -> eyre::Result<()> {
+    let proxy = start_proxy(Duration::from_secs(60)).await?;
+    let upstream = TcpListener::bind(("127.0.0.1", 0)).await?;
+    let upstream_port = upstream.local_addr()?.port();
+    let _registrar = Registrar::start(
+        proxy.paths.clone(),
+        registration("one", &[("search", upstream_port, None)]),
+        proxy.port,
+        None,
+        &CancellationToken::new(),
+    )
+    .await?;
+
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = upstream.accept().await?;
+        let head = read_head(&mut stream).await?;
+        // Read the chunked body up to its terminating chunk.
+        let mut body = Vec::new();
+        let mut byte = [0u8; 1];
+        while !body.ends_with(b"0\r\n\r\n") {
+            if stream.read(&mut byte).await? == 0 {
+                break;
+            }
+            body.push(byte[0]);
+        }
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+            .await?;
+        Ok::<_, eyre::Report>((head, String::from_utf8(body)?))
+    });
+
+    let mut client = TcpStream::connect(("127.0.0.1", proxy.port)).await?;
+    client
+        .write_all(
+            b"GET /_search HTTP/1.1\r\nHost: search.one.localhost\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n9\r\n{\"q\":\"x\"}\r\n0\r\n\r\n",
+        )
+        .await?;
+    let mut response = String::new();
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        client.read_to_string(&mut response),
+    )
+    .await??;
+    let (head, body) = server.await??;
+
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    assert!(
+        head.to_ascii_lowercase()
+            .contains("transfer-encoding: chunked"),
+        "{head}"
+    );
+    assert!(body.contains("{\"q\":\"x\"}"), "{body}");
+
+    proxy.shutdown.cancel();
+    proxy.task.await??;
+    Ok(())
+}
+
+/// Stopping the proxy ends every registration, so a registered session notices at once instead
+/// of staying attached to a proxy that no longer routes anything.
+#[tokio::test]
+async fn stopping_the_proxy_ends_its_registrations() -> eyre::Result<()> {
+    let proxy = start_proxy(Duration::from_secs(60)).await?;
+    let registrar = Registrar::start(
+        proxy.paths.clone(),
+        registration("one", &[("app", 1, None)]),
+        proxy.port,
+        None,
+        &CancellationToken::new(),
+    )
+    .await?;
+    let mut status = registrar.status();
+
+    proxy.shutdown.cancel();
+    proxy.task.await??;
+
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        status.wait_for(|status| {
+            matches!(
+                status,
+                micromux_proxy::RegistrationStatus::Unavailable { .. }
+            )
+        }),
+    )
+    .await??;
     Ok(())
 }

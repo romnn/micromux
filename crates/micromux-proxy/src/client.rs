@@ -57,12 +57,25 @@ pub enum ClientError {
         /// The acceptable ports, for the message.
         wanted: String,
     },
-    /// The proxy refused the registration.
+    /// The proxy refused the registration because of a conflict with another session.
     #[error("the micromux proxy rejected the routes: {0}")]
     Rejected(String),
+    /// The proxy cannot take the registration right now, such as while it shuts down.
+    #[error("the micromux proxy cannot take the routes right now: {0}")]
+    Unavailable(String),
     /// The proxy answered something unexpected or nothing at all.
     #[error("unexpected reply from the micromux proxy: {0}")]
     Protocol(String),
+}
+
+impl ClientError {
+    /// Whether a retry against a freshly started proxy can succeed.
+    fn is_transient(&self) -> bool {
+        matches!(
+            self,
+            Self::Unreachable { .. } | Self::Protocol(_) | Self::Unavailable(_)
+        )
+    }
 }
 
 /// Starts a detached proxy process when none is running.
@@ -242,7 +255,14 @@ async fn register(
     .await?
     {
         ProxyMessage::Registered => Ok(connection),
-        ProxyMessage::Rejected { reason } => Err(ClientError::Rejected(reason)),
+        ProxyMessage::Rejected {
+            reason,
+            transient: true,
+        } => Err(ClientError::Unavailable(reason)),
+        ProxyMessage::Rejected {
+            reason,
+            transient: false,
+        } => Err(ClientError::Rejected(reason)),
         other => Err(ClientError::Protocol(format!("{other:?}"))),
     }
 }
@@ -273,6 +293,8 @@ impl Registrar {
     /// Registers `registration` with the proxy listening on `port`, then keeps it alive until
     /// `shutdown` fires or the registrar is dropped.
     ///
+    /// The registration's `proxy_port` is set to `port`, so a proxy on any other port refuses it.
+    ///
     /// # Errors
     ///
     /// Returns the first registration's error, such as [`ClientError::Rejected`] when another
@@ -284,7 +306,25 @@ impl Registrar {
         launcher: Option<ProxyLauncher>,
         shutdown: &CancellationToken,
     ) -> Result<Self, ClientError> {
-        let connection = register(&paths, &registration, port, launcher.as_ref()).await?;
+        let registration = Registration {
+            proxy_port: port,
+            ..registration
+        };
+        // A proxy that answered a moment ago may be exiting for idleness or replaced by now, so
+        // retry what a fresh proxy can fix; conflicts and port mismatches stay fatal.
+        let deadline = Instant::now() + START_TIMEOUT;
+        let mut backoff = Duration::from_millis(50);
+        let connection = loop {
+            match register(&paths, &registration, port, launcher.as_ref()).await {
+                Ok(connection) => break connection,
+                Err(err) if err.is_transient() && Instant::now() < deadline => {
+                    tracing::debug!(%err, "retrying the proxy registration");
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(Duration::from_secs(1));
+                }
+                Err(err) => return Err(err),
+            }
+        };
         let (status_tx, status) = watch::channel(RegistrationStatus::Registered);
         let stop = shutdown.child_token();
         tokio::spawn(maintain(

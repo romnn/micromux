@@ -114,6 +114,12 @@ fn bind_set(port: u16, wildcard: bool) -> Result<Bound, BindError> {
     } else {
         (Ipv4Addr::LOCALHOST, Ipv6Addr::LOCALHOST)
     };
+    // `SO_REUSEADDR` lets the proxy restart over lingering connections, but on macOS it also lets
+    // a loopback bind succeed next to another program's wildcard listener, so a successful bind
+    // alone does not prove the port is free: anything that accepts a connection owns it.
+    if port != 0 && is_accepting(port) {
+        return Err(BindError::InUse { port });
+    }
     let ipv4 = bind_one(SocketAddr::from((ipv4, port)))?;
     // Port 0 picks a free port for IPv4; IPv6 has to use the same one.
     let port = ipv4
@@ -163,6 +169,18 @@ fn bind_one(address: SocketAddr) -> Result<TcpListener, BindError> {
     socket.bind(&address.into()).map_err(classify)?;
     socket.listen(1024).map_err(classify)?;
     Ok(socket.into())
+}
+
+/// Whether something already accepts connections on `port` over IPv4 or IPv6 loopback.
+fn is_accepting(port: u16) -> bool {
+    [
+        SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
+        SocketAddr::from((Ipv6Addr::LOCALHOST, port)),
+    ]
+    .iter()
+    .any(|address| {
+        std::net::TcpStream::connect_timeout(address, std::time::Duration::from_millis(250)).is_ok()
+    })
 }
 
 /// Whether binding failed because the host has no usable IPv6 at all, rather than because the
@@ -236,6 +254,22 @@ mod tests {
         if TcpListener::bind((Ipv4Addr::LOCALHOST, port)).is_err() {
             return Ok(());
         }
+
+        let result = bind(PortPreference {
+            port,
+            fallback_port: None,
+        });
+
+        assert!(matches!(result, Err(BindError::InUse { .. })), "{result:?}");
+        Ok(())
+    }
+
+    /// Another program listening on the wildcard address owns the port, even where the OS would
+    /// let a loopback bind succeed next to it.
+    #[test]
+    fn wildcard_listener_makes_the_port_taken() -> eyre::Result<()> {
+        let taken = TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0))?;
+        let port = taken.local_addr()?.port();
 
         let result = bind(PortPreference {
             port,

@@ -50,6 +50,10 @@ pub enum ProxyMessage {
     Rejected {
         /// Why, for the session to show.
         reason: String,
+        /// Whether trying again (against a proxy started afresh) can succeed, as when this proxy
+        /// is shutting down, rather than a conflict with another session.
+        #[serde(default)]
+        transient: bool,
     },
     /// Reply to [`ClientMessage::Ping`].
     Pong,
@@ -66,6 +70,9 @@ pub struct Registration {
     pub config_path: String,
     /// Process id of the session.
     pub pid: u32,
+    /// The proxy port the session's services were told about; a proxy on another port refuses
+    /// the registration.
+    pub proxy_port: u16,
     /// The session's routes.
     pub routes: Vec<RouteTarget>,
 }

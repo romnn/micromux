@@ -132,9 +132,10 @@ pub async fn serve(
         }
     }
 
-    // Unpublish the socket while still holding the lock, so a session that finds no socket can
-    // start a replacement without racing this one.
+    // End every registration and connection, then unpublish the socket while still holding the
+    // lock, so a session that finds no socket can start a replacement without racing this one.
     stop.cancel();
+    shared.end_all_registrations();
     let _ = std::fs::remove_file(&paths.socket);
     drop(lock);
     Ok(())
@@ -194,6 +195,22 @@ struct Entry {
     registration: Registration,
     /// Cancelled when the registration ends, which also ends its proxied connections.
     cancel: CancellationToken,
+}
+
+/// Why a registration was refused.
+#[derive(Debug)]
+struct Refusal {
+    reason: String,
+    transient: bool,
+}
+
+impl Refusal {
+    fn transient(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+            transient: true,
+        }
+    }
 }
 
 /// A registration owned by one socket connection.
@@ -297,19 +314,40 @@ impl Shared {
         &self,
         registration: Registration,
         previous: Option<&Owned>,
-    ) -> Result<Owned, String> {
+    ) -> Result<Owned, Refusal> {
         let mut state = self.state();
         if state.shutting_down {
-            return Err("the proxy is shutting down; start it again".to_string());
+            return Err(Refusal::transient("the proxy is shutting down"));
         }
-        if let Some(existing) = state.sessions.get(&registration.session_domain)
-            && existing.registration.config_path != registration.config_path
-        {
-            return Err(format!(
-                "{} is already served by the live session for {}; set `session.name` to tell \
-                 the two apart",
-                registration.session_domain, existing.registration.config_path
-            ));
+        if registration.proxy_port != self.port {
+            return Err(Refusal::transient(format!(
+                "this proxy listens on port {}, not {}",
+                self.port, registration.proxy_port
+            )));
+        }
+        // Session domains must not nest either: `api.two` under `one.localhost` and `api` under
+        // `two.one.localhost` would both claim `api.two.one.localhost`.
+        let domain = registration.session_domain.as_str();
+        let overlaps = |other: &str| {
+            other == domain
+                || domain
+                    .strip_suffix(other)
+                    .is_some_and(|prefix| prefix.ends_with('.'))
+                || other
+                    .strip_suffix(domain)
+                    .is_some_and(|prefix| prefix.ends_with('.'))
+        };
+        if let Some((other, existing)) = state.sessions.iter().find(|(other, existing)| {
+            existing.registration.config_path != registration.config_path && overlaps(other)
+        }) {
+            return Err(Refusal {
+                reason: format!(
+                    "{domain} overlaps {other}, which the live session for {} serves; set \
+                     `session.name` or `session.domain` to tell the two apart",
+                    existing.registration.config_path
+                ),
+                transient: false,
+            });
         }
         // A connection that switches to another session domain gives up its old one.
         if let Some(previous) = previous
@@ -369,6 +407,15 @@ impl Shared {
         }
     }
 
+    /// Ends every registration, which also ends the requests and tunnels proxied for it.
+    fn end_all_registrations(&self) {
+        let mut state = self.state();
+        state.shutting_down = true;
+        for (_, entry) in state.sessions.drain() {
+            entry.cancel.cancel();
+        }
+    }
+
     /// Decides to exit when no session has been registered for `idle_timeout`.
     ///
     /// The decision and every registration take the same lock, so a registration either lands
@@ -410,7 +457,14 @@ async fn accept_http(
             tracing::debug!(%peer, "dropping a connection from another host");
             continue;
         }
-        tokio::spawn(crate::forward::serve_connection(stream, shared.clone()));
+        let stop = stop.clone();
+        let connection = crate::forward::serve_connection(stream, shared.clone());
+        tokio::spawn(async move {
+            tokio::select! {
+                () = stop.cancelled() => {}
+                () = connection => {}
+            }
+        });
     }
 }
 
@@ -426,7 +480,7 @@ async fn accept_registrations(
         };
         match accepted {
             Ok((stream, _)) => {
-                tokio::spawn(serve_registration(stream, shared.clone()));
+                tokio::spawn(serve_registration(stream, shared.clone(), stop.clone()));
             }
             Err(err) => {
                 tracing::warn!(%err, "failed to accept a registration connection");
@@ -436,8 +490,8 @@ async fn accept_registrations(
     }
 }
 
-/// Serves one session connection; its registration ends with the connection.
-async fn serve_registration(stream: UnixStream, shared: Arc<Shared>) {
+/// Serves one session connection; its registration ends with the connection or the proxy.
+async fn serve_registration(stream: UnixStream, shared: Arc<Shared>, stop: CancellationToken) {
     let mut framed = Framed::new(stream, LinesCodec::new_with_max_length(MAX_MESSAGE_BYTES));
     let mut owned: Option<Owned> = None;
     loop {
@@ -445,6 +499,7 @@ async fn serve_registration(stream: UnixStream, shared: Arc<Shared>) {
             .as_ref()
             .map_or_else(CancellationToken::new, |owned| owned.cancel.clone());
         let line = tokio::select! {
+            () = stop.cancelled() => break,
             () = replaced.cancelled() => break,
             line = tokio::time::timeout(LEASE_TIMEOUT, framed.next()) => line,
         };
@@ -469,15 +524,19 @@ async fn serve_registration(stream: UnixStream, shared: Arc<Shared>) {
                         owned = Some(registered);
                         ProxyMessage::Registered
                     }
-                    Err(reason) => {
-                        let _ = send(&mut framed, &ProxyMessage::Rejected { reason }).await;
+                    Err(Refusal { reason, transient }) => {
+                        let rejected = ProxyMessage::Rejected { reason, transient };
+                        let _ = send(&mut framed, &rejected).await;
                         break;
                     }
                 }
             }
             Err(err) => {
-                let reason = format!("invalid message: {err}");
-                let _ = send(&mut framed, &ProxyMessage::Rejected { reason }).await;
+                let rejected = ProxyMessage::Rejected {
+                    reason: format!("invalid message: {err}"),
+                    transient: false,
+                };
+                let _ = send(&mut framed, &rejected).await;
                 break;
             }
         };
@@ -514,6 +573,7 @@ pub(crate) mod tests {
             session_domain: format!("{session}.localhost"),
             config_path: config_path.to_string(),
             pid: 1,
+            proxy_port: 80,
             routes: routes
                 .iter()
                 .map(|(host, port)| RouteTarget {
@@ -540,7 +600,7 @@ pub(crate) mod tests {
     /// Exact routes win over catch-alls, and a catch-all serves the bare domain and every
     /// deeper name under it.
     #[test]
-    fn lookup_prefers_exact_routes_then_the_catch_all() -> Result<(), String> {
+    fn lookup_prefers_exact_routes_then_the_catch_all() -> Result<(), Refusal> {
         let shared = shared();
         shared.register(
             registration(
@@ -568,7 +628,7 @@ pub(crate) mod tests {
     /// A second config cannot take over a live session's domain, while the same config (a
     /// reconnect) replaces its own registration and the stale connection cannot remove it.
     #[test]
-    fn registrations_are_owned_by_config_and_generation() -> Result<(), String> {
+    fn registrations_are_owned_by_config_and_generation() -> Result<(), Refusal> {
         let shared = shared();
         let first = shared.register(registration("one", "/one", &[("app", 1001)]), None)?;
 
@@ -589,6 +649,39 @@ pub(crate) mod tests {
         Ok(())
     }
 
+    /// Session domains that nest inside each other could claim the same hostname, so the second
+    /// is refused; a registration for another proxy port is refused as retryable.
+    #[test]
+    fn overlapping_domains_and_wrong_ports_are_refused() -> Result<(), Refusal> {
+        let shared = shared();
+        let mut outer = registration("one", "/one", &[("api.two", 1)]);
+        outer.session_domain = "one.localhost".to_string();
+        shared.register(outer, None)?;
+
+        let mut inner = registration("two", "/two", &[("api", 2)]);
+        inner.session_domain = "two.one.localhost".to_string();
+        let refused = shared.register(inner, None);
+        assert!(matches!(
+            refused,
+            Err(Refusal {
+                transient: false,
+                ..
+            })
+        ));
+
+        let mut elsewhere = registration("three", "/three", &[("app", 3)]);
+        elsewhere.proxy_port = 8080;
+        let refused = shared.register(elsewhere, None);
+        assert!(matches!(
+            refused,
+            Err(Refusal {
+                transient: true,
+                ..
+            })
+        ));
+        Ok(())
+    }
+
     /// Once the proxy decided to exit, registrations are refused, so none can be lost with it.
     #[test]
     fn idle_exit_refuses_later_registrations() {
@@ -603,7 +696,7 @@ pub(crate) mod tests {
 
     /// A registered session keeps the proxy alive.
     #[test]
-    fn registered_sessions_prevent_idle_exit() -> Result<(), String> {
+    fn registered_sessions_prevent_idle_exit() -> Result<(), Refusal> {
         let shared = shared();
         let owned = shared.register(registration("one", "/one", &[("app", 1)]), None)?;
         assert!(!shared.try_begin_idle_exit(Duration::ZERO));

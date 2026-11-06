@@ -219,6 +219,10 @@ fn connection_tokens(headers: &HeaderMap) -> Vec<String> {
 /// Removes the fields that describe one connection rather than the message, as an intermediary
 /// must ([RFC 9110 section 7.6.1][rfc]).
 ///
+/// `Transfer-Encoding` and `Trailer` stay: hyper re-frames every hop from them, and without
+/// `Transfer-Encoding` it would send a chunked request body of unknown length as empty and drop
+/// declared trailers.
+///
 /// [rfc]: https://www.rfc-editor.org/rfc/rfc9110.html#section-7.6.1
 fn strip_hop_by_hop(headers: &mut HeaderMap) {
     for token in connection_tokens(headers) {
@@ -233,8 +237,6 @@ fn strip_hop_by_hop(headers: &mut HeaderMap) {
         header::PROXY_AUTHENTICATE,
         header::PROXY_AUTHORIZATION,
         header::TE,
-        header::TRAILER,
-        header::TRANSFER_ENCODING,
         header::UPGRADE,
     ] {
         headers.remove(name);
