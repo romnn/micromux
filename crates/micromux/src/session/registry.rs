@@ -56,9 +56,20 @@ pub(crate) struct Lease {
 }
 
 /// Where the per-user port registry lives.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct PortRegistry {
     directory: Option<PathBuf>,
+    /// Whether nothing on the host listens on a port.
+    port_is_free: fn(u16) -> bool,
+}
+
+impl Default for PortRegistry {
+    fn default() -> Self {
+        Self {
+            directory: None,
+            port_is_free,
+        }
+    }
 }
 
 impl PortRegistry {
@@ -73,6 +84,20 @@ impl PortRegistry {
     pub fn at(directory: impl Into<PathBuf>) -> Self {
         Self {
             directory: Some(directory.into()),
+            ..Self::default()
+        }
+    }
+
+    /// A registry in `directory` that treats every port as free on the host.
+    ///
+    /// Probing binds each candidate for a moment, so a test running in parallel can find the
+    /// port it persisted busy just then.
+    /// Tests of the registry's own bookkeeping use this to stay independent of the host.
+    #[cfg(test)]
+    fn ignoring_host_listeners(directory: impl Into<PathBuf>) -> Self {
+        Self {
+            port_is_free: |_| true,
+            ..Self::at(directory)
         }
     }
 
@@ -178,7 +203,7 @@ impl PortRegistry {
             let port = match persisted.get(name).copied() {
                 // A range changed since the assignment: a new one in the range replaces it.
                 Some(port) if !range.contains(&port) => {
-                    pick_port(&key, name, range, &taken, &survey.dormant)?
+                    self.pick_port(&key, name, range, &taken, &survey.dormant)?
                 }
                 Some(port) if excluded.contains(&port) => {
                     return Err(SessionError::PortReserved {
@@ -190,7 +215,7 @@ impl PortRegistry {
                 Some(port)
                     if !survey.live.contains(&port) && !ports.values().any(|p| *p == port) =>
                 {
-                    if !port_is_free(port) {
+                    if !(self.port_is_free)(port) {
                         return Err(SessionError::PortBusy {
                             variable: name.clone(),
                             port,
@@ -198,7 +223,7 @@ impl PortRegistry {
                     }
                     port
                 }
-                _ => pick_port(&key, name, range, &taken, &survey.dormant)?,
+                _ => self.pick_port(&key, name, range, &taken, &survey.dormant)?,
             };
             taken.insert(port);
             ports.insert(name.clone(), port);
@@ -291,42 +316,45 @@ fn survey(directory: &Path, own_key: &str, session_name: &str) -> Result<Survey,
     Ok(survey)
 }
 
-/// Picks a free port in `range` for `name`, preferring ports no other session has ever been
-/// assigned.
-///
-/// The scan starts at an offset derived from the session and the variable, so a session tends to
-/// get the same ports again even after its record is deleted.
-fn pick_port(
-    key: &str,
-    name: &str,
-    range: &RangeInclusive<u16>,
-    taken: &HashSet<u16>,
-    dormant: &HashSet<u16>,
-) -> Result<u16, SessionError> {
-    let start = *range.start();
-    let len = u32::from(range.end().saturating_sub(start)) + 1;
-    let seed = config_path_key(Path::new(&format!("{key}/{name}")));
-    let offset = u32::from_str_radix(seed.get(..8).unwrap_or("0"), 16).unwrap_or(0) % len;
-    let candidates = || {
-        (0..len).filter_map(move |step| {
-            u16::try_from((offset + step) % len)
-                .ok()
-                .map(|index| start + index)
-        })
-    };
-    for avoid_dormant in [true, false] {
-        if let Some(port) = candidates().find(|port| {
-            let reserved = avoid_dormant && dormant.contains(port);
-            !taken.contains(port) && !reserved && port_is_free(*port)
-        }) {
-            return Ok(port);
+impl PortRegistry {
+    /// Picks a free port in `range` for `name`, preferring ports no other session has ever been
+    /// assigned.
+    ///
+    /// The scan starts at an offset derived from the session and the variable, so a session tends to
+    /// get the same ports again even after its record is deleted.
+    fn pick_port(
+        &self,
+        key: &str,
+        name: &str,
+        range: &RangeInclusive<u16>,
+        taken: &HashSet<u16>,
+        dormant: &HashSet<u16>,
+    ) -> Result<u16, SessionError> {
+        let start = *range.start();
+        let len = u32::from(range.end().saturating_sub(start)) + 1;
+        let seed = config_path_key(Path::new(&format!("{key}/{name}")));
+        let offset = u32::from_str_radix(seed.get(..8).unwrap_or("0"), 16).unwrap_or(0) % len;
+        let candidates = || {
+            (0..len).filter_map(move |step| {
+                u16::try_from((offset + step) % len)
+                    .ok()
+                    .map(|index| start + index)
+            })
+        };
+        for avoid_dormant in [true, false] {
+            if let Some(port) = candidates().find(|port| {
+                let reserved = avoid_dormant && dormant.contains(port);
+                !taken.contains(port) && !reserved && (self.port_is_free)(*port)
+            }) {
+                return Ok(port);
+            }
         }
+        Err(SessionError::Exhausted {
+            variable: name.to_string(),
+            start,
+            end: *range.end(),
+        })
     }
-    Err(SessionError::Exhausted {
-        variable: name.to_string(),
-        start,
-        end: *range.end(),
-    })
 }
 
 /// Whether nothing currently listens on `port`, probed by binding the loopback and wildcard
@@ -483,7 +511,7 @@ mod tests {
     #[test]
     fn assignments_are_stable_and_disjoint() -> eyre::Result<()> {
         let directory = tempfile::tempdir()?;
-        let registry = PortRegistry::at(directory.path());
+        let registry = PortRegistry::ignoring_host_listeners(directory.path());
         let first = Path::new("/projects/one/micromux.yaml");
         let second = Path::new("/projects/two/micromux.yaml");
 
@@ -516,7 +544,7 @@ mod tests {
     #[test]
     fn assignments_outside_the_range_are_replaced() -> eyre::Result<()> {
         let directory = tempfile::tempdir()?;
-        let registry = PortRegistry::at(directory.path());
+        let registry = PortRegistry::ignoring_host_listeners(directory.path());
         let config = Path::new("/projects/one/micromux.yaml");
 
         let (before, lease) =
@@ -537,30 +565,22 @@ mod tests {
     #[test]
     fn reassigned_names_leave_kept_ports_alone() -> eyre::Result<()> {
         let directory = tempfile::tempdir()?;
-        let registry = PortRegistry::at(directory.path());
+        let registry = PortRegistry::ignoring_host_listeners(directory.path());
         let config = Path::new("/projects/one/micromux.yaml");
 
         let (before, lease) =
             registry.acquire(config, "one", &names(&["A", "B"]), &[], &DEFAULT_PORT_RANGE)?;
         drop(lease);
         let (a, b) = (before["A"], before["B"]);
-        // A two-port range of B and a free neighbor other than A, so A's new port competes with
-        // B's; other processes on the machine may hold either neighbor.
+        // A two-port range of B and a neighbor other than A, so A's new port competes with B's.
         let range = [
             b.checked_add(1).map(|next| b..=next),
             b.checked_sub(1).map(|prev| prev..=b),
         ]
         .into_iter()
         .flatten()
-        .find(|range| {
-            let neighbor = if *range.start() == b {
-                *range.end()
-            } else {
-                *range.start()
-            };
-            neighbor != a && port_is_free(neighbor)
-        })
-        .ok_or_else(|| eyre::eyre!("both neighbors of port {b} are in use"))?;
+        .find(|range| !range.contains(&a))
+        .ok_or_else(|| eyre::eyre!("port {b} has no neighbor other than {a}"))?;
         let (after, _lease) = registry.acquire(config, "one", &names(&["A", "B"]), &[], &range)?;
 
         assert_eq!(after["B"], b);
@@ -593,7 +613,7 @@ mod tests {
     #[test]
     fn second_instance_of_the_same_config_is_rejected() -> eyre::Result<()> {
         let directory = tempfile::tempdir()?;
-        let registry = PortRegistry::at(directory.path());
+        let registry = PortRegistry::ignoring_host_listeners(directory.path());
         let config = Path::new("/projects/one/micromux.yaml");
 
         let (_ports, _lease) =
@@ -609,7 +629,7 @@ mod tests {
     #[test]
     fn live_sessions_need_distinct_names() -> eyre::Result<()> {
         let directory = tempfile::tempdir()?;
-        let registry = PortRegistry::at(directory.path());
+        let registry = PortRegistry::ignoring_host_listeners(directory.path());
 
         let (_ports, lease) = registry.acquire(
             Path::new("/a/app/micromux.yaml"),
@@ -689,7 +709,7 @@ mod tests {
     #[test]
     fn records_of_deleted_projects_are_pruned() -> eyre::Result<()> {
         let directory = tempfile::tempdir()?;
-        let registry = PortRegistry::at(directory.path().join("registry"));
+        let registry = PortRegistry::ignoring_host_listeners(directory.path().join("registry"));
         let project = directory.path().join("gone");
         std::fs::create_dir_all(&project)?;
         let config = project.join("micromux.yaml");
@@ -723,7 +743,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
 
         let directory = tempfile::tempdir()?;
-        let registry = PortRegistry::at(directory.path().join("registry"));
+        let registry = PortRegistry::ignoring_host_listeners(directory.path().join("registry"));
         let project = directory.path().join("locked");
         std::fs::create_dir_all(&project)?;
         let config = project.join("micromux.yaml");
@@ -760,7 +780,7 @@ mod tests {
     #[test]
     fn excluded_ports_are_never_assigned() -> eyre::Result<()> {
         let directory = tempfile::tempdir()?;
-        let registry = PortRegistry::at(directory.path());
+        let registry = PortRegistry::ignoring_host_listeners(directory.path());
         let config = Path::new("/projects/one/micromux.yaml");
         let (ports, lease) =
             registry.acquire(config, "one", &names(&["A"]), &[], &DEFAULT_PORT_RANGE)?;
@@ -781,7 +801,7 @@ mod tests {
     #[test]
     fn persisted_assignment_is_readable_while_live() -> eyre::Result<()> {
         let directory = tempfile::tempdir()?;
-        let registry = PortRegistry::at(directory.path());
+        let registry = PortRegistry::ignoring_host_listeners(directory.path());
         let config = Path::new("/projects/one/micromux.yaml");
         let (ports, _lease) =
             registry.acquire(config, "one", &names(&["A"]), &[], &DEFAULT_PORT_RANGE)?;
@@ -795,7 +815,7 @@ mod tests {
     #[test]
     fn unreadable_record_of_a_live_session_is_an_error() -> eyre::Result<()> {
         let directory = tempfile::tempdir()?;
-        let registry = PortRegistry::at(directory.path());
+        let registry = PortRegistry::ignoring_host_listeners(directory.path());
         let first = Path::new("/projects/one/micromux.yaml");
         let (_ports, _lease) =
             registry.acquire(first, "one", &names(&["A"]), &[], &DEFAULT_PORT_RANGE)?;

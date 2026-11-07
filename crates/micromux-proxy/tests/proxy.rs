@@ -67,6 +67,18 @@ fn registration(session: &str, routes: &[(&str, u16, Option<&str>)]) -> Registra
     }
 }
 
+/// Reserves a loopback port that refuses connections, for routes whose upstream must be down.
+///
+/// The socket is bound but never listens, so connecting to it is refused while no other
+/// process, such as a test running in parallel, can listen on the port until the socket drops.
+/// A port merely freed after use could be handed to such a process right away.
+fn refusing_port() -> eyre::Result<(tokio::net::TcpSocket, u16)> {
+    let socket = tokio::net::TcpSocket::new_v4()?;
+    socket.bind((std::net::Ipv4Addr::LOCALHOST, 0).into())?;
+    let port = socket.local_addr()?.port();
+    Ok((socket, port))
+}
+
 /// Reads one request head from `stream`.
 async fn read_head(stream: &mut TcpStream) -> eyre::Result<String> {
     let mut head = Vec::new();
@@ -211,11 +223,7 @@ async fn upgrades_become_tunnels() -> eyre::Result<()> {
 #[tokio::test]
 async fn error_pages_name_sessions_and_services() -> eyre::Result<()> {
     let proxy = start_proxy(Duration::from_secs(60)).await?;
-    // A port nothing listens on
-    let closed_port = TcpListener::bind(("127.0.0.1", 0))
-        .await?
-        .local_addr()?
-        .port();
+    let (_closed, closed_port) = refusing_port()?;
     let _registrar = Registrar::start(
         proxy.paths.clone(),
         registration("one", &[("api", closed_port, Some("api-service"))]),
@@ -291,20 +299,10 @@ async fn replaced_routes_take_effect_on_the_live_registration() -> eyre::Result<
     let admin_port = admin_upstream.local_addr()?.port();
     let echo_upstream = TcpListener::bind(("127.0.0.1", 0)).await?;
     let echo_port = echo_upstream.local_addr()?.port();
-    // Distinct ports nothing listens on, so each route answers with its 502 page
-    let mut ports = vec![admin_port, echo_port];
-    while ports.len() < 5 {
-        let port = TcpListener::bind(("127.0.0.1", 0))
-            .await?
-            .local_addr()?
-            .port();
-        if !ports.contains(&port) {
-            ports.push(port);
-        }
-    }
-    let [_, _, app_port, removed_port, moved_port] = ports[..] else {
-        eyre::bail!("expected five ports");
-    };
+    // Ports that refuse connections, so each route answers with its 502 page
+    let (_app, app_port) = refusing_port()?;
+    let (_removed, removed_port) = refusing_port()?;
+    let (_moved, moved_port) = refusing_port()?;
     let registrar = Registrar::start(
         proxy.paths.clone(),
         registration(
@@ -386,9 +384,17 @@ async fn replaced_routes_take_effect_on_the_live_registration() -> eyre::Result<
 }
 
 /// A session's routes vanish with its registration, and the proxy exits once it has been idle.
-#[tokio::test]
+///
+/// The runtime's clock is paused, so a slow machine cannot run the idle timeout out before the
+/// session registers.
+/// Whenever every task waits, the paused clock jumps to the next timer, and the proxy's idle
+/// tick of at most a second bounds each jump.
+/// A one-minute idle timeout therefore leaves the registration handshake dozens of round trips,
+/// while the test still finishes in milliseconds.
+#[tokio::test(start_paused = true)]
 async fn routes_end_with_the_registration_and_the_proxy_exits_when_idle() -> eyre::Result<()> {
-    let proxy = start_proxy(Duration::from_millis(300)).await?;
+    const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+    let proxy = start_proxy(IDLE_TIMEOUT).await?;
     let upstream = TcpListener::bind(("127.0.0.1", 0)).await?;
     let registrar = Registrar::start(
         proxy.paths.clone(),
@@ -400,12 +406,12 @@ async fn routes_end_with_the_registration_and_the_proxy_exits_when_idle() -> eyr
     .await?;
 
     // A registered session keeps the proxy alive past its idle timeout.
-    tokio::time::sleep(Duration::from_millis(600)).await;
+    tokio::time::sleep(IDLE_TIMEOUT * 2).await;
     assert!(!proxy.task.is_finished());
 
     drop(registrar);
     // The proxy notices the closed connection and later exits on its own.
-    tokio::time::timeout(Duration::from_secs(5), proxy.task).await???;
+    tokio::time::timeout(IDLE_TIMEOUT * 5, proxy.task).await???;
     assert!(!proxy.paths.socket.exists());
     Ok(())
 }
@@ -622,23 +628,29 @@ async fn stopping_the_proxy_ends_its_registrations() -> eyre::Result<()> {
 async fn a_stopped_proxy_frees_its_port_immediately() -> eyre::Result<()> {
     let directory = tempfile::tempdir()?;
     let paths = ProxyPaths::in_dir(directory.path());
-    let port = TcpListener::bind(("127.0.0.1", 0))
-        .await?
-        .local_addr()?
-        .port();
-    let options = ServeOptions {
+    let mut options = ServeOptions {
         paths,
         preference: PortPreference {
-            port,
+            port: 0,
             fallback_port: None,
         },
         idle_timeout: Duration::from_secs(60),
     };
 
+    // The first proxy picks the port itself, so no probe listener frees it for a parallel test
+    // to take before the proxy binds it.
     let shutdown = CancellationToken::new();
     let stop = shutdown.clone();
-    serve(options.clone(), shutdown, move |_| stop.cancel()).await?;
+    let (port_tx, port_rx) = tokio::sync::oneshot::channel();
+    serve(options.clone(), shutdown, move |port| {
+        let _ = port_tx.send(port);
+        stop.cancel();
+    })
+    .await?;
+    let port = port_rx.await?;
 
+    // A successor on that very port binds it as soon as the first proxy has returned.
+    options.preference.port = port;
     let shutdown = CancellationToken::new();
     let stop = shutdown.clone();
     serve(options, shutdown, move |_| stop.cancel()).await?;

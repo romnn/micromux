@@ -668,28 +668,62 @@ mod tests {
         Ok(())
     }
 
+    /// Spawns `bash -c script` as the leader of a new process group, so its pgid is its pid.
+    ///
+    /// The shell must not source a startup file: a `BASH_ENV` script runs its own commands, and
+    /// their short-lived children would pass for the fixture's jobs.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn spawn_group_leader_shell(script: &str) -> std::io::Result<std::process::Child> {
+        use std::os::unix::process::CommandExt as _;
+
+        std::process::Command::new("bash")
+            .args(["-c", script])
+            .env_remove("BASH_ENV")
+            .env_remove("ENV")
+            .process_group(0)
+            // An orphaned sleep that is still exiting must not hold the test's output open.
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+    }
+
+    /// Polls the descendants of `root` until `count` of them report a group other than
+    /// `root`'s own, or ten seconds pass.
+    ///
+    /// The shell forks its jobs asynchronously, and a forked job stays in the shell's group
+    /// until it calls `setpgid`, so counting descendants alone does not mean they escaped.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn wait_for_escaped_descendants(
+        root: super::ProcessStamp,
+        count: usize,
+    ) -> Vec<super::Descendant> {
+        let escaped = |found: &[super::Descendant]| {
+            found
+                .iter()
+                .filter(|descendant| descendant.process_group != Some(root.pid))
+                .count()
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut found = descendants(root);
+        while escaped(&found) < count && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            found = descendants(root);
+        }
+        found
+    }
+
     /// Background jobs under `set -m` run in their own process groups, mimicking task
     /// runners that escape the service's group; the parent-pid walk must still find
     /// them and report the group that lets callers skip a `killpg`-covered process.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn finds_descendants_that_left_the_process_group() -> eyre::Result<()> {
-        use std::os::unix::process::CommandExt as _;
-
-        let mut child = std::process::Command::new("bash")
-            .args(["-c", "set -m; sleep 30 & sleep 30 & wait"])
-            .process_group(0)
-            .spawn()?;
+        let mut child = spawn_group_leader_shell("set -m; sleep 30 & sleep 30 & wait")?;
         let root = child.id();
         let root_stamp = stamp(root).ok_or_eyre("expected a root stamp")?;
 
-        // The shell forks the background jobs asynchronously; wait for both to appear.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        let mut found = descendants(root_stamp);
-        while found.len() < 2 && std::time::Instant::now() < deadline {
-            std::thread::sleep(std::time::Duration::from_millis(25));
-            found = descendants(root_stamp);
-        }
+        let found = wait_for_escaped_descendants(root_stamp, 2);
 
         let escaped_the_group = found
             .iter()
@@ -730,45 +764,25 @@ mod tests {
     #[test]
     fn expansion_recovers_descendants_and_group_members() -> eyre::Result<()> {
         use std::collections::HashSet;
-        use std::os::unix::process::CommandExt as _;
 
-        // `process_group(0)` makes the shell's pgid its own pid, so group membership
-        // can be probed by that number. Under `set -m` the sleep moves to its *own*
-        // group: from a group-only probe it is reachable solely by walking down from
-        // the recovered shell, which is exactly the traversal under test.
-        let mut child = std::process::Command::new("bash")
-            .args(["-c", "set -m; sleep 30 & wait"])
-            .process_group(0)
-            // An orphaned sleep that is still exiting must not hold the test's output open.
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()?;
+        // The shell's pgid is its own pid, so group membership can be probed by that
+        // number. Under `set -m` the sleep moves to its *own* group: from a group-only
+        // probe it is reachable solely by walking down from the recovered shell, which
+        // is exactly the traversal under test.
+        let mut child = spawn_group_leader_shell("set -m; sleep 30 & wait")?;
         let root = child.id();
         let root_stamp = stamp(root).ok_or_eyre("expected a root stamp")?;
 
-        // Wait for the sleep to fork and leave the shell's group.
-        // A descendant count is not enough: bash may first fork short-lived helpers, such
-        // as a command substitution in a `BASH_ENV` startup file, which stay in its group.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        let escaped = || {
-            descendants(root_stamp)
-                .into_iter()
-                .find(|descendant| descendant.process_group.is_some_and(|group| group != root))
-                .map(|descendant| descendant.stamp)
-        };
-        let mut sleep = escaped();
-        while sleep.is_none() && std::time::Instant::now() < deadline {
-            std::thread::sleep(std::time::Duration::from_millis(25));
-            sleep = escaped();
-        }
+        let escaped = wait_for_escaped_descendants(root_stamp, 1)
+            .into_iter()
+            .find(|descendant| descendant.process_group != Some(root))
+            .map(|descendant| descendant.stamp);
         let from_seed = expand_survivors(&[root_stamp], &HashSet::new());
         let from_group = expand_survivors(&[], &HashSet::from([root]));
 
         // Kill the fixture before asserting so a failing run does not leak processes;
         // the escaped sleep is outside the root's group, so it is killed by stamp.
-        let fixture: Vec<_> = from_seed.iter().copied().chain(sleep).collect();
-        for &survivor in &fixture {
+        for &survivor in from_seed.iter().chain(&escaped) {
             let _ = super::send_signal(survivor, nix::sys::signal::Signal::SIGKILL);
         }
         if let Ok(root) = i32::try_from(root) {
@@ -781,22 +795,22 @@ mod tests {
         let _ = child.wait();
         // Wait for the kills to land so no fixture process outlives the test.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while fixture.iter().any(|&survivor| is_alive(survivor))
+        while from_seed.iter().any(|&survivor| is_alive(survivor))
             && std::time::Instant::now() < deadline
         {
             std::thread::sleep(std::time::Duration::from_millis(25));
         }
         let after_death = expand_survivors(&[root_stamp], &HashSet::new());
 
-        let sleep = sleep.ok_or_eyre("expected the sleep to leave the shell's process group")?;
+        let escaped = escaped.ok_or_eyre("the sleep never left the shell's process group")?;
         eyre::ensure!(
-            from_seed.contains(&root_stamp) && from_seed.contains(&sleep),
-            "expected the live seed plus its forked sleep, found {from_seed:?}"
+            from_seed.contains(&root_stamp) && from_seed.contains(&escaped),
+            "expected the live seed plus its escaped sleep {escaped:?}, found {from_seed:?}"
         );
         eyre::ensure!(
-            from_group.contains(&root_stamp) && from_group.contains(&sleep),
+            from_group.contains(&root_stamp) && from_group.contains(&escaped),
             "expected the group-only probe to recover the shell and, through it, the \
-             sleep that escaped to another group, found {from_group:?}"
+             sleep {escaped:?} that escaped to another group, found {from_group:?}"
         );
         eyre::ensure!(
             after_death.is_empty(),

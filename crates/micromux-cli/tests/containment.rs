@@ -24,6 +24,26 @@ fn shim(supervisor: u32, command: &[&str]) -> Command {
     shim
 }
 
+/// A spawned process group leader whose whole group is killed when the test ends, however it
+/// ends.
+///
+/// Killing only the leader would orphan the command it started, and a command that loops until
+/// signalled would then outlive the test.
+struct KillGroupOnDrop(std::process::Child);
+
+impl Drop for KillGroupOnDrop {
+    fn drop(&mut self) {
+        // A reaped leader's pid may name an unrelated process by now, so only a live group is
+        // signalled.
+        if matches!(self.0.try_wait(), Ok(None))
+            && let Ok(group) = i32::try_from(self.0.id())
+        {
+            let _ = nix::sys::signal::killpg(Pid::from_raw(group), Signal::SIGKILL);
+            let _ = self.0.wait();
+        }
+    }
+}
+
 fn alive(pid: i32) -> bool {
     kill(Pid::from_raw(pid), None).is_ok()
 }
@@ -359,19 +379,23 @@ while :; do sleep 0.05; done
 #[test]
 fn shim_forwards_signals_from_other_processes() -> eyre::Result<()> {
     let directory = tempfile::tempdir()?;
-    let mut shim = shim(
-        std::process::id(),
-        &[
-            "sh",
-            "-c",
-            "trap 'echo usr1 > got; exit 3' USR1; touch ready; while :; do sleep 0.05; done",
-        ],
-    )
-    .current_dir(directory.path())
-    .stdin(Stdio::null())
-    // As under the supervisor, the shim leads its group, which the sender is not part of.
-    .process_group(0)
-    .spawn()?;
+    // The command loops until it receives the signal, so a failing run must kill it with the
+    // shim's group.
+    let mut shim = KillGroupOnDrop(
+        shim(
+            std::process::id(),
+            &[
+                "sh",
+                "-c",
+                "trap 'echo usr1 > got; exit 3' USR1; touch ready; while :; do sleep 0.05; done",
+            ],
+        )
+        .current_dir(directory.path())
+        .stdin(Stdio::null())
+        // As under the supervisor, the shim leads its group, which the sender is not part of.
+        .process_group(0)
+        .spawn()?,
+    );
     let ready = directory.path().join("ready");
     let deadline = Instant::now() + Duration::from_secs(10);
     while !ready.exists() && Instant::now() < deadline {
@@ -379,17 +403,15 @@ fn shim_forwards_signals_from_other_processes() -> eyre::Result<()> {
     }
     // `kill(1)` is a sender other than the supervisor, which this test plays.
     let sent = Command::new("kill")
-        .args(["-USR1", &shim.id().to_string()])
+        .args(["-USR1", &shim.0.id().to_string()])
         .status()?;
 
     let deadline = Instant::now() + Duration::from_secs(10);
     let status = loop {
-        if let Some(status) = shim.try_wait()? {
+        if let Some(status) = shim.0.try_wait()? {
             break status;
         }
         if Instant::now() >= deadline {
-            let _ = shim.kill();
-            let _ = shim.wait();
             eyre::bail!("the command never saw the forwarded signal");
         }
         std::thread::sleep(Duration::from_millis(20));

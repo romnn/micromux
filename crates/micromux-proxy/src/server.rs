@@ -97,7 +97,7 @@ pub async fn serve(
             sessions: HashMap::new(),
             next_generation: 0,
             shutting_down: false,
-            idle_since: Some(Instant::now()),
+            idle_since: Some(tokio::time::Instant::now()),
         }),
     });
     let stop = shutdown.child_token();
@@ -192,7 +192,10 @@ struct State {
     /// Set once the proxy decided to exit; no registration is accepted afterwards.
     shutting_down: bool,
     /// Since when no session has been registered.
-    idle_since: Option<Instant>,
+    ///
+    /// Measured on the runtime's clock, which also drives the idle tick, so a paused test
+    /// runtime controls both.
+    idle_since: Option<tokio::time::Instant>,
 }
 
 struct Entry {
@@ -429,7 +432,7 @@ impl Shared {
             tracing::info!(session = %entry.registration.session, "session unregistered");
         }
         if state.sessions.is_empty() && state.idle_since.is_none() {
-            state.idle_since = Some(Instant::now());
+            state.idle_since = Some(tokio::time::Instant::now());
         }
     }
 
@@ -618,7 +621,7 @@ pub(crate) mod tests {
                 sessions: HashMap::new(),
                 next_generation: 0,
                 shutting_down: false,
-                idle_since: Some(Instant::now()),
+                idle_since: Some(tokio::time::Instant::now()),
             }),
         }
     }
