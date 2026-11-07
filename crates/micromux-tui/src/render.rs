@@ -1469,7 +1469,7 @@ const HELP_COLUMNS: [&[HelpSection]; 2] = [
                 },
                 HelpKey {
                     keys: "q",
-                    description: "Quit / detach (Ctrl-C twice)",
+                    description: "Quit / detach",
                 },
                 HelpKey {
                     keys: "?",
@@ -2507,18 +2507,15 @@ impl App {
     /// Draws what the last mouse release copied at the right end of the footer's last row, where
     /// the hints leave room, so it never changes the layout.
     fn render_mouse_notice(&self, footer: &[HintRow], area: Rect, buf: &mut Buffer) {
-        // The quit prompt matters more than what the last copy took.
-        let quitting = self.quit_prompt_at.is_some();
+        // How to quit matters more than what the last copy took.
+        let quitting = self.quit_hint_at.is_some();
         let (notice, color) = if quitting {
             let action = if self.source.attachment_status().is_some() {
                 "detach"
             } else {
                 "quit"
             };
-            (
-                Some(format!("press Ctrl-C again within 2 s to {action} (or q)")),
-                tailwind::YELLOW.c400,
-            )
+            (Some(format!("press q to {action}")), tailwind::YELLOW.c400)
         } else {
             (self.mouse.notice.clone(), tailwind::GREEN.c400)
         };
@@ -2532,7 +2529,7 @@ impl App {
             return;
         }
         if used.saturating_add(width) > area.width {
-            // The quit prompt must show, so for its two seconds it covers the hints of the
+            // The quit hint must show, so for its two seconds it covers the hints of the
             // footer's last row; other notices wait for room.
             if !quitting {
                 return;

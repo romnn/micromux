@@ -42,7 +42,7 @@ The header's right side lists the view keys, which change only what the panes sh
 | `Ctrl-Z` | Suspend to the shell; `fg` brings the TUI back |
 | `y` / `Enter` | Copy the mouse selection; so do a right-click and the terminal's copy shortcut (see [Copying](#copying)) |
 | `Esc` | Clear the mouse selection |
-| `q` / `Ctrl-C` twice | Quit; a single `Ctrl-C` only asks for a second within 2 seconds, so a stray one never stops the session |
+| `q` | Quit. `Ctrl-C` never quits, so a stray one cannot stop the session; the footer only says to press `q`. To stop micromux from outside, send it `SIGINT` or `SIGTERM` |
 
 {{< figure src="images/service-details.png" alt="The service details popup over the log pane, listing the api service's state, ports, command, directory, dependencies, restart and stop policy, last healthcheck, and current run" caption="`i` describes the selected service in full; `u` shows the session's routes and ports the same way." >}}
 
@@ -82,7 +82,9 @@ Two things stand between these shortcuts and micromux:
   ```
 
   In WezTerm, a Lua `action_callback` can copy when `window:get_selection_text_for_pane(pane)` returns text and otherwise pass the key on with `window:perform_action(act.SendKey { key = 'c', mods = 'CTRL|SHIFT' }, pane)`. Where a terminal cannot pass the shortcut on, `Ctrl+Insert`, which few terminals bind, a right-click and `y` still copy.
-- **The kitty keyboard protocol tells `Ctrl+Shift+C` from `Ctrl-C`.** Without it, terminals send both as the same byte, and `Super` never reaches programs at all. micromux turns the protocol on wherever the terminal supports it, as Ghostty, kitty, WezTerm, foot and Alacritty do, and turns it off again whenever it lets go of the terminal. In a terminal without it, a copy shortcut passed on to programs arrives as `Ctrl-C`; that is the terminal's doing, not micromux's, and micromux then only asks for a second `Ctrl-C` instead of quitting.
+- **The kitty keyboard protocol tells `Ctrl+Shift+C` from `Ctrl-C`.** Without it, terminals send both as the same byte, and `Super` never reaches programs at all. micromux turns the protocol on wherever the terminal supports it, as Ghostty, kitty, WezTerm, foot and Alacritty do, and turns it off again whenever it lets go of the terminal. In a terminal without it, a copy shortcut passed on to programs arrives as `Ctrl-C`; that is the terminal's doing, not micromux's, and micromux then only says to press `q` to quit. tmux does not pass the protocol on either, so inside tmux `Ctrl+Shift+C` arrives as `Ctrl-C` too; `Ctrl+Insert`, a right-click and `y` still copy there.
+
+To see what micromux receives, start it with `MICROMUX_DEBUG_KEYS=1`: its log, `~/.cache/micromux/micromux.log.<date>` on Linux, `~/Library/Caches/com.romnn.micromux/micromux.log.<date>` on macOS, or the file `--log-file` names, then records whether the terminal has the protocol and every key as micromux reads it.
 
 A service in PTY input mode never asked for the protocol, so micromux sends it every key as the bytes a terminal without the protocol sends. Two limits come with the protocol: on a non-Latin keyboard layout, such as Russian or Greek, `Ctrl` chords arrive as the layout's letter, so `Ctrl-C` and `Ctrl-Z` reach neither micromux nor a service as such; switch to a Latin layout for them. And `Alt+Esc` leaves PTY input mode only in terminals with the protocol, since the others send it as a plain `Esc`; there, click the `Alt+Esc Exit` hint instead.
 
@@ -170,4 +172,4 @@ A selector may be a bare session name or `name:`, `pid:`, or `hash:`. More than 
 An attached TUI follows service status, logs, and healthchecks, and its lifecycle keys (`r`, `R`, `d`) still restart, enable, and disable services. In v1 it does **not** forward service PTY input or terminal-resize events.
 
 > [!NOTE]
-> Pressing `q`, or `Ctrl-C` twice, in an attached client only **detaches** it — it never stops the session or its services. To stop a headless session explicitly, use `micromux ctl stop` or the MCP `stop_session` tool.
+> Pressing `q` in an attached client only **detaches** it — it never stops the session or its services. To stop a headless session explicitly, use `micromux ctl stop` or the MCP `stop_session` tool.

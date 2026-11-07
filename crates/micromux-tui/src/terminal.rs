@@ -49,8 +49,39 @@ const KEYBOARD_FLAGS: KeyboardEnhancementFlags =
 /// It is asked once, before the input reader starts, which would otherwise take the answer.
 fn has_keyboard_protocol() -> bool {
     static SUPPORTED: OnceLock<bool> = OnceLock::new();
-    // A terminal that does not answer has no protocol to speak.
-    *SUPPORTED.get_or_init(|| supports_keyboard_enhancement().unwrap_or(false))
+    *SUPPORTED.get_or_init(|| {
+        let answer = supports_keyboard_enhancement();
+        let message = match &answer {
+            Ok(true) => "the terminal has the kitty keyboard protocol".to_string(),
+            Ok(false) => "the terminal has no kitty keyboard protocol".to_string(),
+            Err(err) => format!(
+                "the terminal did not say whether it has the kitty keyboard protocol: {err}"
+            ),
+        };
+        log_keyboard(&message);
+        // A terminal that does not answer has no protocol to speak.
+        answer.unwrap_or(false)
+    })
+}
+
+/// Whether `MICROMUX_DEBUG_KEYS` asks for every key micromux reads, and what it learned about
+/// the keyboard, to go to its log.
+pub(crate) fn debug_keys() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("MICROMUX_DEBUG_KEYS")
+            .is_some_and(|value| !value.is_empty() && value != "0")
+    })
+}
+
+/// Logs what micromux learned about the keyboard, at a level the default log keeps when
+/// `MICROMUX_DEBUG_KEYS` is set.
+fn log_keyboard(message: &str) {
+    if debug_keys() {
+        tracing::warn!(target: "micromux::keys", "{message}");
+    } else {
+        tracing::info!(target: "micromux::keys", "{message}");
+    }
 }
 
 /// Mouse reporting for presses, releases, drags and the wheel, in SGR encoding.
@@ -108,6 +139,7 @@ fn push_keyboard_flags_on(out: &mut impl Write, supported: bool) -> io::Result<(
     if !supported || !SCREEN.load(Ordering::SeqCst) || KEYBOARD.swap(true, Ordering::SeqCst) {
         return Ok(());
     }
+    log_keyboard(&format!("pushed kitty keyboard flags {KEYBOARD_FLAGS:?}"));
     execute!(out, PushKeyboardEnhancementFlags(KEYBOARD_FLAGS))
 }
 

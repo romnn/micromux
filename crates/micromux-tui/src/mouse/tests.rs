@@ -880,12 +880,12 @@ async fn selecting_only_highlights_and_copying_takes_an_explicit_key() -> eyre::
     assert_eq!(app.mouse.notice.as_deref(), Some("copied 6 characters"));
     assert!(app.running);
 
-    // Ctrl-C never copies, not even with text selected: it only asks for a second to quit.
+    // Ctrl-C never copies, not even with text selected: it only says that `q` quits.
     key_with(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL);
     assert_eq!(copied(&mut app), Vec::<String>::new());
-    assert!(app.quit_prompt_at.is_some());
+    assert!(app.quit_hint_at.is_some());
     assert!(app.running);
-    app.quit_prompt_at = None;
+    app.quit_hint_at = None;
 
     // Clicking the copy hint copies too, without the press dropping the selection.
     let frame = draw(&mut app);
@@ -1255,7 +1255,7 @@ async fn nothing_copies_or_quits_in_pty_input_mode() -> eyre::Result<()> {
     }
     assert_eq!(copied(&mut app), Vec::<String>::new());
     assert!(app.has_selection());
-    assert_eq!(app.quit_prompt_at, None);
+    assert_eq!(app.quit_hint_at, None);
     assert!(app.running);
     Ok(())
 }

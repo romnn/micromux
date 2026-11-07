@@ -45,6 +45,8 @@ struct Terminal {
     /// Whether to answer as a terminal with the kitty keyboard protocol.
     keyboard_protocol: bool,
     started: Instant,
+    /// The process groups killed when the test ends, the program's own first.
+    groups: Vec<i32>,
 }
 
 impl Terminal {
@@ -62,6 +64,12 @@ impl Terminal {
             .spawn_command(command)
             .map_err(|err| eyre::eyre!("{err}"))?;
         drop(pair.slave);
+        // The program leads a session and process group of its own.
+        let groups = child
+            .process_id()
+            .and_then(|pid| i32::try_from(pid).ok())
+            .into_iter()
+            .collect();
         let mut reader = pair
             .master
             .try_clone_reader()
@@ -92,6 +100,7 @@ impl Terminal {
             answered: 0,
             keyboard_protocol: false,
             started: Instant::now(),
+            groups,
         })
     }
 
@@ -204,10 +213,36 @@ impl Terminal {
 }
 
 impl Drop for Terminal {
+    /// Kills every process group the test ran, however it ended, so no supervisor outlives it,
+    /// not even one stopped as a job, which only `SIGKILL` reliably ends.
     fn drop(&mut self) {
-        // A failed test must not leave the supervisor and its service running.
+        use nix::sys::signal::{Signal, killpg};
+        use nix::unistd::Pid;
+
+        for &group in &self.groups {
+            // A group that is gone already, as after a clean exit, has nothing to signal.
+            killpg(Pid::from_raw(group), Signal::SIGKILL).ok();
+        }
         self.child.kill().ok();
+        self.child.wait().ok();
     }
+}
+
+/// The process group the wrapper printed as `job=<pid>`.
+fn job_group(written: &[u8]) -> eyre::Result<i32> {
+    let text = String::from_utf8_lossy(written);
+    // Only a finished line holds the whole pid.
+    let finished = text.rsplit_once('\n').map_or("", |(finished, _)| finished);
+    // The shell may start the line with mode changes, and its echo of the command line names
+    // `$$`, not a number.
+    finished
+        .lines()
+        .filter_map(|line| line.split_once("job=").map(|(_, rest)| rest))
+        .find_map(|rest| {
+            let digits = rest.split(|c: char| !c.is_ascii_digit()).next()?;
+            digits.parse().ok()
+        })
+        .ok_or_else(|| eyre::eyre!("the wrapper printed no job:\n{text}"))
 }
 
 /// Whether `needle` occurs in `haystack`.
@@ -290,11 +325,8 @@ fn mouse_report(code: u8, (column, row): (u16, u16), pressed: bool) -> Vec<u8> {
     format!("\x1b[<{code};{};{}{end}", column + 1, row + 1).into_bytes()
 }
 
-/// Selects `hello` in the logs, copies it with `y` and with Ctrl+Shift+C, and checks that a
-/// single Ctrl-C copies nothing and stops nothing.
-fn copy_hello_and_survive_a_ctrl_c(tui: &mut Terminal) -> eyre::Result<()> {
-    // Dragging over a word of the logs selects it, and only `y` copies it to the clipboard
-    // through OSC 52.
+/// Selects `hello` in the logs by dragging over it, which copies nothing yet.
+fn select_hello(tui: &mut Terminal) -> eyre::Result<()> {
     let (column, row) = find(tui.parser.screen(), "hello")?;
     tui.send(&mouse_report(0, (column, row), true))?;
     tui.send(&mouse_report(32, (column + 4, row), true))?;
@@ -305,38 +337,57 @@ fn copy_hello_and_survive_a_ctrl_c(tui: &mut Terminal) -> eyre::Result<()> {
         screen.contents().contains("y Copy") && screen.contents().contains("Health:ON")
     })?;
     assert!(!contains(&tui.written, b"\x1b]52;"));
+    Ok(())
+}
+
+/// Waits until `hello` was copied to the clipboard `times` times in all.
+fn wait_for_copies(tui: &mut Terminal, what: &str, times: usize) -> eyre::Result<()> {
+    tui.wait_until(what, |_, written| {
+        written
+            .windows(HELLO_COPIED.len())
+            .filter(|window| *window == HELLO_COPIED)
+            .count()
+            == times
+    })
+}
+
+/// Waits for the footer to say that `q` quits, and for it to stop saying so, and checks that
+/// micromux still runs.
+fn wait_out_the_quit_hint(tui: &mut Terminal) -> eyre::Result<()> {
+    tui.wait_until("the quit hint", |screen, _| {
+        screen.contents().contains("press q to quit")
+    })?;
+    tui.wait_until("the quit hint to go", |screen, _| {
+        !screen.contents().contains("press q to quit")
+    })?;
+    eyre::ensure!(tui.child.try_wait()?.is_none(), "a Ctrl-C stopped micromux");
+    Ok(())
+}
+
+/// Selects `hello` in the logs, copies it with `y` and with Ctrl+Shift+C in both forms a
+/// kitty-protocol terminal reports it, and checks that Ctrl-C copies nothing and stops nothing.
+fn copy_hello_and_survive_a_ctrl_c(tui: &mut Terminal) -> eyre::Result<()> {
+    // Dragging over a word of the logs selects it, and only `y` copies it to the clipboard
+    // through OSC 52.
+    select_hello(tui)?;
     tui.send(b"y")?;
     tui.wait_until("the copy", |_, written| contains(written, HELLO_COPIED))?;
     // One copy to the clipboard and one to the primary selection.
     assert_eq!(tui.count(b"\x1b]52;"), 2);
 
-    // Ctrl+Shift+C, as the kitty protocol reports it apart from Ctrl-C with the shifted key,
-    // copies the same way.
+    // Ctrl+Shift+C copies the same way, both as a terminal reports it with the shifted key and
+    // as one that reports Shift instead.
     tui.send(b"\x1b[99:67;6u")?;
-    tui.wait_until("the copy with Ctrl+Shift+C", |_, written| {
-        written
-            .windows(HELLO_COPIED.len())
-            .filter(|window| *window == HELLO_COPIED)
-            .count()
-            == 2
-    })?;
+    wait_for_copies(tui, "the copy with Ctrl+Shift+C as C", 2)?;
+    tui.send(b"\x1b[99;6u")?;
+    wait_for_copies(tui, "the copy with Ctrl+Shift+C as c with Shift", 3)?;
 
-    // Ctrl-C never copies, even with text selected: a single one only asks for another, and
-    // stops nothing once its two seconds pass.
+    // Ctrl-C never copies, even with text selected, and never quits, however often it comes.
     tui.send(b"\x1b[99;5u")?;
-    tui.wait_until("the quit prompt", |screen, _| {
-        screen
-            .contents()
-            .contains("press Ctrl-C again within 2 s to quit")
-    })?;
-    tui.wait_until("the quit prompt to go", |screen, _| {
-        !screen.contents().contains("Ctrl-C again")
-    })?;
-    eyre::ensure!(
-        tui.child.try_wait()?.is_none(),
-        "a single Ctrl-C stopped micromux"
-    );
-    assert_eq!(tui.count(HELLO_COPIED), 2);
+    tui.send(b"\x1b[99;5u")?;
+    tui.send(b"\x03")?;
+    wait_out_the_quit_hint(tui)?;
+    assert_eq!(tui.count(HELLO_COPIED), 3);
     Ok(())
 }
 
@@ -436,11 +487,9 @@ fn mouse_capture_is_released_by_the_toggle_a_suspend_and_quitting() -> eyre::Res
         contains(written.get(before..).unwrap_or_default(), b"\x1b[2J")
     })?;
 
-    // Two Ctrl-C in a row quit, releasing the mouse, the keyboard flags and the alternate
-    // screen.
+    // `q` quits, releasing the mouse, the keyboard flags and the alternate screen.
     let before = tui.written.len();
-    tui.send(b"\x03")?;
-    tui.send(b"\x03")?;
+    tui.send(b"q")?;
     tui.wait_for_exit()?;
     let screen = tui.parser.screen();
     assert_eq!(screen.mouse_protocol_mode(), MouseProtocolMode::None);
@@ -454,6 +503,37 @@ fn mouse_capture_is_released_by_the_toggle_a_suspend_and_quitting() -> eyre::Res
     );
     // Every push came off again.
     assert_eq!(tui.count(KEYBOARD_PUSH), tui.count(KEYBOARD_POP));
+    Ok(())
+}
+
+/// In a terminal without the kitty keyboard protocol, as inside tmux, which answers only the
+/// device attributes query, micromux pushes no flags; Ctrl+Shift+C then arrives as the Ctrl-C
+/// byte, which copies nothing and stops nothing, while Ctrl+Insert, which such terminals still
+/// send apart, copies.
+#[test]
+fn without_the_keyboard_protocol_ctrl_shift_c_is_a_harmless_ctrl_c() -> eyre::Result<()> {
+    let project = Project::new(CONFIG)?;
+    let mut tui = project.micromux(&[])?;
+    tui.wait_for_tui()?;
+    tui.wait_until("the service's output", |screen, _| {
+        screen.contents().contains("hello world")
+    })?;
+    let hint = find(tui.parser.screen(), "Tab Focus")?;
+    tui.send(&mouse_report(0, hint, true))?;
+    tui.send(&mouse_report(0, hint, false))?;
+    tui.wait_until("the logs to take the focus", |screen, _| {
+        screen.contents().contains("Focus:LOGS")
+    })?;
+    select_hello(&mut tui)?;
+
+    tui.send(b"\x03")?;
+    wait_out_the_quit_hint(&mut tui)?;
+    assert!(!contains(&tui.written, b"\x1b]52;"));
+
+    tui.send(b"\x1b[2;5~")?;
+    wait_for_copies(&mut tui, "the copy with Ctrl+Insert", 1)?;
+    tui.quit()?;
+    assert!(!contains(&tui.written, b"\x1b[>"));
     Ok(())
 }
 
@@ -510,7 +590,15 @@ fn ctrl_z_suspends_to_the_shell_and_fg_resumes() -> eyre::Result<()> {
     shell.wait_until("the prompt", |screen, _| {
         screen.contents().contains("shell$")
     })?;
-    shell.send(format!("sh -c '{MICROMUX} --no-control; echo wrapper-done'\r").as_bytes())?;
+    // The wrapper says its job's process group, for the test to kill however it ends, and its
+    // last line differs from the command line the shell echoes.
+    shell.send(
+        format!("sh -c 'echo job=$$; {MICROMUX} --no-control; printf \"wrapper%s\\n\" -done'\r")
+            .as_bytes(),
+    )?;
+    shell.wait_until("the wrapper's job", |_, written| job_group(written).is_ok())?;
+    let job = job_group(&shell.written)?;
+    shell.groups.push(job);
     shell.wait_for_tui()?;
     shell.wait_until("mouse capture", |screen, _| {
         screen.mouse_protocol_mode() == MouseProtocolMode::ButtonMotion

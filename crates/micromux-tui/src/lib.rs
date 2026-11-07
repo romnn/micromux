@@ -31,8 +31,8 @@ pub use source::{LocalSource, SessionSource};
 
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 const PENDING_PTY_INPUT_RETRY: Duration = Duration::from_millis(5);
-/// How long after a first Ctrl-C a second one quits.
-const QUIT_CONFIRM_WINDOW: Duration = Duration::from_secs(2);
+/// How long the footer says how to quit after a Ctrl-C.
+const QUIT_HINT_DURATION: Duration = Duration::from_secs(2);
 const TERMINAL_INPUT_CLOSED_NOTICE: &str = "terminal input closed; send SIGINT or SIGTERM to exit";
 
 fn format_byte_limit(bytes: usize) -> String {
@@ -143,8 +143,8 @@ pub struct App {
     mouse: mouse::MouseState,
     /// Index of the service on the services list's first row in the last frame.
     first_service: usize,
-    /// When Ctrl-C last asked for a second Ctrl-C to quit, while that request stands.
-    quit_prompt_at: Option<std::time::Instant>,
+    /// When a Ctrl-C last had the footer say how to quit, while it says so.
+    quit_hint_at: Option<std::time::Instant>,
     /// Where the last frame drew what the mouse can act on.
     hits: mouse::Hits,
     /// Terminal work queued for the event loop.
@@ -225,7 +225,7 @@ impl App {
             popup_scroll: 0,
             mouse: mouse::MouseState::new(view_options.mouse),
             first_service: 0,
-            quit_prompt_at: None,
+            quit_hint_at: None,
             hits: mouse::Hits::default(),
             effects: Vec::new(),
             pty_input_mode: false,
@@ -531,35 +531,32 @@ impl App {
     }
 
     /// When the event loop must wake by itself: to retry queued PTY input, or to take back the
-    /// quit prompt.
+    /// quit hint.
     fn next_timer(&self) -> Option<std::time::Instant> {
         let retry = (!self.pending_pty_input.is_empty())
             .then(|| std::time::Instant::now() + PENDING_PTY_INPUT_RETRY);
-        let prompt = self.quit_prompt_at.map(|at| at + QUIT_CONFIRM_WINDOW);
-        retry.into_iter().chain(prompt).min()
+        let hint = self.quit_hint_at.map(|at| at + QUIT_HINT_DURATION);
+        retry.into_iter().chain(hint).min()
     }
 
-    /// Does what is due `now`: retries queued PTY input and takes back an expired quit prompt.
+    /// Does what is due `now`: retries queued PTY input and takes back an expired quit hint.
     fn on_timer(&mut self, now: std::time::Instant) {
         if !self.pending_pty_input.is_empty() {
             self.flush_pending_pty_input();
         }
         if self
-            .quit_prompt_at
-            .is_some_and(|at| now.saturating_duration_since(at) >= QUIT_CONFIRM_WINDOW)
+            .quit_hint_at
+            .is_some_and(|at| now.saturating_duration_since(at) >= QUIT_HINT_DURATION)
         {
-            self.quit_prompt_at = None;
+            self.quit_hint_at = None;
         }
     }
 
-    /// Ctrl-C pressed `now`: the first asks for a second, and only a second within
-    /// [`QUIT_CONFIRM_WINDOW`] quits, so a stray Ctrl-C, as from a copy chord a terminal sends
-    /// as Ctrl-C, never stops the session.
+    /// Ctrl-C pressed `now`, which never quits: only `q` does, so a stray Ctrl-C, as from a copy
+    /// shortcut a terminal sends as Ctrl-C, cannot stop the session. The footer says so for a
+    /// moment.
     fn ctrl_c(&mut self, now: std::time::Instant) {
-        match self.quit_prompt_at {
-            Some(at) if now.saturating_duration_since(at) < QUIT_CONFIRM_WINDOW => self.exit(),
-            _ => self.quit_prompt_at = Some(now),
-        }
+        self.quit_hint_at = Some(now);
     }
 
     /// Does the terminal work that input queued, and returns whether a suspend was asked for,
@@ -739,6 +736,19 @@ impl App {
     fn handle_crossterm_event(&mut self, event: &crossterm::event::Event) {
         use crossterm::event::KeyEventKind;
 
+        if let crossterm::event::Event::Key(key) = *event
+            && terminal::debug_keys()
+        {
+            tracing::warn!(
+                target: "micromux::keys",
+                code = ?key.code,
+                modifiers = ?key.modifiers,
+                kind = ?key.kind,
+                state = ?key.state,
+                pty_input_mode = self.pty_input_mode,
+                "key"
+            );
+        }
         match *event {
             crossterm::event::Event::Resize(cols, rows) => {
                 self.terminal_cols = cols;
@@ -1408,7 +1418,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn command_mode_quit_requires_plain_q_or_ctrl_c() -> eyre::Result<()> {
+    async fn only_plain_q_quits_in_command_mode() -> eyre::Result<()> {
         let mut diagnostics = Vec::new();
         let parsed = micromux::from_str(
             "version: 1\nservices: {}\n",
@@ -1440,20 +1450,21 @@ mod tests {
         app.handle_key_press(key(KeyCode::Char('H'), KeyModifiers::SHIFT));
         assert!(app.show_healthcheck_pane);
 
-        // A first Ctrl-C only asks for a second, and a second one right after quits.
-        app.handle_key_press(key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        // Ctrl-C never quits, however often it comes; plain `q` does.
+        for _ in 0..3 {
+            app.handle_key_press(key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        }
         assert!(app.running);
         assert!(!shutdown.is_cancelled());
-        app.handle_key_press(key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        app.handle_key_press(key(KeyCode::Char('q'), KeyModifiers::NONE));
         assert!(!app.running);
         assert!(shutdown.is_cancelled());
         Ok(())
     }
 
-    /// A stray Ctrl-C never stops the session: only a second one within two seconds quits, the
-    /// footer says so meanwhile, and `q` quits at once.
+    /// Ctrl-C never stops the session: the footer only says for a moment that `q` quits.
     #[tokio::test]
-    async fn ctrl_c_quits_only_when_pressed_twice_within_two_seconds() -> eyre::Result<()> {
+    async fn ctrl_c_only_says_that_q_quits() -> eyre::Result<()> {
         let mut diagnostics = Vec::new();
         let parsed = micromux::from_str(
             "version: 1\nservices:\n  svc:\n    command: [\"sleep\", \"30\"]\n",
@@ -1472,7 +1483,7 @@ mod tests {
             ViewOptions::default(),
         );
         let now = std::time::Instant::now();
-        // Narrow enough that the prompt has no free room in the footer and covers its last row.
+        // Narrow enough that the hint has no free room in the footer and covers its last row.
         let footer = |app: &mut App| {
             let area = ratatui::layout::Rect::new(0, 0, 60, 20);
             let mut buffer = ratatui::buffer::Buffer::empty(area);
@@ -1482,22 +1493,19 @@ mod tests {
                 .collect::<String>()
         };
 
-        // The first press prompts, without stopping anything.
+        // A press says how to quit, without stopping anything.
         app.ctrl_c(now);
         assert!(app.running);
-        assert!(footer(&mut app).contains("press Ctrl-C again within 2 s to quit (or q)"));
+        assert!(footer(&mut app).contains("press q to quit"));
 
-        // Once the window passes, the prompt goes, and the next press only prompts again.
-        app.on_timer(now + QUIT_CONFIRM_WINDOW);
-        assert!(!footer(&mut app).contains("Ctrl-C again"));
-        app.ctrl_c(now + Duration::from_secs(3));
+        // Once its moment passes, the hint goes; however often Ctrl-C comes, nothing stops.
+        app.on_timer(now + QUIT_HINT_DURATION);
+        assert!(!footer(&mut app).contains("press q"));
+        for later in [3, 3, 4] {
+            app.ctrl_c(now + Duration::from_secs(later));
+        }
         assert!(app.running);
         assert!(!shutdown.is_cancelled());
-
-        // A second press within the window quits.
-        app.ctrl_c(now + Duration::from_millis(4500));
-        assert!(!app.running);
-        assert!(shutdown.is_cancelled());
         Ok(())
     }
 
