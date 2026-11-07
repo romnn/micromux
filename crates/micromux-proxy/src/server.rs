@@ -266,11 +266,12 @@ impl Shared {
 
     /// Finds the route serving `path` on `host`.
     ///
-    /// The most specific route wins.
-    /// The routes of the exact host come first, and only when none of them matches `path` does
-    /// the catch-all of the most specific session domain containing `host` serve it.
-    /// Among the routes of one host, the longest path prefix wins, and a route without a path
-    /// matches every path.
+    /// The host decides first, then the path.
+    /// A hostname that any route names is served by those routes alone, and every other hostname
+    /// under the most specific session domain containing it by the catch-all routes.
+    /// Among the chosen routes, the longest path prefix wins, and a route without a path matches
+    /// every path; when none matches, nothing serves the request, rather than another host's
+    /// routes answering for a mistyped path.
     pub(crate) fn lookup(&self, host: &str, path: &str) -> Option<Target> {
         let state = self.state();
         let target = |entry: &Entry, route: &RouteTarget| Target {
@@ -296,17 +297,15 @@ impl Shared {
             .strip_suffix(domain.as_str())
             .and_then(|prefix| prefix.strip_suffix('.'));
         let routes = &entry.registration.routes;
-        labels
-            .and_then(|labels| {
-                best_route(
-                    routes
-                        .iter()
-                        .filter(|route| route.host != "*" && route.host == labels),
-                    path,
-                )
-            })
-            .or_else(|| best_route(routes.iter().filter(|route| route.host == "*"), path))
-            .map(|route| target(entry, route))
+        let named = |route: &&RouteTarget| {
+            route.host != "*" && labels.is_some_and(|labels| route.host == labels)
+        };
+        let host_routes = if routes.iter().any(|route| named(&route)) {
+            routes.iter().filter(named).collect::<Vec<_>>()
+        } else {
+            routes.iter().filter(|route| route.host == "*").collect()
+        };
+        best_route(host_routes.into_iter(), path).map(|route| target(entry, route))
     }
 
     /// The live sessions and their URLs, for the not-found page.
@@ -681,11 +680,11 @@ pub(crate) mod tests {
         Ok(())
     }
 
-    /// Within a host the longest matching path prefix wins, a route without a path serves the
-    /// rest, and a path no route of the exact host matches falls through to the catch-all, which
-    /// follows the same rule.
+    /// Within a host the longest matching path prefix wins and a route without a path serves the
+    /// rest; the catch-all follows the same rule for hostnames no route names, and never answers
+    /// for a named host's unmatched paths.
     #[test]
-    fn lookup_prefers_the_longest_path_prefix_then_the_catch_all() -> Result<(), Refusal> {
+    fn lookup_picks_the_host_then_the_longest_path_prefix() -> Result<(), Refusal> {
         let shared = shared();
         let mut one = registration(
             "one",
@@ -721,14 +720,15 @@ pub(crate) mod tests {
         assert_eq!(port("api.one.localhost", "/REST/x"), Some(1001));
         assert_eq!(port("api.one.localhost", "/static/x"), Some(1001));
 
-        // A host whose path routes do not match falls through to the catch-all.
+        // A named host whose path routes do not match is not handed to the catch-all.
         assert_eq!(port("auth.one.localhost", "/auth/v1/token"), Some(1004));
-        assert_eq!(port("auth.one.localhost", "/other"), Some(1005));
-        assert_eq!(port("auth.one.localhost", "/static/x"), Some(1006));
+        assert_eq!(port("auth.one.localhost", "/other"), None);
+        assert_eq!(port("auth.one.localhost", "/static/x"), None);
 
-        // The catch-all's own path routes and its fallback
+        // The catch-all's own path routes and its fallback serve every unnamed hostname.
         assert_eq!(port("one.localhost", "/static/app.js"), Some(1006));
         assert_eq!(port("deep.other.one.localhost", "/"), Some(1005));
+        assert_eq!(port("web.one.localhost", "/static/x"), Some(1006));
         Ok(())
     }
 

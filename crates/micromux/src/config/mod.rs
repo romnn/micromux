@@ -1186,6 +1186,28 @@ mod tests {
         Ok(())
     }
 
+    /// The schema, like the parser, refuses `strip_prefix` without a `path` to strip.
+    #[test]
+    fn schema_rejects_strip_prefix_without_path() -> eyre::Result<()> {
+        let compiled = compiled_schema()?;
+        let route = |route: serde_json::Value| serde_json::json!({ "version": 1, "routes": [route], "services": {} });
+
+        assert!(
+            compiled
+                .validate(&route(serde_json::json!({
+                    "host": "auth", "strip_prefix": true, "port": 1
+                })))
+                .is_err()
+        );
+        for valid in [
+            serde_json::json!({ "host": "auth", "strip_prefix": false, "port": 1 }),
+            serde_json::json!({ "host": "auth", "path": "/auth/v1/", "strip_prefix": true, "port": 1 }),
+        ] {
+            assert!(compiled.validate(&route(valid.clone())).is_ok(), "{valid}");
+        }
+        Ok(())
+    }
+
     #[test]
     fn schema_rejects_missing_command() -> eyre::Result<()> {
         let compiled = compiled_schema()?;

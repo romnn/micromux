@@ -352,7 +352,7 @@ async fn upgrades_tunnel_through_stripped_path_routes() -> eyre::Result<()> {
 
 /// A proxy that does not report the path-route protocol, as one started by an older micromux,
 /// would ignore route paths, so a session with path routes refuses it with an error naming the
-/// proxy, while a session without paths still registers.
+/// proxy, while a session without paths still registers until its routes gain a path.
 #[tokio::test]
 async fn path_routes_refuse_an_outdated_proxy() -> eyre::Result<()> {
     use micromux_proxy::protocol::{ClientMessage, ProxyMessage};
@@ -429,8 +429,25 @@ async fn path_routes_refuse_an_outdated_proxy() -> eyre::Result<()> {
         None,
         &CancellationToken::new(),
     )
-    .await;
-    assert!(without_paths.is_ok(), "{without_paths:?}");
+    .await?;
+
+    // Routes that gain a path later are not sent over the connection checked without one; the
+    // reconnect refuses the old proxy and reports why.
+    let mut status = without_paths.status();
+    without_paths
+        .routes()
+        .send_replace(vec![path_route("app", "/rest/", false, 3)]);
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        status.wait_for(|status| {
+            matches!(
+                status,
+                micromux_proxy::RegistrationStatus::Unavailable { reason }
+                    if reason.contains("registration protocol 1")
+            )
+        }),
+    )
+    .await??;
 
     old_proxy.abort();
     Ok(())

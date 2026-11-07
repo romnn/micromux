@@ -33,6 +33,12 @@ const MAX_ERROR_OUTPUT: u64 = 16 * 1024;
 
 type Connection = Framed<UnixStream, LinesCodec>;
 
+/// A registered connection, with the protocol its proxy speaks.
+struct Live {
+    connection: Connection,
+    protocol: u32,
+}
+
 /// Why a session cannot use the proxy.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ClientError {
@@ -62,9 +68,10 @@ pub enum ClientError {
     /// differently, such as ignoring their paths.
     #[error(
         "the running micromux proxy (pid {pid}) speaks registration protocol {protocol}, but this \
-         session's routes need {required} (path routes); it was started by an older micromux and \
-         exits a minute after its last session stops, or stop it with `kill {pid}` and start \
-         this session again"
+         session's routes need {required} (path routes); it was started by an older micromux, \
+         so stop or restart the sessions still running that micromux, which would start it \
+         again, then wait a minute for it to exit or stop it with `kill {pid}`, and start this \
+         session again"
     )]
     OutdatedProxy {
         /// Process id of the running proxy.
@@ -257,7 +264,7 @@ async fn register(
     registration: &Registration,
     port: u16,
     launcher: Option<&ProxyLauncher>,
-) -> Result<Connection, ClientError> {
+) -> Result<Live, ClientError> {
     // Recovery never renegotiates: the running services already carry URLs with this port.
     let exact = PortPreference {
         port,
@@ -267,7 +274,7 @@ async fn register(
     let mut connection = connect(&paths.socket).await?;
     // Ask on the registration connection itself, so the answer describes the very proxy that
     // takes the routes even if another one replaced it since `ensure_proxy`.
-    match request(&mut connection, &ClientMessage::Hello).await? {
+    let protocol = match request(&mut connection, &ClientMessage::Hello).await? {
         ProxyMessage::Info { pid, protocol, .. } if protocol < registration.required_protocol() => {
             return Err(ClientError::OutdatedProxy {
                 pid,
@@ -275,16 +282,19 @@ async fn register(
                 required: registration.required_protocol(),
             });
         }
-        ProxyMessage::Info { .. } => {}
+        ProxyMessage::Info { protocol, .. } => protocol,
         other => return Err(ClientError::Protocol(format!("{other:?}"))),
-    }
+    };
     match request(
         &mut connection,
         &ClientMessage::Register(registration.clone()),
     )
     .await?
     {
-        ProxyMessage::Registered => Ok(connection),
+        ProxyMessage::Registered => Ok(Live {
+            connection,
+            protocol,
+        }),
         ProxyMessage::Rejected {
             reason,
             transient: true,
@@ -410,7 +420,7 @@ struct Maintained {
 
 async fn maintain(
     mut maintained: Maintained,
-    connection: Connection,
+    connection: Live,
     mut routes: watch::Receiver<Vec<RouteTarget>>,
     status: watch::Sender<RegistrationStatus>,
     stop: CancellationToken,
@@ -461,12 +471,18 @@ async fn maintain(
 ///
 /// New routes are registered on the same connection, which the proxy treats as a replacement.
 /// Its reply refreshes the lease like a pong; a refusal closes the connection, which reconnects.
+/// New routes that need a newer protocol than the proxy speaks end the connection instead, so the
+/// reconnect checks them against whichever proxy runs then.
 async fn keep_alive(
-    mut connection: Connection,
+    live: Live,
     maintained: &mut Maintained,
     routes: &mut watch::Receiver<Vec<RouteTarget>>,
     stop: &CancellationToken,
 ) -> Option<String> {
+    let Live {
+        mut connection,
+        protocol,
+    } = live;
     let ping = serde_json::to_string(&ClientMessage::Ping).unwrap_or_default();
     let mut ticker = tokio::time::interval(PING_INTERVAL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -486,6 +502,9 @@ async fn keep_alive(
                     return None;
                 }
                 maintained.registration.routes = routes.borrow_and_update().clone();
+                if maintained.registration.required_protocol() > protocol {
+                    return Some("the new routes need a newer proxy".to_string());
+                }
                 let register = ClientMessage::Register(maintained.registration.clone());
                 let Ok(register) = serde_json::to_string(&register) else {
                     return Some("cannot encode the new routes".to_string());

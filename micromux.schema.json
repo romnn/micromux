@@ -157,11 +157,16 @@
     },
     "routes": {
       "type": "array",
-      "description": "Hostnames, optionally narrowed to path prefixes, served by the shared micromux proxy while the session runs, as http://<host>.<session>.<domain><path>. A request goes to the exact host's route with the longest prefix of its path, or to that host's route without a path; when none of them matches, the catch-all's routes serve it by the same rule. Not supported on Windows. Changes require a session restart.",
+      "description": "Hostnames, optionally narrowed to path prefixes, served by the shared micromux proxy while the session runs, as http://<host>.<session>.<domain><path>. The host decides first: a hostname any route names is served by its own routes alone, every other hostname by the catch-all's. Among those, the route with the longest prefix of the request path wins, then the route without a path; otherwise the proxy answers 404. Not supported on Windows. Changes require a session restart.",
       "items": {
         "type": "object",
         "additionalProperties": false,
         "required": ["host", "port"],
+        "if": {
+          "required": ["strip_prefix"],
+          "properties": { "strip_prefix": { "const": true } }
+        },
+        "then": { "required": ["path"] },
         "properties": {
           "host": {
             "type": "string",
