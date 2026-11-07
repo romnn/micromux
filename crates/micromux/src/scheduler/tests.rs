@@ -5158,30 +5158,17 @@ async fn restarts_wait_for_the_cleanup() -> eyre::Result<()> {
     let mut services = ServiceMap::new();
     services.insert("svc".to_string(), service);
     let harness = spawn_harness(services, None);
-    wait_until(&harness.reader, "svc", |snapshot| {
-        snapshot.execution == Execution::Running
-    })
-    .await?;
+    let starts = dir.path().join("starts");
+    // A run reports Running before its shell has written its line, so wait for the line itself:
+    // a restart before it would stop the first run before it records that it ran.
+    wait_for_lines(&starts, 1).await?;
 
     accepted(harness.control.restart(&"svc".to_string()).await)?;
     wait_until(&harness.reader, "svc", |snapshot| {
         snapshot.run_generation == 2 && snapshot.execution == Execution::Running
     })
     .await?;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    // A run reports Running before its shell has written its line, so the file may not exist yet.
-    while fs::read_to_string(dir.path().join("starts"))
-        .unwrap_or_default()
-        .lines()
-        .count()
-        < 2
-    {
-        eyre::ensure!(
-            tokio::time::Instant::now() < deadline,
-            "the second run never started"
-        );
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    wait_for_lines(&starts, 2).await?;
 
     // The second run found the marker the first run's cleanup left.
     assert_eq!(
@@ -5191,6 +5178,20 @@ async fn restarts_wait_for_the_cleanup() -> eyre::Result<()> {
 
     harness.shutdown.cancel();
     harness.handle.await??;
+    Ok(())
+}
+
+/// Wait until the file at `path` holds at least `lines` lines.
+async fn wait_for_lines(path: &Path, lines: usize) -> eyre::Result<()> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while fs::read_to_string(path).unwrap_or_default().lines().count() < lines {
+        eyre::ensure!(
+            tokio::time::Instant::now() < deadline,
+            "{} never reached {lines} lines",
+            path.display()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     Ok(())
 }
 

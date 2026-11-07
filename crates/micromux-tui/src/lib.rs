@@ -1408,6 +1408,44 @@ mod tests {
         Ok(())
     }
 
+    /// A service row names the service only: its ports belong to the `i` popup and its URLs to
+    /// the Logs title.
+    #[tokio::test]
+    async fn service_rows_leave_ports_to_the_details_popup() -> eyre::Result<()> {
+        let yaml = indoc! {r#"
+            version: 1
+            services:
+              api:
+                command: ["true"]
+                ports: [8080, 9090]
+        "#};
+        let mut diagnostics = Vec::new();
+        let parsed = micromux::from_str(yaml, Path::new("."), 0usize, None, &mut diagnostics)?;
+        let mux = std::sync::Arc::new(micromux::Micromux::new(&parsed)?);
+        let (_runner, handles) = mux.start(micromux::CancellationToken::new());
+        let mut app = App::new(
+            SessionSource::Local(LocalSource::new(handles.reader, handles.commands.clone())),
+            Some(handles.terminal),
+            micromux::CancellationToken::new(),
+            LogViewOptions::default(),
+        );
+        let area = ratatui::layout::Rect::new(0, 0, 200, 24);
+        let mut buffer = ratatui::buffer::Buffer::empty(area);
+        (&mut app).render(area, &mut buffer);
+        let row = (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .filter_map(|x| buffer.cell((x, y)).map(ratatui::buffer::Cell::symbol))
+                    .collect::<String>()
+            })
+            .find(|row| row.contains(" api"))
+            .ok_or_else(|| eyre::eyre!("no row lists the api service"))?;
+
+        assert!(!row.contains(":8080"), "{row}");
+        assert!(!row.contains('['), "{row}");
+        Ok(())
+    }
+
     /// A local app for a session established from `yaml` in `directory`, with its live session
     /// status and allocated ports.
     #[cfg(unix)]
