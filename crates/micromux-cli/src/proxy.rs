@@ -126,6 +126,8 @@ pub(crate) async fn register(
         mux.proxy_port(),
         Some(launcher()?),
         shutdown,
+        // The MCP `start_session` tool reads this line from a headless session's stderr to give
+        // the session the time the wait needs.
         |waiting| eprintln!("{waiting}"),
     )
     .await?;
