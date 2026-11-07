@@ -25,6 +25,8 @@ mod pages;
 mod paths;
 #[cfg(unix)]
 mod server;
+#[cfg(all(test, unix))]
+mod test_ports;
 
 #[cfg(unix)]
 pub use client::{ClientError, ProxyLauncher, Registrar, RegistrationStatus, ensure_proxy};
