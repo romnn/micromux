@@ -36,11 +36,68 @@ The header's right side lists the view keys, which change only what the panes sh
 | `i` | Show everything about the selected service: URLs, ports by variable, command, directory, dependencies, restart and stop policy, the last healthcheck, the current run, and the last cleanup (close with `i` or `Esc`) |
 | `u` | Show the session: its domain, the proxy port, every route with its port and service, and the allocated ports (close with `u` or `Esc`) |
 | `?` | Show every key binding (close with `Esc`) |
-| `q` / `Esc` | Quit |
+| `m` | Toggle mouse capture (see [Mouse](#mouse)) |
+| `Ctrl-Z` | Suspend to the shell; `fg` brings the TUI back |
+| `Esc` | Clear the mouse selection |
+| `q` / `Ctrl-C` | Quit |
 
 {{< figure src="images/service-details.png" alt="The service details popup over the log pane, listing the api service's state, ports, command, directory, dependencies, restart and stop policy, last healthcheck, and current run" caption="`i` describes the selected service in full; `u` shows the session's routes and ports the same way." >}}
 
+`Ctrl-Z` gives the terminal back and stops micromux as it would any foreground program. Until you resume it with `fg`, micromux supervises nothing: the services keep running, but their output piles up unread until they block on it, and agents talking to the session get no answer.
+
 Restart, disable, and enable all go through the [control plane]({{< relref "agent-control/control-plane.md" >}}), so they respect dependency gating and restart policy.
+
+## Mouse
+
+With mouse capture on, which is the default, the mouse works as in most terminal apps:
+
+- **Click** a service to select it, or any pane to focus it, as `Tab` would.
+- **Wheel** scrolls the pane under the pointer, without moving the focus: the service list moves the selection, and the log and healthcheck panes scroll three rows a turn. Scrolling up leaves follow-tail, as the keys do, and scrolling back to the bottom follows the tail again. While a popup is open, the wheel scrolls the popup.
+- **Drag** selects text inside the pane where the drag started, never across panes, so a selection in the logs never picks up the sidebar. Dragging past the top or bottom of the pane scrolls it. A double click selects a word, a triple click the whole line, even when it wraps over several rows. `Esc` clears the selection.
+- **Releasing** the button copies the selection to the clipboard, and to the primary selection where there is one, through the terminal's OSC 52 support, which also works over ssh. The footer says what was copied. A few terminals, such as GNOME Terminal, do not support OSC 52; use their own selection there.
+- **Click** a key hint in the header or footer to run its key, such as `H` to show the healthcheck pane or `?` for help. The `q` hint does nothing, so a stray click never ends the session, and neither do hints that name two keys, like `↑/↓`.
+- **Click** a URL in the Logs pane's title to open it in your browser.
+- **Click** outside an open popup to close it, as `Esc` does. In the level picker, click the threshold you want.
+
+In PTY input mode, clicks never change which service receives your keystrokes.
+
+{{< figure src="images/mouse-selection.png" alt="Four request lines of the api service's logs highlighted by a mouse drag, with the footer reading copied 4 lines" caption="A drag selects lines inside the logs pane only, and releasing the button copies them." >}}
+
+### Using the terminal's own mouse handling
+
+Mouse capture keeps the terminal from seeing the mouse. To use your terminal's own selection or link clicking for a moment, hold its bypass modifier while you click or drag: **Shift** in most terminals, including GNOME Terminal, Konsole, kitty, Alacritty, WezTerm, foot, Ghostty and Windows Terminal, and **Option** in iTerm2. macOS Terminal switches mouse reporting off and on with **View › Allow Mouse Reporting**. Inside tmux with `mouse on`, Shift also bypasses tmux.
+
+Press `m` to turn capture off or on while the TUI runs; the footer shows `Mouse:ON` or `Mouse:OFF`. With capture off, the terminal behaves exactly as without micromux: micromux sends it no mouse sequences, and nothing in the TUI reacts to the mouse.
+
+To choose the default, set `ui.mouse`, in order of precedence:
+
+1. The `--mouse on|off` flag, or the `MICROMUX_MOUSE` environment variable, for one run. It also applies to `micromux attach`.
+2. `ui: { mouse: false }` in the project's `micromux.yaml`.
+3. `ui: { mouse: false }` in your [user config](#user-config), for every project.
+4. On, when none of them says.
+
+A project setting wins over your own because it describes something about that project, such as a team that copies a lot of log output with the terminal's selection; your user config is the default for projects that do not care.
+
+micromux releases the mouse whenever it lets go of the terminal: when it exits, however it is asked to, when you press `Ctrl-Z`, and when it panics. A stop sent from outside, such as `kill -STOP`, gives micromux no chance to let go first, but when it continues it takes the terminal over afresh and redraws.
+
+### User config
+
+Settings that are about you rather than a project live in your user config, `config.yaml` in micromux's config directory:
+
+| Platform | Path |
+|---|---|
+| Linux | `$XDG_CONFIG_HOME/micromux/config.yaml`, by default `~/.config/micromux/config.yaml` |
+| macOS | `~/Library/Application Support/com.romnn.micromux/config.yaml` |
+| Windows | `%APPDATA%\romnn\micromux\config\config.yaml` |
+
+It uses the same keys as a project's `micromux.yaml`, and holds only the mouse setting for now:
+
+```yaml
+ui:
+  mouse: false
+```
+
+The file is optional. Unknown keys produce a warning, so a file written for a newer micromux still loads.
 
 ## Filtering structured logs
 

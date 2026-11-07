@@ -81,6 +81,16 @@ pub struct Options {
     pub no_pretty_json_logs: bool,
 
     #[arg(
+        long = "mouse",
+        env = "MICROMUX_MOUSE",
+        global = true,
+        value_name = "on|off",
+        value_parser = clap::builder::BoolishValueParser::new(),
+        help = "capture the mouse in the TUI for clicks, scrolling and selection; overrides `ui: { mouse: ... }` in the project and user configs"
+    )]
+    pub mouse: Option<bool>,
+
+    #[arg(
         long = "no-control",
         env = "MICROMUX_NO_CONTROL",
         help = "disable the agent control plane (also configurable via `control: { enabled: false }`)"

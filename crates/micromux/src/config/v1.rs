@@ -79,7 +79,7 @@ const KNOWN_CONFIG_KEYS: &[&str] = &[
 const MAX_SESSION_ENTRIES: usize = 256;
 
 /// Warn (or, in strict mode, error) about mapping keys that the parser does not recognize.
-fn warn_unknown_keys<F: Copy>(
+pub(super) fn warn_unknown_keys<F: Copy>(
     mapping: &Mapping,
     known: &[&str],
     context: &str,
@@ -409,7 +409,7 @@ pub fn parse_ui_config<F: Copy>(
     let (_span, mapping) = expect_mapping(value, "ui config must be a mapping".into())?;
     warn_unknown_keys(
         mapping,
-        &["width", "pretty_json_logs"],
+        &["width", "pretty_json_logs", "mouse"],
         "ui",
         file_id,
         strict,
@@ -419,9 +419,11 @@ pub fn parse_ui_config<F: Copy>(
     let pretty_json_logs = parse_optional::<bool>(mapping.get("pretty_json_logs"))?
         .map(Spanned::into_inner)
         .unwrap_or(true);
+    let mouse = parse_optional::<bool>(mapping.get("mouse"))?.map(Spanned::into_inner);
     Ok(UiConfig {
         width,
         pretty_json_logs,
+        mouse,
     })
 }
 

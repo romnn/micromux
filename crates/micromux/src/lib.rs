@@ -56,6 +56,7 @@ pub use tokio_util::sync::CancellationToken;
 pub use cleanup::{
     CleanupWaitCancelled, cleanup_directory_in, cleanup_state_directory, wait_for_previous_cleanups,
 };
+pub use config::user::{UserConfig, parse_user_config, user_config_path};
 pub use config::{
     ConfigError, ConfigFile, ControlConfig, DependencyCondition, DynamicServicesPolicy,
     MAX_CONFIG_FILE_BYTES, config_file_names, find_config_file, from_str, read_config_file,

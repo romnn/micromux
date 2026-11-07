@@ -99,8 +99,11 @@ from the TUI or with the control plane.
  - **PTY input mode (send input)**: `a` (exit input mode with `Alt+Esc`)
  - **Toggle panes/focus**: `Tab`, healthchecks pane: `H`
  - **Logs**: wrap `w`, follow-tail `t`, level threshold `L`, timestamps `T`, hidden fields `F`
+ - **Mouse**: click to select and focus, wheel to scroll, drag to select and copy text inside a pane;
+   `m` toggles capture, Shift bypasses it, and `ui: { mouse: false }` or `--mouse off` turns it off
+ - **Suspend**: `Ctrl-Z` (resume with `fg`)
  - **All keys**: `?`
- - **Quit**: `q` (or `Esc`)
+ - **Quit**: `q` (or `Ctrl-C`)
 
 ## Attach to a running session
 

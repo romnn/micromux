@@ -11,6 +11,7 @@ mod ctl;
 mod logging;
 #[cfg(feature = "mcp")]
 mod mcp;
+mod mouse;
 mod options;
 mod proxy;
 mod session_env;
@@ -122,6 +123,8 @@ fn spawn_second_interrupt_handler(shutdown: micromux::CancellationToken) {
     tokio::spawn(async move {
         shutdown.cancelled().await;
         if tokio::signal::ctrl_c().await.is_ok() {
+            // The TUI may not have given the terminal back yet, and exiting skips its teardown.
+            micromux_tui::release_terminal();
             eprintln!("exiting; service shims finish the remaining stops and cleanups");
             std::process::exit(EXIT_INTERRUPTED);
         }
@@ -467,6 +470,9 @@ async fn run() -> Result<(), Error> {
     let _log_guard = setup_logging(&options)?;
 
     let LoadedConfig { config, printer } = load_config(&options, color_choice).await?;
+    // Settle the TUI's settings before any service starts, so a broken user config stops nothing.
+    let mouse_capture =
+        mouse::mouse_capture(options.mouse, config.config.ui_config.mouse, &printer).await?;
 
     let Supervisor { mux, routes } = start_supervisor(&config, &printer, &shutdown).await?;
     let (runner, handles) = mux.clone().start(shutdown.clone());
@@ -522,8 +528,9 @@ async fn run() -> Result<(), Error> {
         micromux_tui::SessionSource::Local(source),
         Some(input),
         shutdown.clone(),
-        micromux_tui::LogViewOptions {
+        micromux_tui::ViewOptions {
             pretty_json: config.config.ui_config.pretty_json_logs && !options.no_pretty_json_logs,
+            mouse_capture,
         },
     );
 

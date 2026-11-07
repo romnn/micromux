@@ -46,6 +46,10 @@
           "type": "boolean",
           "default": true,
           "description": "Render structured JSON service logs as compact colored log lines in the TUI."
+        },
+        "mouse": {
+          "type": "boolean",
+          "description": "Capture the mouse in the TUI for clicks, scrolling and in-pane text selection. Overrides the user config; the --mouse flag overrides both."
         }
       }
     },

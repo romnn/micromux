@@ -7,11 +7,13 @@
 mod event;
 mod json_log;
 mod level;
+mod mouse;
 mod remote;
 mod render;
 mod source;
 mod state;
 mod style;
+mod terminal;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Duration;
@@ -42,17 +44,38 @@ fn format_byte_limit(bytes: usize) -> String {
     }
 }
 
-/// Initial presentation of service logs in the TUI.
+/// Initial presentation of the TUI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct LogViewOptions {
+pub struct ViewOptions {
     /// Render structured JSON logs as compact colored lines instead of raw JSON.
     pub pretty_json: bool,
+    /// Capture the mouse for clicks, the wheel and selecting text inside one pane.
+    ///
+    /// Without it the terminal keeps its own mouse handling, such as selecting text across the
+    /// whole screen; the `m` key switches capture at runtime either way.
+    pub mouse_capture: bool,
 }
 
-impl Default for LogViewOptions {
+impl Default for ViewOptions {
     fn default() -> Self {
-        Self { pretty_json: true }
+        Self {
+            pretty_json: true,
+            mouse_capture: true,
+        }
     }
+}
+
+/// What the app asks of the terminal, which only the event loop owns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Effect {
+    /// Turn mouse capture on or off.
+    MouseCapture(bool),
+    /// Put the text on the clipboard.
+    Copy(String),
+    /// Open the URL in the browser.
+    OpenUrl(String),
+    /// Give the terminal back and stop until the shell continues the process.
+    Suspend,
 }
 
 /// Errors from running or rendering the terminal interface.
@@ -93,8 +116,13 @@ pub struct App {
     show_help: bool,
     /// The details popup on screen, if any.
     info: Option<InfoView>,
-    /// First row of the details popup on screen, clamped when it renders.
-    info_scroll: usize,
+    /// First row of the help or details popup on screen, clamped when it renders.
+    popup_scroll: usize,
+    mouse: mouse::MouseState,
+    /// Where the last frame drew what the mouse can act on.
+    hits: mouse::Hits,
+    /// Terminal work queued for the event loop.
+    effects: Vec<Effect>,
     pty_input_mode: bool,
     focus: Focus,
     terminal_cols: u16,
@@ -129,7 +157,7 @@ impl App {
         source: SessionSource,
         input: Option<TerminalControl>,
         shutdown: micromux::CancellationToken,
-        log_view_options: LogViewOptions,
+        view_options: ViewOptions,
     ) -> Self {
         let changes = source.subscribe();
         let summary_changes = source.summary_changes();
@@ -164,11 +192,14 @@ impl App {
             log_view,
             healthcheck_view,
             show_healthcheck_pane: false,
-            pretty_json_logs: log_view_options.pretty_json,
+            pretty_json_logs: view_options.pretty_json,
             level_picker: None,
             show_help: false,
             info: None,
-            info_scroll: 0,
+            popup_scroll: 0,
+            mouse: mouse::MouseState::new(view_options.mouse_capture),
+            hits: mouse::Hits::default(),
+            effects: Vec::new(),
             pty_input_mode: false,
             focus: Focus::Services,
             terminal_cols: 80,
@@ -180,57 +211,12 @@ impl App {
 }
 
 impl App {
+    /// The size of the logs pane's text, which the service PTYs match.
     fn desired_pty_size(&self) -> (u16, u16) {
-        use ratatui::layout::{Constraint, Direction, Layout, Rect};
-
-        let area = Rect {
-            x: 0,
-            y: 0,
-            width: self.terminal_cols,
-            height: self.terminal_rows,
-        };
-
-        let chrome = self.chrome_rows(self.terminal_cols);
-        let [_header_area, main_area, _footer_area] = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                // Must match the vertical layout the renderer draws.
-                Constraint::Length(chrome.header),
-                Constraint::Min(0),
-                Constraint::Length(chrome.footer),
-            ])
-            .spacing(0)
-            .areas(area);
-
-        let [_services_area, main_right_area] = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Length(self.state.services_sidebar_width),
-                Constraint::Min(0),
-            ])
-            .spacing(0)
-            .areas(main_area);
-
-        let logs_area = if self.show_healthcheck_pane {
-            let [a, _b] = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-                .spacing(0)
-                .areas::<2>(main_right_area);
-            a
-        } else {
-            main_right_area
-        };
-
-        let [logs_pane_area, _scrollbar_area] = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Min(0), Constraint::Length(1)])
-            .spacing(0)
-            .areas(logs_area);
-
-        let cols = logs_pane_area.width.saturating_sub(2).max(1);
-        let rows = logs_pane_area.height.saturating_sub(2).max(1);
-        (cols, rows)
+        let area = ratatui::layout::Rect::new(0, 0, self.terminal_cols, self.terminal_rows);
+        let layout = self.screen_layout(area, self.chrome_rows(self.terminal_cols));
+        let text = render::log_view::text_area(layout.logs);
+        (text.width.max(1), text.height.max(1))
     }
 
     fn maybe_resize_pty(&mut self) {
@@ -416,7 +402,11 @@ impl App {
             PendingInput,
             /// The session's URLs or routing status changed; only the header needs a redraw.
             Summary,
+            /// The process continued after a stop, and the shell may have taken the terminal.
+            Continued,
         }
+
+        let mut continued = terminal::Continued::watch();
 
         let area = terminal.size()?;
         self.terminal_cols = area.width;
@@ -458,6 +448,7 @@ impl App {
                         std::future::pending::<()>().await;
                     }
                 } => Some(Wake::Summary),
+                () = continued.recv() => Some(Wake::Continued),
             };
 
             let mut needs_resync = false;
@@ -467,6 +458,7 @@ impl App {
                 Some(Wake::Resync) => needs_resync = true,
                 Some(Wake::PendingInput) => self.flush_pending_pty_input(),
                 Some(Wake::Summary) => {}
+                Some(Wake::Continued) => self.take_terminal_again(&mut terminal)?,
                 None => {
                     self.running = false;
                     continue;
@@ -488,6 +480,7 @@ impl App {
                     ) => break,
                 }
             }
+            self.apply_effects(&mut terminal)?;
             if needs_resync {
                 self.resync();
             }
@@ -501,6 +494,53 @@ impl App {
             terminal.draw(|frame| frame.render_widget(&mut self, frame.area()))?;
             last_frame = tokio::time::Instant::now();
         }
+        Ok(())
+    }
+
+    /// Does the terminal work that input queued.
+    fn apply_effects(&mut self, terminal: &mut DefaultTerminal) -> Result<(), Error> {
+        use crossterm::clipboard::CopyToClipboard;
+
+        for effect in std::mem::take(&mut self.effects) {
+            match effect {
+                Effect::MouseCapture(enabled) => terminal::set_mouse_capture(enabled)?,
+                // Both the clipboard and Linux's primary selection, pasted with the middle button.
+                Effect::Copy(text) => crossterm::execute!(
+                    terminal.backend_mut(),
+                    CopyToClipboard::to_clipboard_from(text.as_bytes()),
+                    CopyToClipboard::to_primary_from(text.as_bytes())
+                )?,
+                Effect::OpenUrl(url) => {
+                    if let Err(err) = open_url(&url) {
+                        tracing::warn!(?err, url, "cannot open the URL in a browser");
+                        self.mouse.notice = Some(format!("cannot open a browser: {err}"));
+                    }
+                }
+                #[cfg(unix)]
+                Effect::Suspend => {
+                    terminal::suspend(self.mouse.capture)?;
+                    self.take_terminal_again(terminal)?;
+                }
+                #[cfg(not(unix))]
+                Effect::Suspend => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Takes the terminal over again after the process continued from a stop, and has the next
+    /// frame draw every cell at the terminal's current size.
+    fn take_terminal_again(&mut self, terminal: &mut DefaultTerminal) -> Result<(), Error> {
+        use crossterm::terminal::{Clear, ClearType};
+
+        terminal::take_over(self.mouse.capture)?;
+        // A new terminal forgets what was drawn; ratatui's own `clear` would ask the terminal
+        // where its cursor is, an answer the input reader takes first.
+        *terminal =
+            ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(std::io::stdout()))?;
+        crossterm::execute!(terminal.backend_mut(), Clear(ClearType::All))?;
+        let size = terminal.size()?;
+        self.handle_crossterm_event(&crossterm::event::Event::Resize(size.width, size.height));
         Ok(())
     }
 
@@ -623,8 +663,10 @@ impl App {
                 self.maybe_resize_pty();
             }
             crossterm::event::Event::Key(key) if key.kind == KeyEventKind::Press => {
+                self.mouse.notice = None;
                 self.handle_key_press(key);
             }
+            crossterm::event::Event::Mouse(mouse) => self.handle_mouse(mouse),
             crossterm::event::Event::Paste(ref text) if self.pty_input_mode => {
                 if let Some(service) = self.state.current_service() {
                     let service_id = service.snapshot.id.clone();
@@ -649,37 +691,15 @@ impl App {
             self.exit();
             return;
         }
+        if key.code == KeyCode::Char('z') && key.modifiers == KeyModifiers::CONTROL {
+            self.effects.push(Effect::Suspend);
+            return;
+        }
         if key.modifiers != KeyModifiers::NONE && key.modifiers != KeyModifiers::SHIFT {
             return;
         }
-        if self.show_help {
-            // The overlay swallows every other key, so a stray press cannot act behind it.
-            if matches!(key.code, KeyCode::Esc | KeyCode::Char('?')) {
-                self.show_help = false;
-            }
-            return;
-        }
-        if let Some(view) = self.info {
-            // Like help, the popup swallows every other key: its own key or Esc closes it, the
-            // other popup's key switches, and the movement keys scroll it.
-            const PAGE: usize = 10;
-            match key.code {
-                KeyCode::Esc => self.info = None,
-                KeyCode::Char('i') => self.toggle_info(view, InfoView::Service),
-                KeyCode::Char('u') => self.toggle_info(view, InfoView::Session),
-                KeyCode::Char('k') | KeyCode::Up => {
-                    self.info_scroll = self.info_scroll.saturating_sub(1);
-                }
-                KeyCode::Char('j') | KeyCode::Down => {
-                    self.info_scroll = self.info_scroll.saturating_add(1);
-                }
-                KeyCode::PageUp => self.info_scroll = self.info_scroll.saturating_sub(PAGE),
-                KeyCode::PageDown => self.info_scroll = self.info_scroll.saturating_add(PAGE),
-                KeyCode::Char('g') => self.info_scroll = 0,
-                // Rendering clamps it to the last page.
-                KeyCode::Char('G') => self.info_scroll = usize::MAX,
-                _ => {}
-            }
+        if self.show_help || self.info.is_some() {
+            self.handle_key_press_popup(key.code);
             return;
         }
         if self.level_picker.is_some() {
@@ -691,8 +711,14 @@ impl App {
             // Quit
             KeyCode::Char('q') if key.modifiers == KeyModifiers::NONE => self.exit(),
 
+            // Drop the mouse selection
+            KeyCode::Esc => self.mouse.selection = None,
+
             // Toggle focus
             KeyCode::Tab => self.toggle_focus(),
+
+            // Toggle mouse capture
+            KeyCode::Char('m') => self.toggle_mouse_capture(),
 
             // Toggle PTY input mode
             KeyCode::Char('a') if self.input.is_some() => {
@@ -737,7 +763,10 @@ impl App {
             // Toggle automatic tailing for log viewer
             KeyCode::Char('t') => self.toggle_tail(),
 
-            KeyCode::Char('?') => self.show_help = true,
+            KeyCode::Char('?') => {
+                self.show_help = true;
+                self.popup_scroll = 0;
+            }
             // Without a selected service there is nothing to describe.
             KeyCode::Char('i') if self.state.current_service().is_some() => {
                 self.open_info(InfoView::Service);
@@ -760,9 +789,39 @@ impl App {
         }
     }
 
+    /// Keys while the help or a details popup shows, which swallow every other key so a stray
+    /// press cannot act behind them: the popup's own key or Esc closes it, the other details
+    /// popup's key switches to it, and the movement keys scroll it.
+    fn handle_key_press_popup(&mut self, code: crossterm::event::KeyCode) {
+        use crossterm::event::KeyCode;
+
+        const PAGE: usize = 10;
+        match (code, self.info) {
+            (KeyCode::Esc, _) => {
+                self.show_help = false;
+                self.info = None;
+            }
+            (KeyCode::Char('?'), None) => self.show_help = false,
+            (KeyCode::Char('i'), Some(view)) => self.toggle_info(view, InfoView::Service),
+            (KeyCode::Char('u'), Some(view)) => self.toggle_info(view, InfoView::Session),
+            (KeyCode::Char('k') | KeyCode::Up, _) => {
+                self.popup_scroll = self.popup_scroll.saturating_sub(1);
+            }
+            (KeyCode::Char('j') | KeyCode::Down, _) => {
+                self.popup_scroll = self.popup_scroll.saturating_add(1);
+            }
+            (KeyCode::PageUp, _) => self.popup_scroll = self.popup_scroll.saturating_sub(PAGE),
+            (KeyCode::PageDown, _) => self.popup_scroll = self.popup_scroll.saturating_add(PAGE),
+            (KeyCode::Char('g'), _) => self.popup_scroll = 0,
+            // Rendering clamps it to the last page.
+            (KeyCode::Char('G'), _) => self.popup_scroll = usize::MAX,
+            _ => {}
+        }
+    }
+
     fn open_info(&mut self, view: InfoView) {
         self.info = Some(view);
-        self.info_scroll = 0;
+        self.popup_scroll = 0;
     }
 
     /// Closes `target` when it is the popup on screen, and opens it otherwise.
@@ -923,6 +982,7 @@ impl App {
             .saturating_sub(usize::from(lines));
     }
 
+    /// Scrolls the logs down by `lines`; reaching the bottom resumes following the tail.
     fn scroll_logs_down(&mut self, lines: u16) {
         self.log_view.follow_tail = false;
         let Some(service) = self.state.current_service() else {
@@ -938,6 +998,7 @@ impl App {
             .scroll_offset
             .saturating_add(usize::from(lines))
             .min(max_off);
+        self.log_view.follow_tail = self.log_view.scroll_offset == max_off;
     }
 
     fn scroll_healthchecks_up(&mut self, lines: u16) {
@@ -948,6 +1009,7 @@ impl App {
             .saturating_sub(usize::from(lines));
     }
 
+    /// Scrolls the healthcheck pane down by `lines`; reaching the bottom resumes following it.
     fn scroll_healthchecks_down(&mut self, lines: u16) {
         self.healthcheck_view.follow_tail = false;
         let Some(service) = self.state.current_service() else {
@@ -961,6 +1023,7 @@ impl App {
             .scroll_offset
             .saturating_add(usize::from(lines))
             .min(max_off);
+        self.healthcheck_view.follow_tail = self.healthcheck_view.scroll_offset == max_off;
     }
 
     fn is_running(&self) -> bool {
@@ -1014,6 +1077,40 @@ impl App {
         tracing::info!("restarting all services");
         self.source.restart_all();
     }
+}
+
+/// Gives the terminal back if the TUI holds it, for an exit that skips the TUI's own teardown,
+/// such as a second interrupt.
+///
+/// It releases mouse capture, leaves the alternate screen and turns raw mode off, each only if
+/// it is on, so calling it again or without a TUI does nothing.
+pub fn release_terminal() {
+    // An exit path has nowhere better to report a failure to restore the terminal.
+    terminal::give_back().ok();
+}
+
+/// Opens `url` in the browser with the platform's opener, without waiting for it.
+///
+/// The opener's output is discarded, since anything it prints would land on the TUI.
+fn open_url(url: &str) -> std::io::Result<()> {
+    use std::process::{Command, Stdio};
+
+    let opener = if cfg!(target_os = "macos") {
+        "open"
+    } else if cfg!(windows) {
+        "explorer"
+    } else {
+        "xdg-open"
+    };
+    let mut child = Command::new(opener)
+        .arg(url)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    // Reap the opener once it exits, so it does not linger as a zombie.
+    std::thread::spawn(move || child.wait());
+    Ok(())
 }
 
 fn key_event_to_bytes(
@@ -1175,7 +1272,7 @@ mod tests {
             SessionSource::Local(LocalSource::new(handles.reader, handles.commands.clone())),
             Some(handles.terminal.clone()),
             shutdown.clone(),
-            LogViewOptions::default(),
+            ViewOptions::default(),
         );
         let key = |code, modifiers| KeyEvent {
             code,
@@ -1223,7 +1320,7 @@ mod tests {
             SessionSource::Local(LocalSource::new(handles.reader, handles.commands.clone())),
             Some(handles.terminal),
             shutdown.clone(),
-            LogViewOptions::default(),
+            ViewOptions::default(),
         );
         let press = |app: &mut App, code| {
             app.handle_key_press(KeyEvent {
@@ -1326,7 +1423,7 @@ mod tests {
             SessionSource::Local(LocalSource::new(handles.reader, handles.commands.clone())),
             Some(handles.terminal),
             micromux::CancellationToken::new(),
-            LogViewOptions::default(),
+            ViewOptions::default(),
         );
 
         // A wide terminal fits the status and the view controls on one header row and every action
@@ -1385,7 +1482,7 @@ mod tests {
             SessionSource::Local(LocalSource::new(handles.reader, handles.commands.clone())),
             Some(handles.terminal),
             micromux::CancellationToken::new(),
-            LogViewOptions::default(),
+            ViewOptions::default(),
         );
         let area = ratatui::layout::Rect::new(0, 0, 200, 24);
         let mut buffer = ratatui::buffer::Buffer::empty(area);
@@ -1427,7 +1524,7 @@ mod tests {
             SessionSource::Local(LocalSource::new(handles.reader, handles.commands.clone())),
             Some(handles.terminal),
             micromux::CancellationToken::new(),
-            LogViewOptions::default(),
+            ViewOptions::default(),
         );
         let area = ratatui::layout::Rect::new(0, 0, 200, 24);
         let mut buffer = ratatui::buffer::Buffer::empty(area);
@@ -1473,7 +1570,7 @@ mod tests {
             ),
             Some(handles.terminal),
             micromux::CancellationToken::new(),
-            LogViewOptions::default(),
+            ViewOptions::default(),
         );
         Ok((app, handles.session, ports))
     }
@@ -1573,6 +1670,78 @@ mod tests {
         assert!(
             rows[1].contains("routing unavailable: the proxy stopped answering"),
             "{rows:#?}"
+        );
+        Ok(())
+    }
+
+    /// A click on a URL in the Logs title opens that URL, since mouse capture keeps the
+    /// terminal from opening it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn clicking_a_url_in_the_logs_title_opens_it() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let yaml = indoc! {r#"
+            version: 1
+            session: { name: tui }
+            proxy: { port: 8080 }
+            routes:
+              - host: app
+                port: 9997
+              - host: api
+                port: 9998
+            services:
+              web:
+                command: ["sleep", "30"]
+                ports: [9997, 9998]
+        "#};
+        let (mut app, _session, _) = routed_app(directory.path(), yaml)?;
+        let screen = screen_text(&mut app, 200, 24);
+        let (y, row) = screen
+            .lines()
+            .enumerate()
+            .find(|(_, row)| row.contains("┌Logs"))
+            .ok_or_else(|| eyre::eyre!("no Logs title:\n{screen}"))?;
+        let column = |needle: &str| -> eyre::Result<u16> {
+            let byte = row
+                .find(needle)
+                .ok_or_else(|| eyre::eyre!("{needle} is not in {row}"))?;
+            Ok(u16::try_from(
+                row.get(..byte).unwrap_or_default().chars().count(),
+            )?)
+        };
+        let y = u16::try_from(y)?;
+        let click = |app: &mut App, x: u16| {
+            for kind in [
+                crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+            ] {
+                app.handle_mouse(crossterm::event::MouseEvent {
+                    kind,
+                    column: x,
+                    row: y,
+                    modifiers: KeyModifiers::NONE,
+                });
+            }
+        };
+
+        // Both ends of the second URL open it, and the separator between the URLs opens nothing.
+        let api = "http://api.tui.localhost:8080";
+        let start = column(api)?;
+        let width = u16::try_from(api.len())?;
+        click(&mut app, start);
+        click(&mut app, start + width - 1);
+        click(&mut app, start - 2);
+        assert_eq!(
+            std::mem::take(&mut app.effects),
+            vec![
+                Effect::OpenUrl(api.to_string()),
+                Effect::OpenUrl(api.to_string())
+            ]
+        );
+        click(&mut app, column("http://app.tui.localhost:8080")?);
+        assert_eq!(
+            app.effects,
+            vec![Effect::OpenUrl("http://app.tui.localhost:8080".to_string())]
         );
         Ok(())
     }
@@ -1720,7 +1889,7 @@ mod tests {
             SessionSource::Local(LocalSource::new(handles.reader, handles.commands.clone())),
             Some(handles.terminal),
             shutdown.clone(),
-            LogViewOptions::default(),
+            ViewOptions::default(),
         );
 
         // With no service to describe, `i` opens nothing that would swallow later keys.
@@ -1771,7 +1940,7 @@ mod tests {
             SessionSource::Local(LocalSource::new(handles.reader, handles.commands.clone())),
             Some(handles.terminal.clone()),
             micromux::CancellationToken::new(),
-            LogViewOptions::default(),
+            ViewOptions::default(),
         );
         app.show_healthcheck_pane = true;
         let area = ratatui::layout::Rect::new(0, 0, 120, 30);
@@ -1870,7 +2039,7 @@ mod tests {
             SessionSource::Local(LocalSource::new(handles.reader, handles.commands.clone())),
             Some(handles.terminal),
             shutdown.clone(),
-            LogViewOptions::default(),
+            ViewOptions::default(),
         );
 
         app.enqueue_pty_input("svc".to_string(), b"first".to_vec());
@@ -1908,7 +2077,7 @@ mod tests {
             SessionSource::Local(LocalSource::new(handles.reader, handles.commands.clone())),
             Some(handles.terminal),
             micromux::CancellationToken::new(),
-            LogViewOptions::default(),
+            ViewOptions::default(),
         );
 
         app.handle_crossterm_event(&crossterm::event::Event::Paste("Rq".to_string()));
@@ -1942,7 +2111,7 @@ mod tests {
             SessionSource::Local(LocalSource::new(handles.reader, handles.commands.clone())),
             Some(handles.terminal),
             shutdown.clone(),
-            LogViewOptions::default(),
+            ViewOptions::default(),
         );
         let paste = vec![b'x'; micromux::MAX_PTY_INPUT_BATCH_BYTES + 17];
 
@@ -1980,7 +2149,7 @@ mod tests {
             SessionSource::Local(LocalSource::new(handles.reader, handles.commands.clone())),
             Some(handles.terminal.clone()),
             micromux::CancellationToken::new(),
-            LogViewOptions::default(),
+            ViewOptions::default(),
         );
         let paste = vec![b'x'; micromux::MAX_PTY_PASTE_BYTES + 1];
 
@@ -2046,7 +2215,7 @@ mod tests {
             SessionSource::Local(LocalSource::new(handles.reader, handles.commands.clone())),
             Some(handles.terminal),
             shutdown.clone(),
-            LogViewOptions::default(),
+            ViewOptions::default(),
         );
         let runner = tokio::spawn(runner);
 
@@ -2113,7 +2282,7 @@ mod tests {
             ),
             Some(handles.terminal),
             micromux::CancellationToken::new(),
-            LogViewOptions::default(),
+            ViewOptions::default(),
         );
         app.input_notice = Some("input warning".to_string());
         app.terminal_input_closed = true;
@@ -2159,7 +2328,7 @@ mod tests {
             )),
             Some(handles.terminal.clone()),
             shutdown,
-            LogViewOptions::default(),
+            ViewOptions::default(),
         );
         app.focus = Focus::Services;
         app.show_healthcheck_pane = false;
@@ -2200,7 +2369,7 @@ mod tests {
             SessionSource::Local(LocalSource::new(handles.reader, commands_tx)),
             None,
             shutdown,
-            LogViewOptions::default(),
+            ViewOptions::default(),
         );
         let key = |code| KeyEvent {
             code,
@@ -2256,7 +2425,7 @@ mod tests {
             SessionSource::Local(LocalSource::new(handles.reader.clone(), commands_tx)),
             Some(handles.terminal),
             shutdown,
-            LogViewOptions::default(),
+            ViewOptions::default(),
         );
 
         // Hand the viewer one red, bold line as if the service had printed it.
@@ -2353,7 +2522,7 @@ mod tests {
             )),
             Some(handles.terminal),
             shutdown,
-            LogViewOptions::default(),
+            ViewOptions::default(),
         );
         if let Some(service) = app.state.current_service_mut() {
             service.snapshot.desired = micromux::Desired::Disabled;
@@ -2402,7 +2571,7 @@ mod tests {
             )),
             Some(handles.terminal),
             shutdown,
-            LogViewOptions::default(),
+            ViewOptions::default(),
         );
         let stop_key = KeyEvent {
             code: KeyCode::Char('s'),
@@ -2474,7 +2643,7 @@ mod tests {
             SessionSource::Local(LocalSource::new(initial.reader, initial.commands.clone())),
             Some(initial.terminal),
             shutdown,
-            LogViewOptions::default(),
+            ViewOptions::default(),
         );
         app.state.selected_service = 1;
         if let Some(service) = app.state.current_service_mut() {

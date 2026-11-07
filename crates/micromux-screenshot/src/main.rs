@@ -108,6 +108,19 @@ const SCENARIOS: &[Scenario] = &[
         rows: 44,
         keys: &[b"jj" as &[u8]],
     },
+    // Mouse selection: a drag over four of `api`'s request lines, sent as SGR mouse reports with
+    // one-based columns and rows, highlights them and copies them, which the footer confirms.
+    // The logs' text starts in column 42, and the 12:00:02 POST line is drawn on row 12.
+    Scenario {
+        name: "mouse-selection",
+        cols: 200,
+        rows: 44,
+        keys: &[
+            b"\x1b[<0;42;12M" as &[u8],
+            b"\x1b[<32;81;15M",
+            b"\x1b[<0;81;15m",
+        ],
+    },
     // Service details: `i` opens the popup that describes the selected `api` service in full.
     Scenario {
         name: "service-details",
@@ -459,7 +472,8 @@ fn screen_to_ansi(screen: &vt100::Screen, rows: u16, cols: u16) -> String {
                             italic: cell.italic(),
                             underline: cell.underline(),
                             inverse: cell.inverse(),
-                        },
+                        }
+                        .resolve_inverse(),
                     )
                 }
                 None => (" ", DEFAULT_STY),
@@ -495,6 +509,36 @@ fn screen_to_ansi(screen: &vt100::Screen, rows: u16, cols: u16) -> String {
         out.push('\n');
     }
     out
+}
+
+/// The colors `freeze` draws for the terminal's default foreground and background.
+const FREEZE_DEFAULT_FG: Col = Col::Rgb(0xdc, 0xdc, 0xdc);
+const FREEZE_DEFAULT_BG: Col = Col::Rgb(0x17, 0x17, 0x17);
+
+impl Sty {
+    /// Swaps the colors of reverse video, which `freeze` does not draw, such as a mouse
+    /// selection.
+    fn resolve_inverse(self) -> Self {
+        if !self.inverse {
+            return self;
+        }
+        let fg = if self.fg == Col::Default {
+            FREEZE_DEFAULT_FG
+        } else {
+            self.fg
+        };
+        let bg = if self.bg == Col::Default {
+            FREEZE_DEFAULT_BG
+        } else {
+            self.bg
+        };
+        Self {
+            fg: bg,
+            bg: fg,
+            inverse: false,
+            ..self
+        }
+    }
 }
 
 /// Append the SGR parameters for `color` (each with a leading `;`); `Default` appends nothing.
