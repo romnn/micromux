@@ -38,6 +38,7 @@ The header's right side lists the view keys, which change only what the panes sh
 | `?` | Show every key binding (close with `Esc`) |
 | `m` | Toggle mouse capture (see [Mouse](#mouse)) |
 | `Ctrl-Z` | Suspend to the shell; `fg` brings the TUI back |
+| `y` / `Enter` | Copy the mouse selection (see [Mouse](#mouse)) |
 | `Esc` | Clear the mouse selection |
 | `q` / `Ctrl-C` | Quit |
 
@@ -52,16 +53,18 @@ Restart, disable, and enable all go through the [control plane]({{< relref "agen
 With mouse capture on, which is the default, the mouse works as in most terminal apps:
 
 - **Click** a service to select it, or any pane to focus it, as `Tab` would.
-- **Wheel** scrolls the pane under the pointer, without moving the focus: the service list moves the selection, and the log and healthcheck panes scroll three rows a turn. Scrolling up leaves follow-tail, as the keys do, and scrolling back to the bottom follows the tail again. While a popup is open, the wheel scrolls the popup.
-- **Drag** selects text inside the pane where the drag started, never across panes, so a selection in the logs never picks up the sidebar. Dragging past the top or bottom of the pane scrolls it, and past its right edge selects to the end of the line, even where a line runs on beyond the pane. Dragging in the logs stops follow-tail, so new lines do not scroll the text away under the pointer; the selection stays on its text while a busy log drops its oldest lines. A double click selects a word, a triple click the whole line, even when it wraps over several rows or runs past the pane. `Esc` clears the selection.
-- **Releasing** the button copies the selection to the clipboard, and to the primary selection where there is one, through the terminal's OSC 52 support, which also works over ssh. The footer says what was copied. Some terminals ignore OSC 52, such as macOS Terminal and GNOME Terminal and other VTE-based terminals, so outside ssh micromux also hands the text to `pbcopy` on macOS, or to `wl-copy`, `xclip` or `xsel` on Linux, whichever is installed. Where neither works, use the terminal's own selection, described below.
+- **Wheel** scrolls the pane under the pointer, without moving the focus: each notch moves the service list's selection by one service, and the log and healthcheck panes by three rows, however many events the terminal sends for it. Scrolling up leaves follow-tail, as the keys do, but only when the view moves; a pane whose text fits, such as a full-screen program's live screen, keeps following. Scrolling back to the bottom follows the tail again. While a popup is open, the wheel scrolls the popup.
+- **Drag** selects text inside the pane where the drag started, never across panes, so a selection in the logs never picks up the sidebar. Dragging past the top or bottom of the pane scrolls it, and past its right edge selects to the end of the line, even where a line runs on beyond the pane. A double click selects a word, a triple click the whole line, even when it wraps over several rows or runs past the pane. `Esc` clears the selection.
+- **The selection stays on its text** until you clear it or start another: while new lines arrive and the pane scrolls, while a busy log drops its oldest lines, and while a live screen or a popup redraws. A resize keeps it too, unless wrapping lays the text out anew.
+- **Selecting only highlights.** Press `y` or `Enter`, or click `y Copy` in the footer, which takes the mouse toggle's place while text is selected, to copy the selection to the clipboard. `Ctrl+Shift+C` and `Super+C` copy too, but only where the terminal passes them on: most terminals keep these chords for their own copy, and without the kitty keyboard protocol `Ctrl+Shift+C` arrives as `Ctrl-C`, which quits. To copy as soon as a drag ends instead, turn on [`ui.copy_on_select`](#settings).
+- **Copying** goes to the clipboard, and to the primary selection where there is one, through the terminal's OSC 52 support, which also works over ssh. The footer says what was copied. Some terminals ignore OSC 52, such as macOS Terminal and GNOME Terminal and other VTE-based terminals, so outside ssh micromux also hands the text to `pbcopy` on macOS, or to `wl-copy`, `xclip` or `xsel` on Linux, whichever is installed. Where neither works, use the terminal's own selection, described below.
 - **Click** a key hint in the header or footer to run its key, such as `H` to show the healthcheck pane or `?` for help. It acts when the button comes up on the hint it went down on, so sliding off cancels it. The `q` hint does nothing, so a stray click never ends the session, and neither do hints that name two keys, like `↑/↓`.
 - **Click** a URL in the Logs pane's title to open it in your browser.
 - **Click** outside an open popup to close it, as `Esc` does. In the level picker, click the threshold you want.
 
-In PTY input mode, clicks never change which service receives your keystrokes.
+In PTY input mode, neither clicks nor the wheel change which service receives your keystrokes, and `y` and `Enter` go to the service; leave the mode with `Alt+Esc` to copy.
 
-{{< figure src="images/mouse-selection.png" alt="Four request lines of the api service's logs highlighted by a mouse drag, with the footer reading copied 4 lines" caption="A drag selects lines inside the logs pane only, and releasing the button copies them." >}}
+{{< figure src="images/mouse-selection.png" alt="Four request lines of the api service's logs highlighted by a mouse drag, with the footer reading copied 4 lines after y" caption="A drag selects lines inside the logs pane only, and y copies them." >}}
 
 ### Using the terminal's own mouse handling
 
@@ -69,12 +72,21 @@ Mouse capture keeps the terminal from seeing the mouse. To use your terminal's o
 
 Press `m` to turn capture off or on while the TUI runs; the footer shows `Mouse:ON` or `Mouse:OFF`. With capture off, the terminal behaves exactly as without micromux: micromux sends it no mouse sequences, and nothing in the TUI reacts to the mouse.
 
-To choose the default, set `ui.mouse`, in order of precedence:
+### Settings
 
-1. The `--mouse on|off` flag, or the `MICROMUX_MOUSE` environment variable, for one run. It also applies to `micromux attach`.
-2. `ui: { mouse: false }` in the project's `micromux.yaml`.
-3. `ui: { mouse: false }` in your [user config](#user-config), for every project.
-4. On, when none of them says.
+Two settings shape the mouse:
+
+| Setting | Flag and environment variable | Default | Effect |
+|---|---|---|---|
+| `ui.mouse` | `--mouse on\|off`, `MICROMUX_MOUSE` | on | Capture the mouse. |
+| `ui.copy_on_select` | `--copy-on-select on\|off`, `MICROMUX_COPY_ON_SELECT` | off | Copy a selection as soon as the drag ends, without waiting for `y`. |
+
+For each, the first of these that says wins:
+
+1. The flag or its environment variable, for one run. They also apply to `micromux attach`.
+2. The `ui` section of the project's `micromux.yaml`.
+3. The `ui` section of your [user config](#user-config), for every project.
+4. The default.
 
 A project setting wins over your own because it describes something about that project, such as a team that copies a lot of log output with the terminal's selection; your user config is the default for projects that do not care.
 
@@ -90,11 +102,12 @@ Settings that are about you rather than a project live in your user config, `con
 | macOS | `~/Library/Application Support/com.romnn.micromux/config.yaml` |
 | Windows | `%APPDATA%\romnn\micromux\config\config.yaml` |
 
-It uses the same keys as a project's `micromux.yaml`, and holds only the mouse setting for now:
+It uses the same keys as a project's `micromux.yaml`, and holds only the mouse settings for now:
 
 ```yaml
 ui:
-  mouse: false
+  mouse: true
+  copy_on_select: false
 ```
 
 The file is optional. Unknown keys produce a warning, so a file written for a newer micromux still loads.

@@ -1417,6 +1417,10 @@ const HELP_COLUMNS: [&[HelpSection]; 2] = [
                     keys: "m",
                     description: "Mouse capture; Shift bypasses",
                 },
+                HelpKey {
+                    keys: "y / ↵",
+                    description: "Copy the mouse selection",
+                },
             ],
         },
     ],
@@ -2022,11 +2026,18 @@ impl App {
                 hints.push(KeyHint::new("a", "PTY input"));
             }
         }
-        hints.push(KeyHint::toggle(
-            "m",
-            "Mouse",
-            if self.mouse.capture { "ON" } else { "OFF" },
-        ));
+        // While text is selected, the copy key takes the mouse toggle's place, padded to its
+        // width, so the footer keeps its rows and the panes and service terminals their size.
+        // Capture is on whenever there is a selection, so the toggle has nothing to report.
+        if self.has_selection() && !self.pty_input_mode {
+            hints.push(KeyHint::new("y", "Copy    "));
+        } else {
+            hints.push(KeyHint::toggle(
+                "m",
+                "Mouse",
+                if self.mouse.capture { "ON" } else { "OFF" },
+            ));
+        }
         hints.push(KeyHint::new(
             "q",
             if self.source.attachment_status().is_some() {
@@ -2665,6 +2676,25 @@ pub mod log_view {
     }
 
     impl LogView {
+        /// Scrolls by `rows`, up when negative, through `total` rows shown `viewport` at a time.
+        ///
+        /// Following the tail stops only when the view leaves the bottom, so a pane whose text
+        /// fits, such as a full-screen program's live screen, keeps following however the wheel
+        /// turns; scrolling down to the bottom follows again.
+        pub(crate) fn scroll_by(&mut self, rows: isize, total: usize, viewport: usize) {
+            let max_off = total.saturating_sub(viewport);
+            let from = if self.follow_tail {
+                max_off
+            } else {
+                self.scroll_offset.min(max_off)
+            };
+            let to = from.saturating_add_signed(rows).min(max_off);
+            self.scroll_offset = to;
+            if to != from || rows > 0 {
+                self.follow_tail = to == max_off;
+            }
+        }
+
         /// Render a scrollable text pane and return its wrap-aware rendered line count, so callers
         /// can clamp keyboard scrolling consistently with the scrollbar/follow-tail behavior.
         ///

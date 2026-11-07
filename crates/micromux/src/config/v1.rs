@@ -409,7 +409,7 @@ pub fn parse_ui_config<F: Copy>(
     let (_span, mapping) = expect_mapping(value, "ui config must be a mapping".into())?;
     warn_unknown_keys(
         mapping,
-        &["width", "pretty_json_logs", "mouse"],
+        &["width", "pretty_json_logs", "mouse", "copy_on_select"],
         "ui",
         file_id,
         strict,
@@ -420,10 +420,13 @@ pub fn parse_ui_config<F: Copy>(
         .map(Spanned::into_inner)
         .unwrap_or(true);
     let mouse = parse_optional::<bool>(mapping.get("mouse"))?.map(Spanned::into_inner);
+    let copy_on_select =
+        parse_optional::<bool>(mapping.get("copy_on_select"))?.map(Spanned::into_inner);
     Ok(UiConfig {
         width,
         pretty_json_logs,
         mouse,
+        copy_on_select,
     })
 }
 

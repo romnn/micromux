@@ -50,18 +50,37 @@ fn format_byte_limit(bytes: usize) -> String {
 pub struct ViewOptions {
     /// Render structured JSON logs as compact colored lines instead of raw JSON.
     pub pretty_json: bool,
-    /// Capture the mouse for clicks, the wheel and selecting text inside one pane.
-    ///
-    /// Without it the terminal keeps its own mouse handling, such as selecting text across the
-    /// whole screen; the `m` key switches capture at runtime either way.
-    pub mouse_capture: bool,
+    /// How the TUI handles the mouse.
+    pub mouse: MouseOptions,
 }
 
 impl Default for ViewOptions {
     fn default() -> Self {
         Self {
             pretty_json: true,
-            mouse_capture: true,
+            mouse: MouseOptions::default(),
+        }
+    }
+}
+
+/// How the TUI handles the mouse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MouseOptions {
+    /// Capture the mouse for clicks, the wheel and selecting text inside one pane.
+    ///
+    /// Without it the terminal keeps its own mouse handling, such as selecting text across the
+    /// whole screen; the `m` key switches capture at runtime either way.
+    pub capture: bool,
+    /// Copy a selection to the clipboard as soon as the drag ends, rather than only on an
+    /// explicit copy key.
+    pub copy_on_select: bool,
+}
+
+impl Default for MouseOptions {
+    fn default() -> Self {
+        Self {
+            capture: true,
+            copy_on_select: false,
         }
     }
 }
@@ -200,7 +219,7 @@ impl App {
             show_help: false,
             info: None,
             popup_scroll: 0,
-            mouse: mouse::MouseState::new(view_options.mouse_capture),
+            mouse: mouse::MouseState::new(view_options.mouse),
             first_service: 0,
             hits: mouse::Hits::default(),
             effects: Vec::new(),
@@ -707,6 +726,14 @@ impl App {
     fn handle_key_press(&mut self, key: crossterm::event::KeyEvent) {
         use crossterm::event::{KeyCode, KeyModifiers};
 
+        // Terminals copy with these chords, never meant for a service, so they copy a selection
+        // even in PTY input mode. They only arrive where the terminal reports them apart from
+        // Ctrl-C and has no binding of its own for them.
+        if is_copy_chord(key) && self.has_selection() {
+            self.copy_selection();
+            return;
+        }
+
         // PTY mode forwards Ctrl-C to the selected process; command mode reserves the same chord
         // for leaving the TUI.
         if self.pty_input_mode {
@@ -739,8 +766,10 @@ impl App {
             // Quit
             KeyCode::Char('q') if key.modifiers == KeyModifiers::NONE => self.exit(),
 
-            // Drop the mouse selection
+            // Drop or copy the mouse selection
             KeyCode::Esc => self.mouse.selection = None,
+            KeyCode::Char('y') => self.copy_selection(),
+            KeyCode::Enter if self.has_selection() => self.copy_selection(),
 
             // Toggle focus
             KeyCode::Tab => self.toggle_focus(),
@@ -830,6 +859,7 @@ impl App {
                 self.info = None;
             }
             (KeyCode::Char('?'), None) => self.show_help = false,
+            (KeyCode::Char('y') | KeyCode::Enter, _) => self.copy_selection(),
             (KeyCode::Char('i'), Some(view)) => self.toggle_info(view, InfoView::Service),
             (KeyCode::Char('u'), Some(view)) => self.toggle_info(view, InfoView::Session),
             (KeyCode::Char('k') | KeyCode::Up, _) => {
@@ -1003,55 +1033,42 @@ impl App {
     }
 
     fn scroll_logs_up(&mut self, lines: u16) {
-        self.log_view.follow_tail = false;
-        self.log_view.scroll_offset = self
-            .log_view
-            .scroll_offset
-            .saturating_sub(usize::from(lines));
+        self.scroll_logs(-isize::from(lines.cast_signed()));
     }
 
-    /// Scrolls the logs down by `lines`; reaching the bottom resumes following the tail.
     fn scroll_logs_down(&mut self, lines: u16) {
-        self.log_view.follow_tail = false;
+        self.scroll_logs(isize::from(lines.cast_signed()));
+    }
+
+    /// Scrolls the logs by `rows`, up when negative, as [`render::log_view::LogView::scroll_by`]
+    /// does.
+    fn scroll_logs(&mut self, rows: isize) {
         let Some(service) = self.state.current_service() else {
             return;
         };
         // Wrap-aware count persisted by the renderer, so scrolling reaches the true bottom
         // even when wrapping is enabled (the raw entry count would stop short).
-        let num_lines = service.cached_line_index.total_lines();
+        let total = service.cached_line_index.total_lines();
         let viewport = usize::from(self.log_viewport_height());
-        let max_off = num_lines.saturating_sub(viewport);
-        self.log_view.scroll_offset = self
-            .log_view
-            .scroll_offset
-            .saturating_add(usize::from(lines))
-            .min(max_off);
-        self.log_view.follow_tail = self.log_view.scroll_offset == max_off;
+        self.log_view.scroll_by(rows, total, viewport);
     }
 
     fn scroll_healthchecks_up(&mut self, lines: u16) {
-        self.healthcheck_view.follow_tail = false;
-        self.healthcheck_view.scroll_offset = self
-            .healthcheck_view
-            .scroll_offset
-            .saturating_sub(usize::from(lines));
+        self.scroll_healthchecks(-isize::from(lines.cast_signed()));
     }
 
-    /// Scrolls the healthcheck pane down by `lines`; reaching the bottom resumes following it.
     fn scroll_healthchecks_down(&mut self, lines: u16) {
-        self.healthcheck_view.follow_tail = false;
+        self.scroll_healthchecks(isize::from(lines.cast_signed()));
+    }
+
+    /// Scrolls the healthcheck pane by `rows`, up when negative.
+    fn scroll_healthchecks(&mut self, rows: isize) {
         let Some(service) = self.state.current_service() else {
             return;
         };
-        let num_lines = service.healthcheck_cached_line_index.total_lines();
+        let total = service.healthcheck_cached_line_index.total_lines();
         let viewport = usize::from(self.log_viewport_height());
-        let max_off = num_lines.saturating_sub(viewport);
-        self.healthcheck_view.scroll_offset = self
-            .healthcheck_view
-            .scroll_offset
-            .saturating_add(usize::from(lines))
-            .min(max_off);
-        self.healthcheck_view.follow_tail = self.healthcheck_view.scroll_offset == max_off;
+        self.healthcheck_view.scroll_by(rows, total, viewport);
     }
 
     fn is_running(&self) -> bool {
@@ -1141,6 +1158,16 @@ fn open_url(url: &str) -> std::io::Result<()> {
     // Reap the opener once it exits, so it does not linger as a zombie.
     std::thread::spawn(move || child.wait());
     Ok(())
+}
+
+/// Whether `key` is a terminal's copy chord: Ctrl+Shift+C, as on Linux, or Super+C, as Cmd+C on
+/// macOS.
+fn is_copy_chord(key: crossterm::event::KeyEvent) -> bool {
+    use crossterm::event::{KeyCode, KeyModifiers};
+
+    let c = matches!(key.code, KeyCode::Char('c' | 'C'));
+    c && (key.modifiers == KeyModifiers::CONTROL | KeyModifiers::SHIFT
+        || key.modifiers == KeyModifiers::SUPER)
 }
 
 fn key_event_to_bytes(

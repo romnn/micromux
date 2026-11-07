@@ -20,6 +20,9 @@ pub const USER_CONFIG_FILE_NAME: &str = "config.yaml";
 pub struct UserConfig {
     /// `ui.mouse`: whether the TUI captures the mouse, or `None` when the file does not say.
     pub mouse: Option<bool>,
+    /// `ui.copy_on_select`: whether finishing a mouse selection copies it, or `None` when the
+    /// file does not say.
+    pub copy_on_select: Option<bool>,
 }
 
 /// Where the user config lives: `config.yaml` in the platform's config directory for micromux,
@@ -56,9 +59,20 @@ pub fn parse_user_config<F: Copy>(
         return Ok(UserConfig::default());
     };
     let (_span, ui) = expect_mapping(ui, Some("ui config must be a mapping"))?;
-    super::v1::warn_unknown_keys(ui, &["mouse"], "ui", file_id, false, diagnostics);
+    super::v1::warn_unknown_keys(
+        ui,
+        &["mouse", "copy_on_select"],
+        "ui",
+        file_id,
+        false,
+        diagnostics,
+    );
     let mouse = parse_optional::<bool>(ui.get("mouse"))?.map(Spanned::into_inner);
-    Ok(UserConfig { mouse })
+    let copy_on_select = parse_optional::<bool>(ui.get("copy_on_select"))?.map(Spanned::into_inner);
+    Ok(UserConfig {
+        mouse,
+        copy_on_select,
+    })
 }
 
 #[cfg(test)]
@@ -69,10 +83,20 @@ mod tests {
     use similar_asserts::assert_eq;
 
     #[test]
-    fn reads_the_mouse_setting() -> eyre::Result<()> {
+    fn reads_the_mouse_settings() -> eyre::Result<()> {
         let mut diagnostics = Vec::new();
-        let config = parse_user_config("ui:\n  mouse: false\n", 0usize, &mut diagnostics)?;
-        assert_eq!(config, UserConfig { mouse: Some(false) });
+        let config = parse_user_config(
+            "ui:\n  mouse: false\n  copy_on_select: true\n",
+            0usize,
+            &mut diagnostics,
+        )?;
+        assert_eq!(
+            config,
+            UserConfig {
+                mouse: Some(false),
+                copy_on_select: Some(true),
+            }
+        );
         assert_eq!(diagnostics, Vec::new());
         Ok(())
     }
@@ -103,7 +127,13 @@ mod tests {
         let config = parse_user_config(raw, 0usize, &mut diagnostics)?;
 
         // The known key still applies, and each unknown one gets a warning of its own.
-        assert_eq!(config, UserConfig { mouse: Some(true) });
+        assert_eq!(
+            config,
+            UserConfig {
+                mouse: Some(true),
+                copy_on_select: None,
+            }
+        );
         let messages = diagnostics
             .iter()
             .map(|diagnostic| diagnostic.message.as_str())

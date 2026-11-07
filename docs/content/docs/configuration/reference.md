@@ -110,6 +110,7 @@ One of `always`, `unless-stopped`, `on-failure` (or `on-failure:N`), `no` (synon
 | `width` | integer | — | Initial sidebar width, in columns. |
 | `pretty_json_logs` | bool | `true` | Render structured JSON logs as compact colored lines in the TUI. |
 | `mouse` | bool | from the user config, else `true` | Capture the mouse in the TUI for clicks, the wheel, and selecting text in one pane. Overrides the [user config]({{< relref "../tui.md#user-config" >}}); `--mouse` / `MICROMUX_MOUSE` override both. See [Mouse]({{< relref "../tui.md#mouse" >}}). |
+| `copy_on_select` | bool | from the user config, else `false` | Copy a mouse selection to the clipboard as soon as the drag ends, instead of on `y` or `Enter`. Overrides the [user config]({{< relref "../tui.md#user-config" >}}); `--copy-on-select` / `MICROMUX_COPY_ON_SELECT` override both. |
 
 ## `control`
 

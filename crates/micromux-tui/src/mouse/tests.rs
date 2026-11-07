@@ -12,6 +12,7 @@ use ratatui::style::Modifier;
 use ratatui::widgets::Widget as _;
 use similar_asserts::assert_eq;
 
+use super::MouseState;
 use crate::{App, Effect, Focus, LocalSource, SessionSource, ViewOptions};
 
 const WIDTH: u16 = 120;
@@ -90,7 +91,11 @@ fn find(buffer: &Buffer, needle: &str) -> eyre::Result<Position> {
     eyre::bail!("{needle:?} is not on screen")
 }
 
+/// Sends a mouse event; each turn of the wheel counts as a notch of its own.
 fn mouse(app: &mut App, kind: MouseEventKind, position: Position) {
+    if matches!(kind, MouseEventKind::ScrollUp | MouseEventKind::ScrollDown) {
+        app.mouse.last_wheel = None;
+    }
     app.handle_mouse(MouseEvent {
         kind,
         column: position.x,
@@ -132,6 +137,12 @@ fn copied(app: &mut App) -> Vec<String> {
             _ => None,
         })
         .collect()
+}
+
+/// Copies the selection with `y`, as a user does, and returns what was copied.
+fn yank(app: &mut App) -> Vec<String> {
+    press_key(app, KeyCode::Char('y'));
+    copied(app)
 }
 
 fn numbered(lines: usize) -> impl Iterator<Item = String> {
@@ -243,7 +254,7 @@ async fn a_drag_selects_text_inside_one_pane_and_copies_it_on_release() -> eyre:
         &[Position::new(end.x + 5, end.y)],
     );
     assert_eq!(
-        copied(&mut app),
+        yank(&mut app),
         vec!["of the log\nline 3 of the log\nline 4".to_string()]
     );
     assert_eq!(app.mouse.notice.as_deref(), Some("copied 3 lines"));
@@ -271,13 +282,13 @@ async fn a_drag_selects_text_inside_one_pane_and_copies_it_on_release() -> eyre:
         Position::new(end.x + 4, end.y),
         &[Position::new(services.x, end.y)],
     );
-    assert_eq!(copied(&mut app), vec!["line ".to_string()]);
+    assert_eq!(yank(&mut app), vec!["line ".to_string()]);
 
     // Esc drops the selection, and a plain click copies nothing.
     press_key(&mut app, KeyCode::Esc);
     assert!(app.mouse.selection.is_none());
     click(&mut app, Position::new(start.x + 1, start.y));
-    assert_eq!(copied(&mut app), Vec::<String>::new());
+    assert_eq!(yank(&mut app), Vec::<String>::new());
     Ok(())
 }
 
@@ -302,7 +313,7 @@ async fn double_and_triple_clicks_select_a_word_and_a_whole_wrapped_line() -> ey
         now + Duration::from_millis(100),
     );
     app.release(Position::new(0, 0));
-    assert_eq!(copied(&mut app), vec!["line".to_string()]);
+    assert_eq!(yank(&mut app), vec!["line".to_string()]);
 
     // A third selects the whole line, and the rows of a wrapped line join without a break.
     for offset in 0..3 {
@@ -312,7 +323,7 @@ async fn double_and_triple_clicks_select_a_word_and_a_whole_wrapped_line() -> ey
         );
     }
     app.release(Position::new(0, 0));
-    assert_eq!(copied(&mut app), vec![long]);
+    assert_eq!(yank(&mut app), vec![long]);
 
     // A press that comes too late starts over.
     app.press(Position::new(short.x, short.y), now);
@@ -321,7 +332,7 @@ async fn double_and_triple_clicks_select_a_word_and_a_whole_wrapped_line() -> ey
         now + Duration::from_secs(1),
     );
     app.release(Position::new(0, 0));
-    assert_eq!(copied(&mut app), Vec::<String>::new());
+    assert_eq!(yank(&mut app), Vec::<String>::new());
     Ok(())
 }
 
@@ -341,7 +352,7 @@ async fn a_drag_past_the_pane_scrolls_it_and_keeps_selecting() -> eyre::Result<(
     drag(&mut app, first_row, &[above, above]);
     assert_eq!(app.log_view.scroll_offset, top - 2);
     assert!(!app.log_view.follow_tail);
-    let copied = copied(&mut app);
+    let copied = yank(&mut app);
     assert_eq!(copied.len(), 1);
     let text = copied.first().map(String::as_str).unwrap_or_default();
     assert_eq!(
@@ -372,7 +383,7 @@ async fn a_press_outside_a_popup_closes_it_and_a_press_inside_does_not() -> eyre
     let frame = draw(&mut app);
     let state = find(&frame, "State")?;
     drag(&mut app, state, &[Position::new(state.x + 4, state.y)]);
-    assert_eq!(copied(&mut app), vec!["State".to_string()]);
+    assert_eq!(yank(&mut app), vec!["State".to_string()]);
     assert!(app.info.is_some());
     click(&mut app, outside);
     assert!(app.info.is_none());
@@ -521,7 +532,7 @@ async fn padding_after_the_text_is_neither_highlighted_nor_copied() -> eyre::Res
     let first = find(&frame, "first")?;
     let second = find(&frame, "second")?;
     drag(&mut app, first, &[Position::new(second.x + 70, second.y)]);
-    assert_eq!(copied(&mut app), vec!["first\nsecond".to_string()]);
+    assert_eq!(yank(&mut app), vec!["first\nsecond".to_string()]);
 
     let frame = draw(&mut app);
     let reversed = |x: u16, y: u16| {
@@ -547,7 +558,7 @@ async fn a_selection_stays_on_its_text_while_a_full_log_drops_its_oldest_lines()
     app.press(on_number, now);
     app.press(on_number, now + Duration::from_millis(50));
     app.release(on_number);
-    assert_eq!(copied(&mut app), vec!["10".to_string()]);
+    assert_eq!(yank(&mut app), vec!["10".to_string()]);
 
     // The log reaches its cap: five new lines arrive and the five oldest go.
     let service = app
@@ -605,7 +616,7 @@ async fn an_unwrapped_line_is_copied_whole_past_the_panes_edge() -> eyre::Result
         app.press(row, now + Duration::from_millis(50 * offset));
     }
     app.release(row);
-    assert_eq!(copied(&mut app), vec![long.clone()]);
+    assert_eq!(yank(&mut app), vec![long.clone()]);
 
     // So does a drag that leaves the pane on the right.
     let short = find(&frame, "short")?;
@@ -614,7 +625,7 @@ async fn an_unwrapped_line_is_copied_whole_past_the_panes_edge() -> eyre::Result
         Position::new(short.x + 2, short.y),
         &[Position::new(WIDTH - 1, row.y)],
     );
-    assert_eq!(copied(&mut app), vec![format!("ort\n{long}")]);
+    assert_eq!(yank(&mut app), vec![format!("ort\n{long}")]);
     Ok(())
 }
 
@@ -695,7 +706,7 @@ async fn a_blank_last_line_keeps_the_selection_on_its_text() -> eyre::Result<()>
     let frame = draw(&mut app);
     let line = find(&frame, "line 5 of")?;
     drag(&mut app, line, &[Position::new(line.x + 5, line.y)]);
-    assert_eq!(copied(&mut app), vec!["line 5".to_string()]);
+    assert_eq!(yank(&mut app), vec!["line 5".to_string()]);
 
     // Another line arrives, and later a blank one again, each pushing the text up.
     for text in ["next", ""] {
@@ -753,7 +764,7 @@ async fn copying_a_very_long_unwrapped_line_lays_it_out_without_drawing_it() -> 
     let last = find(&frame, "line 9 of")?;
     // Select from the start of the long line to the end of the last line.
     drag(&mut app, first, &[Position::new(WIDTH - 1, last.y)]);
-    let copied = copied(&mut app);
+    let copied = yank(&mut app);
     let text = copied.first().map(String::as_str).unwrap_or_default();
     assert!(text.contains(&long));
     assert!(
@@ -777,12 +788,12 @@ async fn a_selection_stays_on_its_text_next_to_a_screen_snapshot_record() -> eyr
     let frame = draw(&mut app);
     let line = find(&frame, "line 5 of")?;
     drag(&mut app, line, &[Position::new(line.x + 5, line.y)]);
-    assert_eq!(copied(&mut app), vec!["line 5".to_string()]);
+    assert_eq!(yank(&mut app), vec!["line 5".to_string()]);
 
     // A row of the snapshot itself is found by its record and its row within it.
     let row = find(&frame, "snapshot row two")?;
     drag(&mut app, row, &[Position::new(row.x + 7, row.y)]);
-    assert_eq!(copied(&mut app), vec!["snapshot".to_string()]);
+    assert_eq!(yank(&mut app), vec!["snapshot".to_string()]);
     drag(&mut app, line, &[Position::new(line.x + 5, line.y)]);
 
     // The log drops its oldest record, the snapshot, and gains a line.
@@ -810,6 +821,227 @@ async fn a_double_click_takes_a_long_word_whole_past_the_panes_edge() -> eyre::R
     app.press(word, now);
     app.press(word, now + Duration::from_millis(50));
     app.release(word);
-    assert_eq!(copied(&mut app), vec![token]);
+    assert_eq!(yank(&mut app), vec![token]);
+    Ok(())
+}
+
+fn key_with(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
+    app.handle_key_press(KeyEvent {
+        code,
+        modifiers,
+        kind: KeyEventKind::Press,
+        state: KeyEventState::NONE,
+    });
+}
+
+fn footer(app: &mut App) -> String {
+    let frame = draw(app);
+    (HEIGHT - 2..HEIGHT)
+        .map(|y| row_text(&frame, y))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[tokio::test]
+async fn selecting_only_highlights_and_copying_takes_an_explicit_key() -> eyre::Result<()> {
+    let mut app = app(SERVICES)?;
+    set_logs(&mut app, numbered(5))?;
+    let frame = draw(&mut app);
+    let line = find(&frame, "line 2 of")?;
+    let select = |app: &mut App| drag(app, line, &[Position::new(line.x + 5, line.y)]);
+
+    // Ending the drag copies nothing and says nothing.
+    select(&mut app);
+    assert_eq!(copied(&mut app), Vec::<String>::new());
+    assert_eq!(app.mouse.notice, None);
+
+    // While text is selected, the footer offers the copy key in the mouse toggle's place.
+    let shown = footer(&mut app);
+    assert!(shown.contains("y Copy"), "{shown}");
+    assert!(!shown.contains("Mouse:"), "{shown}");
+
+    // `y`, Enter, and the terminals' copy chords each copy the same text, which stays selected.
+    for (code, modifiers) in [
+        (KeyCode::Char('y'), KeyModifiers::NONE),
+        (KeyCode::Enter, KeyModifiers::NONE),
+        (
+            KeyCode::Char('C'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ),
+        (KeyCode::Char('c'), KeyModifiers::SUPER),
+    ] {
+        key_with(&mut app, code, modifiers);
+        assert_eq!(copied(&mut app), vec!["line 2".to_string()], "{code:?}");
+    }
+    assert_eq!(app.mouse.notice.as_deref(), Some("copied 6 characters"));
+    assert!(app.running);
+
+    // Clicking the copy hint copies too, without the press dropping the selection.
+    let frame = draw(&mut app);
+    click(&mut app, find(&frame, "y Copy")?);
+    assert_eq!(copied(&mut app), vec!["line 2".to_string()]);
+
+    // Without a selection, Enter and the copy key do nothing, and the footer shows the toggle.
+    press_key(&mut app, KeyCode::Esc);
+    press_key(&mut app, KeyCode::Enter);
+    press_key(&mut app, KeyCode::Char('y'));
+    assert_eq!(copied(&mut app), Vec::<String>::new());
+    assert!(footer(&mut app).contains("m Mouse:ON"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn copy_on_select_copies_when_the_drag_ends() -> eyre::Result<()> {
+    let mut app = app(SERVICES)?;
+    app.mouse = MouseState::new(crate::MouseOptions {
+        capture: true,
+        copy_on_select: true,
+    });
+    set_logs(&mut app, numbered(5))?;
+    let frame = draw(&mut app);
+    let line = find(&frame, "line 2 of")?;
+    drag(&mut app, line, &[Position::new(line.x + 5, line.y)]);
+    assert_eq!(copied(&mut app), vec!["line 2".to_string()]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_selection_holds_while_its_text_moves_and_copies_later() -> eyre::Result<()> {
+    let mut app = app(SERVICES)?;
+    press_key(&mut app, KeyCode::Char('H'));
+    set_logs(&mut app, numbered(40))?;
+    let frame = draw(&mut app);
+    let line = find(&frame, "line 30 of")?;
+    drag(&mut app, line, &[Position::new(line.x + 6, line.y)]);
+
+    // Lines arrive and the oldest go, the pane scrolls both ways and redraws many times.
+    for round in 0..5u64 {
+        let service = app
+            .state
+            .current_service_mut()
+            .ok_or_else(|| eyre::eyre!("no service is selected"))?;
+        let seq = service.cached_lines.back().map_or(1, |(seq, _)| seq + 1);
+        service.cached_lines.pop_front();
+        service
+            .cached_lines
+            .push_back((seq, format!("arrived in round {round}")));
+        service.text_dirty = true;
+        draw(&mut app);
+    }
+    let logs = find(&draw(&mut app), "Logs")?;
+    mouse(
+        &mut app,
+        MouseEventKind::ScrollUp,
+        Position::new(logs.x + 2, logs.y + 2),
+    );
+    draw(&mut app);
+    mouse(
+        &mut app,
+        MouseEventKind::ScrollDown,
+        Position::new(logs.x + 2, logs.y + 2),
+    );
+    for _ in 0..3 {
+        draw(&mut app);
+    }
+
+    // A healthcheck refresh and a terminal resize leave the unwrapped log's selection alone.
+    if let Some(service) = app.state.current_service_mut() {
+        service.healthcheck_dirty = true;
+    }
+    draw(&mut app);
+    let area = Rect::new(0, 0, WIDTH - 10, HEIGHT);
+    let mut resized = Buffer::empty(area);
+    (&mut app).render(area, &mut resized);
+    draw(&mut app);
+
+    // Copying now gives what was selected at the start.
+    assert_eq!(yank(&mut app), vec!["line 30".to_string()]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_selection_in_a_popup_holds_while_the_popup_redraws() -> eyre::Result<()> {
+    let mut app = app(SERVICES)?;
+    press_key(&mut app, KeyCode::Char('i'));
+    let frame = draw(&mut app);
+    let state = find(&frame, "State")?;
+    drag(&mut app, state, &[Position::new(state.x + 4, state.y)]);
+    for _ in 0..3 {
+        draw(&mut app);
+    }
+    assert_eq!(yank(&mut app), vec!["State".to_string()]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_wrapped_selection_is_dropped_when_a_resize_rewraps_it() -> eyre::Result<()> {
+    let mut app = app(SERVICES)?;
+    set_logs(&mut app, [format!("start {} end", "x".repeat(150))])?;
+    press_key(&mut app, KeyCode::Char('w'));
+    let frame = draw(&mut app);
+    let start = find(&frame, "start")?;
+    drag(&mut app, start, &[Position::new(start.x + 4, start.y)]);
+    assert!(app.has_selection());
+
+    let area = Rect::new(0, 0, WIDTH - 10, HEIGHT);
+    let mut resized = Buffer::empty(area);
+    (&mut app).render(area, &mut resized);
+    assert!(!app.has_selection());
+    Ok(())
+}
+
+#[tokio::test]
+async fn one_notch_is_one_step_however_many_events_the_terminal_sends() -> eyre::Result<()> {
+    let mut services = String::new();
+    for index in 0..20 {
+        writeln!(
+            services,
+            "  svc{index:02}:\n    command: [\"sleep\", \"30\"]"
+        )?;
+    }
+    let mut app = app(&format!("version: 1\nservices:\n{services}"))?;
+    let frame = draw(&mut app);
+    let list = find(&frame, "svc05")?;
+    let now = Instant::now();
+
+    // A notch reported as a burst of three events moves one service.
+    for _ in 0..3 {
+        app.wheel(list, true, now);
+    }
+    assert_eq!(app.state.selected_service, 1);
+
+    // Notches a moment apart move one service each, and the list never wraps around.
+    for notch in 1..=30u64 {
+        app.wheel(list, true, now + Duration::from_millis(100 * notch));
+    }
+    assert_eq!(app.state.selected_service, 19);
+    let later = now + Duration::from_secs(10);
+    app.wheel(list, false, later);
+    assert_eq!(app.state.selected_service, 18);
+
+    // The list scrolls along, keeping the selection on screen.
+    let frame = draw(&mut app);
+    assert!(find(&frame, "svc18").is_ok());
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_wheel_leaves_a_pane_with_nothing_to_scroll_following() -> eyre::Result<()> {
+    let mut app = app(SERVICES)?;
+    // Like a full-screen program's live screen, the text fits the pane.
+    set_logs(&mut app, numbered(3))?;
+    let frame = draw(&mut app);
+    let logs = find(&frame, "Logs")?;
+    let inside = Position::new(logs.x + 2, logs.y + 2);
+    for down in [false, true, false, false, true] {
+        let kind = if down {
+            MouseEventKind::ScrollDown
+        } else {
+            MouseEventKind::ScrollUp
+        };
+        mouse(&mut app, kind, inside);
+        assert!(app.log_view.follow_tail);
+        assert!(row_text(&draw(&mut app), 0).contains("Tail:ON"));
+    }
     Ok(())
 }

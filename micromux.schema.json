@@ -50,6 +50,10 @@
         "mouse": {
           "type": "boolean",
           "description": "Capture the mouse in the TUI for clicks, scrolling and in-pane text selection. Overrides the user config; the --mouse flag overrides both."
+        },
+        "copy_on_select": {
+          "type": "boolean",
+          "description": "Copy a mouse selection to the clipboard as soon as the drag ends, instead of on y or Enter. Off by default. Overrides the user config; the --copy-on-select flag overrides both."
         }
       }
     },

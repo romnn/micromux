@@ -243,11 +243,17 @@ fn mouse_capture_is_released_by_the_toggle_a_suspend_and_quitting() -> eyre::Res
         screen.contents().contains("Focus:LOGS")
     })?;
 
-    // Dragging over a word of the logs copies it to the clipboard through OSC 52.
+    // Dragging over a word of the logs selects it, and only `y` copies it to the clipboard
+    // through OSC 52.
     let (column, row) = find(tui.parser.screen(), "hello")?;
     tui.send(&mouse_report(0, (column, row), true))?;
     tui.send(&mouse_report(32, (column + 4, row), true))?;
     tui.send(&mouse_report(0, (column + 4, row), false))?;
+    tui.wait_until("the copy key in the footer", |screen, _| {
+        screen.contents().contains("y Copy")
+    })?;
+    assert!(!contains(&tui.written, b"\x1b]52;"));
+    tui.send(b"y")?;
     tui.wait_until("the copy", |_, written| {
         contains(written, b"\x1b]52;c;aGVsbG8=")
     })?;

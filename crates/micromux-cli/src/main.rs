@@ -11,10 +11,10 @@ mod ctl;
 mod logging;
 #[cfg(feature = "mcp")]
 mod mcp;
-mod mouse;
 mod options;
 mod proxy;
 mod session_env;
+mod ui_settings;
 
 use clap::Parser;
 use codespan_reporting::diagnostic::Diagnostic;
@@ -471,8 +471,12 @@ async fn run() -> Result<(), Error> {
 
     let LoadedConfig { config, printer } = load_config(&options, color_choice).await?;
     // Settle the TUI's settings before any service starts, so a broken user config stops nothing.
-    let mouse_capture =
-        mouse::mouse_capture(options.mouse, config.config.ui_config.mouse, &printer).await?;
+    let mouse = ui_settings::mouse_options(
+        options.ui_setting_flags(),
+        Some(&config.config.ui_config),
+        &printer,
+    )
+    .await?;
 
     let Supervisor { mux, routes } = start_supervisor(&config, &printer, &shutdown).await?;
     let (runner, handles) = mux.clone().start(shutdown.clone());
@@ -530,7 +534,7 @@ async fn run() -> Result<(), Error> {
         shutdown.clone(),
         micromux_tui::ViewOptions {
             pretty_json: config.config.ui_config.pretty_json_logs && !options.no_pretty_json_logs,
-            mouse_capture,
+            mouse,
         },
     );
 

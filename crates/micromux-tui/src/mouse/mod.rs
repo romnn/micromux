@@ -29,6 +29,12 @@ pub(crate) use select::{END_OF_LINE, Selection, TextPane, TextPos};
 /// Rows one turn of the wheel scrolls a pane, as terminals scroll their own.
 const WHEEL_ROWS: u16 = 3;
 
+/// The shortest time between two steps of the wheel.
+///
+/// Terminals report one notch as one event or as a burst of several, and high-resolution and
+/// smooth-scrolling devices send a stream; each of these scrolls one step per interval.
+const WHEEL_STEP: Duration = Duration::from_millis(35);
+
 /// How soon a second press on the same cell counts as a double click.
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 
@@ -122,26 +128,46 @@ struct Press {
 pub(crate) struct MouseState {
     /// Whether the terminal reports the mouse to the TUI.
     pub(crate) capture: bool,
+    /// Whether ending a drag copies the selection.
+    copy_on_select: bool,
     pub(crate) selection: Option<Selection>,
     /// Whether the left button is down on a selection being made.
     dragging: bool,
     /// The hint or URL the left button went down on, which a release on it clicks.
     pressed: Option<Clickable>,
     last_press: Option<Press>,
-    /// What the last release copied, shown in the footer until the next press or key.
+    /// When a turn of the wheel last scrolled, to fold the burst of events some terminals send
+    /// for one notch into one step.
+    last_wheel: Option<Instant>,
+    /// What the last copy took, shown in the footer until the next press or key.
     pub(crate) notice: Option<String>,
 }
 
 impl MouseState {
-    pub(crate) fn new(capture: bool) -> Self {
+    pub(crate) fn new(options: crate::MouseOptions) -> Self {
         Self {
-            capture,
+            capture: options.capture,
+            copy_on_select: options.copy_on_select,
             selection: None,
             dragging: false,
             pressed: None,
             last_press: None,
+            last_wheel: None,
             notice: None,
         }
+    }
+
+    /// Whether a turn of the wheel `now` scrolls, rather than continuing the burst of events
+    /// that the last step already took.
+    fn wheel_steps(&mut self, now: Instant) -> bool {
+        if self
+            .last_wheel
+            .is_some_and(|last| now.saturating_duration_since(last) < WHEEL_STEP)
+        {
+            return false;
+        }
+        self.last_wheel = Some(now);
+        true
     }
 
     /// Counts a press at `position` in a quick series on the same cell and returns which press
@@ -213,8 +239,8 @@ impl App {
             MouseEventKind::Down(MouseButton::Left) => self.press(position, Instant::now()),
             MouseEventKind::Drag(MouseButton::Left) => self.drag_to(position),
             MouseEventKind::Up(MouseButton::Left) => self.release(position),
-            MouseEventKind::ScrollUp => self.wheel(position, false),
-            MouseEventKind::ScrollDown => self.wheel(position, true),
+            MouseEventKind::ScrollUp => self.wheel(position, false, Instant::now()),
+            MouseEventKind::ScrollDown => self.wheel(position, true, Instant::now()),
             _ => {}
         }
     }
@@ -240,9 +266,17 @@ impl App {
     fn press(&mut self, position: Position, now: Instant) {
         let count = self.mouse.count_press(position, now);
         self.mouse.notice = None;
-        self.mouse.selection = None;
         self.mouse.dragging = false;
         self.mouse.pressed = None;
+
+        // A hint or URL acts on release and keeps the selection, which the copy hint copies.
+        if self.hits.popup.is_none()
+            && let Some(clickable) = self.clickable_at(position)
+        {
+            self.mouse.pressed = Some(clickable);
+            return;
+        }
+        self.mouse.selection = None;
 
         // A popup takes every press: one outside closes it, as Esc does.
         if let Some(popup) = &self.hits.popup {
@@ -266,10 +300,6 @@ impl App {
             return;
         }
 
-        if let Some(clickable) = self.clickable_at(position) {
-            self.mouse.pressed = Some(clickable);
-            return;
-        }
         if self.hits.services.contains(position) {
             self.focus = Focus::Services;
             // Typed input goes to the selected service, so a click must not retarget it.
@@ -350,9 +380,6 @@ impl App {
 
     /// The left button moved to `position` while down: the selection extends there, and past the
     /// pane's top or bottom the pane scrolls a row.
-    ///
-    /// Dragging stops the pane from following its tail, so new lines do not scroll the text away
-    /// under the pointer.
     fn drag_to(&mut self, position: Position) {
         // Sliding off a hint or URL cancels its click.
         if self
@@ -377,11 +404,6 @@ impl App {
         let Some(area) = self.text_area(pane).filter(|area| !area.is_empty()) else {
             return;
         };
-        match pane {
-            TextPane::Logs => self.log_view.follow_tail = false,
-            TextPane::Healthcheck => self.healthcheck_view.follow_tail = false,
-            TextPane::Help | TextPane::Info(_) => {}
-        }
         let edge_row = if position.y < area.top() {
             self.scroll_pane(pane, false, 1);
             0
@@ -406,7 +428,7 @@ impl App {
     }
 
     /// The left button came up at `position`: a click on a hint or URL acts, and a selection
-    /// being made ends with its text going to the clipboard.
+    /// being made ends, copied only when copy-on-select is on.
     fn release(&mut self, position: Position) {
         if let Some(pressed) = self.mouse.pressed.take()
             && self.clickable_at(position).as_ref() == Some(&pressed)
@@ -414,9 +436,13 @@ impl App {
             self.click(pressed);
             return;
         }
-        if !std::mem::take(&mut self.mouse.dragging) {
-            return;
+        if std::mem::take(&mut self.mouse.dragging) && self.mouse.copy_on_select {
+            self.copy_selection();
         }
+    }
+
+    /// Copies the selection to the clipboard, as `y` does, and says so in the footer.
+    pub(crate) fn copy_selection(&mut self) {
         let Some(text) = self.selected_text() else {
             return;
         };
@@ -429,9 +455,13 @@ impl App {
         self.effects.push(Effect::Copy(text));
     }
 
-    /// A turn of the wheel at `position`: under a popup it scrolls the popup, elsewhere the pane
-    /// under the pointer, without moving the focus.
-    fn wheel(&mut self, position: Position, down: bool) {
+    /// A turn of the wheel at `position`, `now`: under a popup it scrolls the popup, elsewhere the
+    /// pane under the pointer, without moving the focus; the services list moves a service a
+    /// step, the text panes three rows.
+    fn wheel(&mut self, position: Position, down: bool, now: Instant) {
+        if !self.mouse.wheel_steps(now) {
+            return;
+        }
         let popup = self.hits.popup.as_ref().map(|popup| match popup.content {
             PopupContent::Levels { .. } => None,
             PopupContent::Text { pane, .. } => Some(pane),

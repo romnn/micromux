@@ -28,15 +28,16 @@ pub(crate) async fn run(options: &Options, raw_session: Option<&str>) -> Result<
         .await
         .map_err(|error| crate::Error::Message(format_control_error(error, "attach")))?;
 
-    let project_mouse = if options.mouse.is_none() {
-        crate::mouse::project_mouse_setting(&config_path).await
-    } else {
-        None
-    };
+    let project_ui = crate::ui_settings::project_ui_config(&config_path).await;
     let printer = crate::DiagnosticsPrinter::new(
         options.color_choice.unwrap_or(termcolor::ColorChoice::Auto),
     );
-    let mouse_capture = crate::mouse::mouse_capture(options.mouse, project_mouse, &printer).await?;
+    let mouse = crate::ui_settings::mouse_options(
+        options.ui_setting_flags(),
+        project_ui.as_ref(),
+        &printer,
+    )
+    .await?;
 
     let shutdown = micromux::CancellationToken::new();
     crate::spawn_shutdown_handler(shutdown.clone());
@@ -47,7 +48,7 @@ pub(crate) async fn run(options: &Options, raw_session: Option<&str>) -> Result<
         shutdown,
         micromux_tui::ViewOptions {
             pretty_json: !options.no_pretty_json_logs,
-            mouse_capture,
+            mouse,
         },
     );
     Ok(app.render().await?)

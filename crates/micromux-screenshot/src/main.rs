@@ -109,7 +109,7 @@ const SCENARIOS: &[Scenario] = &[
         keys: &[b"jj" as &[u8]],
     },
     // Mouse selection: a drag over four of `api`'s request lines, sent as SGR mouse reports with
-    // one-based columns and rows, highlights them and copies them, which the footer confirms.
+    // one-based columns and rows, highlights them, and `y` copies them, which the footer confirms.
     // The logs' text starts in column 42, and the 12:00:02 POST line is drawn on row 12.
     Scenario {
         name: "mouse-selection",
@@ -119,6 +119,7 @@ const SCENARIOS: &[Scenario] = &[
             b"\x1b[<0;42;12M" as &[u8],
             b"\x1b[<32;81;15M",
             b"\x1b[<0;81;15m",
+            b"y",
         ],
     },
     // Service details: `i` opens the popup that describes the selected `api` service in full.

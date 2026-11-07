@@ -68,6 +68,22 @@ pub(crate) struct TextContext {
     width: u16,
 }
 
+impl TextContext {
+    /// Whether a pane under `now` still shows the text this context's selection was made in, on
+    /// the same rows.
+    ///
+    /// Only wrapping makes rows depend on the width, so an unwrapped log keeps its selection
+    /// through a resize.
+    fn shows_same_text(&self, now: &Self) -> bool {
+        let width_matters = self.wrap || matches!(self.pane, TextPane::Info(_));
+        self.pane == now.pane
+            && self.service == now.service
+            && self.format == now.format
+            && self.wrap == now.wrap
+            && (!width_matters || self.width == now.width)
+    }
+}
+
 /// Selected text: the cells from `anchor` to `head` in text order, both included.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Selection {
@@ -378,7 +394,10 @@ impl App {
     fn placed(&self) -> Option<(&Selection, Placed)> {
         let selection = self.mouse.selection.as_ref()?;
         let pane = selection.context.pane;
-        if self.text_context(pane).as_ref() != Some(&selection.context) {
+        if !self
+            .text_context(pane)
+            .is_some_and(|now| selection.context.shows_same_text(&now))
+        {
             return None;
         }
         let anchor = self.place(pane, selection.anchor);
@@ -494,6 +513,12 @@ impl App {
                 (cursor.advance(&shown), cells)
             })
             .collect()
+    }
+
+    /// Whether text is selected in a pane that still shows it.
+    pub(crate) fn has_selection(&self) -> bool {
+        self.placed()
+            .is_some_and(|(_, Placed { start, end })| start != end)
     }
 
     /// The selected text, or `None` when nothing is selected.

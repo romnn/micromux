@@ -189,6 +189,9 @@ pub struct UiConfig {
     pub pretty_json_logs: bool,
     /// Whether the TUI captures the mouse, or `None` to leave the choice to the user config.
     pub mouse: Option<bool>,
+    /// Whether finishing a mouse selection copies it, or `None` to leave the choice to the user
+    /// config.
+    pub copy_on_select: Option<bool>,
 }
 
 /// Agent-control configuration latched for the lifetime of a session.
@@ -236,6 +239,7 @@ impl Default for UiConfig {
             width: None,
             pretty_json_logs: true,
             mouse: None,
+            copy_on_select: None,
         }
     }
 }
@@ -1021,6 +1025,7 @@ mod tests {
               width: 80
               pretty_json_logs: false
               mouse: false
+              copy_on_select: true
             services:
               app:
                 command: "true"
@@ -1033,6 +1038,7 @@ mod tests {
         assert_eq!(parsed.config.ui_config.width.as_deref().copied(), Some(80));
         assert!(!parsed.config.ui_config.pretty_json_logs);
         assert_eq!(parsed.config.ui_config.mouse, Some(false));
+        assert_eq!(parsed.config.ui_config.copy_on_select, Some(true));
         Ok(())
     }
 
@@ -1112,6 +1118,7 @@ mod tests {
               width: 120
               pretty_json_logs: false
               mouse: false
+              copy_on_select: false
             control:
               enabled: true
               dynamic_services:
