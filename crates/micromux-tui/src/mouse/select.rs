@@ -42,10 +42,18 @@ pub(crate) struct TextPos {
 /// it, the rendered row within the line, and a cell column, or [`END_OF_LINE`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TextAnchor {
-    /// A log line's sequence number, or the line's index in a pane that never drops lines.
-    line: u64,
+    line: LineKey,
     row_in_line: usize,
     col: u16,
+}
+
+/// A line of a pane's text by a key that stays with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LineKey {
+    /// A log record's sequence number, or the line's index in a pane that never drops lines.
+    record: u64,
+    /// The line within the record, which a live screen snapshot has several of.
+    line: usize,
 }
 
 /// What a pane's rows belong to; a selection made under one context means nothing under another.
@@ -264,37 +272,65 @@ impl App {
         }
     }
 
-    /// The key of line `index` of `pane`: a log line's sequence number, which stays with it when
-    /// older lines are dropped, or else the index itself.
-    fn line_key(&self, pane: TextPane, index: usize) -> u64 {
-        let index_key = u64::try_from(index).unwrap_or(u64::MAX);
-        let Some(service) = self.state.current_service() else {
+    /// The key of line `index` of `pane`: for a log, the sequence number of the record it comes
+    /// from, which stays with it when older records are dropped, and its line within the record;
+    /// for other panes, the index itself.
+    fn line_key(&self, pane: TextPane, index: usize) -> LineKey {
+        let index_key = LineKey {
+            record: u64::try_from(index).unwrap_or(u64::MAX),
+            line: 0,
+        };
+        let Some(service) = self
+            .state
+            .current_service()
+            .filter(|_| pane == TextPane::Logs)
+        else {
             return index_key;
         };
-        // Each retained log record is one line of the text; were they ever to differ, indices
-        // are the only key left.
-        if pane == TextPane::Logs && service.cached_lines.len() == service.cached_text.lines.len() {
-            return service
-                .cached_lines
-                .get(index)
-                .map_or(index_key, |(seq, _)| *seq);
+        let Some(record) = service
+            .record_starts
+            .partition_point(|start| *start <= index)
+            .checked_sub(1)
+        else {
+            return index_key;
+        };
+        match (
+            service.cached_lines.get(record),
+            service.record_starts.get(record),
+        ) {
+            (Some((seq, _)), Some(start)) => LineKey {
+                record: *seq,
+                line: index - start,
+            },
+            _ => index_key,
         }
-        index_key
     }
 
-    /// The index of the line `key` names in `pane`, or, when that line was dropped, `Err` with the
-    /// index of the line now in its place.
-    fn line_index(&self, pane: TextPane, key: u64) -> Result<usize, usize> {
-        let index_key = usize::try_from(key).unwrap_or(usize::MAX);
-        let Some(service) = self.state.current_service() else {
+    /// The index of the line `key` names in `pane`, or, when its record was dropped, `Err` with
+    /// the index of the line now in its place.
+    fn line_index(&self, pane: TextPane, key: LineKey) -> Result<usize, usize> {
+        let index_key = usize::try_from(key.record).unwrap_or(usize::MAX);
+        let Some(service) = self
+            .state
+            .current_service()
+            .filter(|_| pane == TextPane::Logs)
+        else {
             return Ok(index_key);
         };
-        if pane == TextPane::Logs && service.cached_lines.len() == service.cached_text.lines.len() {
-            return service
-                .cached_lines
-                .binary_search_by_key(&key, |(seq, _)| *seq);
+        let start_of = |record: usize| {
+            service
+                .record_starts
+                .get(record)
+                .copied()
+                .unwrap_or(service.cached_text.lines.len())
+        };
+        match service
+            .cached_lines
+            .binary_search_by_key(&key.record, |(seq, _)| *seq)
+        {
+            Ok(record) => Ok(start_of(record) + key.line),
+            Err(record) => Err(start_of(record)),
         }
-        Ok(index_key)
     }
 
     /// The anchor for `pos` in `pane`'s text.
@@ -504,8 +540,8 @@ impl App {
         (!text.is_empty()).then_some(text)
     }
 
-    /// The word around `pos` in `context`'s pane: the run of non-blank cells it is in, or of
-    /// blank ones.
+    /// The word around `pos` in `context`'s pane: the run of adjacent non-blank cells it is in,
+    /// or just `pos` on a blank one.
     pub(crate) fn word_at(&self, context: &TextContext, pos: TextPos) -> (TextPos, TextPos) {
         let cells = if context.wrap {
             row_cells(
@@ -517,32 +553,42 @@ impl App {
                 .map(unwrapped_cells)
                 .unwrap_or_default()
         };
-        let blank = |col: usize| {
-            cells
-                .iter()
-                .find(|(at, symbol)| {
-                    (*at..*at + ratatui::text::Span::raw(symbol.as_str()).width().max(1))
-                        .contains(&col)
-                })
-                .is_none_or(|(_, symbol)| symbol.trim().is_empty())
-        };
-        let last = cells
-            .last()
-            .map_or(0, |(at, symbol)| {
-                at + ratatui::text::Span::raw(symbol.as_str()).width()
-            })
-            .max(usize::from(context.width));
+        let width = |symbol: &str| ratatui::text::Span::raw(symbol).width().max(1);
         let col = usize::from(pos.col);
-        let kind = blank(col);
-        let mut from = col;
-        while from > 0 && blank(from - 1) == kind {
-            from -= 1;
+        // Cells are in column order, so the clicked one is the last that starts at or before it.
+        let clicked = cells
+            .partition_point(|(at, _)| *at <= col)
+            .checked_sub(1)
+            .filter(|&index| {
+                cells.get(index).is_some_and(|(at, symbol)| {
+                    col < at + width(symbol) && !symbol.trim().is_empty()
+                })
+            });
+        let Some(clicked) = clicked else {
+            return (pos, pos);
+        };
+        // A word runs on while its cells touch and none is blank.
+        let joined = |left: usize| match (cells.get(left), cells.get(left + 1)) {
+            (Some((at, symbol)), Some((next_at, next))) => {
+                at + width(symbol) == *next_at
+                    && !symbol.trim().is_empty()
+                    && !next.trim().is_empty()
+            }
+            _ => false,
+        };
+        let mut first = clicked;
+        while first > 0 && joined(first - 1) {
+            first -= 1;
         }
-        let mut to = col;
-        while to + 1 < last && blank(to + 1) == kind {
-            to += 1;
+        let mut last = clicked;
+        while joined(last) {
+            last += 1;
         }
         let as_col = |col: usize| u16::try_from(col).unwrap_or(END_OF_LINE - 1);
+        let from = cells.get(first).map_or(col, |(at, _)| *at);
+        let to = cells
+            .get(last)
+            .map_or(col, |(at, symbol)| at + width(symbol) - 1);
         (
             TextPos {
                 row: pos.row,

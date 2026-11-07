@@ -763,3 +763,53 @@ async fn copying_a_very_long_unwrapped_line_lays_it_out_without_drawing_it() -> 
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn a_selection_stays_on_its_text_next_to_a_screen_snapshot_record() -> eyre::Result<()> {
+    let mut app = app(SERVICES)?;
+    // A live screen snapshot is one record holding every row of the screen.
+    set_logs(
+        &mut app,
+        ["snapshot row one\nsnapshot row two".to_string()]
+            .into_iter()
+            .chain(numbered(10)),
+    )?;
+    let frame = draw(&mut app);
+    let line = find(&frame, "line 5 of")?;
+    drag(&mut app, line, &[Position::new(line.x + 5, line.y)]);
+    assert_eq!(copied(&mut app), vec!["line 5".to_string()]);
+
+    // A row of the snapshot itself is found by its record and its row within it.
+    let row = find(&frame, "snapshot row two")?;
+    drag(&mut app, row, &[Position::new(row.x + 7, row.y)]);
+    assert_eq!(copied(&mut app), vec!["snapshot".to_string()]);
+    drag(&mut app, line, &[Position::new(line.x + 5, line.y)]);
+
+    // The log drops its oldest record, the snapshot, and gains a line.
+    let service = app
+        .state
+        .current_service_mut()
+        .ok_or_else(|| eyre::eyre!("no service is selected"))?;
+    let seq = service.cached_lines.back().map_or(1, |(seq, _)| seq + 1);
+    service.cached_lines.pop_front();
+    service.cached_lines.push_back((seq, "next".to_string()));
+    service.text_dirty = true;
+    draw(&mut app);
+    assert_eq!(app.selected_text().as_deref(), Some("line 5"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_double_click_takes_a_long_word_whole_past_the_panes_edge() -> eyre::Result<()> {
+    let mut app = app(SERVICES)?;
+    let token = "z".repeat(16 * 1024);
+    set_logs(&mut app, [format!("token {token} end")])?;
+    let frame = draw(&mut app);
+    let word = find(&frame, "zzzz")?;
+    let now = Instant::now();
+    app.press(word, now);
+    app.press(word, now + Duration::from_millis(50));
+    app.release(word);
+    assert_eq!(copied(&mut app), vec![token]);
+    Ok(())
+}

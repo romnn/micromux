@@ -2133,11 +2133,16 @@ impl App {
                 );
                 escaped.into()
             });
-            // Joining drops the line of a blank last record, but each record keeps a line of its
-            // own, so a selection can find its lines by their records.
-            let records = service.cached_lines.len();
-            if service.cached_text.lines.len() < records {
-                service.cached_text.lines.resize(records, Line::default());
+            // A selection finds its lines by the records they came from.
+            service.record_starts.clear();
+            let mut next = 0;
+            for (_, line) in &service.cached_lines {
+                service.record_starts.push(next);
+                next += 1 + line.matches('\n').count();
+            }
+            // Joining drops the line of a blank last record, which keeps a line of its own.
+            if service.cached_text.lines.len() < next {
+                service.cached_text.lines.resize(next, Line::default());
             }
             service
                 .cached_line_index
