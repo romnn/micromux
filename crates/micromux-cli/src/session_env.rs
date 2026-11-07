@@ -54,6 +54,19 @@ pub(crate) async fn print(target: &Target<'_>, output: &Output<'_>) -> Result<()
             .map_err(|missing| missing_message(&missing, &session, target.service))?;
         let bare = output.format == EnvFormat::Env && output.names.len() == 1;
         let rendered = render(&selected, output.format, bare)?;
+        // A name the caller asked for must not silently go missing, as a missing one does not.
+        if !output.names.is_empty() && !rendered.skipped.is_empty() {
+            return Err(crate::Error::Message(format!(
+                "cannot print {} as shell assignments: not valid shell variable names; use \
+                 --format json",
+                rendered
+                    .skipped
+                    .iter()
+                    .map(|key| format!("{key:?}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+        }
         for key in &rendered.skipped {
             eprintln!("micromux: skipping {key:?}, which is not a valid shell variable name");
         }

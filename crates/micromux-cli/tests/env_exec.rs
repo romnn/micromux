@@ -189,6 +189,16 @@ fn env_prints_the_session_and_the_service_environment() -> eyre::Result<()> {
         "micromux: skipping \"NOT-SHELL\", which is not a valid shell variable name\n"
     );
 
+    // A requested name no shell can assign fails instead of vanishing from the assignments.
+    let output = session.run(&["env", "--service", "svc", "--export", "NOT-SHELL", "INLINE"])?;
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "");
+    assert!(
+        stderr(&output).contains("\"NOT-SHELL\""),
+        "{}",
+        stderr(&output)
+    );
+
     // JSON carries every key.
     let output = session.run(&["env", "--service", "svc", "--format", "json"])?;
     assert!(output.status.success(), "{}", stderr(&output));

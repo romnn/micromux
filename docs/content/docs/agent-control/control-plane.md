@@ -110,7 +110,7 @@ The command replaces the micromux process: it runs in your terminal with your st
 - It exits 1 on any failure.
 
 > [!WARNING]
-> Values can be secrets from env files. They reach stdout or the command only when you run one of these commands, and micromux never logs them. The control socket is reachable by your user only.
+> Values can be secrets from env files. They reach stdout or the command only when you run one of these commands, and micromux never logs them, unless you replace its log filter with a `RUST_LOG` that turns on debug logging for the MCP library (`rmcp`), which records tool results. The control socket is reachable by your user only.
 
 Agents read the same environment with the MCP `get_session_env` tool. For a service, it returns only the variable names unless the agent asks for `names`.
 
