@@ -28,6 +28,9 @@ pub enum ClientMessage {
     /// Asks which port the proxy listens on.
     Hello,
     /// Registers (or replaces) the routes of one session for the lifetime of this connection.
+    ///
+    /// Sent again on the same connection for the same session, it swaps the routes in place and
+    /// keeps the session's proxied connections and tunnels open.
     Register(Registration),
     /// Keeps the registration alive.
     Ping,

@@ -354,6 +354,27 @@ impl Shared {
                 transient: false,
             });
         }
+        // A connection that registers its live session again only replaces the routes.
+        // Keeping the generation and the cancellation keeps every proxied connection and tunnel
+        // of the session open, which a takeover by another connection would end.
+        if let Some(previous) = previous
+            && previous.session_domain == registration.session_domain
+            && let Some(entry) = state.sessions.get_mut(&previous.session_domain)
+            && entry.generation == previous.generation
+        {
+            tracing::info!(
+                session = %registration.session,
+                routes = registration.routes.len(),
+                generation = previous.generation,
+                "session routes replaced"
+            );
+            entry.registration = registration;
+            return Ok(Owned {
+                session_domain: previous.session_domain.clone(),
+                generation: previous.generation,
+                cancel: previous.cancel.clone(),
+            });
+        }
         // A connection that switches to another session domain gives up its old one.
         if let Some(previous) = previous
             && previous.session_domain != registration.session_domain
@@ -651,6 +672,45 @@ pub(crate) mod tests {
         shared.unregister(&second);
         assert!(shared.lookup("app.one.localhost").is_none());
         assert!(second.cancel.is_cancelled());
+        Ok(())
+    }
+
+    /// A connection that registers its live session again swaps the routes in place, so the
+    /// session's proxied connections stay open; a reconnect from another connection still takes
+    /// the session over and ends them.
+    #[test]
+    fn re_registering_on_the_same_connection_keeps_proxied_connections() -> Result<(), Refusal> {
+        let shared = shared();
+        let first = shared.register(registration("one", "/one", &[("app", 1001)]), None)?;
+        let target = shared
+            .lookup("app.one.localhost")
+            .ok_or_else(|| Refusal::transient("app is not routed"))?;
+
+        // Same connection
+        let replaced = shared.register(
+            registration("one", "/one", &[("app", 1002), ("api", 1003)]),
+            Some(&first),
+        )?;
+        assert_eq!(replaced.generation, first.generation);
+        assert!(!target.cancel.is_cancelled());
+        assert_eq!(
+            shared.lookup("app.one.localhost").map(|t| t.port),
+            Some(1002)
+        );
+        assert_eq!(
+            shared.lookup("api.one.localhost").map(|t| t.port),
+            Some(1003)
+        );
+
+        // Another connection
+        let takeover = shared.register(registration("one", "/one", &[("app", 1004)]), None)?;
+        assert!(target.cancel.is_cancelled());
+        shared.unregister(&replaced);
+        assert_eq!(
+            shared.lookup("app.one.localhost").map(|t| t.port),
+            Some(1004)
+        );
+        shared.unregister(&takeover);
         Ok(())
     }
 

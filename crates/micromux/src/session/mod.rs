@@ -18,8 +18,8 @@ use crate::config::{ConfigFile, SessionConfig};
 
 pub use registry::PortRegistry;
 pub(crate) use registry::{DEFAULT_PORT_RANGE, Lease, create_private_dir, user_state_directory};
-pub(crate) use routes::resolve as resolve_routes;
 pub use routes::{CATCH_ALL_HOST, Route, RouteError};
+pub(crate) use routes::{owner as route_owner, resolve as resolve_routes};
 pub use status::{RoutingStatus, SessionStatus, SessionSummary};
 
 /// Parent domain of every session when the config does not name one.

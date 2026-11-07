@@ -12,9 +12,12 @@ pub(crate) struct RouteRegistration {
 }
 
 impl RouteRegistration {
-    /// Reports the registration's status to the session's adapters until `shutdown` fires.
+    /// Reports the registration's status to the session's adapters, and keeps the registered
+    /// routes in step with the session's route owners, until `shutdown` fires.
     #[cfg(unix)]
     pub(crate) fn report_to(&self, session: micromux::SessionStatus, shutdown: CancellationToken) {
+        follow_route_owners(&session, self.registrar.routes(), shutdown.clone());
+
         let mut status = self.registrar.status();
         tokio::spawn(async move {
             loop {
@@ -103,7 +106,7 @@ pub(crate) async fn register(
     config_path: &std::path::Path,
     shutdown: &CancellationToken,
 ) -> Result<Option<RouteRegistration>, Error> {
-    use micromux_proxy::protocol::{Registration, RouteTarget};
+    use micromux_proxy::protocol::Registration;
 
     if mux.routes().is_empty() {
         return Ok(None);
@@ -115,15 +118,7 @@ pub(crate) async fn register(
         config_path: config_path.display().to_string(),
         pid: std::process::id(),
         proxy_port: mux.proxy_port(),
-        routes: mux
-            .routes()
-            .iter()
-            .map(|route| RouteTarget {
-                host: route.host.clone(),
-                port: route.port,
-                service: route.service.clone(),
-            })
-            .collect(),
+        routes: route_targets(mux.routes()),
     };
     let registrar = micromux_proxy::Registrar::start(
         micromux_proxy::ProxyPaths::user()?,
@@ -134,6 +129,49 @@ pub(crate) async fn register(
     )
     .await?;
     Ok(Some(RouteRegistration { registrar }))
+}
+
+/// Forwards the session's routes to `routes` whenever they change, until `shutdown` fires.
+///
+/// A config reload can move a route to another service, which the proxy's error pages name.
+#[cfg(unix)]
+fn follow_route_owners(
+    session: &micromux::SessionStatus,
+    routes: tokio::sync::watch::Sender<Vec<micromux_proxy::protocol::RouteTarget>>,
+    shutdown: CancellationToken,
+) {
+    let mut summary = session.subscribe();
+    tokio::spawn(async move {
+        loop {
+            let targets = route_targets(&summary.borrow_and_update().routes);
+            routes.send_if_modified(|current| {
+                let changed = *current != targets;
+                *current = targets;
+                changed
+            });
+            tokio::select! {
+                () = shutdown.cancelled() => return,
+                changed = summary.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// The proxy's view of the session's routes.
+#[cfg(unix)]
+fn route_targets(routes: &[micromux::Route]) -> Vec<micromux_proxy::protocol::RouteTarget> {
+    routes
+        .iter()
+        .map(|route| micromux_proxy::protocol::RouteTarget {
+            host: route.host.clone(),
+            port: route.port,
+            service: route.service.clone(),
+        })
+        .collect()
 }
 
 /// Routes are rejected on platforms without a proxy, so there is nothing to register.
@@ -243,4 +281,147 @@ fn spawn_signal_handler(shutdown: CancellationToken) {
         }
         shutdown.cancel();
     });
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use color_eyre::eyre;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    /// A config whose only route goes to `port`, which `web` lists, or `frontend` once `moved`.
+    fn config(port: u16, moved: bool) -> String {
+        let (web, frontend) = if moved { (0, port) } else { (port, 0) };
+        format!(
+            r#"version: 1
+routes:
+  - host: app
+    port: {port}
+services:
+  web:
+    command: ["sh", "-c", "sleep 60"]
+    ports: [{web}]
+  frontend:
+    command: ["sh", "-c", "sleep 60"]
+    ports: [{frontend}]
+"#
+        )
+    }
+
+    /// Sends a `Connection: close` GET for `host` through the proxy and returns the response.
+    async fn get(proxy_port: u16, host: &str) -> eyre::Result<String> {
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", proxy_port)).await?;
+        stream
+            .write_all(
+                format!("GET / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n").as_bytes(),
+            )
+            .await?;
+        let mut response = String::new();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            stream.read_to_string(&mut response),
+        )
+        .await??;
+        Ok(response)
+    }
+
+    /// A reconcile that moves a route to another service reaches a real proxy through the
+    /// session's registration, whose 502 page then names the new service.
+    #[tokio::test]
+    async fn reconciled_route_owners_reach_the_proxy_registration() -> eyre::Result<()> {
+        let shutdown = micromux::CancellationToken::new();
+
+        // A proxy of its own, in a private directory
+        let directory = tempfile::tempdir()?;
+        let paths = micromux_proxy::ProxyPaths::in_dir(directory.path().join("proxy"));
+        std::fs::create_dir_all(directory.path().join("proxy"))?;
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let proxy = tokio::spawn(micromux_proxy::serve(
+            micromux_proxy::ServeOptions {
+                paths: paths.clone(),
+                preference: micromux_proxy::PortPreference {
+                    port: 0,
+                    fallback_port: None,
+                },
+                idle_timeout: Duration::from_secs(60),
+            },
+            shutdown.clone(),
+            move |port| {
+                let _ = ready_tx.send(port);
+            },
+        ));
+        let proxy_port = tokio::time::timeout(Duration::from_secs(5), ready_rx).await??;
+
+        // A route port nothing listens on, so the proxy answers with its 502 page
+        let route_port = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await?
+            .local_addr()?
+            .port();
+        let project = directory.path().join("project");
+        std::fs::create_dir_all(&project)?;
+        let config_path = project.join("micromux.yaml");
+        let raw = config(route_port, false);
+        std::fs::write(&config_path, &raw)?;
+        let mut config_file = micromux::from_str(&raw, &project, 0, None, &mut Vec::new())?;
+        config_file.config_path = Some(config_path.canonicalize()?);
+        let registry = micromux::PortRegistry::at(directory.path().join("registry"));
+        let mut session = micromux::Session::establish(&config_file, &registry)?;
+        session.set_proxy_port(proxy_port);
+        let mux = Arc::new(micromux::Micromux::with_session(&config_file, session)?);
+        let (runner, handles) = mux.clone().start(shutdown.clone());
+        let runner = tokio::spawn(runner);
+
+        // Register the way the CLI does, and follow the session.
+        let registration = super::RouteRegistration {
+            registrar: micromux_proxy::Registrar::start(
+                paths,
+                micromux_proxy::protocol::Registration {
+                    session: mux.session_identity().name.clone(),
+                    session_domain: mux.session_identity().session_domain(),
+                    config_path: config_path.display().to_string(),
+                    pid: std::process::id(),
+                    proxy_port,
+                    routes: super::route_targets(mux.routes()),
+                },
+                proxy_port,
+                None,
+                &shutdown,
+            )
+            .await?,
+        };
+        registration.report_to(handles.session.clone(), shutdown.clone());
+        let host = format!("app.{}", mux.session_identity().session_domain());
+        let before = get(proxy_port, &host).await?;
+        eyre::ensure!(before.contains("<strong>web</strong>"), "{before}");
+
+        // Move the route's port from `web` to `frontend`.
+        std::fs::write(&config_path, config(route_port, true))?;
+        handles
+            .service_control()
+            .reconcile_config(false)
+            .await
+            .map_err(|_| eyre::eyre!("scheduler stopped"))?
+            .map_err(|rejection| eyre::eyre!("reconcile rejected: {rejection}"))?;
+
+        // The proxy's 502 page follows with the new owner.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let after = get(proxy_port, &host).await?;
+            if after.contains("<strong>frontend</strong>") {
+                break;
+            }
+            eyre::ensure!(
+                tokio::time::Instant::now() < deadline,
+                "the proxy never named the new owner: {after}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        shutdown.cancel();
+        runner.await??;
+        proxy.await??;
+        Ok(())
+    }
 }

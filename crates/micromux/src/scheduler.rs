@@ -1069,6 +1069,8 @@ struct SchedulerRuntime {
     /// The latched session; holding it keeps the session registered until the scheduler has
     /// drained every service.
     session: std::sync::Arc<crate::session::SessionContext>,
+    /// The live summary adapters read, whose route owners follow config reloads.
+    session_status: crate::SessionStatus,
     default_log_retention: LogRetention,
     default_log_display: LogDisplay,
     idempotency: VecDeque<IdempotencyRecord>,
@@ -1086,6 +1088,7 @@ struct SchedulerResources {
     /// The latched session; holding it keeps the session registered until the scheduler has
     /// drained every service.
     session: std::sync::Arc<crate::session::SessionContext>,
+    session_status: crate::SessionStatus,
     default_log_retention: LogRetention,
     default_log_display: LogDisplay,
 }
@@ -1128,6 +1131,7 @@ impl SchedulerRuntime {
             config_dir,
             dynamic_policy,
             session,
+            session_status,
             default_log_retention,
             default_log_display,
         } = resources;
@@ -1149,10 +1153,29 @@ impl SchedulerRuntime {
             config_dir,
             dynamic_policy,
             session,
+            session_status,
             default_log_retention,
             default_log_display,
             idempotency: VecDeque::new(),
         }
+    }
+
+    /// Recomputes which service owns each route from the live configured services and publishes
+    /// it to the session summary, which the control plane, the TUI and the proxy lease follow.
+    ///
+    /// Dynamic and retired services never own a route, so the owners match those of a session
+    /// started with the current config.
+    fn publish_route_owners(&self, services: &ServiceMap) {
+        let live_configured = services
+            .iter()
+            .filter(|(service_id, service)| {
+                roster_entry_state(&self.services, service_id, service)
+                    == Some(RosterEntryState::LiveConfigured)
+            })
+            .collect::<Vec<_>>();
+        self.session_status.set_route_owners(|port| {
+            crate::session::route_owner(port, live_configured.iter().copied())
+        });
     }
 
     /// Re-project a single service into the model. Both shared borrows (`services` meta and the
@@ -2130,6 +2153,7 @@ impl SchedulerRuntime {
         }
         *services = merged;
         self.sync_all(services);
+        self.publish_route_owners(services);
         if !changed.is_empty() {
             let detail = format!("reloaded changed service specs: {}", changed.join(", "));
             for service_id in &changed {
@@ -2375,6 +2399,7 @@ impl SchedulerRuntime {
         self.validate_reconcile_candidate(services, &updated, &actions)?;
         if !dry_run {
             self.apply_reconcile(services, &updated, &actions);
+            self.publish_route_owners(services);
         }
         Ok(ReconcileReceipt {
             config_path,
@@ -3050,6 +3075,7 @@ pub(crate) struct SchedulerInput {
     pub(crate) config_dir: PathBuf,
     pub(crate) dynamic_policy: DynamicServicesPolicy,
     pub(crate) session: std::sync::Arc<crate::session::SessionContext>,
+    pub(crate) session_status: crate::SessionStatus,
     pub(crate) default_log_retention: LogRetention,
     pub(crate) default_log_display: LogDisplay,
 }
@@ -3069,6 +3095,7 @@ pub(crate) async fn scheduler(input: SchedulerInput) -> Result<(), crate::graph:
         config_dir,
         dynamic_policy,
         session,
+        session_status,
         default_log_retention,
         default_log_display,
     } = input;
@@ -3093,6 +3120,7 @@ pub(crate) async fn scheduler(input: SchedulerInput) -> Result<(), crate::graph:
             config_dir,
             dynamic_policy,
             session,
+            session_status,
             default_log_retention,
             default_log_display,
         },

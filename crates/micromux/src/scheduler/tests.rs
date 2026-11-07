@@ -38,10 +38,24 @@ async fn run_test_scheduler(
         config_dir: Path::new(".").to_path_buf(),
         dynamic_policy: DynamicServicesPolicy::default(),
         session: std::sync::Arc::new(crate::session::SessionContext::unconfigured()),
+        session_status: unrouted_session_status(),
         default_log_retention: crate::LogRetention::default(),
         default_log_display: crate::LogDisplay::default(),
     })
     .await
+}
+
+/// The live summary of a session without routes, which no reload ever changes.
+fn unrouted_session_status() -> crate::SessionStatus {
+    crate::SessionStatus::new(crate::SessionSummary {
+        name: "test".to_string(),
+        domain: "test.localhost".to_string(),
+        host_suffix: "test.localhost".to_string(),
+        proxy_port: 80,
+        routes: Vec::new(),
+        allocated_ports: indexmap::IndexMap::new(),
+        routing: None,
+    })
 }
 
 /// A scheduler running against a temp config plus model/control handles.
@@ -136,6 +150,7 @@ fn spawn_harness_with_session(
                 config_dir,
                 dynamic_policy,
                 session,
+                session_status: unrouted_session_status(),
                 default_log_retention: crate::LogRetention::default(),
                 default_log_display: crate::LogDisplay::default(),
             })
@@ -169,6 +184,7 @@ async fn config_reload_wait_keeps_draining_process_events() -> eyre::Result<()> 
             config_dir: PathBuf::new(),
             dynamic_policy: DynamicServicesPolicy::default(),
             session: std::sync::Arc::new(crate::session::SessionContext::unconfigured()),
+            session_status: unrouted_session_status(),
             default_log_retention: LogRetention::default(),
             default_log_display: crate::LogDisplay::default(),
         },
@@ -223,6 +239,7 @@ async fn config_reload_wait_yields_to_session_shutdown() -> eyre::Result<()> {
             config_dir: PathBuf::new(),
             dynamic_policy: DynamicServicesPolicy::default(),
             session: std::sync::Arc::new(crate::session::SessionContext::unconfigured()),
+            session_status: unrouted_session_status(),
             default_log_retention: LogRetention::default(),
             default_log_display: crate::LogDisplay::default(),
         },
