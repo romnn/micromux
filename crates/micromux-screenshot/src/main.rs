@@ -115,7 +115,16 @@ const SCENARIOS: &[Scenario] = &[
 fn main() -> Result<(), Error> {
     let workspace = workspace_dir()?;
     let micromux = micromux_bin(&workspace)?;
-    let example_dir = workspace.join("examples").join("demo");
+    // Stage the demo under a scratch home at the path of the main checkout, so the screenshots
+    // show the same directory whichever checkout or worktree renders them.
+    let home =
+        std::env::temp_dir().join(format!("micromux-screenshot-home-{}", std::process::id()));
+    let example_dir = home
+        .join("dev")
+        .join("micromux")
+        .join("examples")
+        .join("demo");
+    copy_dir(&workspace.join("examples").join("demo"), &example_dir)?;
     // The screenshots live in the Hugo static tree so the docs site and the README can both serve
     // them (README via a raw.githubusercontent URL, the site as /images/<name>.png).
     let images = workspace.join("docs").join("static").join("images");
@@ -124,7 +133,7 @@ fn main() -> Result<(), Error> {
     std::fs::create_dir_all(&images)?;
 
     for scenario in SCENARIOS {
-        let ansi = capture(&micromux, &example_dir, scenario)?;
+        let ansi = capture(&micromux, &home, &example_dir, scenario)?;
 
         let tmp = std::env::temp_dir().join(format!("micromux-screenshot-{}.ansi", scenario.name));
         std::fs::write(&tmp, &ansi)?;
@@ -135,6 +144,22 @@ fn main() -> Result<(), Error> {
         println!("wrote {}", png.display());
     }
 
+    let _ = std::fs::remove_dir_all(&home);
+    Ok(())
+}
+
+/// Copy the directory tree at `from` to `to`, keeping file permissions.
+fn copy_dir(from: &Path, to: &Path) -> Result<(), Error> {
+    std::fs::create_dir_all(to)?;
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let target = to.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir(&entry.path(), &target)?;
+        } else {
+            std::fs::copy(entry.path(), &target)?;
+        }
+    }
     Ok(())
 }
 
@@ -187,9 +212,14 @@ fn ensure_freeze() -> Result<(), Error> {
     }
 }
 
-/// Run `micromux` in a PTY against `example_dir`, drive the scenario, and return the settled screen
+/// Run `micromux` in a PTY against `example_dir` with `home` as its home directory, drive the scenario, and return the settled screen
 /// as a plain ANSI string (one row per line).
-fn capture(micromux: &Path, example_dir: &Path, scenario: &Scenario) -> Result<String, Error> {
+fn capture(
+    micromux: &Path,
+    home: &Path,
+    example_dir: &Path,
+    scenario: &Scenario,
+) -> Result<String, Error> {
     let pty = native_pty_system();
     let pair = pty
         .openpty(PtySize {
@@ -206,6 +236,8 @@ fn capture(micromux: &Path, example_dir: &Path, scenario: &Scenario) -> Result<S
     // The TUI shows log timestamps in local time, so pin the zone to render the demo records'
     // fixed timestamps identically on every machine.
     cmd.env("TZ", "UTC");
+    // The details popup shows the working directory relative to the home directory.
+    cmd.env("HOME", home);
     // micromux discovers `micromux.yaml` in its working directory, so no --config is needed.
 
     let mut child = pair
@@ -475,6 +507,8 @@ fn run_freeze(input: &Path, output: &Path) -> Result<(), Error> {
         .arg("--padding")
         .arg("20")
         .arg(input)
+        // freeze reads its input from stdin when stdin is not a terminal, and would wait forever.
+        .stdin(std::process::Stdio::null())
         .status()?;
 
     if status.success() {
