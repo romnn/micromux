@@ -44,6 +44,7 @@ struct Terminal {
     answered: usize,
     /// Whether to answer as a terminal with the kitty keyboard protocol.
     keyboard_protocol: bool,
+    started: Instant,
 }
 
 impl Terminal {
@@ -90,6 +91,7 @@ impl Terminal {
             written: Vec::new(),
             answered: 0,
             keyboard_protocol: false,
+            started: Instant::now(),
         })
     }
 
@@ -101,11 +103,9 @@ impl Terminal {
     ) -> eyre::Result<()> {
         let deadline = Instant::now() + WAIT;
         while !done(self.parser.screen(), &self.written) {
-            eyre::ensure!(
-                Instant::now() < deadline,
-                "timed out waiting for {what}; the screen shows:\n{}",
-                self.parser.screen().contents()
-            );
+            if Instant::now() >= deadline {
+                eyre::bail!(self.failure(&format!("timed out waiting for {what}")));
+            }
             match self.output.recv_timeout(Duration::from_millis(50)) {
                 Ok(chunk) => {
                     self.parser.process(&chunk);
@@ -114,16 +114,32 @@ impl Terminal {
                 }
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => {
-                    eyre::ensure!(
-                        done(self.parser.screen(), &self.written),
-                        "the program closed the terminal before {what}; the screen shows:\n{}",
-                        self.parser.screen().contents()
-                    );
+                    if !done(self.parser.screen(), &self.written) {
+                        eyre::bail!(
+                            self.failure(&format!("the program closed the terminal before {what}"))
+                        );
+                    }
                     return Ok(());
                 }
             }
         }
         Ok(())
+    }
+
+    /// Says `what` went wrong, with the screen and the last bytes the program wrote, escaped.
+    fn failure(&self, what: &str) -> String {
+        const TAIL: usize = 4096;
+        let tail = self
+            .written
+            .get(self.written.len().saturating_sub(TAIL)..)
+            .unwrap_or_default();
+        format!(
+            "{what} after {:?}; the program wrote {} bytes, ending in:\n{}\nthe screen shows:\n{}",
+            self.started.elapsed(),
+            self.written.len(),
+            tail.escape_ascii(),
+            self.parser.screen().contents()
+        )
     }
 
     /// Answers the queries written since the last call as a terminal does, which vt100 does not:
