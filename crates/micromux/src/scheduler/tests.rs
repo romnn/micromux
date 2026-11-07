@@ -5237,6 +5237,11 @@ async fn dynamic_clones_do_not_inherit_the_cleanup() -> eyre::Result<()> {
 
     assert_eq!(stopped.last_cleanup, None);
     assert!(!dir.path().join("cleaned").exists());
+    harness.shutdown.cancel();
+    harness.handle.await??;
+    Ok(())
+}
+
 fn depends_on(name: &str, condition: config::DependencyCondition) -> config::Dependency {
     config::Dependency {
         name: spanned_string(name),
