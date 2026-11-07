@@ -134,7 +134,7 @@ micromux ctl reconcile --dry-run   # show the semantic diff
 micromux ctl reconcile             # apply it
 ```
 
-Reconciliation **adds** newly-defined services, **retires** removed ones, and **updates** changed definitions. Additions and removals take effect immediately; a changed definition is used on the service's **next restart** (manual, enable, or a due automatic restart). Reconciliation does not by itself restart a changed process.
+Reconciliation **adds** newly-defined services, **retires** removed ones, and **updates** changed definitions. Additions and removals take effect immediately; a changed definition is used on the service's **next restart** (manual, enable, or a due automatic restart). Reconciliation does not by itself restart a changed process. Until a restart applies the change, `micromux ctl ls` marks the service `config=stale`, the TUI says so in its service details, and `micromux env --service` notes it. That covers every change a restart would apply, including the contents of an `env_file`, which reconciliation reads again.
 
 > [!NOTE]
 > Over MCP the same flow is `reconcile_config` — run it with `dry_run=true` first, then apply. For a config that has no running session, `validate_config` checks a candidate file without starting anything.

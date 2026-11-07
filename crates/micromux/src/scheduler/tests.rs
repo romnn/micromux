@@ -694,6 +694,41 @@ fn project_snapshot_reports_runtime_identity_and_config_drift() -> eyre::Result<
     Ok(())
 }
 
+/// A change that only reaches the process through its environment still needs a restart, so it
+/// marks the run stale like a command change does.
+#[test]
+fn project_snapshot_reports_environment_only_drift() -> eyre::Result<()> {
+    let service = Service::new(
+        "svc",
+        Path::new("."),
+        service_config("svc", ("sh", &["-c", "sleep 60"])),
+    )?;
+    let mut runtime = ServiceRuntime::new(ServiceRuntimeInit::from(&service));
+    runtime.run_config = Some(RunConfig::from(&service));
+    start_dummy_run(&mut runtime)?;
+
+    // An environment entry
+    let mut changed_environment = service.clone();
+    changed_environment
+        .spec
+        .environment
+        .insert("API_URL".to_string(), "http://127.0.0.1:1".to_string());
+    assert!(
+        project_snapshot(&changed_environment, &runtime)
+            .0
+            .config_stale
+    );
+
+    // The color variables micromux adds to the environment
+    let mut changed_color = service.clone();
+    changed_color.enable_color = !service.enable_color;
+    assert!(project_snapshot(&changed_color, &runtime).0.config_stale);
+
+    // The unchanged definition stays current.
+    assert!(!project_snapshot(&service, &runtime).0.config_stale);
+    Ok(())
+}
+
 #[test]
 fn project_snapshot_reports_active_restart_backoff() -> eyre::Result<()> {
     let mut config = service_config("svc", ("false", &[]));
@@ -727,7 +762,6 @@ fn start_dummy_run(runtime: &mut ServiceRuntime) -> eyre::Result<RunId> {
         since: tokio::time::Instant::now(),
         exited_at: None,
         stop_requested: false,
-        environment: indexmap::IndexMap::new(),
     });
     Ok(run_id)
 }
@@ -2017,7 +2051,7 @@ async fn environment_reports_session_variables_and_the_live_run_environment() ->
     );
 
     // A reconciled definition does not reach the running process, so the old values stay and
-    // are marked stale.
+    // are marked stale, and the service snapshot agrees although only the environment changed.
     fs::write(dir.path().join("micromux.yaml"), environment_yaml("after"))?;
     reconcile_accepted(harness.control.reconcile_config(false).await)?;
     let reconciled = environment_accepted(harness.control.environment(Some(&svc)).await)?;
@@ -2028,6 +2062,7 @@ async fn environment_reports_session_variables_and_the_live_run_environment() ->
             stale: true,
         }
     );
+    wait_until(&harness.reader, "svc", |snapshot| snapshot.config_stale).await?;
 
     // The restart runs the new definition, which is current again.
     let generation = running_generation(&harness, &svc)?;
@@ -2042,6 +2077,47 @@ async fn environment_reports_session_variables_and_the_live_run_environment() ->
         Some("after")
     );
     assert!(!restarted.stale);
+    wait_until(&harness.reader, "svc", |snapshot| !snapshot.config_stale).await?;
+
+    harness.shutdown.cancel();
+    harness.handle.await??;
+    Ok(())
+}
+
+/// A reconcile re-reads env files, so a change to their contents alone marks the running service
+/// stale in its snapshot and in its environment alike.
+#[tokio::test]
+async fn reconcile_marks_a_changed_env_file_stale() -> eyre::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let harness = spawn_environment_harness(dir.path()).await?;
+    let svc = "svc".to_string();
+
+    // Only the env file changes; the config file stays byte for byte the same.
+    fs::write(
+        dir.path().join("svc.env"),
+        "FROM_ENV_FILE=changed\nSESSION_PORT=1\n",
+    )?;
+    let receipt = reconcile_accepted(harness.control.reconcile_config(false).await)?;
+    assert_eq!(
+        receipt
+            .actions
+            .iter()
+            .map(|action| (action.service.as_str(), action.action))
+            .collect::<Vec<_>>(),
+        vec![("svc", ReconcileActionKind::Changed)]
+    );
+
+    // The running process keeps the old value, and both views call it stale.
+    let reconciled = environment_accepted(harness.control.environment(Some(&svc)).await)?;
+    assert_eq!(
+        reconciled
+            .variables
+            .get("FROM_ENV_FILE")
+            .map(String::as_str),
+        Some("from-file")
+    );
+    assert!(reconciled.stale);
+    wait_until(&harness.reader, "svc", |snapshot| snapshot.config_stale).await?;
 
     harness.shutdown.cancel();
     harness.handle.await??;
