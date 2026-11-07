@@ -57,7 +57,8 @@ fn set_logs(app: &mut App, lines: impl IntoIterator<Item = String>) -> eyre::Res
     service.cached_lines = lines
         .into_iter()
         .enumerate()
-        .map(|(seq, line)| (u64::try_from(seq).unwrap_or(u64::MAX), line))
+        // Sequence numbers start at 1, apart from the line indices.
+        .map(|(index, line)| (u64::try_from(index).unwrap_or(u64::MAX) + 1, line))
         .collect();
     service.text_dirty = true;
     draw(app);
@@ -553,7 +554,7 @@ async fn a_selection_stays_on_its_text_while_a_full_log_drops_its_oldest_lines()
         .state
         .current_service_mut()
         .ok_or_else(|| eyre::eyre!("no service is selected"))?;
-    for seq in 20..25u64 {
+    for seq in 21..26u64 {
         service.cached_lines.pop_front();
         service
             .cached_lines
@@ -683,5 +684,82 @@ async fn a_hint_acts_only_when_the_button_comes_up_on_it() -> eyre::Result<()> {
     mouse(&mut app, MouseEventKind::Down(MouseButton::Left), health);
     mouse(&mut app, MouseEventKind::Up(MouseButton::Left), health);
     assert!(app.show_healthcheck_pane);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_blank_last_line_keeps_the_selection_on_its_text() -> eyre::Result<()> {
+    let mut app = app(SERVICES)?;
+    // A burst of output ending with a blank line, as many services print.
+    set_logs(&mut app, numbered(10).chain([String::new()]))?;
+    let frame = draw(&mut app);
+    let line = find(&frame, "line 5 of")?;
+    drag(&mut app, line, &[Position::new(line.x + 5, line.y)]);
+    assert_eq!(copied(&mut app), vec!["line 5".to_string()]);
+
+    // Another line arrives, and later a blank one again, each pushing the text up.
+    for text in ["next", ""] {
+        let service = app
+            .state
+            .current_service_mut()
+            .ok_or_else(|| eyre::eyre!("no service is selected"))?;
+        let seq = service.cached_lines.back().map_or(1, |(seq, _)| seq + 1);
+        service.cached_lines.pop_front();
+        service.cached_lines.push_back((seq, text.to_string()));
+        service.text_dirty = true;
+        draw(&mut app);
+        assert_eq!(
+            app.selected_text().as_deref(),
+            Some("line 5"),
+            "after {text:?}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_taller_pane_scrolls_the_services_list_back_up() -> eyre::Result<()> {
+    let mut services = String::new();
+    for index in 0..40 {
+        writeln!(
+            services,
+            "  svc{index:02}:\n    command: [\"sleep\", \"30\"]"
+        )?;
+    }
+    let mut app = app(&format!("version: 1\nservices:\n{services}"))?;
+    app.state.selected_service = 39;
+    draw(&mut app);
+    assert!(app.first_service > 0);
+
+    // At a height that fits every service, the list starts at the first one again.
+    let area = Rect::new(0, 0, WIDTH, 60);
+    let mut frame = Buffer::empty(area);
+    (&mut app).render(area, &mut frame);
+    assert_eq!(app.first_service, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn copying_a_very_long_unwrapped_line_lays_it_out_without_drawing_it() -> eyre::Result<()> {
+    let mut app = app(SERVICES)?;
+    // As long as a log line can get, among the lines of a full log.
+    let long = "y".repeat(16 * 1024);
+    set_logs(
+        &mut app,
+        numbered(500).chain([long.clone()]).chain(numbered(10)),
+    )?;
+    let frame = draw(&mut app);
+    let first = find(&frame, "yyyy")?;
+    let last = find(&frame, "line 9 of")?;
+    // Select from the start of the long line to the end of the last line.
+    drag(&mut app, first, &[Position::new(WIDTH - 1, last.y)]);
+    let copied = copied(&mut app);
+    let text = copied.first().map(String::as_str).unwrap_or_default();
+    assert!(text.contains(&long));
+    assert!(
+        text.ends_with("line 9 of the log"),
+        "{}",
+        &text[text.len() - 40..]
+    );
     Ok(())
 }

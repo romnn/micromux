@@ -1130,12 +1130,14 @@ fn open_url(url: &str) -> std::io::Result<()> {
     } else {
         "xdg-open"
     };
-    let mut child = Command::new(opener)
+    let mut command = Command::new(opener);
+    command
         .arg(url)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
+        .stderr(Stdio::null());
+    clipboard::detach(&mut command);
+    let mut child = command.spawn()?;
     // Reap the opener once it exits, so it does not linger as a zombie.
     std::thread::spawn(move || child.wait());
     Ok(())

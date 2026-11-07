@@ -2071,14 +2071,20 @@ impl App {
             })
             .collect();
 
-        // The list scrolls on from where the last frame left it, so the rows a click lands on
-        // stay put once the selection moves to one of them.
-        let mut state = ListState::default()
-            .with_offset(self.first_service)
-            .with_selected(Some(self.state.selected_service));
-
         let block = Block::default().borders(Borders::ALL).title("Services");
         let rows = block.inner(area);
+        // The list scrolls on from where the last frame left it, so the rows a click lands on
+        // stay put once the selection moves to one of them.
+        // Rows freed by a taller pane or a shorter roster go to the services above, which ratatui
+        // would leave scrolled out of view.
+        let max_offset = self
+            .state
+            .services
+            .len()
+            .saturating_sub(usize::from(rows.height));
+        let mut state = ListState::default()
+            .with_offset(self.first_service.min(max_offset))
+            .with_selected(Some(self.state.selected_service));
         let sidebar = List::new(items)
             .block(block)
             .highlight_style(
@@ -2127,6 +2133,12 @@ impl App {
                 );
                 escaped.into()
             });
+            // Joining drops the line of a blank last record, but each record keeps a line of its
+            // own, so a selection can find its lines by their records.
+            let records = service.cached_lines.len();
+            if service.cached_text.lines.len() < records {
+                service.cached_text.lines.resize(records, Line::default());
+            }
             service
                 .cached_line_index
                 .rebuild(&service.cached_text, wrap, wrap_width);

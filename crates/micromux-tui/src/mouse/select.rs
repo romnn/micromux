@@ -103,12 +103,73 @@ fn text_end(buf: &Buffer, y: u16) -> Option<u16> {
     })
 }
 
-/// Everything drawn on row `y` of `buf`, from column `from` to `to`, both included.
-fn drawn_between(buf: &Buffer, y: u16, from: u16, to: u16) -> String {
-    (from..=to.min(buf.area.width.saturating_sub(1)))
-        .filter_map(|x| buf.cell((x, y)).map(Cell::symbol))
-        .filter(|symbol| *symbol != UNWRITTEN)
+/// The text one rendered row shows: each grapheme with the column it starts at.
+type RowCells = Vec<(usize, String)>;
+
+/// The cells of row `y` of `buf` that hold text.
+fn row_cells(buf: &Buffer, y: u16) -> RowCells {
+    (0..buf.area.width)
+        .filter_map(|x| {
+            let symbol = buf.cell((x, y))?.symbol();
+            (symbol != UNWRITTEN).then(|| (usize::from(x), symbol.to_string()))
+        })
         .collect()
+}
+
+/// The graphemes of `line` that a pane draws into cells, leaving out control and zero-width
+/// ones.
+fn drawn_graphemes(line: &ratatui::text::Line<'_>) -> Vec<String> {
+    line.styled_graphemes(ratatui::style::Style::default())
+        .map(|grapheme| grapheme.symbol)
+        .filter(|symbol| {
+            !symbol.contains(char::is_control) && ratatui::text::Span::raw(*symbol).width() > 0
+        })
+        .map(str::to_string)
+        .collect()
+}
+
+/// The cells of `line` drawn on one row that never wraps, however far past the pane it runs.
+fn unwrapped_cells(line: &ratatui::text::Line<'_>) -> RowCells {
+    let mut col = 0;
+    drawn_graphemes(line)
+        .into_iter()
+        .map(|symbol| {
+            let at = col;
+            col += ratatui::text::Span::raw(symbol.as_str()).width();
+            (at, symbol)
+        })
+        .collect()
+}
+
+/// The last column of `cells` that shows text, counting the hidden half of a wide character,
+/// or `None` for a row without any.
+///
+/// Blanks after the text are padding, such as the spaces a service's terminal output fills its
+/// rows with, so a selection neither highlights nor copies them.
+fn cells_text_end(cells: &RowCells) -> Option<usize> {
+    cells
+        .iter()
+        .rev()
+        .find(|(_, symbol)| !symbol.trim().is_empty())
+        .map(|(col, symbol)| col + ratatui::text::Span::raw(symbol.as_str()).width().max(1) - 1)
+}
+
+/// The text of `cells` from column `from` to `to`, both included.
+fn cells_between(cells: &RowCells, from: usize, to: usize) -> String {
+    cells
+        .iter()
+        .filter(|(col, _)| (from..=to).contains(col))
+        .map(|(_, symbol)| symbol.as_str())
+        .collect()
+}
+
+/// A selected column as a cell column, with [`END_OF_LINE`] past every line.
+fn column(col: u16) -> usize {
+    if col == END_OF_LINE {
+        usize::MAX
+    } else {
+        usize::from(col)
+    }
 }
 
 impl App {
@@ -343,6 +404,62 @@ impl App {
             .map_or(row, |(_, first_row)| first_row)
     }
 
+    /// The rows of the line that `row` is on, in `context`'s pane.
+    fn line_rows(&self, context: &TextContext, row: usize) -> std::ops::RangeInclusive<usize> {
+        let Some((_, index)) = self.pane_text(context.pane) else {
+            return row..=row;
+        };
+        let Some((line, first)) = index.line_of_row(row) else {
+            return row..=row;
+        };
+        let next = index
+            .line_start(line + 1)
+            .unwrap_or_else(|| index.total_lines());
+        first..=next.saturating_sub(1).max(first)
+    }
+
+    /// The line that `row` starts in `context`'s pane, as the pane draws it.
+    fn line_starting_at(
+        &self,
+        context: &TextContext,
+        row: usize,
+    ) -> Option<&ratatui::text::Line<'static>> {
+        match self.pane_text(context.pane) {
+            Some((text, index)) => text.lines.get(index.line_of_row(row)?.0),
+            None => self.popup_lines().get(row),
+        }
+    }
+
+    /// The cells of every row of the line `rows` covers, and before each row the whitespace that
+    /// wrapping dropped there.
+    ///
+    /// Only a wrapped line is drawn off screen, one line at a time; an unwrapped one is laid out
+    /// from its graphemes, so a long line never needs a buffer as wide as itself.
+    fn line_cells(
+        &self,
+        context: &TextContext,
+        rows: &std::ops::RangeInclusive<usize>,
+    ) -> Vec<(String, RowCells)> {
+        let Some(line) = self.line_starting_at(context, *rows.start()) else {
+            return Vec::new();
+        };
+        if !context.wrap {
+            return vec![(String::new(), unwrapped_cells(line))];
+        }
+        let buf = self.draw_rows(context, *rows.start()..*rows.end() + 1, context.width);
+        let mut cursor = LineCursor::new(drawn_graphemes(line).concat());
+        (0..buf.area.height)
+            .map(|y| {
+                let cells = row_cells(&buf, y);
+                let shown = cells
+                    .iter()
+                    .map(|(_, symbol)| symbol.as_str())
+                    .collect::<String>();
+                (cursor.advance(&shown), cells)
+            })
+            .collect()
+    }
+
     /// The selected text, or `None` when nothing is selected.
     ///
     /// Rows of one wrapped line join with the whitespace the wrap dropped between them, and a
@@ -354,97 +471,86 @@ impl App {
         if start == end {
             return None;
         }
-        let last_row = self.total_rows(context.pane).checked_sub(1)?;
-        let end_row = end.row.min(last_row);
-        // Draw from the start of the first line, so the whitespace dropped where it wraps can be
-        // found, and wide enough for the longest line when lines run past the pane's edge.
-        let first = self.line_start_row(context, start.row);
-        let width = match self.pane_text(context.pane) {
-            Some((text, index)) if !context.wrap => (first..=end_row)
-                .filter_map(|row| index.line_of_row(row))
-                .filter_map(|(line, _)| text.lines.get(line).map(ratatui::text::Line::width))
-                .max()
-                .map_or(context.width, |widest| rows_u16(widest).max(context.width)),
-            _ => context.width,
-        };
-        let buf = self.draw_rows(context, first..end_row + 1, width);
+        let end_row = end.row.min(self.total_rows(context.pane).checked_sub(1)?);
 
         let mut text = String::new();
-        let mut line = LineCursor::default();
-        for row in first..=end_row {
-            let y = rows_u16(row - first);
-            let starts_line = self.line_start_row(context, row) == row;
-            if starts_line {
-                line = LineCursor::new(self.drawn_line(context, row));
-            }
-            let gap = line.advance(&drawn_between(&buf, y, 0, END_OF_LINE));
-            if row < start.row {
-                continue;
-            }
-            if row > start.row {
-                if starts_line {
-                    text.push('\n');
-                } else {
-                    text.push_str(&gap);
+        let mut row = start.row;
+        while row <= end_row {
+            let rows = self.line_rows(context, row);
+            for (offset, (gap, cells)) in self.line_cells(context, &rows).into_iter().enumerate() {
+                let at = rows.start() + offset;
+                if at < start.row || at > end_row {
+                    continue;
+                }
+                if at > start.row {
+                    if at == *rows.start() {
+                        text.push('\n');
+                    } else {
+                        text.push_str(&gap);
+                    }
+                }
+                if let (Some((from, to)), Some(text_end)) =
+                    (placed.columns_in_row(at), cells_text_end(&cells))
+                {
+                    text.push_str(&cells_between(
+                        &cells,
+                        column(from),
+                        column(to).min(text_end),
+                    ));
                 }
             }
-            let (Some((from, to)), Some(text_end)) =
-                (placed.columns_in_row(row), text_end(&buf, y))
-            else {
-                continue;
-            };
-            text.push_str(&drawn_between(&buf, y, from, to.min(text_end)));
+            row = rows.end() + 1;
         }
         (!text.is_empty()).then_some(text)
-    }
-
-    /// The text of the line starting on `row` as the pane draws it, without the control and
-    /// zero-width characters that never land in a cell.
-    fn drawn_line(&self, context: &TextContext, row: usize) -> String {
-        let line = self
-            .pane_text(context.pane)
-            .and_then(|(text, index)| text.lines.get(index.line_of_row(row)?.0));
-        line.map(|line| {
-            line.styled_graphemes(ratatui::style::Style::default())
-                .map(|grapheme| grapheme.symbol)
-                .filter(|symbol| {
-                    !symbol.contains(char::is_control)
-                        && ratatui::text::Span::raw(*symbol).width() > 0
-                })
-                .collect()
-        })
-        .unwrap_or_default()
     }
 
     /// The word around `pos` in `context`'s pane: the run of non-blank cells it is in, or of
     /// blank ones.
     pub(crate) fn word_at(&self, context: &TextContext, pos: TextPos) -> (TextPos, TextPos) {
-        let buf = self.draw_rows(context, pos.row..pos.row + 1, context.width);
-        let blank = |x: u16| {
-            buf.cell((x, 0))
-                .is_none_or(|cell| cell.symbol() == UNWRITTEN || cell.symbol().trim().is_empty())
+        let cells = if context.wrap {
+            row_cells(
+                &self.draw_rows(context, pos.row..pos.row + 1, context.width),
+                0,
+            )
+        } else {
+            self.line_starting_at(context, pos.row)
+                .map(unwrapped_cells)
+                .unwrap_or_default()
         };
-        let kind = blank(pos.col);
-        let mut from = pos.col;
+        let blank = |col: usize| {
+            cells
+                .iter()
+                .find(|(at, symbol)| {
+                    (*at..*at + ratatui::text::Span::raw(symbol.as_str()).width().max(1))
+                        .contains(&col)
+                })
+                .is_none_or(|(_, symbol)| symbol.trim().is_empty())
+        };
+        let last = cells
+            .last()
+            .map_or(0, |(at, symbol)| {
+                at + ratatui::text::Span::raw(symbol.as_str()).width()
+            })
+            .max(usize::from(context.width));
+        let col = usize::from(pos.col);
+        let kind = blank(col);
+        let mut from = col;
         while from > 0 && blank(from - 1) == kind {
             from -= 1;
         }
-        let mut to = pos.col;
-        while to + 1 < context.width && blank(to + 1) == kind {
+        let mut to = col;
+        while to + 1 < last && blank(to + 1) == kind {
             to += 1;
         }
-        // A word that reaches the pane's edge of an unwrapped pane goes on past it.
-        if !context.wrap && to + 1 == context.width && !kind {
-            to = END_OF_LINE;
-        }
+        let as_col = |col: usize| u16::try_from(col).unwrap_or(END_OF_LINE - 1);
         (
             TextPos {
                 row: pos.row,
-                col: from,
+                col: as_col(from),
             },
             TextPos {
                 row: pos.row,
-                col: to,
+                col: as_col(to),
             },
         )
     }
