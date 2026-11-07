@@ -124,7 +124,11 @@ proxy:
 
 On Linux, port 80 needs privileges unless you allow unprivileged low ports once with `sudo sysctl -w net.ipv4.ip_unprivileged_port_start=80` (persist it in `/etc/sysctl.d/`) or grant the binary `cap_net_bind_service` with `setcap`. Without either, set `fallback_port`, or the session fails to start and says so. macOS lets unprivileged processes bind port 80 only on the wildcard address, so there the proxy listens on all interfaces and drops every connection that does not come from the local machine.
 
-A session joins a proxy that is already running only if it listens on `port` or `fallback_port`. A session with path routes also needs a proxy that routes by path: one started by an older micromux would ignore the paths, so the session refuses it and names its process id. Stop or restart the sessions that still run the older micromux, which would otherwise start their proxy again; the old proxy exits a minute after its last session stops, or right away with `kill <pid>`. The port a session started with stays its port: if the proxy goes away, the session starts it again on the same port, because its services already hold URLs with that port.
+A session joins a proxy that is already running only if it listens on `port` or `fallback_port`. A session with path routes also needs a proxy that routes by path: one started by an older micromux would ignore the paths, so the session never registers with it.
+
+After an upgrade, the old proxy usually serves no session anymore and only waits out its idle minute, so a session that needs a newer proxy takes it over. A proxy from this version on is asked to stop right away. An older one cannot be stopped, so the session shows `waiting for the outdated proxy (pid N) to exit` and waits up to 75 seconds for it to exit on its own. Then it starts the new proxy and registers. The session never signals the old proxy's process. If other sessions still use the old proxy, the session refuses it instead and names the proxy's process id and those sessions: stopping it would cut their routes, and an older micromux would start it again. Stop those sessions or restart them with the new micromux; the old proxy exits a minute after its last session stops. Once only sessions of the new micromux use it, `kill <pid>` moves them to a new proxy right away.
+
+The port a session started with stays its port: if the proxy goes away, the session starts it again on the same port, because its services already hold URLs with that port.
 
 ## Restarting to apply changes
 

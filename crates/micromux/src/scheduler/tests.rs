@@ -5670,14 +5670,23 @@ async fn a_dependency_that_will_not_restart_fails_its_dependents_transitively() 
             via: vec!["worker".to_string()],
         })
     );
-    let failed = harness
-        .reader
-        .events("api", None, None)
-        .0
-        .into_iter()
-        .filter(|event| event.kind == ServiceEventKind::DependencyFailed)
-        .map(|event| event.detail)
-        .collect::<Vec<_>>();
+    // The scheduler publishes the snapshot before it appends the event, so the event can trail
+    // the snapshot this thread just read.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let failed = loop {
+        let failed = harness
+            .reader
+            .events("api", None, None)
+            .0
+            .into_iter()
+            .filter(|event| event.kind == ServiceEventKind::DependencyFailed)
+            .map(|event| event.detail)
+            .collect::<Vec<_>>();
+        if !failed.is_empty() || tokio::time::Instant::now() >= deadline {
+            break failed;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
     assert_eq!(
         failed,
         vec![
