@@ -23,8 +23,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use micromux::{DependencyFailure, Desired, Execution, Health, HealthAttempt, ServiceSnapshot};
 use micromux_control::{
-    Client, ControlEndpoint, ControlError, ErrorCode, Request, Response, SessionInfo, endpoint_for,
-    runtime_dir_statuses, transport_supported, usable_runtime_dirs,
+    Client, ControlEndpoint, ControlError, ENVIRONMENT_PROTOCOL_VERSION, ErrorCode, Request,
+    Response, SessionInfo, endpoint_for, runtime_dir_statuses, transport_supported,
+    usable_runtime_dirs,
 };
 use regex::{Regex, RegexBuilder};
 use rmcp::{
@@ -97,8 +98,12 @@ const GREP_PATTERN_MAX_BYTES: usize = 64 * 1024;
 const INSTRUCTIONS: &str = "Discover and control running micromux sessions. When no `session` is \
 given, tools target the current project's session. Use `find_service` to locate a service across \
 sessions; service-scoped errors also point at matching sibling sessions. Read a session's browser \
-URLs and allocated ports from `get_session_urls` instead of guessing them. Validate a candidate file \
-with `validate_config`; for an active session's on-disk edits, call `reconcile_config` with \
+URLs and allocated ports from `get_session_urls` instead of guessing them. When you run a dev task \
+yourself, such as a migration or a seed against the session's database, read the session's \
+variables or a service's resolved environment with `get_session_env`; a service's values come back \
+only for the `names` you ask for. `start_dynamic_service` remains the way to run a command under \
+the session. Validate a candidate file with `validate_config`; for an active session's on-disk \
+edits, call `reconcile_config` with \
 `dry_run=true` before applying it. Reconciliation adds, retires, and updates configured services but \
 does not restart changed processes. Before creating a runtime service, use `list_sessions` and check \
 `capabilities.dynamic_services`. Supply an `idempotency_key` so creation retries are safe. Leases \
@@ -135,6 +140,22 @@ struct SessionArgs {
     /// target the micromux running in the current project directory.
     #[serde(default)]
     session: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct SessionEnvArgs {
+    /// Optional session selector; omit for the current project.
+    #[serde(default)]
+    session: Option<String>,
+    /// The id of a service whose resolved environment to read; omit for the session's own
+    /// variables.
+    #[serde(default)]
+    service: Option<String>,
+    /// Variables to read.
+    ///
+    /// Without them, a service's environment returns only the names.
+    #[serde(default)]
+    names: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -659,6 +680,30 @@ struct SessionUrlsResult {
     /// The session's name, browser URLs, allocated ports, and routing status; absent for a
     /// session too old to report them.
     session: Option<micromux::SessionSummary>,
+}
+
+#[derive(Serialize, JsonSchema)]
+struct SessionEnvResult {
+    #[serde(flatten)]
+    session_ref: SessionRef,
+    /// The service whose environment this is; absent for the session's own variables.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    service: Option<String>,
+    /// For a service, whether its definition changed since its running process started; the
+    /// variables are then those of the running process, not of its next run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stale: Option<bool>,
+    /// The variables with their values, sorted by name; absent when only names are returned.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    variables: Option<BTreeMap<String, String>>,
+    /// The variable names, sorted, when the values are withheld.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    names: Option<Vec<String>>,
+    /// Requested names that are not set.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    missing: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hint: Option<&'static str>,
 }
 
 #[derive(Serialize, JsonSchema)]
@@ -1470,6 +1515,81 @@ impl McpServer {
             config_path: resolved.info.config_path,
             session: resolved.info.session.map(|session| *session),
         }))
+    }
+
+    #[tool(
+        description = "Read a running session's environment, to run a dev task yourself with \
+        exactly what its services get, such as a migration or seed against the session's \
+        database. Without `service`, returns the session's own variables with their values: \
+        MICROMUX_SESSION, MICROMUX_SESSION_DOMAIN, MICROMUX_PROXY_PORT, MICROMUX_HOST_SUFFIX, \
+        and every allocated port. With `service` (its id), returns that service's resolved \
+        env_file and environment entries with the session variables applied, as its running \
+        process got them; `stale` says whether its config changed since. A service's values may \
+        hold secrets, so it returns only names unless you pass `names`. Requested names that are \
+        not set are listed in `missing`. The result names the session and config it read from."
+    )]
+    async fn get_session_env(
+        &self,
+        args: Parameters<SessionEnvArgs>,
+    ) -> ToolResult<SessionEnvResult> {
+        let Parameters(args) = args;
+        let resolved = select::resolve(&self.cwd, args.session)
+            .await
+            .map_err(error_data)?;
+        let version = resolved.info.protocol_version;
+        if !version.supports(ENVIRONMENT_PROTOCOL_VERSION) {
+            return Err(ErrorData::invalid_params(
+                format!(
+                    "session `{}` speaks control protocol {version}, but get_session_env needs \
+                     {ENVIRONMENT_PROTOCOL_VERSION} or later; restart the session with this \
+                     micromux",
+                    resolved.info.name
+                ),
+                None,
+            ));
+        }
+        let response = send_request(
+            &resolved.endpoint,
+            Request::GetEnvironment {
+                service: args.service.clone(),
+            },
+        )
+        .await
+        .map_err(error_data)?;
+        let environment = match &args.service {
+            Some(service) => service_result(service, convert::environment(response)).await?,
+            None => convert::environment(response).map_err(error_data)?,
+        };
+        let micromux::ResolvedEnvironment {
+            mut variables,
+            stale,
+        } = environment;
+        let mut result = SessionEnvResult {
+            session_ref: SessionRef::from(&resolved.info),
+            stale: args.service.as_ref().map(|_| stale),
+            service: args.service,
+            variables: None,
+            names: None,
+            missing: Vec::new(),
+            hint: None,
+        };
+        match args.names {
+            Some(names) => {
+                result.missing = names
+                    .iter()
+                    .filter(|name| !variables.contains_key(*name))
+                    .cloned()
+                    .collect();
+                variables.retain(|key, _| names.contains(key));
+                result.variables = Some(variables);
+            }
+            None if result.service.is_some() => {
+                result.names = Some(variables.into_keys().collect());
+                result.hint = Some("pass `names` to read values");
+            }
+            None => result.variables = Some(variables),
+        }
+        Ok(Json(result))
     }
 
     #[tool(
@@ -3180,8 +3300,8 @@ mod tests {
         DynamicServiceArgs, EnsureAction, EnsureActionKind, EnsureReadyArgs, LogFilterArgs,
         LogsArgs, ReconcileConfigArgs, RenewDynamicServiceArgs, ReplaceDynamicServiceArgs,
         RestartAndWaitArgs, ServiceArgs, ServiceEventsArgs, ServiceEventsResult, SessionArgs,
-        SessionServiceEventsResult, StartDynamicAndWaitArgs, WaitArgs, WaitForExitArgs, WaitStatus,
-        capture_mutation_cursor,
+        SessionEnvArgs, SessionServiceEventsResult, StartDynamicAndWaitArgs, WaitArgs,
+        WaitForExitArgs, WaitStatus, capture_mutation_cursor,
     };
 
     #[cfg(unix)]
@@ -3671,6 +3791,7 @@ services:
             "ensure_service_ready",
             "wait_for_exit",
             "get_health_history",
+            "get_session_env",
         ] {
             assert!(
                 tools.iter().any(|tool| tool.name == name),
@@ -3697,6 +3818,8 @@ services:
             "ensure_service_ready",
             "wait_for_exit",
             "get_health_history",
+            "get_session_env",
+            "start_dynamic_service` remains the way to run a command under the session",
             "micromux attach",
         ] {
             assert!(
@@ -3764,6 +3887,100 @@ services:
                 .iter()
                 .any(|line| line.line.contains("probe-output"))
         );
+        session.finish().await
+    }
+
+    /// The session's variables come back with values, a service's only by name unless the
+    /// caller asks for names, and every result says which session answered.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn get_session_env_discloses_service_values_only_when_asked() -> eyre::Result<()> {
+        let project = tempfile::tempdir()?;
+        std::fs::write(project.path().join("svc.env"), "FROM_ENV_FILE=from-file\n")?;
+        let yaml = r#"version: 1
+allocate_ports: [MCP_ENV_TEST_PORT]
+services:
+  svc:
+    command: ["sh", "-c", "sleep 60"]
+    env_file: svc.env
+    environment:
+      SECRET: "s3cr3t"
+"#;
+        let (session, selector) = boot_mcp_session_with_yaml(project.path(), "mcp-env-test", yaml)?;
+        let mut server = McpServer::new();
+        server.cwd = project.path().to_path_buf();
+        let env = |service: Option<&str>, names: Option<&[&str]>| SessionEnvArgs {
+            session: Some(selector.clone()),
+            service: service.map(str::to_string),
+            names: names.map(|names| names.iter().map(ToString::to_string).collect()),
+        };
+
+        // Session variables, with values
+        let Json(pins) = server
+            .get_session_env(Parameters(env(None, None)))
+            .await
+            .map_err(|err| eyre::eyre!(err.message))?;
+        assert_eq!(pins.session_ref.session, "mcp-env-test");
+        assert_eq!(
+            pins.session_ref.config_path,
+            project
+                .path()
+                .canonicalize()?
+                .join("micromux.yaml")
+                .to_string_lossy()
+        );
+        let variables = pins
+            .variables
+            .ok_or_else(|| eyre::eyre!("session values are missing"))?;
+        let port = variables
+            .get("MCP_ENV_TEST_PORT")
+            .ok_or_else(|| eyre::eyre!("the allocated port is missing"))?;
+        assert!(port.parse::<u16>().is_ok(), "{port}");
+        assert!(variables.contains_key("MICROMUX_SESSION"));
+        assert_eq!((pins.service, pins.stale, pins.names), (None, None, None));
+
+        // A service's names only, so its secrets stay out of the transcript
+        let Json(names_only) = server
+            .get_session_env(Parameters(env(Some("svc"), None)))
+            .await
+            .map_err(|err| eyre::eyre!(err.message))?;
+        assert!(!serde_json::to_string(&names_only)?.contains("s3cr3t"));
+        assert!(names_only.variables.is_none());
+        assert_eq!(names_only.stale, Some(false));
+        let names = names_only
+            .names
+            .ok_or_else(|| eyre::eyre!("service names are missing"))?;
+        for name in ["FROM_ENV_FILE", "MCP_ENV_TEST_PORT", "SECRET"] {
+            assert!(names.iter().any(|listed| listed == name), "{name}");
+        }
+
+        // Values for the requested names, and the ones that are not set
+        let Json(values) = server
+            .get_session_env(Parameters(env(Some("svc"), Some(&["SECRET", "NOT_SET"]))))
+            .await
+            .map_err(|err| eyre::eyre!(err.message))?;
+        assert_eq!(
+            values.variables,
+            Some(BTreeMap::from([(
+                "SECRET".to_string(),
+                "s3cr3t".to_string()
+            )]))
+        );
+        assert_eq!(values.missing, ["NOT_SET"]);
+        assert_eq!(values.service.as_deref(), Some("svc"));
+
+        // An unknown service is a typed error.
+        let unknown = server
+            .get_session_env(Parameters(env(Some("nope"), None)))
+            .await;
+        assert!(
+            unknown
+                .as_ref()
+                .is_err_and(|err| err.message.contains("UnknownService")),
+            "{:?}",
+            unknown.map(|_| ())
+        );
+
         session.finish().await
     }
 

@@ -238,6 +238,15 @@ micromux ctl restart api
 micromux ctl wait api   # until healthy; fails fast behind a dependency that failed
 ```
 
+Run your own commands with the session's allocated ports and variables, or print them:
+
+```bash
+micromux exec task migrations:reset
+micromux exec --service api -- cargo run --bin seed   # with exactly what `api` gets
+micromux env API_PORT                                 # the bare value, for scripts
+eval "$(micromux env --export)"
+```
+
 Runtime-created services are disabled by default. Enable and bound them in the target session's
 config; policy changes are latched when the session starts and require a restart:
 
@@ -256,7 +265,8 @@ Set `max_lifetime: none` to explicitly opt in to session-lifetime leases; caller
 restarting it. This policy limits accidental blast radius for a same-user local control tool; it is
 not a security sandbox, because commands still run as the session user. Environment values can be
 sent inward or cloned server-side with `from_service`; snapshots omit the environment entirely, and
-receipts return only key names.
+receipts return only key names. Values are read only on request, through `micromux env`,
+`micromux exec`, or `get_session_env`.
 
 Use `validate_config` to check a candidate config without a running session. For edits to the active
 session's on-disk config, run `reconcile_config` as a dry run first, then apply it; additions and
@@ -267,9 +277,10 @@ deliberately exposes no service PTY input tool; human observation of a headless 
 Build a lean TUI-only binary with the MCP server compiled out via `cargo install --no-default-features micromux-cli`.
 
 **Platform support.** micromux is developed and fully supported on Linux and macOS. On Windows the
-TUI runs, but the control plane (`micromux attach`, `micromux ctl`, `micromux mcp`, `micromux serve`)
-is not yet available, and stopping a service kills it immediately without a graceful-termination
-phase. Windows named-pipe support is planned (`ControlEndpoint::WindowsNamedPipe` reserves the slot).
+TUI runs, but the control plane (`micromux attach`, `micromux ctl`, `micromux env`, `micromux exec`,
+`micromux mcp`, `micromux serve`) is not yet available, and stopping a service kills it immediately
+without a graceful-termination phase. Windows named-pipe support is planned
+(`ControlEndpoint::WindowsNamedPipe` reserves the slot).
 
  ## How it differs from Docker Compose
  

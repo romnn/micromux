@@ -13,6 +13,7 @@ mod logging;
 mod mcp;
 mod options;
 mod proxy;
+mod session_env;
 
 use clap::Parser;
 use codespan_reporting::diagnostic::Diagnostic;
@@ -39,6 +40,8 @@ enum Error {
     Logging(#[from] logging::Error),
     #[error(transparent)]
     Join(#[from] tokio::task::JoinError),
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
     #[cfg(feature = "mcp")]
     #[error("mcp server error: {0}")]
     Mcp(Box<dyn std::error::Error + Send + Sync>),
@@ -47,10 +50,10 @@ enum Error {
     /// The failure was already explained by diagnostics printed to stderr.
     #[error("configuration errors were reported")]
     DiagnosticsEmitted,
-    /// A `ctl wait` ended without its condition and already reported why; the process exits
-    /// with this code.
-    #[error("the wait ended without its condition")]
-    WaitUnmet(i32),
+    /// The failure was already reported on stderr, such as a `ctl wait` that ended without its
+    /// condition; the process exits with this code.
+    #[error("the command failed with exit code {0}")]
+    Exit(i32),
     /// The session was asked to stop before it started.
     #[error(transparent)]
     Interrupted(#[from] micromux::CleanupWaitCancelled),
@@ -369,6 +372,44 @@ async fn run_command(command: options::Command, options: options::Options) -> Re
     match command {
         options::Command::Attach { session } => attach::run(&options, session.as_deref()).await,
         options::Command::Ctl { action } => ctl::run(action, options.config_path.as_deref()).await,
+        options::Command::Env {
+            session,
+            service,
+            export,
+            format,
+            names,
+        } => {
+            let target = session_env::Target {
+                session: session.as_deref(),
+                service: service.as_deref(),
+                config: options.config_path.as_deref(),
+            };
+            let format = if export {
+                options::EnvFormat::Shell
+            } else {
+                format.unwrap_or(options::EnvFormat::Env)
+            };
+            session_env::print(
+                &target,
+                &session_env::Output {
+                    format,
+                    names: &names,
+                },
+            )
+            .await
+        }
+        options::Command::Exec {
+            session,
+            service,
+            command,
+        } => {
+            let target = session_env::Target {
+                session: session.as_deref(),
+                service: service.as_deref(),
+                config: options.config_path.as_deref(),
+            };
+            session_env::exec(&target, &command).await
+        }
         #[cfg(feature = "mcp")]
         options::Command::Mcp {
             allow_session_start,
@@ -397,6 +438,10 @@ async fn run_command(command: options::Command, options: options::Options) -> Re
 
 async fn run() -> Result<(), Error> {
     let mut options = options::Options::parse();
+    // `exec` replaces this process, and the command it runs keeps the caller's open-file limit.
+    if !matches!(options.command, Some(options::Command::Exec { .. })) {
+        raise_file_descriptor_limit();
+    }
 
     if let Some(command) = options.command.take() {
         return run_command(command, options).await;
@@ -573,14 +618,13 @@ const RUNTIME_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_
 
 async fn async_main() -> color_eyre::Result<()> {
     color_eyre::install()?;
-    raise_file_descriptor_limit();
     match run().await {
         Ok(()) => Ok(()),
         // The diagnostics already explained the failure; a report with a location and a
         // backtrace hint would make a config typo read like a crash.
         Err(Error::DiagnosticsEmitted) => std::process::exit(1),
         Err(Error::Interrupted(_)) => std::process::exit(EXIT_INTERRUPTED),
-        Err(Error::WaitUnmet(code)) => std::process::exit(code),
+        Err(Error::Exit(code)) => std::process::exit(code),
         Err(err) => Err(err.into()),
     }
 }

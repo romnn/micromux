@@ -275,7 +275,8 @@ fn print_response(response: &Response) -> Result<(), crate::Error> {
         Response::ShuttingDown => {
             println!("session is shutting down");
         }
-        Response::Change(_) => {}
+        // `ctl` never subscribes or asks for environment values.
+        Response::Change(_) | Response::Environment(_) => {}
     }
     Ok(())
 }
@@ -407,12 +408,48 @@ fn ambiguous_session_message(
     )
 }
 
+/// A connection to the session that runs the project's config.
+pub(crate) struct ProjectSession {
+    pub(crate) endpoint: ControlEndpoint,
+    pub(crate) client: Client,
+    pub(crate) info: SessionInfo,
+}
+
+/// Connects to the session for the config found at or above the current directory, or for
+/// `config_path`.
+///
+/// Only that config's endpoints are probed, so a session for any other config never answers,
+/// not even one whose config lives under the current directory.
+pub(crate) async fn connect_project(
+    config_path: Option<&Path>,
+) -> Result<ProjectSession, crate::Error> {
+    if !micromux_control::transport_supported() {
+        return Err(crate::Error::Message(
+            "the micromux control plane is not supported on this platform".to_string(),
+        ));
+    }
+
+    let working_dir = std::env::current_dir()?;
+    let config_path = crate::control::resolve_config_path(config_path, &working_dir).await?;
+    let dir_statuses = runtime_dir_statuses();
+    let runtime_dirs = usable_runtime_dirs(&dir_statuses);
+    if runtime_dirs.is_empty() {
+        return Err(crate::Error::Message(no_session_message(
+            &dir_statuses,
+            &[],
+            &config_path,
+            &working_dir,
+        )));
+    }
+    connect_project_session(&dir_statuses, &runtime_dirs, &working_dir, &config_path).await
+}
+
 async fn connect_project_session(
     dir_statuses: &[RuntimeDirStatus],
     runtime_dirs: &[PathBuf],
     working_dir: &Path,
     config_path: &micromux_control::CanonicalConfigPath,
-) -> Result<(ControlEndpoint, Client), crate::Error> {
+) -> Result<ProjectSession, crate::Error> {
     let endpoints = runtime_dirs
         .iter()
         .map(|runtime_dir| endpoint_for(runtime_dir, config_path))
@@ -440,7 +477,13 @@ async fn connect_project_session(
                 continue;
             }
             match Client::connect(&endpoint).await {
-                Ok(client) => return Ok((endpoint, client)),
+                Ok(client) => {
+                    return Ok(ProjectSession {
+                        endpoint,
+                        client,
+                        info,
+                    });
+                }
                 Err(err) => failed_probes.push(EndpointProbe {
                     endpoint,
                     result: EndpointProbeResult::Unreachable(format!(
@@ -466,26 +509,11 @@ async fn connect_project_session(
 /// Returns an error if no session is running for this project, the runtime dir is unresolvable, or
 /// the request fails.
 pub async fn run(action: CtlAction, config_path: Option<&Path>) -> Result<(), crate::Error> {
-    if !micromux_control::transport_supported() {
-        return Err(crate::Error::Message(
-            "the micromux control plane is not supported on this platform".to_string(),
-        ));
-    }
-
-    let working_dir = std::env::current_dir()?;
-    let config_path = crate::control::resolve_config_path(config_path, &working_dir).await?;
-    let dir_statuses = runtime_dir_statuses();
-    let runtime_dirs = usable_runtime_dirs(&dir_statuses);
-    if runtime_dirs.is_empty() {
-        return Err(crate::Error::Message(no_session_message(
-            &dir_statuses,
-            &[],
-            &config_path,
-            &working_dir,
-        )));
-    }
-    let (endpoint, mut client) =
-        connect_project_session(&dir_statuses, &runtime_dirs, &working_dir, &config_path).await?;
+    let ProjectSession {
+        endpoint,
+        mut client,
+        ..
+    } = connect_project(config_path).await?;
 
     if let CtlAction::Wait {
         exit,
@@ -557,7 +585,7 @@ async fn wait(
                     .map(|health| format!(" ({health})"))
                     .unwrap_or_default()
             );
-            return Err(crate::Error::WaitUnmet(WAIT_TIMED_OUT));
+            return Err(crate::Error::Exit(WAIT_TIMED_OUT));
         }
         waker.sleep(deadline).await;
     }
@@ -602,11 +630,11 @@ fn report_wait(
                 "{service} exited with {} (generation {generation})",
                 exit_code(*code)
             );
-            Err(crate::Error::WaitUnmet(WAIT_EXITED))
+            Err(crate::Error::Exit(WAIT_EXITED))
         }
         (WaitVerdict::DependencyFailed(failure), _) => {
             eprintln!("{}", wait::dependency_failure_message(service, failure));
-            Err(crate::Error::WaitUnmet(WAIT_DEPENDENCY_FAILED))
+            Err(crate::Error::Exit(WAIT_DEPENDENCY_FAILED))
         }
         (WaitVerdict::Unavailable, _) => {
             let state = if snapshot.retired.is_some() {
@@ -615,7 +643,7 @@ fn report_wait(
                 "disabled"
             };
             eprintln!("{service} is {state} and has no run in flight to wait for");
-            Err(crate::Error::WaitUnmet(WAIT_UNAVAILABLE))
+            Err(crate::Error::Exit(WAIT_UNAVAILABLE))
         }
     }
 }

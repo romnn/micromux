@@ -2,10 +2,10 @@
 //!
 //! The session binds a Unix domain socket (Unix/macOS) keyed by a hash of its canonical config
 //! path; clients — the `micromux ctl` CLI and the MCP proxy — connect, speak newline-delimited JSON
-//! ([`Request`]/[`Response`]), and probe local endpoint paths without pruning stale sockets. The
-//! core knows nothing about any of this; the server is driven by a
-//! [`micromux::SessionModelReader`] (reads) and a [`micromux::ServiceControl`] (mutations), so it
-//! can observe and command but never mutate the model directly.
+//! ([`Request`]/[`Response`]), and probe local endpoint paths without pruning stale sockets.
+//! The core knows nothing about any of this; the server is driven by a
+//! [`micromux::SessionModelReader`] (reads) and a [`micromux::ServiceControl`] (mutations and the
+//! environment read), so it can observe and command but never mutate the model directly.
 
 mod client;
 mod endpoint;
@@ -39,10 +39,13 @@ pub use endpoint::{
     CanonicalConfigPath, ControlEndpoint, RuntimeDirStatus, endpoint_for, endpoint_from_hash,
     endpoint_hash, runtime_dir, runtime_dir_statuses, transport_supported, usable_runtime_dirs,
 };
-pub use micromux::{DynamicServiceAck, ReconcileAction, ReconcileActionKind, ReconcileReceipt};
+pub use micromux::{
+    DynamicServiceAck, ReconcileAction, ReconcileActionKind, ReconcileReceipt, ResolvedEnvironment,
+};
 pub use protocol::{
-    DiskLogReadHealth, DynamicServicesCaps, ErrorCode, PROTOCOL_VERSION, ProtocolVersion, Request,
-    Response, ServiceBrief, SessionCapabilities, SessionInfo,
+    DiskLogReadHealth, DynamicServicesCaps, ENVIRONMENT_PROTOCOL_VERSION, ErrorCode,
+    PROTOCOL_VERSION, ProtocolVersion, Request, Response, ServiceBrief, SessionCapabilities,
+    SessionInfo,
 };
 pub use select::{
     AmbiguousSelection, ProbeReport, ResolvedSession, RuntimeDirDetail, SelectError,

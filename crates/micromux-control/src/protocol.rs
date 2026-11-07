@@ -1,14 +1,16 @@
 //! The control wire protocol: newline-delimited JSON request/response envelopes.
 //!
 //! Domain payloads (`ServiceSnapshot`, `HealthAttempt`, `LogLine`, `SessionChange`,
-//! `ServiceCommandAck`, `DynamicServiceAck`, `ReconcileReceipt`, `ServiceEvent`, and
-//! `DynamicServiceParams`) are the stable core types reused directly — no DTO mirror. The session
-//! and the proxy accept peers that speak the same major protocol version, so additive payload
-//! changes do not orphan already-running sessions.
+//! `ServiceCommandAck`, `DynamicServiceAck`, `ReconcileReceipt`, `ResolvedEnvironment`,
+//! `ServiceEvent`, and `DynamicServiceParams`) are the stable core types reused directly — no DTO
+//! mirror.
+//! The session and the proxy accept peers that speak the same major protocol version, so
+//! additive payload changes do not orphan already-running sessions.
 
 use micromux::{
     DynamicServiceAck, DynamicServiceParams, HealthAttempt, Lease, LogLine, LogRunSummary,
-    ReconcileReceipt, ServiceCommandAck, ServiceEvent, ServiceID, ServiceSnapshot, SessionChange,
+    ReconcileReceipt, ResolvedEnvironment, ServiceCommandAck, ServiceEvent, ServiceID,
+    ServiceSnapshot, SessionChange,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -17,7 +19,10 @@ use serde::{Deserialize, Serialize};
 ///
 /// Bump the minor for additive changes (new optional/defaulted fields, new tools that reuse
 /// existing requests), and bump the major for incompatible request/response semantics.
-pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(3, 14);
+pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(3, 15);
+
+/// The first protocol revision whose sessions answer [`Request::GetEnvironment`].
+pub const ENVIRONMENT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(3, 15);
 
 pub(crate) const fn supports_versioned_subscriptions(version: ProtocolVersion) -> bool {
     version.major() == PROTOCOL_VERSION.major() && version.minor() >= 7
@@ -53,6 +58,14 @@ impl ProtocolVersion {
     #[must_use]
     pub const fn is_compatible_with(self, peer: Self) -> bool {
         self.major == peer.major
+    }
+
+    /// Return whether a peer speaking this version understands everything `revision` added.
+    ///
+    /// That holds on the same major line at `revision`'s minor or a later one.
+    #[must_use]
+    pub const fn supports(self, revision: Self) -> bool {
+        self.major == revision.major && self.minor >= revision.minor
     }
 }
 
@@ -172,6 +185,15 @@ pub enum Request {
         /// Dynamic service id.
         service: ServiceID,
     },
+    /// Return the session's variables, or one service's resolved environment, with their values.
+    ///
+    /// Sessions answer it from protocol [`ENVIRONMENT_PROTOCOL_VERSION`] on; older ones reject it
+    /// as a bad request.
+    /// See [`micromux::ServiceControl::environment`] for what the variables are.
+    GetEnvironment {
+        /// Service id, matched exactly, or `None` for the session's own variables.
+        service: Option<ServiceID>,
+    },
     /// Reconcile configured services against the session's on-disk config.
     ///
     /// The config file is the authority, so this operation has no dynamic-service capability gate.
@@ -211,6 +233,7 @@ impl Request {
                 | Self::GetHealth { .. }
                 | Self::GetHealthHistory { .. }
                 | Self::GetEvents { .. }
+                | Self::GetEnvironment { .. }
                 | Self::ReconcileConfig { dry_run: true }
         )
     }
@@ -436,6 +459,8 @@ pub enum Response {
     DynamicService(DynamicServiceAck),
     /// Reply to a config reconciliation.
     Reconcile(ReconcileReceipt),
+    /// Reply to [`Request::GetEnvironment`].
+    Environment(ResolvedEnvironment),
     /// A streamed change notification (only after [`Request::Subscribe`]).
     Change(SessionChange),
     /// Acknowledgement of [`Request::Shutdown`], written just before the session begins exiting.
@@ -499,7 +524,7 @@ mod tests {
     fn protocol_version_uses_major_minor_shape_and_accepts_same_major() {
         assert_eq!(
             serde_json::to_value(PROTOCOL_VERSION).unwrap(),
-            json!({ "major": 3, "minor": 14 })
+            json!({ "major": 3, "minor": 15 })
         );
         assert_eq!(
             serde_json::from_value::<ProtocolVersion>(json!({ "major": 1, "minor": 0 })).unwrap(),
@@ -512,6 +537,74 @@ mod tests {
             3, 6
         )));
         assert!(supports_versioned_subscriptions(ProtocolVersion::new(3, 7)));
+    }
+
+    /// A session answers `GetEnvironment` only from 3.15 on, and never across a major line.
+    #[test]
+    fn environment_requires_protocol_3_15_on_the_same_major_line() {
+        assert!(ProtocolVersion::new(3, 15).supports(ENVIRONMENT_PROTOCOL_VERSION));
+        assert!(ProtocolVersion::new(3, 16).supports(ENVIRONMENT_PROTOCOL_VERSION));
+        assert!(!ProtocolVersion::new(3, 14).supports(ENVIRONMENT_PROTOCOL_VERSION));
+        assert!(!ProtocolVersion::new(4, 15).supports(ENVIRONMENT_PROTOCOL_VERSION));
+        assert!(PROTOCOL_VERSION.supports(ENVIRONMENT_PROTOCOL_VERSION));
+    }
+
+    #[test]
+    fn environment_request_and_response_round_trip() -> serde_json::Result<()> {
+        for service in [None, Some("api".to_string())] {
+            let encoded = serde_json::to_value(Request::GetEnvironment {
+                service: service.clone(),
+            })?;
+            assert_matches!(
+                serde_json::from_value::<Request>(encoded)?,
+                Request::GetEnvironment { service: decoded } if decoded == service
+            );
+        }
+        assert!(Request::GetEnvironment { service: None }.is_retry_safe());
+
+        let environment = ResolvedEnvironment {
+            variables: [
+                ("API_PORT".to_string(), "20001".to_string()),
+                ("DATABASE_URL".to_string(), "postgres://secret".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+            stale: true,
+        };
+        let encoded = serde_json::to_value(Response::Environment(environment.clone()))?;
+        assert_eq!(
+            encoded,
+            json!({
+                "Environment": {
+                    "variables": {"API_PORT": "20001", "DATABASE_URL": "postgres://secret"},
+                    "stale": true
+                }
+            })
+        );
+        let Response::Environment(decoded) = serde_json::from_value::<Response>(encoded)? else {
+            return Err(serde_json::Error::io(std::io::Error::other(
+                "unexpected environment response variant",
+            )));
+        };
+        assert_eq!(decoded, environment);
+        Ok(())
+    }
+
+    /// Debug output reaches logs and "unexpected response" messages, so it must never carry a
+    /// value.
+    #[test]
+    fn environment_debug_output_names_variables_without_values() {
+        let response = Response::Environment(ResolvedEnvironment {
+            variables: [("DATABASE_URL".to_string(), "postgres://secret".to_string())]
+                .into_iter()
+                .collect(),
+            stale: false,
+        });
+
+        let debug = format!("{response:?}");
+
+        assert!(debug.contains("DATABASE_URL"), "{debug}");
+        assert!(!debug.contains("postgres://secret"), "{debug}");
     }
 
     #[test]
@@ -716,7 +809,7 @@ mod tests {
     fn protocol_version_ignores_additive_fields() {
         let version = serde_json::from_value::<ProtocolVersion>(json!({
             "major": 3,
-            "minor": 14,
+            "minor": 15,
             "future_capability": true
         }))
         .unwrap();
