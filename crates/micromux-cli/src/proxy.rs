@@ -354,11 +354,12 @@ services:
         ));
         let proxy_port = tokio::time::timeout(Duration::from_secs(5), ready_rx).await??;
 
-        // A route port nothing listens on, so the proxy answers with its 502 page
-        let route_port = tokio::net::TcpListener::bind(("127.0.0.1", 0))
-            .await?
-            .local_addr()?
-            .port();
+        // A route port that refuses connections, so the proxy answers with its 502 page.
+        // The socket is bound but never listens, which keeps a parallel test from listening on
+        // the port while this one runs.
+        let route_socket = tokio::net::TcpSocket::new_v4()?;
+        route_socket.bind((std::net::Ipv4Addr::LOCALHOST, 0).into())?;
+        let route_port = route_socket.local_addr()?.port();
         let project = directory.path().join("project");
         std::fs::create_dir_all(&project)?;
         let config_path = project.join("micromux.yaml");
