@@ -2570,7 +2570,7 @@ impl App {
     /// - The underlying event loop (`App::run`) fails.
     pub async fn render(self) -> Result<(), crate::Error> {
         crate::terminal::install_panic_hook();
-        if let Err(err) = crate::terminal::take_over(self.mouse.capture, !self.pty_input_mode) {
+        if let Err(err) = crate::terminal::take_over(self.mouse.capture) {
             // The failure to take the terminal over is the one to report.
             crate::terminal::give_back().ok();
             return Err(err.into());

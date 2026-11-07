@@ -508,7 +508,6 @@ impl App {
                     ) => break,
                 }
             }
-            terminal::set_keyboard_protocol(!self.pty_input_mode)?;
             #[cfg(unix)]
             if self.apply_effects(&mut terminal)? {
                 self.suspend(&mut terminal, &mut continued).await?;
@@ -617,7 +616,7 @@ impl App {
     fn take_terminal_again(&mut self, terminal: &mut DefaultTerminal) -> Result<(), Error> {
         use crossterm::terminal::{Clear, ClearType};
 
-        terminal::take_over(self.mouse.capture, !self.pty_input_mode)?;
+        terminal::take_over(self.mouse.capture)?;
         // A new terminal forgets what was drawn; ratatui's own `clear` would ask the terminal
         // where its cursor is, an answer the input reader takes first.
         *terminal =
@@ -1223,8 +1222,8 @@ fn is_copy_chord(key: crossterm::event::KeyEvent) -> bool {
 /// The bytes a terminal without the kitty keyboard protocol sends for `code` with `modifiers`,
 /// as xterm does, which is what a service in PTY input mode expects to read.
 ///
-/// PTY input mode turns the kitty protocol off, but keys typed before the terminal saw that may
-/// still come reported apart, such as Ctrl+Shift+C or Alt+Shift+A; this folds them back into the
+/// micromux may have asked its own terminal for the kitty protocol, which reports keys such as
+/// Ctrl+Shift+C or Ctrl+I apart that legacy terminals send alike; this folds them back into the
 /// legacy bytes. Super and the other modifiers legacy terminals cannot send are left out.
 fn key_event_to_bytes(
     code: crossterm::event::KeyCode,

@@ -21,7 +21,7 @@ const WAIT: Duration = Duration::from_secs(30);
 const MOUSE_ON: &[u8] = b"\x1b[?1000h";
 
 /// The sequences that push and pop micromux's kitty keyboard flags.
-const KEYBOARD_PUSH: &[u8] = b"\x1b[>1u";
+const KEYBOARD_PUSH: &[u8] = b"\x1b[>5u";
 const KEYBOARD_POP: &[u8] = b"\x1b[<1u";
 
 /// The terminal's queries for its kitty keyboard flags and its primary device attributes.
@@ -294,8 +294,9 @@ fn copy_hello_and_survive_a_ctrl_c(tui: &mut Terminal) -> eyre::Result<()> {
     // One copy to the clipboard and one to the primary selection.
     assert_eq!(tui.count(b"\x1b]52;"), 2);
 
-    // Ctrl+Shift+C, as the kitty protocol reports it apart from Ctrl-C, copies the same way.
-    tui.send(b"\x1b[99;6u")?;
+    // Ctrl+Shift+C, as the kitty protocol reports it apart from Ctrl-C with the shifted key,
+    // copies the same way.
+    tui.send(b"\x1b[99:67;6u")?;
     tui.wait_until("the copy with Ctrl+Shift+C", |_, written| {
         written
             .windows(HELLO_COPIED.len())
@@ -356,24 +357,14 @@ fn mouse_capture_is_released_by_the_toggle_a_suspend_and_quitting() -> eyre::Res
 
     copy_hello_and_survive_a_ctrl_c(&mut tui)?;
 
-    // PTY input mode pops the keyboard flags, so the terminal sends the service its keys as
-    // without micromux, and leaving it, here with a click on its hint, pushes them again.
+    // With the protocol, Alt+Esc arrives apart from Esc and leaves PTY input mode.
     tui.send(b"a")?;
-    tui.wait_until("PTY input mode to pop the flags", |_, written| {
-        position(written, KEYBOARD_POP).is_some()
-    })?;
-    tui.wait_until("the exit hint", |screen, _| {
+    tui.wait_until("PTY input mode", |screen, _| {
         screen.contents().contains("Alt+Esc Exit")
     })?;
-    let exit = find(tui.parser.screen(), "Alt+Esc Exit")?;
-    tui.send(&mouse_report(0, exit, true))?;
-    tui.send(&mouse_report(0, exit, false))?;
-    tui.wait_until("leaving PTY input mode to push them again", |_, written| {
-        written
-            .windows(KEYBOARD_PUSH.len())
-            .filter(|window| *window == KEYBOARD_PUSH)
-            .count()
-            == 2
+    tui.send(b"\x1b[27;3u")?;
+    tui.wait_until("PTY input mode to end", |screen, _| {
+        !screen.contents().contains("Alt+Esc Exit")
     })?;
 
     // The toggle releases the mouse and takes it again.

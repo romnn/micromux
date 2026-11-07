@@ -64,7 +64,7 @@ With mouse capture on, which is the default, the mouse works as in most terminal
 - **Click** a URL in the Logs pane's title to open it in your browser.
 - **Click** outside an open popup to close it, as `Esc` does. In the level picker, click the threshold you want.
 
-In PTY input mode, neither clicks nor the wheel change which service receives your keystrokes, a right-click copies nothing, and `y`, `Enter`, `Ctrl-C` and the copy shortcuts go to the service, as the bytes the terminal sends for them without the kitty keyboard protocol; leave the mode with `Alt+Esc` to copy.
+In PTY input mode, neither clicks nor the wheel change which service receives your keystrokes, a right-click copies nothing, and `y`, `Enter`, `Ctrl-C` and the copy shortcuts go to the service, as the bytes a terminal without the kitty keyboard protocol sends for them; leave the mode with `Alt+Esc` to copy.
 
 {{< figure src="images/mouse-selection.png" alt="Four request lines of the api service's logs highlighted by a mouse drag, with the footer reading copied 4 lines after y" caption="A drag selects lines inside the logs pane only, and y copies them." >}}
 
@@ -84,7 +84,7 @@ Two things stand between these shortcuts and micromux:
   In WezTerm, a Lua `action_callback` can copy when `window:get_selection_text_for_pane(pane)` returns text and otherwise pass the key on with `window:perform_action(act.SendKey { key = 'c', mods = 'CTRL|SHIFT' }, pane)`. Where a terminal cannot pass the shortcut on, `Ctrl+Insert`, which few terminals bind, a right-click and `y` still copy.
 - **The kitty keyboard protocol tells `Ctrl+Shift+C` from `Ctrl-C`.** Without it, terminals send both as the same byte, and `Super` never reaches programs at all. micromux turns the protocol on wherever the terminal supports it, as Ghostty, kitty, WezTerm, foot and Alacritty do, and turns it off again whenever it lets go of the terminal. In a terminal without it, a copy shortcut passed on to programs arrives as `Ctrl-C`; that is the terminal's doing, not micromux's, and micromux then only asks for a second `Ctrl-C` instead of quitting.
 
-A service in PTY input mode never asked for the protocol, so micromux turns it off for as long as the mode lasts, and the terminal sends the service its keys as it would without micromux.
+A service in PTY input mode never asked for the protocol, so micromux sends it every key as the bytes a terminal without the protocol sends. Two limits come with the protocol: on a non-Latin keyboard layout, such as Russian or Greek, `Ctrl` chords arrive as the layout's letter, so `Ctrl-C` and `Ctrl-Z` reach neither micromux nor a service as such; switch to a Latin layout for them. And `Alt+Esc` leaves PTY input mode only in terminals with the protocol, since the others send it as a plain `Esc`; there, click the `Alt+Esc Exit` hint instead.
 
 ### Using the terminal's own mouse handling
 
