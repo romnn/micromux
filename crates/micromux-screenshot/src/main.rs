@@ -103,6 +103,13 @@ const SCENARIOS: &[Scenario] = &[
         rows: 44,
         keys: &[b"jj" as &[u8]],
     },
+    // Service details: `i` opens the popup that describes the selected `api` service in full.
+    Scenario {
+        name: "service-details",
+        cols: 200,
+        rows: 44,
+        keys: &[b"i" as &[u8]],
+    },
 ];
 
 fn main() -> Result<(), Error> {

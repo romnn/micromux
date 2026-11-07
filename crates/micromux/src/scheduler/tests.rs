@@ -5168,7 +5168,9 @@ async fn restarts_wait_for_the_cleanup() -> eyre::Result<()> {
     })
     .await?;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    while fs::read_to_string(dir.path().join("starts"))?
+    // A run reports Running before its shell has written its line, so the file may not exist yet.
+    while fs::read_to_string(dir.path().join("starts"))
+        .unwrap_or_default()
         .lines()
         .count()
         < 2
@@ -5398,6 +5400,48 @@ async fn slow_cleanups_do_not_make_crash_loops_look_stable() -> eyre::Result<()>
         stable.restart.decrement_failure_restart(&policy);
     }
     assert!(stable.will_auto_restart(&policy, 1));
+    Ok(())
+}
+
+/// A dynamic service cloned from a configured one never runs the original's cleanup, which would
+/// tear down what the original still uses.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dynamic_clones_do_not_inherit_the_cleanup() -> eyre::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let state = tempfile::tempdir()?;
+    let service = service_with_cleanup(
+        dir.path(),
+        "exec sleep 60",
+        "touch cleaned",
+        Duration::from_secs(30),
+        state.path(),
+    )?;
+    let mut services = ServiceMap::new();
+    services.insert("svc".to_string(), service);
+    let harness = spawn_harness_with_policy(
+        services,
+        None,
+        dir.path().to_path_buf(),
+        enabled_dynamic_policy(dir.path())?,
+    );
+    let mut params = dynamic_params("clone", &["sh", "-c", "exec sleep 60"]);
+    params.from_service = Some("svc".to_string());
+
+    dynamic_accepted(harness.control.start_dynamic(params).await)?;
+    wait_until(&harness.reader, "clone", |snapshot| {
+        snapshot.execution == Execution::Running
+    })
+    .await?;
+    dynamic_accepted(harness.control.stop_dynamic(&"clone".to_string()).await)?;
+    let stopped = wait_until(&harness.reader, "clone", |snapshot| {
+        snapshot.execution == Execution::Exited
+    })
+    .await?;
+
+    assert_eq!(stopped.last_cleanup, None);
+    assert!(!dir.path().join("cleaned").exists());
+    harness.shutdown.cancel();
+    harness.handle.await??;
     Ok(())
 }
 

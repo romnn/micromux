@@ -721,6 +721,7 @@ pub(super) fn project_snapshot(
         } else {
             None
         },
+        depends_on: service.spec.depends_on.clone(),
     };
     (snapshot, runtime.uptime_started_at)
 }
@@ -1439,6 +1440,9 @@ impl SchedulerRuntime {
             ServiceSpec::default()
         };
         let mut spec = params.spec.clone().apply_to(base);
+        // A cleanup belongs to the configured service: run for a clone started `from_service`, it
+        // would tear down what the original still uses, such as its Compose project.
+        spec.cleanup = None;
         spec.normalize()
             .map_err(|err| CommandRejection::InvalidSpec(err.to_string()))?;
         spec.command.extend(params.extra_args.clone());

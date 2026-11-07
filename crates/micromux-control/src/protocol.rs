@@ -531,7 +531,7 @@ mod tests {
             ProtocolVersion::new(1, 0)
         );
 
-        assert!(PROTOCOL_VERSION.is_compatible_with(ProtocolVersion::new(3, 14)));
+        assert!(PROTOCOL_VERSION.is_compatible_with(ProtocolVersion::new(3, 15)));
         assert!(!PROTOCOL_VERSION.is_compatible_with(ProtocolVersion::new(2, 9)));
         assert!(!supports_versioned_subscriptions(ProtocolVersion::new(
             3, 6
