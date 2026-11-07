@@ -10,6 +10,16 @@ homebrew_casks:
     description: "Micromux is a local process supervisor with a terminal UI"
     custom_block: |
       os macos: "darwin", linux: "linux"
+
+      postflight_steps do
+        on_macos do
+          if_path_exists "/usr/bin/xattr" do
+            run "/usr/bin/xattr",
+                args:         ["-dr", "com.apple.quarantine", "{{ `{{staged_path}}` }}/micromux"],
+                must_succeed: false
+          end
+        end
+      end
     directory: Casks
     commit_author:
       name: romnn
@@ -21,12 +31,6 @@ homebrew_casks:
       token: "{{ .Env.TAP_GITHUB_TOKEN }}"
       pull_request:
         enabled: false
-    hooks:
-      post:
-        install: |
-          if OS.mac? && File.exist?("/usr/bin/xattr")
-            system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/micromux"]
-          end
 
 builds:
   - id: *micromux
