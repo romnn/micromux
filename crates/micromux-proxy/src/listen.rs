@@ -217,19 +217,19 @@ mod tests {
     fn taken_port_uses_the_fallback_for_every_listener() -> eyre::Result<()> {
         let taken = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
         let taken_port = taken.local_addr()?.port();
-        let fallback = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?
-            .local_addr()?
-            .port();
+        // A port merely freed after use could be taken by a parallel test before `bind` gets to
+        // it.
+        let fallback = crate::test_ports::hold_port()?;
 
         let bound = bind(PortPreference {
             port: taken_port,
-            fallback_port: Some(fallback),
+            fallback_port: Some(fallback.port),
         })?;
 
-        assert_eq!(bound.port, fallback);
+        assert_eq!(bound.port, fallback.port);
         assert!(!bound.wildcard);
         for listener in &bound.listeners {
-            assert_eq!(listener.local_addr()?.port(), fallback);
+            assert_eq!(listener.local_addr()?.port(), fallback.port);
             assert!(listener.local_addr()?.ip().is_loopback());
         }
         Ok(())

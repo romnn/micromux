@@ -11,6 +11,9 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
 
+#[path = "../src/test_ports.rs"]
+mod test_ports;
+
 /// A proxy running in this process on an ephemeral port.
 struct Proxy {
     paths: ProxyPaths,
@@ -23,30 +26,44 @@ struct Proxy {
 async fn start_proxy(idle_timeout: Duration) -> eyre::Result<Proxy> {
     let directory = tempfile::tempdir()?;
     let paths = ProxyPaths::in_dir(directory.path());
-    let shutdown = CancellationToken::new();
-    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-    let task = tokio::spawn(serve(
-        ServeOptions {
-            paths: paths.clone(),
-            preference: PortPreference {
-                port: 0,
-                fallback_port: None,
+    // The kernel picks a free IPv4 port, which a parallel test may hold over IPv6; another port
+    // fixes that, and nothing under test has happened yet.
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        let shutdown = CancellationToken::new();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(serve(
+            ServeOptions {
+                paths: paths.clone(),
+                preference: PortPreference {
+                    port: 0,
+                    fallback_port: None,
+                },
+                idle_timeout,
             },
-            idle_timeout,
-        },
-        shutdown.clone(),
-        move |port| {
-            let _ = ready_tx.send(port);
-        },
-    ));
-    let port = tokio::time::timeout(Duration::from_secs(5), ready_rx).await??;
-    Ok(Proxy {
-        paths,
-        port,
-        shutdown,
-        task,
-        _directory: directory,
-    })
+            shutdown.clone(),
+            move |port| {
+                let _ = ready_tx.send(port);
+            },
+        ));
+        if let Ok(port) = tokio::time::timeout(Duration::from_secs(5), ready_rx).await? {
+            return Ok(Proxy {
+                paths,
+                port,
+                shutdown,
+                task,
+                _directory: directory,
+            });
+        }
+        // The proxy gave up before it came up; its error says why.
+        match task.await? {
+            Err(micromux_proxy::ServeError::Bind(micromux_proxy::BindError::InUse { .. }))
+                if attempts < 10 => {}
+            Err(err) => return Err(err.into()),
+            Ok(()) => eyre::bail!("the proxy stopped before it came up"),
+        }
+    }
 }
 
 fn registration(session: &str, routes: &[(&str, u16, Option<&str>)]) -> Registration {
@@ -416,35 +433,15 @@ fn spawn_old_proxy(
 const UNKNOWN_REQUEST: &str =
     r#"{"type":"rejected","reason":"invalid message: unknown variant","transient":false}"#;
 
-/// A process whose pid an outdated stand-in proxy reports as its own, so a test can tell that
-/// nobody signalled it.
-struct Bystander(std::process::Child);
-
-impl Bystander {
-    fn spawn() -> eyre::Result<Self> {
-        Ok(Self(
-            std::process::Command::new("sleep")
-                .arg("600")
-                .stdin(std::process::Stdio::null())
-                .spawn()?,
-        ))
-    }
-
-    fn pid(&self) -> u32 {
-        self.0.id()
-    }
-
-    /// Whether the process still runs.
-    fn alive(&mut self) -> eyre::Result<bool> {
-        Ok(self.0.try_wait()?.is_none())
-    }
-}
-
-impl Drop for Bystander {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
+/// The pid an outdated stand-in proxy reports as its own: the test process's, so a signal that
+/// should never be sent, such as `SIGTERM` or `SIGKILL`, ends the test run instead of passing
+/// unnoticed.
+///
+/// A child process would serve as well, but spawning one forks the test process, and until it
+/// execs, the fork holds copies of the sockets parallel tests have open, which keeps their ports
+/// bound after those tests close them.
+fn bystander_pid() -> u32 {
+    std::process::id()
 }
 
 /// Takes over the registration socket of `old`'s directory for `proxy`, the way a fresh proxy
@@ -466,8 +463,7 @@ async fn path_routes_wait_for_an_outdated_proxy_and_refuse_one_that_stays() -> e
 
     let directory = tempfile::tempdir()?;
     let paths = ProxyPaths::in_dir(directory.path());
-    let mut bystander = Bystander::spawn()?;
-    let pid = bystander.pid();
+    let pid = bystander_pid();
     let info = format!(r#"{{"type":"info","port":1,"pid":{pid}}}"#);
     // The stand-in's reply is what an older proxy sends: no protocol, read as the first one, and
     // no sessions, which it cannot tell.
@@ -520,14 +516,14 @@ async fn path_routes_wait_for_an_outdated_proxy_and_refuse_one_that_stays() -> e
     // its reply timeout, so the upper end of the wait is loose.
     let bound = IDLE_TIMEOUT + LEASE_TIMEOUT;
     assert!(waited >= bound && waited < bound * 2, "{waited:?}");
-    // A proxy that cannot tell is never asked to stop, and its pid is never signalled.
+    // A proxy that cannot tell is never asked to stop, and its pid, this process's, was never
+    // signalled, or the test would not have got here.
     while let Ok(message) = received.try_recv() {
         assert!(
             !matches!(message, micromux_proxy::protocol::ClientMessage::StopIfIdle),
             "{message:?}"
         );
     }
-    assert!(bystander.alive()?);
 
     let without_paths = Registrar::start(
         paths,
@@ -565,7 +561,6 @@ async fn path_routes_wait_for_an_outdated_proxy_and_refuse_one_that_stays() -> e
             )
         })
         .await?;
-    assert!(bystander.alive()?);
 
     old_proxy.abort();
     Ok(())
@@ -578,8 +573,7 @@ async fn path_routes_take_over_an_outdated_proxy_once_it_exits() -> eyre::Result
     let proxy = start_proxy(Duration::from_secs(60)).await?;
     let directory = tempfile::tempdir()?;
     let paths = ProxyPaths::in_dir(directory.path());
-    let mut bystander = Bystander::spawn()?;
-    let pid = bystander.pid();
+    let pid = bystander_pid();
     let (old_proxy, _received) = spawn_old_proxy(
         &paths,
         format!(r#"{{"type":"info","port":{},"pid":{pid}}}"#, proxy.port),
@@ -630,7 +624,6 @@ async fn path_routes_take_over_an_outdated_proxy_once_it_exits() -> eyre::Result
     let response = get_target(proxy.port, "api.one.localhost", "/rest/x").await?;
     assert!(response.ends_with("rest"), "{response}");
     assert!(served.await??.starts_with("GET /x HTTP/1.1\r\n"));
-    assert!(bystander.alive()?);
 
     proxy.shutdown.cancel();
     proxy.task.await??;
@@ -1442,19 +1435,21 @@ async fn stopping_the_proxy_ends_its_registrations() -> eyre::Result<()> {
 /// right away.
 #[tokio::test(flavor = "current_thread")]
 async fn a_stopped_proxy_frees_its_port_immediately() -> eyre::Result<()> {
+    // A port the kernel picked and the first proxy released could go to a parallel test before
+    // the second proxy binds it; a held test port cannot.
+    let held = test_ports::hold_port()?;
+    let port = held.port;
     let directory = tempfile::tempdir()?;
-    let paths = ProxyPaths::in_dir(directory.path());
-    let mut options = ServeOptions {
-        paths,
+    let options = ServeOptions {
+        paths: ProxyPaths::in_dir(directory.path()),
         preference: PortPreference {
-            port: 0,
+            port,
             fallback_port: None,
         },
         idle_timeout: Duration::from_secs(60),
     };
 
-    // The first proxy picks the port itself, so no probe listener frees it for a parallel test
-    // to take before the proxy binds it.
+    // The first proxy comes up on the port and stops at once.
     let shutdown = CancellationToken::new();
     let stop = shutdown.clone();
     let (port_tx, port_rx) = tokio::sync::oneshot::channel();
@@ -1463,12 +1458,26 @@ async fn a_stopped_proxy_frees_its_port_immediately() -> eyre::Result<()> {
         stop.cancel();
     })
     .await?;
-    let port = port_rx.await?;
+    assert_eq!(port_rx.await?, port);
 
     // A successor on that very port binds it as soon as the first proxy has returned.
-    options.preference.port = port;
     let shutdown = CancellationToken::new();
     let stop = shutdown.clone();
-    serve(options, shutdown, move |_| stop.cancel()).await?;
+    serve(options.clone(), shutdown, move |_| stop.cancel()).await?;
+
+    // A listener left on the port makes a proxy fail, so the successor's bind above proves the
+    // first proxy left none.
+    let leftover = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))?;
+    let refused = serve(options, CancellationToken::new(), |_| {}).await;
+    assert!(
+        matches!(
+            refused,
+            Err(micromux_proxy::ServeError::Bind(
+                micromux_proxy::BindError::InUse { .. }
+            ))
+        ),
+        "{refused:?}"
+    );
+    drop(leftover);
     Ok(())
 }
