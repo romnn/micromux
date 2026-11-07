@@ -1717,7 +1717,8 @@ mod tests {
             routes:
               - host: app
                 port: 9997
-              - host: api
+              - host: app
+                path: /api/
                 port: 9998
             services:
               web:
@@ -1754,8 +1755,9 @@ mod tests {
             }
         };
 
-        // Both ends of the second URL open it, and the separator between the URLs opens nothing.
-        let api = "http://api.tui.localhost:8080";
+        // Both ends of the second URL open it, path included, and the separator between the URLs
+        // opens nothing.
+        let api = "http://app.tui.localhost:8080/api/";
         let start = column(api)?;
         let width = u16::try_from(api.len())?;
         click(&mut app, start);
