@@ -5830,8 +5830,9 @@ async fn a_job_stopped_by_micromux_is_not_completed() -> eyre::Result<()> {
     .await?;
 
     accepted(harness.control.disable(&"migrate".to_string()).await)?;
+    // How the stopped shell exits differs between platforms; a status 0 is pinned below.
     let stopped = wait_until(&harness.reader, "migrate", |snapshot| {
-        snapshot.last_exit_code == Some(0) && snapshot.execution != Execution::Stopping
+        snapshot.last_exit_code.is_some() && snapshot.execution != Execution::Stopping
     })
     .await?;
     assert_ne!(stopped.execution, Execution::Completed);
@@ -5923,5 +5924,28 @@ fn a_job_whose_rerun_was_requested_does_not_report_its_last_completion() -> eyre
         project_snapshot(&manual, &runtime).0.execution,
         Execution::Starting
     );
+    Ok(())
+}
+
+#[test]
+fn a_stopped_job_run_that_exits_zero_is_pending_again() -> eyre::Result<()> {
+    let service = job("migrate", "true", |_| {})?;
+    let mut runtime = ServiceRuntime::new(ServiceRuntimeInit::from(&service));
+    start_dummy_run(&mut runtime)?;
+    if let Some(running) = runtime.running.as_mut() {
+        running.cancel();
+    }
+    runtime.finish_current_run(&service.spec, 0);
+
+    assert!(matches!(runtime.state, State::Pending));
+    assert_eq!(
+        project_snapshot(&service, &runtime).0.execution,
+        Execution::Pending
+    );
+    assert!(!schedule::condition_met(
+        config::DependencyCondition::CompletedSuccessfully,
+        &service,
+        &runtime
+    ));
     Ok(())
 }

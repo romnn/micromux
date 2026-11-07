@@ -54,7 +54,7 @@ fn describe_blockers(blocked: &[BlockedDependency]) -> String {
 ///
 /// A target that is disabled, or whose start was requested, meets nothing until it runs again.
 /// A job meets `started` while it runs and after it completed.
-fn condition_met(
+pub(super) fn condition_met(
     condition: DependencyCondition,
     target: &crate::service::Service,
     runtime: &ServiceRuntime,
