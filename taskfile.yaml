@@ -67,6 +67,7 @@ tasks:
       - crates/micromux-screenshot/src/**/*.rs
       - crates/micromux/src/**/*.rs
       - crates/micromux-cli/src/**/*.rs
+      - crates/micromux-control/src/**/*.rs
       - crates/micromux-tui/src/**/*.rs
       - examples/demo/micromux.yaml
       - examples/demo/bin/*.sh

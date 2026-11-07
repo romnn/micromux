@@ -44,6 +44,11 @@ enum Error {
         status: portable_pty::ExitStatus,
         example_dir: PathBuf,
     },
+    #[error(
+        "micromux drew no screen in time; check the demo config in {}",
+        example_dir.display()
+    )]
+    NoFirstFrame { example_dir: PathBuf },
     #[error("freeze failed for {}", input.display())]
     FreezeFailed { input: PathBuf },
 }
@@ -119,6 +124,9 @@ fn main() -> Result<(), Error> {
     // show the same directory whichever checkout or worktree renders them.
     let home =
         std::env::temp_dir().join(format!("micromux-screenshot-home-{}", std::process::id()));
+    std::fs::create_dir_all(&home)?;
+    // micromux shows real paths, so the home must be one too, which a temp dir is not on macOS.
+    let home = std::fs::canonicalize(&home)?;
     let example_dir = home
         .join("dev")
         .join("micromux")
@@ -272,6 +280,14 @@ fn capture(
 
     let mut parser = vt100::Parser::new(scenario.rows, scenario.cols, 0);
 
+    // A blank screen holds still as well, so wait for the first frame before settling; keys
+    // typed earlier would reach a terminal that is not in raw mode yet.
+    if !wait_for_first_frame(&rx, &mut parser) {
+        let _ = child.kill();
+        return Err(Error::NoFirstFrame {
+            example_dir: example_dir.to_path_buf(),
+        });
+    }
     settle(&rx, &mut parser);
     if let Ok(Some(status)) = child.try_wait() {
         return Err(Error::EarlyExit {
@@ -298,6 +314,25 @@ fn capture(
     let _ = reader_thread.join();
 
     Ok(ansi)
+}
+
+/// Feed PTY output into `parser` until the TUI drew its first frame, which shows the services
+/// pane; returns whether it did within the time limit.
+fn wait_for_first_frame(rx: &mpsc::Receiver<Vec<u8>>, parser: &mut vt100::Parser) -> bool {
+    const MAX_WAIT: Duration = Duration::from_secs(30);
+
+    let deadline = Instant::now() + MAX_WAIT;
+    while Instant::now() < deadline {
+        if parser.screen().contents().contains("Services") {
+            return true;
+        }
+        match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(chunk) => parser.process(&chunk),
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => return false,
+        }
+    }
+    false
 }
 
 /// Drive the parser until the rendered screen stops changing.
