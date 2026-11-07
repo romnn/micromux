@@ -10,7 +10,6 @@ use crate::{
 };
 use codespan_reporting::diagnostic::{Diagnostic, Label};
 use indexmap::IndexMap;
-use itertools::Itertools;
 use std::path::Path;
 use yaml_spanned::{Mapping, Sequence, Spanned, Value, value::Kind};
 
@@ -961,7 +960,7 @@ pub fn parse_command(
                     })
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            let raw_command = command.iter().map(std::convert::AsRef::as_ref).join(" ");
+            let raw_command = crate::shell_join(command.iter().map(|part| part.as_str()));
             normalize_command(&command, raw_command.as_str(), *span)
         }
         other => Err(ConfigError::UnexpectedType {
