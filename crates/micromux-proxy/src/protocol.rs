@@ -13,6 +13,12 @@
 //! [`PROTOCOL_VERSION`] (see [`Registration::required_protocol`]) asks for
 //! [`ProxyMessage::Info`] on its registration connection first and refuses a proxy that is too
 //! old, rather than registering routes that proxy would serve differently.
+//!
+//! An outdated proxy that no session uses is only waiting out its [`IDLE_TIMEOUT`], so the
+//! session takes it over instead: it asks the proxy to exit with [`ClientMessage::StopIfIdle`]
+//! when [`ProxyMessage::Info`] lists the registered sessions, and otherwise waits for it to exit.
+//! A proxy older than revision 3 lists its sessions only on the HTML page it answers a host no
+//! session serves with, which the session reads instead.
 
 use std::time::Duration;
 
@@ -28,13 +34,21 @@ pub const LEASE_TIMEOUT: Duration = Duration::from_secs(15);
 /// Longest accepted message line.
 pub const MAX_MESSAGE_BYTES: usize = 64 * 1024;
 
+/// How long a proxy started by a session keeps running without any registered session.
+///
+/// Every revision uses it, so it also bounds how long an outdated proxy that no session uses
+/// keeps running.
+pub const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// The registration protocol this proxy and session speak.
 ///
 /// Revisions:
 ///
 /// - 1: hostname routes; a proxy that does not report a protocol speaks 1.
 /// - 2: path routes, with [`RouteTarget::path`] and [`RouteTarget::strip_prefix`].
-pub const PROTOCOL_VERSION: u32 = 2;
+/// - 3: [`ProxyMessage::Info`] lists the registered sessions, and [`ClientMessage::StopIfIdle`]
+///   stops a proxy that no session uses.
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// The first protocol revision that routes by path.
 pub const PATH_ROUTES_PROTOCOL: u32 = 2;
@@ -56,6 +70,13 @@ pub enum ClientMessage {
     Register(Registration),
     /// Keeps the registration alive.
     Ping,
+    /// Asks the proxy to exit now if no session is registered, answered with
+    /// [`ProxyMessage::Stopping`] or [`ProxyMessage::Busy`].
+    ///
+    /// The proxy decides under the same lock as every registration, so a session that registers
+    /// concurrently either keeps the proxy running or is refused as the proxy shuts down.
+    /// A proxy older than revision 3 rejects it as an invalid message.
+    StopIfIdle,
 }
 
 /// A message from the proxy to a session.
@@ -71,6 +92,10 @@ pub enum ProxyMessage {
         /// The registration protocol the proxy speaks.
         #[serde(default = "first_protocol")]
         protocol: u32,
+        /// The registered sessions, or `None` from a proxy older than revision 3, which does
+        /// not tell.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sessions: Option<Vec<RegisteredSession>>,
     },
     /// The registration is active.
     Registered,
@@ -85,6 +110,30 @@ pub enum ProxyMessage {
     },
     /// Reply to [`ClientMessage::Ping`].
     Pong,
+    /// Reply to [`ClientMessage::StopIfIdle`]: the proxy refuses every later registration and
+    /// exits.
+    Stopping,
+    /// Reply to [`ClientMessage::StopIfIdle`]: sessions are registered, so the proxy keeps
+    /// running.
+    Busy {
+        /// The registered sessions.
+        sessions: Vec<RegisteredSession>,
+    },
+}
+
+/// A session registered with the proxy, as the proxy reports it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RegisteredSession {
+    /// Session name, such as `luup2`.
+    pub session: String,
+    /// Canonical config path of the session.
+    pub config_path: String,
+}
+
+impl std::fmt::Display for RegisteredSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} ({})", self.session, self.config_path)
+    }
 }
 
 /// The routes of one session.

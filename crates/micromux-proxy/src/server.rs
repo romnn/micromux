@@ -14,8 +14,8 @@ use crate::listen::{self, BindError, PortPreference};
 use crate::pages::ListedSession;
 use crate::paths::ProxyPaths;
 use crate::protocol::{
-    ClientMessage, LEASE_TIMEOUT, MAX_MESSAGE_BYTES, PROTOCOL_VERSION, ProxyMessage, Registration,
-    RouteTarget,
+    ClientMessage, LEASE_TIMEOUT, MAX_MESSAGE_BYTES, PROTOCOL_VERSION, ProxyMessage,
+    RegisteredSession, Registration, RouteTarget,
 };
 
 /// How long a starting proxy waits for a previous one to release the singleton lock.
@@ -459,6 +459,43 @@ impl Shared {
         }
     }
 
+    /// The registered sessions, sorted by name.
+    fn registered_sessions(state: &State) -> Vec<RegisteredSession> {
+        let mut sessions = state
+            .sessions
+            .values()
+            .map(|entry| RegisteredSession {
+                session: entry.registration.session.clone(),
+                config_path: entry.registration.config_path.clone(),
+            })
+            .collect::<Vec<_>>();
+        sessions.sort_by(|a, b| a.session.cmp(&b.session));
+        sessions
+    }
+
+    /// Answers [`ClientMessage::Hello`].
+    fn info(&self) -> ProxyMessage {
+        ProxyMessage::Info {
+            port: self.port,
+            pid: std::process::id(),
+            protocol: PROTOCOL_VERSION,
+            sessions: Some(Self::registered_sessions(&self.state())),
+        }
+    }
+
+    /// Decides to exit now when no session is registered, or returns the registered sessions.
+    ///
+    /// Like [`Self::try_begin_idle_exit`], the decision takes the registration lock, so no
+    /// session registers between the check and the decision.
+    fn try_stop_if_idle(&self) -> Result<(), Vec<RegisteredSession>> {
+        let mut state = self.state();
+        if !state.sessions.is_empty() {
+            return Err(Self::registered_sessions(&state));
+        }
+        state.shutting_down = true;
+        Ok(())
+    }
+
     /// Ends every registration, which also ends the requests and tunnels proxied for it.
     fn end_all_registrations(&self) {
         let mut state = self.state();
@@ -565,12 +602,19 @@ async fn serve_registration(stream: UnixStream, shared: Arc<Shared>, stop: Cance
             Ok(None) | Err(_) => break,
         };
         let reply = match serde_json::from_str::<ClientMessage>(&line) {
-            Ok(ClientMessage::Hello) => ProxyMessage::Info {
-                port: shared.port,
-                pid: std::process::id(),
-                protocol: PROTOCOL_VERSION,
-            },
+            Ok(ClientMessage::Hello) => shared.info(),
             Ok(ClientMessage::Ping) => ProxyMessage::Pong,
+            Ok(ClientMessage::StopIfIdle) => match shared.try_stop_if_idle() {
+                Ok(()) => {
+                    tracing::info!("asked to stop while no session is registered; exiting");
+                    let _ = send(&mut framed, &ProxyMessage::Stopping).await;
+                    // The proxy refuses registrations from now on, so it must exit even when the
+                    // reply could not be sent.
+                    stop.cancel();
+                    break;
+                }
+                Err(sessions) => ProxyMessage::Busy { sessions },
+            },
             Ok(ClientMessage::Register(registration)) => {
                 match shared.register(registration, owned.as_ref()) {
                     Ok(registered) => {
@@ -869,6 +913,30 @@ pub(crate) mod tests {
         assert!(!shared.try_begin_idle_exit(Duration::ZERO));
         shared.unregister(&owned);
         assert!(shared.try_begin_idle_exit(Duration::ZERO));
+        Ok(())
+    }
+
+    /// A request to stop is refused with the registered sessions while any is registered, and
+    /// otherwise decides the exit at once, so a session registering afterwards is refused rather
+    /// than lost with the proxy.
+    #[test]
+    fn stop_if_idle_stops_only_without_sessions() -> Result<(), Refusal> {
+        let shared = shared();
+        let owned = shared.register(registration("one", "/one", &[("app", 1)]), None)?;
+        assert_eq!(
+            shared.try_stop_if_idle(),
+            Err(vec![RegisteredSession {
+                session: "one".to_string(),
+                config_path: "/one".to_string(),
+            }])
+        );
+        shared.unregister(&owned);
+        assert_eq!(shared.try_stop_if_idle(), Ok(()));
+        let refused = shared
+            .register(registration("two", "/two", &[("app", 2)]), None)
+            .err()
+            .map(|refusal| refusal.transient);
+        assert_eq!(refused, Some(true));
         Ok(())
     }
 }

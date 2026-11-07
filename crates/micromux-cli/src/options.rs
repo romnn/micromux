@@ -174,7 +174,7 @@ pub enum Command {
         #[arg(long)]
         fallback_port: Option<u16>,
         /// Seconds to keep running without any registered session.
-        #[arg(long, default_value_t = 60)]
+        #[arg(long, default_value_t = micromux_proxy::protocol::IDLE_TIMEOUT.as_secs())]
         idle_timeout_secs: u64,
     },
 }

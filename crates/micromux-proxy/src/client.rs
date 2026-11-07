@@ -15,8 +15,8 @@ use tokio_util::sync::CancellationToken;
 use crate::listen::PortPreference;
 use crate::paths::ProxyPaths;
 use crate::protocol::{
-    ClientMessage, LEASE_TIMEOUT, MAX_MESSAGE_BYTES, PING_INTERVAL, ProxyMessage, Registration,
-    RouteTarget,
+    ClientMessage, IDLE_TIMEOUT, LEASE_TIMEOUT, MAX_MESSAGE_BYTES, PING_INTERVAL, ProxyMessage,
+    RegisteredSession, Registration, RouteTarget,
 };
 
 /// How long a session waits for a proxy it started to come up.
@@ -30,6 +30,16 @@ const MAX_BACKOFF: Duration = Duration::from_secs(10);
 
 /// Longest proxy error output reported back to the session.
 const MAX_ERROR_OUTPUT: u64 = 16 * 1024;
+
+/// How long a session waits for an outdated proxy to exit before it gives up.
+///
+/// An outdated proxy that no session uses exits within its idle timeout.
+/// The lease covers a session that went away without closing its connection, which the proxy
+/// only notices once the lease runs out, and leaves room for the proxy's idle check and shutdown.
+const OUTDATED_PROXY_WAIT: Duration = IDLE_TIMEOUT.saturating_add(LEASE_TIMEOUT);
+
+/// How often a session checks whether an outdated proxy has exited.
+const OUTDATED_PROXY_POLL: Duration = Duration::from_millis(250);
 
 type Connection = Framed<UnixStream, LinesCodec>;
 
@@ -65,14 +75,9 @@ pub enum ClientError {
         wanted: String,
     },
     /// The running proxy speaks an older registration protocol that would serve the routes
-    /// differently, such as ignoring their paths.
-    #[error(
-        "the running micromux proxy (pid {pid}) speaks registration protocol {protocol}, but this \
-         session's routes need {required} (path routes); it was started by an older micromux, \
-         so stop or restart the sessions still running that micromux, which would start it \
-         again, then wait a minute for it to exit or stop it with `kill {pid}`, and start this \
-         session again"
-    )]
+    /// differently, such as ignoring their paths, and other sessions still use it, or it did not
+    /// exit in time.
+    #[error("{}", outdated_proxy_message(*.pid, *.protocol, *.required, .sessions.as_deref()))]
     OutdatedProxy {
         /// Process id of the running proxy.
         pid: u32,
@@ -80,6 +85,9 @@ pub enum ClientError {
         protocol: u32,
         /// The protocol the routes need.
         required: u32,
+        /// The sessions registered with the proxy, or `None` when it cannot tell and did not
+        /// exit within the wait.
+        sessions: Option<Vec<RegisteredSession>>,
     },
     /// The proxy refused the registration because of a conflict with another session.
     #[error("the micromux proxy rejected the routes: {0}")]
@@ -90,6 +98,43 @@ pub enum ClientError {
     /// The proxy answered something unexpected or nothing at all.
     #[error("unexpected reply from the micromux proxy: {0}")]
     Protocol(String),
+    /// The session was asked to stop while it waited for an outdated proxy to exit.
+    #[error("cancelled while waiting for the outdated micromux proxy to exit")]
+    Cancelled,
+}
+
+/// Explains [`ClientError::OutdatedProxy`] and what to do about it.
+fn outdated_proxy_message(
+    pid: u32,
+    protocol: u32,
+    required: u32,
+    sessions: Option<&[RegisteredSession]>,
+) -> String {
+    let outdated = format!(
+        "the running micromux proxy (pid {pid}) speaks registration protocol {protocol}, but this \
+         session's routes need {required} (path routes)"
+    );
+    match sessions {
+        Some(sessions) if !sessions.is_empty() => {
+            let sessions = sessions
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "{outdated}; it was started by an older micromux and still serves {sessions}: \
+                 stop those sessions or restart them with this micromux, which would otherwise \
+                 start it again, and start this session again; once only sessions of this \
+                 micromux use it, `kill {pid}` moves them to a new proxy"
+            )
+        }
+        _ => format!(
+            "{outdated}; it was started by an older micromux and did not exit within \
+             {OUTDATED_PROXY_WAIT:?}, so sessions of that micromux likely still use it: stop or \
+             restart them, which would otherwise start it again, then start this session again, \
+             or stop the proxy with `kill {pid}`"
+        ),
+    }
 }
 
 impl ClientError {
@@ -259,32 +304,200 @@ async fn hello(socket: &Path) -> Result<u16, ClientError> {
 }
 
 /// Connects to the proxy on exactly `port` (starting it if needed) and registers.
+///
+/// A proxy that speaks too old a protocol for the routes is taken over when no session uses it:
+/// a proxy that answers [`ClientMessage::StopIfIdle`] is asked to stop, and any other is given
+/// until [`OUTDATED_PROXY_WAIT`] to exit by itself, with `on_wait` told what the session waits
+/// for.
+/// Either way the next round starts a current proxy.
+/// A proxy that serves other sessions, by its own account or its not-found page's, is refused
+/// with their names, and nothing ever signals the old proxy's process.
 async fn register(
-    paths: &ProxyPaths,
-    registration: &Registration,
-    port: u16,
-    launcher: Option<&ProxyLauncher>,
+    target: &Maintained,
+    outdated_proxies: &mut OutdatedProxies,
+    on_wait: &mut (dyn FnMut(&str) + Send),
+    stop: &CancellationToken,
 ) -> Result<Live, ClientError> {
+    let Maintained {
+        paths,
+        registration,
+        port,
+        launcher,
+    } = target;
     // Recovery never renegotiates: the running services already carry URLs with this port.
     let exact = PortPreference {
-        port,
+        port: *port,
         fallback_port: None,
     };
-    ensure_proxy(paths, exact, launcher).await?;
-    let mut connection = connect(&paths.socket).await?;
-    // Ask on the registration connection itself, so the answer describes the very proxy that
-    // takes the routes even if another one replaced it since `ensure_proxy`.
-    let protocol = match request(&mut connection, &ClientMessage::Hello).await? {
-        ProxyMessage::Info { pid, protocol, .. } if protocol < registration.required_protocol() => {
-            return Err(ClientError::OutdatedProxy {
+    let required = registration.required_protocol();
+    loop {
+        ensure_proxy(paths, exact, launcher.as_ref()).await?;
+        let mut connection = connect(&paths.socket).await?;
+        // Ask on the registration connection itself, so the answer describes the very proxy that
+        // takes the routes even if another one replaced it since `ensure_proxy`.
+        let (proxy_port, pid, protocol, sessions) =
+            match request(&mut connection, &ClientMessage::Hello).await? {
+                ProxyMessage::Info {
+                    port,
+                    pid,
+                    protocol,
+                    sessions,
+                } => (port, pid, protocol, sessions),
+                other => return Err(ClientError::Protocol(format!("{other:?}"))),
+            };
+        if protocol >= required {
+            return register_on(connection, registration, protocol).await;
+        }
+        let outdated = |sessions| ClientError::OutdatedProxy {
+            pid,
+            protocol,
+            required,
+            sessions,
+        };
+
+        // Outdated proxy: stop it if it says nobody uses it, refuse it if somebody does.
+        // A proxy older than revision 3 does not say over the socket, but its not-found page
+        // lists the sessions; one that tells neither way is waited out.
+        let stoppable = sessions.is_some();
+        let sessions = match sessions {
+            Some(sessions) => Some(sessions),
+            None => listed_sessions(proxy_port).await,
+        };
+        match sessions {
+            Some(sessions) if !sessions.is_empty() => return Err(outdated(Some(sessions))),
+            Some(_) if stoppable => {
+                match request(&mut connection, &ClientMessage::StopIfIdle).await {
+                    Ok(ProxyMessage::Stopping) => {
+                        tracing::info!(pid, protocol, "stopped an idle outdated proxy");
+                    }
+                    Ok(ProxyMessage::Busy { sessions }) => return Err(outdated(Some(sessions))),
+                    // It may be exiting already; the wait below tells.
+                    Ok(_) | Err(_) => {}
+                }
+            }
+            Some(_) | None => {}
+        }
+
+        // Wait for it to exit
+        drop(connection);
+        if outdated_proxies.announced != Some(pid) {
+            outdated_proxies.announced = Some(pid);
+            tracing::info!(
                 pid,
                 protocol,
-                required: registration.required_protocol(),
-            });
+                required,
+                "waiting for an outdated proxy to exit"
+            );
+            on_wait(&format!(
+                "waiting for the outdated proxy (pid {pid}) to exit"
+            ));
         }
-        ProxyMessage::Info { protocol, .. } => protocol,
-        other => return Err(ClientError::Protocol(format!("{other:?}"))),
+        let deadline = *outdated_proxies
+            .deadline
+            .get_or_insert_with(|| tokio::time::Instant::now() + OUTDATED_PROXY_WAIT);
+        if tokio::time::Instant::now() >= deadline {
+            return Err(outdated(None));
+        }
+        tokio::select! {
+            () = stop.cancelled() => return Err(ClientError::Cancelled),
+            () = tokio::time::sleep(OUTDATED_PROXY_POLL) => {}
+        }
+    }
+}
+
+/// The wait for outdated proxies to exit, which spans every registration attempt until one
+/// succeeds.
+///
+/// One bound covers them all, even when the attempt fails for another reason in between or an
+/// older micromux starts another outdated proxy after the first one exits.
+#[derive(Debug, Default)]
+struct OutdatedProxies {
+    /// When the session stops waiting, set once it first finds an outdated proxy.
+    deadline: Option<tokio::time::Instant>,
+    /// The outdated proxy the session last reported waiting for.
+    announced: Option<u32>,
+}
+
+impl OutdatedProxies {
+    /// Whether the session is still within its wait for an outdated proxy.
+    fn waiting(&self) -> bool {
+        self.deadline
+            .is_some_and(|deadline| tokio::time::Instant::now() < deadline)
+    }
+}
+
+/// The host the session asks a proxy's not-found page for; no session domain contains it.
+const PROBE_HOST: &str = "micromux-probe.invalid";
+
+/// The sessions an older proxy listening on `port` lists on its not-found page, or `None` when
+/// the page cannot be read.
+///
+/// Every proxy answers a host no session serves with a page that says either that no session is
+/// registered or which sessions are, so a proxy that predates [`ProxyMessage::Info`]'s session
+/// list still tells.
+async fn listed_sessions(port: u16) -> Option<Vec<RegisteredSession>> {
+    let probe = async {
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .ok()?;
+        tokio::io::AsyncWriteExt::write_all(
+            &mut stream,
+            format!("GET / HTTP/1.1\r\nHost: {PROBE_HOST}\r\nConnection: close\r\n\r\n").as_bytes(),
+        )
+        .await
+        .ok()?;
+        let mut response = String::new();
+        stream
+            .take(MAX_PAGE_BYTES)
+            .read_to_string(&mut response)
+            .await
+            .ok()?;
+        Some(response)
     };
+    let response = tokio::time::timeout(REPLY_TIMEOUT, probe).await.ok()??;
+    parse_not_found_sessions(&response)
+}
+
+/// Longest not-found page read from an older proxy.
+const MAX_PAGE_BYTES: u64 = 256 * 1024;
+
+/// Reads the session list off a proxy's not-found response.
+fn parse_not_found_sessions(response: &str) -> Option<Vec<RegisteredSession>> {
+    if !response.starts_with("HTTP/1.1 404 ") {
+        return None;
+    }
+    if response.contains("<p>No session is registered with the proxy right now.</p>") {
+        return Some(Vec::new());
+    }
+    let (_, list) = response.split_once("<p>Live sessions:</p>")?;
+    // The page escapes names and paths, so neither contains the markup around them.
+    let mut sessions = Vec::new();
+    for item in list.split("<li><strong>").skip(1) {
+        let (session, rest) = item.split_once("</strong> <small>(")?;
+        let (config_path, _) = rest.split_once(")</small>")?;
+        sessions.push(RegisteredSession {
+            session: unescape_html(session),
+            config_path: unescape_html(config_path),
+        });
+    }
+    (!sessions.is_empty()).then_some(sessions)
+}
+
+/// Reverses the proxy pages' HTML escaping.
+fn unescape_html(text: &str) -> String {
+    text.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&amp;", "&")
+}
+
+/// Registers on `connection`, whose proxy speaks `protocol`.
+async fn register_on(
+    mut connection: Connection,
+    registration: &Registration,
+    protocol: u32,
+) -> Result<Live, ClientError> {
     match request(
         &mut connection,
         &ClientMessage::Register(registration.clone()),
@@ -336,29 +549,51 @@ impl Registrar {
     ///
     /// The registration's `proxy_port` is set to `port`, so a proxy on any other port refuses it.
     ///
+    /// A running proxy that speaks too old a protocol for the routes but serves no session is
+    /// taken over: the registrar has it stop, or waits for it to exit by itself, and then starts
+    /// a current one.
+    /// `on_wait` receives a description of such a wait, such as `waiting for the outdated proxy
+    /// (pid 4242) to exit`, for the session to show while it starts.
+    /// Later waits, on a reconnect, are reported through [`Self::status`].
+    ///
     /// # Errors
     ///
     /// Returns the first registration's error, such as [`ClientError::Rejected`] when another
-    /// live session already serves the same session domain.
+    /// live session already serves the same session domain,
+    /// [`ClientError::OutdatedProxy`] when an outdated proxy still serves other sessions or does
+    /// not exit in time, and [`ClientError::Cancelled`] when `shutdown` fires during that wait.
     pub async fn start(
         paths: ProxyPaths,
         registration: Registration,
         port: u16,
         launcher: Option<ProxyLauncher>,
         shutdown: &CancellationToken,
+        mut on_wait: impl FnMut(&str) + Send,
     ) -> Result<Self, ClientError> {
         let registration = Registration {
             proxy_port: port,
             ..registration
         };
+        let maintained = Maintained {
+            paths,
+            registration,
+            port,
+            launcher,
+        };
         // A proxy that answered a moment ago may be exiting for idleness or replaced by now, so
         // retry what a fresh proxy can fix; conflicts and port mismatches stay fatal.
         let deadline = Instant::now() + START_TIMEOUT;
         let mut backoff = Duration::from_millis(50);
+        let mut outdated_proxies = OutdatedProxies::default();
         let connection = loop {
-            match register(&paths, &registration, port, launcher.as_ref()).await {
+            match register(&maintained, &mut outdated_proxies, &mut on_wait, shutdown).await {
                 Ok(connection) => break connection,
-                Err(err) if err.is_transient() && Instant::now() < deadline => {
+                // An outdated proxy that exits while the session waits for it can fail an attempt
+                // midway, which the next attempt recovers from as long as the wait lasts.
+                Err(err)
+                    if err.is_transient()
+                        && (Instant::now() < deadline || outdated_proxies.waiting()) =>
+                {
                     tracing::debug!(%err, "retrying the proxy registration");
                     tokio::time::sleep(backoff).await;
                     backoff = (backoff * 2).min(Duration::from_secs(1));
@@ -367,15 +602,10 @@ impl Registrar {
             }
         };
         let (status_tx, status) = watch::channel(RegistrationStatus::Registered);
-        let (routes, routes_rx) = watch::channel(registration.routes.clone());
+        let (routes, routes_rx) = watch::channel(maintained.registration.routes.clone());
         let stop = shutdown.child_token();
         tokio::spawn(maintain(
-            Maintained {
-                paths,
-                registration,
-                port,
-                launcher,
-            },
+            maintained,
             connection,
             routes_rx,
             status_tx,
@@ -411,6 +641,7 @@ impl Drop for Registrar {
     }
 }
 
+/// What a registrar registers, and where.
 struct Maintained {
     paths: ProxyPaths,
     registration: Registration,
@@ -427,8 +658,10 @@ async fn maintain(
 ) {
     let mut connection = Some(connection);
     let mut backoff = Duration::from_millis(250);
+    let mut outdated_proxies = OutdatedProxies::default();
     loop {
         if let Some(live) = connection.take() {
+            outdated_proxies = OutdatedProxies::default();
             // The channel starts out registered, so only a restored registration notifies.
             status.send_if_modified(|current| {
                 let restored = *current != RegistrationStatus::Registered;
@@ -447,15 +680,14 @@ async fn maintain(
             () = tokio::time::sleep(backoff) => {}
         }
         maintained.registration.routes = routes.borrow_and_update().clone();
-        match register(
-            &maintained.paths,
-            &maintained.registration,
-            maintained.port,
-            maintained.launcher.as_ref(),
-        )
-        .await
-        {
+        let mut on_wait = |reason: &str| {
+            status.send_replace(RegistrationStatus::Unavailable {
+                reason: reason.to_string(),
+            });
+        };
+        match register(&maintained, &mut outdated_proxies, &mut on_wait, &stop).await {
             Ok(live) => connection = Some(live),
+            Err(ClientError::Cancelled) => return,
             Err(err) => {
                 tracing::warn!(%err, "cannot restore the proxy registration");
                 status.send_replace(RegistrationStatus::Unavailable {
@@ -522,5 +754,67 @@ async fn keep_alive(
                 return Some("the proxy stopped answering".to_string());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use similar_asserts::assert_eq;
+
+    /// A protocol 1 proxy's not-found page, as it renders it, lists the sessions with their
+    /// escaped names and config paths, or says that none is registered.
+    #[test]
+    fn reads_the_sessions_off_a_not_found_page() {
+        let response = |body: &str| {
+            format!(
+                "HTTP/1.1 404 Not Found\r\ncontent-type: text/html; charset=utf-8\r\n\r\n\
+                 <!doctype html><html><head><meta charset=\"utf-8\"><title>404 Not Found: no \
+                 micromux route</title></head><body><h1>404 Not Found: no micromux route</h1>\
+                 <p>No micromux session serves <code>micromux-probe.invalid</code>.</p>{body}\
+                 <hr><small>micromux proxy</small></body></html>"
+            )
+        };
+
+        // Idle
+        assert_eq!(
+            parse_not_found_sessions(&response(
+                "<p>No session is registered with the proxy right now.</p>"
+            )),
+            Some(Vec::new())
+        );
+
+        // Busy, with escaped names and paths
+        let busy = response(
+            "<p>Live sessions:</p><ul>\
+             <li><strong>luup2</strong> <small>(/home/me/luup2/micromux.yaml)</small><ul>\
+             <li><a href=\"http://app.luup2.localhost\">http://app.luup2.localhost</a></li>\
+             </ul></li>\
+             <li><strong>a&amp;b</strong> <small>(/tmp/&lt;x&gt; &#39;y&#39;/micromux.yaml)</small>\
+             <ul></ul></li></ul>",
+        );
+        assert_eq!(
+            parse_not_found_sessions(&busy),
+            Some(vec![
+                RegisteredSession {
+                    session: "luup2".to_string(),
+                    config_path: "/home/me/luup2/micromux.yaml".to_string(),
+                },
+                RegisteredSession {
+                    session: "a&b".to_string(),
+                    config_path: "/tmp/<x> 'y'/micromux.yaml".to_string(),
+                },
+            ])
+        );
+
+        // Anything else tells nothing
+        assert_eq!(
+            parse_not_found_sessions("HTTP/1.1 502 Bad Gateway\r\n\r\n"),
+            None
+        );
+        assert_eq!(
+            parse_not_found_sessions(&response("<p>Something else</p>")),
+            None
+        );
     }
 }

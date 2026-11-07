@@ -624,6 +624,10 @@ async fn async_main() -> color_eyre::Result<()> {
         // backtrace hint would make a config typo read like a crash.
         Err(Error::DiagnosticsEmitted) => std::process::exit(1),
         Err(Error::Interrupted(_)) => std::process::exit(EXIT_INTERRUPTED),
+        #[cfg(unix)]
+        Err(Error::Proxy(micromux_proxy::ClientError::Cancelled)) => {
+            std::process::exit(EXIT_INTERRUPTED)
+        }
         Err(Error::Exit(code)) => std::process::exit(code),
         Err(err) => Err(err.into()),
     }

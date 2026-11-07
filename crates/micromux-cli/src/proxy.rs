@@ -126,6 +126,7 @@ pub(crate) async fn register(
         mux.proxy_port(),
         Some(launcher()?),
         shutdown,
+        |waiting| eprintln!("{waiting}"),
     )
     .await?;
     Ok(Some(RouteRegistration { registrar }))
@@ -391,6 +392,7 @@ services:
                 proxy_port,
                 None,
                 &shutdown,
+                |_| {},
             )
             .await?,
         };
