@@ -300,7 +300,7 @@ async fn double_and_triple_clicks_select_a_word_and_a_whole_wrapped_line() -> ey
         Position::new(short.x + 7, short.y),
         now + Duration::from_millis(100),
     );
-    app.release();
+    app.release(Position::new(0, 0));
     assert_eq!(copied(&mut app), vec!["line".to_string()]);
 
     // A third selects the whole line, and the rows of a wrapped line join without a break.
@@ -310,7 +310,7 @@ async fn double_and_triple_clicks_select_a_word_and_a_whole_wrapped_line() -> ey
             now + Duration::from_millis(1000 + 100 * offset),
         );
     }
-    app.release();
+    app.release(Position::new(0, 0));
     assert_eq!(copied(&mut app), vec![long]);
 
     // A press that comes too late starts over.
@@ -319,7 +319,7 @@ async fn double_and_triple_clicks_select_a_word_and_a_whole_wrapped_line() -> ey
         Position::new(short.x, short.y),
         now + Duration::from_secs(1),
     );
-    app.release();
+    app.release(Position::new(0, 0));
     assert_eq!(copied(&mut app), Vec::<String>::new());
     Ok(())
 }
@@ -474,6 +474,7 @@ async fn m_toggles_capture_and_the_footer_says_so() -> eyre::Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn ctrl_z_asks_the_event_loop_to_suspend() -> eyre::Result<()> {
     let mut app = app(SERVICES)?;
@@ -529,5 +530,158 @@ async fn padding_after_the_text_is_neither_highlighted_nor_copied() -> eyre::Res
     };
     assert!(reversed(first.x + 4, first.y));
     assert!(!reversed(first.x + 5, first.y));
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_selection_stays_on_its_text_while_a_full_log_drops_its_oldest_lines() -> eyre::Result<()>
+{
+    let mut app = app(SERVICES)?;
+    set_logs(&mut app, numbered(20))?;
+    let frame = draw(&mut app);
+    let line = find(&frame, "line 10 of")?;
+    // Double-click selects "10" on line 10, and the release copies it.
+    let now = Instant::now();
+    let on_number = Position::new(line.x + 5, line.y);
+    app.press(on_number, now);
+    app.press(on_number, now + Duration::from_millis(50));
+    app.release(on_number);
+    assert_eq!(copied(&mut app), vec!["10".to_string()]);
+
+    // The log reaches its cap: five new lines arrive and the five oldest go.
+    let service = app
+        .state
+        .current_service_mut()
+        .ok_or_else(|| eyre::eyre!("no service is selected"))?;
+    for seq in 20..25u64 {
+        service.cached_lines.pop_front();
+        service
+            .cached_lines
+            .push_back((seq, format!("line {seq} of the log")));
+    }
+    service.text_dirty = true;
+    let frame = draw(&mut app);
+
+    // The highlight moved up with its line, and copying it again still gives that line's text.
+    let moved = find(&frame, "line 10 of")?;
+    assert_eq!(moved.y + 5, line.y);
+    assert!(
+        frame
+            .cell((moved.x + 5, moved.y))
+            .is_some_and(|cell| cell.modifier.contains(Modifier::REVERSED))
+    );
+    assert_eq!(app.selected_text().as_deref(), Some("10"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn changing_what_the_log_lines_say_drops_the_selection() -> eyre::Result<()> {
+    let mut app = app(SERVICES)?;
+    set_logs(&mut app, numbered(5))?;
+    let frame = draw(&mut app);
+    let line = find(&frame, "line 1 of")?;
+    drag(&mut app, line, &[Position::new(line.x + 3, line.y)]);
+    assert!(app.mouse.selection.is_some());
+
+    // Timestamps change every structured line, so the selected cells no longer hold its text.
+    press_key(&mut app, KeyCode::Char('T'));
+    draw(&mut app);
+    assert!(app.mouse.selection.is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_unwrapped_line_is_copied_whole_past_the_panes_edge() -> eyre::Result<()> {
+    let mut app = app(SERVICES)?;
+    let long = format!("start {} end", "x".repeat(150));
+    set_logs(&mut app, ["short".to_string(), long.clone()])?;
+    let frame = draw(&mut app);
+    let row = find(&frame, "start")?;
+    let now = Instant::now();
+
+    // A triple click takes the whole line, though the pane shows only its start.
+    for offset in 0..3 {
+        app.press(row, now + Duration::from_millis(50 * offset));
+    }
+    app.release(row);
+    assert_eq!(copied(&mut app), vec![long.clone()]);
+
+    // So does a drag that leaves the pane on the right.
+    let short = find(&frame, "short")?;
+    drag(
+        &mut app,
+        Position::new(short.x + 2, short.y),
+        &[Position::new(WIDTH - 1, row.y)],
+    );
+    assert_eq!(copied(&mut app), vec![format!("ort\n{long}")]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_second_click_in_a_scrolled_list_picks_the_same_service() -> eyre::Result<()> {
+    let mut services = String::new();
+    for index in 0..40 {
+        writeln!(
+            services,
+            "  svc{index:02}:\n    command: [\"sleep\", \"30\"]"
+        )?;
+    }
+    let mut app = app(&format!("version: 1\nservices:\n{services}"))?;
+    app.state.selected_service = 39;
+    let frame = draw(&mut app);
+    let target = find(&frame, "svc30")?;
+
+    // The list does not jump when the selection moves up to a row it already shows.
+    click(&mut app, target);
+    draw(&mut app);
+    click(&mut app, target);
+    assert_eq!(
+        app.state
+            .current_service()
+            .map(|service| service.snapshot.id.as_str()),
+        Some("svc30")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn in_pty_input_mode_the_mouse_never_changes_the_service_typed_into() -> eyre::Result<()> {
+    let mut app = app(SERVICES)?;
+    press_key(&mut app, KeyCode::Char('a'));
+    assert!(app.pty_input_mode);
+    let frame = draw(&mut app);
+    let web = find(&frame, "web")?;
+
+    mouse(&mut app, MouseEventKind::ScrollDown, web);
+    click(&mut app, web);
+    assert_eq!(app.state.selected_service, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_hint_acts_only_when_the_button_comes_up_on_it() -> eyre::Result<()> {
+    let mut app = app(SERVICES)?;
+    let frame = draw(&mut app);
+    let health = find(&frame, "H Health")?;
+
+    // Pressing does nothing yet, and releasing elsewhere cancels the click.
+    mouse(&mut app, MouseEventKind::Down(MouseButton::Left), health);
+    assert!(!app.show_healthcheck_pane);
+    mouse(
+        &mut app,
+        MouseEventKind::Drag(MouseButton::Left),
+        Position::new(1, HEIGHT / 2),
+    );
+    mouse(
+        &mut app,
+        MouseEventKind::Up(MouseButton::Left),
+        Position::new(1, HEIGHT / 2),
+    );
+    assert!(!app.show_healthcheck_pane);
+
+    // Releasing on the hint it went down on runs its key.
+    mouse(&mut app, MouseEventKind::Down(MouseButton::Left), health);
+    mouse(&mut app, MouseEventKind::Up(MouseButton::Left), health);
+    assert!(app.show_healthcheck_pane);
     Ok(())
 }

@@ -259,6 +259,9 @@ fn capture(
     cmd.env("TZ", "UTC");
     // The details popup shows the working directory relative to the home directory.
     cmd.env("HOME", home);
+    // The mouse-selection scenario copies, which must not reach the desktop's clipboard.
+    cmd.env_remove("DISPLAY");
+    cmd.env_remove("WAYLAND_DISPLAY");
     // micromux discovers `micromux.yaml` in its working directory, so no --config is needed.
 
     let mut child = pair

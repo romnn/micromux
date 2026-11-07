@@ -4,6 +4,7 @@
 //! sender, a shutdown token, and display options; call [`App::render`] to run it. The TUI holds only
 //! view state and re-reads its synchronous source on each [`micromux::SessionChange`].
 
+mod clipboard;
 mod event;
 mod json_log;
 mod level;
@@ -119,6 +120,8 @@ pub struct App {
     /// First row of the help or details popup on screen, clamped when it renders.
     popup_scroll: usize,
     mouse: mouse::MouseState,
+    /// Index of the service on the services list's first row in the last frame.
+    first_service: usize,
     /// Where the last frame drew what the mouse can act on.
     hits: mouse::Hits,
     /// Terminal work queued for the event loop.
@@ -198,6 +201,7 @@ impl App {
             info: None,
             popup_scroll: 0,
             mouse: mouse::MouseState::new(view_options.mouse_capture),
+            first_service: 0,
             hits: mouse::Hits::default(),
             effects: Vec::new(),
             pty_input_mode: false,
@@ -480,6 +484,11 @@ impl App {
                     ) => break,
                 }
             }
+            #[cfg(unix)]
+            if self.apply_effects(&mut terminal)? {
+                self.suspend(&mut terminal, &mut continued).await?;
+            }
+            #[cfg(not(unix))]
             self.apply_effects(&mut terminal)?;
             if needs_resync {
                 self.resync();
@@ -497,35 +506,53 @@ impl App {
         Ok(())
     }
 
-    /// Does the terminal work that input queued.
-    fn apply_effects(&mut self, terminal: &mut DefaultTerminal) -> Result<(), Error> {
+    /// Does the terminal work that input queued, and returns whether a suspend was asked for,
+    /// which the caller does last.
+    fn apply_effects(&mut self, terminal: &mut DefaultTerminal) -> Result<bool, Error> {
         use crossterm::clipboard::CopyToClipboard;
 
+        let mut suspend = false;
         for effect in std::mem::take(&mut self.effects) {
             match effect {
                 Effect::MouseCapture(enabled) => terminal::set_mouse_capture(enabled)?,
                 // Both the clipboard and Linux's primary selection, pasted with the middle button.
-                Effect::Copy(text) => crossterm::execute!(
-                    terminal.backend_mut(),
-                    CopyToClipboard::to_clipboard_from(text.as_bytes()),
-                    CopyToClipboard::to_primary_from(text.as_bytes())
-                )?,
+                Effect::Copy(text) => {
+                    crossterm::execute!(
+                        terminal.backend_mut(),
+                        CopyToClipboard::to_clipboard_from(text.as_bytes()),
+                        CopyToClipboard::to_primary_from(text.as_bytes())
+                    )?;
+                    clipboard::copy_locally(text);
+                }
                 Effect::OpenUrl(url) => {
                     if let Err(err) = open_url(&url) {
                         tracing::warn!(?err, url, "cannot open the URL in a browser");
                         self.mouse.notice = Some(format!("cannot open a browser: {err}"));
                     }
                 }
-                #[cfg(unix)]
-                Effect::Suspend => {
-                    terminal::suspend(self.mouse.capture)?;
-                    self.take_terminal_again(terminal)?;
-                }
-                #[cfg(not(unix))]
-                Effect::Suspend => {}
+                Effect::Suspend => suspend = true,
             }
         }
-        Ok(())
+        Ok(suspend)
+    }
+
+    /// Suspends to the shell as Ctrl-Z does there, then takes the terminal again once the shell
+    /// continues micromux.
+    #[cfg(unix)]
+    async fn suspend(
+        &mut self,
+        terminal: &mut DefaultTerminal,
+        continued: &mut terminal::Continued,
+    ) -> Result<(), Error> {
+        /// How long to wait for the stop to land before taking the terminal back regardless, as
+        /// when nothing could ever continue the process and the system ignores the stop.
+        const STOP_LANDS_WITHIN: Duration = Duration::from_millis(100);
+
+        terminal::stop_process_group()?;
+        // The stop can reach another thread after the signal is sent, so wait for the process to
+        // be continued rather than take the terminal while it is about to stop.
+        let _ = tokio::time::timeout(STOP_LANDS_WITHIN, continued.recv()).await;
+        self.take_terminal_again(terminal)
     }
 
     /// Takes the terminal over again after the process continued from a stop, and has the next
@@ -691,7 +718,8 @@ impl App {
             self.exit();
             return;
         }
-        if key.code == KeyCode::Char('z') && key.modifiers == KeyModifiers::CONTROL {
+        // Only Unix shells can suspend a job.
+        if cfg!(unix) && key.code == KeyCode::Char('z') && key.modifiers == KeyModifiers::CONTROL {
             self.effects.push(Effect::Suspend);
             return;
         }

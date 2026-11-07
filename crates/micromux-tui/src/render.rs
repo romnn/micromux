@@ -2046,7 +2046,7 @@ impl App {
 
     /// Draws the services list and returns the rows it was drawn in and the index of the service
     /// on the first of them.
-    fn render_services(&self, area: Rect, buf: &mut Buffer) -> (Rect, usize) {
+    fn render_services(&mut self, area: Rect, buf: &mut Buffer) -> (Rect, usize) {
         let items: Vec<ListItem> = self
             .state
             .services
@@ -2071,8 +2071,11 @@ impl App {
             })
             .collect();
 
-        let mut state = ListState::default();
-        state.select(Some(self.state.selected_service));
+        // The list scrolls on from where the last frame left it, so the rows a click lands on
+        // stay put once the selection moves to one of them.
+        let mut state = ListState::default()
+            .with_offset(self.first_service)
+            .with_selected(Some(self.state.selected_service));
 
         let block = Block::default().borders(Borders::ALL).title("Services");
         let rows = block.inner(area);
@@ -2085,6 +2088,7 @@ impl App {
             )
             .highlight_symbol(" > ");
         StatefulWidget::render(&sidebar, area, buf, &mut state);
+        self.first_service = state.offset();
         (rows, state.offset())
     }
 
@@ -2549,10 +2553,10 @@ pub mod log_view {
             self.total_lines
         }
 
-        /// Whether rendered `row` starts a logical line rather than continuing a wrapped one.
+        /// The rendered row that logical line `line` starts on.
         #[must_use]
-        pub(crate) fn starts_line(&self, row: usize) -> bool {
-            self.starts.binary_search(&row).is_ok()
+        pub(crate) fn line_start(&self, line: usize) -> Option<usize> {
+            self.starts.get(line).copied()
         }
 
         /// The logical line that rendered `row` belongs to, and the row it starts on.

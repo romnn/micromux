@@ -190,6 +190,9 @@ impl Project {
         command.env("HOME", self.home());
         command.env_remove("XDG_CONFIG_HOME");
         command.env_remove("MICROMUX_MOUSE");
+        // A copy would otherwise also reach the desktop's clipboard, overwriting the user's.
+        command.env_remove("DISPLAY");
+        command.env_remove("WAYLAND_DISPLAY");
         command
     }
 
@@ -321,6 +324,9 @@ fn the_mouse_setting_follows_the_flag_then_the_project_then_the_user() -> eyre::
 
 /// In a shell with job control, Ctrl-Z stops micromux with the terminal given back, and `fg`
 /// brings the TUI back with the mouse captured again.
+///
+/// micromux runs under a wrapper, as under `cargo run` or a task runner, which must stop with it
+/// for the shell to see the job stop.
 #[test]
 fn ctrl_z_suspends_to_the_shell_and_fg_resumes() -> eyre::Result<()> {
     let bash = Path::new("/bin/bash");
@@ -334,7 +340,7 @@ fn ctrl_z_suspends_to_the_shell_and_fg_resumes() -> eyre::Result<()> {
     shell.wait_until("the prompt", |screen, _| {
         screen.contents().contains("shell$")
     })?;
-    shell.send(format!("{MICROMUX} --no-control\r").as_bytes())?;
+    shell.send(format!("sh -c '{MICROMUX} --no-control; echo wrapper-done'\r").as_bytes())?;
     shell.wait_for_tui()?;
     shell.wait_until("mouse capture", |screen, _| {
         screen.mouse_protocol_mode() == MouseProtocolMode::ButtonMotion
@@ -357,10 +363,10 @@ fn ctrl_z_suspends_to_the_shell_and_fg_resumes() -> eyre::Result<()> {
     })?;
 
     shell.send(b"q")?;
-    shell.wait_until("the shell to return", |screen, _| {
+    shell.wait_until("the wrapper to finish", |screen, _| {
         !screen.alternate_screen()
             && screen.mouse_protocol_mode() == MouseProtocolMode::None
-            && screen.contents().matches("shell$").count() >= 2
+            && screen.contents().contains("wrapper-done")
     })?;
     shell.send(b"exit\r")?;
     Ok(())

@@ -43,7 +43,7 @@ The header's right side lists the view keys, which change only what the panes sh
 
 {{< figure src="images/service-details.png" alt="The service details popup over the log pane, listing the api service's state, ports, command, directory, dependencies, restart and stop policy, last healthcheck, and current run" caption="`i` describes the selected service in full; `u` shows the session's routes and ports the same way." >}}
 
-`Ctrl-Z` gives the terminal back and stops micromux as it would any foreground program. Until you resume it with `fg`, micromux supervises nothing: the services keep running, but their output piles up unread until they block on it, and agents talking to the session get no answer.
+`Ctrl-Z` gives the terminal back and stops micromux as the shell would stop any foreground job, together with whatever started it in the same job, such as `cargo run` or a task runner. Until you resume it with `fg`, micromux supervises nothing: the services keep running, but their output piles up unread until they block on it, healthchecks and restart policies pause, agents talking to the session get no answer, and after about 15 seconds the shared proxy drops the session's routes, so its `*.localhost` URLs stop answering until micromux continues.
 
 Restart, disable, and enable all go through the [control plane]({{< relref "agent-control/control-plane.md" >}}), so they respect dependency gating and restart policy.
 
@@ -53,9 +53,9 @@ With mouse capture on, which is the default, the mouse works as in most terminal
 
 - **Click** a service to select it, or any pane to focus it, as `Tab` would.
 - **Wheel** scrolls the pane under the pointer, without moving the focus: the service list moves the selection, and the log and healthcheck panes scroll three rows a turn. Scrolling up leaves follow-tail, as the keys do, and scrolling back to the bottom follows the tail again. While a popup is open, the wheel scrolls the popup.
-- **Drag** selects text inside the pane where the drag started, never across panes, so a selection in the logs never picks up the sidebar. Dragging past the top or bottom of the pane scrolls it. A double click selects a word, a triple click the whole line, even when it wraps over several rows. `Esc` clears the selection.
-- **Releasing** the button copies the selection to the clipboard, and to the primary selection where there is one, through the terminal's OSC 52 support, which also works over ssh. The footer says what was copied. A few terminals, such as GNOME Terminal, do not support OSC 52; use their own selection there.
-- **Click** a key hint in the header or footer to run its key, such as `H` to show the healthcheck pane or `?` for help. The `q` hint does nothing, so a stray click never ends the session, and neither do hints that name two keys, like `↑/↓`.
+- **Drag** selects text inside the pane where the drag started, never across panes, so a selection in the logs never picks up the sidebar. Dragging past the top or bottom of the pane scrolls it, and past its right edge selects to the end of the line, even where a line runs on beyond the pane. Dragging in the logs stops follow-tail, so new lines do not scroll the text away under the pointer; the selection stays on its text while a busy log drops its oldest lines. A double click selects a word, a triple click the whole line, even when it wraps over several rows or runs past the pane. `Esc` clears the selection.
+- **Releasing** the button copies the selection to the clipboard, and to the primary selection where there is one, through the terminal's OSC 52 support, which also works over ssh. The footer says what was copied. Some terminals ignore OSC 52, such as macOS Terminal and GNOME Terminal and other VTE-based terminals, so outside ssh micromux also hands the text to `pbcopy` on macOS, or to `wl-copy`, `xclip` or `xsel` on Linux, whichever is installed. Where neither works, use the terminal's own selection, described below.
+- **Click** a key hint in the header or footer to run its key, such as `H` to show the healthcheck pane or `?` for help. It acts when the button comes up on the hint it went down on, so sliding off cancels it. The `q` hint does nothing, so a stray click never ends the session, and neither do hints that name two keys, like `↑/↓`.
 - **Click** a URL in the Logs pane's title to open it in your browser.
 - **Click** outside an open popup to close it, as `Esc` does. In the level picker, click the threshold you want.
 
@@ -78,7 +78,7 @@ To choose the default, set `ui.mouse`, in order of precedence:
 
 A project setting wins over your own because it describes something about that project, such as a team that copies a lot of log output with the terminal's selection; your user config is the default for projects that do not care.
 
-micromux releases the mouse whenever it lets go of the terminal: when it exits, however it is asked to, when you press `Ctrl-Z`, and when it panics. A stop sent from outside, such as `kill -STOP`, gives micromux no chance to let go first, but when it continues it takes the terminal over afresh and redraws.
+micromux releases the mouse whenever it lets go of the terminal: when it exits, however it is asked to, when you press `Ctrl-Z`, and when it panics. A stop signal sent from outside, such as `kill -TSTP` or `kill -STOP`, gives micromux no chance to let go first, but when it continues it takes the terminal over afresh and redraws.
 
 ### User config
 

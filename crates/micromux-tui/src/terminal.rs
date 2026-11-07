@@ -136,20 +136,23 @@ pub(crate) fn install_panic_hook() {
     });
 }
 
-/// Suspends the process as Ctrl-Z does in a shell: gives the terminal back, stops until the
-/// shell continues it, then takes the terminal over again with mouse capture as `mouse` says.
+/// Gives the terminal back and stops micromux's whole process group, as Ctrl-Z does in a shell.
 ///
-/// Raw mode delivers Ctrl-Z as a key instead of the terminal's stop signal, so the TUI raises
-/// the signal itself.
-/// It raises `SIGTSTP` rather than `SIGSTOP` because the system ignores `SIGTSTP` in an orphaned
-/// process group, where no shell could ever continue the process; the call then returns at once
-/// and the TUI keeps running.
+/// Raw mode delivers Ctrl-Z as a key instead of the terminal's stop signal, so the TUI sends the
+/// signal itself.
+/// It signals the group, not just this process, so a wrapper that started micromux, such as
+/// `cargo run` or `sh -c`, stops with it and the shell sees the job stop.
+/// Services run in sessions and process groups of their own, so they keep running.
+/// The signal is `SIGTSTP` rather than `SIGSTOP` because the system ignores `SIGTSTP` in an
+/// orphaned process group, where no shell could ever continue it.
 #[cfg(unix)]
-pub(crate) fn suspend(mouse: bool) -> io::Result<()> {
+pub(crate) fn stop_process_group() -> io::Result<()> {
+    use nix::sys::signal::{Signal, kill};
+    use nix::unistd::Pid;
+
     give_back()?;
-    // `raise` signals this thread, so the stop takes effect before it returns.
-    nix::sys::signal::raise(nix::sys::signal::Signal::SIGTSTP).map_err(io::Error::from)?;
-    take_over(mouse)
+    // Pid 0 addresses the caller's process group.
+    kill(Pid::from_raw(0), Signal::SIGTSTP).map_err(io::Error::from)
 }
 
 /// Notices that the process continued after a stop, such as one sent from outside, which leaves
