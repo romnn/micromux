@@ -118,15 +118,23 @@ async fn load_user_config(printer: &DiagnosticsPrinter) -> Result<micromux::User
 
 /// The `ui` section of the project config at `config_path`, or `None` when it cannot be read.
 ///
-/// An attached TUI reads it only for these settings: the session it attaches to already loaded
-/// and reported on the config, so a problem with it is not this client's to report.
+/// An attached TUI reads only that section: the session it attaches to already loaded and
+/// reported on the config, so the rest is not this client's to judge.
 pub(crate) async fn project_ui_config(config_path: &Path) -> Option<micromux::UiConfig> {
-    let raw = micromux::read_config_file_async(config_path).await.ok()?;
-    let config_dir = config_path.parent()?;
-    let mut diagnostics = Vec::new();
-    micromux::from_str(&raw, config_dir, 0usize, None, &mut diagnostics)
-        .ok()
-        .map(|config| config.config.ui_config)
+    let raw = match micromux::read_config_file_async(config_path).await {
+        Ok(raw) => raw,
+        Err(err) => {
+            tracing::warn!(?err, path = %config_path.display(), "cannot read the project's ui settings");
+            return None;
+        }
+    };
+    match micromux::parse_ui_section(&raw) {
+        Ok(ui) => Some(ui),
+        Err(err) => {
+            tracing::warn!(?err, path = %config_path.display(), "cannot read the project's ui settings");
+            None
+        }
+    }
 }
 
 #[cfg(test)]

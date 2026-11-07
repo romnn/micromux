@@ -38,8 +38,9 @@ pub(crate) fn detach(command: &mut Command) {
     let _ = command;
 }
 
-/// Whether the TUI runs over ssh, where a local clipboard command would copy on the remote host.
-fn over_ssh() -> bool {
+/// Whether the TUI runs over ssh, where a local clipboard command would copy, and a browser
+/// open, on the remote host.
+pub(crate) fn over_ssh() -> bool {
     ["SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"]
         .iter()
         .any(|name| std::env::var_os(name).is_some())

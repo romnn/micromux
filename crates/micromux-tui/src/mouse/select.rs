@@ -90,6 +90,9 @@ pub(crate) struct Selection {
     pub(crate) context: TextContext,
     anchor: TextAnchor,
     head: TextAnchor,
+    /// Whether it is only the caret a press placed, which selects nothing until a drag moves
+    /// it, unlike a one-cell selection.
+    caret: bool,
 }
 
 /// A selection placed on the rows its pane draws now.
@@ -97,13 +100,15 @@ pub(crate) struct Selection {
 struct Placed {
     start: TextPos,
     end: TextPos,
+    /// Whether it selects nothing: a caret, or text the pane dropped entirely.
+    empty: bool,
 }
 
 impl Placed {
     /// The selected columns of `row`, both ends included, the last possibly [`END_OF_LINE`].
     fn columns_in_row(self, row: usize) -> Option<(u16, u16)> {
-        let Self { start, end } = self;
-        if start == end || row < start.row || row > end.row {
+        let Self { start, end, empty } = self;
+        if empty || row < start.row || row > end.row {
             return None;
         }
         let from = if row == start.row { start.col } else { 0 };
@@ -362,8 +367,8 @@ impl App {
         }
     }
 
-    /// Where `anchor` is drawn now in `pane`'s text.
-    fn place(&self, pane: TextPane, anchor: TextAnchor) -> TextPos {
+    /// Where `anchor` is drawn now in `pane`'s text, and whether its line is still there.
+    fn place(&self, pane: TextPane, anchor: TextAnchor) -> (TextPos, bool) {
         let (line, kept) = match self.line_index(pane, anchor.line) {
             Ok(line) => (line, true),
             Err(line) => (line, false),
@@ -372,20 +377,29 @@ impl App {
             .pane_text(pane)
             .map_or(Some(line), |(_, index)| index.line_start(line));
         match first_row {
-            Some(first_row) if kept => TextPos {
-                row: first_row + anchor.row_in_line,
-                col: anchor.col,
-            },
+            Some(first_row) if kept => (
+                TextPos {
+                    row: first_row + anchor.row_in_line,
+                    col: anchor.col,
+                },
+                true,
+            ),
             // The line was dropped, so the selection starts or ends where the next one does.
-            Some(first_row) => TextPos {
-                row: first_row,
-                col: 0,
-            },
+            Some(first_row) => (
+                TextPos {
+                    row: first_row,
+                    col: 0,
+                },
+                false,
+            ),
             // Every line after it is gone too, as when the log was cleared.
-            None => TextPos {
-                row: self.total_rows(pane),
-                col: 0,
-            },
+            None => (
+                TextPos {
+                    row: self.total_rows(pane),
+                    col: 0,
+                },
+                false,
+            ),
         }
     }
 
@@ -400,22 +414,33 @@ impl App {
         {
             return None;
         }
-        let anchor = self.place(pane, selection.anchor);
-        let head = self.place(pane, selection.head);
+        let (anchor, anchor_kept) = self.place(pane, selection.anchor);
+        let (head, head_kept) = self.place(pane, selection.head);
         let (start, end) = if anchor <= head {
             (anchor, head)
         } else {
             (head, anchor)
         };
-        Some((selection, Placed { start, end }))
+        // With both ends' lines dropped and nothing kept between them, the text is gone.
+        let dropped = !anchor_kept && !head_kept && start == end;
+        Some((
+            selection,
+            Placed {
+                start,
+                end,
+                empty: selection.caret || dropped,
+            },
+        ))
     }
 
-    /// Starts a selection from `anchor` to `head` in `context`'s pane.
-    pub(crate) fn select(&mut self, context: TextContext, anchor: TextPos, head: TextPos) {
+    /// Starts a selection from `anchor` to `head` in `context`'s pane, or with `head` `None` just
+    /// places a caret at `anchor`.
+    pub(crate) fn select(&mut self, context: TextContext, anchor: TextPos, head: Option<TextPos>) {
         let pane = context.pane;
         self.mouse.selection = Some(Selection {
             anchor: self.anchor_at(pane, anchor),
-            head: self.anchor_at(pane, head),
+            head: self.anchor_at(pane, head.unwrap_or(anchor)),
+            caret: head.is_none(),
             context,
         });
     }
@@ -427,6 +452,8 @@ impl App {
         };
         let head = self.anchor_at(pane, head);
         if let Some(selection) = &mut self.mouse.selection {
+            // Once the drag moves off the caret's cell, even coming back selects that cell.
+            selection.caret &= head == selection.anchor;
             selection.head = head;
         }
     }
@@ -517,8 +544,7 @@ impl App {
 
     /// Whether text is selected in a pane that still shows it.
     pub(crate) fn has_selection(&self) -> bool {
-        self.placed()
-            .is_some_and(|(_, Placed { start, end })| start != end)
+        self.placed().is_some_and(|(_, placed)| !placed.empty)
     }
 
     /// The selected text, or `None` when nothing is selected.
@@ -528,8 +554,8 @@ impl App {
     pub(crate) fn selected_text(&self) -> Option<String> {
         let (selection, placed) = self.placed()?;
         let context = &selection.context;
-        let Placed { start, end } = placed;
-        if start == end {
+        let Placed { start, end, empty } = placed;
+        if empty {
             return None;
         }
         let end_row = end.row.min(self.total_rows(context.pane).checked_sub(1)?);
@@ -566,8 +592,12 @@ impl App {
     }
 
     /// The word around `pos` in `context`'s pane: the run of adjacent non-blank cells it is in,
-    /// or just `pos` on a blank one.
-    pub(crate) fn word_at(&self, context: &TextContext, pos: TextPos) -> (TextPos, TextPos) {
+    /// or `None` on a blank one.
+    pub(crate) fn word_at(
+        &self,
+        context: &TextContext,
+        pos: TextPos,
+    ) -> Option<(TextPos, TextPos)> {
         let cells = if context.wrap {
             row_cells(
                 &self.draw_rows(context, pos.row..pos.row + 1, context.width),
@@ -589,9 +619,7 @@ impl App {
                     col < at + width(symbol) && !symbol.trim().is_empty()
                 })
             });
-        let Some(clicked) = clicked else {
-            return (pos, pos);
-        };
+        let clicked = clicked?;
         // A word runs on while its cells touch and none is blank.
         let joined = |left: usize| match (cells.get(left), cells.get(left + 1)) {
             (Some((at, symbol)), Some((next_at, next))) => {
@@ -614,7 +642,7 @@ impl App {
         let to = cells
             .get(last)
             .map_or(col, |(at, symbol)| at + width(symbol) - 1);
-        (
+        Some((
             TextPos {
                 row: pos.row,
                 col: as_col(from),
@@ -623,13 +651,13 @@ impl App {
                 row: pos.row,
                 col: as_col(to),
             },
-        )
+        ))
     }
 
     /// The whole line at `pos` in `context`'s pane, every row of it when it wraps.
     pub(crate) fn line_at(&self, context: &TextContext, pos: TextPos) -> (TextPos, TextPos) {
         let first = self.line_start_row(context, pos.row);
-        let last_row = self.total_rows(context.pane).saturating_sub(1).max(pos.row);
+        let last_row = self.total_rows(context.pane).saturating_sub(1);
         let mut last = pos.row;
         while last < last_row && self.line_start_row(context, last + 1) != last + 1 {
             last += 1;

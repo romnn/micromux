@@ -1188,11 +1188,16 @@ pub fn release_terminal() {
     terminal::give_back().ok();
 }
 
-/// Opens `url` in the browser with the platform's opener, without waiting for it.
+/// Opens `url` in the browser with the platform's opener, without waiting for it, unless the TUI
+/// runs over ssh, where the browser would open on the remote host, if anywhere.
 ///
 /// The opener's output is discarded, since anything it prints would land on the TUI.
 fn open_url(url: &str) -> std::io::Result<()> {
     use std::process::{Command, Stdio};
+
+    if clipboard::over_ssh() {
+        return Err(std::io::Error::other("micromux runs over ssh"));
+    }
 
     let opener = if cfg!(target_os = "macos") {
         "open"
@@ -1491,14 +1496,23 @@ mod tests {
             ViewOptions::default(),
         );
         let now = std::time::Instant::now();
-        // Narrow enough that the hint has no free room in the footer and covers its last row.
+        // Narrow enough that the hint may have no free room in the footer and cover its last
+        // row. Every hint that takes clicks there still shows.
         let footer = |app: &mut App| {
-            let area = ratatui::layout::Rect::new(0, 0, 60, 20);
+            let area = ratatui::layout::Rect::new(0, 0, 40, 20);
             let mut buffer = ratatui::buffer::Buffer::empty(area);
             ratatui::widgets::Widget::render(&mut *app, area, &mut buffer);
-            (0..60)
+            let row = (0..40)
                 .filter_map(|x| buffer.cell((x, 19)).map(ratatui::buffer::Cell::symbol))
-                .collect::<String>()
+                .collect::<Vec<_>>();
+            for hit in app.hits.hints.iter().filter(|hit| hit.area.y == 19) {
+                let shown = row
+                    .get(usize::from(hit.area.x)..)
+                    .unwrap_or_default()
+                    .concat();
+                assert!(shown.starts_with(hit.keys), "{} under {shown:?}", hit.keys);
+            }
+            row.concat()
         };
 
         // A press says how to quit, without stopping anything, and closes a popup, where `q`

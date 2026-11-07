@@ -1259,3 +1259,67 @@ async fn nothing_copies_or_quits_in_pty_input_mode() -> eyre::Result<()> {
     assert!(app.running);
     Ok(())
 }
+
+/// A drag that starts below a short log's last line starts at that line's end, so lines that
+/// arrive later never join the selection.
+#[tokio::test]
+async fn a_selection_started_below_the_text_never_takes_in_new_lines() -> eyre::Result<()> {
+    let mut app = app(SERVICES)?;
+    set_logs(&mut app, numbered(3))?;
+    let frame = draw(&mut app);
+    let first = find(&frame, "line 0 of")?;
+    let below = Position::new(first.x + 10, first.y + 10);
+    drag(&mut app, below, &[first]);
+    let selected = vec!["line 0 of the log\nline 1 of the log\nline 2 of the log".to_string()];
+    assert_eq!(yank(&mut app), selected);
+
+    set_logs(&mut app, numbered(8))?;
+    assert_eq!(yank(&mut app), selected);
+
+    // A triple click below the text takes the last line, and no later one.
+    let now = Instant::now();
+    set_logs(&mut app, numbered(3))?;
+    let frame = draw(&mut app);
+    let first = find(&frame, "line 0 of")?;
+    for offset in 0..3 {
+        app.press(
+            Position::new(first.x + 2, first.y + 10),
+            now + Duration::from_millis(100 * offset),
+        );
+    }
+    app.release(Position::new(0, 0));
+    set_logs(&mut app, numbered(8))?;
+    assert_eq!(yank(&mut app), vec!["line 2 of the log".to_string()]);
+    Ok(())
+}
+
+/// A one-character word can be selected by a double click or a drag that ends where it
+/// started, while a plain click selects nothing.
+#[tokio::test]
+async fn a_single_cell_can_be_selected() -> eyre::Result<()> {
+    let mut app = app(SERVICES)?;
+    set_logs(&mut app, ["exit 1 done".to_string()])?;
+    let frame = draw(&mut app);
+    let one = find(&frame, " 1 ")?;
+    let one = Position::new(one.x + 1, one.y);
+    let now = Instant::now();
+    app.press(one, now);
+    app.press(one, now + Duration::from_millis(100));
+    app.release(one);
+    assert_eq!(yank(&mut app), vec!["1".to_string()]);
+
+    // A drag away and back keeps that one cell; its press starts no series with the earlier
+    // ones.
+    press_key(&mut app, KeyCode::Esc);
+    app.mouse.last_press = None;
+    drag(&mut app, one, &[Position::new(one.x + 3, one.y), one]);
+    assert_eq!(yank(&mut app), vec!["1".to_string()]);
+
+    // A plain click only places a caret.
+    press_key(&mut app, KeyCode::Esc);
+    app.mouse.last_press = None;
+    click(&mut app, Position::new(one.x + 5, one.y));
+    assert_eq!(yank(&mut app), Vec::<String>::new());
+    assert!(!footer(&mut app).contains("y Copy"));
+    Ok(())
+}

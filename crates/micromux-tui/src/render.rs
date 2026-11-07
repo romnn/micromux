@@ -1792,7 +1792,7 @@ impl Widget for &mut App {
                 .collect::<Vec<_>>(),
         )
         .render(layout.footer, buf);
-        self.render_mouse_notice(&footer, layout.footer, buf);
+        let covered = self.render_mouse_notice(&footer, layout.footer, buf);
 
         // The popups below record themselves as they draw.
         self.hits = crate::mouse::Hits {
@@ -1801,9 +1801,11 @@ impl Widget for &mut App {
             first_service,
             logs: layout.logs,
             health: layout.health,
+            // The hints the quit hint covers cannot be clicked, since they do not show.
             hints: [(&header, layout.header), (&footer, layout.footer)]
                 .into_iter()
                 .flat_map(|(rows, area)| hint_hits(rows, area))
+                .filter(|hit| Some(hit.area.y) != covered)
                 .collect(),
             links,
             popup: None,
@@ -2505,8 +2507,9 @@ impl App {
     }
 
     /// Draws what the last mouse release copied at the right end of the footer's last row, where
-    /// the hints leave room, so it never changes the layout.
-    fn render_mouse_notice(&self, footer: &[HintRow], area: Rect, buf: &mut Buffer) {
+    /// the hints leave room, so it never changes the layout; returns the row the quit hint covers
+    /// instead, when there is no room for it.
+    fn render_mouse_notice(&self, footer: &[HintRow], area: Rect, buf: &mut Buffer) -> Option<u16> {
         // How to quit matters more than what the last copy took.
         let quitting = self.quit_hint_at.is_some();
         let (notice, color) = if quitting {
@@ -2520,19 +2523,19 @@ impl App {
             (self.mouse.notice.clone(), tailwind::GREEN.c400)
         };
         let (Some(notice), Some(last)) = (notice, footer.last()) else {
-            return;
+            return None;
         };
         let notice = format!("{notice} ");
         let width = rows_u16(notice.chars().count());
         let used = rows_u16(last.line.width()).saturating_add(2);
         if area.height == 0 {
-            return;
+            return None;
         }
         if used.saturating_add(width) > area.width {
             // The quit hint must show, so for its two seconds it covers the hints of the
             // footer's last row; other notices wait for room.
             if !quitting {
-                return;
+                return None;
             }
             let row = Rect {
                 y: area.bottom() - 1,
@@ -2547,7 +2550,7 @@ impl App {
                 usize::from(row.width),
                 Style::default().fg(color),
             );
-            return;
+            return Some(row.y);
         }
         buf.set_string(
             area.right() - width,
@@ -2555,6 +2558,7 @@ impl App {
             notice,
             Style::default().fg(color),
         );
+        None
     }
 
     /// Run the application in the terminal.

@@ -377,14 +377,32 @@ impl App {
         if !area.contains(position) {
             return;
         }
-        let pos = TextPos {
-            row: self.first_row(pane) + usize::from(position.y - area.y),
-            col: position.x - area.x,
+        let Some(last_row) = self.total_rows(pane).checked_sub(1) else {
+            return;
+        };
+        let row = self.first_row(pane) + usize::from(position.y - area.y);
+        // Below the text, the selection starts at the end of the last line, so lines that come
+        // later never join it.
+        let pos = if row > last_row {
+            TextPos {
+                row: last_row,
+                col: END_OF_LINE,
+            }
+        } else {
+            TextPos {
+                row,
+                col: position.x - area.x,
+            }
         };
         let (anchor, head) = match count {
-            1 => (pos, pos),
-            2 => self.word_at(&context, pos),
-            _ => self.line_at(&context, pos),
+            1 => (pos, None),
+            2 => self
+                .word_at(&context, pos)
+                .map_or((pos, None), |(from, to)| (from, Some(to))),
+            _ => {
+                let (from, to) = self.line_at(&context, pos);
+                (from, Some(to))
+            }
         };
         self.select(context, anchor, head);
         self.mouse.dragging = true;
