@@ -747,18 +747,28 @@ mod tests {
         let root = child.id();
         let root_stamp = stamp(root).ok_or_eyre("expected a root stamp")?;
 
-        // The shell forks the sleep asynchronously; wait for it to join the tree.
+        // Wait for the sleep to fork and leave the shell's group.
+        // A descendant count is not enough: bash may first fork short-lived helpers, such
+        // as a command substitution in a `BASH_ENV` startup file, which stay in its group.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        let mut from_seed = expand_survivors(&[root_stamp], &HashSet::new());
-        while from_seed.len() < 2 && std::time::Instant::now() < deadline {
+        let escaped = || {
+            descendants(root_stamp)
+                .into_iter()
+                .find(|descendant| descendant.process_group.is_some_and(|group| group != root))
+                .map(|descendant| descendant.stamp)
+        };
+        let mut sleep = escaped();
+        while sleep.is_none() && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(25));
-            from_seed = expand_survivors(&[root_stamp], &HashSet::new());
+            sleep = escaped();
         }
+        let from_seed = expand_survivors(&[root_stamp], &HashSet::new());
         let from_group = expand_survivors(&[], &HashSet::from([root]));
 
         // Kill the fixture before asserting so a failing run does not leak processes;
         // the escaped sleep is outside the root's group, so it is killed by stamp.
-        for &survivor in &from_seed {
+        let fixture: Vec<_> = from_seed.iter().copied().chain(sleep).collect();
+        for &survivor in &fixture {
             let _ = super::send_signal(survivor, nix::sys::signal::Signal::SIGKILL);
         }
         if let Ok(root) = i32::try_from(root) {
@@ -771,19 +781,20 @@ mod tests {
         let _ = child.wait();
         // Wait for the kills to land so no fixture process outlives the test.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while from_seed.iter().any(|&survivor| is_alive(survivor))
+        while fixture.iter().any(|&survivor| is_alive(survivor))
             && std::time::Instant::now() < deadline
         {
             std::thread::sleep(std::time::Duration::from_millis(25));
         }
         let after_death = expand_survivors(&[root_stamp], &HashSet::new());
 
+        let sleep = sleep.ok_or_eyre("expected the sleep to leave the shell's process group")?;
         eyre::ensure!(
-            from_seed.len() >= 2 && from_seed.contains(&root_stamp),
+            from_seed.contains(&root_stamp) && from_seed.contains(&sleep),
             "expected the live seed plus its forked sleep, found {from_seed:?}"
         );
         eyre::ensure!(
-            from_group.len() >= 2,
+            from_group.contains(&root_stamp) && from_group.contains(&sleep),
             "expected the group-only probe to recover the shell and, through it, the \
              sleep that escaped to another group, found {from_group:?}"
         );
