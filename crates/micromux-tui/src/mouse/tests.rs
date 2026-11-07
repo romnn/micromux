@@ -1045,3 +1045,49 @@ async fn the_wheel_leaves_a_pane_with_nothing_to_scroll_following() -> eyre::Res
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn the_focused_pane_has_a_thick_accented_frame() -> eyre::Result<()> {
+    let mut app = app(SERVICES)?;
+    press_key(&mut app, KeyCode::Char('H'));
+    // Each pane's top-left corner, found by its name drawn right after it.
+    let corners = |app: &mut App| -> eyre::Result<Vec<(String, String)>> {
+        let frame = draw(app);
+        ["Services", "Logs", "Healthcheck"]
+            .into_iter()
+            .map(|name| {
+                let at = find(&frame, name)?;
+                let corner = frame
+                    .cell((at.x - 1, at.y))
+                    .ok_or_else(|| eyre::eyre!("no corner before {name}"))?;
+                Ok((name.to_string(), corner.symbol().to_string()))
+            })
+            .collect()
+    };
+    let thick = |corners: &[(String, String)]| {
+        corners
+            .iter()
+            .filter(|(_, corner)| corner == "┏")
+            .map(|(name, _)| name.clone())
+            .collect::<Vec<_>>()
+    };
+
+    // Exactly the focused pane is drawn thick, which tells it apart without any color.
+    assert_eq!(thick(&corners(&mut app)?), vec!["Services".to_string()]);
+    press_key(&mut app, KeyCode::Tab);
+    assert_eq!(thick(&corners(&mut app)?), vec!["Logs".to_string()]);
+    press_key(&mut app, KeyCode::Tab);
+    assert_eq!(thick(&corners(&mut app)?), vec!["Healthcheck".to_string()]);
+
+    // A click moves the frame as Tab does, and the focused frame takes the accent color.
+    let frame = draw(&mut app);
+    click(&mut app, find(&frame, "web")?);
+    assert_eq!(thick(&corners(&mut app)?), vec!["Services".to_string()]);
+    let frame = draw(&mut app);
+    let services = find(&frame, "Services")?;
+    let logs = find(&frame, "Logs")?;
+    let color = |at: Position| frame.cell((at.x - 1, at.y)).map(|cell| cell.fg);
+    assert_eq!(color(services), Some(crate::render::FOCUS_COLOR));
+    assert_ne!(color(logs), Some(crate::render::FOCUS_COLOR));
+    Ok(())
+}

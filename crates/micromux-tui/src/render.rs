@@ -54,6 +54,7 @@ mod tests {
                 title: Line::raw("Logs"),
                 status: None,
                 detail: None,
+                focused: false,
             },
             buf,
         )
@@ -248,6 +249,7 @@ mod tests {
                 title: Line::raw("Logs"),
                 status: None,
                 detail: Some(service_detail(&snapshot, 1_000)),
+                focused: false,
             },
             &mut buf,
         );
@@ -1666,6 +1668,38 @@ fn lease_phrase(expires_at_unix_ms: Option<u64>, now_unix_ms: u64) -> String {
     }
 }
 
+/// A pane's frame, which shows whether the pane has the focus: thick and in the accent color
+/// when it has, plain and dim when not.
+///
+/// The thickness alone tells the focused pane apart where the terminal shows no color.
+fn pane_block<'a>(focused: bool) -> Block<'a> {
+    let block = Block::default().borders(Borders::ALL);
+    if focused {
+        block
+            .border_type(ratatui::widgets::BorderType::Thick)
+            .border_style(Style::default().fg(FOCUS_COLOR))
+    } else {
+        block.border_style(Style::default().fg(UNFOCUSED_COLOR))
+    }
+}
+
+/// A pane's name for its frame's title: bold and in the accent color when the pane has the
+/// focus, dim when not.
+fn pane_name(name: &str, focused: bool) -> Span<'static> {
+    let span = Span::raw(name.to_string());
+    if focused {
+        span.bold().fg(FOCUS_COLOR)
+    } else {
+        span.fg(tailwind::GRAY.c400)
+    }
+}
+
+/// The accent of the focused pane's frame.
+pub(crate) const FOCUS_COLOR: Color = tailwind::SKY.c400;
+
+/// The frame of a pane without the focus.
+const UNFOCUSED_COLOR: Color = tailwind::GRAY.c600;
+
 /// Color of the command in the logs pane's bottom border.
 const BORDER_COMMAND_COLOR: Color = tailwind::GRAY.c400;
 /// Color of the run facts in the logs pane's bottom border.
@@ -2082,7 +2116,8 @@ impl App {
             })
             .collect();
 
-        let block = Block::default().borders(Borders::ALL).title("Services");
+        let block = pane_block(self.focus == crate::Focus::Services)
+            .title(pane_name("Services", self.focus == crate::Focus::Services));
         let rows = block.inner(area);
         // The list scrolls on from where the last frame left it, so the rows a click lands on
         // stay put once the selection moves to one of them.
@@ -2177,6 +2212,10 @@ impl App {
             &service_urls(session.as_ref(), &current_service.snapshot.id),
             title_width,
         );
+        let mut title = title;
+        if let Some(name) = title.spans.first_mut() {
+            *name = pane_name("Logs", self.focus == crate::Focus::Logs);
+        }
         // The title starts right after the pane's top-left corner.
         let links = url_columns
             .into_iter()
@@ -2204,6 +2243,7 @@ impl App {
                 title,
                 status,
                 detail: Some(detail),
+                focused: self.focus == crate::Focus::Logs,
             },
             buf,
         );
@@ -2271,9 +2311,13 @@ impl App {
             &service.healthcheck_cached_line_index,
             &service.healthcheck_cached_text,
             log_view::PaneBorders {
-                title: Line::raw("Healthcheck"),
+                title: Line::from(pane_name(
+                    "Healthcheck",
+                    self.focus == crate::Focus::Healthcheck,
+                )),
                 status: None,
                 detail: None,
+                focused: self.focus == crate::Focus::Healthcheck,
             },
             buf,
         );
@@ -2514,10 +2558,7 @@ pub mod log_view {
     use ratatui::{
         buffer::Buffer,
         layout::{Constraint, Direction, Layout, Rect},
-        widgets::{
-            Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarState, StatefulWidget, Widget,
-            Wrap,
-        },
+        widgets::{Clear, Paragraph, Scrollbar, ScrollbarState, StatefulWidget, Widget, Wrap},
     };
 
     /// Narrowest left border text worth drawing; below it the truncation marker would crowd out
@@ -2537,6 +2578,8 @@ pub mod log_view {
         pub status: Option<ratatui::text::Line<'static>>,
         /// Identity facts along the bottom border.
         pub detail: Option<BorderDetail>,
+        /// Whether the pane has the focus, which its frame shows.
+        pub focused: bool,
     }
 
     /// Facts drawn into a pane's bottom border.
@@ -2711,6 +2754,7 @@ pub mod log_view {
                 title,
                 status,
                 detail,
+                focused,
             } = borders;
             let num_lines = line_index.total_lines();
             let [log_area, scrollbar_area] = Layout::default()
@@ -2752,7 +2796,7 @@ pub mod log_view {
                 self.wrap,
             );
 
-            let mut block = Block::default().borders(Borders::ALL).title(title);
+            let mut block = super::pane_block(focused).title(title);
             if let Some(status) = status {
                 block = block.title(status.right_aligned());
             }

@@ -15,6 +15,8 @@ Running `micromux` with no subcommand opens the TUI for the current project. It'
 - **Log pane** — the selected service's live output, annotated with the lifecycle transitions that stall it. ANSI color and interactive/redrawing output are supported.
 - **Healthcheck pane** — toggled with `H`, it shows the selected service's latest probe: the command, its exit status, and its output.
 
+The pane with the focus, which the movement keys act on, has a thick frame in an accent color; `Tab` or a click moves it. The thickness tells it apart even where the terminal shows no color.
+
 ## Keybindings
 
 The header's right side lists the view keys, which change only what the panes show, with their current state. With [routes]({{< relref "configuration/sessions.md" >}}#hostnames), the Logs pane's title lists the browser URLs of the selected service, the routes whose port is in its `ports` list, as many as fit, then a count of the rest; the header says so in red when the shared proxy does not serve them right now. The footer lists the keys that move around and act on services. Both wrap onto extra rows when the terminal is too narrow.
