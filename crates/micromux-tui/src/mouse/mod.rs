@@ -267,6 +267,12 @@ impl App {
         if !self.mouse.capture {
             return;
         }
+        // A key or an earlier click in the same batch of input opened or closed a popup that the
+        // last frame does not show yet, so the frame's areas no longer say what is where.
+        let popup_open = self.show_help || self.info.is_some() || self.level_picker.is_some();
+        if popup_open != self.hits.popup.is_some() {
+            return;
+        }
         let position = Position::new(event.column, event.row);
         match event.kind {
             MouseEventKind::Down(MouseButton::Left) => self.press(position, Instant::now()),

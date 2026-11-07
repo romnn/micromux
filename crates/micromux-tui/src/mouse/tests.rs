@@ -424,6 +424,16 @@ async fn hints_run_their_key_but_never_quit() -> eyre::Result<()> {
     assert!(app.show_help);
     press_key(&mut app, KeyCode::Esc);
 
+    // Until a frame shows the popup that a click opened, further mouse events are ignored rather
+    // than landing on what the popup now covers.
+    let frame = draw(&mut app);
+    click(&mut app, find(&frame, "? Help")?);
+    assert!(app.show_help);
+    click(&mut app, find(&frame, "worker")?);
+    assert!(app.show_help);
+    assert_eq!(app.state.selected_service, 0);
+    press_key(&mut app, KeyCode::Esc);
+
     // Quitting from a stray click would stop every service, so its hint does nothing.
     let frame = draw(&mut app);
     click(&mut app, find(&frame, "q Quit")?);
