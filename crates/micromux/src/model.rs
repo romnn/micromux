@@ -367,6 +367,9 @@ pub struct ServiceSnapshot {
     /// Set only while `execution` is `Blocked`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dependency_failure: Option<DependencyFailure>,
+    /// Services this one waits for before it starts, with the condition each must reach.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<crate::spec::DependencySpec>,
 }
 
 /// How a service's most recent `cleanup` command ended.
@@ -427,6 +430,7 @@ impl ServiceSnapshot {
             log_display: LogDisplay::default(),
             last_cleanup: None,
             dependency_failure: None,
+            depends_on: Vec::new(),
         }
     }
 }

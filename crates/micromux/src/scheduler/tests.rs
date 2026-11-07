@@ -4968,7 +4968,9 @@ async fn restarts_wait_for_the_cleanup() -> eyre::Result<()> {
     })
     .await?;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    while fs::read_to_string(dir.path().join("starts"))?
+    // A run reports Running before its shell has written its line, so the file may not exist yet.
+    while fs::read_to_string(dir.path().join("starts"))
+        .unwrap_or_default()
         .lines()
         .count()
         < 2

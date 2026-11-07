@@ -771,6 +771,7 @@ pub(super) fn project_snapshot(
         } else {
             None
         },
+        depends_on: service.spec.depends_on.clone(),
     };
     (snapshot, runtime.uptime_started_at)
 }
