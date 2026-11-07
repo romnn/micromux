@@ -5,7 +5,8 @@ use super::{
 #[cfg(test)]
 use super::{Event, ServiceRuntimeInit, TestEventSink};
 use crate::config::DependencyCondition;
-use crate::{ServiceEventKind, ServiceMap, health_check::Health};
+use crate::model::{DependencyFailure, DependencyFailureReason};
+use crate::{DependencySpec, ServiceEventKind, ServiceMap, health_check::Health};
 use std::collections::HashMap;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -88,6 +89,105 @@ fn blocking_dependencies(
         .collect()
 }
 
+/// Find a dependency of `service` that cannot meet its condition until someone intervenes.
+///
+/// Dependencies are checked in declaration order and the first failure wins. A dependency that
+/// still has to start but is itself stuck behind such a dependency fails as well, so the result
+/// names the root cause and the chain of blocked services leading to it.
+pub(super) fn dependency_failure(
+    services: &ServiceMap,
+    runtimes: &HashMap<ServiceID, ServiceRuntime>,
+    service: &crate::service::Service,
+) -> Option<DependencyFailure> {
+    let mut visiting = vec![service.id.clone()];
+    service
+        .spec
+        .depends_on
+        .iter()
+        .find_map(|dependency| unmeetable_dependency(services, runtimes, dependency, &mut visiting))
+}
+
+fn unmeetable_dependency(
+    services: &ServiceMap,
+    runtimes: &HashMap<ServiceID, ServiceRuntime>,
+    dependency: &DependencySpec,
+    visiting: &mut Vec<ServiceID>,
+) -> Option<DependencyFailure> {
+    let failure = |reason, exit_code| DependencyFailure {
+        service: dependency.service.clone(),
+        condition: dependency.condition,
+        reason,
+        exit_code,
+        via: Vec::new(),
+    };
+    let (Some(runtime), Some(service)) = (
+        runtimes.get(&dependency.service),
+        services.get(&dependency.service),
+    ) else {
+        return Some(failure(DependencyFailureReason::Missing, None));
+    };
+    if runtime.is_retired() {
+        return Some(failure(
+            DependencyFailureReason::Retired,
+            runtime.last_exit_code,
+        ));
+    }
+    if runtime.desired == DesiredState::Disabled {
+        return Some(failure(
+            DependencyFailureReason::Disabled,
+            runtime.last_exit_code,
+        ));
+    }
+    // A live run keeps the healthcheck it started with; the configured one applies to the next
+    // run, including one a pending restart is about to start.
+    let has_healthcheck = match (&runtime.running, &runtime.run_config) {
+        (Some(_), Some(run_config)) if !runtime.start_requested => run_config.healthcheck.is_some(),
+        _ => service.spec.healthcheck.is_some(),
+    };
+    if dependency.condition == DependencyCondition::Healthy && !has_healthcheck {
+        return Some(failure(
+            DependencyFailureReason::NoHealthcheck,
+            runtime.last_exit_code,
+        ));
+    }
+    if runtime.running.is_some() {
+        return None;
+    }
+    // A requested start still waits for the dependency's own dependencies.
+    match runtime.state {
+        _ if runtime.start_requested => {}
+        State::Exited { exit_code } => {
+            let completed = dependency.condition == DependencyCondition::CompletedSuccessfully
+                && exit_code == 0;
+            if completed {
+                return None;
+            }
+            if !runtime.will_auto_restart(&service.spec.restart, exit_code) {
+                return Some(failure(DependencyFailureReason::Exited, Some(exit_code)));
+            }
+        }
+        State::Pending => {}
+        State::Starting | State::Running { .. } | State::Killed | State::Disabled => return None,
+    }
+
+    // The dependency still has to start, which it never will while one of its own dependencies
+    // is stuck. The graph is acyclic, but a cycle guard costs nothing.
+    if visiting.contains(&dependency.service) {
+        return None;
+    }
+    visiting.push(dependency.service.clone());
+    let nested = service
+        .spec
+        .depends_on
+        .iter()
+        .find_map(|nested| unmeetable_dependency(services, runtimes, nested, visiting));
+    visiting.pop();
+    nested.map(|mut failure| {
+        failure.via.insert(0, dependency.service.clone());
+        failure
+    })
+}
+
 enum StartCheck {
     Skip,
     Consider { exited_code: Option<i32> },
@@ -161,23 +261,39 @@ fn record_dependency_block(
         .iter()
         .map(|dependency| dependency.service.clone())
         .collect::<Vec<_>>();
+    let failure = dependency_failure(ctx.services, ctx.runtimes, service);
     let Some(runtime) = ctx.runtimes.get_mut(service_id) else {
         return;
     };
-    if runtime.blocked_on == blocked_on {
+    let blockers_changed = runtime.blocked_on != blocked_on;
+    let failure_changed = runtime.dependency_failure != failure;
+    if !blockers_changed && !failure_changed {
         return;
     }
     runtime.blocked_on.clone_from(&blocked_on);
+    runtime.dependency_failure.clone_from(&failure);
     let generation = runtime.run_generation();
     sync_model(ctx.writer, service, runtime);
 
-    let mut event = service_event(
-        generation,
-        ServiceEventKind::DependencyBlocked,
-        format!("waiting for {}", describe_blockers(blocked)),
-    );
-    event.blocked_on = Some(blocked_on);
-    ctx.writer.append_event(service_id, event);
+    if blockers_changed {
+        let mut event = service_event(
+            generation,
+            ServiceEventKind::DependencyBlocked,
+            format!("waiting for {}", describe_blockers(blocked)),
+        );
+        event.blocked_on = Some(blocked_on.clone());
+        ctx.writer.append_event(service_id, event);
+    }
+    if failure_changed && let Some(failure) = failure {
+        let mut event = service_event(
+            generation,
+            ServiceEventKind::DependencyFailed,
+            failure.describe(),
+        );
+        event.exit_code = failure.exit_code;
+        event.blocked_on = Some(blocked_on);
+        ctx.writer.append_event(service_id, event);
+    }
 }
 
 /// Forget a recorded dependency block once the service stops being a start candidate — it was
@@ -195,6 +311,7 @@ fn clear_dependency_block(
         return;
     }
     runtime.blocked_on.clear();
+    runtime.dependency_failure = None;
     sync_model(ctx.writer, service, runtime);
 }
 
@@ -298,6 +415,7 @@ fn start_service_if_ready(
     };
     if !runtime.blocked_on.is_empty() {
         runtime.blocked_on.clear();
+        runtime.dependency_failure = None;
         ctx.writer.append_event(
             service_id,
             service_event(

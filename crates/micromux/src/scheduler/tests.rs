@@ -5237,6 +5237,335 @@ async fn dynamic_clones_do_not_inherit_the_cleanup() -> eyre::Result<()> {
 
     assert_eq!(stopped.last_cleanup, None);
     assert!(!dir.path().join("cleaned").exists());
+fn depends_on(name: &str, condition: config::DependencyCondition) -> config::Dependency {
+    config::Dependency {
+        name: spanned_string(name),
+        condition: Some(Spanned {
+            span: yaml_spanned::spanned::Span::default(),
+            inner: condition,
+        }),
+    }
+}
+
+/// `seed` succeeds once `marker` exists, `worker` waits for it to complete, and `api` waits for
+/// `worker` to start.
+fn seed_worker_api(marker: &Path) -> eyre::Result<ServiceMap> {
+    let config_dir = Path::new(".");
+    let marker_arg = format!("test -f '{}'", marker.display());
+    let mut services = ServiceMap::new();
+    services.insert(
+        "seed".to_string(),
+        Service::new(
+            "seed",
+            config_dir,
+            service_config("seed", ("sh", &["-c", &marker_arg])),
+        )?,
+    );
+    let mut worker_cfg = service_config("worker", ("sh", &["-c", "sleep 60"]));
+    worker_cfg.depends_on = vec![depends_on(
+        "seed",
+        config::DependencyCondition::CompletedSuccessfully,
+    )];
+    services.insert(
+        "worker".to_string(),
+        Service::new("worker", config_dir, worker_cfg)?,
+    );
+    let mut api_cfg = service_config("api", ("sh", &["-c", "sleep 60"]));
+    api_cfg.depends_on = vec![depends_on("worker", config::DependencyCondition::Started)];
+    services.insert("api".to_string(), Service::new("api", config_dir, api_cfg)?);
+    Ok(services)
+}
+
+/// A dependency that exited and will not restart fails its dependents, and the dependents of
+/// those, until a restart revives it; the restart's acknowledgement already clears the failure.
+///
+/// The test runs the scheduler on another worker thread, so a reply sent before the scheduling
+/// pass the restart triggers would let the reads below race that pass.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dependency_that_will_not_restart_fails_its_dependents_transitively() -> eyre::Result<()>
+{
+    let dir = unique_tmp_dir("dependency-failure");
+    fs::create_dir_all(&dir)?;
+    let marker = dir.join("seeded");
+    let services = seed_worker_api(&marker)?;
+    let harness = spawn_harness(services, None);
+
+    let worker = wait_until(&harness.reader, "worker", |snapshot| {
+        snapshot.dependency_failure.is_some()
+    })
+    .await?;
+    assert_eq!(worker.execution, Execution::Blocked);
+    assert_eq!(
+        worker.dependency_failure,
+        Some(crate::DependencyFailure {
+            service: "seed".to_string(),
+            condition: config::DependencyCondition::CompletedSuccessfully,
+            reason: crate::DependencyFailureReason::Exited,
+            exit_code: Some(1),
+            via: Vec::new(),
+        })
+    );
+    let api = wait_until(&harness.reader, "api", |snapshot| {
+        snapshot.dependency_failure.is_some()
+    })
+    .await?;
+    assert_eq!(api.execution, Execution::Blocked);
+    assert_eq!(
+        api.dependency_failure,
+        Some(crate::DependencyFailure {
+            service: "seed".to_string(),
+            condition: config::DependencyCondition::CompletedSuccessfully,
+            reason: crate::DependencyFailureReason::Exited,
+            exit_code: Some(1),
+            via: vec!["worker".to_string()],
+        })
+    );
+    let failed = harness
+        .reader
+        .events("api", None, None)
+        .0
+        .into_iter()
+        .filter(|event| event.kind == ServiceEventKind::DependencyFailed)
+        .map(|event| event.detail)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        failed,
+        vec![
+            "dependency `seed` (through `worker`) exited with code 1 and will not restart, so it \
+             cannot complete successfully"
+                .to_string()
+        ]
+    );
+
+    // Restarting the blocked `worker` cannot get past `seed`, so `api` stays failed.
+    accepted(harness.control.restart(&"worker".to_string()).await)?;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    for service in ["worker", "api"] {
+        assert_eq!(
+            harness
+                .reader
+                .service(service)
+                .and_then(|snapshot| snapshot.dependency_failure)
+                .map(|failure| failure.service),
+            Some("seed".to_string()),
+            "{service} lost the failure when the blocked worker was restarted"
+        );
+    }
+
+    fs::write(&marker, "")?;
+    accepted(harness.control.restart(&"seed".to_string()).await)?;
+    assert_eq!(
+        harness
+            .reader
+            .service("seed")
+            .map(|snapshot| snapshot.run_generation),
+        Some(2),
+        "the restart was acknowledged before the pass that starts it"
+    );
+    for service in ["worker", "api"] {
+        assert_eq!(
+            harness
+                .reader
+                .service(service)
+                .and_then(|snapshot| snapshot.dependency_failure),
+            None,
+            "{service} still reported the failure once the restart was acknowledged"
+        );
+    }
+    wait_until(&harness.reader, "api", |snapshot| {
+        snapshot.execution == Execution::Running
+    })
+    .await?;
+
+    harness.shutdown.cancel();
+    harness.handle.await??;
+    let _ = fs::remove_dir_all(&dir);
+    Ok(())
+}
+
+/// A dependency that can still restart on its own is not a failure, and neither is a disabled
+/// dependency's dependent once the dependency is enabled again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn only_dependencies_that_cannot_recover_on_their_own_fail_their_dependents()
+-> eyre::Result<()> {
+    let config_dir = Path::new(".");
+    let mut services = ServiceMap::new();
+    let mut flaky_cfg = service_config("flaky", ("sh", &["-c", "exit 2"]));
+    flaky_cfg.restart_policy = RestartPolicy::OnFailure {
+        max_attempts: Some(2),
+    };
+    services.insert(
+        "flaky".to_string(),
+        Service::new("flaky", config_dir, flaky_cfg)?,
+    );
+    let mut gate_cfg = service_config("gate", ("sh", &["-c", "sleep 60"]));
+    gate_cfg.startup_mode = StartupMode::Disabled;
+    services.insert(
+        "gate".to_string(),
+        Service::new("gate", config_dir, gate_cfg)?,
+    );
+    let mut app_cfg = service_config("app", ("sh", &["-c", "sleep 60"]));
+    app_cfg.depends_on = vec![depends_on(
+        "flaky",
+        config::DependencyCondition::CompletedSuccessfully,
+    )];
+    services.insert("app".to_string(), Service::new("app", config_dir, app_cfg)?);
+    let mut web_cfg = service_config("web", ("sh", &["-c", "sleep 60"]));
+    web_cfg.depends_on = vec![depends_on("gate", config::DependencyCondition::Started)];
+    services.insert("web".to_string(), Service::new("web", config_dir, web_cfg)?);
+    let harness = spawn_harness(services, None);
+
+    let web = wait_until(&harness.reader, "web", |snapshot| {
+        snapshot.dependency_failure.is_some()
+    })
+    .await?;
+    assert_eq!(
+        web.dependency_failure
+            .as_ref()
+            .map(|failure| (failure.service.as_str(), failure.reason)),
+        Some(("gate", crate::DependencyFailureReason::Disabled))
+    );
+
+    // `flaky` fails only once its restart budget is spent: three runs in all.
+    let app = wait_until(&harness.reader, "app", |snapshot| {
+        snapshot.dependency_failure.is_some()
+    })
+    .await?;
+    assert_eq!(
+        harness
+            .reader
+            .service("flaky")
+            .map(|snapshot| snapshot.run_generation),
+        Some(3)
+    );
+    assert_eq!(
+        app.dependency_failure
+            .as_ref()
+            .map(|failure| (failure.reason, failure.exit_code)),
+        Some((crate::DependencyFailureReason::Exited, Some(2)))
+    );
+    let blocked_while_restarting = harness
+        .reader
+        .events("app", None, None)
+        .0
+        .iter()
+        .filter(|event| event.kind == ServiceEventKind::DependencyFailed)
+        .count();
+    assert_eq!(blocked_while_restarting, 1);
+
+    accepted(harness.control.enable(&"gate".to_string()).await)?;
+    assert_eq!(
+        harness
+            .reader
+            .service("web")
+            .and_then(|snapshot| snapshot.dependency_failure),
+        None
+    );
+    wait_until(&harness.reader, "web", |snapshot| {
+        snapshot.execution == Execution::Running
+    })
+    .await?;
+
+    harness.shutdown.cancel();
+    harness.handle.await??;
+    Ok(())
+}
+
+/// A `healthy` condition on a dependency without a healthcheck can never be met.
+#[tokio::test]
+async fn a_healthy_condition_on_a_dependency_without_a_healthcheck_fails() -> eyre::Result<()> {
+    let config_dir = Path::new(".");
+    let mut services = ServiceMap::new();
+    services.insert(
+        "db".to_string(),
+        Service::new(
+            "db",
+            config_dir,
+            service_config("db", ("sh", &["-c", "sleep 60"])),
+        )?,
+    );
+    let mut api_cfg = service_config("api", ("sh", &["-c", "sleep 60"]));
+    api_cfg.depends_on = vec![depends_on("db", config::DependencyCondition::Healthy)];
+    services.insert("api".to_string(), Service::new("api", config_dir, api_cfg)?);
+    let harness = spawn_harness(services, None);
+
+    let api = wait_until(&harness.reader, "api", |snapshot| {
+        snapshot.dependency_failure.is_some()
+    })
+    .await?;
+    assert_eq!(
+        api.dependency_failure
+            .map(|failure| (failure.service, failure.reason)),
+        Some((
+            "db".to_string(),
+            crate::DependencyFailureReason::NoHealthcheck
+        ))
+    );
+
+    harness.shutdown.cancel();
+    harness.handle.await??;
+    Ok(())
+}
+
+/// A running dependency keeps the healthcheck it started with, so adding one to its config does
+/// not clear the failure until the dependency restarts with it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_missing_healthcheck_is_judged_by_the_running_process() -> eyre::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let config_path = dir.path().join("micromux.yaml");
+    let yaml = |healthcheck: &str| {
+        format!(
+            r#"version: "1"
+services:
+  db:
+    command: ["sh", "-c", "sleep 60"]{healthcheck}
+  api:
+    command: ["sh", "-c", "sleep 60"]
+    depends_on:
+      - name: db
+        condition: healthy
+"#
+        )
+    };
+    fs::write(&config_path, yaml(""))?;
+    let harness = spawn_harness(
+        services_from_config_path(&config_path)?,
+        Some(reload_config(&config_path)?),
+    );
+    let reason = |harness: &Harness| {
+        harness
+            .reader
+            .service("api")
+            .and_then(|snapshot| snapshot.dependency_failure)
+            .map(|failure| failure.reason)
+    };
+    wait_until(&harness.reader, "api", |snapshot| {
+        snapshot.dependency_failure.is_some()
+    })
+    .await?;
+    assert_eq!(
+        reason(&harness),
+        Some(crate::DependencyFailureReason::NoHealthcheck)
+    );
+
+    fs::write(
+        &config_path,
+        yaml("\n    healthcheck:\n      test: [\"CMD\", \"true\"]\n      interval: 100ms"),
+    )?;
+    reconcile_accepted(harness.control.reconcile_config(false).await)?;
+    assert_eq!(
+        reason(&harness),
+        Some(crate::DependencyFailureReason::NoHealthcheck),
+        "the running db has no probe, whatever its config says now"
+    );
+
+    accepted(harness.control.restart(&"db".to_string()).await)?;
+    assert_eq!(reason(&harness), None);
+    wait_until(&harness.reader, "api", |snapshot| {
+        snapshot.execution == Execution::Running
+    })
+    .await?;
+
     harness.shutdown.cancel();
     harness.handle.await??;
     Ok(())

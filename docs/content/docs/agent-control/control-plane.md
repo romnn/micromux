@@ -25,6 +25,8 @@ micromux ctl restart-all
 micromux ctl enable worker            # enable (and start)
 micromux ctl disable worker
 micromux ctl health payments          # latest healthcheck attempt (--history for all)
+micromux ctl wait api                 # block until api is healthy (or fail fast)
+micromux ctl wait migrate --exit      # block until a one-shot run exits
 micromux ctl describe                 # session identity, browser URLs, allocated ports
 micromux ctl stop                     # stop the whole session, freeing its ports
 ```
@@ -38,6 +40,31 @@ Because these go through the control plane, a restart re-applies dependency gati
 {{< terminal name="health" >}}
 
 Add `--history` to see the retained attempts (oldest first) instead of only the latest — useful when a probe is flapping.
+
+### Waiting from a script
+
+`micromux ctl wait <id>` blocks until a service is up, and healthy if it has a healthcheck. With `--exit` it waits for the service's run to exit instead, for one-shot jobs such as migrations. It gives up after `--timeout` (default `60s`), and `--after-generation <n>` accepts only a run newer than generation `n`, such as the one `ctl restart` printed.
+
+A wait does not hang on something that cannot happen. It fails at once when the service is disabled or retired, or when it is blocked behind a dependency that will not meet its condition without your help: one that exited and whose restart policy will not start it again, that is disabled or retired, or that is waited on as `healthy` but has no healthcheck, directly or further down the chain. The message names that dependency, its state, and its exit code.
+
+The exit code tells the outcomes apart:
+
+| Code | Meaning |
+|---|---|
+| `0` | The service is healthy; with `--exit`, its run exited with status 0. |
+| `3` | The run exited instead; with `--exit`, it exited with a non-zero status. |
+| `4` | The service is blocked behind a dependency that failed. |
+| `5` | The service is disabled or retired. |
+| `124` | The timeout elapsed. |
+
+After a restart, pass the generation `ctl restart` printed, so the wait cannot settle on the run the restart replaced:
+
+```bash
+generation=$(micromux ctl restart seed | sed -n 's/.*(generation \([0-9]*\)).*/\1/p')
+micromux ctl wait seed --exit --after-generation "$generation" && micromux ctl wait api
+```
+
+The MCP `wait_for_healthy` and `wait_for_exit` tools follow the same rules; a dependency failure comes back as an error whose data names the failed dependency.
 
 ## Headless sessions: `micromux serve`
 
@@ -66,4 +93,4 @@ Reconciliation **adds** newly-defined services, **retires** removed ones, and **
 
 ## Protocol compatibility
 
-Protocol 3 peers accept additive fields from newer minor revisions. Revision 3.8 changed transient disk-log rotation and reader saturation failures from `LimitExceeded` to the retryable `Busy` code. Revision 3.9 distinguishes an uninitialized disk-reader pool and reports reads that still occupy workers after their callers leave. Revision 3.11 adds `session` to the session description: its name, [browser URLs and allocated ports]({{< relref "../configuration/sessions.md" >}}), and whether the shared proxy serves its routes. Revision 3.12 adds `last_cleanup` to service snapshots and the `CleanupStarted`, `CleanupFinished`, and `CleanupFailed` event kinds for [cleanup commands]({{< relref "../configuration/services.md" >}}#cleanup); older peers read the new kinds as `Unknown`.
+Protocol 3 peers accept additive fields from newer minor revisions. Revision 3.8 changed transient disk-log rotation and reader saturation failures from `LimitExceeded` to the retryable `Busy` code. Revision 3.9 distinguishes an uninitialized disk-reader pool and reports reads that still occupy workers after their callers leave. Revision 3.11 adds `session` to the session description: its name, [browser URLs and allocated ports]({{< relref "../configuration/sessions.md" >}}), and whether the shared proxy serves its routes. Revision 3.12 adds `last_cleanup` to service snapshots and the `CleanupStarted`, `CleanupFinished`, and `CleanupFailed` event kinds for [cleanup commands]({{< relref "../configuration/services.md" >}}#cleanup); older peers read the new kinds as `Unknown`. Revision 3.13 adds `dependency_failure` to service snapshots, naming the dependency that keeps a blocked service from ever starting on its own, and the `DependencyFailed` event kind.
