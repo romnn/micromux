@@ -294,6 +294,9 @@ impl Project {
         command.env_remove("XDG_CONFIG_HOME");
         command.env_remove("MICROMUX_MOUSE");
         command.env_remove("MICROMUX_COPY_ON_SELECT");
+        // Outside tmux, unless a test puts micromux in a tmux of its own.
+        command.env_remove("TMUX");
+        command.env_remove("TMUX_PANE");
         // A copy would otherwise also reach the desktop's clipboard, overwriting the user's.
         command.env_remove("DISPLAY");
         command.env_remove("WAYLAND_DISPLAY");
@@ -304,6 +307,30 @@ impl Project {
         let mut all = vec!["--no-control"];
         all.extend_from_slice(args);
         Terminal::spawn(self.command(MICROMUX, &all))
+    }
+
+    /// micromux as if inside tmux, whose `tmux` command says it reports extended keys in
+    /// `format`.
+    fn micromux_in_tmux(&self, format: &str) -> eyre::Result<Terminal> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let bin = self.directory.path().join("bin");
+        std::fs::create_dir_all(&bin)?;
+        let tmux = bin.join("tmux");
+        std::fs::write(
+            &tmux,
+            format!(
+                "#!/bin/sh\n[ \"$*\" = \"show-options -sv extended-keys-format\" ] && echo {format}\n"
+            ),
+        )?;
+        std::fs::set_permissions(&tmux, std::fs::Permissions::from_mode(0o755))?;
+        let mut command = self.command(MICROMUX, &["--no-control"]);
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let mut paths = vec![bin];
+        paths.extend(std::env::split_paths(&path));
+        command.env("PATH", std::env::join_paths(paths)?);
+        command.env("TMUX", "/tmp/tmux-test/default,1,0");
+        Terminal::spawn(command)
     }
 }
 
@@ -323,6 +350,23 @@ fn find(screen: &vt100::Screen, needle: &str) -> eyre::Result<(u16, u16)> {
 fn mouse_report(code: u8, (column, row): (u16, u16), pressed: bool) -> Vec<u8> {
     let end = if pressed { 'M' } else { 'm' };
     format!("\x1b[<{code};{};{}{end}", column + 1, row + 1).into_bytes()
+}
+
+/// Waits for the service's output, focuses the logs with a click on the focus hint and selects
+/// `hello`.
+fn focus_the_logs_and_select_hello(tui: &mut Terminal) -> eyre::Result<()> {
+    tui.wait_for_tui()?;
+    // A frame can arrive in pieces, so its footer may follow the service's output.
+    tui.wait_until("the service's output and the focus hint", |screen, _| {
+        screen.contents().contains("hello world") && screen.contents().contains("Tab Focus")
+    })?;
+    let hint = find(tui.parser.screen(), "Tab Focus")?;
+    tui.send(&mouse_report(0, hint, true))?;
+    tui.send(&mouse_report(0, hint, false))?;
+    tui.wait_until("the logs to take the focus", |screen, _| {
+        screen.contents().contains("Focus:LOGS")
+    })?;
+    select_hello(tui)
 }
 
 /// Selects `hello` in the logs by dragging over it, which copies nothing yet.
@@ -410,8 +454,9 @@ fn mouse_capture_is_released_by_the_toggle_a_suspend_and_quitting() -> eyre::Res
     tui.wait_until("mouse capture", |screen, _| {
         screen.mouse_protocol_mode() == MouseProtocolMode::ButtonMotion
     })?;
-    tui.wait_until("the service's output", |screen, _| {
-        screen.contents().contains("hello world")
+    // A frame can arrive in pieces, so its footer may follow the service's output.
+    tui.wait_until("the service's output and the focus hint", |screen, _| {
+        screen.contents().contains("hello world") && screen.contents().contains("Tab Focus")
     })?;
 
     // A click on a hint runs its key, as the terminal reports it.
@@ -514,17 +559,7 @@ fn mouse_capture_is_released_by_the_toggle_a_suspend_and_quitting() -> eyre::Res
 fn without_the_keyboard_protocol_ctrl_shift_c_is_a_harmless_ctrl_c() -> eyre::Result<()> {
     let project = Project::new(CONFIG)?;
     let mut tui = project.micromux(&[])?;
-    tui.wait_for_tui()?;
-    tui.wait_until("the service's output", |screen, _| {
-        screen.contents().contains("hello world")
-    })?;
-    let hint = find(tui.parser.screen(), "Tab Focus")?;
-    tui.send(&mouse_report(0, hint, true))?;
-    tui.send(&mouse_report(0, hint, false))?;
-    tui.wait_until("the logs to take the focus", |screen, _| {
-        screen.contents().contains("Focus:LOGS")
-    })?;
-    select_hello(&mut tui)?;
+    focus_the_logs_and_select_hello(&mut tui)?;
 
     tui.send(b"\x03")?;
     wait_out_the_quit_hint(&mut tui)?;
@@ -534,6 +569,50 @@ fn without_the_keyboard_protocol_ctrl_shift_c_is_a_harmless_ctrl_c() -> eyre::Re
     wait_for_copies(&mut tui, "the copy with Ctrl+Insert", 1)?;
     tui.quit()?;
     assert!(!contains(&tui.written, b"\x1b[>"));
+    Ok(())
+}
+
+/// Inside tmux, which has no kitty keyboard protocol but reports extended keys as CSI u where set
+/// to, micromux asks for modifyOtherKeys, so Ctrl+Shift+C arrives apart from Ctrl-C and copies,
+/// and resets it on the way out.
+#[test]
+fn inside_tmux_modify_other_keys_makes_ctrl_shift_c_copy() -> eyre::Result<()> {
+    const ON: &[u8] = b"\x1b[>4;2m";
+    const RESET: &[u8] = b"\x1b[>4m";
+
+    let project = Project::new(CONFIG)?;
+    let mut tui = project.micromux_in_tmux("csi-u")?;
+    focus_the_logs_and_select_hello(&mut tui)?;
+    assert_eq!(tui.count(ON), 1);
+    assert!(!contains(&tui.written, KEYBOARD_PUSH));
+
+    // Ctrl+Shift+C, as tmux reports it, copies; Ctrl-C, in either form, only says that `q`
+    // quits.
+    tui.send(b"\x1b[99;6u")?;
+    wait_for_copies(&mut tui, "the copy with Ctrl+Shift+C", 1)?;
+    tui.send(b"\x1b[99;5u")?;
+    tui.send(b"\x03")?;
+    wait_out_the_quit_hint(&mut tui)?;
+    assert_eq!(tui.count(HELLO_COPIED), 1);
+
+    // Quitting resets it before leaving the alternate screen.
+    let before = tui.written.len();
+    tui.quit()?;
+    let after = tui.written.get(before..).unwrap_or_default();
+    let reset = position(after, RESET);
+    assert!(
+        reset.is_some() && reset < position(after, b"\x1b[?1049l"),
+        "{:?}",
+        String::from_utf8_lossy(after)
+    );
+    assert_eq!(tui.count(RESET), 1);
+
+    // tmux's default form for extended keys is one micromux cannot read, so it asks for none.
+    let project = Project::new(CONFIG)?;
+    let mut tui = project.micromux_in_tmux("xterm")?;
+    tui.wait_for_tui()?;
+    tui.quit()?;
+    assert!(!contains(&tui.written, b"\x1b[>4"));
     Ok(())
 }
 

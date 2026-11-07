@@ -8,7 +8,7 @@
 
 use std::fmt;
 use std::io::{self, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Once, OnceLock};
 
 #[cfg(windows)]
@@ -32,9 +32,25 @@ static SCREEN: AtomicBool = AtomicBool::new(false);
 /// Whether the terminal reports the mouse.
 static MOUSE: AtomicBool = AtomicBool::new(false);
 
-/// Whether the TUI pushed its kitty keyboard flags onto the alternate screen's stack, which it
-/// does once at most, so a single pop takes them off.
-static KEYBOARD: AtomicBool = AtomicBool::new(false);
+/// Which keyboard reporting the TUI asked for, as a [`Keyboard`], which it does once at most, so
+/// a single reset takes it back.
+static KEYBOARD: AtomicU8 = AtomicU8::new(Keyboard::Legacy as u8);
+
+/// How the terminal reports keys micromux asked it to report apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum Keyboard {
+    /// As terminals do by default, Ctrl+Shift+C as Ctrl-C.
+    Legacy = 0,
+    /// The kitty keyboard protocol's flags, pushed onto the alternate screen's stack.
+    Kitty = 1,
+    /// xterm's modifyOtherKeys at level 2, which tmux turns into CSI u reports.
+    ModifyOtherKeys = 2,
+}
+
+/// The sequences that ask for modifyOtherKeys at level 2 and reset it.
+const MODIFY_OTHER_KEYS_ON: &[u8] = b"\x1b[>4;2m";
+const MODIFY_OTHER_KEYS_RESET: &[u8] = b"\x1b[>4m";
 
 /// What the TUI asks of the kitty keyboard protocol: Ctrl+Shift+C reported apart from Ctrl-C and
 /// Super+C reported at all, so the terminals' copy shortcuts arrive, Alt+Esc apart from Esc, so
@@ -120,10 +136,10 @@ pub(crate) fn take_over(mouse: bool) -> io::Result<()> {
     }
     enable_raw_mode()?;
     // Asked before anything else, so the reader is not running yet.
-    has_keyboard_protocol();
+    let keyboard = keyboard();
     SCREEN.store(true, Ordering::SeqCst);
     execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
-    push_keyboard_flags_on(&mut stdout, has_keyboard_protocol())?;
+    ask_for_keyboard_on(&mut stdout, keyboard)?;
     if mouse {
         MOUSE.store(true, Ordering::SeqCst);
         execute!(stdout, EnableButtonMouseCapture)?;
@@ -131,16 +147,106 @@ pub(crate) fn take_over(mouse: bool) -> io::Result<()> {
     Ok(())
 }
 
-/// Pushes the kitty keyboard flags where the terminal has the protocol, once at most however
-/// often the terminal is taken again, so the single pop in [`give_back`] takes them off.
-fn push_keyboard_flags_on(out: &mut impl Write, supported: bool) -> io::Result<()> {
-    // The main and alternate screens keep separate flag stacks, so the flags only go onto the
-    // alternate screen's, and come off before leaving it.
-    if !supported || !SCREEN.load(Ordering::SeqCst) || KEYBOARD.swap(true, Ordering::SeqCst) {
+/// Asks the terminal to report keys as `keyboard` says, once at most however often the terminal
+/// is taken again, so the single reset in [`give_back`] takes it back.
+fn ask_for_keyboard_on(out: &mut impl Write, keyboard: Keyboard) -> io::Result<()> {
+    // The main and alternate screens keep separate kitty flag stacks, so the flags only go onto
+    // the alternate screen's, and come off before leaving it.
+    if keyboard == Keyboard::Legacy || !SCREEN.load(Ordering::SeqCst) {
         return Ok(());
     }
-    log_keyboard(&format!("pushed kitty keyboard flags {KEYBOARD_FLAGS:?}"));
-    execute!(out, PushKeyboardEnhancementFlags(KEYBOARD_FLAGS))
+    if KEYBOARD
+        .compare_exchange(
+            Keyboard::Legacy as u8,
+            keyboard as u8,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        )
+        .is_err()
+    {
+        return Ok(());
+    }
+    match keyboard {
+        Keyboard::Kitty => {
+            log_keyboard(&format!("pushed kitty keyboard flags {KEYBOARD_FLAGS:?}"));
+            execute!(out, PushKeyboardEnhancementFlags(KEYBOARD_FLAGS))
+        }
+        Keyboard::ModifyOtherKeys => {
+            log_keyboard("asked for modifyOtherKeys at level 2");
+            out.write_all(MODIFY_OTHER_KEYS_ON)?;
+            out.flush()
+        }
+        Keyboard::Legacy => Ok(()),
+    }
+}
+
+/// Which keyboard reporting to ask the terminal for, decided once: the kitty protocol where the
+/// terminal has it, else modifyOtherKeys where tmux passes it on as CSI u, else none.
+fn keyboard() -> Keyboard {
+    static CHOSEN: OnceLock<Keyboard> = OnceLock::new();
+    *CHOSEN.get_or_init(|| {
+        if has_keyboard_protocol() {
+            Keyboard::Kitty
+        } else if tmux_reports_keys_as_csi_u() {
+            Keyboard::ModifyOtherKeys
+        } else {
+            Keyboard::Legacy
+        }
+    })
+}
+
+/// Whether micromux runs inside tmux set to report extended keys as CSI u, the form crossterm
+/// reads.
+///
+/// tmux does not speak the kitty protocol, but with `extended-keys` on it reports the keys a pane
+/// asks for with modifyOtherKeys, Ctrl+Shift+C apart from Ctrl-C. Its default form, xterm's
+/// `CSI 27;…~`, is one crossterm cannot read, and xterm itself only sends that form, so
+/// modifyOtherKeys is asked for nowhere else.
+fn tmux_reports_keys_as_csi_u() -> bool {
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    /// How long tmux may take to answer before micromux starts without it.
+    const ANSWER_WITHIN: Duration = Duration::from_millis(500);
+
+    if std::env::var_os("TMUX").is_none_or(|value| value.is_empty()) {
+        return false;
+    }
+    let Ok(mut child) = Command::new("tmux")
+        .args(["show-options", "-sv", "extended-keys-format"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    let deadline = Instant::now() + ANSWER_WITHIN;
+    let answered = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status.success(),
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
+            _ => {
+                child.kill().ok();
+                child.wait().ok();
+                break false;
+            }
+        }
+    };
+    let mut format = String::new();
+    if answered && let Some(mut stdout) = child.stdout.take() {
+        std::io::Read::read_to_string(&mut stdout, &mut format).ok();
+    }
+    let csi_u = format.trim() == "csi-u";
+    log_keyboard(&format!(
+        "tmux reports extended keys as {:?}",
+        if answered {
+            format.trim()
+        } else {
+            "(no answer)"
+        }
+    ));
+    csi_u
 }
 
 /// Turns mouse capture on or off while the TUI shows.
@@ -176,8 +282,15 @@ fn give_back_on(
             first = result;
         }
     };
-    if KEYBOARD.swap(false, Ordering::SeqCst) {
-        step(execute!(out, PopKeyboardEnhancementFlags));
+    match KEYBOARD.swap(Keyboard::Legacy as u8, Ordering::SeqCst) {
+        kitty if kitty == Keyboard::Kitty as u8 => step(execute!(out, PopKeyboardEnhancementFlags)),
+        other if other == Keyboard::ModifyOtherKeys as u8 => {
+            step(
+                out.write_all(MODIFY_OTHER_KEYS_RESET)
+                    .and_then(|()| out.flush()),
+            );
+        }
+        _ => {}
     }
     if MOUSE.swap(false, Ordering::SeqCst) {
         step(execute!(out, DisableMouseCapture));
@@ -266,7 +379,8 @@ impl Continued {
 #[cfg(test)]
 mod tests {
     use super::{
-        KEYBOARD, MOUSE, RAW, SCREEN, give_back_on, push_keyboard_flags_on, set_mouse_capture_on,
+        KEYBOARD, Keyboard, MOUSE, RAW, SCREEN, ask_for_keyboard_on, give_back_on,
+        set_mouse_capture_on,
     };
     use color_eyre::eyre;
     use similar_asserts::assert_eq;
@@ -277,6 +391,8 @@ mod tests {
     const LEAVE_SCREEN: &str = "\x1b[?1049l";
     const KEYBOARD_POP: &str = "\x1b[<1u";
     const KEYBOARD_PUSH: &str = "\x1b[>5u";
+    const MODIFY_OTHER_KEYS_ON: &str = "\x1b[>4;2m";
+    const MODIFY_OTHER_KEYS_RESET: &str = "\x1b[>4m";
 
     fn written(out: &[u8]) -> String {
         String::from_utf8_lossy(out).into_owned()
@@ -290,7 +406,7 @@ mod tests {
         // screen and turns raw mode off.
         RAW.store(true, Ordering::SeqCst);
         SCREEN.store(true, Ordering::SeqCst);
-        KEYBOARD.store(true, Ordering::SeqCst);
+        KEYBOARD.store(Keyboard::Kitty as u8, Ordering::SeqCst);
         MOUSE.store(true, Ordering::SeqCst);
         let mut out = Vec::new();
         let mut raw_disabled = 0;
@@ -335,27 +451,35 @@ mod tests {
         assert_eq!(written(&out), MOUSE_ON);
         MOUSE.store(false, Ordering::SeqCst);
 
-        // The keyboard flags go on once however often the terminal is taken, as when it is taken
-        // again without having been given back, so the one pop on the way out leaves the stack
-        // as it was.
-        SCREEN.store(true, Ordering::SeqCst);
-        let mut out = Vec::new();
-        push_keyboard_flags_on(&mut out, true)?;
-        push_keyboard_flags_on(&mut out, true)?;
-        give_back_on(&mut out, || Ok(()))?;
-        assert_eq!(
-            written(&out),
-            format!("{KEYBOARD_PUSH}{KEYBOARD_POP}\x1b[?2004l\x1b[?1049l\x1b[?25h")
-        );
+        // The keyboard reporting is asked for once however often the terminal is taken, as when
+        // it is taken again without having been given back, so the one reset on the way out
+        // takes it back, before leaving the alternate screen: the kitty flags, and likewise
+        // modifyOtherKeys.
+        let leave = "\x1b[?2004l\x1b[?1049l\x1b[?25h";
+        for (keyboard, on, off) in [
+            (Keyboard::Kitty, KEYBOARD_PUSH, KEYBOARD_POP),
+            (
+                Keyboard::ModifyOtherKeys,
+                MODIFY_OTHER_KEYS_ON,
+                MODIFY_OTHER_KEYS_RESET,
+            ),
+        ] {
+            SCREEN.store(true, Ordering::SeqCst);
+            let mut out = Vec::new();
+            ask_for_keyboard_on(&mut out, keyboard)?;
+            ask_for_keyboard_on(&mut out, keyboard)?;
+            give_back_on(&mut out, || Ok(()))?;
+            assert_eq!(written(&out), format!("{on}{off}{leave}"), "{keyboard:?}");
+        }
 
-        // Without the protocol, or off the alternate screen, nothing goes out.
+        // Legacy reporting, or a terminal off the alternate screen, gets nothing.
         let mut out = Vec::new();
         SCREEN.store(true, Ordering::SeqCst);
-        push_keyboard_flags_on(&mut out, false)?;
+        ask_for_keyboard_on(&mut out, Keyboard::Legacy)?;
         SCREEN.store(false, Ordering::SeqCst);
-        push_keyboard_flags_on(&mut out, true)?;
+        ask_for_keyboard_on(&mut out, Keyboard::Kitty)?;
         assert!(out.is_empty(), "{:?}", written(&out));
-        assert!(!KEYBOARD.load(Ordering::SeqCst));
+        assert_eq!(KEYBOARD.load(Ordering::SeqCst), Keyboard::Legacy as u8);
         Ok(())
     }
 }

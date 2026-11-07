@@ -1232,9 +1232,9 @@ fn is_copy_chord(key: crossterm::event::KeyEvent) -> bool {
 /// The bytes a terminal without the kitty keyboard protocol sends for `code` with `modifiers`,
 /// as xterm does, which is what a service in PTY input mode expects to read.
 ///
-/// micromux may have asked its own terminal for the kitty protocol, which reports keys such as
-/// Ctrl+Shift+C or Ctrl+I apart that legacy terminals send alike; this folds them back into the
-/// legacy bytes. Super and the other modifiers legacy terminals cannot send are left out.
+/// micromux may have asked its own terminal for the kitty protocol, or tmux for modifyOtherKeys,
+/// which report keys such as Ctrl+Shift+C or Ctrl+I apart that legacy terminals send alike; this
+/// folds them back into the legacy bytes. Super and the other modifiers legacy terminals cannot send are left out.
 fn key_event_to_bytes(
     code: crossterm::event::KeyCode,
     modifiers: crossterm::event::KeyModifiers,
@@ -2193,8 +2193,8 @@ mod tests {
     }
 
     /// Keys reach a service as the bytes a legacy terminal sends, whether micromux's terminal
-    /// reported them in legacy form or through the kitty keyboard protocol, which reports some
-    /// apart that legacy terminals send alike.
+    /// reported them in legacy form, through the kitty keyboard protocol or through tmux's
+    /// modifyOtherKeys reports, which report some keys apart that legacy terminals send alike.
     #[test]
     fn keys_reach_a_service_as_a_legacy_terminal_sends_them() {
         const NONE: KeyModifiers = KeyModifiers::NONE;
@@ -2236,6 +2236,10 @@ mod tests {
             (KeyCode::Char('x'), ALT, b"\x1bx"),
             (KeyCode::Char('a'), ALT | SHIFT, b"\x1bA"),
             (KeyCode::Char('>'), ALT, b"\x1b>"),
+            // As tmux reports keys under modifyOtherKeys: Alt+Shift+C as a capital with Alt
+            // alone, Ctrl+Shift+Z with both.
+            (KeyCode::Char('C'), ALT, b"\x1bC"),
+            (KeyCode::Char('z'), CTRL | SHIFT, b"\x1a"),
             (KeyCode::Char('c'), CTRL | ALT, b"\x1b\x03"),
             (KeyCode::Enter, ALT, b"\x1b\r"),
             (KeyCode::Backspace, ALT, b"\x1b\x7f"),

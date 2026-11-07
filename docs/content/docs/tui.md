@@ -82,11 +82,18 @@ Two things stand between these shortcuts and micromux:
   ```
 
   In WezTerm, a Lua `action_callback` can copy when `window:get_selection_text_for_pane(pane)` returns text and otherwise pass the key on with `window:perform_action(act.SendKey { key = 'c', mods = 'CTRL|SHIFT' }, pane)`. Where a terminal cannot pass the shortcut on, `Ctrl+Insert`, which few terminals bind, a right-click and `y` still copy.
-- **The kitty keyboard protocol tells `Ctrl+Shift+C` from `Ctrl-C`.** Without it, terminals send both as the same byte, and `Super` never reaches programs at all. micromux turns the protocol on wherever the terminal supports it, as Ghostty, kitty, WezTerm, foot and Alacritty do, and turns it off again whenever it lets go of the terminal. In a terminal without it, a copy shortcut passed on to programs arrives as `Ctrl-C`; that is the terminal's doing, not micromux's, and micromux then only says to press `q` to quit. tmux does not pass the protocol on either, so inside tmux `Ctrl+Shift+C` arrives as `Ctrl-C` too; `Ctrl+Insert`, a right-click and `y` still copy there.
+- **The kitty keyboard protocol tells `Ctrl+Shift+C` from `Ctrl-C`.** Without it, terminals send both as the same byte, and `Super` never reaches programs at all. micromux turns the protocol on wherever the terminal supports it, as Ghostty, kitty, WezTerm, foot and Alacritty do, and turns it off again whenever it lets go of the terminal. In a terminal without it, a copy shortcut passed on to programs arrives as `Ctrl-C`; that is the terminal's doing, not micromux's, and micromux then only says to press `q` to quit. tmux has no kitty protocol either, but it can report `Ctrl+Shift+C` apart in its own way: with
+
+  ```
+  set -s extended-keys on
+  set -s extended-keys-format csi-u
+  ```
+
+  in `~/.tmux.conf`, micromux asks tmux for these reports (xterm's modifyOtherKeys) and resets the request whenever it lets go of the terminal. tmux's default `extended-keys-format xterm` sends a form micromux cannot read, so there micromux asks for nothing, and `Ctrl+Shift+C` arrives as `Ctrl-C`; `Ctrl+Insert`, a right-click and `y` still copy. The terminal around tmux needs its copy shortcut passed on too, as above.
 
 To see what micromux receives, start it with `MICROMUX_DEBUG_KEYS=1`: its log, `~/.cache/micromux/micromux.log.<date>` on Linux, `~/Library/Caches/com.romnn.micromux/micromux.log.<date>` on macOS, or the file `--log-file` names, then records whether the terminal has the protocol and every key as micromux reads it.
 
-A service in PTY input mode never asked for the protocol, so micromux sends it every key as the bytes a terminal without the protocol sends. Two limits come with the protocol: on a non-Latin keyboard layout, such as Russian or Greek, `Ctrl` chords arrive as the layout's letter, so `Ctrl-C` and `Ctrl-Z` reach neither micromux nor a service as such; switch to a Latin layout for them. And `Alt+Esc` leaves PTY input mode only in terminals with the protocol, since the others send it as a plain `Esc`; there, click the `Alt+Esc Exit` hint instead.
+A service in PTY input mode never asked for the protocol, so micromux sends it every key as the bytes a terminal without the protocol sends. Two limits come with the protocol: on a non-Latin keyboard layout, such as Russian or Greek, `Ctrl` chords arrive as the layout's letter, so `Ctrl-C` and `Ctrl-Z` reach neither micromux nor a service as such; switch to a Latin layout for them. And `Alt+Esc` leaves PTY input mode only in terminals with the protocol, or tmux set as above, since the others send it as a plain `Esc`; there, click the `Alt+Esc Exit` hint instead.
 
 ### Using the terminal's own mouse handling
 
