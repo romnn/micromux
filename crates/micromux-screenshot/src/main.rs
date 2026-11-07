@@ -283,6 +283,12 @@ fn capture(
     // A blank screen holds still as well, so wait for the first frame before settling; keys
     // typed earlier would reach a terminal that is not in raw mode yet.
     if !wait_for_first_frame(&rx, &mut parser) {
+        if let Ok(Some(status)) = child.try_wait() {
+            return Err(Error::EarlyExit {
+                status,
+                example_dir: example_dir.to_path_buf(),
+            });
+        }
         let _ = child.kill();
         return Err(Error::NoFirstFrame {
             example_dir: example_dir.to_path_buf(),
