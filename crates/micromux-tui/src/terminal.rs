@@ -147,23 +147,20 @@ pub(crate) fn take_over(mouse: bool) -> io::Result<()> {
     Ok(())
 }
 
-/// Asks the terminal to report keys as `keyboard` says, once at most however often the terminal
-/// is taken again, so the single reset in [`give_back`] takes it back.
+/// Asks the terminal to report keys as `keyboard` says, so the single reset in [`give_back`]
+/// takes it back.
+///
+/// The kitty flags go onto a stack, so they are pushed once at most however often the terminal
+/// is taken again. modifyOtherKeys is a plain setting, so it is asked for again every time, in
+/// case a shell reset it while micromux was stopped.
 fn ask_for_keyboard_on(out: &mut impl Write, keyboard: Keyboard) -> io::Result<()> {
     // The main and alternate screens keep separate kitty flag stacks, so the flags only go onto
     // the alternate screen's, and come off before leaving it.
     if keyboard == Keyboard::Legacy || !SCREEN.load(Ordering::SeqCst) {
         return Ok(());
     }
-    if KEYBOARD
-        .compare_exchange(
-            Keyboard::Legacy as u8,
-            keyboard as u8,
-            Ordering::SeqCst,
-            Ordering::SeqCst,
-        )
-        .is_err()
-    {
+    let asked = KEYBOARD.swap(keyboard as u8, Ordering::SeqCst) == keyboard as u8;
+    if asked && keyboard == Keyboard::Kitty {
         return Ok(());
     }
     match keyboard {
@@ -172,7 +169,9 @@ fn ask_for_keyboard_on(out: &mut impl Write, keyboard: Keyboard) -> io::Result<(
             execute!(out, PushKeyboardEnhancementFlags(KEYBOARD_FLAGS))
         }
         Keyboard::ModifyOtherKeys => {
-            log_keyboard("asked for modifyOtherKeys at level 2");
+            if !asked {
+                log_keyboard("asked for modifyOtherKeys at level 2");
+            }
             out.write_all(MODIFY_OTHER_KEYS_ON)?;
             out.flush()
         }
@@ -195,13 +194,14 @@ fn keyboard() -> Keyboard {
     })
 }
 
-/// Whether micromux runs inside tmux set to report extended keys as CSI u, the form crossterm
-/// reads.
+/// Whether micromux runs in a tmux pane set to report extended keys as CSI u, the form
+/// crossterm reads.
 ///
 /// tmux does not speak the kitty protocol, but with `extended-keys` on it reports the keys a pane
 /// asks for with modifyOtherKeys, Ctrl+Shift+C apart from Ctrl-C. Its default form, xterm's
 /// `CSI 27;…~`, is one crossterm cannot read, and xterm itself only sends that form, so
-/// modifyOtherKeys is asked for nowhere else.
+/// modifyOtherKeys is asked for nowhere else. Every program started from a pane inherits `TMUX`,
+/// a terminal window included, so tmux must name micromux's own terminal as the pane's.
 fn tmux_reports_keys_as_csi_u() -> bool {
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
@@ -209,11 +209,21 @@ fn tmux_reports_keys_as_csi_u() -> bool {
     /// How long tmux may take to answer before micromux starts without it.
     const ANSWER_WITHIN: Duration = Duration::from_millis(500);
 
-    if std::env::var_os("TMUX").is_none_or(|value| value.is_empty()) {
+    let (Some(_), Some(pane)) = (
+        std::env::var_os("TMUX").filter(|value| !value.is_empty()),
+        std::env::var_os("TMUX_PANE").filter(|value| !value.is_empty()),
+    ) else {
         return false;
-    }
+    };
+    let Some(own_tty) = own_tty() else {
+        return false;
+    };
     let Ok(mut child) = Command::new("tmux")
-        .args(["show-options", "-sv", "extended-keys-format"])
+        .arg("display-message")
+        .arg("-p")
+        .arg("-t")
+        .arg(pane)
+        .arg("#{pane_tty}\t#{extended-keys}\t#{extended-keys-format}")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -233,20 +243,31 @@ fn tmux_reports_keys_as_csi_u() -> bool {
             }
         }
     };
-    let mut format = String::new();
+    let mut answer = String::new();
     if answered && let Some(mut stdout) = child.stdout.take() {
-        std::io::Read::read_to_string(&mut stdout, &mut format).ok();
+        std::io::Read::read_to_string(&mut stdout, &mut answer).ok();
     }
-    let csi_u = format.trim() == "csi-u";
+    let mut fields = answer.trim_end().split('\t');
+    let (pane_tty, extended_keys, format) = (fields.next(), fields.next(), fields.next());
     log_keyboard(&format!(
-        "tmux reports extended keys as {:?}",
-        if answered {
-            format.trim()
-        } else {
-            "(no answer)"
-        }
+        "tmux says its pane's terminal is {pane_tty:?}, micromux's {own_tty:?}, with \
+         extended-keys {extended_keys:?} in format {format:?}"
     ));
-    csi_u
+    pane_tty == Some(own_tty.as_str())
+        && matches!(extended_keys, Some("on" | "always"))
+        && format == Some("csi-u")
+}
+
+/// The path of the terminal micromux runs in, as tmux names a pane's.
+#[cfg(unix)]
+fn own_tty() -> Option<String> {
+    let path = nix::unistd::ttyname(io::stdin()).ok()?;
+    path.to_str().map(str::to_owned)
+}
+
+#[cfg(not(unix))]
+fn own_tty() -> Option<String> {
+    None
 }
 
 /// Turns mouse capture on or off while the TUI shows.
@@ -451,17 +472,21 @@ mod tests {
         assert_eq!(written(&out), MOUSE_ON);
         MOUSE.store(false, Ordering::SeqCst);
 
-        // The keyboard reporting is asked for once however often the terminal is taken, as when
-        // it is taken again without having been given back, so the one reset on the way out
-        // takes it back, before leaving the alternate screen: the kitty flags, and likewise
-        // modifyOtherKeys.
+        // Taking the terminal again without having given it back, as after a continue signal,
+        // pushes the kitty flags only once, onto their stack, but asks for modifyOtherKeys, a
+        // plain setting a shell may have reset meanwhile, again; either way the one reset on the
+        // way out takes it back, before leaving the alternate screen.
         let leave = "\x1b[?2004l\x1b[?1049l\x1b[?25h";
-        for (keyboard, on, off) in [
-            (Keyboard::Kitty, KEYBOARD_PUSH, KEYBOARD_POP),
+        for (keyboard, expected) in [
+            (
+                Keyboard::Kitty,
+                format!("{KEYBOARD_PUSH}{KEYBOARD_POP}{leave}"),
+            ),
             (
                 Keyboard::ModifyOtherKeys,
-                MODIFY_OTHER_KEYS_ON,
-                MODIFY_OTHER_KEYS_RESET,
+                format!(
+                    "{MODIFY_OTHER_KEYS_ON}{MODIFY_OTHER_KEYS_ON}{MODIFY_OTHER_KEYS_RESET}{leave}"
+                ),
             ),
         ] {
             SCREEN.store(true, Ordering::SeqCst);
@@ -469,7 +494,7 @@ mod tests {
             ask_for_keyboard_on(&mut out, keyboard)?;
             ask_for_keyboard_on(&mut out, keyboard)?;
             give_back_on(&mut out, || Ok(()))?;
-            assert_eq!(written(&out), format!("{on}{off}{leave}"), "{keyboard:?}");
+            assert_eq!(written(&out), expected, "{keyboard:?}");
         }
 
         // Legacy reporting, or a terminal off the alternate screen, gets nothing.

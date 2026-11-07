@@ -219,7 +219,9 @@ impl Drop for Terminal {
         use nix::sys::signal::{Signal, killpg};
         use nix::unistd::Pid;
 
-        for &group in &self.groups {
+        // Once the program is reaped its pid, and so its group's id, may name another group.
+        let reaped = !matches!(self.child.try_wait(), Ok(None));
+        for &group in self.groups.iter().skip(usize::from(reaped)) {
             // A group that is gone already, as after a clean exit, has nothing to signal.
             killpg(Pid::from_raw(group), Signal::SIGKILL).ok();
         }
@@ -309,9 +311,10 @@ impl Project {
         Terminal::spawn(self.command(MICROMUX, &all))
     }
 
-    /// micromux as if inside tmux, whose `tmux` command says it reports extended keys in
-    /// `format`.
-    fn micromux_in_tmux(&self, format: &str) -> eyre::Result<Terminal> {
+    /// micromux as if inside a tmux pane, whose `tmux` command says it reports extended keys in
+    /// `format`, and names micromux's own terminal as the pane's or, unless `own_pane`, another
+    /// one, as for a terminal window started from a pane.
+    fn micromux_in_tmux(&self, format: &str, own_pane: bool) -> eyre::Result<Terminal> {
         use std::os::unix::fs::PermissionsExt as _;
 
         let bin = self.directory.path().join("bin");
@@ -320,7 +323,11 @@ impl Project {
         std::fs::write(
             &tmux,
             format!(
-                "#!/bin/sh\n[ \"$*\" = \"show-options -sv extended-keys-format\" ] && echo {format}\n"
+                "#!/bin/sh\n\
+                 case \"$*\" in *display-message*) ;; *) exit 1 ;; esac\n\
+                 tty=/dev/$(ps -o tty= -p $PPID | tr -d ' ')\n\
+                 [ {own_pane} = true ] || tty=/dev/pts/999999\n\
+                 printf '%s\\ton\\t{format}\\n' \"$tty\"\n"
             ),
         )?;
         std::fs::set_permissions(&tmux, std::fs::Permissions::from_mode(0o755))?;
@@ -330,6 +337,7 @@ impl Project {
         paths.extend(std::env::split_paths(&path));
         command.env("PATH", std::env::join_paths(paths)?);
         command.env("TMUX", "/tmp/tmux-test/default,1,0");
+        command.env("TMUX_PANE", "%1");
         Terminal::spawn(command)
     }
 }
@@ -581,7 +589,7 @@ fn inside_tmux_modify_other_keys_makes_ctrl_shift_c_copy() -> eyre::Result<()> {
     const RESET: &[u8] = b"\x1b[>4m";
 
     let project = Project::new(CONFIG)?;
-    let mut tui = project.micromux_in_tmux("csi-u")?;
+    let mut tui = project.micromux_in_tmux("csi-u", true)?;
     focus_the_logs_and_select_hello(&mut tui)?;
     assert_eq!(tui.count(ON), 1);
     assert!(!contains(&tui.written, KEYBOARD_PUSH));
@@ -607,12 +615,15 @@ fn inside_tmux_modify_other_keys_makes_ctrl_shift_c_copy() -> eyre::Result<()> {
     );
     assert_eq!(tui.count(RESET), 1);
 
-    // tmux's default form for extended keys is one micromux cannot read, so it asks for none.
-    let project = Project::new(CONFIG)?;
-    let mut tui = project.micromux_in_tmux("xterm")?;
-    tui.wait_for_tui()?;
-    tui.quit()?;
-    assert!(!contains(&tui.written, b"\x1b[>4"));
+    // tmux's default form for extended keys is one micromux cannot read, and a terminal started
+    // from a pane is not tmux, so in neither micromux asks for anything.
+    for (format, own_pane) in [("xterm", true), ("csi-u", false)] {
+        let project = Project::new(CONFIG)?;
+        let mut tui = project.micromux_in_tmux(format, own_pane)?;
+        tui.wait_for_tui()?;
+        tui.quit()?;
+        assert!(!contains(&tui.written, b"\x1b[>4"), "{format} {own_pane}");
+    }
     Ok(())
 }
 
@@ -705,6 +716,8 @@ fn ctrl_z_suspends_to_the_shell_and_fg_resumes() -> eyre::Result<()> {
             && screen.mouse_protocol_mode() == MouseProtocolMode::None
             && screen.contents().contains("wrapper-done")
     })?;
+    // The job is done, so its group's id may be reused from now on.
+    shell.groups.retain(|&group| group != job);
     // However the wake after `fg` raced the suspend's own, the keyboard flags came off as often
     // as they went on.
     assert_eq!(shell.count(KEYBOARD_PUSH), 2);

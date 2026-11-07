@@ -87,11 +87,12 @@ Two things stand between these shortcuts and micromux:
   ```
   set -s extended-keys on
   set -s extended-keys-format csi-u
+  set -as terminal-features '*:extkeys'
   ```
 
-  in `~/.tmux.conf`, micromux asks tmux for these reports (xterm's modifyOtherKeys) and resets the request whenever it lets go of the terminal. tmux's default `extended-keys-format xterm` sends a form micromux cannot read, so there micromux asks for nothing, and `Ctrl+Shift+C` arrives as `Ctrl-C`; `Ctrl+Insert`, a right-click and `y` still copy. The terminal around tmux needs its copy shortcut passed on too, as above.
+  in `~/.tmux.conf`, micromux asks tmux for these reports (xterm's modifyOtherKeys) and resets the request whenever it lets go of the terminal. The last line has tmux ask the terminal around it to send `Ctrl+Shift+C` apart in turn, which tmux only does for terminals it knows to support it. tmux's default `extended-keys-format xterm` sends a form micromux cannot read, so there micromux asks for nothing, and `Ctrl+Shift+C` arrives as `Ctrl-C`; `Ctrl+Insert`, a right-click and `y` still copy. The terminal around tmux needs its copy shortcut passed on too, as above.
 
-To see what micromux receives, start it with `MICROMUX_DEBUG_KEYS=1`: its log, `~/.cache/micromux/micromux.log.<date>` on Linux, `~/Library/Caches/com.romnn.micromux/micromux.log.<date>` on macOS, or the file `--log-file` names, then records whether the terminal has the protocol and every key as micromux reads it.
+To see what micromux receives, start it with `MICROMUX_DEBUG_KEYS=1`: its log, `~/.cache/micromux/micromux.log.<date>` on Linux, `~/Library/Caches/com.romnn.micromux/micromux.log.<date>` on macOS, or the file `--log-file` names, then records whether the terminal has the protocol, what tmux said, and every key as micromux reads it; in PTY input mode it leaves out which character was typed, so a password typed into a service stays out of the log.
 
 A service in PTY input mode never asked for the protocol, so micromux sends it every key as the bytes a terminal without the protocol sends. Two limits come with the protocol: on a non-Latin keyboard layout, such as Russian or Greek, `Ctrl` chords arrive as the layout's letter, so `Ctrl-C` and `Ctrl-Z` reach neither micromux nor a service as such; switch to a Latin layout for them. And `Alt+Esc` leaves PTY input mode only in terminals with the protocol, or tmux set as above, since the others send it as a plain `Esc`; there, click the `Alt+Esc Exit` hint instead.
 

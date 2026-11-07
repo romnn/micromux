@@ -553,9 +553,12 @@ impl App {
     }
 
     /// Ctrl-C pressed `now`, which never quits: only `q` does, so a stray Ctrl-C, as from a copy
-    /// shortcut a terminal sends as Ctrl-C, cannot stop the session. The footer says so for a
-    /// moment.
+    /// shortcut a terminal sends as Ctrl-C, cannot stop the session. It closes any popup, where
+    /// `q` means something else, and the footer says for a moment that `q` quits.
     fn ctrl_c(&mut self, now: std::time::Instant) {
+        self.show_help = false;
+        self.info = None;
+        self.level_picker = None;
         self.quit_hint_at = Some(now);
     }
 
@@ -734,14 +737,19 @@ impl App {
     }
 
     fn handle_crossterm_event(&mut self, event: &crossterm::event::Event) {
-        use crossterm::event::KeyEventKind;
+        use crossterm::event::{KeyCode, KeyEventKind};
 
         if let crossterm::event::Event::Key(key) = *event
             && terminal::debug_keys()
         {
+            // What is typed into a service, a password among it, stays out of the log.
+            let code = match key.code {
+                KeyCode::Char(_) if self.pty_input_mode => "Char(…)".to_string(),
+                code => format!("{code:?}"),
+            };
             tracing::warn!(
                 target: "micromux::keys",
-                code = ?key.code,
+                code,
                 modifiers = ?key.modifiers,
                 kind = ?key.kind,
                 state = ?key.state,
@@ -1493,10 +1501,22 @@ mod tests {
                 .collect::<String>()
         };
 
-        // A press says how to quit, without stopping anything.
+        // A press says how to quit, without stopping anything, and closes a popup, where `q`
+        // would not quit.
+        app.show_help = true;
         app.ctrl_c(now);
         assert!(app.running);
+        assert!(!app.show_help);
         assert!(footer(&mut app).contains("press q to quit"));
+        app.handle_key_press(KeyEvent {
+            code: KeyCode::Char('L'),
+            modifiers: KeyModifiers::SHIFT,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        });
+        assert!(app.level_picker.is_some());
+        app.ctrl_c(now);
+        assert!(app.level_picker.is_none());
 
         // Once its moment passes, the hint goes; however often Ctrl-C comes, nothing stops.
         app.on_timer(now + QUIT_HINT_DURATION);

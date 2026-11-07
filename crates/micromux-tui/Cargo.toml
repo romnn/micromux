@@ -54,8 +54,9 @@ tokio.workspace = true
 futures.workspace = true
 
 [target.'cfg(unix)'.dependencies]
-# Ctrl-Z raises the stop signal itself, since raw mode delivers it as a key.
-nix = { workspace = true, features = ["signal"] }
+# Ctrl-Z raises the stop signal itself, since raw mode delivers it as a key, and the tmux pane
+# micromux runs in is told by its terminal's name.
+nix = { workspace = true, features = ["signal", "term"] }
 
 [dev-dependencies]
 color-eyre.workspace = true
