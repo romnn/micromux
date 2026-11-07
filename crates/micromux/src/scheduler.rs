@@ -178,9 +178,6 @@ pub(super) struct RunningService {
     /// Whether micromux asked the run to stop. The terminate token cannot tell: the run cancels
     /// it itself once its process exits.
     stop_requested: bool,
-    /// The configured environment the process was spawned with, which a reconcile can no longer
-    /// change.
-    environment: indexmap::IndexMap<String, String>,
 }
 
 impl RunningService {
@@ -245,14 +242,23 @@ impl Drop for RunningService {
     }
 }
 
-/// Presentation fields captured at spawn time, so config reloads cannot rewrite what an already
-/// running or exited run actually executed.
+/// The definition a run was started with, captured at spawn time, so config reloads cannot
+/// rewrite what an already running or exited run actually executed.
+///
+/// It holds every field a restart would apply to the run, so comparing it with the current
+/// definition is the one staleness check behind [`ServiceRuntime::config_stale`].
+/// It has no [`Debug`] implementation because the environment may hold secrets from env files.
 #[derive(Clone, PartialEq, Eq)]
 pub(super) struct RunConfig {
     command: Vec<String>,
     working_dir: String,
+    /// The configured environment, with env file contents and session variables resolved.
+    environment: indexmap::IndexMap<String, String>,
+    /// Whether the run got the color variables, which are part of its environment too.
+    enable_color: bool,
     advertised_ports: Vec<u16>,
-    healthcheck: Option<HealthcheckConfig>,
+    /// The whole probe definition, because the run's probe loop keeps the one it started with.
+    healthcheck: Option<crate::spec::HealthcheckSpec>,
     stop_grace_period: Duration,
     stop_signal: crate::spec::StopSignal,
     cleanup: Option<crate::spec::CleanupSpec>,
@@ -260,18 +266,37 @@ pub(super) struct RunConfig {
 
 impl From<&Service> for RunConfig {
     fn from(service: &Service) -> Self {
+        // An exhaustive pattern makes every new spec field either captured here or explicitly left
+        // out, because a field a restart applies but this misses is never reported as stale.
+        let crate::spec::ServiceSpec {
+            // Display only.
+            name: _,
+            // Read when a run ends, so a change applies to the live run without a restart.
+            kind: _,
+            command,
+            // Captured below from the validated directory the run spawns in.
+            working_dir: _,
+            environment,
+            // Gates only when a run starts, so a change needs no restart.
+            depends_on: _,
+            healthcheck,
+            ports,
+            // A reconcile applies the policy to the runtime directly.
+            restart: _,
+            stop_grace_period,
+            stop_signal,
+            cleanup,
+        } = &service.spec;
         Self {
-            command: service.argv(),
+            command: command.clone(),
             working_dir: service.working_dir_display(),
-            advertised_ports: service.spec.ports.clone(),
-            healthcheck: service
-                .spec
-                .healthcheck
-                .as_ref()
-                .map(HealthcheckConfig::from),
-            stop_grace_period: service.spec.stop_grace_period,
-            stop_signal: service.spec.stop_signal,
-            cleanup: service.spec.cleanup.clone(),
+            environment: environment.clone(),
+            enable_color: service.enable_color,
+            advertised_ports: ports.clone(),
+            healthcheck: healthcheck.clone(),
+            stop_grace_period: *stop_grace_period,
+            stop_signal: *stop_signal,
+            cleanup: cleanup.clone(),
         }
     }
 }
@@ -426,6 +451,20 @@ impl ServiceRuntime {
 
     fn is_live(&self) -> bool {
         self.retired.is_none()
+    }
+
+    /// Whether `service` has a live run whose definition differs from the current one, so a
+    /// restart would change what runs.
+    ///
+    /// The service snapshot's `config_stale` and the environment's `stale` both come from here,
+    /// so the TUI, `ctl` and `env`/`exec` always agree.
+    /// Without a live run nothing is stale, because the next start runs the current definition.
+    fn config_stale(&self, service: &Service) -> bool {
+        self.running.is_some()
+            && self
+                .run_config
+                .as_ref()
+                .is_some_and(|captured| *captured != RunConfig::from(service))
     }
 
     fn is_retired(&self) -> bool {
@@ -754,13 +793,10 @@ pub(super) fn project_snapshot(
         started_at_unix_ms: runtime.started_at_unix_ms,
         advertised_ports: run_config.advertised_ports.clone(),
         healthcheck_configured: run_config.healthcheck.is_some(),
-        healthcheck: run_config.healthcheck.clone(),
+        healthcheck: run_config.healthcheck.as_ref().map(HealthcheckConfig::from),
         stop_grace_period: run_config.stop_grace_period,
         stop_signal: run_config.stop_signal,
-        config_stale: runtime
-            .run_config
-            .as_ref()
-            .is_some_and(|captured| captured != &current_config),
+        config_stale: runtime.config_stale(service),
         restart_state,
         last_exit_code: runtime.last_exit_code,
         command: run_config.command.clone(),
@@ -2610,19 +2646,18 @@ impl SchedulerRuntime {
         let service = services
             .get(service_id)
             .ok_or(CommandRejection::UnknownService)?;
-        let current = &service.spec.environment;
-        let running = self
+        let live_run = self
             .services
             .get(service_id)
-            .and_then(|runtime| runtime.running.as_ref())
-            .map(|running| &running.environment);
-        Ok(match running {
-            Some(running) => ResolvedEnvironment {
-                variables: sorted_variables(running),
-                stale: running != current,
+            .filter(|runtime| runtime.running.is_some())
+            .and_then(|runtime| Some((runtime, runtime.run_config.as_ref()?)));
+        Ok(match live_run {
+            Some((runtime, run_config)) => ResolvedEnvironment {
+                variables: sorted_variables(&run_config.environment),
+                stale: runtime.config_stale(service),
             },
             None => ResolvedEnvironment {
-                variables: sorted_variables(current),
+                variables: sorted_variables(&service.spec.environment),
                 stale: false,
             },
         })

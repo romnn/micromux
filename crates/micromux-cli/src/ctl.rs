@@ -131,6 +131,16 @@ fn job_exit_label(service: &micromux::ServiceSnapshot) -> String {
     }
 }
 
+/// Suffix marking a service whose config changed since its latest run started, so a restart
+/// would apply it.
+fn config_stale_label(service: &micromux::ServiceSnapshot) -> &'static str {
+    if service.config_stale {
+        " config=stale"
+    } else {
+        ""
+    }
+}
+
 /// Suffix naming the dependency that holds a blocked service back for good.
 fn dependency_failure_label(service: &micromux::ServiceSnapshot) -> String {
     let Some(failure) = &service.dependency_failure else {
@@ -161,7 +171,7 @@ fn print_services(services: &[micromux::ServiceSnapshot]) {
             .health
             .map_or_else(|| "-".to_string(), |health| health.to_string());
         println!(
-            "{:<20} id={} origin={}{} desired={:?} execution={:?}{} health={} generation={}{}{}",
+            "{:<20} id={} origin={}{} desired={:?} execution={:?}{} health={} generation={}{}{}{}",
             service.name,
             service.id,
             service_origin_label(service),
@@ -171,6 +181,7 @@ fn print_services(services: &[micromux::ServiceSnapshot]) {
             job_exit_label(service),
             health,
             service.run_generation,
+            config_stale_label(service),
             service_retired_label(service),
             dependency_failure_label(service)
         );

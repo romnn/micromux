@@ -425,6 +425,59 @@ fn a_changed_service_reports_its_running_environment_with_a_note() -> eyre::Resu
     Ok(())
 }
 
+/// A reconcile after a change to the env file's contents alone marks the service stale in
+/// `ctl ls` exactly as `env` reports it, before and after the restart that applies it.
+#[test]
+fn ctl_and_env_agree_on_a_changed_env_file() -> eyre::Result<()> {
+    let session = Session::start()?;
+    let svc_row = |session: &Session| -> eyre::Result<String> {
+        let output = session.run(&["ctl", "ls"])?;
+        eyre::ensure!(output.status.success(), "{}", stderr(&output));
+        stdout(&output)
+            .lines()
+            .find(|line| line.contains("id=svc "))
+            .map(str::to_string)
+            .ok_or_else(|| eyre::eyre!("no svc row in `ctl ls`"))
+    };
+
+    // A fresh run is current everywhere.
+    assert!(!svc_row(&session)?.contains("config=stale"));
+
+    std::fs::write(
+        session.path().join("svc.env"),
+        "FROM_ENV_FILE=changed in env file\n",
+    )?;
+    let output = session.run(&["ctl", "reconcile"])?;
+    assert!(output.status.success(), "{}", stderr(&output));
+
+    // Both commands call the running process stale, and `env` still shows what it got.
+    let row = svc_row(&session)?;
+    assert!(row.contains("config=stale"), "{row}");
+    let output = session.run(&["env", "--service", "svc", "INLINE"])?;
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "it's from env file\n");
+    assert_eq!(stderr(&output), format!("micromux: {STALE_NOTE}\n"));
+
+    // The restart applies the new contents, and both commands agree it is current again.
+    let output = session.run(&["ctl", "restart", "svc"])?;
+    assert!(output.status.success(), "{}", stderr(&output));
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let row = svc_row(&session)?;
+        if row.contains("generation=2") && row.contains("execution=Running") {
+            assert!(!row.contains("config=stale"), "{row}");
+            break;
+        }
+        eyre::ensure!(Instant::now() < deadline, "svc never restarted: {row}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let output = session.run(&["env", "--service", "svc", "INLINE"])?;
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "it's changed in env file\n");
+    assert_eq!(stderr(&output), "");
+    Ok(())
+}
+
 /// Without a session for the exact config, both commands fail before running anything, even
 /// when a session runs for a config further down the directory tree.
 #[test]
