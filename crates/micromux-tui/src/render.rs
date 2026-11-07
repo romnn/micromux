@@ -2063,7 +2063,8 @@ impl App {
         // While text is selected, the copy key takes the mouse toggle's place, padded to its
         // width, so the footer keeps its rows and the panes and service terminals their size.
         // Capture is on whenever there is a selection, so the toggle has nothing to report.
-        if self.has_selection() && !self.pty_input_mode {
+        // The level picker takes `y` for nothing, so the hint would promise what it cannot do.
+        if self.has_selection() && !self.pty_input_mode && self.level_picker.is_none() {
             hints.push(KeyHint::new("y", "Copy    "));
         } else {
             hints.push(KeyHint::toggle(

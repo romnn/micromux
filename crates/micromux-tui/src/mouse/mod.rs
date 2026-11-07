@@ -6,8 +6,9 @@
 //! Under a popup only the popup reacts, and a press outside it closes it.
 //!
 //! Text is selected inside one pane at a time, never across panes: a drag selects from where it
-//! started, a double click a word and a triple click a line, and releasing the button copies the
-//! selection to the clipboard.
+//! started, a double click a word and a triple click a line.
+//! Selecting only highlights; `y` or Enter copies, or ending the drag when copy-on-select is
+//! on.
 //! A drag past the top or bottom of a pane scrolls it a row at a time.
 //!
 //! Hints and URLs act on a click, a press and a release on the same one, so a press that slides
@@ -29,11 +30,13 @@ pub(crate) use select::{END_OF_LINE, Selection, TextPane, TextPos};
 /// Rows one turn of the wheel scrolls a pane, as terminals scroll their own.
 const WHEEL_ROWS: u16 = 3;
 
-/// The shortest time between two steps of the wheel.
+/// The shortest time between the arrivals of two steps of the wheel.
 ///
-/// Terminals report one notch as one event or as a burst of several, and high-resolution and
-/// smooth-scrolling devices send a stream; each of these scrolls one step per interval.
-const WHEEL_STEP: Duration = Duration::from_millis(35);
+/// Some terminals report one notch as a burst of events written together, which arrive within
+/// microseconds and make one step.
+/// Separate notches, even of a fast spin, come further apart, and each makes a step; a
+/// high-resolution or smooth-scrolling device's stream makes a step at most this often.
+const WHEEL_STEP: Duration = Duration::from_millis(15);
 
 /// How soon a second press on the same cell counts as a double click.
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
@@ -136,8 +139,8 @@ pub(crate) struct MouseState {
     /// The hint or URL the left button went down on, which a release on it clicks.
     pressed: Option<Clickable>,
     last_press: Option<Press>,
-    /// When a turn of the wheel last scrolled, to fold the burst of events some terminals send
-    /// for one notch into one step.
+    /// When the wheel event that last scrolled arrived, to fold the burst of events some
+    /// terminals send for one notch into one step.
     last_wheel: Option<Instant>,
     /// What the last copy took, shown in the footer until the next press or key.
     pub(crate) notice: Option<String>,
@@ -157,16 +160,16 @@ impl MouseState {
         }
     }
 
-    /// Whether a turn of the wheel `now` scrolls, rather than continuing the burst of events
-    /// that the last step already took.
-    fn wheel_steps(&mut self, now: Instant) -> bool {
+    /// Whether a wheel event that arrived `at` scrolls, rather than belonging to the burst of
+    /// events whose first one already took the step.
+    fn wheel_steps(&mut self, at: Instant) -> bool {
         if self
             .last_wheel
-            .is_some_and(|last| now.saturating_duration_since(last) < WHEEL_STEP)
+            .is_some_and(|last| at.saturating_duration_since(last) < WHEEL_STEP)
         {
             return false;
         }
-        self.last_wheel = Some(now);
+        self.last_wheel = Some(at);
         true
     }
 
@@ -222,8 +225,8 @@ impl App {
         self.effects.push(Effect::MouseCapture(capture));
     }
 
-    /// Acts on a mouse event from the terminal.
-    pub(crate) fn handle_mouse(&mut self, event: MouseEvent) {
+    /// Acts on a mouse event from the terminal that arrived `at`.
+    pub(crate) fn handle_mouse(&mut self, event: MouseEvent, at: Instant) {
         // The terminal may still report events it sent before capture went off.
         if !self.mouse.capture {
             return;
@@ -236,11 +239,11 @@ impl App {
         }
         let position = Position::new(event.column, event.row);
         match event.kind {
-            MouseEventKind::Down(MouseButton::Left) => self.press(position, Instant::now()),
+            MouseEventKind::Down(MouseButton::Left) => self.press(position, at),
             MouseEventKind::Drag(MouseButton::Left) => self.drag_to(position),
             MouseEventKind::Up(MouseButton::Left) => self.release(position),
-            MouseEventKind::ScrollUp => self.wheel(position, false, Instant::now()),
-            MouseEventKind::ScrollDown => self.wheel(position, true, Instant::now()),
+            MouseEventKind::ScrollUp => self.wheel(position, false, at),
+            MouseEventKind::ScrollDown => self.wheel(position, true, at),
             _ => {}
         }
     }
@@ -270,8 +273,10 @@ impl App {
         self.mouse.pressed = None;
 
         // A hint or URL acts on release and keeps the selection, which the copy hint copies.
-        if self.hits.popup.is_none()
-            && let Some(clickable) = self.clickable_at(position)
+        // Under a popup only the copy hint does, since copying text selected in the popup is the
+        // one thing a click outside it may do without closing it.
+        if let Some(clickable) = self.clickable_at(position)
+            && (self.hits.popup.is_none() || clickable == Clickable::Hint("y"))
         {
             self.mouse.pressed = Some(clickable);
             return;
@@ -455,11 +460,11 @@ impl App {
         self.effects.push(Effect::Copy(text));
     }
 
-    /// A turn of the wheel at `position`, `now`: under a popup it scrolls the popup, elsewhere the
-    /// pane under the pointer, without moving the focus; the services list moves a service a
-    /// step, the text panes three rows.
-    fn wheel(&mut self, position: Position, down: bool, now: Instant) {
-        if !self.mouse.wheel_steps(now) {
+    /// A turn of the wheel at `position` that arrived `at`: under a popup it scrolls the popup,
+    /// elsewhere the pane under the pointer, without moving the focus; the services list moves a
+    /// service a step, the text panes three rows.
+    fn wheel(&mut self, position: Position, down: bool, at: Instant) {
+        if !self.mouse.wheel_steps(at) {
             return;
         }
         let popup = self.hits.popup.as_ref().map(|popup| match popup.content {

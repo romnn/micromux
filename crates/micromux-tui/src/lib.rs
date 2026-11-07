@@ -689,6 +689,7 @@ impl App {
     fn handle_input_event(&mut self, input_event: event::Input) {
         match input_event {
             event::Input::Event(event) => self.handle_crossterm_event(&event),
+            event::Input::Mouse { event, at } => self.handle_mouse(event, at),
             event::Input::Closed => {
                 if !self.terminal_input_closed {
                     tracing::warn!("terminal input closed; supervision will continue");
@@ -712,7 +713,9 @@ impl App {
                 self.mouse.notice = None;
                 self.handle_key_press(key);
             }
-            crossterm::event::Event::Mouse(mouse) => self.handle_mouse(mouse),
+            crossterm::event::Event::Mouse(mouse) => {
+                self.handle_mouse(mouse, std::time::Instant::now());
+            }
             crossterm::event::Event::Paste(ref text) if self.pty_input_mode => {
                 if let Some(service) = self.state.current_service() {
                     let service_id = service.snapshot.id.clone();
@@ -1773,12 +1776,15 @@ mod tests {
                 crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
                 crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
             ] {
-                app.handle_mouse(crossterm::event::MouseEvent {
-                    kind,
-                    column: x,
-                    row: y,
-                    modifiers: KeyModifiers::NONE,
-                });
+                app.handle_mouse(
+                    crossterm::event::MouseEvent {
+                        kind,
+                        column: x,
+                        row: y,
+                        modifiers: KeyModifiers::NONE,
+                    },
+                    std::time::Instant::now(),
+                );
             }
         };
 

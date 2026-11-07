@@ -190,6 +190,7 @@ impl Project {
         command.env("HOME", self.home());
         command.env_remove("XDG_CONFIG_HOME");
         command.env_remove("MICROMUX_MOUSE");
+        command.env_remove("MICROMUX_COPY_ON_SELECT");
         // A copy would otherwise also reach the desktop's clipboard, overwriting the user's.
         command.env_remove("DISPLAY");
         command.env_remove("WAYLAND_DISPLAY");
@@ -249,14 +250,23 @@ fn mouse_capture_is_released_by_the_toggle_a_suspend_and_quitting() -> eyre::Res
     tui.send(&mouse_report(0, (column, row), true))?;
     tui.send(&mouse_report(32, (column + 4, row), true))?;
     tui.send(&mouse_report(0, (column + 4, row), false))?;
-    tui.wait_until("the copy key in the footer", |screen, _| {
-        screen.contents().contains("y Copy")
+    // Input is handled in order, so once `H` shows, the release before it was handled too.
+    tui.send(b"H")?;
+    tui.wait_until("the release and the copy key in the footer", |screen, _| {
+        screen.contents().contains("y Copy") && screen.contents().contains("Health:ON")
     })?;
     assert!(!contains(&tui.written, b"\x1b]52;"));
     tui.send(b"y")?;
     tui.wait_until("the copy", |_, written| {
         contains(written, b"\x1b]52;c;aGVsbG8=")
     })?;
+    // One copy to the clipboard and one to the primary selection.
+    let copies = tui
+        .written
+        .windows(b"\x1b]52;".len())
+        .filter(|window| *window == b"\x1b]52;")
+        .count();
+    assert_eq!(copies, 2);
 
     // The toggle releases the mouse and takes it again.
     tui.send(b"m")?;

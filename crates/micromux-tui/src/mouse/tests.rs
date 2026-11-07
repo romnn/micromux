@@ -96,12 +96,15 @@ fn mouse(app: &mut App, kind: MouseEventKind, position: Position) {
     if matches!(kind, MouseEventKind::ScrollUp | MouseEventKind::ScrollDown) {
         app.mouse.last_wheel = None;
     }
-    app.handle_mouse(MouseEvent {
-        kind,
-        column: position.x,
-        row: position.y,
-        modifiers: KeyModifiers::NONE,
-    });
+    app.handle_mouse(
+        MouseEvent {
+            kind,
+            column: position.x,
+            row: position.y,
+            modifiers: KeyModifiers::NONE,
+        },
+        Instant::now(),
+    );
 }
 
 fn click(app: &mut App, position: Position) {
@@ -1010,9 +1013,26 @@ async fn one_notch_is_one_step_however_many_events_the_terminal_sends() -> eyre:
     }
     assert_eq!(app.state.selected_service, 1);
 
-    // Notches a moment apart move one service each, and the list never wraps around.
+    // The notches of a fast spin, 20 ms apart, each move one service.
+    for notch in 1..=10u64 {
+        app.wheel(list, true, now + Duration::from_millis(20 * notch));
+    }
+    assert_eq!(app.state.selected_service, 11);
+
+    // How late the TUI gets to them does not matter, only when they arrived.
+    let start = now + Duration::from_secs(1);
+    for notch in 0..5u64 {
+        app.wheel(list, true, start + Duration::from_millis(20 * notch));
+    }
+    assert_eq!(app.state.selected_service, 16);
+
+    // The list never wraps around.
     for notch in 1..=30u64 {
-        app.wheel(list, true, now + Duration::from_millis(100 * notch));
+        app.wheel(
+            list,
+            true,
+            now + Duration::from_secs(2) + Duration::from_millis(100 * notch),
+        );
     }
     assert_eq!(app.state.selected_service, 19);
     let later = now + Duration::from_secs(10);
@@ -1089,5 +1109,25 @@ async fn the_focused_pane_has_a_thick_accented_frame() -> eyre::Result<()> {
     let color = |at: Position| frame.cell((at.x - 1, at.y)).map(|cell| cell.fg);
     assert_eq!(color(services), Some(crate::render::FOCUS_COLOR));
     assert_ne!(color(logs), Some(crate::render::FOCUS_COLOR));
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_copy_hint_copies_a_selection_in_a_popup_without_closing_it() -> eyre::Result<()> {
+    let mut app = app(SERVICES)?;
+    press_key(&mut app, KeyCode::Char('?'));
+    let frame = draw(&mut app);
+    let text = find(&frame, "Log level threshold")?;
+    drag(&mut app, text, &[Position::new(text.x + 2, text.y)]);
+    let frame = draw(&mut app);
+
+    click(&mut app, find(&frame, "y Copy")?);
+    assert_eq!(copied(&mut app), vec!["Log".to_string()]);
+    assert!(app.show_help);
+
+    // The level picker has no use for `y`, so its footer offers no copy.
+    press_key(&mut app, KeyCode::Esc);
+    press_key(&mut app, KeyCode::Char('L'));
+    assert!(!footer(&mut app).contains("y Copy"));
     Ok(())
 }
