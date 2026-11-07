@@ -32,6 +32,7 @@ mod process_tree;
 mod scheduler;
 mod service;
 pub mod session;
+mod shell;
 mod spec;
 pub mod structured_log;
 #[cfg(test)]
@@ -84,6 +85,7 @@ pub use session::{
     PortRegistry, Route, RouteError, RoutingStatus, Session, SessionEnvironment, SessionError,
     SessionIdentity, SessionStatus, SessionSummary,
 };
+pub use shell::shell_join;
 pub use spec::{
     DependencySpec, DynamicOrigin, DynamicServiceParams, HealthcheckSpec, Lease,
     PartialServiceSpec, ServiceKind, ServiceOrigin, ServiceSpec, SpecError, SpecField, StopSignal,

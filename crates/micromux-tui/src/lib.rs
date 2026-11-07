@@ -1641,7 +1641,7 @@ mod tests {
             "Service · web",
             "URLs        http://app.tui.localhost:8080",
             &format!("Ports       :{port}  WEB_PORT"),
-            "Command     sh -c \"sleep 30\"",
+            "Command     sh -c 'sleep 30'",
             "Depends on  db (started)",
             "Restart     on failure",
             "i or Esc closes",
