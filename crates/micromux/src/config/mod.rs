@@ -445,6 +445,8 @@ pub struct EnvFile {
 pub struct Service {
     /// Service name.
     pub name: Spanned<String>,
+    /// Whether this is a long-running service or a job that runs to completion.
+    pub kind: crate::ServiceKind,
     /// Startup behavior for new sessions.
     pub startup_mode: StartupMode,
     /// Command to execute and its arguments.

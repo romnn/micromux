@@ -137,6 +137,42 @@ mod tests {
     }
 
     #[test]
+    fn job_states_have_their_own_names() {
+        let mut snapshot = micromux::ServiceSnapshot::initial(
+            "seed".to_string(),
+            "seed".to_string(),
+            Vec::new(),
+            None,
+            micromux::RestartPolicy::Never,
+            Vec::new(),
+            None,
+        );
+        snapshot.kind = micromux::ServiceKind::Job;
+        let mut named = |execution, exit_code, manual| {
+            snapshot.execution = execution;
+            snapshot.last_exit_code = exit_code;
+            snapshot.manual = manual;
+            (state_name(&snapshot), crate::style::is_frozen(&snapshot))
+        };
+        assert_eq!(
+            named(micromux::Execution::Completed, Some(0), false),
+            ("COMPLETED".to_string(), true)
+        );
+        assert_eq!(
+            named(micromux::Execution::Failed, Some(137), false),
+            ("FAILED 137".to_string(), false)
+        );
+        assert_eq!(
+            named(micromux::Execution::Exited, Some(1), false),
+            ("RETRYING".to_string(), false)
+        );
+        assert_eq!(
+            named(micromux::Execution::Pending, None, true),
+            ("IDLE".to_string(), false)
+        );
+    }
+
+    #[test]
     fn shell_join_quotes_only_arguments_a_shell_would_split() {
         let argv = vec![
             "sh".to_string(),
@@ -208,7 +244,7 @@ mod tests {
             created_at_unix_ms: 0,
         });
 
-        let rows = super::service_info_rows(&snapshot, None, None, 1_000)
+        let rows = super::service_info_rows(&snapshot, &|_| None, None, None, 1_000)
             .iter()
             .map(Line::to_string)
             .collect::<Vec<_>>()
@@ -758,6 +794,7 @@ fn wrap_info_row(row: Line<'static>, width: usize) -> Vec<Line<'static>> {
 /// Everything known about one service, for its details popup.
 fn service_info_rows(
     snapshot: &micromux::ServiceSnapshot,
+    dependency_kind: &dyn Fn(&str) -> Option<micromux::ServiceKind>,
     session: Option<&micromux::SessionSummary>,
     last_healthcheck: Option<&micromux::HealthAttempt>,
     now_unix_ms: u64,
@@ -783,7 +820,8 @@ fn service_info_rows(
         .depends_on
         .iter()
         .map(|dependency| {
-            let condition = match dependency.condition {
+            let kind = dependency_kind(&dependency.service).unwrap_or_default();
+            let condition = match dependency.condition_for(kind) {
                 micromux::DependencyCondition::Started => "started",
                 micromux::DependencyCondition::Healthy => "healthy",
                 micromux::DependencyCondition::CompletedSuccessfully => "completed",
@@ -1018,15 +1056,17 @@ fn session_info_rows(session: Option<&micromux::SessionSummary>) -> Vec<Line<'st
     rows
 }
 
-fn state_name(snapshot: &micromux::ServiceSnapshot) -> &'static str {
+fn state_name(snapshot: &micromux::ServiceSnapshot) -> String {
     if snapshot.retired.is_some() {
-        return "RETIRED";
+        return "RETIRED".to_string();
     }
     if snapshot.desired == micromux::Desired::Disabled {
-        return "DISABLED";
+        return "DISABLED".to_string();
     }
 
-    match snapshot.execution {
+    let job = snapshot.kind == micromux::ServiceKind::Job;
+    let name = match snapshot.execution {
+        micromux::Execution::Pending if snapshot.manual => "IDLE",
         micromux::Execution::Pending => "PENDING",
         micromux::Execution::Blocked => "BLOCKED",
         micromux::Execution::Starting => "STARTING",
@@ -1037,9 +1077,18 @@ fn state_name(snapshot: &micromux::ServiceSnapshot) -> &'static str {
             None => "RUNNING",
         },
         micromux::Execution::Stopping => "KILLED",
+        // A job's failed run waits for its retry.
+        micromux::Execution::Exited if job => "RETRYING",
         micromux::Execution::Exited => "EXITED",
+        micromux::Execution::Completed => "COMPLETED",
+        micromux::Execution::Failed => {
+            return snapshot
+                .last_exit_code
+                .map_or_else(|| "FAILED".to_string(), |code| format!("FAILED {code}"));
+        }
         micromux::Execution::Unknown => "UNKNOWN",
-    }
+    };
+    name.to_string()
 }
 
 /// Join argv for display, quoting only arguments a shell would split.
@@ -2027,6 +2076,13 @@ impl App {
                     format!(" Service · {} ", service.snapshot.id),
                     service_info_rows(
                         &service.snapshot,
+                        &|id| {
+                            self.state
+                                .services
+                                .iter()
+                                .find(|service| service.snapshot.id == id)
+                                .map(|service| service.snapshot.kind)
+                        },
                         session.as_ref(),
                         attempts.last(),
                         now_unix_ms(),

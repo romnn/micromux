@@ -351,7 +351,7 @@ async fn assert_dynamic_retirement(harness: &Harness) -> eyre::Result<()> {
     let mut blocked = dynamic_params("blocked", &["true"]);
     blocked.spec.depends_on = Some(vec![crate::DependencySpec {
         service: "debug".to_string(),
-        condition: config::DependencyCondition::Started,
+        condition: Some(config::DependencyCondition::Started),
     }]);
     let blocked = harness
         .control
@@ -649,7 +649,7 @@ fn failed_start_advances_generation_and_records_exit() {
     runtime.mark_starting();
     let run_id = runtime.allocate_run_id();
 
-    runtime.finish_failed_start(&crate::service::RestartPolicy::Never, run_id, -1);
+    runtime.finish_failed_start(&crate::ServiceSpec::default(), run_id, -1);
 
     assert_eq!(runtime.run_generation(), 1);
     assert_eq!(runtime.last_exit_code, Some(-1));
@@ -663,7 +663,7 @@ fn project_snapshot_reports_runtime_identity_and_config_drift() -> eyre::Result<
         Path::new("."),
         service_config("svc", ("sh", &["-c", "sleep 60"])),
     )?;
-    let policy = service.spec.restart.clone();
+    let spec = service.spec.clone();
     let mut runtime = ServiceRuntime::new(ServiceRuntimeInit::from(&service));
     runtime.run_config = Some(RunConfig::from(&service));
     start_dummy_run(&mut runtime)?;
@@ -686,7 +686,7 @@ fn project_snapshot_reports_runtime_identity_and_config_drift() -> eyre::Result<
     assert!(stale.config_stale);
     assert_eq!(stale.command, vec!["sh", "-c", "sleep 60"]);
 
-    runtime.finish_current_run(&policy, 0);
+    runtime.finish_current_run(&spec, 0);
     let (exited, uptime_started_at) = project_snapshot(&service, &runtime);
     assert_eq!(exited.pid, None);
     assert_eq!(exited.started_at_unix_ms, None);
@@ -702,7 +702,7 @@ fn project_snapshot_reports_active_restart_backoff() -> eyre::Result<()> {
     let mut runtime = ServiceRuntime::new(ServiceRuntimeInit::from(&service));
     runtime.run_config = Some(RunConfig::from(&service));
     start_dummy_run(&mut runtime)?;
-    runtime.finish_current_run(&service.spec.restart, 1);
+    runtime.finish_current_run(&service.spec, 1);
 
     let (snapshot, _) = project_snapshot(&service, &runtime);
 
@@ -726,6 +726,7 @@ fn start_dummy_run(runtime: &mut ServiceRuntime) -> eyre::Result<RunId> {
         pty: pty::PtyHandles::test_dummy()?,
         since: tokio::time::Instant::now(),
         exited_at: None,
+        stop_requested: false,
         environment: indexmap::IndexMap::new(),
     });
     Ok(run_id)
@@ -743,7 +744,7 @@ async fn post_exit_drain_cap_keeps_run_reserved_until_reader_finishes() -> eyre:
     });
 
     let run_id = start_dummy_run(&mut runtime)?;
-    runtime.finish_current_run(&policy, 0);
+    runtime.finish_current_run(&spec_for(&policy), 0);
     assert_eq!(runtime.draining_log_readers.len(), 1);
 
     runtime.cancel_due_drains(&service_id, tokio::time::Instant::now());
@@ -774,12 +775,12 @@ async fn log_reader_finished_leaves_no_draining_handle_in_either_order() -> eyre
     // Reader finishes first (EOF/cancel before the exit is processed).
     let run_id = start_dummy_run(&mut runtime)?;
     runtime.finish_log_reader(run_id);
-    runtime.finish_current_run(&policy, 0);
+    runtime.finish_current_run(&spec_for(&policy), 0);
     assert!(runtime.draining_log_readers.is_empty());
 
     // Exit is processed first; the reader keeps draining until its finish event removes it.
     let run_id = start_dummy_run(&mut runtime)?;
-    runtime.finish_current_run(&policy, 0);
+    runtime.finish_current_run(&spec_for(&policy), 0);
     assert_eq!(runtime.draining_log_readers.len(), 1);
     runtime.finish_log_reader(run_id);
     assert!(runtime.draining_log_readers.is_empty());
@@ -1002,7 +1003,7 @@ async fn dynamic_policy_limit_ttl_and_dependency_gating() -> eyre::Result<()> {
     params.expires_after = Some(Lease::Unbounded);
     params.spec.depends_on = Some(vec![crate::DependencySpec {
         service: "dep".to_string(),
-        condition: config::DependencyCondition::Started,
+        condition: Some(config::DependencyCondition::Started),
     }]);
     let created = dynamic_accepted(harness.control.start_dynamic(params).await)?;
     let now = unix_now_ms().unwrap_or_default();
@@ -1360,7 +1361,7 @@ async fn dynamic_replace_rejects_cycles_before_mutating() -> eyre::Result<()> {
     let mut b = dynamic_params("b", &["sh", "-c", "sleep 60"]);
     b.spec.depends_on = Some(vec![crate::DependencySpec {
         service: "a".to_string(),
-        condition: config::DependencyCondition::Started,
+        condition: Some(config::DependencyCondition::Started),
     }]);
     dynamic_accepted(harness.control.start_dynamic(b).await)?;
     let before = wait_until(&harness.reader, "a", |snapshot| {
@@ -1371,7 +1372,7 @@ async fn dynamic_replace_rejects_cycles_before_mutating() -> eyre::Result<()> {
     let mut replacement = dynamic_params("a", &["false"]);
     replacement.spec.depends_on = Some(vec![crate::DependencySpec {
         service: "b".to_string(),
-        condition: config::DependencyCondition::Started,
+        condition: Some(config::DependencyCondition::Started),
     }]);
     let result = harness
         .control
@@ -1414,7 +1415,7 @@ async fn retired_eviction_keeps_live_dependency_targets() -> eyre::Result<()> {
     let mut dependent = dynamic_params("dependent", &["sh", "-c", "sleep 60"]);
     dependent.spec.depends_on = Some(vec![crate::DependencySpec {
         service: "anchor".to_string(),
-        condition: config::DependencyCondition::Started,
+        condition: Some(config::DependencyCondition::Started),
     }]);
     dynamic_accepted(harness.control.start_dynamic(dependent).await)?;
     wait_until(&harness.reader, "dependent", |snapshot| {
@@ -1488,7 +1489,7 @@ async fn retired_eviction_keeps_dependencies_until_their_dependents_are_evicted(
     let mut dependent = dynamic_params("dependent", &["sh", "-c", "sleep 60"]);
     dependent.spec.depends_on = Some(vec![crate::DependencySpec {
         service: "anchor".to_string(),
-        condition: config::DependencyCondition::Started,
+        condition: Some(config::DependencyCondition::Started),
     }]);
     dynamic_accepted(harness.control.start_dynamic(dependent).await)?;
     wait_until(&harness.reader, "dependent", |snapshot| {
@@ -2178,7 +2179,7 @@ async fn reconcile_rejects_dynamic_dependencies_collisions_and_invalid_files_wit
     let mut params = dynamic_params("job", &["sh", "-c", "sleep 60"]);
     params.spec.depends_on = Some(vec![crate::DependencySpec {
         service: "svc".to_string(),
-        condition: config::DependencyCondition::Started,
+        condition: Some(config::DependencyCondition::Started),
     }]);
     dynamic_accepted(harness.control.start_dynamic(params).await)?;
     wait_until(&harness.reader, "job", |snapshot| {
@@ -5383,7 +5384,7 @@ async fn slow_cleanups_do_not_make_crash_loops_look_stable() -> eyre::Result<()>
         start_dummy_run(&mut crashing)?;
         crashing.mark_cleanup_started(1);
         age(&mut crashing, slow)?;
-        crashing.finish_current_run(&policy, 1);
+        crashing.finish_current_run(&spec_for(&policy), 1);
         // The scheduling pass spends one attempt on the automatic restart.
         assert!(crashing.will_auto_restart(&policy, 1));
         crashing.restart.decrement_failure_restart(&policy);
@@ -5396,11 +5397,19 @@ async fn slow_cleanups_do_not_make_crash_loops_look_stable() -> eyre::Result<()>
         start_dummy_run(&mut stable)?;
         age(&mut stable, slow)?;
         stable.mark_cleanup_started(1);
-        stable.finish_current_run(&policy, 1);
+        stable.finish_current_run(&spec_for(&policy), 1);
         stable.restart.decrement_failure_restart(&policy);
     }
     assert!(stable.will_auto_restart(&policy, 1));
     Ok(())
+}
+
+/// A service definition with `policy` and defaults elsewhere.
+fn spec_for(policy: &crate::service::RestartPolicy) -> crate::ServiceSpec {
+    crate::ServiceSpec {
+        restart: policy.clone(),
+        ..crate::ServiceSpec::default()
+    }
 }
 
 /// A dynamic service cloned from a configured one never runs the original's cleanup, which would
@@ -5776,5 +5785,370 @@ services:
 
     harness.shutdown.cancel();
     harness.handle.await??;
+    Ok(())
+}
+
+fn job(
+    id: &str,
+    script: &str,
+    configure: impl FnOnce(&mut config::Service),
+) -> eyre::Result<Service> {
+    let mut cfg = service_config(id, ("sh", &["-c", script]));
+    cfg.kind = crate::ServiceKind::Job;
+    configure(&mut cfg);
+    Ok(Service::new(id, Path::new("."), cfg)?)
+}
+
+fn dependent(id: &str, dependencies: Vec<config::Dependency>) -> eyre::Result<Service> {
+    let mut cfg = service_config(id, ("sh", &["-c", "sleep 60"]));
+    cfg.depends_on = dependencies;
+    Ok(Service::new(id, Path::new("."), cfg)?)
+}
+
+/// A bare dependency on a job waits for it to complete, and `started` on a job is met once it
+/// completed too; the completed job reports `Completed`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_completed_job_releases_bare_and_started_dependents() -> eyre::Result<()> {
+    let mut services = ServiceMap::new();
+    services.insert("seed".to_string(), job("seed", "sleep 0.3", |_| {})?);
+    services.insert(
+        "api".to_string(),
+        dependent(
+            "api",
+            vec![config::Dependency {
+                name: spanned_string("seed"),
+                condition: None,
+            }],
+        )?,
+    );
+    services.insert(
+        "web".to_string(),
+        dependent(
+            "web",
+            vec![depends_on("seed", config::DependencyCondition::Started)],
+        )?,
+    );
+    let harness = spawn_harness(services, None);
+
+    let api = wait_until(&harness.reader, "api", |snapshot| {
+        snapshot.execution == Execution::Running
+    })
+    .await?;
+    let seed = harness
+        .reader
+        .service("seed")
+        .ok_or_else(|| eyre::eyre!("seed vanished"))?;
+    assert_eq!(seed.kind, crate::ServiceKind::Job);
+    assert_eq!(seed.execution, Execution::Completed);
+    assert_eq!(seed.last_exit_code, Some(0));
+    assert_eq!(api.run_generation, 1);
+    wait_until(&harness.reader, "web", |snapshot| {
+        snapshot.execution == Execution::Running
+    })
+    .await?;
+
+    harness.shutdown.cancel();
+    harness.handle.await??;
+    Ok(())
+}
+
+/// A job that retries shows `Exited` between attempts and `Failed` once it gave up, which fails
+/// its dependents; a job's long runs do not refill its retries.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_job_fails_once_its_retries_are_spent() -> eyre::Result<()> {
+    let mut services = ServiceMap::new();
+    services.insert(
+        "migrate".to_string(),
+        job("migrate", "exit 2", |cfg| {
+            cfg.restart_policy = RestartPolicy::OnFailure {
+                max_attempts: Some(1),
+            };
+        })?,
+    );
+    services.insert(
+        "api".to_string(),
+        dependent(
+            "api",
+            vec![config::Dependency {
+                name: spanned_string("migrate"),
+                condition: None,
+            }],
+        )?,
+    );
+    let harness = spawn_harness(services, None);
+
+    let api = wait_until(&harness.reader, "api", |snapshot| {
+        snapshot.dependency_failure.is_some()
+    })
+    .await?;
+    let migrate = harness
+        .reader
+        .service("migrate")
+        .ok_or_else(|| eyre::eyre!("migrate vanished"))?;
+    assert_eq!(
+        (
+            migrate.execution,
+            migrate.run_generation,
+            migrate.last_exit_code
+        ),
+        (Execution::Failed, 2, Some(2))
+    );
+    assert_eq!(
+        api.dependency_failure.map(|failure| (
+            failure.condition,
+            failure.reason,
+            failure.exit_code
+        )),
+        Some((
+            config::DependencyCondition::CompletedSuccessfully,
+            crate::DependencyFailureReason::Exited,
+            Some(2)
+        ))
+    );
+    let retried = harness
+        .reader
+        .events("migrate", None, None)
+        .0
+        .iter()
+        .any(|event| event.kind == ServiceEventKind::BackoffScheduled);
+    assert!(retried, "the first failure did not schedule a retry");
+
+    harness.shutdown.cancel();
+    harness.handle.await??;
+    Ok(())
+}
+
+#[test]
+fn a_jobs_long_runs_do_not_refill_its_retries() -> eyre::Result<()> {
+    let policy = RestartPolicy::OnFailure {
+        max_attempts: Some(2),
+    };
+    let spec = crate::ServiceSpec {
+        kind: crate::ServiceKind::Job,
+        ..spec_for(&policy)
+    };
+    let mut runtime = ServiceRuntime::new(ServiceRuntimeInit {
+        restart_policy: &policy,
+        startup_mode: StartupMode::Enabled,
+    });
+    for _ in 0..2 {
+        start_dummy_run(&mut runtime)?;
+        if let Some(running) = runtime.running.as_mut() {
+            running.since = running
+                .since
+                .checked_sub(RESTART_BACKOFF_RESET * 3)
+                .ok_or_else(|| eyre::eyre!("the clock cannot go back"))?;
+        }
+        runtime.finish_current_run(&spec, 1);
+        runtime.restart.decrement_failure_restart(&policy);
+    }
+    assert!(!runtime.will_auto_restart(&policy, 1));
+    Ok(())
+}
+
+/// A manual job waits to be run, which fails its dependents until a restart runs it; neither
+/// `restart_all` nor an enable runs it again once it completed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_manual_job_runs_only_when_restarted() -> eyre::Result<()> {
+    let mut services = ServiceMap::new();
+    services.insert(
+        "seed".to_string(),
+        job("seed", "true", |cfg| cfg.startup_mode = StartupMode::Manual)?,
+    );
+    services.insert(
+        "api".to_string(),
+        dependent(
+            "api",
+            vec![config::Dependency {
+                name: spanned_string("seed"),
+                condition: None,
+            }],
+        )?,
+    );
+    let harness = spawn_harness(services, None);
+
+    let api = wait_until(&harness.reader, "api", |snapshot| {
+        snapshot.dependency_failure.is_some()
+    })
+    .await?;
+    assert_eq!(
+        api.dependency_failure.map(|failure| failure.reason),
+        Some(crate::DependencyFailureReason::NotRun)
+    );
+    let seed = harness
+        .reader
+        .service("seed")
+        .ok_or_else(|| eyre::eyre!("seed vanished"))?;
+    assert_eq!(
+        (seed.manual, seed.execution, seed.run_generation),
+        (true, Execution::Pending, 0)
+    );
+
+    accepted(harness.control.restart(&"seed".to_string()).await)?;
+    wait_until(&harness.reader, "api", |snapshot| {
+        snapshot.execution == Execution::Running
+    })
+    .await?;
+    let generation = |harness: &Harness| {
+        harness
+            .reader
+            .service("seed")
+            .map(|snapshot| (snapshot.execution, snapshot.run_generation))
+    };
+    assert_eq!(generation(&harness), Some((Execution::Completed, 1)));
+
+    accepted(harness.control.restart_all().await)?;
+    accepted(harness.control.disable(&"seed".to_string()).await)?;
+    accepted(harness.control.enable(&"seed".to_string()).await)?;
+    assert_eq!(generation(&harness), Some((Execution::Completed, 1)));
+
+    harness.shutdown.cancel();
+    harness.handle.await??;
+    Ok(())
+}
+
+/// A job that micromux stopped did not complete, even when it exits with status 0 on its stop
+/// signal: re-enabled, an on-start job runs again, and its dependents stay blocked meanwhile.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_job_stopped_by_micromux_is_not_completed() -> eyre::Result<()> {
+    let mut services = ServiceMap::new();
+    services.insert(
+        "migrate".to_string(),
+        job("migrate", "trap 'exit 0' TERM; sleep 60 & wait", |_| {})?,
+    );
+    services.insert(
+        "api".to_string(),
+        dependent(
+            "api",
+            vec![config::Dependency {
+                name: spanned_string("migrate"),
+                condition: None,
+            }],
+        )?,
+    );
+    let harness = spawn_harness(services, None);
+    wait_until(&harness.reader, "migrate", |snapshot| {
+        snapshot.execution == Execution::Running
+    })
+    .await?;
+
+    accepted(harness.control.disable(&"migrate".to_string()).await)?;
+    // How the stopped shell exits differs between platforms; a status 0 is pinned below.
+    let stopped = wait_until(&harness.reader, "migrate", |snapshot| {
+        snapshot.last_exit_code.is_some() && snapshot.execution != Execution::Stopping
+    })
+    .await?;
+    assert_ne!(stopped.execution, Execution::Completed);
+
+    accepted(harness.control.enable(&"migrate".to_string()).await)?;
+    let rerun = harness
+        .reader
+        .service("migrate")
+        .ok_or_else(|| eyre::eyre!("migrate vanished"))?;
+    assert_eq!(
+        (rerun.execution, rerun.run_generation),
+        (Execution::Running, 2)
+    );
+    assert_ne!(
+        harness.reader.service("api").map(|api| api.execution),
+        Some(Execution::Running)
+    );
+
+    harness.shutdown.cancel();
+    harness.handle.await??;
+    Ok(())
+}
+
+/// Enabling a job that is already enabled neither starts nor cancels a run of it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn enabling_an_enabled_job_keeps_its_requested_run() -> eyre::Result<()> {
+    let mut services = ServiceMap::new();
+    let mut gate_cfg = service_config("gate", ("sh", &["-c", "sleep 60"]));
+    gate_cfg.startup_mode = StartupMode::Disabled;
+    services.insert(
+        "gate".to_string(),
+        Service::new("gate", Path::new("."), gate_cfg)?,
+    );
+    services.insert(
+        "reset".to_string(),
+        job("reset", "true", |cfg| {
+            cfg.startup_mode = StartupMode::Manual;
+            cfg.depends_on = vec![depends_on("gate", config::DependencyCondition::Started)];
+        })?,
+    );
+    let harness = spawn_harness(services, None);
+
+    accepted(harness.control.restart(&"reset".to_string()).await)?;
+    accepted(harness.control.enable(&"reset".to_string()).await)?;
+    assert_eq!(
+        harness.reader.service("reset").map(|reset| reset.execution),
+        Some(Execution::Blocked)
+    );
+
+    accepted(harness.control.enable(&"gate".to_string()).await)?;
+    let reset = wait_until(&harness.reader, "reset", |snapshot| {
+        snapshot.execution == Execution::Completed
+    })
+    .await?;
+    assert_eq!(reset.run_generation, 1);
+
+    harness.shutdown.cancel();
+    harness.handle.await??;
+    Ok(())
+}
+
+#[test]
+fn a_job_whose_rerun_was_requested_does_not_report_its_last_completion() -> eyre::Result<()> {
+    let service = job("seed", "true", |_| {})?;
+    let mut runtime = ServiceRuntime::new(ServiceRuntimeInit::from(&service));
+    start_dummy_run(&mut runtime)?;
+    runtime.finish_current_run(&service.spec, 0);
+    assert_eq!(
+        project_snapshot(&service, &runtime).0.execution,
+        Execution::Completed
+    );
+
+    runtime.request_restart();
+    assert_ne!(
+        project_snapshot(&service, &runtime).0.execution,
+        Execution::Completed
+    );
+
+    let manual = job("reset", "true", |cfg| {
+        cfg.startup_mode = StartupMode::Manual;
+    })?;
+    let mut runtime = ServiceRuntime::new(ServiceRuntimeInit::from(&manual));
+    assert_eq!(
+        project_snapshot(&manual, &runtime).0.execution,
+        Execution::Pending
+    );
+    runtime.request_restart();
+    assert_eq!(
+        project_snapshot(&manual, &runtime).0.execution,
+        Execution::Starting
+    );
+    Ok(())
+}
+
+#[test]
+fn a_stopped_job_run_that_exits_zero_is_pending_again() -> eyre::Result<()> {
+    let service = job("migrate", "true", |_| {})?;
+    let mut runtime = ServiceRuntime::new(ServiceRuntimeInit::from(&service));
+    start_dummy_run(&mut runtime)?;
+    if let Some(running) = runtime.running.as_mut() {
+        running.cancel();
+    }
+    runtime.finish_current_run(&service.spec, 0);
+
+    assert!(matches!(runtime.state, State::Pending));
+    assert_eq!(
+        project_snapshot(&service, &runtime).0.execution,
+        Execution::Pending
+    );
+    assert!(!schedule::condition_met(
+        config::DependencyCondition::CompletedSuccessfully,
+        &service,
+        &runtime
+    ));
     Ok(())
 }

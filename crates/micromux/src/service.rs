@@ -743,6 +743,7 @@ mod tests {
             service.spec,
             ServiceSpec {
                 name: Some("worker".to_string()),
+                kind: crate::ServiceKind::Service,
                 command: vec!["sh".to_string(), "-c".to_string(), "echo ok".to_string()],
                 working_dir: Some(dir.join("work")),
                 environment: indexmap::IndexMap::from([
@@ -752,7 +753,7 @@ mod tests {
                 ]),
                 depends_on: vec![DependencySpec {
                     service: "database".to_string(),
-                    condition: config::DependencyCondition::Healthy,
+                    condition: Some(config::DependencyCondition::Healthy),
                 }],
                 healthcheck: Some(HealthcheckSpec {
                     test: vec!["true".to_string()],
@@ -1240,6 +1241,8 @@ pub enum StartupMode {
     Enabled,
     /// Wait for an explicit enable request.
     Disabled,
+    /// Enabled, but run only on request: a job that runs on demand.
+    Manual,
 }
 
 #[derive(Debug, Clone)]
@@ -1475,10 +1478,7 @@ impl Service {
             .into_iter()
             .map(|dependency| DependencySpec {
                 service: dependency.name.into_inner(),
-                condition: dependency
-                    .condition
-                    .map(yaml_spanned::Spanned::into_inner)
-                    .unwrap_or_default(),
+                condition: dependency.condition.map(yaml_spanned::Spanned::into_inner),
             })
             .collect();
 
@@ -1486,6 +1486,7 @@ impl Service {
             id,
             spec: ServiceSpec {
                 name: Some(config.name.into_inner()),
+                kind: config.kind,
                 command,
                 working_dir: Some(working_directory.path.clone()),
                 environment,

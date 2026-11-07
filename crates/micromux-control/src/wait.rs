@@ -4,7 +4,7 @@
 use std::time::Duration;
 
 use micromux::{ChangeKind, DependencyFailure, DependencyFailureReason, Desired, Execution};
-use micromux::{Health, ServiceSnapshot, SessionChange};
+use micromux::{Health, ServiceKind, ServiceSnapshot, SessionChange};
 
 use crate::{Client, ControlEndpoint, Subscription};
 
@@ -22,10 +22,14 @@ pub enum WaitFor {
 pub enum WaitVerdict {
     /// The target run is up, and healthy if a healthcheck is configured.
     Healthy,
+    /// The target run of a job completed with exit status 0, which is a job's readiness.
+    Completed,
     /// The target run exited; carries its exit code.
     Exited(Option<i32>),
     /// The service is disabled or retired, with no qualifying run in flight.
     Unavailable,
+    /// A job that finished, or a manual job that never ran, and that nothing asked to run again.
+    Idle,
     /// The service is blocked behind a dependency that cannot meet its condition.
     DependencyFailed(DependencyFailure),
 }
@@ -52,6 +56,11 @@ pub fn evaluate(
 ) -> Option<WaitVerdict> {
     let ready = generation_ready(snapshot, after);
     let unavailable = snapshot.desired == Desired::Disabled || snapshot.retired.is_some();
+    let job = snapshot.kind == ServiceKind::Job;
+    // A finished job, or a manual job that never ran, runs again only when asked to. The session
+    // never reports either while a run of it is requested, so neither can be about to run.
+    let idle = matches!(snapshot.execution, Execution::Completed | Execution::Failed)
+        || (snapshot.manual && snapshot.execution == Execution::Pending);
     match wait_for {
         WaitFor::Healthy => {
             // Neither a disabled service nor one blocked for good will become healthy, whatever
@@ -62,18 +71,25 @@ pub fn evaluate(
             if let Some(failure) = &snapshot.dependency_failure {
                 return Some(WaitVerdict::DependencyFailed(failure.clone()));
             }
-            if !ready {
-                return None;
+            // A pending manual job waits for a request, at any generation.
+            if !ready || (snapshot.manual && snapshot.execution == Execution::Pending) {
+                return idle.then_some(WaitVerdict::Idle);
             }
             match snapshot.execution {
-                Execution::Exited => Some(WaitVerdict::Exited(snapshot.last_exit_code)),
+                Execution::Completed => Some(WaitVerdict::Completed),
+                Execution::Failed => Some(WaitVerdict::Exited(snapshot.last_exit_code)),
+                // A job that exited is about to retry; a service that exited is down.
+                Execution::Exited if !job => Some(WaitVerdict::Exited(snapshot.last_exit_code)),
+                // A job is ready once it completed, not while it runs.
                 Execution::Running
-                    if !snapshot.healthcheck_configured
-                        || snapshot.health == Some(Health::Healthy) =>
+                    if !job
+                        && (!snapshot.healthcheck_configured
+                            || snapshot.health == Some(Health::Healthy)) =>
                 {
                     Some(WaitVerdict::Healthy)
                 }
-                Execution::Running
+                Execution::Exited
+                | Execution::Running
                 | Execution::Pending
                 | Execution::Blocked
                 | Execution::Starting
@@ -82,7 +98,7 @@ pub fn evaluate(
             }
         }
         WaitFor::Exit => {
-            if ready && snapshot.execution == Execution::Exited {
+            if ready && snapshot.execution.has_exited() {
                 return Some(WaitVerdict::Exited(snapshot.last_exit_code));
             }
             // A disabled run that is still draining will still exit.
@@ -94,10 +110,10 @@ pub fn evaluate(
             if unavailable && !run_in_flight {
                 return Some(WaitVerdict::Unavailable);
             }
-            snapshot
-                .dependency_failure
-                .clone()
-                .map(WaitVerdict::DependencyFailed)
+            if let Some(failure) = &snapshot.dependency_failure {
+                return Some(WaitVerdict::DependencyFailed(failure.clone()));
+            }
+            idle.then_some(WaitVerdict::Idle)
         }
     }
 }
@@ -108,6 +124,9 @@ pub fn dependency_failure_message(service: &str, failure: &DependencyFailure) ->
     let remedy = match failure.reason {
         DependencyFailureReason::Exited => format!("fix it and restart `{}`", failure.service),
         DependencyFailureReason::Disabled => format!("enable `{}`", failure.service),
+        DependencyFailureReason::NotRun => {
+            format!("run it with a restart of `{}`", failure.service)
+        }
         DependencyFailureReason::NoHealthcheck => format!(
             "give `{}` a healthcheck and restart it, or depend on it with `condition: started`",
             failure.service
@@ -318,6 +337,70 @@ mod tests {
             evaluate(&snap, WaitFor::Exit, Some(1)),
             Some(WaitVerdict::Unavailable)
         );
+    }
+
+    fn job(execution: Execution, exit_code: Option<i32>) -> ServiceSnapshot {
+        let mut snap = snapshot();
+        snap.kind = ServiceKind::Job;
+        snap.execution = execution;
+        snap.last_exit_code = exit_code;
+        snap
+    }
+
+    #[test]
+    fn a_job_is_ready_once_it_completed_and_not_while_it_runs_or_retries() {
+        assert_eq!(
+            evaluate(&job(Execution::Running, None), WaitFor::Healthy, None),
+            None
+        );
+        assert_eq!(
+            evaluate(&job(Execution::Exited, Some(1)), WaitFor::Healthy, None),
+            None
+        );
+        assert_eq!(
+            evaluate(&job(Execution::Completed, Some(0)), WaitFor::Healthy, None),
+            Some(WaitVerdict::Completed)
+        );
+        assert_eq!(
+            evaluate(&job(Execution::Failed, Some(2)), WaitFor::Healthy, None),
+            Some(WaitVerdict::Exited(Some(2)))
+        );
+        // An exit wait resolves on every exit, a retried one included.
+        assert_eq!(
+            evaluate(&job(Execution::Exited, Some(1)), WaitFor::Exit, None),
+            Some(WaitVerdict::Exited(Some(1)))
+        );
+        assert_eq!(
+            evaluate(&job(Execution::Completed, Some(0)), WaitFor::Exit, None),
+            Some(WaitVerdict::Exited(Some(0)))
+        );
+    }
+
+    #[test]
+    fn a_wait_for_a_run_that_nothing_will_start_fails_fast() {
+        // A finished job waited on for a newer run.
+        for wait_for in [WaitFor::Healthy, WaitFor::Exit] {
+            assert_eq!(
+                evaluate(&job(Execution::Completed, Some(0)), wait_for, Some(1)),
+                Some(WaitVerdict::Idle)
+            );
+        }
+        // A manual job that never ran.
+        let mut manual = job(Execution::Pending, None);
+        manual.manual = true;
+        manual.run_generation = 0;
+        for wait_for in [WaitFor::Healthy, WaitFor::Exit] {
+            assert_eq!(evaluate(&manual, wait_for, None), Some(WaitVerdict::Idle));
+        }
+        // So does one that micromux interrupted after an earlier run.
+        manual.run_generation = 1;
+        assert_eq!(
+            evaluate(&manual, WaitFor::Healthy, None),
+            Some(WaitVerdict::Idle)
+        );
+        // Once it was asked to run, it waits.
+        manual.execution = Execution::Blocked;
+        assert_eq!(evaluate(&manual, WaitFor::Healthy, None), None);
     }
 
     #[test]

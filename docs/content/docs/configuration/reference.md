@@ -35,6 +35,8 @@ Every key in `micromux.yaml`. The machine-readable source of truth is [`micromux
 |---|---|---|
 | `command` | string / array | **Required.** Shell-like string or argv array. Each argument is [interpolated]({{< relref "services.md" >}}#variable-interpolation) after splitting. |
 | `name` | string | Display name for the TUI. |
+| `kind` | string | `service` (default) or `job`, which [runs to completion]({{< relref "services.md" >}}#jobs). |
+| `run` | string | For a job: `on-start` (default) or `manual`, which runs it only when restarted. |
 | `disabled` | bool | Leave the service disabled when the session starts. |
 | `working_dir` | string | Working directory, relative to the config; defaults to the config's directory. Aliases: `cwd`, `directory`. May reference `${VAR}` from micromux's own environment only. |
 | `environment` | map | Inline environment variables. Values may reference `${VAR}`. |

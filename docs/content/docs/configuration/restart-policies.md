@@ -29,6 +29,8 @@ services:
 | `on-failure` | Restart only on a non-zero exit. Add a cap with `on-failure:N` (e.g. `on-failure:5`). |
 | `no` | Never restart. Use for one-shot jobs like migrations. (`never` is accepted as a synonym.) |
 
+A [job]({{< relref "services.md" >}}#jobs) does not inherit the top-level default: it never restarts unless it sets `restart: on-failure[:N]`, and `always` and `unless-stopped` are errors on a job. Its `on-failure` count covers every failed attempt, however long each ran.
+
 `on-failure` may be written with a count as `on-failure:3` or `on-failure=3`. Policy names are case-insensitive and accept `-` or `_` (`unless-stopped` or `unless_stopped`).
 
 ## Graceful stops

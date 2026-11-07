@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// Bump the minor for additive changes (new optional/defaulted fields, new tools that reuse
 /// existing requests), and bump the major for incompatible request/response semantics.
-pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(3, 15);
+pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(3, 16);
 
 /// The first protocol revision whose sessions answer [`Request::GetEnvironment`].
 pub const ENVIRONMENT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(3, 15);
@@ -524,14 +524,14 @@ mod tests {
     fn protocol_version_uses_major_minor_shape_and_accepts_same_major() {
         assert_eq!(
             serde_json::to_value(PROTOCOL_VERSION).unwrap(),
-            json!({ "major": 3, "minor": 15 })
+            json!({ "major": 3, "minor": 16 })
         );
         assert_eq!(
             serde_json::from_value::<ProtocolVersion>(json!({ "major": 1, "minor": 0 })).unwrap(),
             ProtocolVersion::new(1, 0)
         );
 
-        assert!(PROTOCOL_VERSION.is_compatible_with(ProtocolVersion::new(3, 15)));
+        assert!(PROTOCOL_VERSION.is_compatible_with(ProtocolVersion::new(3, 17)));
         assert!(!PROTOCOL_VERSION.is_compatible_with(ProtocolVersion::new(2, 9)));
         assert!(!supports_versioned_subscriptions(ProtocolVersion::new(
             3, 6
@@ -809,7 +809,7 @@ mod tests {
     fn protocol_version_ignores_additive_fields() {
         let version = serde_json::from_value::<ProtocolVersion>(json!({
             "major": 3,
-            "minor": 15,
+            "minor": 16,
             "future_capability": true
         }))
         .unwrap();

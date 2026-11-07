@@ -175,6 +175,9 @@ pub(super) struct RunningService {
     since: tokio::time::Instant,
     /// When the process exited, while its cleanup still holds the run open.
     exited_at: Option<tokio::time::Instant>,
+    /// Whether micromux asked the run to stop. The terminate token cannot tell: the run cancels
+    /// it itself once its process exits.
+    stop_requested: bool,
     /// The configured environment the process was spawned with, which a reconcile can no longer
     /// change.
     environment: indexmap::IndexMap<String, String>,
@@ -186,6 +189,7 @@ impl RunningService {
     /// On Darwin, stopping the reader while terminal output remains queued can keep `wait` from
     /// completing and leave the service unable to restart.
     fn cancel(&mut self) {
+        self.stop_requested = true;
         self.terminate.cancel();
     }
 
@@ -302,6 +306,9 @@ pub(super) struct ServiceRuntime {
     /// start. Non-empty exactly while the service is held back by them, so the projection can report
     /// a blocked service as such instead of leaving it at its pre-start state.
     blocked_on: Vec<ServiceID>,
+    /// Whether micromux itself stopped the last run, by a restart, a disable, or shutdown. Such a
+    /// run did not finish on its own, so a job's exit status 0 does not complete it.
+    last_run_stopped: bool,
     /// The blocker among `blocked_on`, possibly reached through further blocked services, that
     /// cannot meet its condition without an intervention. `Some` only while `blocked_on` is not
     /// empty.
@@ -380,7 +387,7 @@ impl<'a> From<&'a Service> for ServiceRuntimeInit<'a> {
 impl ServiceRuntime {
     fn new(init: ServiceRuntimeInit<'_>) -> Self {
         let desired = match init.startup_mode {
-            StartupMode::Enabled => DesiredState::Enabled,
+            StartupMode::Enabled | StartupMode::Manual => DesiredState::Enabled,
             StartupMode::Disabled => DesiredState::Disabled,
         };
         let state = match desired {
@@ -407,6 +414,7 @@ impl ServiceRuntime {
             retired_at_unix_ms: None,
             expires_at: None,
             blocked_on: Vec::new(),
+            last_run_stopped: false,
             dependency_failure: None,
             input_drops: InputDropThrottle::default(),
         }
@@ -534,6 +542,23 @@ impl ServiceRuntime {
         }
     }
 
+    /// Enable a disabled job without starting a run: it returns to its outcome, or to pending,
+    /// where an on-start job is scheduled as at session start and a manual one waits.
+    fn enable_without_start(&mut self) {
+        self.desired = DesiredState::Enabled;
+        self.start_requested = false;
+        self.clear_logs_on_start = false;
+        self.restart.clear_backoff();
+        if matches!(self.state, State::Disabled) && self.running.is_none() {
+            // A job that finished on its own keeps its outcome; one that never ran, or that
+            // micromux interrupted, is pending again.
+            self.state = match (self.last_exit_code, self.last_run_stopped) {
+                (Some(exit_code), false) => State::Exited { exit_code },
+                _ => State::Pending,
+            };
+        }
+    }
+
     fn disable(&mut self) {
         self.desired = DesiredState::Disabled;
         self.start_requested = false;
@@ -545,13 +570,14 @@ impl ServiceRuntime {
         }
     }
 
-    fn finish_current_run(&mut self, policy: &service::RestartPolicy, exit_code: i32) {
+    fn finish_current_run(&mut self, spec: &ServiceSpec, exit_code: i32) {
         // Preserve the generation and exit code before dropping the run handle so an exited or
         // disabled service can still be projected with an accurate `run_generation`/`last_exit_code`.
         let Some(running) = self.running.take() else {
-            self.finish_run_state(policy, exit_code, None, false);
+            self.finish_run_state(spec, exit_code, None, false, false);
             return;
         };
+        let stopped = running.stop_requested;
         let (finished_run_id, stable, log_reader) = running.finish();
         if let Some(log_reader) = log_reader {
             self.draining_log_readers.push(DrainingLogReader {
@@ -560,7 +586,7 @@ impl ServiceRuntime {
                 cancel_at: Some(tokio::time::Instant::now() + POST_EXIT_DRAIN_GRACE),
             });
         }
-        self.finish_run_state(policy, exit_code, Some(finished_run_id), stable);
+        self.finish_run_state(spec, exit_code, Some(finished_run_id), stable, stopped);
     }
 
     fn cancel_due_drains(&mut self, service_id: &ServiceID, now: tokio::time::Instant) {
@@ -594,37 +620,42 @@ impl ServiceRuntime {
         }
     }
 
-    fn finish_failed_start(
-        &mut self,
-        policy: &service::RestartPolicy,
-        run_id: RunId,
-        exit_code: i32,
-    ) {
-        self.finish_run_state(policy, exit_code, Some(run_id), false);
+    fn finish_failed_start(&mut self, spec: &ServiceSpec, run_id: RunId, exit_code: i32) {
+        self.finish_run_state(spec, exit_code, Some(run_id), false, false);
     }
 
     fn finish_run_state(
         &mut self,
-        policy: &service::RestartPolicy,
+        spec: &ServiceSpec,
         exit_code: i32,
         finished_run_id: Option<RunId>,
         stable: bool,
+        stopped: bool,
     ) {
         if let Some(run_id) = finished_run_id {
             self.last_run_id = Some(run_id);
         }
+        self.last_run_stopped = stopped;
         self.uptime_started_at = None;
         self.started_at_unix_ms = None;
         self.last_exit_code = Some(exit_code);
         if self.desired == DesiredState::Disabled {
             self.state = State::Disabled;
             self.restart.clear_backoff();
+        } else if spec.kind == crate::ServiceKind::Job && stopped && !self.start_requested {
+            // A job interrupted by micromux did not finish: it is pending again, like one that
+            // never ran, whatever its exit status.
+            self.state = State::Pending;
+            self.restart.clear_backoff();
         } else {
             self.state = State::Exited { exit_code };
             if self.start_requested {
                 self.restart.clear_backoff();
-            } else if self.will_auto_restart(policy, exit_code) {
-                self.restart.apply_backoff(stable);
+            } else if self.will_auto_restart(&spec.restart, exit_code) {
+                // A job's retries count every failed attempt, however long each ran; only an
+                // explicit restart or enable resets them.
+                self.restart
+                    .apply_backoff(stable && spec.kind == crate::ServiceKind::Service);
             } else {
                 self.restart.clear_backoff();
             }
@@ -665,6 +696,26 @@ pub(super) fn project_snapshot(
         ran_before,
         !runtime.blocked_on.is_empty(),
     );
+    let execution = match (service.spec.kind, execution, runtime.last_exit_code) {
+        (crate::ServiceKind::Job, Execution::Exited, Some(0))
+            if !runtime.start_requested && !runtime.last_run_stopped =>
+        {
+            Execution::Completed
+        }
+        (crate::ServiceKind::Job, Execution::Exited, Some(exit_code))
+            if !runtime.last_run_stopped
+                && (runtime.desired == DesiredState::Disabled
+                    || (!runtime.start_requested
+                        && !runtime.will_auto_restart(&service.spec.restart, exit_code))) =>
+        {
+            Execution::Failed
+        }
+        // A job asked to run is about to, so it never reads as idle meanwhile.
+        (crate::ServiceKind::Job, Execution::Pending, _) if runtime.start_requested => {
+            Execution::Starting
+        }
+        (_, execution, _) => execution,
+    };
     let health = match (execution, &runtime.state) {
         (Execution::Running, State::Running { health }) => *health,
         _ => None,
@@ -690,6 +741,8 @@ pub(super) fn project_snapshot(
         },
         retired: runtime.retired,
         retired_at_unix_ms: runtime.retired_at_unix_ms,
+        kind: service.spec.kind,
+        manual: service.startup_mode == StartupMode::Manual,
         desired: match runtime.desired {
             DesiredState::Enabled => Desired::Enabled,
             DesiredState::Disabled => Desired::Disabled,
@@ -2203,6 +2256,7 @@ impl SchedulerRuntime {
                             match service.startup_mode {
                                 StartupMode::Enabled => runtime.request_restart(),
                                 StartupMode::Disabled => runtime.disable(),
+                                StartupMode::Manual => runtime.enable_without_start(),
                             }
                         }
                         services.insert(service_id.clone(), service.clone());
@@ -2460,7 +2514,16 @@ impl SchedulerRuntime {
             .get_mut(service_id)
             .ok_or(CommandRejection::UnknownService)?;
         let observed_generation = runtime.run_generation();
-        runtime.request_enable();
+        // Enabling a job never starts or cancels a run of it: an enabled job is left alone, and a
+        // disabled one returns to where it was. Only a restart runs a job on request.
+        let job = services
+            .get(service_id)
+            .is_some_and(|service| service.spec.kind == crate::ServiceKind::Job);
+        match (job, runtime.desired) {
+            (false, _) => runtime.request_enable(),
+            (true, DesiredState::Disabled) => runtime.enable_without_start(),
+            (true, DesiredState::Enabled) => {}
+        }
         self.sync(services, service_id);
         self.append_event(
             service_id,
@@ -2507,6 +2570,12 @@ impl SchedulerRuntime {
                 .services
                 .get_mut(service_id)
                 .filter(|runtime| runtime.desired == DesiredState::Enabled && runtime.is_live())
+                // A manual job runs only when asked for by name.
+                .filter(|_| {
+                    services
+                        .get(service_id)
+                        .is_none_or(|service| service.startup_mode != StartupMode::Manual)
+                })
                 .map(|runtime| {
                     let observed_generation = runtime.run_generation();
                     runtime.request_restart();
@@ -2732,7 +2801,7 @@ impl SchedulerRuntime {
         if let Some(service) = services.get(service_id)
             && let Some(runtime) = self.services.get_mut(service_id)
         {
-            runtime.finish_current_run(&service.spec.restart, exit_code);
+            runtime.finish_current_run(&service.spec, exit_code);
         }
         self.sync(services, service_id);
         let generation = event.run_id().get();

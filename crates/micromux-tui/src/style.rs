@@ -19,10 +19,13 @@ pub fn health_style(health: Option<micromux::Health>) -> Style {
 
 /// Whether a service's panes show output nothing is producing any more.
 ///
-/// A disabled or retired service is stopped, so its logs are a record rather than a live view.
+/// A disabled or retired service is stopped and a completed job is done, so their logs are a
+/// record rather than a live view.
 #[must_use]
 pub fn is_frozen(snapshot: &micromux::ServiceSnapshot) -> bool {
-    snapshot.retired.is_some() || snapshot.desired == micromux::Desired::Disabled
+    snapshot.retired.is_some()
+        || snapshot.desired == micromux::Desired::Disabled
+        || snapshot.execution == micromux::Execution::Completed
 }
 
 #[must_use]
@@ -44,7 +47,11 @@ pub fn service_style(snapshot: &micromux::ServiceSnapshot) -> Style {
         micromux::Execution::Stopping | micromux::Execution::Unknown => {
             Style::default().fg(tailwind::AMBER.c500)
         }
-        micromux::Execution::Exited => Style::default().fg(tailwind::RED.c400),
+        micromux::Execution::Exited | micromux::Execution::Failed => {
+            Style::default().fg(tailwind::RED.c400)
+        }
+        // Unreachable behind `is_frozen`, which grays a completed job out entirely.
+        micromux::Execution::Completed => Style::default().fg(FROZEN_TEXT),
     }
 }
 

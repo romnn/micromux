@@ -48,9 +48,9 @@ use crate::select::ToolError;
 use crate::tools::events::{ServiceEventPage, SessionServiceEvent, merge_service_events};
 use crate::tools::health::{
     ServiceDiagnosis, SnapshotWait, WaitConclusion, bounded_attempt, dependency_failed_error,
-    diagnose_service, health_history, latest_health_for_snapshot, retired_service_message,
-    service_needs_diagnosis, service_snapshot, timeout_hint, unavailable_error, wait_for_health,
-    wait_for_snapshot,
+    diagnose_service, health_history, idle_error, latest_health_for_snapshot,
+    retired_service_message, service_needs_diagnosis, service_snapshot, timeout_hint,
+    unavailable_error, wait_for_health, wait_for_snapshot,
 };
 use crate::tools::logs::{
     FollowGap, ServiceFollowGap, compact_logs_since, current_cursors, current_service_cursor,
@@ -111,7 +111,10 @@ are bounded by session policy unless it explicitly permits `expires_after=\"none
 `renew_dynamic_service` to extend a live lease without restarting. For servers, use \
 `start_dynamic_service_and_wait` for the create/wait/log/events/diagnosis bundle, or compose \
 `start_dynamic_service`, `wait_for_healthy(after_generation=observed_generation)`, and \
-`follow_logs`. Use `wait_for_exit` for one-shot jobs instead of waiting for health. \
+`follow_logs`. A service with `kind: Job` runs to completion: it reports `Completed` (exit 0) or \
+`Failed`, `wait_for_healthy` and `ensure_service_ready` treat completion as ready, and \
+`restart_service` runs it again, a `manual` one included; use `wait_for_exit` when you need the \
+exit code and output of any one-shot run. \
 `ensure_service_ready` can start a missing session, enable a disabled configured service, and wait \
 for readiness in one call. Use `get_service_events` for startup forensics; pass `service=\"*\"` \
 with its per-service cursor map to follow ordering across the session. `restart_service` and \
@@ -810,6 +813,8 @@ enum ServiceEventsResult {
 enum EnsureActionKind {
     StartedSession,
     EnabledService,
+    /// Ran a manual job that had not run, by restarting it.
+    RanJob,
     Waited,
 }
 
@@ -882,6 +887,8 @@ struct WaitResult {
 #[serde(rename_all = "snake_case")]
 enum WaitStatus {
     Healthy,
+    /// A job's run completed with exit status 0.
+    Completed,
     Exited,
     DependencyFailed,
     Timeout,
@@ -913,6 +920,12 @@ impl WaitResult {
     fn from_conclusion(service: String, timeout: Duration, conclusion: &WaitConclusion) -> Self {
         match conclusion {
             WaitConclusion::Healthy(snapshot) => Self::healthy(service, snapshot.run_generation),
+            WaitConclusion::Completed(snapshot) => {
+                let mut result = Self::healthy(service, snapshot.run_generation);
+                result.status = WaitStatus::Completed;
+                result.exit_code = Some(Nullable(Some(0)));
+                result
+            }
             WaitConclusion::Exited(snapshot) => {
                 Self::exited(service, snapshot.last_exit_code, snapshot.run_generation)
             }
@@ -2892,11 +2905,17 @@ impl McpServer {
                 return Err(error_data(dependency_failed_error(&args.service, failure)));
             }
             SnapshotWait::Matched {
-                verdict: WaitVerdict::Healthy,
+                snapshot,
+                verdict: WaitVerdict::Idle,
+            } => {
+                return Err(error_data(idle_error(&args.service, &snapshot)));
+            }
+            SnapshotWait::Matched {
+                verdict: WaitVerdict::Healthy | WaitVerdict::Completed,
                 ..
             } => {
                 return Err(error_data(ToolError::Unexpected(
-                    "an exit wait resolved as healthy".to_string(),
+                    "an exit wait resolved without an exit".to_string(),
                 )));
             }
             SnapshotWait::Timeout(snapshot) => (WaitForExitStatus::Timeout, None, snapshot),
@@ -2925,7 +2944,8 @@ impl McpServer {
         and the generation-aware health wait. Every action taken is reported. An already-healthy \
         service returns immediately with no actions; an exit or timeout includes bounded failure \
         diagnosis. Starting a missing session requires the operator to enable session spawning. \
-        Retired dynamic services must be revived with replace_dynamic_service."
+        Retired dynamic services must be revived with replace_dynamic_service. A job is ready once \
+        it completed; a manual job that has not run is run."
     )]
     async fn ensure_service_ready(
         &self,
@@ -2986,12 +3006,17 @@ impl McpServer {
                 return Err(error_data(enrich_unknown_service(&args.service, err).await));
             }
         };
-        if wait::evaluate(&snapshot, WaitFor::Healthy, None) == Some(WaitVerdict::Healthy) {
+        let ready = match wait::evaluate(&snapshot, WaitFor::Healthy, None) {
+            Some(WaitVerdict::Healthy) => Some(WaitConclusion::Healthy(snapshot.clone())),
+            Some(WaitVerdict::Completed) => Some(WaitConclusion::Completed(snapshot.clone())),
+            _ => None,
+        };
+        if let Some(ready) = ready {
             return Ok(Json(EnsureServiceReadyResult {
                 session_ref: SessionRef::from(&resolved.info),
                 service: args.service.clone(),
                 actions,
-                outcome: WaitResult::healthy(args.service, snapshot.run_generation),
+                outcome: WaitResult::from_conclusion(args.service, Duration::ZERO, &ready),
                 snapshot,
                 diagnosis: None,
             }));
@@ -3001,6 +3026,7 @@ impl McpServer {
                 retired_service_message(&args.service, reason),
             )));
         }
+        let job = snapshot.kind == micromux::ServiceKind::Job;
         let after_generation = if snapshot.desired == Desired::Disabled {
             let response = conn
                 .request(Request::Enable {
@@ -3023,9 +3049,45 @@ impl McpServer {
                 kind: EnsureActionKind::EnabledService,
                 detail: format!("enabled service from generation {generation}"),
             });
-            Some(generation)
+            if job {
+                // Enabling a job does not start a run: it returns to its outcome, or is pending
+                // again, which a manual job leaves to the request below.
+                snapshot = service_snapshot(&mut conn, &args.service)
+                    .await
+                    .map_err(error_data)?;
+                None
+            } else {
+                Some(generation)
+            }
         } else {
             None
+        };
+        let after_generation = if snapshot.manual && snapshot.execution == Execution::Pending {
+            // Naming a manual job that has not run asks for it to run.
+            let response = conn
+                .request(Request::Restart {
+                    service: args.service.clone(),
+                })
+                .await
+                .map_err(error_data)?;
+            let generation = convert::accepted(response)
+                .map_err(error_data)?
+                .iter()
+                .find(|ack| ack.service == args.service)
+                .map(|ack| ack.observed_generation)
+                .ok_or_else(|| {
+                    ErrorData::internal_error(
+                        format!("restart acknowledgement omitted service `{}`", args.service),
+                        None,
+                    )
+                })?;
+            actions.push(EnsureAction {
+                kind: EnsureActionKind::RanJob,
+                detail: format!("ran the manual job from generation {generation}"),
+            });
+            Some(generation)
+        } else {
+            after_generation
         };
         let conclusion = match wait_for_health(
             &resolved.endpoint,
@@ -4216,6 +4278,73 @@ services:
     }
 
     #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ensure_ready_runs_jobs_to_completion() -> eyre::Result<()> {
+        let project = tempfile::tempdir()?;
+        let yaml = r#"version: 1
+services:
+  seed:
+    kind: job
+    command: ["sh", "-c", "sleep 2"]
+  reset:
+    kind: job
+    run: manual
+    command: ["sh", "-c", "true"]
+  off:
+    kind: job
+    disabled: true
+    command: ["sh", "-c", "true"]
+"#;
+        let (session, selector) =
+            boot_mcp_session_with_yaml(project.path(), "mcp-jobs-test", yaml)?;
+        let mut server = McpServer::new();
+        server.cwd = project.path().to_path_buf();
+
+        for (service, expected) in [
+            ("seed", &[EnsureActionKind::Waited][..]),
+            (
+                "reset",
+                &[EnsureActionKind::RanJob, EnsureActionKind::Waited][..],
+            ),
+            (
+                "off",
+                &[EnsureActionKind::EnabledService, EnsureActionKind::Waited][..],
+            ),
+        ] {
+            let Json(ready) = server
+                .ensure_service_ready(Parameters(EnsureReadyArgs {
+                    service: service.to_string(),
+                    session: Some(selector.clone()),
+                    path: None,
+                    timeout_secs: Some(10),
+                    log_limit: Some(2),
+                }))
+                .await
+                .map_err(|err| eyre::eyre!(err.message))?;
+            assert!(
+                matches!(ready.outcome.status, WaitStatus::Completed),
+                "{service} did not complete: {:?} {:?}",
+                ready.snapshot.execution,
+                ready.snapshot.kind
+            );
+            assert_eq!(ready.snapshot.execution, Execution::Completed);
+            let kinds = ready
+                .actions
+                .iter()
+                .map(|action| serde_json::to_value(&action.kind))
+                .collect::<Result<Vec<_>, _>>()?;
+            let expected = expected
+                .iter()
+                .map(serde_json::to_value)
+                .collect::<Result<Vec<_>, _>>()?;
+            assert_eq!(kinds, expected, "{service}");
+        }
+
+        session.finish().await?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn waits_fail_fast_behind_a_dependency_that_will_not_restart() -> eyre::Result<()> {
         let project = tempfile::tempdir()?;
@@ -4242,7 +4371,7 @@ services:
         let mut api = dynamic_params_for("api", &["sh", "-c", "sleep 60"], None);
         api.spec.depends_on = Some(vec![micromux::DependencySpec {
             service: "seed".to_string(),
-            condition: micromux::DependencyCondition::CompletedSuccessfully,
+            condition: Some(micromux::DependencyCondition::CompletedSuccessfully),
         }]);
         server
             .start_dynamic_service(Parameters(DynamicServiceArgs {

@@ -12,6 +12,17 @@ pub enum Error {
         /// Missing dependency id.
         dependency: String,
     },
+    /// A dependency waits for a job to become healthy, which a job never does.
+    #[error(
+        "service `{service}` waits for job `{dependency}` to become healthy; a job has no health, \
+         so depend on it with `condition: completed`"
+    )]
+    HealthyJob {
+        /// Service declaring the dependency.
+        service: String,
+        /// The job it depends on.
+        dependency: String,
+    },
     /// The dependency graph contains a cycle.
     #[error("cycle detected at service: `{service}`")]
     Cycle {
@@ -40,8 +51,16 @@ impl ServiceGraph {
                 let dep_name = dep.service.as_str();
 
                 // Validate that the dependency actually exists
-                if !graph.contains_node(dep_name) {
+                let Some(target) = services.get(dep_name) else {
                     return Err(Error::UnknownDependency {
+                        service: name.to_string(),
+                        dependency: dep_name.to_string(),
+                    });
+                };
+                if dep.condition == Some(crate::config::DependencyCondition::Healthy)
+                    && target.spec.kind == crate::ServiceKind::Job
+                {
+                    return Err(Error::HealthyJob {
                         service: name.to_string(),
                         dependency: dep_name.to_string(),
                     });
@@ -118,6 +137,39 @@ mod tests {
 
         let res = ServiceGraph::new(&services);
         assert!(res.is_err());
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod job_tests {
+    use super::*;
+    use crate::service::Service;
+    use crate::test_util::{service_config, spanned_string};
+    use color_eyre::eyre;
+    use std::path::Path;
+
+    #[test]
+    fn waiting_for_a_job_to_become_healthy_is_rejected() -> eyre::Result<()> {
+        let mut seed = service_config("seed", ("true", &[]));
+        seed.kind = crate::ServiceKind::Job;
+        let mut api = service_config("api", ("true", &[]));
+        api.depends_on = vec![crate::config::Dependency {
+            name: spanned_string("seed"),
+            condition: Some(yaml_spanned::Spanned {
+                span: yaml_spanned::spanned::Span::default(),
+                inner: crate::config::DependencyCondition::Healthy,
+            }),
+        }];
+        let mut services = ServiceMap::new();
+        services.insert(
+            "seed".to_string(),
+            Service::new("seed", Path::new("."), seed)?,
+        );
+        services.insert("api".to_string(), Service::new("api", Path::new("."), api)?);
+
+        let error = ServiceGraph::new(&services).expect_err("a healthy job cannot be waited for");
+        assert!(matches!(error, Error::HealthyJob { .. }));
         Ok(())
     }
 }

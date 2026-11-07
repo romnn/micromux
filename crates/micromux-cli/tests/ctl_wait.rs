@@ -134,3 +134,55 @@ fn ctl_wait_exit_codes_tell_the_outcomes_apart() -> eyre::Result<()> {
     );
     Ok(())
 }
+
+const JOBS_CONFIG: &str = r#"version: 1
+services:
+  seed:
+    kind: job
+    command: ["sh", "-c", "sleep 0.2"]
+  reset:
+    kind: job
+    run: manual
+    command: ["sh", "-c", "exit 0"]
+  migrate:
+    kind: job
+    command: ["sh", "-c", "exit 7"]
+  api:
+    command: ["sh", "-c", "exec sleep 300"]
+    depends_on: [seed]
+"#;
+
+/// A completed job is a successful wait, a failed one an exit, and a manual job that never ran
+/// fails fast until a restart runs it.
+#[test]
+fn ctl_wait_treats_a_completed_job_as_ready() -> eyre::Result<()> {
+    let session = Session::start(JOBS_CONFIG)?;
+
+    let (code, text) = session.wait(&["seed", "--timeout", "30s"])?;
+    assert_eq!(code, Some(0), "{text}");
+    assert!(text.contains("seed completed"), "{text}");
+    let (code, text) = session.wait(&["api", "--timeout", "30s"])?;
+    assert_eq!(code, Some(0), "{text}");
+
+    let (code, text) = session.wait(&["migrate", "--timeout", "30s"])?;
+    assert_eq!(code, Some(3), "{text}");
+    assert!(text.contains("migrate exited with code 7"), "{text}");
+
+    let (code, text) = session.wait(&["reset", "--timeout", "30s"])?;
+    assert_eq!(code, Some(5), "{text}");
+    assert!(text.contains("manual job that has not run"), "{text}");
+
+    let restarted = ctl(session.directory.path(), &["restart", "reset"])?;
+    assert!(restarted.status.success());
+    let (code, text) = session.wait(&["reset", "--after-generation", "0", "--timeout", "30s"])?;
+    assert_eq!(code, Some(0), "{text}");
+
+    let listed =
+        String::from_utf8_lossy(&ctl(session.directory.path(), &["ls"])?.stdout).into_owned();
+    assert!(
+        listed.contains("kind=job run=manual desired=Enabled execution=Completed"),
+        "{listed}"
+    );
+    assert!(listed.contains("execution=Failed exit_code=7"), "{listed}");
+    Ok(())
+}
