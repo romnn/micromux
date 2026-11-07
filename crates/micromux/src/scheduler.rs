@@ -2738,7 +2738,7 @@ impl SchedulerRuntime {
                 .run_config
                 .as_ref()
                 .and_then(|config| config.cleanup.as_ref())
-                .map(|cleanup| crate::cleanup::display_command(&cleanup.command))
+                .map(|cleanup| crate::shell_join(&cleanup.command))
         });
         self.sync(services, service_id);
         self.writer.append_event(

@@ -2,7 +2,6 @@ use crate::{
     model::RunSink,
     scheduler::{OutputStream, ProcessEvent, RunId, ServiceID},
 };
-use itertools::Itertools;
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::Command;
@@ -45,6 +44,19 @@ mod tests {
     use color_eyre::eyre;
     use similar_asserts::assert_eq;
     use std::path::PathBuf;
+
+    /// A `CMD-SHELL` probe is shown with its script quoted as the single `-c` argument it is.
+    #[test]
+    fn attempt_command_quotes_a_cmd_shell_script() -> eyre::Result<()> {
+        let test =
+            crate::spec::normalize_command(&["CMD-SHELL".to_string(), "echo 'ok'".to_string()])?;
+        let hc = crate::HealthcheckSpec {
+            test,
+            ..crate::HealthcheckSpec::default()
+        };
+        assert_eq!(command_string(&hc), r#"sh -c "echo 'ok'""#);
+        Ok(())
+    }
 
     struct TempDir(PathBuf);
 
@@ -591,7 +603,7 @@ pub async fn run_loop(health_check: crate::HealthcheckSpec, params: RunLoopParam
 }
 
 fn command_string(health_check: &crate::HealthcheckSpec) -> String {
-    health_check.test.iter().join(" ")
+    crate::shell_join(&health_check.test)
 }
 
 fn emit_spawn_failed(sink: &RunSink, attempt: u64, source: &std::io::Error) {

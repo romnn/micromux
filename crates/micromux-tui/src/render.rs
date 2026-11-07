@@ -13,9 +13,9 @@ use ratatui::{
 #[cfg(test)]
 mod tests {
     use super::{
-        lease_phrase,
+        command_rows, lease_phrase,
         log_view::{LogView, PaneBorders, RenderedLineIndex, window_text},
-        service_detail, shell_join, short_local_time, state_name,
+        service_detail, short_local_time, state_name,
     };
     use ratatui::{
         buffer::Buffer,
@@ -173,14 +173,20 @@ mod tests {
     }
 
     #[test]
-    fn shell_join_quotes_only_arguments_a_shell_would_split() {
-        let argv = vec![
-            "sh".to_string(),
-            "-c".to_string(),
-            "echo hi".to_string(),
-            String::new(),
-        ];
-        assert_eq!(shell_join(&argv), r#"sh -c "echo hi" """#);
+    fn command_rows_give_each_script_line_its_own_row() {
+        let command_line = micromux::shell_join(["sh", "-c", "set -e\necho 'ok'"]);
+
+        // The quoted script spans two rows, and each row keeps its quotes.
+        assert_eq!(
+            command_rows(&command_line),
+            vec!["sh -c \"set -e".to_string(), "echo 'ok'\"".to_string()]
+        );
+
+        // A tab, which ratatui would drop, stays visible as its control picture.
+        assert_eq!(
+            command_rows(&micromux::shell_join(["printf", "a\tb"])),
+            vec!["printf 'a␉b'".to_string()]
+        );
     }
 
     #[test]
@@ -219,6 +225,29 @@ mod tests {
         let bottom = row_text(&buf, 0, 3, 59);
         assert!(bottom.ends_with("xxx ... ────────── gen 1 ┘"), "{bottom}");
         assert!(bottom.starts_with("└ $ sh -c xxx"), "{bottom}");
+    }
+
+    #[test]
+    fn border_detail_quotes_the_script_and_shows_its_line_breaks() {
+        let snapshot = micromux::ServiceSnapshot::initial(
+            "svc".to_string(),
+            "svc".to_string(),
+            Vec::new(),
+            None,
+            micromux::RestartPolicy::Never,
+            vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "echo 'a'\necho b".to_string(),
+            ],
+            None,
+        );
+
+        // The script reads as one quoted argument, and its newline stays visible on the one-line
+        // border as a picture rather than being dropped or turned into a `\n` escape that a
+        // pasted line would pass to the script.
+        let detail = service_detail(&snapshot, 1_000);
+        assert_eq!(detail.left.content, " $ sh -c \"echo 'a'␊echo b\" ");
     }
 
     /// A retired dynamic service says why it retired and drops its dead lease, and a run whose
@@ -334,7 +363,7 @@ mod tests {
         );
         snapshot.run_generation = 3;
         let configured = service_detail(&snapshot, 1_000);
-        assert_eq!(configured.left.content, r#" $ sh -c "sleep 60" "#);
+        assert_eq!(configured.left.content, " $ sh -c 'sleep 60' ");
         assert_eq!(configured.right.to_string(), " gen 3 ");
 
         // A running service also shows when its current run started, next to the generation.
@@ -856,7 +885,10 @@ fn service_info_rows(
     }
     rows.extend(info_rows("URLs", urls));
     rows.extend(info_rows("Ports", port_rows(snapshot, session)));
-    rows.extend(info_rows("Command", vec![shell_join(&snapshot.command)]));
+    rows.extend(info_rows(
+        "Command",
+        command_rows(&micromux::shell_join(&snapshot.command)),
+    ));
     rows.extend(info_rows(
         "Directory",
         snapshot
@@ -974,10 +1006,13 @@ fn healthcheck_rows(
                 Some(result) if result.success => "ok".to_string(),
                 Some(result) => format!("failed with exit code {}", result.exit_code),
             };
-            vec![
-                Span::raw(format!("last attempt {outcome}")),
-                format!("$ {}", attempt.command).fg(tailwind::GRAY.c400),
-            ]
+            let mut rows = vec![Span::raw(format!("last attempt {outcome}"))];
+            rows.extend(
+                command_rows(&format!("$ {}", attempt.command))
+                    .into_iter()
+                    .map(|row| row.fg(tailwind::GRAY.c400)),
+            );
+            rows
         }
     }
 }
@@ -1091,18 +1126,30 @@ fn state_name(snapshot: &micromux::ServiceSnapshot) -> String {
     name.to_string()
 }
 
-/// Join argv for display, quoting only arguments a shell would split.
-fn shell_join(argv: &[String]) -> String {
-    argv.iter()
-        .map(|arg| {
-            if arg.is_empty() || arg.chars().any(char::is_whitespace) {
-                format!("{arg:?}")
-            } else {
-                arg.clone()
-            }
+/// Splits a [`micromux::shell_join`] command line into the rows an info popup shows.
+///
+/// A multi-line script keeps its newlines inside the shell quotes, so each line of the command
+/// gets a row of its own; any other control character shows as [`control_pictures`] does.
+fn command_rows(command_line: &str) -> Vec<String> {
+    command_line.split('\n').map(control_pictures).collect()
+}
+
+/// Shows each control character of `text` as its Unicode control picture, such as `␊` for a
+/// newline and `␉` for a tab.
+///
+/// The `ratatui` renderer drops control characters, which would silently change a displayed
+/// command.
+/// A picture keeps it visible without looking like shell syntax, so a reader cannot mistake it for
+/// an escape the shell would interpret.
+fn control_pictures(text: &str) -> String {
+    text.chars()
+        .map(|ch| match u32::from(ch) {
+            code @ 0..0x20 => char::from_u32(0x2400 + code).unwrap_or(char::REPLACEMENT_CHARACTER),
+            0x7f => '\u{2421}',
+            _ if ch.is_control() => char::REPLACEMENT_CHARACTER,
+            _ => ch,
         })
-        .collect::<Vec<_>>()
-        .join(" ")
+        .collect()
 }
 
 /// One key binding shown in the header or footer.
@@ -1522,7 +1569,8 @@ fn service_detail(
     snapshot: &micromux::ServiceSnapshot,
     now_unix_ms: u64,
 ) -> log_view::BorderDetail {
-    let command = shell_join(&snapshot.command);
+    // The border is a single line, so even the newlines of a multi-line script show as pictures.
+    let command = control_pictures(&micromux::shell_join(&snapshot.command));
     let left = if command.is_empty() {
         Span::default()
     } else {

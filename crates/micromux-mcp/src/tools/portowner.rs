@@ -70,12 +70,14 @@ fn command_for_pid(pid_dir: &Path) -> String {
     let command = std::fs::read(pid_dir.join("cmdline"))
         .ok()
         .map(|bytes| {
-            bytes
-                .split(|byte| *byte == 0)
-                .filter(|part| !part.is_empty())
-                .map(String::from_utf8_lossy)
-                .collect::<Vec<_>>()
-                .join(" ")
+            // Empty parts are dropped: besides the terminating NUL, a process that rewrites its
+            // title pads `cmdline` with NULs, which would otherwise show as runs of `''`.
+            micromux::shell_join(
+                bytes
+                    .split(|byte| *byte == 0)
+                    .filter(|part| !part.is_empty())
+                    .map(|part| String::from_utf8_lossy(part).into_owned()),
+            )
         })
         .filter(|command| !command.is_empty())
         .or_else(|| std::fs::read_to_string(pid_dir.join("comm")).ok())
