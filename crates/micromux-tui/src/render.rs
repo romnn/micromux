@@ -1818,35 +1818,19 @@ impl App {
                 let status = format!("{: >10}", state_name(&service.snapshot))
                     .set_style(crate::style::service_style(&service.snapshot));
 
-                // Combine into one line.
-                let ports = service
-                    .snapshot
-                    .advertised_ports
-                    .iter()
-                    .map(|i| format!(":{i}").fg(tailwind::GRAY.c400));
-
                 let origin = match service.snapshot.origin {
                     micromux::OriginKind::Dynamic => "+",
                     micromux::OriginKind::Configured | micromux::OriginKind::Unknown => " ",
                 };
-                let line = [
+                // Ports and URLs live in the `i` popup and the Logs title, not in the list.
+                let line = Line::from(vec![
                     status,
                     " ".into(),
                     origin.fg(tailwind::GRAY.c400),
                     service.snapshot.id.as_str().into(),
-                ]
-                .into_iter()
-                .chain(if ports.len() > 0 {
-                    [" [".into()]
-                        .into_iter()
-                        .chain(intersperse(ports, ", ".into()))
-                        .chain(["]".into()])
-                        .collect()
-                } else {
-                    vec!["".into()]
-                });
+                ]);
 
-                ListItem::new(line.collect::<Line>())
+                ListItem::new(line)
             })
             .collect();
 
