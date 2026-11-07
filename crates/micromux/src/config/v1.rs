@@ -1685,7 +1685,10 @@ fn parse_routes<F: Copy>(
     let Some(routes_value) = value.get("routes") else {
         return Ok(Vec::new());
     };
-    let entries = expect_sequence(routes_value, Some("routes must be a list of {host, port}"))?;
+    let entries = expect_sequence(
+        routes_value,
+        Some("routes must be a list of {host, path, strip_prefix, port}"),
+    )?;
     if entries.len() > MAX_SESSION_ENTRIES {
         return Err(ConfigError::InvalidValue {
             message: format!("routes lists more than {MAX_SESSION_ENTRIES} entries"),
@@ -1703,7 +1706,7 @@ fn parse_routes<F: Copy>(
         let (span, mapping) = expect_mapping(entry, "each route must be a mapping".into())?;
         warn_unknown_keys(
             mapping,
-            &["host", "port"],
+            &["host", "path", "strip_prefix", "port"],
             "route",
             file_id,
             strict,
@@ -1725,10 +1728,43 @@ fn parse_routes<F: Copy>(
                 span: host.span.into(),
             });
         }
-        if routes.iter().any(|route| route.host.inner == host.inner) {
+        let path = parse_optional::<String>(mapping.get("path"))?;
+        if let Some(path) = &path
+            && let Some(problem) = crate::session::route_path_problem(&path.inner)
+        {
             return Err(ConfigError::InvalidValue {
-                message: format!("route host `{}` is listed more than once", host.inner),
-                span: host.span.into(),
+                message: format!("route path `{}` {problem}", path.inner),
+                span: path.span.into(),
+            });
+        }
+        let strip_prefix = parse_optional::<bool>(mapping.get("strip_prefix"))?;
+        if let Some(strip) = &strip_prefix
+            && strip.inner
+            && path.is_none()
+        {
+            return Err(ConfigError::InvalidValue {
+                message: "route `strip_prefix` needs a `path` to strip".to_string(),
+                span: strip.span.into(),
+            });
+        }
+        let path_value = path.as_ref().map(|path| path.inner.as_str());
+        if routes.iter().any(|route| {
+            route.host.inner == host.inner
+                && route.path.as_ref().map(|path| path.inner.as_str()) == path_value
+        }) {
+            let message = match &path {
+                Some(path) => format!(
+                    "route host `{}` with path `{}` is listed more than once",
+                    host.inner, path.inner
+                ),
+                None => format!(
+                    "route host `{}` without a path is listed more than once",
+                    host.inner
+                ),
+            };
+            return Err(ConfigError::InvalidValue {
+                message,
+                span: path.as_ref().map_or(host.span, |path| path.span).into(),
             });
         }
         let port_value = mapping.get("port").ok_or_else(|| missing("port"))?;
@@ -1736,7 +1772,12 @@ fn parse_routes<F: Copy>(
             span: port_value.span,
             inner: parse_string_value(port_value, "route port must be a number or a ${VAR}")?,
         };
-        routes.push(super::RouteConfig { host, port });
+        routes.push(super::RouteConfig {
+            host,
+            path,
+            strip_prefix: strip_prefix.is_some_and(|strip| strip.inner),
+            port,
+        });
     }
     Ok(routes)
 }
@@ -3158,6 +3199,13 @@ mod tests {
                 port: 8025
               - host: "*"
                 port: 9000
+              - host: app
+                path: /rest/
+                port: 9001
+              - host: app
+                path: /auth/v1/
+                strip_prefix: true
+                port: 9002
             services:
               app:
                 command: ["true"]
@@ -3168,14 +3216,23 @@ mod tests {
         let routes = session
             .routes
             .iter()
-            .map(|route| (route.host.inner.as_str(), route.port.inner.as_str()))
+            .map(|route| {
+                (
+                    route.host.inner.as_str(),
+                    route.path.as_ref().map(|path| path.inner.as_str()),
+                    route.strip_prefix,
+                    route.port.inner.as_str(),
+                )
+            })
             .collect::<Vec<_>>();
         assert_eq!(
             routes,
             vec![
-                ("app", "${APP_PORT}"),
-                ("email.internal", "8025"),
-                ("*", "9000")
+                ("app", None, false, "${APP_PORT}"),
+                ("email.internal", None, false, "8025"),
+                ("*", None, false, "9000"),
+                ("app", Some("/rest/"), false, "9001"),
+                ("app", Some("/auth/v1/"), true, "9002"),
             ]
         );
         assert_eq!(session.proxy.port(), 8081);
@@ -3195,9 +3252,30 @@ mod tests {
                 ),
                 (
                     "routes: [{host: a, port: 1}, {host: a, port: 2}]",
-                    "more than once",
+                    "without a path is listed more than once",
+                ),
+                (
+                    "routes: [{host: a, path: /x/, port: 1}, {host: a, path: /x/, port: 2}]",
+                    "with path `/x/` is listed more than once",
                 ),
                 ("routes: [{port: 1}]", "missing `host`"),
+                (
+                    "routes: [{host: a, path: x/, port: 1}]",
+                    "must start with `/`",
+                ),
+                ("routes: [{host: a, path: /, port: 1}]", "omit `path`"),
+                (
+                    "routes: [{host: a, path: '/a?b', port: 1}]",
+                    "without spaces",
+                ),
+                (
+                    "routes: [{host: a, path: '/a b', port: 1}]",
+                    "without spaces",
+                ),
+                (
+                    "routes: [{host: a, strip_prefix: true, port: 1}]",
+                    "needs a `path`",
+                ),
             ]);
         } else {
             cases.push(("routes: [{host: app, port: 1}]", "not supported on Windows"));

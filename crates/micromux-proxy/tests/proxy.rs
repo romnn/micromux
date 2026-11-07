@@ -60,6 +60,8 @@ fn registration(session: &str, routes: &[(&str, u16, Option<&str>)]) -> Registra
             .iter()
             .map(|(host, port, service)| RouteTarget {
                 host: (*host).to_string(),
+                path: None,
+                strip_prefix: false,
                 port: *port,
                 service: service.map(ToString::to_string),
             })
@@ -77,6 +79,57 @@ fn refusing_port() -> eyre::Result<(tokio::net::TcpSocket, u16)> {
     socket.bind((std::net::Ipv4Addr::LOCALHOST, 0).into())?;
     let port = socket.local_addr()?.port();
     Ok((socket, port))
+}
+
+/// A route of `host` that serves only paths under `path`, removing `path` first when `strip`.
+fn path_route(host: &str, path: &str, strip: bool, port: u16) -> RouteTarget {
+    RouteTarget {
+        host: host.to_string(),
+        path: Some(path.to_string()),
+        strip_prefix: strip,
+        port,
+        service: None,
+    }
+}
+
+/// Answers one request on `upstream` with `body` and returns the request head it received.
+fn answer_once(
+    upstream: TcpListener,
+    body: &'static str,
+) -> tokio::task::JoinHandle<eyre::Result<String>> {
+    tokio::spawn(async move {
+        let (mut stream, _) = upstream.accept().await?;
+        let head = read_head(&mut stream).await?;
+        stream
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            )
+            .await?;
+        Ok(head)
+    })
+}
+
+/// Sends a `Connection: close` GET for `target` on `host` through the proxy and returns the whole
+/// response.
+async fn get_target(proxy_port: u16, host: &str, target: &str) -> eyre::Result<String> {
+    let mut stream = TcpStream::connect(("127.0.0.1", proxy_port)).await?;
+    stream
+        .write_all(
+            format!("GET {target} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .await?;
+    let mut response = String::new();
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        stream.read_to_string(&mut response),
+    )
+    .await??;
+    Ok(response)
 }
 
 /// Reads one request head from `stream`.
@@ -149,6 +202,254 @@ async fn routes_by_host_and_preserves_the_host_header() -> eyre::Result<()> {
 
     proxy.shutdown.cancel();
     proxy.task.await??;
+    Ok(())
+}
+
+/// Path routes split one host between upstreams by the longest matching prefix, a stripped
+/// prefix never reaches its upstream, and the path, query, and `Host` header otherwise pass
+/// through unchanged.
+#[tokio::test]
+async fn path_routes_split_a_host_and_strip_prefixes() -> eyre::Result<()> {
+    let proxy = start_proxy(Duration::from_secs(60)).await?;
+    let rest = TcpListener::bind(("127.0.0.1", 0)).await?;
+    let grpc = TcpListener::bind(("127.0.0.1", 0)).await?;
+    let auth = TcpListener::bind(("127.0.0.1", 0)).await?;
+    let mut one = registration("one", &[("api", grpc.local_addr()?.port(), None)]);
+    one.routes.extend([
+        path_route("api", "/rest/", false, rest.local_addr()?.port()),
+        path_route("auth", "/auth/v1/", true, auth.local_addr()?.port()),
+    ]);
+    let _registrar = Registrar::start(
+        proxy.paths.clone(),
+        one,
+        proxy.port,
+        None,
+        &CancellationToken::new(),
+    )
+    .await?;
+
+    // Prefix route, kept prefix
+    let server = answer_once(rest, "rest");
+    let response = get_target(proxy.port, "api.one.localhost", "/rest/users?page=2").await?;
+    let head = server.await??;
+    assert!(response.ends_with("rest"), "{response}");
+    assert!(
+        head.starts_with("GET /rest/users?page=2 HTTP/1.1\r\n"),
+        "{head}"
+    );
+
+    // The host's route without a path serves every other path, including the bare prefix.
+    let server = answer_once(grpc, "grpc");
+    let response = get_target(proxy.port, "api.one.localhost", "/rest").await?;
+    let head = server.await??;
+    assert!(response.ends_with("grpc"), "{response}");
+    assert!(head.starts_with("GET /rest HTTP/1.1\r\n"), "{head}");
+
+    // Stripped prefix, with the browser's Host intact
+    let server = answer_once(auth, "auth");
+    let response = get_target(proxy.port, "auth.one.localhost", "/auth/v1/token?grant=pw").await?;
+    let head = server.await??;
+    assert!(response.ends_with("auth"), "{response}");
+    assert!(
+        head.starts_with("GET /token?grant=pw HTTP/1.1\r\n"),
+        "{head}"
+    );
+    assert!(
+        head.to_ascii_lowercase()
+            .contains("host: auth.one.localhost\r\n"),
+        "{head}"
+    );
+
+    // A path no route of the host serves, without a catch-all, lists the routes with their paths.
+    let missing = get_target(proxy.port, "auth.one.localhost", "/other").await?;
+    assert!(missing.starts_with("HTTP/1.1 404"), "{missing}");
+    assert!(missing.contains("auth.one.localhost/other"), "{missing}");
+    assert!(
+        missing.contains(&format!(
+            "http://auth.one.localhost:{}/auth/v1/",
+            proxy.port
+        )),
+        "{missing}"
+    );
+
+    proxy.shutdown.cancel();
+    proxy.task.await??;
+    Ok(())
+}
+
+/// An upgrade through a stripped path route reaches the upstream at the stripped path and then
+/// tunnels bytes both ways.
+#[tokio::test]
+async fn upgrades_tunnel_through_stripped_path_routes() -> eyre::Result<()> {
+    let proxy = start_proxy(Duration::from_secs(60)).await?;
+    let upstream = TcpListener::bind(("127.0.0.1", 0)).await?;
+    let mut one = registration("one", &[]);
+    one.routes.push(path_route(
+        "realtime",
+        "/realtime/v1",
+        true,
+        upstream.local_addr()?.port(),
+    ));
+    let _registrar = Registrar::start(
+        proxy.paths.clone(),
+        one,
+        proxy.port,
+        None,
+        &CancellationToken::new(),
+    )
+    .await?;
+
+    // An echo server behind an upgrade handshake, which reports the head it was asked with
+    let (head_tx, head_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = upstream.accept().await?;
+        let _ = head_tx.send(read_head(&mut stream).await?);
+        stream
+            .write_all(
+                b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
+            )
+            .await?;
+        let mut buffer = [0u8; 64];
+        loop {
+            let read = stream.read(&mut buffer).await?;
+            if read == 0 {
+                return Ok::<_, eyre::Report>(());
+            }
+            stream
+                .write_all(buffer.get(..read).unwrap_or_default())
+                .await?;
+        }
+    });
+
+    let mut client = TcpStream::connect(("127.0.0.1", proxy.port)).await?;
+    client
+        .write_all(b"GET /realtime/v1/websocket?vsn=1.0.0 HTTP/1.1\r\nHost: realtime.one.localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n")
+        .await?;
+    let response = read_head(&mut client).await?;
+    assert!(response.starts_with("HTTP/1.1 101"), "{response}");
+    let head = head_rx.await?;
+    assert!(
+        head.starts_with("GET /websocket?vsn=1.0.0 HTTP/1.1\r\n"),
+        "{head}"
+    );
+    assert!(
+        head.to_ascii_lowercase().contains("upgrade: websocket"),
+        "{head}"
+    );
+
+    // The tunnel carries bytes both ways after the switch.
+    client.write_all(b"ping").await?;
+    let mut echoed = [0u8; 4];
+    tokio::time::timeout(Duration::from_secs(5), client.read_exact(&mut echoed)).await??;
+    assert_eq!(&echoed, b"ping");
+
+    drop(client);
+    server.await??;
+    proxy.shutdown.cancel();
+    proxy.task.await??;
+    Ok(())
+}
+
+/// A proxy that does not report the path-route protocol, as one started by an older micromux,
+/// would ignore route paths, so a session with path routes refuses it with an error naming the
+/// proxy, while a session without paths still registers until its routes gain a path.
+#[tokio::test]
+async fn path_routes_refuse_an_outdated_proxy() -> eyre::Result<()> {
+    use micromux_proxy::protocol::{ClientMessage, ProxyMessage};
+
+    // A stand-in for an older proxy: it answers `hello` without a protocol and accepts every
+    // registration.
+    let directory = tempfile::tempdir()?;
+    let paths = ProxyPaths::in_dir(directory.path());
+    let listener = tokio::net::UnixListener::bind(&paths.socket)?;
+    let old_proxy = tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let (reader, mut writer) = stream.into_split();
+                let mut lines = tokio::io::BufReader::new(reader);
+                let mut line = String::new();
+                while tokio::io::AsyncBufReadExt::read_line(&mut lines, &mut line)
+                    .await
+                    .is_ok_and(|read| read > 0)
+                {
+                    let reply = match serde_json::from_str::<ClientMessage>(&line) {
+                        Ok(ClientMessage::Hello) => r#"{"type":"info","port":1,"pid":4242}"#,
+                        Ok(ClientMessage::Register(_)) => r#"{"type":"registered"}"#,
+                        _ => r#"{"type":"pong"}"#,
+                    };
+                    line.clear();
+                    if writer
+                        .write_all(format!("{reply}\n").as_bytes())
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    // The stand-in's reply is what an older proxy sends: no protocol, read as the first one.
+    assert!(matches!(
+        serde_json::from_str::<ProxyMessage>(r#"{"type":"info","port":1,"pid":4242}"#)?,
+        ProxyMessage::Info { protocol: 1, .. }
+    ));
+
+    let mut with_paths = registration("one", &[]);
+    with_paths
+        .routes
+        .push(path_route("api", "/rest/", false, 2));
+    let refused = Registrar::start(
+        paths.clone(),
+        with_paths,
+        1,
+        None,
+        &CancellationToken::new(),
+    )
+    .await;
+    assert!(
+        matches!(
+            refused,
+            Err(micromux_proxy::ClientError::OutdatedProxy {
+                pid: 4242,
+                protocol: 1,
+                required: 2,
+            })
+        ),
+        "{refused:?}"
+    );
+
+    let without_paths = Registrar::start(
+        paths,
+        registration("two", &[("app", 3, None)]),
+        1,
+        None,
+        &CancellationToken::new(),
+    )
+    .await?;
+
+    // Routes that gain a path later are not sent over the connection checked without one; the
+    // reconnect refuses the old proxy and reports why.
+    let mut status = without_paths.status();
+    without_paths
+        .routes()
+        .send_replace(vec![path_route("app", "/rest/", false, 3)]);
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        status.wait_for(|status| {
+            matches!(
+                status,
+                micromux_proxy::RegistrationStatus::Unavailable { reason }
+                    if reason.contains("registration protocol 1")
+            )
+        }),
+    )
+    .await??;
+
+    old_proxy.abort();
     Ok(())
 }
 
@@ -483,9 +784,13 @@ async fn streaming_responses_are_not_buffered() -> eyre::Result<()> {
     let proxy = start_proxy(Duration::from_secs(60)).await?;
     let upstream = TcpListener::bind(("127.0.0.1", 0)).await?;
     let upstream_port = upstream.local_addr()?.port();
+    // Through a stripped path route, which rewrites only the request target
+    let mut one = registration("one", &[]);
+    one.routes
+        .push(path_route("events", "/events/", true, upstream_port));
     let _registrar = Registrar::start(
         proxy.paths.clone(),
-        registration("one", &[("events", upstream_port, None)]),
+        one,
         proxy.port,
         None,
         &CancellationToken::new(),
@@ -495,7 +800,8 @@ async fn streaming_responses_are_not_buffered() -> eyre::Result<()> {
     let (finish_tx, finish_rx) = tokio::sync::oneshot::channel::<()>();
     let server = tokio::spawn(async move {
         let (mut stream, _) = upstream.accept().await?;
-        read_head(&mut stream).await?;
+        let head = read_head(&mut stream).await?;
+        eyre::ensure!(head.starts_with("GET /stream HTTP/1.1\r\n"), "{head}");
         stream
             .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n6\r\nfirst\n\r\n")
             .await?;
@@ -508,7 +814,7 @@ async fn streaming_responses_are_not_buffered() -> eyre::Result<()> {
     let mut client = TcpStream::connect(("127.0.0.1", proxy.port)).await?;
     client
         .write_all(
-            b"GET /events HTTP/1.1\r\nHost: events.one.localhost\r\nConnection: close\r\n\r\n",
+            b"GET /events/stream HTTP/1.1\r\nHost: events.one.localhost\r\nConnection: close\r\n\r\n",
         )
         .await?;
     let mut received = Vec::new();
@@ -537,9 +843,13 @@ async fn chunked_request_bodies_are_forwarded() -> eyre::Result<()> {
     let proxy = start_proxy(Duration::from_secs(60)).await?;
     let upstream = TcpListener::bind(("127.0.0.1", 0)).await?;
     let upstream_port = upstream.local_addr()?.port();
+    // Through a path route, which leaves the body alone
+    let mut one = registration("one", &[]);
+    one.routes
+        .push(path_route("search", "/_search", false, upstream_port));
     let _registrar = Registrar::start(
         proxy.paths.clone(),
-        registration("one", &[("search", upstream_port, None)]),
+        one,
         proxy.port,
         None,
         &CancellationToken::new(),

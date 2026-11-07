@@ -1055,7 +1055,7 @@ fn session_info_rows(session: Option<&micromux::SessionSummary>) -> Vec<Line<'st
         let width = session
             .routes
             .iter()
-            .map(|route| route.url.trim_end_matches('/').chars().count())
+            .map(|route| route.display_url().chars().count())
             .max()
             .unwrap_or_default();
         rows.extend(info_rows(
@@ -1064,15 +1064,20 @@ fn session_info_rows(session: Option<&micromux::SessionSummary>) -> Vec<Line<'st
                 .routes
                 .iter()
                 .map(|route| {
-                    let url = route.url.trim_end_matches('/');
+                    let url = route.display_url();
                     let service = route.service.as_deref().unwrap_or("no single service");
                     let catch_all = if route.host == micromux::session::CATCH_ALL_HOST {
                         "  (catch-all)"
                     } else {
                         ""
                     };
+                    let stripped = if route.strip_prefix {
+                        "  (prefix stripped)"
+                    } else {
+                        ""
+                    };
                     Span::raw(format!(
-                        "{url:<width$}  → :{}  {service}{catch_all}",
+                        "{url:<width$}  → :{}  {service}{catch_all}{stripped}",
                         route.port
                     ))
                 })
@@ -1484,7 +1489,7 @@ fn service_urls(session: Option<&micromux::SessionSummary>, service: &str) -> Ve
                 .routes
                 .iter()
                 .filter(|route| route.service.as_deref() == Some(service))
-                .map(|route| route.url.trim_end_matches('/').to_string())
+                .map(|route| route.display_url().to_string())
                 .collect()
         })
         .unwrap_or_default()

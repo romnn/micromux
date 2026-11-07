@@ -168,6 +168,8 @@ fn route_targets(routes: &[micromux::Route]) -> Vec<micromux_proxy::protocol::Ro
         .iter()
         .map(|route| micromux_proxy::protocol::RouteTarget {
             host: route.host.clone(),
+            path: route.path.clone(),
+            strip_prefix: route.strip_prefix,
             port: route.port,
             service: route.service.clone(),
         })

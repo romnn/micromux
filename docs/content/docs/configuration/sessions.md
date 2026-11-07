@@ -84,8 +84,31 @@ Browsers resolve every `*.localhost` name to the local machine on their own, so 
 
 - `port` is the upstream port on `127.0.0.1`. It may reference micromux's own environment and the [injected variables](#injected-variables), typically an `allocate_ports` name, but not a service's `env_file`. A route cannot point at the proxy's own port.
 - The proxy routes by the `Host` header, which reaches the service unchanged, and passes WebSocket upgrades and streaming responses (SSE, chunked) through without buffering.
-- A hostname no session serves gets a 404 page listing the live sessions and their URLs. A route whose service does not accept connections gets a 502 page naming the session and the service. The service is the one whose `ports` list the route's port, so list the port there. A config reload that adds, removes, or changes services updates which service that is.
+- A hostname or path no route serves gets a 404 page listing the live sessions and their URLs. A route whose service does not accept connections gets a 502 page naming the session and the service. The service is the one whose `ports` list the route's port, so list the port there. A config reload that adds, removes, or changes services updates which service that is.
 - `routes` are not supported on Windows.
+
+### Path routes
+
+A route with a `path` serves only the requests under that path prefix, so one hostname can split between services, and `strip_prefix` hides a prefix the upstream does not serve:
+
+```yaml
+routes:
+  - host: api
+    path: /rest/              # http://api.<session>.<domain>/rest/...
+    port: ${API_HTTP_PORT}
+  - host: api                 # every other path of api
+    port: ${API_GRPC_WEB_PORT}
+  - host: auth
+    path: /auth/v1/
+    strip_prefix: true        # the upstream sees /token, not /auth/v1/token
+    port: ${AUTH_PORT}
+```
+
+- `path` starts with `/` and is a plain prefix of the request path, without the query: `/rest/` matches `/rest/users` and `/rest/`, but not `/rest` or `/restore`. Matching is case-sensitive and sees the path as the browser sent it, without decoding percent-escapes or resolving `..`. To match both `/rest` and `/rest/...`, write `path: /rest`, which also matches `/restore`.
+- The host decides first, then the path. A hostname that any route names is served by its own routes alone; the catch-all `*` routes serve only the hostnames no route names. Among those routes, the longest matching `path` wins, and a route without `path` serves every path no other route matches. A path none of them matches gets a 404, even when a catch-all exists, so a mistyped API path never lands on a frontend.
+- `strip_prefix: true` removes the matched `path` before forwarding and keeps the query: `/auth/v1/token?x=1` reaches the upstream as `/token?x=1`. What remains always starts with `/`, so `/auth/v1/` arrives as `/`. The `Host` header still reaches the service unchanged. It needs a `path`.
+- A host may appear once without a path and once per distinct path. Each route has its own URL, such as `http://api.<session>.<domain>/rest/`, and its own service on error pages, in `ctl describe`, `get_session_urls`, and the TUI.
+- Path routes carry every kind of traffic the proxy forwards: plain requests, WebSocket upgrades, server-sent events, and streamed bodies. The proxy does not rewrite headers, redirects, or response bodies; a service behind a stripped prefix that builds absolute links has to know its public prefix itself.
 
 ### The proxy
 
@@ -101,7 +124,7 @@ proxy:
 
 On Linux, port 80 needs privileges unless you allow unprivileged low ports once with `sudo sysctl -w net.ipv4.ip_unprivileged_port_start=80` (persist it in `/etc/sysctl.d/`) or grant the binary `cap_net_bind_service` with `setcap`. Without either, set `fallback_port`, or the session fails to start and says so. macOS lets unprivileged processes bind port 80 only on the wildcard address, so there the proxy listens on all interfaces and drops every connection that does not come from the local machine.
 
-A session joins a proxy that is already running only if it listens on `port` or `fallback_port`. The port a session started with stays its port: if the proxy goes away, the session starts it again on the same port, because its services already hold URLs with that port.
+A session joins a proxy that is already running only if it listens on `port` or `fallback_port`. A session with path routes also needs a proxy that routes by path: one started by an older micromux would ignore the paths, so the session refuses it and names its process id. Stop or restart the sessions that still run the older micromux, which would otherwise start their proxy again; the old proxy exits a minute after its last session stops, or right away with `kill <pid>`. The port a session started with stays its port: if the proxy goes away, the session starts it again on the same port, because its services already hold URLs with that port.
 
 ## Restarting to apply changes
 

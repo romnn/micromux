@@ -18,7 +18,7 @@ use crate::config::{ConfigFile, SessionConfig};
 
 pub use registry::PortRegistry;
 pub(crate) use registry::{DEFAULT_PORT_RANGE, Lease, create_private_dir, user_state_directory};
-pub use routes::{CATCH_ALL_HOST, Route, RouteError};
+pub use routes::{CATCH_ALL_HOST, Route, RouteError, route_path_problem};
 pub(crate) use routes::{owner as route_owner, resolve as resolve_routes};
 pub use status::{RoutingStatus, SessionStatus, SessionSummary};
 

@@ -9,11 +9,12 @@ pub(crate) struct ListedSession {
     pub(crate) urls: Vec<String>,
 }
 
-/// The page for a hostname no session serves.
-pub(crate) fn not_found(host: &str, sessions: &[ListedSession]) -> String {
+/// The page for a hostname and path no route serves.
+pub(crate) fn not_found(host: &str, path: &str, sessions: &[ListedSession]) -> String {
     let mut body = format!(
-        "<p>No micromux session serves <code>{}</code>.</p>",
-        escape(host)
+        "<p>No micromux route serves <code>{}{}</code>.</p>",
+        escape(host),
+        escape(path)
     );
     if sessions.is_empty() {
         body.push_str("<p>No session is registered with the proxy right now.</p>");
@@ -38,10 +39,12 @@ pub(crate) fn not_found(host: &str, sessions: &[ListedSession]) -> String {
 }
 
 /// The page for a route whose upstream does not accept connections.
+///
+/// `route` names the route as its host followed by its path prefix, if it has one.
 pub(crate) fn bad_gateway(
     session: &str,
     service: Option<&str>,
-    host: &str,
+    route: &str,
     port: u16,
     error: &str,
 ) -> String {
@@ -57,7 +60,7 @@ pub(crate) fn bad_gateway(
         "<p><code>{}</code> is routed to {target} on <code>127.0.0.1:{port}</code>, but nothing \
          accepted the connection: {}.</p><p>The service may still be starting, or it has \
          stopped. Check it in micromux.</p>",
-        escape(host),
+        escape(route),
         escape(error),
     );
     page("502 Bad Gateway: service unavailable", &body)
@@ -94,9 +97,10 @@ mod tests {
     /// A hostile Host header cannot inject markup into the page.
     #[test]
     fn pages_escape_untrusted_text() {
-        let page = not_found("<script>x</script>", &[]);
+        let page = not_found("<script>x</script>", "/<b>", &[]);
         assert!(!page.contains("<script>"));
         assert!(page.contains("&lt;script&gt;"));
+        assert!(page.contains("/&lt;b&gt;"));
     }
 
     #[test]
