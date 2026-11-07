@@ -9,7 +9,7 @@
 
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use std::fmt::Write as _;
-use std::io::{Read as _, Write as _};
+use std::io::{Read as _, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant};
@@ -299,7 +299,7 @@ fn capture(
 
     // A blank screen holds still as well, so wait for the first frame before settling; keys
     // typed earlier would reach a terminal that is not in raw mode yet.
-    if !wait_for_first_frame(&rx, &mut parser) {
+    if !wait_for_first_frame(&rx, &mut parser, &mut writer) {
         if let Ok(Some(status)) = child.try_wait() {
             return Err(Error::EarlyExit {
                 status,
@@ -341,16 +341,40 @@ fn capture(
 
 /// Feed PTY output into `parser` until the TUI drew its first frame, which shows the services
 /// pane; returns whether it did within the time limit.
-fn wait_for_first_frame(rx: &mpsc::Receiver<Vec<u8>>, parser: &mut vt100::Parser) -> bool {
+///
+/// micromux asks the terminal at startup whether it has the kitty keyboard protocol, and waits
+/// up to two seconds for an answer; like a terminal without the protocol, this answers only the
+/// device attributes query that follows, so the answer comes at once.
+fn wait_for_first_frame(
+    rx: &mpsc::Receiver<Vec<u8>>,
+    parser: &mut vt100::Parser,
+    writer: &mut impl Write,
+) -> bool {
     const MAX_WAIT: Duration = Duration::from_secs(30);
+    const ATTRIBUTES_QUERY: &[u8] = b"\x1b[c";
 
     let deadline = Instant::now() + MAX_WAIT;
+    let mut written = Vec::new();
+    let mut answered = false;
     while Instant::now() < deadline {
         if parser.screen().contents().contains("Services") {
             return true;
         }
         match rx.recv_timeout(Duration::from_millis(100)) {
-            Ok(chunk) => parser.process(&chunk),
+            Ok(chunk) => {
+                parser.process(&chunk);
+                written.extend_from_slice(&chunk);
+                if !answered
+                    && written
+                        .windows(ATTRIBUTES_QUERY.len())
+                        .any(|window| window == ATTRIBUTES_QUERY)
+                {
+                    answered = true;
+                    // Without an answer micromux only starts two seconds later.
+                    writer.write_all(b"\x1b[?62c").ok();
+                    writer.flush().ok();
+                }
+            }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => return false,
         }
