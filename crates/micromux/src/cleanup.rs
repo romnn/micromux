@@ -143,15 +143,6 @@ pub(crate) fn open_log(path: &Path, truncate: bool) -> std::io::Result<File> {
     options.open(path)
 }
 
-/// Renders an argv the way a shell would accept it back.
-pub(crate) fn display_command(command: &[impl AsRef<OsStr>]) -> String {
-    let words = command
-        .iter()
-        .map(|word| word.as_ref().to_string_lossy())
-        .collect::<Vec<_>>();
-    shlex::try_join(words.iter().map(AsRef::as_ref)).unwrap_or_else(|_| words.join(" "))
-}
-
 /// The line that opens a cleanup's log: which run it follows, when it started, and what it runs.
 ///
 /// `run_generation` is `None` for a cleanup a service shim runs after the supervisor died.
@@ -163,7 +154,7 @@ pub(crate) fn header(run_generation: Option<u64>, command: &[impl AsRef<OsStr>])
     format!(
         "micromux: cleanup {after}, started {}: {}",
         humantime::format_rfc3339_seconds(std::time::SystemTime::now()),
-        display_command(command)
+        crate::shell_join(command)
     )
 }
 

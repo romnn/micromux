@@ -1550,7 +1550,6 @@ dependencies = [
  "humantime",
  "indexmap",
  "indoc",
- "itertools 0.15.0",
  "jsonschema",
  "nix 0.31.3",
  "parking_lot",
