@@ -1276,6 +1276,22 @@ async fn a_selection_started_below_the_text_never_takes_in_new_lines() -> eyre::
     set_logs(&mut app, numbered(8))?;
     assert_eq!(yank(&mut app), selected);
 
+    // A drag down into the space below the text takes the last line whole, and one only across
+    // that space takes nothing.
+    set_logs(&mut app, numbered(3))?;
+    let frame = draw(&mut app);
+    let first = find(&frame, "line 0 of")?;
+    app.mouse.last_press = None;
+    drag(&mut app, first, &[Position::new(first.x + 2, first.y + 10)]);
+    assert_eq!(yank(&mut app), selected);
+    app.mouse.last_press = None;
+    drag(
+        &mut app,
+        Position::new(first.x + 2, first.y + 10),
+        &[Position::new(first.x + 30, first.y + 12)],
+    );
+    assert_eq!(yank(&mut app), Vec::<String>::new());
+
     // A triple click below the text takes the last line, and no later one.
     let now = Instant::now();
     set_logs(&mut app, numbered(3))?;

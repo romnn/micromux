@@ -121,17 +121,19 @@ async fn load_user_config(printer: &DiagnosticsPrinter) -> Result<micromux::User
 /// An attached TUI reads only that section: the session it attaches to already loaded and
 /// reported on the config, so the rest is not this client's to judge.
 pub(crate) async fn project_ui_config(config_path: &Path) -> Option<micromux::UiConfig> {
-    let raw = match micromux::read_config_file_async(config_path).await {
-        Ok(raw) => raw,
-        Err(err) => {
-            tracing::warn!(?err, path = %config_path.display(), "cannot read the project's ui settings");
-            return None;
-        }
+    let parsed = match micromux::read_config_file_async(config_path).await {
+        Ok(raw) => micromux::parse_ui_section(&raw).map_err(|err| err.to_string()),
+        Err(err) => Err(err.to_string()),
     };
-    match micromux::parse_ui_section(&raw) {
+    match parsed {
         Ok(ui) => Some(ui),
         Err(err) => {
-            tracing::warn!(?err, path = %config_path.display(), "cannot read the project's ui settings");
+            // Shown once the TUI gives the terminal back, and kept in the log.
+            eprintln!(
+                "warning: ignoring the ui settings of {}: {err}",
+                config_path.display()
+            );
+            tracing::warn!(err, path = %config_path.display(), "ignoring the project's ui settings");
             None
         }
     }

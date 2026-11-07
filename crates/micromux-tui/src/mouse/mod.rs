@@ -444,15 +444,16 @@ impl App {
             position.y - area.y
         };
         let last_row = self.total_rows(pane).saturating_sub(1);
+        let row = self.first_row(pane) + usize::from(edge_row);
         // Past the pane's right edge, the selection runs to the end of the line, even where an
-        // unwrapped line goes on beyond the edge.
-        let col = if position.x >= area.right() {
+        // unwrapped line goes on beyond the edge, and below the text, to the end of the last line.
+        let col = if position.x >= area.right() || row > last_row {
             END_OF_LINE
         } else {
             position.x.saturating_sub(area.x)
         };
         self.extend_selection(TextPos {
-            row: (self.first_row(pane) + usize::from(edge_row)).min(last_row),
+            row: row.min(last_row),
             col,
         });
     }

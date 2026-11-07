@@ -28,6 +28,8 @@ pub(crate) async fn run(options: &Options, raw_session: Option<&str>) -> Result<
         .await
         .map_err(|error| crate::Error::Message(format_control_error(error, "attach")))?;
 
+    // Before anything that may warn, so the warnings reach the log.
+    let _log_guard = crate::setup_logging(options)?;
     let project_ui = crate::ui_settings::project_ui_config(&config_path).await;
     let printer = crate::DiagnosticsPrinter::new(
         options.color_choice.unwrap_or(termcolor::ColorChoice::Auto),
@@ -41,7 +43,6 @@ pub(crate) async fn run(options: &Options, raw_session: Option<&str>) -> Result<
 
     let shutdown = micromux::CancellationToken::new();
     crate::spawn_shutdown_handler(shutdown.clone());
-    let _log_guard = crate::setup_logging(options)?;
     let app = micromux_tui::App::new(
         micromux_tui::SessionSource::Remote(remote),
         None,
