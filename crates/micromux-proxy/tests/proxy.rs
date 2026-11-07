@@ -242,6 +242,91 @@ async fn error_pages_name_sessions_and_services() -> eyre::Result<()> {
     Ok(())
 }
 
+/// Replacing a live registration's routes takes effect without a reconnect: an added route is
+/// served, a removed one is unknown, and a route that moved names its new service and reaches its
+/// new port.
+#[tokio::test]
+async fn replaced_routes_take_effect_on_the_live_registration() -> eyre::Result<()> {
+    let proxy = start_proxy(Duration::from_secs(60)).await?;
+    let upstream = TcpListener::bind(("127.0.0.1", 0)).await?;
+    let admin_port = upstream.local_addr()?.port();
+    // Distinct ports nothing listens on, so each route answers with its 502 page
+    let mut closed = vec![admin_port];
+    while closed.len() < 4 {
+        let port = TcpListener::bind(("127.0.0.1", 0))
+            .await?
+            .local_addr()?
+            .port();
+        if !closed.contains(&port) {
+            closed.push(port);
+        }
+    }
+    let [_, app_port, removed_port, moved_port] = closed[..] else {
+        eyre::bail!("expected four ports");
+    };
+    let registrar = Registrar::start(
+        proxy.paths.clone(),
+        registration(
+            "one",
+            &[
+                ("app", app_port, Some("web")),
+                ("api", removed_port, Some("api")),
+            ],
+        ),
+        proxy.port,
+        None,
+        &CancellationToken::new(),
+    )
+    .await?;
+    let before = get(proxy.port, "app.one.localhost").await?;
+    assert!(before.contains("<strong>web</strong>"), "{before}");
+
+    // `app` moves to `frontend` on another port, `api` goes, and `admin` comes.
+    let replaced = registration(
+        "one",
+        &[
+            ("app", moved_port, Some("frontend")),
+            ("admin", admin_port, Some("admin")),
+        ],
+    );
+    registrar.routes().send_replace(replaced.routes);
+
+    // The proxy applies the replacement asynchronously, so wait for the moved route.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let moved = loop {
+        let response = get(proxy.port, "app.one.localhost").await?;
+        if response.contains("<strong>frontend</strong>") {
+            break response;
+        }
+        eyre::ensure!(
+            tokio::time::Instant::now() < deadline,
+            "the route never moved: {response}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert!(moved.starts_with("HTTP/1.1 502"), "{moved}");
+
+    // The removed route is unknown now, and the added one reaches its upstream.
+    let removed = get(proxy.port, "api.one.localhost").await?;
+    assert!(removed.starts_with("HTTP/1.1 404"), "{removed}");
+    let added = tokio::spawn(async move {
+        let (mut stream, _) = upstream.accept().await?;
+        let head = read_head(&mut stream).await?;
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+            .await?;
+        Ok::<_, eyre::Report>(head)
+    });
+    let response = get(proxy.port, "admin.one.localhost").await?;
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    let head = added.await??;
+    assert!(head.contains("admin.one.localhost"), "{head}");
+
+    proxy.shutdown.cancel();
+    proxy.task.await??;
+    Ok(())
+}
+
 /// A session's routes vanish with its registration, and the proxy exits once it has been idle.
 #[tokio::test]
 async fn routes_end_with_the_registration_and_the_proxy_exits_when_idle() -> eyre::Result<()> {

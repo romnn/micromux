@@ -84,7 +84,7 @@ Browsers resolve every `*.localhost` name to the local machine on their own, so 
 
 - `port` is the upstream port on `127.0.0.1`. It may reference micromux's own environment and the [injected variables](#injected-variables), typically an `allocate_ports` name, but not a service's `env_file`. A route cannot point at the proxy's own port.
 - The proxy routes by the `Host` header, which reaches the service unchanged, and passes WebSocket upgrades and streaming responses (SSE, chunked) through without buffering.
-- A hostname no session serves gets a 404 page listing the live sessions and their URLs. A route whose service does not accept connections gets a 502 page naming the session and the service. The service is the one whose `ports` list the route's port, so list the port there.
+- A hostname no session serves gets a 404 page listing the live sessions and their URLs. A route whose service does not accept connections gets a 502 page naming the session and the service. The service is the one whose `ports` list the route's port, so list the port there. A config reload that adds, removes, or changes services updates which service that is.
 - `routes` are not supported on Windows.
 
 ### The proxy

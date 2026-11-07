@@ -16,6 +16,7 @@ use crate::listen::PortPreference;
 use crate::paths::ProxyPaths;
 use crate::protocol::{
     ClientMessage, LEASE_TIMEOUT, MAX_MESSAGE_BYTES, PING_INTERVAL, ProxyMessage, Registration,
+    RouteTarget,
 };
 
 /// How long a session waits for a proxy it started to come up.
@@ -286,6 +287,7 @@ pub enum RegistrationStatus {
 #[derive(Debug)]
 pub struct Registrar {
     status: watch::Receiver<RegistrationStatus>,
+    routes: watch::Sender<Vec<RouteTarget>>,
     stop: CancellationToken,
 }
 
@@ -326,6 +328,7 @@ impl Registrar {
             }
         };
         let (status_tx, status) = watch::channel(RegistrationStatus::Registered);
+        let (routes, routes_rx) = watch::channel(registration.routes.clone());
         let stop = shutdown.child_token();
         tokio::spawn(maintain(
             Maintained {
@@ -335,16 +338,31 @@ impl Registrar {
                 launcher,
             },
             connection,
+            routes_rx,
             status_tx,
             stop.clone(),
         ));
-        Ok(Self { status, stop })
+        Ok(Self {
+            status,
+            routes,
+            stop,
+        })
     }
 
     /// Follows the registration's status.
     #[must_use]
     pub fn status(&self) -> watch::Receiver<RegistrationStatus> {
         self.status.clone()
+    }
+
+    /// A handle that replaces the registered routes, such as after the session's config changed
+    /// which service owns a route.
+    ///
+    /// The registrar re-registers on its live connection, so the proxy swaps the routes without
+    /// dropping them in between, and every later reconnect registers the latest routes.
+    #[must_use]
+    pub fn routes(&self) -> watch::Sender<Vec<RouteTarget>> {
+        self.routes.clone()
     }
 }
 
@@ -362,8 +380,9 @@ struct Maintained {
 }
 
 async fn maintain(
-    maintained: Maintained,
+    mut maintained: Maintained,
     connection: Connection,
+    mut routes: watch::Receiver<Vec<RouteTarget>>,
     status: watch::Sender<RegistrationStatus>,
     stop: CancellationToken,
 ) {
@@ -373,7 +392,7 @@ async fn maintain(
         if let Some(live) = connection.take() {
             status.send_replace(RegistrationStatus::Registered);
             backoff = Duration::from_millis(250);
-            let Some(reason) = keep_alive(live, &stop).await else {
+            let Some(reason) = keep_alive(live, &mut maintained, &mut routes, &stop).await else {
                 return;
             };
             tracing::warn!(reason, "lost the proxy registration; reconnecting");
@@ -383,6 +402,7 @@ async fn maintain(
             () = stop.cancelled() => return,
             () = tokio::time::sleep(backoff) => {}
         }
+        maintained.registration.routes = routes.borrow_and_update().clone();
         match register(
             &maintained.paths,
             &maintained.registration,
@@ -404,7 +424,15 @@ async fn maintain(
 }
 
 /// Pings until the connection is lost, returning why, or `None` once `stop` fires.
-async fn keep_alive(mut connection: Connection, stop: &CancellationToken) -> Option<String> {
+///
+/// New routes are registered on the same connection, which the proxy treats as a replacement.
+/// Its reply refreshes the lease like a pong; a refusal closes the connection, which reconnects.
+async fn keep_alive(
+    mut connection: Connection,
+    maintained: &mut Maintained,
+    routes: &mut watch::Receiver<Vec<RouteTarget>>,
+    stop: &CancellationToken,
+) -> Option<String> {
     let ping = serde_json::to_string(&ClientMessage::Ping).unwrap_or_default();
     let mut ticker = tokio::time::interval(PING_INTERVAL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -414,6 +442,21 @@ async fn keep_alive(mut connection: Connection, stop: &CancellationToken) -> Opt
             () = stop.cancelled() => return None,
             _ = ticker.tick() => {
                 if connection.send(ping.clone()).await.is_err() {
+                    return Some("the proxy connection broke".to_string());
+                }
+            }
+            changed = routes.changed() => {
+                // The registrar holds a sender for as long as it lives, and dropping it stops
+                // the registration too.
+                if changed.is_err() {
+                    return None;
+                }
+                maintained.registration.routes = routes.borrow_and_update().clone();
+                let register = ClientMessage::Register(maintained.registration.clone());
+                let Ok(register) = serde_json::to_string(&register) else {
+                    return Some("cannot encode the new routes".to_string());
+                };
+                if connection.send(register).await.is_err() {
                     return Some("the proxy connection broke".to_string());
                 }
             }

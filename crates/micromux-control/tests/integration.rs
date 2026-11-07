@@ -35,6 +35,8 @@ fn socket_test_base() -> std::path::PathBuf {
 struct Session {
     endpoint: ControlEndpoint,
     reader: micromux::SessionModelReader,
+    /// The live summary the TUI reads in process.
+    status: micromux::SessionStatus,
     shutdown: CancellationToken,
     _runner: tokio::task::JoinHandle<Result<(), micromux::Error>>,
 }
@@ -46,6 +48,25 @@ fn build_session(dir: &Path, command: &str) -> eyre::Result<Session> {
 }
 
 fn build_session_yaml(dir: &Path, yaml: &str) -> eyre::Result<Session> {
+    build_session_with(dir, yaml, |config| Ok(micromux::Micromux::new(config)?))
+}
+
+/// Builds a session with routes, which needs a latched proxy port; nothing registers the routes
+/// with a proxy, so no proxy has to run.
+fn build_routed_session(dir: &Path, yaml: &str) -> eyre::Result<Session> {
+    build_session_with(dir, yaml, |config| {
+        let registry = micromux::PortRegistry::at(dir.join("registry"));
+        let mut session = micromux::Session::establish(config, &registry)?;
+        session.set_proxy_port(8080);
+        Ok(micromux::Micromux::with_session(config, session)?)
+    })
+}
+
+fn build_session_with(
+    dir: &Path,
+    yaml: &str,
+    mux: impl FnOnce(&micromux::ConfigFile<usize>) -> eyre::Result<micromux::Micromux>,
+) -> eyre::Result<Session> {
     let mut diagnostics = vec![];
     let mut config = micromux::from_str(yaml, dir, 0usize, None, &mut diagnostics)
         .map_err(|err| eyre::eyre!("parse config: {err}"))?;
@@ -55,7 +76,7 @@ fn build_session_yaml(dir: &Path, yaml: &str) -> eyre::Result<Session> {
     // `CanonicalConfigPath` signature makes any other input a compile error).
     let config_path = micromux_control::CanonicalConfigPath::new(&config_path)?;
     config.config_path = Some(config_path.as_path().to_path_buf());
-    let mux = Arc::new(micromux::Micromux::new(&config)?);
+    let mux = Arc::new(mux(&config)?);
 
     let shutdown = CancellationToken::new();
     let (runner, handles) = mux.clone().start(shutdown.clone());
@@ -81,6 +102,7 @@ fn build_session_yaml(dir: &Path, yaml: &str) -> eyre::Result<Session> {
     Ok(Session {
         endpoint,
         reader: handles.reader,
+        status: handles.session,
         shutdown,
         _runner: runner,
     })
@@ -500,6 +522,138 @@ services:
     .await?;
 
     session.shutdown.cancel();
+    Ok(())
+}
+
+/// Each route's host, port and owning service, in config order.
+fn routed_owners(routes: &[micromux::Route]) -> Vec<(&str, u16, Option<&str>)> {
+    routes
+        .iter()
+        .map(|route| (route.host.as_str(), route.port, route.service.as_deref()))
+        .collect()
+}
+
+/// Routes `app` to `web`, `api` to `api`, and `admin` to a port no service lists.
+const ROUTED_BEFORE: &str = r#"version: 1
+routes:
+  - host: app
+    port: 41001
+  - host: api
+    port: 41002
+  - host: admin
+    port: 41003
+services:
+  web:
+    command: ["sh", "-c", "sleep 60"]
+    ports: [41001]
+  api:
+    command: ["sh", "-c", "sleep 60"]
+    ports: [41002]
+"#;
+
+/// Removes `api`, moves port 41001 from `web` to the new `frontend`, and adds `admin` for the
+/// port nothing listed before.
+const ROUTED_AFTER: &str = r#"version: 1
+routes:
+  - host: app
+    port: 41001
+  - host: api
+    port: 41002
+  - host: admin
+    port: 41003
+services:
+  web:
+    command: ["sh", "-c", "sleep 60"]
+    ports: [41004]
+  frontend:
+    command: ["sh", "-c", "sleep 60"]
+    ports: [41001]
+  admin:
+    command: ["sh", "-c", "sleep 60"]
+    ports: [41003]
+"#;
+
+/// After a reconcile, `Describe` (behind `ctl describe` and MCP `get_session_urls`) and the
+/// in-process summary the TUI reads name each route's new owner, exactly as a session started
+/// with the new config would: an added owner, a removed one, and one that moved to another
+/// service.
+#[tokio::test]
+async fn reconcile_republishes_route_owners() -> eyre::Result<()> {
+    let dir = unique_dir("route-owners")?;
+    let session = build_routed_session(dir.path(), ROUTED_BEFORE)?;
+    let mut client = Client::connect(&session.endpoint).await?;
+    let describe = async |client: &mut Client| -> eyre::Result<Vec<micromux::Route>> {
+        let Response::Description(info) = client.request(Request::Describe).await? else {
+            eyre::bail!("expected a description");
+        };
+        Ok(info
+            .session
+            .ok_or_else(|| eyre::eyre!("the description carries no session"))?
+            .routes)
+    };
+
+    // The startup owners
+    let before = describe(&mut client).await?;
+    assert_eq!(
+        routed_owners(&before),
+        vec![
+            ("app", 41001, Some("web")),
+            ("api", 41002, Some("api")),
+            ("admin", 41003, None),
+        ]
+    );
+
+    // A dry run changes nothing.
+    std::fs::write(dir.path().join("micromux.yaml"), ROUTED_AFTER)?;
+    client
+        .request(Request::ReconcileConfig { dry_run: true })
+        .await?;
+    assert_eq!(describe(&mut client).await?, before);
+
+    // The applied reconcile moves `app`, drops the retired `api`, and gives `admin` an owner.
+    let applied = client
+        .request(Request::ReconcileConfig { dry_run: false })
+        .await?;
+    assert!(
+        matches!(applied, Response::Reconcile(ref receipt) if !receipt.dry_run),
+        "{applied:?}"
+    );
+    let expected = vec![
+        ("app", 41001, Some("frontend")),
+        ("api", 41002, None),
+        ("admin", 41003, Some("admin")),
+    ];
+    let after = describe(&mut client).await?;
+    assert_eq!(routed_owners(&after), expected);
+    assert_eq!(routed_owners(&session.status.current().routes), expected);
+
+    // `restart_all` reloads the config too, so swapping the ports back moves `app` back to `web`.
+    std::fs::write(
+        dir.path().join("micromux.yaml"),
+        ROUTED_AFTER
+            .replace("[41004]", "[41001]")
+            .replace("ports: [41001]\n  admin", "ports: [41004]\n  admin"),
+    )?;
+    let restarted = client.request(Request::RestartAll).await?;
+    assert!(
+        matches!(restarted, Response::Accepted { .. }),
+        "{restarted:?}"
+    );
+    assert_eq!(
+        routed_owners(&describe(&mut client).await?),
+        vec![
+            ("app", 41001, Some("web")),
+            ("api", 41002, None),
+            ("admin", 41003, Some("admin")),
+        ]
+    );
+
+    // The reconciled owners match those of a session started with the reconciled config.
+    session.shutdown.cancel();
+    let fresh_dir = unique_dir("route-owners-fresh")?;
+    let fresh = build_routed_session(fresh_dir.path(), ROUTED_AFTER)?;
+    assert_eq!(routed_owners(&fresh.status.current().routes), expected);
+    fresh.shutdown.cancel();
     Ok(())
 }
 

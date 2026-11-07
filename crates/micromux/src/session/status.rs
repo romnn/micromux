@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 
 use super::Route;
+use crate::scheduler::ServiceID;
 
 /// A session's name, browser URLs, and allocated ports.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -78,6 +79,22 @@ impl SessionStatus {
             }
             summary.routing = Some(routing);
             true
+        });
+    }
+
+    /// Sets each route's owning service to `owner` of its port, notifying subscribers only when an
+    /// owner changed.
+    pub(crate) fn set_route_owners(&self, owner: impl Fn(u16) -> Option<ServiceID>) {
+        self.summary.send_if_modified(|summary| {
+            let mut changed = false;
+            for route in &mut summary.routes {
+                let service = owner(route.port);
+                if route.service != service {
+                    route.service = service;
+                    changed = true;
+                }
+            }
+            changed
         });
     }
 

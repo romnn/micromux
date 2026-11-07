@@ -625,7 +625,11 @@ impl Micromux {
         &self.session.identity
     }
 
-    /// The session's routes with their ports resolved, in config order.
+    /// The session's routes with their ports resolved, in config order, and the owners the config
+    /// gave them at startup.
+    ///
+    /// A running session publishes later owners, after a config reload, through
+    /// [`Handles::session`].
     #[must_use]
     pub fn routes(&self) -> &[Route] {
         &self.routes
@@ -679,12 +683,13 @@ impl Micromux {
         let (reader, writer) = model::new(initial_model_entries(&self.services));
         let (commands_tx, commands_rx) = mpsc::channel(1024);
         let (terminal, pty_input_rx) = TerminalControl::channel(commands_tx.clone());
+        let session_status = SessionStatus::new(self.session_summary());
         let handles = Handles {
             reader,
             commands: commands_tx,
             terminal,
             dynamic_services: self.dynamic_policy.clone(),
-            session: SessionStatus::new(self.session_summary()),
+            session: session_status.clone(),
         };
 
         let runner = async move {
@@ -705,6 +710,7 @@ impl Micromux {
                 config_dir: self.config_dir.clone(),
                 dynamic_policy: self.dynamic_policy.clone(),
                 session: self.session.clone(),
+                session_status,
                 default_log_retention: self.default_log_retention,
                 default_log_display: self.default_log_display.clone(),
             })

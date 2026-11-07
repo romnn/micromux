@@ -93,6 +93,24 @@ impl ToDiagnostics for RouteError {
     }
 }
 
+/// The service whose `ports` list contains `port`, if exactly one of `services` does.
+///
+/// A session that starts passes every configured service; after a config reload the scheduler
+/// passes the live configured ones, so ownership always follows the config the session runs.
+pub(crate) fn owner<'a>(
+    port: u16,
+    services: impl IntoIterator<Item = (&'a ServiceID, &'a crate::service::Service)>,
+) -> Option<ServiceID> {
+    let mut owners = services
+        .into_iter()
+        .filter(|(_, service)| service.spec.ports.contains(&port))
+        .map(|(id, _)| id.clone());
+    match (owners.next(), owners.next()) {
+        (Some(owner), None) => Some(owner),
+        _ => None,
+    }
+}
+
 /// Resolves every configured route of `session`.
 ///
 /// Ports see micromux's own environment with the session variables pinned on top, not any
@@ -131,14 +149,7 @@ pub(crate) fn resolve(
             errors.push(RouteError::ProxyPort { host, span, port });
             continue;
         }
-        let mut owners = services
-            .iter()
-            .filter(|(_, service)| service.spec.ports.contains(&port))
-            .map(|(id, _)| id.clone());
-        let service = match (owners.next(), owners.next()) {
-            (Some(owner), None) => Some(owner),
-            _ => None,
-        };
+        let service = owner(port, services);
         let url = if host == CATCH_ALL_HOST {
             format!("http://{suffix}/")
         } else {
