@@ -217,12 +217,12 @@ fn effective_log_level(options: &options::Options) -> tracing::metadata::Level {
 fn setup_logging(
     options: &options::Options,
 ) -> Result<tracing_appender::non_blocking::WorkerGuard, Error> {
-    let project_dir = micromux::project_dir()
+    let cache_dir = micromux::cache_directory()
         .ok_or_else(|| Error::Message("failed to create project directory".to_string()))?;
     let log_file = match options.log_file.as_deref() {
         Some(path) => logging::LogFile::LogFile { path },
         None => logging::LogFile::RollingLog {
-            cache_dir: project_dir.cache_dir(),
+            cache_dir: &cache_dir,
         },
     };
     let guard = logging::setup(Some(effective_log_level(options)), &log_file)?;
@@ -438,6 +438,17 @@ async fn run_command(command: options::Command, options: options::Options) -> Re
 
 async fn run() -> Result<(), Error> {
     let mut options = options::Options::parse();
+    // Every micromux of an isolated setup must agree on its directory, wherever it starts.
+    if let Some(state) = std::env::var_os(micromux::STATE_DIR_VARIABLE)
+        && !state.is_empty()
+        && !std::path::Path::new(&state).is_absolute()
+    {
+        return Err(Error::Message(format!(
+            "{} must be an absolute path, not `{}`",
+            micromux::STATE_DIR_VARIABLE,
+            std::path::Path::new(&state).display()
+        )));
+    }
     // `exec` replaces this process, and the command it runs keeps the caller's open-file limit.
     if !matches!(options.command, Some(options::Command::Exec { .. })) {
         raise_file_descriptor_limit();

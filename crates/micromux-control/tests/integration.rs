@@ -48,18 +48,27 @@ fn build_session(dir: &Path, command: &str) -> eyre::Result<Session> {
 }
 
 fn build_session_yaml(dir: &Path, yaml: &str) -> eyre::Result<Session> {
-    build_session_with(dir, yaml, |config| Ok(micromux::Micromux::new(config)?))
+    build_session_with(dir, yaml, |config| {
+        Ok(micromux::Micromux::with_session(
+            config,
+            micromux::Session::establish(config, &private_registry(dir))?,
+        )?)
+    })
 }
 
 /// Builds a session with routes, which needs a latched proxy port; nothing registers the routes
 /// with a proxy, so no proxy has to run.
 fn build_routed_session(dir: &Path, yaml: &str) -> eyre::Result<Session> {
     build_session_with(dir, yaml, |config| {
-        let registry = micromux::PortRegistry::at(dir.join("registry"));
-        let mut session = micromux::Session::establish(config, &registry)?;
+        let mut session = micromux::Session::establish(config, &private_registry(dir))?;
         session.set_proxy_port(8080);
         Ok(micromux::Micromux::with_session(config, session)?)
     })
+}
+
+/// A port registry of the test's own, so its sessions never register with the user's.
+fn private_registry(dir: &Path) -> micromux::PortRegistry {
+    micromux::PortRegistry::at(dir.join("registry"))
 }
 
 fn build_session_with(

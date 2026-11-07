@@ -1506,6 +1506,15 @@ mod tests {
         assert_eq!(lines.first().map(|line| line.seq), Some(1));
     }
 
+    /// Removes a file when the test ends, however it ends.
+    struct RemoveOnDrop(std::path::PathBuf);
+
+    impl Drop for RemoveOnDrop {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
     #[tokio::test]
     async fn project_lock_blocks_a_second_endpoint_for_the_same_config() -> eyre::Result<()> {
         use std::os::unix::fs::PermissionsExt as _;
@@ -1516,6 +1525,9 @@ mod tests {
         let config = CanonicalConfigPath::new(config)?;
         let first = ControlEndpoint::Unix(directory.path().join("first.sock"));
         let second = ControlEndpoint::Unix(directory.path().join("second.sock"));
+        // The project lock lives in the user's coordination directory, keyed by this test's
+        // temporary config, so nobody else ever uses it.
+        let _project_lock = RemoveOnDrop(project_lock_path(&config)?);
 
         let first_guard = bind_project(&first, &config)?.ok_or_else(|| eyre::eyre!("lock busy"))?;
         let ControlEndpoint::Unix(first_path) = &first else {

@@ -2,14 +2,14 @@
 #![cfg(unix)]
 
 use std::path::Path;
-use std::process::{Command, Output, Stdio};
+use std::process::{Output, Stdio};
 use std::time::{Duration, Instant};
 
 use color_eyre::eyre;
 use similar_asserts::assert_eq;
 use std::os::unix::process::CommandExt as _;
 
-const MICROMUX: &str = env!("CARGO_BIN_EXE_micromux");
+mod common;
 
 const CONFIG: &str = r#"version: 1
 services:
@@ -29,7 +29,7 @@ services:
 "#;
 
 fn ctl(directory: &Path, args: &[&str]) -> eyre::Result<Output> {
-    Ok(Command::new(MICROMUX)
+    Ok(common::micromux(directory)
         .arg("ctl")
         .args(args)
         .current_dir(directory)
@@ -47,7 +47,7 @@ impl Session {
     fn start(config: &str) -> eyre::Result<Self> {
         let directory = tempfile::tempdir()?;
         std::fs::write(directory.path().join("micromux.yaml"), config)?;
-        let supervisor = Command::new(MICROMUX)
+        let supervisor = common::micromux(directory.path())
             .arg("serve")
             .current_dir(directory.path())
             .stdin(Stdio::null())

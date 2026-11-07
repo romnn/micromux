@@ -28,7 +28,7 @@ Two live sessions cannot share a name. When a second session would, it fails to 
 
 Every name under `allocate_ports` becomes an environment variable holding a free TCP port:
 
-- The port **stays the same across restarts** of the session. Assignments are stored per config file in micromux's state directory (`~/.local/state/micromux/ports` on Linux, `~/Library/Application Support/com.romnn.micromux/ports` on macOS).
+- The port **stays the same across restarts** of the session. Assignments are stored per config file in micromux's state directory (`~/.local/state/micromux/ports` on Linux, `~/Library/Application Support/com.romnn.micromux/ports` on macOS, or [`MICROMUX_STATE_DIR`](#isolated-state)).
 - **No two live sessions of the same user share a port.** A session holds its assignment while it runs; a stopped session's ports are only handed to another session when no other port is left.
 - Ports come from `session.port_range`, by default `20000`–`32767`, below the ephemeral port ranges of Linux (`32768`+) and macOS (`49152`+), so outgoing connections never take one. See [choosing a port range](#choosing-a-port-range).
 - A port a session is assigned for the first time is checked to be free. If a port the session had before is now held by some other process, the session **fails to start** and names the variable and the port, rather than pointing your services at a stranger. Stop that process (often a leftover of an earlier run) and start again.
@@ -135,3 +135,21 @@ The port a session started with stays its port: if the proxy goes away, the sess
 `session` (including `port_range`), `allocate_ports`, `routes`, and `proxy` are read once, when the session starts. A config reload — [`reconcile_config`]({{< relref "../agent-control/control-plane.md" >}}), or a restart that re-reads the config — that changes any of them is rejected; restart the session to apply the change.
 
 `validate_config` never reserves anything. It uses the assignment a session already has, or provisional values for names that were never assigned, and says so in a note.
+
+## Isolated state
+
+Everything that lets your sessions find each other is per user: the port registry and cleanup state in micromux's state directory, the control sockets in the runtime directory, and the session locks and the shared proxy's socket in `/tmp/micromux-<uid>`. The state directory derives from your account's home directory, not `$HOME` or `$XDG_STATE_HOME`, so sessions started from differently configured shells, agents, and services still share it.
+
+`MICROMUX_STATE_DIR` gives micromux a separate setup in a directory of its own. It is meant for tests and isolated setups, such as a sandbox that runs its own projects:
+
+```sh
+MICROMUX_STATE_DIR=/tmp/micromux-test micromux serve
+```
+
+- The directory holds everything micromux otherwise keeps per user: the port registry in `ports/`, cleanup files in `cleanup/`, control sockets in `run/`, session locks and the proxy's socket in `coordination/`, and micromux's logs and run-log spools in `cache/`.
+- Sessions inside and outside it do not see each other. `micromux ctl`, `attach`, `env`, `exec`, and the MCP server find a session only when they run with the same `MICROMUX_STATE_DIR`.
+- They do not exclude each other either: a session with the variable and one without it can run the **same config file at the same time**, and both start its services without a warning. Do not point an isolated setup at a project you also run normally.
+- Ports are shared by the whole host. A session in a separate setup skips ports that are in use, but it does not know the ports reserved in your own registry, so it can take one that a stopped session of yours expects back. That session then fails to start with a busy port. Give an isolated setup its own `session.port_range` when it runs services that bind their ports, and its own proxy `port` when it has routes.
+- The path must be absolute. micromux creates `run/` and `coordination/` private to you, and the control and proxy sockets live in them, so keep the path short: macOS limits socket paths to 104 bytes.
+
+Registering a session briefly holds a lock on the port registry. A session waits as long as other sessions keep taking turns, but when a single process holds the lock for 5 seconds, the session fails to start and names the lock file and that process, rather than waiting on a stuck process.

@@ -10,6 +10,8 @@
 //! proves its owner is gone; a missing or stale record proves nothing.
 //! Every read, liveness probe, and write happens under the registry-wide `registry.lock`, which
 //! serializes allocation between sessions starting at the same time.
+//! A session waits only a bounded time for any one holder to release it, and records its pid in
+//! it while holding it, so a session that gives up can name the holder.
 //! A lock file is only removed together with the record of a dead session whose config file no
 //! longer exists, and only under the registry lock: replacing a lock file someone could still
 //! open outside it would let two processes hold "the" lock at once.
@@ -20,6 +22,7 @@ use std::io::Write as _;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener};
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
@@ -33,6 +36,33 @@ use super::{SessionError, config_path_key};
 pub(crate) const DEFAULT_PORT_RANGE: RangeInclusive<u16> = 20000..=32767;
 
 const REGISTRY_LOCK: &str = "registry.lock";
+
+/// How long a starting session waits for one holder to release the registry lock.
+///
+/// Allocation holds it for milliseconds, so a holder that keeps it this long is stuck.
+const REGISTRY_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How often a waiting session tries the registry lock again.
+const REGISTRY_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+/// Environment variable that gives micromux a separate per-user setup, for tests and isolated
+/// setups.
+///
+/// When set to a non-empty absolute path, that directory holds everything micromux otherwise
+/// keeps per user:
+///
+/// - the port registry in `ports` and the cleanup state in `cleanup`, in place of the state
+///   directory;
+/// - control sockets in `run`, in place of the runtime directory;
+/// - session locks and the shared proxy's socket and lock in `coordination`, in place of the
+///   coordination directory;
+/// - log files and run-log spools in `cache` (see [`crate::cache_directory`]).
+///
+/// Sessions inside and outside it neither see nor exclude each other, not even for the same
+/// config file.
+/// The micromux CLI refuses a relative path, which processes started in different directories
+/// would resolve to different setups.
+pub const STATE_DIR_VARIABLE: &str = "MICROMUX_STATE_DIR";
 
 /// Persisted port assignment of one session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -61,6 +91,8 @@ pub struct PortRegistry {
     directory: Option<PathBuf>,
     /// Whether nothing on the host listens on a port.
     port_is_free: fn(u16) -> bool,
+    /// How long [`Self::acquire`] waits for the registry lock.
+    lock_timeout: Duration,
 }
 
 impl Default for PortRegistry {
@@ -68,12 +100,15 @@ impl Default for PortRegistry {
         Self {
             directory: None,
             port_is_free,
+            lock_timeout: REGISTRY_LOCK_TIMEOUT,
         }
     }
 }
 
 impl PortRegistry {
     /// The current user's registry, located when first used.
+    ///
+    /// It lives in [`STATE_DIR_VARIABLE`]'s directory when that is set.
     #[must_use]
     pub fn user() -> Self {
         Self::default()
@@ -144,14 +179,7 @@ impl PortRegistry {
         };
 
         // Serialize with every other session's allocation
-        let registry_lock_path = directory.join(REGISTRY_LOCK);
-        let registry_lock = open_lock_file(&registry_lock_path, true)
-            .map_err(io(&registry_lock_path))?
-            .ok_or_else(|| SessionError::Io {
-                path: registry_lock_path.clone(),
-                source: std::io::ErrorKind::NotFound.into(),
-            })?;
-        registry_lock.lock().map_err(io(&registry_lock_path))?;
+        let registry_lock = lock_registry(&directory.join(REGISTRY_LOCK), self.lock_timeout)?;
 
         // Claim this session's own instance lock
         let key = config_path_key(config_path);
@@ -396,6 +424,67 @@ fn ipv6_unavailable(err: &std::io::Error) -> bool {
             .is_some_and(|code| unsupported.contains(&code))
 }
 
+/// The held registry lock, which records the holder's pid in the lock file while held.
+#[derive(Debug)]
+struct RegistryLock(File);
+
+impl Drop for RegistryLock {
+    fn drop(&mut self) {
+        // Clear the pid while still holding the lock, so it never names a past holder.
+        let _ = self.0.set_len(0);
+    }
+}
+
+/// Takes the registry lock at `path`, giving up when one holder keeps it for `timeout`.
+///
+/// Sessions queuing behind each other keep waiting as long as the lock changes hands, which
+/// the pid each holder records shows.
+/// Where the pid cannot be read, as on Windows or behind a micromux that does not record it,
+/// `timeout` bounds the whole wait instead.
+fn lock_registry(path: &Path, timeout: Duration) -> Result<RegistryLock, SessionError> {
+    let io = |source| SessionError::Io {
+        path: path.to_path_buf(),
+        source,
+    };
+    let file = open_lock_file(path, true)
+        .map_err(io)?
+        .ok_or_else(|| io(std::io::ErrorKind::NotFound.into()))?;
+    let mut holder = lock_holder(path);
+    let mut deadline = Instant::now() + timeout;
+    loop {
+        match file.try_lock() {
+            Ok(()) => break,
+            Err(TryLockError::WouldBlock) => {
+                let current = lock_holder(path);
+                if current != holder {
+                    holder = current;
+                    deadline = Instant::now() + timeout;
+                } else if Instant::now() >= deadline {
+                    return Err(SessionError::RegistryLocked {
+                        path: path.to_path_buf(),
+                        waited: timeout,
+                        holder,
+                    });
+                }
+                std::thread::sleep(REGISTRY_LOCK_POLL_INTERVAL);
+            }
+            Err(TryLockError::Error(source)) => return Err(io(source)),
+        }
+    }
+    // The pid only serves diagnostics, so failing to record it never fails the allocation.
+    let _ = file
+        .set_len(0)
+        .and_then(|()| (&file).write_all(std::process::id().to_string().as_bytes()));
+    Ok(RegistryLock(file))
+}
+
+/// The pid the holder of the registry lock at `path` recorded, if it can be read.
+///
+/// Windows locks are mandatory, so there the file cannot be read while it is held.
+fn lock_holder(path: &Path) -> Option<u32> {
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
 /// Whether some process holds the instance lock at `path`.
 ///
 /// Only called under the registry lock, which every session also holds while claiming its own
@@ -457,13 +546,33 @@ fn user_registry_directory() -> Option<PathBuf> {
     user_state_directory().map(|state| state.join("ports"))
 }
 
+/// The directory [`STATE_DIR_VARIABLE`] names, or `None` when it is unset or empty.
+///
+/// A relative path is made absolute against the current directory, so the paths micromux derives
+/// from it stay valid for the shims and proxy it starts in other directories.
+/// Other micromux processes resolve it against their own directories, so give an absolute path.
+#[must_use]
+pub fn state_directory_override() -> Option<PathBuf> {
+    resolve_override(std::env::var_os(STATE_DIR_VARIABLE))
+}
+
+fn resolve_override(value: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    let path = PathBuf::from(value.filter(|value| !value.is_empty())?);
+    Some(std::path::absolute(&path).unwrap_or(path))
+}
+
 /// The current user's micromux state directory, shared by every session of that user.
 ///
-/// On Unix it derives from the account's home directory in the password database rather than
-/// `$HOME` or `$XDG_STATE_HOME`, so sessions started from differently configured shells, agents,
-/// or services still share one registry and find each other's cleanup locks.
-#[cfg(unix)]
+/// [`STATE_DIR_VARIABLE`] overrides it explicitly.
+/// Without it, on Unix it derives from the account's home directory in the password database
+/// rather than `$HOME` or `$XDG_STATE_HOME`, so sessions started from differently configured
+/// shells, agents, or services still share one registry and find each other's cleanup locks.
 pub(crate) fn user_state_directory() -> Option<PathBuf> {
+    state_directory_override().or_else(default_state_directory)
+}
+
+#[cfg(unix)]
+fn default_state_directory() -> Option<PathBuf> {
     let user = nix::unistd::User::from_uid(nix::unistd::Uid::current())
         .ok()
         .flatten()?;
@@ -476,7 +585,7 @@ pub(crate) fn user_state_directory() -> Option<PathBuf> {
 }
 
 #[cfg(not(unix))]
-pub(crate) fn user_state_directory() -> Option<PathBuf> {
+fn default_state_directory() -> Option<PathBuf> {
     crate::project_dir().map(|directories| directories.data_local_dir().to_path_buf())
 }
 
@@ -835,6 +944,155 @@ mod tests {
         );
 
         assert!(matches!(result, Err(SessionError::UnreadableRecord { .. })));
+        Ok(())
+    }
+
+    /// A session that cannot take the registry lock within its timeout fails, naming the lock
+    /// file and the pid its holder recorded, instead of waiting forever.
+    #[test]
+    fn a_held_registry_lock_fails_the_allocation_after_the_timeout() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let registry = PortRegistry {
+            lock_timeout: Duration::from_millis(200),
+            ..PortRegistry::ignoring_host_listeners(directory.path())
+        };
+        let lock_path = directory.path().join(REGISTRY_LOCK);
+        // Another handle on the same file conflicts like another process would.
+        let _held = lock_registry(&lock_path, Duration::ZERO)?;
+
+        let started = Instant::now();
+        let result = registry.acquire(
+            Path::new("/projects/one/micromux.yaml"),
+            "one",
+            &names(&["A"]),
+            &[],
+            &DEFAULT_PORT_RANGE,
+        );
+
+        let Err(err @ SessionError::RegistryLocked { .. }) = result else {
+            eyre::bail!("expected a registry lock timeout, got {result:?}");
+        };
+        // The holder's pid is only readable where locks are advisory.
+        let holder = cfg!(unix).then(std::process::id);
+        assert!(
+            matches!(
+                &err,
+                SessionError::RegistryLocked { path, holder: reported, .. }
+                    if *path == lock_path && *reported == holder
+            ),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains(&lock_path.display().to_string()));
+        assert!(started.elapsed() >= Duration::from_millis(200));
+        Ok(())
+    }
+
+    /// A lock released while a session waits for it is taken, and the allocation proceeds.
+    #[test]
+    fn a_registry_lock_released_during_the_wait_is_taken() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let registry = PortRegistry::ignoring_host_listeners(directory.path());
+        let held = lock_registry(&directory.path().join(REGISTRY_LOCK), Duration::ZERO)?;
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            drop(held);
+        });
+
+        let result = registry.acquire(
+            Path::new("/projects/one/micromux.yaml"),
+            "one",
+            &names(&["A"]),
+            &[],
+            &DEFAULT_PORT_RANGE,
+        );
+        release
+            .join()
+            .map_err(|_| eyre::eyre!("the releasing thread panicked"))?;
+
+        assert!(result.is_ok(), "{result:?}");
+        Ok(())
+    }
+
+    /// The lock file names its holder only while the lock is held, so a released lock never
+    /// points at a past holder.
+    #[test]
+    fn the_registry_lock_names_only_its_current_holder() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let lock_path = directory.path().join(REGISTRY_LOCK);
+
+        let held = lock_registry(&lock_path, Duration::ZERO)?;
+        let while_held = std::fs::read_to_string(&lock_path);
+        drop(held);
+
+        // Windows locks are mandatory, so the holder's pid is only readable elsewhere.
+        if cfg!(unix) {
+            assert_eq!(while_held?, std::process::id().to_string());
+        }
+        assert_eq!(std::fs::read_to_string(&lock_path)?, "");
+        Ok(())
+    }
+
+    /// A session queuing behind several holders in turn keeps waiting past the timeout as long as
+    /// the lock changes hands, and gets it once the last holder releases it.
+    #[cfg(unix)]
+    #[test]
+    fn a_registry_lock_changing_hands_extends_the_wait() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let timeout = Duration::from_millis(300);
+        let registry = PortRegistry {
+            lock_timeout: timeout,
+            ..PortRegistry::ignoring_host_listeners(directory.path())
+        };
+        let lock_path = directory.path().join(REGISTRY_LOCK);
+        let held = lock_registry(&lock_path, Duration::ZERO)?;
+        // Each new pid stands in for the next session taking the lock, well within the timeout
+        // of the one before, and the last releases it after more than twice the timeout.
+        let handover = std::thread::spawn({
+            let lock_path = lock_path.clone();
+            move || -> std::io::Result<()> {
+                for pid in ["1", "2", "3"] {
+                    std::thread::sleep(Duration::from_millis(200));
+                    std::fs::write(&lock_path, pid)?;
+                }
+                std::thread::sleep(Duration::from_millis(200));
+                drop(held);
+                Ok(())
+            }
+        });
+
+        let started = Instant::now();
+        let result = registry.acquire(
+            Path::new("/projects/one/micromux.yaml"),
+            "one",
+            &names(&["A"]),
+            &[],
+            &DEFAULT_PORT_RANGE,
+        );
+        handover
+            .join()
+            .map_err(|_| eyre::eyre!("the handover thread panicked"))??;
+
+        assert!(result.is_ok(), "{result:?}");
+        assert!(started.elapsed() > timeout * 2);
+        Ok(())
+    }
+
+    /// An empty override counts as unset, and a relative one is made absolute so that the shims
+    /// and proxy a process starts in other directories find the same state.
+    #[test]
+    fn the_state_directory_override_is_absolute_or_unset() -> eyre::Result<()> {
+        assert_eq!(resolve_override(None), None);
+        assert_eq!(resolve_override(Some("".into())), None);
+
+        let absolute = std::env::temp_dir().join("micromux-state");
+        assert_eq!(
+            resolve_override(Some(absolute.clone().into())),
+            Some(absolute)
+        );
+        assert_eq!(
+            resolve_override(Some("state".into())),
+            Some(std::env::current_dir()?.join("state"))
+        );
         Ok(())
     }
 }
