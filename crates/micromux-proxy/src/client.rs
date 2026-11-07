@@ -390,7 +390,12 @@ async fn maintain(
     let mut backoff = Duration::from_millis(250);
     loop {
         if let Some(live) = connection.take() {
-            status.send_replace(RegistrationStatus::Registered);
+            // The channel starts out registered, so only a restored registration notifies.
+            status.send_if_modified(|current| {
+                let restored = *current != RegistrationStatus::Registered;
+                *current = RegistrationStatus::Registered;
+                restored
+            });
             backoff = Duration::from_millis(250);
             let Some(reason) = keep_alive(live, &mut maintained, &mut routes, &stop).await else {
                 return;

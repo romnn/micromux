@@ -242,27 +242,68 @@ async fn error_pages_name_sessions_and_services() -> eyre::Result<()> {
     Ok(())
 }
 
+/// Opens an upgraded tunnel to `host` through the proxy, served by an echo server on `upstream`.
+async fn open_echo_tunnel(
+    proxy_port: u16,
+    host: &str,
+    upstream: TcpListener,
+) -> eyre::Result<(TcpStream, tokio::task::JoinHandle<eyre::Result<()>>)> {
+    let echo = tokio::spawn(async move {
+        let (mut stream, _) = upstream.accept().await?;
+        read_head(&mut stream).await?;
+        stream
+            .write_all(
+                b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: echo\r\n\r\n",
+            )
+            .await?;
+        let mut buffer = [0u8; 64];
+        loop {
+            let read = stream.read(&mut buffer).await?;
+            if read == 0 {
+                return Ok(());
+            }
+            stream
+                .write_all(buffer.get(..read).unwrap_or_default())
+                .await?;
+        }
+    });
+    let mut tunnel = TcpStream::connect(("127.0.0.1", proxy_port)).await?;
+    tunnel
+        .write_all(
+            format!(
+                "GET /socket HTTP/1.1\r\nHost: {host}\r\nConnection: Upgrade\r\nUpgrade: echo\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await?;
+    let switched = read_head(&mut tunnel).await?;
+    eyre::ensure!(switched.starts_with("HTTP/1.1 101"), "{switched}");
+    Ok((tunnel, echo))
+}
+
 /// Replacing a live registration's routes takes effect without a reconnect: an added route is
-/// served, a removed one is unknown, and a route that moved names its new service and reaches its
-/// new port.
+/// served, a removed one is unknown, a route that moved names its new service, and a tunnel the
+/// session already had stays open.
 #[tokio::test]
 async fn replaced_routes_take_effect_on_the_live_registration() -> eyre::Result<()> {
     let proxy = start_proxy(Duration::from_secs(60)).await?;
-    let upstream = TcpListener::bind(("127.0.0.1", 0)).await?;
-    let admin_port = upstream.local_addr()?.port();
+    let admin_upstream = TcpListener::bind(("127.0.0.1", 0)).await?;
+    let admin_port = admin_upstream.local_addr()?.port();
+    let echo_upstream = TcpListener::bind(("127.0.0.1", 0)).await?;
+    let echo_port = echo_upstream.local_addr()?.port();
     // Distinct ports nothing listens on, so each route answers with its 502 page
-    let mut closed = vec![admin_port];
-    while closed.len() < 4 {
+    let mut ports = vec![admin_port, echo_port];
+    while ports.len() < 5 {
         let port = TcpListener::bind(("127.0.0.1", 0))
             .await?
             .local_addr()?
             .port();
-        if !closed.contains(&port) {
-            closed.push(port);
+        if !ports.contains(&port) {
+            ports.push(port);
         }
     }
-    let [_, app_port, removed_port, moved_port] = closed[..] else {
-        eyre::bail!("expected four ports");
+    let [_, _, app_port, removed_port, moved_port] = ports[..] else {
+        eyre::bail!("expected five ports");
     };
     let registrar = Registrar::start(
         proxy.paths.clone(),
@@ -271,6 +312,7 @@ async fn replaced_routes_take_effect_on_the_live_registration() -> eyre::Result<
             &[
                 ("app", app_port, Some("web")),
                 ("api", removed_port, Some("api")),
+                ("ws", echo_port, None),
             ],
         ),
         proxy.port,
@@ -278,8 +320,14 @@ async fn replaced_routes_take_effect_on_the_live_registration() -> eyre::Result<
         &CancellationToken::new(),
     )
     .await?;
+    let mut status = registrar.status();
+    status.borrow_and_update();
     let before = get(proxy.port, "app.one.localhost").await?;
     assert!(before.contains("<strong>web</strong>"), "{before}");
+
+    // An echo tunnel that is open while the routes change
+    let (mut tunnel, echo) =
+        open_echo_tunnel(proxy.port, "ws.one.localhost", echo_upstream).await?;
 
     // `app` moves to `frontend` on another port, `api` goes, and `admin` comes.
     let replaced = registration(
@@ -287,6 +335,7 @@ async fn replaced_routes_take_effect_on_the_live_registration() -> eyre::Result<
         &[
             ("app", moved_port, Some("frontend")),
             ("admin", admin_port, Some("admin")),
+            ("ws", echo_port, None),
         ],
     );
     registrar.routes().send_replace(replaced.routes);
@@ -309,8 +358,8 @@ async fn replaced_routes_take_effect_on_the_live_registration() -> eyre::Result<
     // The removed route is unknown now, and the added one reaches its upstream.
     let removed = get(proxy.port, "api.one.localhost").await?;
     assert!(removed.starts_with("HTTP/1.1 404"), "{removed}");
-    let added = tokio::spawn(async move {
-        let (mut stream, _) = upstream.accept().await?;
+    let admin = tokio::spawn(async move {
+        let (mut stream, _) = admin_upstream.accept().await?;
         let head = read_head(&mut stream).await?;
         stream
             .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
@@ -319,9 +368,18 @@ async fn replaced_routes_take_effect_on_the_live_registration() -> eyre::Result<
     });
     let response = get(proxy.port, "admin.one.localhost").await?;
     assert!(response.starts_with("HTTP/1.1 200"), "{response}");
-    let head = added.await??;
+    let head = admin.await??;
     assert!(head.contains("admin.one.localhost"), "{head}");
 
+    // The open tunnel still echoes, and the registration never dropped to reconnect.
+    tunnel.write_all(b"ping").await?;
+    let mut echoed = [0u8; 4];
+    tokio::time::timeout(Duration::from_secs(5), tunnel.read_exact(&mut echoed)).await??;
+    assert_eq!(&echoed, b"ping");
+    assert!(!status.has_changed()?, "the registration reconnected");
+
+    drop(tunnel);
+    echo.await??;
     proxy.shutdown.cancel();
     proxy.task.await??;
     Ok(())

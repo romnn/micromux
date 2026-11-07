@@ -289,55 +289,115 @@ mod tests {
     use std::time::Duration;
 
     use color_eyre::eyre;
-    use similar_asserts::assert_eq;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
-    const CONFIG: &str = r#"version: 1
+    /// A config whose only route goes to `port`, which `web` lists, or `frontend` once `moved`.
+    fn config(port: u16, moved: bool) -> String {
+        let (web, frontend) = if moved { (0, port) } else { (port, 0) };
+        format!(
+            r#"version: 1
 routes:
   - host: app
-    port: 41001
+    port: {port}
 services:
   web:
     command: ["sh", "-c", "sleep 60"]
-    ports: [41001]
-"#;
+    ports: [{web}]
+  frontend:
+    command: ["sh", "-c", "sleep 60"]
+    ports: [{frontend}]
+"#
+        )
+    }
 
-    /// A reconcile that moves a route to another service re-registers it with the proxy under its
-    /// new owner, which the 502 page then names.
+    /// Sends a `Connection: close` GET for `host` through the proxy and returns the response.
+    async fn get(proxy_port: u16, host: &str) -> eyre::Result<String> {
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", proxy_port)).await?;
+        stream
+            .write_all(
+                format!("GET / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n").as_bytes(),
+            )
+            .await?;
+        let mut response = String::new();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            stream.read_to_string(&mut response),
+        )
+        .await??;
+        Ok(response)
+    }
+
+    /// A reconcile that moves a route to another service reaches a real proxy through the
+    /// session's registration, whose 502 page then names the new service.
     #[tokio::test]
     async fn reconciled_route_owners_reach_the_proxy_registration() -> eyre::Result<()> {
-        let directory = tempfile::tempdir()?;
-        let config_path = directory.path().join("micromux.yaml");
-        std::fs::write(&config_path, CONFIG)?;
-        let mut config = micromux::from_str(CONFIG, directory.path(), 0, None, &mut Vec::new())?;
-        config.config_path = Some(config_path.canonicalize()?);
-        let registry = micromux::PortRegistry::at(directory.path().join("registry"));
-        let mut session = micromux::Session::establish(&config, &registry)?;
-        session.set_proxy_port(8080);
-        let mux = Arc::new(micromux::Micromux::with_session(&config, session)?);
         let shutdown = micromux::CancellationToken::new();
+
+        // A proxy of its own, in a private directory
+        let directory = tempfile::tempdir()?;
+        let paths = micromux_proxy::ProxyPaths::in_dir(directory.path().join("proxy"));
+        std::fs::create_dir_all(directory.path().join("proxy"))?;
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let proxy = tokio::spawn(micromux_proxy::serve(
+            micromux_proxy::ServeOptions {
+                paths: paths.clone(),
+                preference: micromux_proxy::PortPreference {
+                    port: 0,
+                    fallback_port: None,
+                },
+                idle_timeout: Duration::from_secs(60),
+            },
+            shutdown.clone(),
+            move |port| {
+                let _ = ready_tx.send(port);
+            },
+        ));
+        let proxy_port = tokio::time::timeout(Duration::from_secs(5), ready_rx).await??;
+
+        // A route port nothing listens on, so the proxy answers with its 502 page
+        let route_port = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await?
+            .local_addr()?
+            .port();
+        let project = directory.path().join("project");
+        std::fs::create_dir_all(&project)?;
+        let config_path = project.join("micromux.yaml");
+        let raw = config(route_port, false);
+        std::fs::write(&config_path, &raw)?;
+        let mut config_file = micromux::from_str(&raw, &project, 0, None, &mut Vec::new())?;
+        config_file.config_path = Some(config_path.canonicalize()?);
+        let registry = micromux::PortRegistry::at(directory.path().join("registry"));
+        let mut session = micromux::Session::establish(&config_file, &registry)?;
+        session.set_proxy_port(proxy_port);
+        let mux = Arc::new(micromux::Micromux::with_session(&config_file, session)?);
         let (runner, handles) = mux.clone().start(shutdown.clone());
         let runner = tokio::spawn(runner);
 
-        // Stand in for the registrar, starting from what the session registered at startup.
-        let (routes, mut registered) =
-            tokio::sync::watch::channel(super::route_targets(mux.routes()));
-        super::follow_route_owners(&handles.session, routes, shutdown.clone());
-        assert_eq!(
-            registered
-                .borrow_and_update()
-                .first()
-                .and_then(|route| route.service.clone()),
-            Some("web".to_string())
-        );
+        // Register the way the CLI does, and follow the session.
+        let registration = super::RouteRegistration {
+            registrar: micromux_proxy::Registrar::start(
+                paths,
+                micromux_proxy::protocol::Registration {
+                    session: mux.session_identity().name.clone(),
+                    session_domain: mux.session_identity().session_domain(),
+                    config_path: config_path.display().to_string(),
+                    pid: std::process::id(),
+                    proxy_port,
+                    routes: super::route_targets(mux.routes()),
+                },
+                proxy_port,
+                None,
+                &shutdown,
+            )
+            .await?,
+        };
+        registration.report_to(handles.session.clone(), shutdown.clone());
+        let host = format!("app.{}", mux.session_identity().session_domain());
+        let before = get(proxy_port, &host).await?;
+        eyre::ensure!(before.contains("<strong>web</strong>"), "{before}");
 
-        // Move port 41001 from `web` to the new `frontend`.
-        std::fs::write(
-            &config_path,
-            CONFIG.replace(
-                "    ports: [41001]\n",
-                "    ports: [41002]\n  frontend:\n    command: [\"sh\", \"-c\", \"sleep 60\"]\n    ports: [41001]\n",
-            ),
-        )?;
+        // Move the route's port from `web` to `frontend`.
+        std::fs::write(&config_path, config(route_port, true))?;
         handles
             .service_control()
             .reconcile_config(false)
@@ -345,17 +405,23 @@ services:
             .map_err(|_| eyre::eyre!("scheduler stopped"))?
             .map_err(|rejection| eyre::eyre!("reconcile rejected: {rejection}"))?;
 
-        // The registration follows with the new owner.
-        tokio::time::timeout(
-            Duration::from_secs(10),
-            registered.wait_for(|routes| {
-                routes.first().and_then(|route| route.service.as_deref()) == Some("frontend")
-            }),
-        )
-        .await??;
+        // The proxy's 502 page follows with the new owner.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let after = get(proxy_port, &host).await?;
+            if after.contains("<strong>frontend</strong>") {
+                break;
+            }
+            eyre::ensure!(
+                tokio::time::Instant::now() < deadline,
+                "the proxy never named the new owner: {after}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
 
         shutdown.cancel();
         runner.await??;
+        proxy.await??;
         Ok(())
     }
 }
