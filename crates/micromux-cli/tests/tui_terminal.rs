@@ -168,12 +168,7 @@ impl Project {
 
     /// Writes the user config micromux reads under this project's home.
     fn write_user_config(&self, config: &str) -> eyre::Result<()> {
-        let path = if cfg!(target_os = "macos") {
-            self.home()
-                .join("Library/Application Support/com.romnn.micromux/config.yaml")
-        } else {
-            self.home().join(".config/micromux/config.yaml")
-        };
+        let path = self.home().join(".config/micromux/config.yaml");
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }

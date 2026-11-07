@@ -100,8 +100,7 @@ Settings that are about you rather than a project live in your user config, `con
 
 | Platform | Path |
 |---|---|
-| Linux | `$XDG_CONFIG_HOME/micromux/config.yaml`, by default `~/.config/micromux/config.yaml` |
-| macOS | `~/Library/Application Support/com.romnn.micromux/config.yaml` |
+| Linux and macOS | `$XDG_CONFIG_HOME/micromux/config.yaml`, by default `~/.config/micromux/config.yaml` |
 | Windows | `%APPDATA%\romnn\micromux\config\config.yaml` |
 
 It uses the same keys as a project's `micromux.yaml`, and holds only the mouse settings for now:

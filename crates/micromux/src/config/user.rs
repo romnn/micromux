@@ -25,13 +25,41 @@ pub struct UserConfig {
     pub copy_on_select: Option<bool>,
 }
 
-/// Where the user config lives: `config.yaml` in the platform's config directory for micromux,
-/// such as `~/.config/micromux/config.yaml` on Linux.
+/// Where the user config lives: `micromux/config.yaml` in `$XDG_CONFIG_HOME`, by default
+/// `~/.config/micromux/config.yaml`, on macOS as on Linux, and in the roaming application data
+/// directory on Windows.
 ///
-/// Returns `None` when the platform has no home directory to put it in.
+/// macOS's `~/Library/Application Support` is passed over because command-line tools keep their
+/// settings under `~/.config` there too, where dotfile managers look for them.
+///
+/// Returns `None` when there is no home directory to put it in.
 #[must_use]
 pub fn user_config_path() -> Option<PathBuf> {
-    crate::project_dir().map(|directories| directories.config_dir().join(USER_CONFIG_FILE_NAME))
+    #[cfg(windows)]
+    {
+        crate::project_dir().map(|directories| directories.config_dir().join(USER_CONFIG_FILE_NAME))
+    }
+    #[cfg(not(windows))]
+    {
+        xdg_user_config_path(
+            std::env::var_os("XDG_CONFIG_HOME"),
+            directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf()),
+        )
+    }
+}
+
+/// The user config's path under `xdg_config_home`, or under `home`'s `.config` when that is
+/// unset, empty or relative, as the XDG base directory specification says.
+#[cfg(any(not(windows), test))]
+fn xdg_user_config_path(
+    xdg_config_home: Option<std::ffi::OsString>,
+    home: Option<PathBuf>,
+) -> Option<PathBuf> {
+    let config_home = xdg_config_home
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .or_else(|| home.map(|home| home.join(".config")))?;
+    Some(config_home.join("micromux").join(USER_CONFIG_FILE_NAME))
 }
 
 /// Parses the text of a user config.
@@ -77,10 +105,33 @@ pub fn parse_user_config<F: Copy>(
 
 #[cfg(test)]
 mod tests {
-    use super::{UserConfig, parse_user_config};
+    use super::{UserConfig, parse_user_config, xdg_user_config_path};
     use color_eyre::eyre;
     use indoc::indoc;
     use similar_asserts::assert_eq;
+    use std::path::PathBuf;
+
+    #[test]
+    fn the_user_config_lives_under_the_xdg_config_home() {
+        let home = Some(PathBuf::from("/home/me"));
+
+        // `$XDG_CONFIG_HOME` decides when it is an absolute path.
+        assert_eq!(
+            xdg_user_config_path(Some("/xdg".into()), home.clone()),
+            Some(PathBuf::from("/xdg/micromux/config.yaml"))
+        );
+
+        // Unset, empty or relative, it falls back to `~/.config`, on macOS as on Linux.
+        for xdg in [None, Some("".into()), Some("relative/config".into())] {
+            assert_eq!(
+                xdg_user_config_path(xdg, home.clone()),
+                Some(PathBuf::from("/home/me/.config/micromux/config.yaml"))
+            );
+        }
+
+        // Without a home directory there is nowhere to look.
+        assert_eq!(xdg_user_config_path(None, None), None);
+    }
 
     #[test]
     fn reads_the_mouse_settings() -> eyre::Result<()> {
