@@ -223,14 +223,16 @@ fn supervisor_death_during_a_stop_does_not_repeat_the_signal() -> eyre::Result<(
     let directory = tempfile::tempdir()?;
     std::fs::write(
         directory.path().join("graceful.sh"),
-        r"trap 'echo int >> interrupts' INT
+        // The service takes a moment to wind down after the interrupt, and the grace period is long,
+        // so the stop is still in progress when the supervisor dies, however slow the machine.
+        r"trap 'echo int >> interrupts; sleep 1; exit 0' INT
 echo $$ > svc.pid
 while :; do sleep 0.05; done
 ",
     )?;
     std::fs::write(
         directory.path().join("micromux.yaml"),
-        "version: 1\nservices:\n  svc:\n    command: [\"sh\", \"./graceful.sh\"]\n    stop_signal: SIGINT\n    stop_grace_period: 2s\n",
+        "version: 1\nservices:\n  svc:\n    command: [\"sh\", \"./graceful.sh\"]\n    stop_signal: SIGINT\n    stop_grace_period: 60s\n",
     )?;
     let mut supervisor = serve(Path::new(MICROMUX), directory.path())?;
     let pids = read_pids(directory.path(), &["svc.pid"], &mut supervisor)?;
