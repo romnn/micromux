@@ -29,7 +29,10 @@ mod server;
 mod test_ports;
 
 #[cfg(unix)]
-pub use client::{ClientError, ProxyLauncher, Registrar, RegistrationStatus, ensure_proxy};
+pub use client::{
+    ClientError, OUTDATED_PROXY_WAIT, ProxyLauncher, Registrar, RegistrationStatus,
+    WAITING_FOR_OUTDATED_PROXY, ensure_proxy,
+};
 #[cfg(unix)]
 pub use listen::{BindError, PortPreference};
 #[cfg(unix)]
