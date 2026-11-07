@@ -508,6 +508,7 @@ impl App {
                     ) => break,
                 }
             }
+            terminal::set_keyboard_protocol(!self.pty_input_mode)?;
             #[cfg(unix)]
             if self.apply_effects(&mut terminal)? {
                 self.suspend(&mut terminal, &mut continued).await?;
@@ -616,7 +617,7 @@ impl App {
     fn take_terminal_again(&mut self, terminal: &mut DefaultTerminal) -> Result<(), Error> {
         use crossterm::terminal::{Clear, ClearType};
 
-        terminal::take_over(self.mouse.capture)?;
+        terminal::take_over(self.mouse.capture, !self.pty_input_mode)?;
         // A new terminal forgets what was drawn; ratatui's own `clear` would ask the terminal
         // where its cursor is, an answer the input reader takes first.
         *terminal =
@@ -1204,7 +1205,7 @@ fn open_url(url: &str) -> std::io::Result<()> {
 fn is_copy_chord(key: crossterm::event::KeyEvent) -> bool {
     use crossterm::event::{KeyCode, KeyModifiers};
 
-    // With alternate keys reported, the terminal sends the shifted key and no Shift.
+    // A terminal that reports the shifted key sends it without Shift.
     let (code, modifiers) = match key.code {
         KeyCode::Char(c) if c.is_ascii_uppercase() => (
             KeyCode::Char(c.to_ascii_lowercase()),
@@ -1222,9 +1223,9 @@ fn is_copy_chord(key: crossterm::event::KeyEvent) -> bool {
 /// The bytes a terminal without the kitty keyboard protocol sends for `code` with `modifiers`,
 /// as xterm does, which is what a service in PTY input mode expects to read.
 ///
-/// micromux may have asked its own terminal for the kitty protocol, which reports keys such as
-/// Ctrl+Shift+C or Alt+Shift+A apart; this folds them back into the legacy bytes. Super and the
-/// other modifiers legacy terminals cannot send are left out.
+/// PTY input mode turns the kitty protocol off, but keys typed before the terminal saw that may
+/// still come reported apart, such as Ctrl+Shift+C or Alt+Shift+A; this folds them back into the
+/// legacy bytes. Super and the other modifiers legacy terminals cannot send are left out.
 fn key_event_to_bytes(
     code: crossterm::event::KeyCode,
     modifiers: crossterm::event::KeyModifiers,
@@ -1296,7 +1297,9 @@ fn key_event_to_bytes(
             control_byte(c).map_or_else(|| c.to_string().into_bytes(), |byte| vec![byte])
         }
         // The kitty protocol reports Alt+Shift+A as a lowercase `a` with Shift.
-        KeyCode::Char(c) if shift => c.to_uppercase().to_string().into_bytes(),
+        KeyCode::Char(c) if shift && c.is_ascii_lowercase() => {
+            c.to_ascii_uppercase().to_string().into_bytes()
+        }
         KeyCode::Char(c) => c.to_string().into_bytes(),
         _ => return None,
     };
@@ -1496,50 +1499,6 @@ mod tests {
         app.ctrl_c(now + Duration::from_millis(4500));
         assert!(!app.running);
         assert!(shutdown.is_cancelled());
-        Ok(())
-    }
-
-    /// In PTY input mode Ctrl-C and the copy chords belong to the service: none prompts, quits
-    /// nor copies.
-    #[tokio::test]
-    async fn ctrl_c_and_copy_chords_go_to_the_service_in_pty_input_mode() -> eyre::Result<()> {
-        let mut diagnostics = Vec::new();
-        let parsed = micromux::from_str(
-            "version: 1\nservices:\n  svc:\n    command: [\"sleep\", \"30\"]\n",
-            Path::new("."),
-            0usize,
-            None,
-            &mut diagnostics,
-        )?;
-        let mux = std::sync::Arc::new(micromux::Micromux::new(&parsed)?);
-        let shutdown = micromux::CancellationToken::new();
-        let (_runner, handles) = mux.start(shutdown.clone());
-        let mut app = App::new(
-            SessionSource::Local(LocalSource::new(handles.reader, handles.commands.clone())),
-            Some(handles.terminal.clone()),
-            shutdown.clone(),
-            ViewOptions::default(),
-        );
-        let key = |code, modifiers| KeyEvent {
-            code,
-            modifiers,
-            kind: KeyEventKind::Press,
-            state: KeyEventState::NONE,
-        };
-        app.handle_key_press(key(KeyCode::Char('a'), KeyModifiers::NONE));
-        assert!(app.pty_input_mode);
-        for _ in 0..2 {
-            app.handle_key_press(key(KeyCode::Char('c'), KeyModifiers::CONTROL));
-            app.handle_key_press(key(
-                KeyCode::Char('c'),
-                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
-            ));
-            app.handle_key_press(key(KeyCode::Insert, KeyModifiers::CONTROL));
-            app.handle_key_press(key(KeyCode::Char('c'), KeyModifiers::SUPER));
-        }
-        assert!(app.running);
-        assert_eq!(app.quit_prompt_at, None);
-        assert_eq!(app.effects, Vec::new());
         Ok(())
     }
 

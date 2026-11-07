@@ -2,7 +2,8 @@
 //! alike.
 //!
 //! While the TUI shows, the terminal is in raw mode on its alternate screen with bracketed paste,
-//! the kitty keyboard protocol where the terminal has it, and, when enabled, mouse capture.
+//! outside PTY input mode the kitty keyboard protocol where the terminal has it, and, when
+//! enabled, mouse capture.
 //! Each mode is marked before it is switched on, so [`give_back`] undoes exactly what is on,
 //! however far taking the terminal over got, and only once.
 
@@ -32,15 +33,14 @@ static SCREEN: AtomicBool = AtomicBool::new(false);
 /// Whether the terminal reports the mouse.
 static MOUSE: AtomicBool = AtomicBool::new(false);
 
-/// Whether the TUI pushed kitty keyboard flags onto the alternate screen's stack.
+/// Whether the TUI pushed its kitty keyboard flags onto the alternate screen's stack, which it
+/// does once at most, so a single pop takes them off.
 static KEYBOARD: AtomicBool = AtomicBool::new(false);
 
 /// What the TUI asks of the kitty keyboard protocol: Ctrl+Shift+C reported apart from Ctrl-C and
-/// Super+C reported at all, so the terminals' copy shortcuts arrive, and the shifted key with
-/// Shift, so a service in PTY input mode still gets the legacy bytes for Alt+Shift+.
+/// Super+C reported at all, so the terminals' copy shortcuts arrive.
 const KEYBOARD_FLAGS: KeyboardEnhancementFlags =
-    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-        .union(KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS);
+    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES;
 
 /// Whether the terminal has the kitty keyboard protocol.
 ///
@@ -75,31 +75,56 @@ impl crossterm::Command for EnableButtonMouseCapture {
 }
 
 /// Takes the terminal over: raw mode, the alternate screen, bracketed paste, the kitty keyboard
-/// protocol where the terminal has it, and mouse capture when `mouse` is set.
+/// protocol when `keyboard` is set and the terminal has it, and mouse capture when `mouse` is
+/// set.
 ///
 /// It also takes the terminal again after a suspend, setting every mode anew, since the shell
 /// may have put its own modes back meanwhile.
-pub(crate) fn take_over(mouse: bool) -> io::Result<()> {
+pub(crate) fn take_over(mouse: bool, keyboard: bool) -> io::Result<()> {
     let mut stdout = io::stdout();
     // crossterm counts raw mode as on even when a shell turned it off during a suspend.
     if RAW.swap(true, Ordering::SeqCst) {
         disable_raw_mode()?;
     }
     enable_raw_mode()?;
-    let keyboard = has_keyboard_protocol();
+    // Asked before anything else, so the reader is not running yet.
+    has_keyboard_protocol();
     SCREEN.store(true, Ordering::SeqCst);
     execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
-    // The main and alternate screens keep separate flag stacks, so the flags go onto the
-    // alternate screen's and come off before leaving it.
-    if keyboard {
-        KEYBOARD.store(true, Ordering::SeqCst);
-        execute!(stdout, PushKeyboardEnhancementFlags(KEYBOARD_FLAGS))?;
-    }
+    set_keyboard_protocol_on(&mut stdout, keyboard, has_keyboard_protocol())?;
     if mouse {
         MOUSE.store(true, Ordering::SeqCst);
         execute!(stdout, EnableButtonMouseCapture)?;
     }
     Ok(())
+}
+
+/// Turns the kitty keyboard protocol on or off while the TUI shows, where the terminal has it.
+///
+/// PTY input mode turns it off, so the terminal itself sends a service's keys as it would without
+/// micromux.
+pub(crate) fn set_keyboard_protocol(enabled: bool) -> io::Result<()> {
+    set_keyboard_protocol_on(&mut io::stdout(), enabled, has_keyboard_protocol())
+}
+
+fn set_keyboard_protocol_on(
+    out: &mut impl Write,
+    enabled: bool,
+    supported: bool,
+) -> io::Result<()> {
+    // The main and alternate screens keep separate flag stacks, so the flags only go onto the
+    // alternate screen's, and come off before leaving it.
+    if !supported || !SCREEN.load(Ordering::SeqCst) {
+        return Ok(());
+    }
+    if KEYBOARD.swap(enabled, Ordering::SeqCst) == enabled {
+        return Ok(());
+    }
+    if enabled {
+        execute!(out, PushKeyboardEnhancementFlags(KEYBOARD_FLAGS))
+    } else {
+        execute!(out, PopKeyboardEnhancementFlags)
+    }
 }
 
 /// Turns mouse capture on or off while the TUI shows.
@@ -224,7 +249,9 @@ impl Continued {
 
 #[cfg(test)]
 mod tests {
-    use super::{KEYBOARD, MOUSE, RAW, SCREEN, give_back_on, set_mouse_capture_on};
+    use super::{
+        KEYBOARD, MOUSE, RAW, SCREEN, give_back_on, set_keyboard_protocol_on, set_mouse_capture_on,
+    };
     use color_eyre::eyre;
     use similar_asserts::assert_eq;
     use std::sync::atomic::Ordering;
@@ -233,6 +260,7 @@ mod tests {
     const MOUSE_ON: &str = "\x1b[?1000h\x1b[?1002h\x1b[?1006h";
     const LEAVE_SCREEN: &str = "\x1b[?1049l";
     const KEYBOARD_POP: &str = "\x1b[<1u";
+    const KEYBOARD_PUSH: &str = "\x1b[>1u";
 
     fn written(out: &[u8]) -> String {
         String::from_utf8_lossy(out).into_owned()
@@ -290,6 +318,33 @@ mod tests {
         set_mouse_capture_on(&mut out, true)?;
         assert_eq!(written(&out), MOUSE_ON);
         MOUSE.store(false, Ordering::SeqCst);
+
+        // The keyboard flags go on once however often they are asked for, as when the terminal
+        // is taken again without having been given back, so the one pop on the way out leaves
+        // the stack as it was; leaving PTY input mode and entering it again push and pop them.
+        SCREEN.store(true, Ordering::SeqCst);
+        let mut out = Vec::new();
+        set_keyboard_protocol_on(&mut out, true, true)?;
+        set_keyboard_protocol_on(&mut out, true, true)?;
+        set_keyboard_protocol_on(&mut out, false, true)?;
+        set_keyboard_protocol_on(&mut out, false, true)?;
+        set_keyboard_protocol_on(&mut out, true, true)?;
+        give_back_on(&mut out, || Ok(()))?;
+        assert_eq!(
+            written(&out),
+            format!(
+                "{KEYBOARD_PUSH}{KEYBOARD_POP}{KEYBOARD_PUSH}{KEYBOARD_POP}\x1b[?2004l\x1b[?1049l\x1b[?25h"
+            )
+        );
+
+        // Without the protocol, or off the alternate screen, nothing goes out.
+        let mut out = Vec::new();
+        SCREEN.store(true, Ordering::SeqCst);
+        set_keyboard_protocol_on(&mut out, true, false)?;
+        SCREEN.store(false, Ordering::SeqCst);
+        set_keyboard_protocol_on(&mut out, true, true)?;
+        assert!(out.is_empty(), "{:?}", written(&out));
+        assert!(!KEYBOARD.load(Ordering::SeqCst));
         Ok(())
     }
 }

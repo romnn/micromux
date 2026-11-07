@@ -21,7 +21,7 @@ const WAIT: Duration = Duration::from_secs(30);
 const MOUSE_ON: &[u8] = b"\x1b[?1000h";
 
 /// The sequences that push and pop micromux's kitty keyboard flags.
-const KEYBOARD_PUSH: &[u8] = b"\x1b[>5u";
+const KEYBOARD_PUSH: &[u8] = b"\x1b[>1u";
 const KEYBOARD_POP: &[u8] = b"\x1b[<1u";
 
 /// The terminal's queries for its kitty keyboard flags and its primary device attributes.
@@ -356,6 +356,26 @@ fn mouse_capture_is_released_by_the_toggle_a_suspend_and_quitting() -> eyre::Res
 
     copy_hello_and_survive_a_ctrl_c(&mut tui)?;
 
+    // PTY input mode pops the keyboard flags, so the terminal sends the service its keys as
+    // without micromux, and leaving it, here with a click on its hint, pushes them again.
+    tui.send(b"a")?;
+    tui.wait_until("PTY input mode to pop the flags", |_, written| {
+        position(written, KEYBOARD_POP).is_some()
+    })?;
+    tui.wait_until("the exit hint", |screen, _| {
+        screen.contents().contains("Alt+Esc Exit")
+    })?;
+    let exit = find(tui.parser.screen(), "Alt+Esc Exit")?;
+    tui.send(&mouse_report(0, exit, true))?;
+    tui.send(&mouse_report(0, exit, false))?;
+    tui.wait_until("leaving PTY input mode to push them again", |_, written| {
+        written
+            .windows(KEYBOARD_PUSH.len())
+            .filter(|window| *window == KEYBOARD_PUSH)
+            .count()
+            == 2
+    })?;
+
     // The toggle releases the mouse and takes it again.
     tui.send(b"m")?;
     tui.wait_until("capture to go off", |screen, _| {
@@ -394,6 +414,21 @@ fn mouse_capture_is_released_by_the_toggle_a_suspend_and_quitting() -> eyre::Res
         },
     )?;
 
+    // A continue signal without a stop, as `kill -CONT` sends, takes the terminal over afresh
+    // without pushing the keyboard flags a second time.
+    let pid = tui
+        .child
+        .process_id()
+        .ok_or_else(|| eyre::eyre!("micromux has no process id"))?;
+    let before = tui.written.len();
+    let status = std::process::Command::new("kill")
+        .args(["-CONT", &pid.to_string()])
+        .status()?;
+    eyre::ensure!(status.success(), "kill -CONT failed");
+    tui.wait_until("the terminal to be taken over afresh", |_, written| {
+        contains(written.get(before..).unwrap_or_default(), b"\x1b[2J")
+    })?;
+
     // Two Ctrl-C in a row quit, releasing the mouse, the keyboard flags and the alternate
     // screen.
     let before = tui.written.len();
@@ -410,6 +445,8 @@ fn mouse_capture_is_released_by_the_toggle_a_suspend_and_quitting() -> eyre::Res
         "{:?}",
         String::from_utf8_lossy(after)
     );
+    // Every push came off again.
+    assert_eq!(tui.count(KEYBOARD_PUSH), tui.count(KEYBOARD_POP));
     Ok(())
 }
 
@@ -448,7 +485,7 @@ fn the_mouse_setting_follows_the_flag_then_the_project_then_the_user() -> eyre::
 }
 
 /// In a shell with job control, Ctrl-Z stops micromux with the terminal given back, and `fg`
-/// brings the TUI back with the mouse captured again.
+/// brings the TUI back with the mouse captured and the keyboard flags pushed again.
 ///
 /// micromux runs under a wrapper, as under `cargo run` or a task runner, which must stop with it
 /// for the shell to see the job stop.
@@ -462,6 +499,7 @@ fn ctrl_z_suspends_to_the_shell_and_fg_resumes() -> eyre::Result<()> {
     let mut command = project.command(bash, &["--norc", "--noprofile", "-i"]);
     command.env("PS1", "shell$ ");
     let mut shell = Terminal::spawn(command)?;
+    shell.keyboard_protocol = true;
     shell.wait_until("the prompt", |screen, _| {
         screen.contents().contains("shell$")
     })?;
@@ -493,6 +531,10 @@ fn ctrl_z_suspends_to_the_shell_and_fg_resumes() -> eyre::Result<()> {
             && screen.mouse_protocol_mode() == MouseProtocolMode::None
             && screen.contents().contains("wrapper-done")
     })?;
+    // However the wake after `fg` raced the suspend's own, the keyboard flags came off as often
+    // as they went on.
+    assert_eq!(shell.count(KEYBOARD_PUSH), 2);
+    assert_eq!(shell.count(KEYBOARD_POP), 2);
     shell.send(b"exit\r")?;
     Ok(())
 }

@@ -1225,16 +1225,37 @@ async fn a_right_click_copies_in_the_healthcheck_pane_and_popups() -> eyre::Resu
     Ok(())
 }
 
-/// In PTY input mode the right button copies nothing.
+/// In PTY input mode the keys belong to the service, so with text selected neither the copy
+/// shortcuts nor a right-click copy, and Ctrl-C neither prompts nor quits.
 #[tokio::test]
-async fn a_right_click_copies_nothing_in_pty_input_mode() -> eyre::Result<()> {
+async fn nothing_copies_or_quits_in_pty_input_mode() -> eyre::Result<()> {
     let mut app = app(SERVICES)?;
     set_logs(&mut app, numbered(5))?;
     let frame = draw(&mut app);
     let line = find(&frame, "line 2 of")?;
     drag(&mut app, line, &[Position::new(line.x + 5, line.y)]);
-    app.pty_input_mode = true;
-    right_click(&mut app, line);
+    assert!(app.has_selection());
+    press_key(&mut app, KeyCode::Char('a'));
+    assert!(app.pty_input_mode);
+    for _ in 0..2 {
+        for (code, modifiers) in [
+            (KeyCode::Char('c'), KeyModifiers::CONTROL),
+            (
+                KeyCode::Char('c'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            ),
+            (KeyCode::Insert, KeyModifiers::CONTROL),
+            (KeyCode::Char('c'), KeyModifiers::SUPER),
+            (KeyCode::Char('y'), KeyModifiers::NONE),
+            (KeyCode::Enter, KeyModifiers::NONE),
+        ] {
+            key_with(&mut app, code, modifiers);
+        }
+        right_click(&mut app, line);
+    }
     assert_eq!(copied(&mut app), Vec::<String>::new());
+    assert!(app.has_selection());
+    assert_eq!(app.quit_prompt_at, None);
+    assert!(app.running);
     Ok(())
 }
