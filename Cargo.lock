@@ -1633,6 +1633,7 @@ dependencies = [
  "fs2",
  "micromux",
  "micromux-control",
+ "micromux-proxy",
  "nix 0.31.3",
  "regex",
  "rmcp",

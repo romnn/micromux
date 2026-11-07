@@ -44,12 +44,16 @@ tracing.workspace = true
 # Confirm a stopped session's process is gone (safe `kill(pid, 0)` wrapper).
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true, features = ["signal"] }
+# How long a starting session may wait for an outdated proxy, and how it says so.
+micromux-proxy = { path = "../micromux-proxy/" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 rustix = { workspace = true, features = ["process"] }
 
 [dev-dependencies]
 similar-asserts.workspace = true
+# Paused clocks for tests of the session start deadline.
+tokio = { workspace = true, features = ["test-util"] }
 color-eyre.workspace = true
 tempfile.workspace = true
 fs2 = "0.4"

@@ -36,7 +36,12 @@ const MAX_ERROR_OUTPUT: u64 = 16 * 1024;
 /// An outdated proxy that no session uses exits within its idle timeout.
 /// The lease covers a session that went away without closing its connection, which the proxy
 /// only notices once the lease runs out, and leaves room for the proxy's idle check and shutdown.
-const OUTDATED_PROXY_WAIT: Duration = IDLE_TIMEOUT.saturating_add(LEASE_TIMEOUT);
+pub const OUTDATED_PROXY_WAIT: Duration = IDLE_TIMEOUT.saturating_add(LEASE_TIMEOUT);
+
+/// How the description [`Registrar::start`] passes to `on_wait` begins while the session waits
+/// for an outdated proxy to exit, for a caller that only sees that description as text, such as
+/// the process that started the session and reads its stderr.
+pub const WAITING_FOR_OUTDATED_PROXY: &str = "waiting for the outdated proxy";
 
 /// How often a session checks whether an outdated proxy has exited.
 const OUTDATED_PROXY_POLL: Duration = Duration::from_millis(250);
@@ -388,9 +393,7 @@ async fn register(
                 required,
                 "waiting for an outdated proxy to exit"
             );
-            on_wait(&format!(
-                "waiting for the outdated proxy (pid {pid}) to exit"
-            ));
+            on_wait(&format!("{WAITING_FOR_OUTDATED_PROXY} (pid {pid}) to exit"));
         }
         let deadline = *outdated_proxies
             .deadline

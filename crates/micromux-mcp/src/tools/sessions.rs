@@ -172,6 +172,32 @@ pub(crate) fn remove_captured_stderr(path: &Path) {
     let _ = std::fs::remove_file(path);
 }
 
+/// How long `start_session` gives a spawned session from the moment its captured stderr says it
+/// waits for an outdated proxy to exit, or `None` while it does not say so.
+///
+/// The session gives up on that proxy within [`micromux_proxy::OUTDATED_PROXY_WAIT`], and then
+/// starts like any other, so a start that is still progressing never runs out of time.
+#[cfg(unix)]
+pub(crate) fn outdated_proxy_start_budget(stderr_path: &Path) -> Option<Duration> {
+    use std::io::Read as _;
+
+    // The session reports the wait before it starts any service, so it is near the start.
+    const STDERR_HEAD: u64 = 64 * 1024;
+    let mut head = Vec::new();
+    std::fs::File::open(stderr_path)
+        .and_then(|file| file.take(STDERR_HEAD).read_to_end(&mut head))
+        .ok()?;
+    String::from_utf8_lossy(&head)
+        .contains(micromux_proxy::WAITING_FOR_OUTDATED_PROXY)
+        .then_some(micromux_proxy::OUTDATED_PROXY_WAIT.saturating_add(START_READY_TIMEOUT))
+}
+
+/// Sessions only start on Unix, where the proxy exists.
+#[cfg(not(unix))]
+pub(crate) fn outdated_proxy_start_budget(_stderr_path: &Path) -> Option<Duration> {
+    None
+}
+
 pub(crate) fn start_failure_message(base: &str, stderr_path: &Path) -> String {
     const STDERR_TAIL: u64 = 4 * 1024;
     const MAX_MESSAGE: usize = 6 * 1024;
@@ -317,6 +343,39 @@ mod tests {
     // assert the tool error quotes its stderr) is deliberately absent: `spawn_detached_serve`
     // execs `current_exe()`, which under `cargo test` is the test binary, not micromux. The
     // message shaping below is the unit-testable half; the spawn path is covered manually.
+
+    /// The line a spawned session prints while it waits for an outdated proxy earns it that wait
+    /// plus an ordinary start, while other output, or a stderr capture that is gone, earns
+    /// nothing.
+    #[cfg(unix)]
+    #[test]
+    fn the_outdated_proxy_wait_line_earns_its_budget() -> std::io::Result<()> {
+        use similar_asserts::assert_eq;
+
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("serve.stderr");
+        assert_eq!(outdated_proxy_start_budget(&path), None);
+
+        std::fs::write(
+            &path,
+            "waiting for the cleanup of infra from the previous session\n",
+        )?;
+        assert_eq!(outdated_proxy_start_budget(&path), None);
+
+        // The line the session prints while it waits
+        std::fs::write(
+            &path,
+            format!(
+                "{} (pid 4242) to exit\n",
+                micromux_proxy::WAITING_FOR_OUTDATED_PROXY
+            ),
+        )?;
+        assert_eq!(
+            outdated_proxy_start_budget(&path),
+            Some(micromux_proxy::OUTDATED_PROXY_WAIT + START_READY_TIMEOUT)
+        );
+        Ok(())
+    }
 
     #[test]
     fn startup_failure_includes_bounded_ansi_free_stderr_tail() -> std::io::Result<()> {
