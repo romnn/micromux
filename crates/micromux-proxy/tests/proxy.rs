@@ -386,9 +386,17 @@ async fn replaced_routes_take_effect_on_the_live_registration() -> eyre::Result<
 }
 
 /// A session's routes vanish with its registration, and the proxy exits once it has been idle.
-#[tokio::test]
+///
+/// The runtime's clock is paused, so a slow machine cannot run the idle timeout out before the
+/// session registers.
+/// Whenever every task waits, the paused clock jumps to the next timer, and the proxy's idle
+/// tick of at most a second bounds each jump.
+/// A one-minute idle timeout therefore leaves the registration handshake dozens of round trips,
+/// while the test still finishes in milliseconds.
+#[tokio::test(start_paused = true)]
 async fn routes_end_with_the_registration_and_the_proxy_exits_when_idle() -> eyre::Result<()> {
-    let proxy = start_proxy(Duration::from_millis(300)).await?;
+    const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+    let proxy = start_proxy(IDLE_TIMEOUT).await?;
     let upstream = TcpListener::bind(("127.0.0.1", 0)).await?;
     let registrar = Registrar::start(
         proxy.paths.clone(),
@@ -400,12 +408,12 @@ async fn routes_end_with_the_registration_and_the_proxy_exits_when_idle() -> eyr
     .await?;
 
     // A registered session keeps the proxy alive past its idle timeout.
-    tokio::time::sleep(Duration::from_millis(600)).await;
+    tokio::time::sleep(IDLE_TIMEOUT * 2).await;
     assert!(!proxy.task.is_finished());
 
     drop(registrar);
     // The proxy notices the closed connection and later exits on its own.
-    tokio::time::timeout(Duration::from_secs(5), proxy.task).await???;
+    tokio::time::timeout(IDLE_TIMEOUT * 5, proxy.task).await???;
     assert!(!proxy.paths.socket.exists());
     Ok(())
 }

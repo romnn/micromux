@@ -3416,23 +3416,6 @@ mod escaped_descendants {
         Ok(fs::read_to_string(&pid_file)?.trim().parse()?)
     }
 
-    /// Polls until the pid no longer names a process; SIGKILL delivery and the
-    /// subsequent reap by init are asynchronous.
-    async fn wait_until_gone(pid: i32) -> bool {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-        loop {
-            if nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None)
-                == Err(nix::errno::Errno::ESRCH)
-            {
-                return true;
-            }
-            if tokio::time::Instant::now() >= deadline {
-                return false;
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-    }
-
     fn kill_best_effort(pid: i32) {
         let _ = nix::sys::signal::kill(
             nix::unistd::Pid::from_raw(pid),
@@ -5166,6 +5149,40 @@ fn pid_from(path: &Path) -> eyre::Result<i32> {
     Ok(fs::read_to_string(path)?.trim().parse()?)
 }
 
+/// Polls until the pid no longer names a running process; SIGKILL delivery and the
+/// subsequent reap by init are asynchronous.
+///
+/// A zombie counts as gone where the platform can tell, so the wait depends only on the
+/// target handling its own SIGKILL, never on whoever inherited it getting around to reaping.
+async fn wait_until_gone(pid: i32) -> bool {
+    let gone = || {
+        if nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None)
+            == Err(nix::errno::Errno::ESRCH)
+        {
+            return true;
+        }
+        // Elsewhere `stamp` cannot inspect processes and reports every pid as gone.
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            u32::try_from(pid).is_ok_and(|pid| crate::process_tree::stamp(pid).is_none())
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            false
+        }
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        if gone() {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
 /// Disabling a service runs its cleanup after the process exits and before the service is
 /// reported stopped: in the service's environment and working directory, with its output in the
 /// run's log and in the cleanup log.
@@ -5409,10 +5426,6 @@ async fn failing_cleanups_are_reported_and_do_not_block_a_restart() -> eyre::Res
 /// started, and reported as timed out.
 #[tokio::test]
 async fn cleanups_past_their_timeout_are_killed() -> eyre::Result<()> {
-    use nix::errno::Errno;
-    use nix::sys::signal::kill;
-    use nix::unistd::Pid;
-
     let dir = tempfile::tempdir()?;
     let state = tempfile::tempdir()?;
     let service = service_with_cleanup(
@@ -5446,11 +5459,13 @@ async fn cleanups_past_their_timeout_are_killed() -> eyre::Result<()> {
             timed_out: true,
         })
     );
+    // The group's SIGKILL lands asynchronously, so the backgrounded sleep, which is not
+    // the supervisor's child, may still run for a moment after the run reports `Exited`.
+    // An unkilled sleep would outlive the wait by a minute.
     for name in ["cleanup.pid", "child.pid"] {
         let pid = pid_from(&dir.path().join(name))?;
-        assert_eq!(
-            kill(Pid::from_raw(pid), None),
-            Err(Errno::ESRCH),
+        assert!(
+            wait_until_gone(pid).await,
             "{name} survived its cleanup's timeout"
         );
     }
