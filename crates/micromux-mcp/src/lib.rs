@@ -2929,9 +2929,20 @@ impl McpServer {
                 kind: EnsureActionKind::EnabledService,
                 detail: format!("enabled service from generation {generation}"),
             });
-            // Enabling a job does not start a run; it returns to its outcome or is scheduled anew.
-            (!job).then_some(generation)
-        } else if snapshot.manual && snapshot.execution == Execution::Pending {
+            if job {
+                // Enabling a job does not start a run: it returns to its outcome, or is pending
+                // again, which a manual job leaves to the request below.
+                snapshot = service_snapshot(&mut conn, &args.service)
+                    .await
+                    .map_err(error_data)?;
+                None
+            } else {
+                Some(generation)
+            }
+        } else {
+            None
+        };
+        let after_generation = if snapshot.manual && snapshot.execution == Execution::Pending {
             // Naming a manual job that has not run asks for it to run.
             let response = conn
                 .request(Request::Restart {
@@ -2956,7 +2967,7 @@ impl McpServer {
             });
             Some(generation)
         } else {
-            None
+            after_generation
         };
         let conclusion = match wait_for_health(
             &resolved.endpoint,

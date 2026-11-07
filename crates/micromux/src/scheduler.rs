@@ -700,9 +700,10 @@ pub(super) fn project_snapshot(
             Execution::Completed
         }
         (crate::ServiceKind::Job, Execution::Exited, Some(exit_code))
-            if runtime.desired == DesiredState::Disabled
-                || (!runtime.start_requested
-                    && !runtime.will_auto_restart(&service.spec.restart, exit_code)) =>
+            if !runtime.last_run_stopped
+                && (runtime.desired == DesiredState::Disabled
+                    || (!runtime.start_requested
+                        && !runtime.will_auto_restart(&service.spec.restart, exit_code))) =>
         {
             Execution::Failed
         }

@@ -71,7 +71,8 @@ pub fn evaluate(
             if let Some(failure) = &snapshot.dependency_failure {
                 return Some(WaitVerdict::DependencyFailed(failure.clone()));
             }
-            if !ready {
+            // A pending manual job waits for a request, at any generation.
+            if !ready || (snapshot.manual && snapshot.execution == Execution::Pending) {
                 return idle.then_some(WaitVerdict::Idle);
             }
             match snapshot.execution {
@@ -391,6 +392,12 @@ mod tests {
         for wait_for in [WaitFor::Healthy, WaitFor::Exit] {
             assert_eq!(evaluate(&manual, wait_for, None), Some(WaitVerdict::Idle));
         }
+        // So does one that micromux interrupted after an earlier run.
+        manual.run_generation = 1;
+        assert_eq!(
+            evaluate(&manual, WaitFor::Healthy, None),
+            Some(WaitVerdict::Idle)
+        );
         // Once it was asked to run, it waits.
         manual.execution = Execution::Blocked;
         assert_eq!(evaluate(&manual, WaitFor::Healthy, None), None);
