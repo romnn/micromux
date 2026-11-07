@@ -449,21 +449,16 @@ fn lock_registry(path: &Path, timeout: Duration) -> Result<RegistryLock, Session
     let file = open_lock_file(path, true)
         .map_err(io)?
         .ok_or_else(|| io(std::io::ErrorKind::NotFound.into()))?;
-    let mut holder = lock_holder(path);
-    let mut deadline = Instant::now() + timeout;
+    let mut wait = LockWait::new(lock_holder(path), Instant::now(), timeout);
     loop {
         match file.try_lock() {
             Ok(()) => break,
             Err(TryLockError::WouldBlock) => {
-                let current = lock_holder(path);
-                if current != holder {
-                    holder = current;
-                    deadline = Instant::now() + timeout;
-                } else if Instant::now() >= deadline {
+                if wait.expired(lock_holder(path), Instant::now()) {
                     return Err(SessionError::RegistryLocked {
                         path: path.to_path_buf(),
                         waited: timeout,
-                        holder,
+                        holder: wait.holder,
                     });
                 }
                 std::thread::sleep(REGISTRY_LOCK_POLL_INTERVAL);
@@ -476,6 +471,34 @@ fn lock_registry(path: &Path, timeout: Duration) -> Result<RegistryLock, Session
         .set_len(0)
         .and_then(|()| (&file).write_all(std::process::id().to_string().as_bytes()));
     Ok(RegistryLock(file))
+}
+
+/// When a session waiting for the registry lock gives up: once one holder kept it for `timeout`.
+struct LockWait {
+    timeout: Duration,
+    /// The holder last seen, by the pid it recorded.
+    holder: Option<u32>,
+    deadline: Instant,
+}
+
+impl LockWait {
+    fn new(holder: Option<u32>, now: Instant, timeout: Duration) -> Self {
+        Self {
+            timeout,
+            holder,
+            deadline: now + timeout,
+        }
+    }
+
+    /// Records the holder seen at `now`, and returns whether the session should give up.
+    fn expired(&mut self, holder: Option<u32>, now: Instant) -> bool {
+        if holder != self.holder {
+            self.holder = holder;
+            self.deadline = now + self.timeout;
+            return false;
+        }
+        now >= self.deadline
+    }
 }
 
 /// The pid the holder of the registry lock at `path` recorded, if it can be read.
@@ -1033,48 +1056,24 @@ mod tests {
     }
 
     /// A session queuing behind several holders in turn keeps waiting past the timeout as long as
-    /// the lock changes hands, and gets it once the last holder releases it.
-    #[cfg(unix)]
+    /// the lock changes hands, and gives up once one holder keeps it for the whole timeout.
     #[test]
-    fn a_registry_lock_changing_hands_extends_the_wait() -> eyre::Result<()> {
-        let directory = tempfile::tempdir()?;
-        let timeout = Duration::from_millis(300);
-        let registry = PortRegistry {
-            lock_timeout: timeout,
-            ..PortRegistry::ignoring_host_listeners(directory.path())
-        };
-        let lock_path = directory.path().join(REGISTRY_LOCK);
-        let held = lock_registry(&lock_path, Duration::ZERO)?;
-        // Each new pid stands in for the next session taking the lock, well within the timeout
-        // of the one before, and the last releases it after more than twice the timeout.
-        let handover = std::thread::spawn({
-            let lock_path = lock_path.clone();
-            move || -> std::io::Result<()> {
-                for pid in ["1", "2", "3"] {
-                    std::thread::sleep(Duration::from_millis(200));
-                    std::fs::write(&lock_path, pid)?;
-                }
-                std::thread::sleep(Duration::from_millis(200));
-                drop(held);
-                Ok(())
-            }
-        });
+    fn a_registry_lock_changing_hands_extends_the_wait() {
+        let timeout = Duration::from_secs(5);
+        let start = Instant::now();
+        let at = |seconds| start + Duration::from_secs(seconds);
+        let mut wait = LockWait::new(Some(1), start, timeout);
 
-        let started = Instant::now();
-        let result = registry.acquire(
-            Path::new("/projects/one/micromux.yaml"),
-            "one",
-            &names(&["A"]),
-            &[],
-            &DEFAULT_PORT_RANGE,
-        );
-        handover
-            .join()
-            .map_err(|_| eyre::eyre!("the handover thread panicked"))??;
+        // Each new holder, and the moment between two holders, restarts the timeout.
+        assert!(!wait.expired(Some(1), at(4)));
+        assert!(!wait.expired(None, at(4)));
+        assert!(!wait.expired(Some(2), at(8)));
+        assert!(!wait.expired(Some(3), at(12)));
 
-        assert!(result.is_ok(), "{result:?}");
-        assert!(started.elapsed() > timeout * 2);
-        Ok(())
+        // The last holder keeps the lock for the whole timeout.
+        assert!(!wait.expired(Some(3), at(16)));
+        assert!(wait.expired(Some(3), at(17)));
+        assert_eq!(wait.holder, Some(3));
     }
 
     /// An empty override counts as unset, and a relative one is made absolute so that the shims
