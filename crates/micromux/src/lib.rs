@@ -477,6 +477,7 @@ pub(crate) fn initial_model_entries(services: &ServiceMap) -> Vec<(ServiceSnapsh
                 service::StartupMode::Disabled => Desired::Disabled,
             };
             snapshot.log_display = service.log_display.clone();
+            snapshot.depends_on = service.spec.depends_on.clone();
             (snapshot, service.log_retention)
         })
         .collect()
