@@ -62,7 +62,8 @@ fn condition_met(
     if runtime.desired == DesiredState::Disabled || runtime.start_requested {
         return false;
     }
-    let completed = matches!(runtime.state, State::Exited { exit_code: 0, .. });
+    let completed =
+        matches!(runtime.state, State::Exited { exit_code: 0, .. }) && !runtime.last_run_stopped;
     match condition {
         DependencyCondition::Started => {
             matches!(runtime.state, State::Running { .. })
@@ -360,6 +361,7 @@ fn finish_service_start(
                 pty: started.handles,
                 since: tokio::time::Instant::now(),
                 exited_at: None,
+                stop_requested: false,
             });
             sync_model(ctx.writer, service, runtime);
             let mut event = service_event(

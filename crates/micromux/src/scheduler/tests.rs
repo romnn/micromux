@@ -710,6 +710,7 @@ fn start_dummy_run(runtime: &mut ServiceRuntime) -> eyre::Result<RunId> {
         pty: pty::PtyHandles::test_dummy()?,
         since: tokio::time::Instant::now(),
         exited_at: None,
+        stop_requested: false,
     });
     Ok(run_id)
 }
@@ -5758,5 +5759,127 @@ async fn a_manual_job_runs_only_when_restarted() -> eyre::Result<()> {
 
     harness.shutdown.cancel();
     harness.handle.await??;
+    Ok(())
+}
+
+/// A job that micromux stopped did not complete, even when it exits with status 0 on its stop
+/// signal: re-enabled, an on-start job runs again, and its dependents stay blocked meanwhile.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_job_stopped_by_micromux_is_not_completed() -> eyre::Result<()> {
+    let mut services = ServiceMap::new();
+    services.insert(
+        "migrate".to_string(),
+        job("migrate", "trap 'exit 0' TERM; sleep 60 & wait", |_| {})?,
+    );
+    services.insert(
+        "api".to_string(),
+        dependent(
+            "api",
+            vec![config::Dependency {
+                name: spanned_string("migrate"),
+                condition: None,
+            }],
+        )?,
+    );
+    let harness = spawn_harness(services, None);
+    wait_until(&harness.reader, "migrate", |snapshot| {
+        snapshot.execution == Execution::Running
+    })
+    .await?;
+
+    accepted(harness.control.disable(&"migrate".to_string()).await)?;
+    let stopped = wait_until(&harness.reader, "migrate", |snapshot| {
+        snapshot.last_exit_code == Some(0) && snapshot.execution != Execution::Stopping
+    })
+    .await?;
+    assert_ne!(stopped.execution, Execution::Completed);
+
+    accepted(harness.control.enable(&"migrate".to_string()).await)?;
+    let rerun = harness
+        .reader
+        .service("migrate")
+        .ok_or_else(|| eyre::eyre!("migrate vanished"))?;
+    assert_eq!(
+        (rerun.execution, rerun.run_generation),
+        (Execution::Running, 2)
+    );
+    assert_ne!(
+        harness.reader.service("api").map(|api| api.execution),
+        Some(Execution::Running)
+    );
+
+    harness.shutdown.cancel();
+    harness.handle.await??;
+    Ok(())
+}
+
+/// Enabling a job that is already enabled neither starts nor cancels a run of it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn enabling_an_enabled_job_keeps_its_requested_run() -> eyre::Result<()> {
+    let mut services = ServiceMap::new();
+    let mut gate_cfg = service_config("gate", ("sh", &["-c", "sleep 60"]));
+    gate_cfg.startup_mode = StartupMode::Disabled;
+    services.insert(
+        "gate".to_string(),
+        Service::new("gate", Path::new("."), gate_cfg)?,
+    );
+    services.insert(
+        "reset".to_string(),
+        job("reset", "true", |cfg| {
+            cfg.startup_mode = StartupMode::Manual;
+            cfg.depends_on = vec![depends_on("gate", config::DependencyCondition::Started)];
+        })?,
+    );
+    let harness = spawn_harness(services, None);
+
+    accepted(harness.control.restart(&"reset".to_string()).await)?;
+    accepted(harness.control.enable(&"reset".to_string()).await)?;
+    assert_eq!(
+        harness.reader.service("reset").map(|reset| reset.execution),
+        Some(Execution::Blocked)
+    );
+
+    accepted(harness.control.enable(&"gate".to_string()).await)?;
+    let reset = wait_until(&harness.reader, "reset", |snapshot| {
+        snapshot.execution == Execution::Completed
+    })
+    .await?;
+    assert_eq!(reset.run_generation, 1);
+
+    harness.shutdown.cancel();
+    harness.handle.await??;
+    Ok(())
+}
+
+#[test]
+fn a_job_whose_rerun_was_requested_does_not_report_its_last_completion() -> eyre::Result<()> {
+    let service = job("seed", "true", |_| {})?;
+    let mut runtime = ServiceRuntime::new(ServiceRuntimeInit::from(&service));
+    start_dummy_run(&mut runtime)?;
+    runtime.finish_current_run(&service.spec, 0);
+    assert_eq!(
+        project_snapshot(&service, &runtime).0.execution,
+        Execution::Completed
+    );
+
+    runtime.request_restart();
+    assert_ne!(
+        project_snapshot(&service, &runtime).0.execution,
+        Execution::Completed
+    );
+
+    let manual = job("reset", "true", |cfg| {
+        cfg.startup_mode = StartupMode::Manual;
+    })?;
+    let mut runtime = ServiceRuntime::new(ServiceRuntimeInit::from(&manual));
+    assert_eq!(
+        project_snapshot(&manual, &runtime).0.execution,
+        Execution::Pending
+    );
+    runtime.request_restart();
+    assert_eq!(
+        project_snapshot(&manual, &runtime).0.execution,
+        Execution::Starting
+    );
     Ok(())
 }

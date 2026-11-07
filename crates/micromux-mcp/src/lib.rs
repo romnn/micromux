@@ -768,6 +768,8 @@ enum ServiceEventsResult {
 enum EnsureActionKind {
     StartedSession,
     EnabledService,
+    /// Ran a manual job that had not run, by restarting it.
+    RanJob,
     Waited,
 }
 
@@ -2822,7 +2824,8 @@ impl McpServer {
         and the generation-aware health wait. Every action taken is reported. An already-healthy \
         service returns immediately with no actions; an exit or timeout includes bounded failure \
         diagnosis. Starting a missing session requires the operator to enable session spawning. \
-        Retired dynamic services must be revived with replace_dynamic_service."
+        Retired dynamic services must be revived with replace_dynamic_service. A job is ready once \
+        it completed; a manual job that has not run is run."
     )]
     async fn ensure_service_ready(
         &self,
@@ -2903,6 +2906,7 @@ impl McpServer {
                 retired_service_message(&args.service, reason),
             )));
         }
+        let job = snapshot.kind == micromux::ServiceKind::Job;
         let after_generation = if snapshot.desired == Desired::Disabled {
             let response = conn
                 .request(Request::Enable {
@@ -2924,6 +2928,31 @@ impl McpServer {
             actions.push(EnsureAction {
                 kind: EnsureActionKind::EnabledService,
                 detail: format!("enabled service from generation {generation}"),
+            });
+            // Enabling a job does not start a run; it returns to its outcome or is scheduled anew.
+            (!job).then_some(generation)
+        } else if snapshot.manual && snapshot.execution == Execution::Pending {
+            // Naming a manual job that has not run asks for it to run.
+            let response = conn
+                .request(Request::Restart {
+                    service: args.service.clone(),
+                })
+                .await
+                .map_err(error_data)?;
+            let generation = convert::accepted(response)
+                .map_err(error_data)?
+                .iter()
+                .find(|ack| ack.service == args.service)
+                .map(|ack| ack.observed_generation)
+                .ok_or_else(|| {
+                    ErrorData::internal_error(
+                        format!("restart acknowledgement omitted service `{}`", args.service),
+                        None,
+                    )
+                })?;
+            actions.push(EnsureAction {
+                kind: EnsureActionKind::RanJob,
+                detail: format!("ran the manual job from generation {generation}"),
             });
             Some(generation)
         } else {
@@ -4015,6 +4044,73 @@ services:
             .err()
             .ok_or_else(|| eyre::eyre!("disabled service unexpectedly waited"))?;
         assert!(disabled.message.contains("disabled with no qualifying run"));
+
+        session.finish().await?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ensure_ready_runs_jobs_to_completion() -> eyre::Result<()> {
+        let project = tempfile::tempdir()?;
+        let yaml = r#"version: 1
+services:
+  seed:
+    kind: job
+    command: ["sh", "-c", "sleep 2"]
+  reset:
+    kind: job
+    run: manual
+    command: ["sh", "-c", "true"]
+  off:
+    kind: job
+    disabled: true
+    command: ["sh", "-c", "true"]
+"#;
+        let (session, selector) =
+            boot_mcp_session_with_yaml(project.path(), "mcp-jobs-test", yaml)?;
+        let mut server = McpServer::new();
+        server.cwd = project.path().to_path_buf();
+
+        for (service, expected) in [
+            ("seed", &[EnsureActionKind::Waited][..]),
+            (
+                "reset",
+                &[EnsureActionKind::RanJob, EnsureActionKind::Waited][..],
+            ),
+            (
+                "off",
+                &[EnsureActionKind::EnabledService, EnsureActionKind::Waited][..],
+            ),
+        ] {
+            let Json(ready) = server
+                .ensure_service_ready(Parameters(EnsureReadyArgs {
+                    service: service.to_string(),
+                    session: Some(selector.clone()),
+                    path: None,
+                    timeout_secs: Some(10),
+                    log_limit: Some(2),
+                }))
+                .await
+                .map_err(|err| eyre::eyre!(err.message))?;
+            assert!(
+                matches!(ready.outcome.status, WaitStatus::Completed),
+                "{service} did not complete: {:?} {:?}",
+                ready.snapshot.execution,
+                ready.snapshot.kind
+            );
+            assert_eq!(ready.snapshot.execution, Execution::Completed);
+            let kinds = ready
+                .actions
+                .iter()
+                .map(|action| serde_json::to_value(&action.kind))
+                .collect::<Result<Vec<_>, _>>()?;
+            let expected = expected
+                .iter()
+                .map(serde_json::to_value)
+                .collect::<Result<Vec<_>, _>>()?;
+            assert_eq!(kinds, expected, "{service}");
+        }
 
         session.finish().await?;
         Ok(())

@@ -1173,6 +1173,16 @@ fn parse_service<F: Copy>(
     let disabled = parse_optional::<bool>(mapping.get("disabled"))?
         .map(Spanned::into_inner)
         .unwrap_or(false);
+    if disabled
+        && manual
+        && let Some(value) = mapping.get("disabled")
+    {
+        return Err(ConfigError::InvalidValue {
+            message: "a manual job runs only when restarted already; drop `disabled: true`"
+                .to_string(),
+            span: value.span().into(),
+        });
+    }
     let startup_mode = if disabled {
         StartupMode::Disabled
     } else if manual {
@@ -1903,6 +1913,10 @@ mod tests {
             ("run: manual", "applies only to jobs"),
             ("kind: cron", "invalid kind"),
             ("kind: job\n    run: later", "invalid run"),
+            (
+                "kind: job\n    run: manual\n    disabled: true",
+                "drop `disabled: true`",
+            ),
         ];
         for (extra, expected) in cases {
             let yaml =

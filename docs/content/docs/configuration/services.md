@@ -149,8 +149,8 @@ services:
 
 - **Dependencies.** A dependency on a job without a `condition` waits for it to complete. `started` is met while the job runs and after it completed. A job has no health, so `condition: healthy` on a job is an error. A failed job makes its dependents [fail fast]({{< relref "dependencies.md" >}}#dependencies-that-cannot-recover).
 - **Restarts.** A job never restarts on its own: it ignores the top-level `restart` default, and may set only `restart: "no"` or `restart: on-failure[:N]`, which retries failures and counts every attempt however long it ran. A job cannot have a `healthcheck`.
-- **Running it again.** Restart it, with `r` in the TUI, `micromux ctl restart <id>`, or `restart_service` over MCP. Enabling a disabled job runs it unless it already completed, and restart-all reruns every job that runs on start.
-- **On demand.** `run: manual` keeps a job from running when the session starts; it shows **IDLE** until you restart it, and restart-all leaves it alone. Use it for jobs you run by hand, such as resetting a database. `run: on-start` is the default.
+- **Running it again.** Restart it, with `r` in the TUI, `micromux ctl restart <id>`, or `restart_service` over MCP; restart-all reruns every job that runs on start. Enabling never starts or cancels a run of a job: a disabled job that finished keeps its outcome, and one that never ran, or that micromux stopped before it finished, is pending again. A run that micromux stopped never counts as completed, even when it exits with status 0.
+- **On demand.** `run: manual` keeps a job from running when the session starts; it shows **IDLE** until you restart it, and restart-all leaves it alone. Use it for jobs you run by hand, such as resetting a database. The MCP `ensure_service_ready` runs a manual job that has not run. `run: on-start` is the default, and `run: manual` cannot be combined with `disabled: true`.
 - **Waiting.** [`micromux ctl wait`]({{< relref "../agent-control/control-plane.md" >}}#waiting-from-a-script) and the MCP `wait_for_healthy` treat a completed job as ready and a failed one as an exit.
 
 Converting a one-shot service into a job:

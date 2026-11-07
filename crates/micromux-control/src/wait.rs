@@ -57,8 +57,8 @@ pub fn evaluate(
     let ready = generation_ready(snapshot, after);
     let unavailable = snapshot.desired == Desired::Disabled || snapshot.retired.is_some();
     let job = snapshot.kind == ServiceKind::Job;
-    // A finished job, or a manual job that never ran, runs again only when asked to, which a
-    // command acknowledges only once the run started.
+    // A finished job, or a manual job that never ran, runs again only when asked to. The session
+    // never reports either while a run of it is requested, so neither can be about to run.
     let idle = matches!(snapshot.execution, Execution::Completed | Execution::Failed)
         || (snapshot.manual && snapshot.execution == Execution::Pending);
     match wait_for {
