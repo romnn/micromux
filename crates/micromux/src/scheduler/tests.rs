@@ -97,6 +97,22 @@ fn spawn_harness_with_policy(
     config_dir: PathBuf,
     dynamic_policy: DynamicServicesPolicy,
 ) -> Harness {
+    spawn_harness_with_session(
+        services,
+        reload_config,
+        config_dir,
+        dynamic_policy,
+        std::sync::Arc::new(crate::session::SessionContext::unconfigured()),
+    )
+}
+
+fn spawn_harness_with_session(
+    services: ServiceMap,
+    reload_config: Option<ReloadConfig>,
+    config_dir: PathBuf,
+    dynamic_policy: DynamicServicesPolicy,
+    session: std::sync::Arc<crate::session::SessionContext>,
+) -> Harness {
     raise_test_file_descriptor_limit();
     let (commands_tx, commands_rx) = mpsc::channel(64);
     let (events_tx, events_rx) = mpsc::channel(256);
@@ -119,7 +135,7 @@ fn spawn_harness_with_policy(
                 shutdown,
                 config_dir,
                 dynamic_policy,
-                session: std::sync::Arc::new(crate::session::SessionContext::unconfigured()),
+                session,
                 default_log_retention: crate::LogRetention::default(),
                 default_log_display: crate::LogDisplay::default(),
             })
@@ -711,6 +727,7 @@ fn start_dummy_run(runtime: &mut ServiceRuntime) -> eyre::Result<RunId> {
         since: tokio::time::Instant::now(),
         exited_at: None,
         stop_requested: false,
+        environment: indexmap::IndexMap::new(),
     });
     Ok(run_id)
 }
@@ -1680,16 +1697,20 @@ fn reload_config(config_path: &Path) -> eyre::Result<ReloadConfig> {
 }
 
 fn services_from_config_path(config_path: &Path) -> eyre::Result<ServiceMap> {
+    services_from_config_path_in_session(config_path, &crate::SessionEnvironment::default())
+}
+
+fn services_from_config_path_in_session(
+    config_path: &Path,
+    session: &crate::SessionEnvironment,
+) -> eyre::Result<ServiceMap> {
     let raw = fs::read_to_string(config_path)?;
     let config_dir = config_path
         .parent()
         .ok_or_else(|| eyre::eyre!("missing config parent"))?;
     let mut diagnostics = Vec::new();
     let config = crate::config::from_str(&raw, config_dir, 0usize, None, &mut diagnostics)?;
-    Ok(crate::service_map_from_config(
-        &config,
-        &crate::SessionEnvironment::default(),
-    )?)
+    Ok(crate::service_map_from_config(&config, session)?)
 }
 
 #[test]
@@ -1888,6 +1909,186 @@ services:
     )?;
     let dry_run = assert_reconcile_dry_run(&harness, &before_x, &before_y).await?;
     apply_reconcile_and_assert(&harness, &config_path, &before_x, &before_y, &dry_run).await?;
+
+    harness.shutdown.cancel();
+    harness.handle.await??;
+    Ok(())
+}
+
+fn environment_accepted(
+    result: Result<EnvironmentResult, SchedulerStopped>,
+) -> eyre::Result<ResolvedEnvironment> {
+    result
+        .map_err(|_| eyre::eyre!("scheduler stopped"))?
+        .map_err(|rejection| eyre::eyre!("unexpected rejection: {rejection}"))
+}
+
+fn variables(pairs: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
+    pairs
+        .iter()
+        .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+        .collect()
+}
+
+fn environment_yaml(inline: &str) -> String {
+    format!(
+        r#"version: 1
+services:
+  svc:
+    name: Display Name
+    command: ["sh", "-c", "sleep 60"]
+    env_file: svc.env
+    environment:
+      INLINE: {inline}
+"#
+    )
+}
+
+/// Runs `svc` from [`environment_yaml`] in a session that pins `MICROMUX_SESSION` and
+/// `SESSION_PORT`, the way it pins allocated ports.
+async fn spawn_environment_harness(dir: &Path) -> eyre::Result<Harness> {
+    let config_path = dir.join("micromux.yaml");
+    // The pinned port shadows the env file's definition.
+    fs::write(
+        dir.join("svc.env"),
+        "FROM_ENV_FILE=from-file\nSESSION_PORT=1\n",
+    )?;
+    fs::write(&config_path, environment_yaml("before"))?;
+    let session = std::sync::Arc::new(crate::session::SessionContext {
+        environment: crate::SessionEnvironment::from_pairs(&[
+            ("MICROMUX_SESSION", "test"),
+            ("SESSION_PORT", "20001"),
+        ]),
+        ..crate::session::SessionContext::unconfigured()
+    });
+    let services = services_from_config_path_in_session(&config_path, &session.environment)?;
+    let reload = ReloadConfig {
+        config_path,
+        config_dir: dir.to_path_buf(),
+        strict_override: None,
+        session: session.clone(),
+    };
+    let harness = spawn_harness_with_session(
+        services,
+        Some(reload),
+        dir.to_path_buf(),
+        DynamicServicesPolicy::default(),
+        session,
+    );
+    wait_until(&harness.reader, "svc", |snapshot| {
+        snapshot.execution == Execution::Running
+    })
+    .await?;
+    Ok(harness)
+}
+
+/// The session's variables come back as latched, a service's as its live run got them, and a
+/// reconciled definition reads as stale until a restart runs it.
+#[tokio::test]
+async fn environment_reports_session_variables_and_the_live_run_environment() -> eyre::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let harness = spawn_environment_harness(dir.path()).await?;
+    let svc = "svc".to_string();
+
+    // Session variables
+    let pins = environment_accepted(harness.control.environment(None).await)?;
+    assert_eq!(
+        pins,
+        ResolvedEnvironment {
+            variables: variables(&[("MICROMUX_SESSION", "test"), ("SESSION_PORT", "20001")]),
+            stale: false,
+        }
+    );
+
+    // The env file, the inline entries, and the pins, without the spawn-owned `TERM`
+    let before = variables(&[
+        ("FROM_ENV_FILE", "from-file"),
+        ("INLINE", "before"),
+        ("MICROMUX_SESSION", "test"),
+        ("SESSION_PORT", "20001"),
+    ]);
+    let running = environment_accepted(harness.control.environment(Some(&svc)).await)?;
+    assert_eq!(
+        running,
+        ResolvedEnvironment {
+            variables: before.clone(),
+            stale: false,
+        }
+    );
+
+    // A reconciled definition does not reach the running process, so the old values stay and
+    // are marked stale.
+    fs::write(dir.path().join("micromux.yaml"), environment_yaml("after"))?;
+    reconcile_accepted(harness.control.reconcile_config(false).await)?;
+    let reconciled = environment_accepted(harness.control.environment(Some(&svc)).await)?;
+    assert_eq!(
+        reconciled,
+        ResolvedEnvironment {
+            variables: before,
+            stale: true,
+        }
+    );
+
+    // The restart runs the new definition, which is current again.
+    let generation = running_generation(&harness, &svc)?;
+    accepted(harness.control.restart(&svc).await)?;
+    wait_until(&harness.reader, "svc", |snapshot| {
+        snapshot.run_generation > generation && snapshot.execution == Execution::Running
+    })
+    .await?;
+    let restarted = environment_accepted(harness.control.environment(Some(&svc)).await)?;
+    assert_eq!(
+        restarted.variables.get("INLINE").map(String::as_str),
+        Some("after")
+    );
+    assert!(!restarted.stale);
+
+    harness.shutdown.cancel();
+    harness.handle.await??;
+    Ok(())
+}
+
+fn running_generation(harness: &Harness, service: &str) -> eyre::Result<u64> {
+    Ok(harness
+        .reader
+        .service(service)
+        .ok_or_else(|| eyre::eyre!("missing {service}"))?
+        .run_generation)
+}
+
+/// Without a live run the current definition answers, and only the exact id selects a service.
+#[tokio::test]
+async fn environment_without_a_live_run_reports_the_current_definition() -> eyre::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let harness = spawn_environment_harness(dir.path()).await?;
+    let svc = "svc".to_string();
+
+    accepted(harness.control.disable(&svc).await)?;
+    wait_until(&harness.reader, "svc", |snapshot| {
+        snapshot.execution != Execution::Running && snapshot.execution != Execution::Stopping
+    })
+    .await?;
+    fs::write(
+        dir.path().join("micromux.yaml"),
+        environment_yaml("disabled"),
+    )?;
+    reconcile_accepted(harness.control.reconcile_config(false).await)?;
+    let idle = environment_accepted(harness.control.environment(Some(&svc)).await)?;
+    assert_eq!(
+        idle.variables.get("INLINE").map(String::as_str),
+        Some("disabled")
+    );
+    assert!(!idle.stale);
+
+    // The display name selects nothing.
+    for unknown in ["nope", "Display Name"] {
+        let rejected = harness
+            .control
+            .environment(Some(&unknown.to_string()))
+            .await
+            .map_err(|_| eyre::eyre!("scheduler stopped"))?;
+        assert_eq!(rejected, Err(CommandRejection::UnknownService), "{unknown}");
+    }
 
     harness.shutdown.cancel();
     harness.handle.await??;

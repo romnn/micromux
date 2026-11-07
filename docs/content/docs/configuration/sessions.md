@@ -64,6 +64,8 @@ These variables are available to every [interpolation]({{< relref "services.md" 
 
 **They win over every other definition.** An `env_file` line or `environment` entry of the same name is ignored, so an existing `.env` that says `API_PORT=9540` keeps working outside micromux, while inside micromux the allocated port replaces it, and a later line such as `API_URL=http://127.0.0.1:${API_PORT}` sees the allocated value.
 
+To use them from your own shell, for a migration or a seed script against the session's services, run the command with `micromux exec` or print them with `micromux env`; see [Run commands in the session environment]({{< relref "../agent-control/control-plane.md" >}}#run-commands-in-the-session-environment).
+
 ## Hostnames
 
 `routes` gives services hostnames under the session's domain, served by one proxy shared by all of your sessions:

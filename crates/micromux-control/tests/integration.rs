@@ -117,6 +117,108 @@ async fn describe_reports_the_session_name_and_allocated_ports() -> eyre::Result
     Ok(())
 }
 
+/// `GetEnvironment` returns the session's variables, or a service's `env_file` and inline
+/// entries with those variables pinned over them, and types an unknown service.
+#[tokio::test]
+async fn environment_crosses_the_socket() -> eyre::Result<()> {
+    let dir = unique_dir("environment")?;
+    std::fs::write(dir.path().join("svc.env"), "FROM_ENV_FILE=from-file\n")?;
+    let session = build_session_yaml(
+        dir.path(),
+        r#"version: 1
+allocate_ports: [ENVIRONMENT_TEST_PORT]
+services:
+  svc:
+    name: Display Name
+    command: ["sh", "-c", "sleep 60"]
+    env_file: svc.env
+    environment:
+      INLINE: "inline ${FROM_ENV_FILE}"
+      ENVIRONMENT_TEST_PORT: "1"
+"#,
+    )?;
+    let mut client = Client::connect(&session.endpoint).await?;
+
+    let Response::Environment(pins) = client
+        .request(Request::GetEnvironment { service: None })
+        .await?
+    else {
+        eyre::bail!("expected the session's environment");
+    };
+    let port = pins
+        .variables
+        .get("ENVIRONMENT_TEST_PORT")
+        .ok_or_else(|| eyre::eyre!("the allocated port is missing"))?
+        .clone();
+    assert_eq!(
+        pins.variables
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        [
+            "ENVIRONMENT_TEST_PORT",
+            "MICROMUX_HOST_SUFFIX",
+            "MICROMUX_PROXY_PORT",
+            "MICROMUX_SESSION",
+            "MICROMUX_SESSION_DOMAIN",
+        ]
+    );
+    // An unnamed session is named after its directory, which keeps parallel tests apart.
+    let directory_name = dir
+        .path()
+        .file_name()
+        .ok_or_else(|| eyre::eyre!("the test directory has no name"))?
+        .to_string_lossy();
+    assert_eq!(
+        pins.variables.get("MICROMUX_SESSION"),
+        Some(&micromux::session::slugify(&directory_name))
+    );
+    assert!(!pins.stale);
+
+    // The service's own entries resolve, and the allocated port wins over its inline definition.
+    let Response::Environment(service) = client
+        .request(Request::GetEnvironment {
+            service: Some("svc".to_string()),
+        })
+        .await?
+    else {
+        eyre::bail!("expected the service's environment");
+    };
+    assert_eq!(
+        service.variables.get("FROM_ENV_FILE").map(String::as_str),
+        Some("from-file")
+    );
+    assert_eq!(
+        service.variables.get("INLINE").map(String::as_str),
+        Some("inline from-file")
+    );
+    assert_eq!(service.variables.get("ENVIRONMENT_TEST_PORT"), Some(&port));
+    assert!(!service.variables.contains_key("TERM"));
+    assert!(!service.stale);
+
+    // Only the exact id selects a service; the display name does not.
+    for unknown in ["nope", "Display Name"] {
+        let response = client
+            .request(Request::GetEnvironment {
+                service: Some(unknown.to_string()),
+            })
+            .await?;
+        assert!(
+            matches!(
+                response,
+                Response::Error {
+                    code: micromux_control::ErrorCode::UnknownService,
+                    ..
+                }
+            ),
+            "{unknown}: {response:?}"
+        );
+    }
+
+    session.shutdown.cancel();
+    Ok(())
+}
+
 #[tokio::test]
 async fn health_history_is_oldest_first_and_unknown_services_are_typed() -> eyre::Result<()> {
     let dir = unique_dir("health-history")?;

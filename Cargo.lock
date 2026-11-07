@@ -1593,6 +1593,7 @@ dependencies = [
  "micromux-tui",
  "nix 0.31.3",
  "rustix",
+ "serde_json",
  "similar-asserts",
  "tempfile",
  "termcolor",

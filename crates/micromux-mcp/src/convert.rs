@@ -181,6 +181,19 @@ pub fn reconcile(response: Response) -> Result<micromux::ReconcileReceipt, ToolE
     }
 }
 
+/// Extract an environment with its values.
+///
+/// # Errors
+///
+/// Returns a [`ToolError`] if the session replied with an error or an unexpected response.
+pub fn environment(response: Response) -> Result<micromux::ResolvedEnvironment, ToolError> {
+    match response {
+        Response::Environment(environment) => Ok(environment),
+        Response::Error { code, message } => Err(remote_error(code, message)),
+        other => Err(ToolError::Unexpected(format!("{other:?}"))),
+    }
+}
+
 /// Confirm a shutdown was acknowledged.
 ///
 /// # Errors

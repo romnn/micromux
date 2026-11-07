@@ -1,6 +1,6 @@
 //! Scheduler command and lifecycle types.
 
-use super::control::{CommandAck, DynamicCommandAck, ReconcileCommandAck};
+use super::control::{CommandAck, DynamicCommandAck, EnvironmentCommandAck, ReconcileCommandAck};
 use crate::cleanup::CleanupOutcome;
 use crate::health_check::Health;
 use crate::{DynamicServiceParams, Lease};
@@ -283,6 +283,13 @@ pub enum Command {
         service: ServiceID,
         /// Optional reply channel for acknowledged commands.
         ack: Option<DynamicCommandAck>,
+    },
+    /// Report the session's variables, or one service's resolved environment.
+    Environment {
+        /// Service id, or `None` for the session's own variables.
+        service: Option<ServiceID>,
+        /// Required reply channel.
+        ack: EnvironmentCommandAck,
     },
     /// Resize all PTYs.
     ResizeAll {

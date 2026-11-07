@@ -1,10 +1,12 @@
 //! The CLI-side control adapter: bind the per-session endpoint and run the control server.
 //!
-//! This is the untrusted boundary. The server is constructed with two model capabilities — a
-//! `SessionModelReader` (queries + subscribe) and a narrow `ServiceControl` (mutations) — so it can
-//! observe and command but can neither mutate the model directly nor forward raw input. The accept
-//! loop additionally holds the session's shutdown token, its one lifecycle capability: a
-//! `Request::Shutdown` cancels it to stop the whole session (the same path as Ctrl-C).
+//! This is the untrusted boundary.
+//! The server is constructed with two model capabilities — a `SessionModelReader` (queries +
+//! subscribe) and a narrow `ServiceControl` (mutations and the environment read) — so it can
+//! observe and command but can neither mutate the model directly nor forward raw input.
+//! The accept loop additionally holds the session's shutdown token, its one lifecycle
+//! capability: a `Request::Shutdown` cancels it to stop the whole session (the same path as
+//! Ctrl-C).
 
 use std::path::Path;
 use std::sync::Arc;

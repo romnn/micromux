@@ -1,4 +1,5 @@
 use clap::{Parser, Subcommand};
+use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::LazyLock;
 
@@ -105,6 +106,54 @@ pub enum Command {
         #[command(subcommand)]
         action: CtlAction,
     },
+    /// Run a command in this terminal with a running session's environment.
+    ///
+    /// The command keeps the variables of the shell that runs `micromux exec`, such as `PATH`,
+    /// and the session's variables override any of the same name.
+    /// It replaces the micromux process, so it gets the terminal, the signals, and the exit
+    /// status directly.
+    /// Exits 125 when micromux fails before the command runs, such as without a running session,
+    /// 126 when the command cannot run, 127 when it is not found, and otherwise with the
+    /// command's own status.
+    Exec {
+        /// Session selector: `name:`, `pid:`, `hash:`, or a bare session name.
+        #[arg(long)]
+        session: Option<String>,
+        /// Use the environment of the service with this id instead of the session's variables.
+        #[arg(long)]
+        service: Option<String>,
+        /// The command and its arguments; everything after the command name is passed to it.
+        #[arg(
+            value_name = "COMMAND",
+            required = true,
+            trailing_var_arg = true,
+            allow_hyphen_values = true
+        )]
+        command: Vec<OsString>,
+    },
+    /// Print a running session's environment.
+    ///
+    /// Without `--service`, these are the variables the session injects into every service: its
+    /// name, domain, proxy port, host suffix, and allocated ports.
+    /// With `--service`, they are that service's resolved environment.
+    /// Exits 1 on any failure, including a NAME that is not set.
+    Env {
+        /// Session selector: `name:`, `pid:`, `hash:`, or a bare session name.
+        #[arg(long)]
+        session: Option<String>,
+        /// Print the environment of the service with this id instead of the session's variables.
+        #[arg(long)]
+        service: Option<String>,
+        /// Print `export` lines for `eval "$(micromux env --export)"`, as `--format shell` does.
+        #[arg(long, conflicts_with = "format")]
+        export: bool,
+        /// Output format [default: env].
+        #[arg(long, value_enum)]
+        format: Option<EnvFormat>,
+        /// Print only these variables; a single NAME in the `env` format prints its bare value.
+        #[arg(value_name = "NAME")]
+        names: Vec<String>,
+    },
     /// Run the MCP server over stdio (configure once in Claude Code / Codex like playwright-mcp).
     #[cfg(feature = "mcp")]
     Mcp {
@@ -130,9 +179,20 @@ pub enum Command {
     },
 }
 
+/// How `micromux env` prints variables.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum EnvFormat {
+    /// `KEY=value` lines, with values quoted for a POSIX shell where needed.
+    Env,
+    /// `export KEY=value` lines for `eval`.
+    Shell,
+    /// One JSON object.
+    Json,
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Command, Options};
+    use super::{Command, EnvFormat, Options};
     use clap::{CommandFactory as _, Parser};
     use similar_asserts::assert_eq;
 
@@ -147,6 +207,121 @@ mod tests {
             micromux_control::PROTOCOL_VERSION
         );
         assert!(version.trim_end().ends_with(&expected), "{version}");
+    }
+
+    fn exec_command(args: &[&str]) -> Result<(Option<String>, Vec<String>), clap::Error> {
+        match Options::try_parse_from(args)?.command {
+            Some(Command::Exec {
+                service, command, ..
+            }) => Ok((
+                service,
+                command
+                    .iter()
+                    .map(|arg| arg.to_string_lossy().into_owned())
+                    .collect(),
+            )),
+            other => panic!("expected exec, got {other:?}"),
+        }
+    }
+
+    /// The command starts at its first word: flags before it belong to micromux, and every
+    /// argument after it, flag or `--`, belongs to the command.
+    #[test]
+    fn exec_passes_everything_after_the_command_name_to_the_command() -> Result<(), clap::Error> {
+        // Without `--`
+        assert_eq!(
+            exec_command(&["micromux", "exec", "task", "migrations:reset"])?,
+            (
+                None,
+                vec!["task".to_string(), "migrations:reset".to_string()]
+            )
+        );
+        assert_eq!(
+            exec_command(&["micromux", "exec", "ls", "-la"])?,
+            (None, vec!["ls".to_string(), "-la".to_string()])
+        );
+
+        // Flags after the command name never reach micromux.
+        assert_eq!(
+            exec_command(&["micromux", "exec", "sh", "-c", "x", "--service", "--", "-v"])?,
+            (
+                None,
+                ["sh", "-c", "x", "--service", "--", "-v"]
+                    .map(str::to_string)
+                    .to_vec()
+            )
+        );
+
+        // With micromux's own flags and `--`
+        assert_eq!(
+            exec_command(&["micromux", "exec", "--service", "api", "--", "ls", "-la"])?,
+            (
+                Some("api".to_string()),
+                vec!["ls".to_string(), "-la".to_string()]
+            )
+        );
+        let options = Options::try_parse_from([
+            "micromux",
+            "exec",
+            "--config",
+            "other.yaml",
+            "--session",
+            "name:api",
+            "true",
+        ])?;
+        assert_eq!(
+            options.config_path.as_deref(),
+            Some(std::path::Path::new("other.yaml"))
+        );
+        assert!(matches!(
+            options.command,
+            Some(Command::Exec { session: Some(session), .. }) if session == "name:api"
+        ));
+
+        // A command is required.
+        assert!(Options::try_parse_from(["micromux", "exec"]).is_err());
+        assert!(Options::try_parse_from(["micromux", "exec", "--service", "api"]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn env_takes_names_and_one_output_format() -> Result<(), clap::Error> {
+        let options = Options::try_parse_from([
+            "micromux",
+            "env",
+            "--service",
+            "api",
+            "--format",
+            "json",
+            "A",
+            "B",
+        ])?;
+        assert!(matches!(
+            options.command,
+            Some(Command::Env {
+                session: None,
+                service: Some(service),
+                export: false,
+                format: Some(EnvFormat::Json),
+                names,
+            }) if service == "api" && names == ["A", "B"]
+        ));
+
+        let options = Options::try_parse_from(["micromux", "env", "--export"])?;
+        assert!(matches!(
+            options.command,
+            Some(Command::Env {
+                export: true,
+                format: None,
+                ..
+            })
+        ));
+
+        // `--export` is `--format shell`, so it cannot be combined with another format.
+        assert!(
+            Options::try_parse_from(["micromux", "env", "--export", "--format", "json"]).is_err()
+        );
+        Ok(())
     }
 
     #[test]

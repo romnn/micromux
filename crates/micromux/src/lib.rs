@@ -70,11 +70,11 @@ pub use model::{
     ServiceEventKind, ServiceSnapshot, SessionChange, SessionModelReader, trim_to_last_bytes,
 };
 pub use scheduler::{
-    Command, CommandRejection, DynamicServiceAck, DynamicServiceResult, MAX_PTY_INPUT_BATCH_BYTES,
-    MAX_PTY_PASTE_BYTES, OutputStream, PreparedPtyInput, PtyInputKind, PtyInputPrepareError,
-    PtyInputSendError, ReconcileAction, ReconcileActionKind, ReconcileReceipt, ReconcileResult,
-    SchedulerStopped, ServiceCommandAck, ServiceCommandResult, ServiceControl, ServiceID,
-    TerminalControl,
+    Command, CommandRejection, DynamicServiceAck, DynamicServiceResult, EnvironmentResult,
+    MAX_PTY_INPUT_BATCH_BYTES, MAX_PTY_PASTE_BYTES, OutputStream, PreparedPtyInput, PtyInputKind,
+    PtyInputPrepareError, PtyInputSendError, ReconcileAction, ReconcileActionKind,
+    ReconcileReceipt, ReconcileResult, ResolvedEnvironment, SchedulerStopped, ServiceCommandAck,
+    ServiceCommandResult, ServiceControl, ServiceID, TerminalControl,
 };
 pub use service::{
     Error as ServiceError, RestartPolicy, Site as ServiceSite, SkipReason as EnvFileSkipReason,

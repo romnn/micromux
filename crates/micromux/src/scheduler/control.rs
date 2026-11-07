@@ -11,6 +11,7 @@ use super::types::{Command, ServiceID};
 use crate::{DynamicServiceParams, Lease, RestartPolicy, ServiceSpec};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use tokio::sync::{mpsc, oneshot};
 
 /// Acknowledgement for one affected service: the generation the scheduler latched while processing
@@ -45,7 +46,9 @@ pub struct DynamicServiceAck {
     /// Informational ports.
     #[serde(default)]
     pub ports: Vec<u16>,
-    /// Environment key names. Values never leave the scheduler boundary.
+    /// Environment key names.
+    ///
+    /// Values leave the scheduler only through [`ServiceControl::environment`].
     #[serde(default)]
     pub env_keys: Vec<String>,
     /// Effective restart policy.
@@ -86,6 +89,31 @@ impl DynamicServiceAck {
             already_retired,
             idempotent_replay,
         }
+    }
+}
+
+/// Environment variables as the scheduler resolved them, for the session or for one service.
+///
+/// Reused directly as the control-protocol wire payload, like [`ServiceCommandAck`].
+/// Values may hold secrets from env files, so the [`Debug`] output names the variables but never
+/// shows their values.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ResolvedEnvironment {
+    /// The variables by name.
+    pub variables: BTreeMap<String, String>,
+    /// Whether the service's definition changed since its running process started.
+    ///
+    /// The variables are then those of the running process, not the ones its next run gets.
+    /// Always `false` for the session's own variables, which are fixed while the session runs.
+    pub stale: bool,
+}
+
+impl std::fmt::Debug for ResolvedEnvironment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResolvedEnvironment")
+            .field("variables", &self.variables.keys().collect::<Vec<_>>())
+            .field("stale", &self.stale)
+            .finish()
     }
 }
 
@@ -163,6 +191,9 @@ pub struct ReconcileReceipt {
 /// Result of one config reconciliation.
 pub type ReconcileResult = Result<ReconcileReceipt, CommandRejection>;
 
+/// Result of one environment query.
+pub type EnvironmentResult = Result<ResolvedEnvironment, CommandRejection>;
+
 /// The scheduler dropped the reply channel (it is shutting down) before acknowledging a command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error("the scheduler has stopped")]
@@ -186,6 +217,12 @@ pub struct DynamicCommandAck {
 #[derive(Debug)]
 pub struct ReconcileCommandAck {
     tx: oneshot::Sender<ReconcileResult>,
+}
+
+/// Reply half for an environment query.
+#[derive(Debug)]
+pub struct EnvironmentCommandAck {
+    tx: oneshot::Sender<EnvironmentResult>,
 }
 
 impl CommandAck {
@@ -218,6 +255,17 @@ impl ReconcileCommandAck {
     }
 
     pub(crate) fn send(self, result: ReconcileResult) {
+        let _ = self.tx.send(result);
+    }
+}
+
+impl EnvironmentCommandAck {
+    pub(crate) fn new() -> (Self, oneshot::Receiver<EnvironmentResult>) {
+        let (tx, rx) = oneshot::channel();
+        (Self { tx }, rx)
+    }
+
+    pub(crate) fn send(self, result: EnvironmentResult) {
         let _ = self.tx.send(result);
     }
 }
@@ -313,6 +361,35 @@ impl ServiceControl {
         let (ack, rx) = ReconcileCommandAck::new();
         self.tx
             .send(Command::ReconcileConfig { dry_run, ack })
+            .await
+            .map_err(|_| SchedulerStopped)?;
+        rx.await.map_err(|_| SchedulerStopped)
+    }
+
+    /// Report the environment the session gives its services.
+    ///
+    /// With `None`, these are the session's own variables: its name, domain, proxy port, host
+    /// suffix, and allocated ports.
+    /// With a service id, they are that service's resolved `env_file` and `environment` entries
+    /// with the session's variables applied, as its live run got them, or as its next run gets
+    /// them when no run is live.
+    /// The variables micromux sets on every spawn itself, such as `TERM`, are not included.
+    /// The id must match exactly; a display name does not select a service.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SchedulerStopped`] if the scheduler is no longer accepting commands.
+    /// The inner result rejects an unknown service with [`CommandRejection::UnknownService`].
+    pub async fn environment(
+        &self,
+        service: Option<&ServiceID>,
+    ) -> Result<EnvironmentResult, SchedulerStopped> {
+        let (ack, rx) = EnvironmentCommandAck::new();
+        self.tx
+            .send(Command::Environment {
+                service: service.cloned(),
+                ack,
+            })
             .await
             .map_err(|_| SchedulerStopped)?;
         rx.await.map_err(|_| SchedulerStopped)
