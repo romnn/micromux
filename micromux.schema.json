@@ -157,7 +157,7 @@
     },
     "routes": {
       "type": "array",
-      "description": "Hostnames served by the shared micromux proxy while the session runs, as http://<host>.<session>.<domain>. Not supported on Windows. Changes require a session restart.",
+      "description": "Hostnames, optionally narrowed to path prefixes, served by the shared micromux proxy while the session runs, as http://<host>.<session>.<domain><path>. A request goes to the exact host's route with the longest prefix of its path, or to that host's route without a path; when none of them matches, the catch-all's routes serve it by the same rule. Not supported on Windows. Changes require a session restart.",
       "items": {
         "type": "object",
         "additionalProperties": false,
@@ -166,7 +166,17 @@
           "host": {
             "type": "string",
             "pattern": "^(\\*|[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*)$",
-            "description": "Hostname labels below the session domain, such as app or email.internal, or * for every other hostname under the session domain."
+            "description": "Hostname labels below the session domain, such as app or email.internal, or * for every other hostname under the session domain. A host may be listed several times with different paths."
+          },
+          "path": {
+            "type": "string",
+            "pattern": "^/[!-\"$->@-~]+$",
+            "description": "Path prefix this route serves, such as /rest/. It matches the request path as plain, case-sensitive text without decoding, so /rest/ matches /rest/x but not /rest. Without path, the route serves every path of its host that no path route matches."
+          },
+          "strip_prefix": {
+            "type": "boolean",
+            "default": false,
+            "description": "Removes path from the request path before forwarding, so the upstream sees /token for /auth/v1/token. The forwarded path always starts with /. Requires path."
           },
           "port": {
             "$ref": "#/definitions/scalar",

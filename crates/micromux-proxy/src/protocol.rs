@@ -6,6 +6,13 @@
 //! sending [`ClientMessage::Ping`] at least every [`LEASE_TIMEOUT`].
 //! A registration lives exactly as long as its connection: the proxy drops the session's routes
 //! when the connection closes or falls silent for longer than the lease.
+//!
+//! Every proxy accepts registrations from older sessions, whose messages lack the newer optional
+//! fields.
+//! An older proxy ignores fields it does not know, so a session whose routes need a newer
+//! [`PROTOCOL_VERSION`] (see [`Registration::required_protocol`]) asks for
+//! [`ProxyMessage::Info`] on its registration connection first and refuses a proxy that is too
+//! old, rather than registering routes that proxy would serve differently.
 
 use std::time::Duration;
 
@@ -20,6 +27,21 @@ pub const LEASE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Longest accepted message line.
 pub const MAX_MESSAGE_BYTES: usize = 64 * 1024;
+
+/// The registration protocol this proxy and session speak.
+///
+/// Revisions:
+///
+/// - 1: hostname routes; a proxy that does not report a protocol speaks 1.
+/// - 2: path routes, with [`RouteTarget::path`] and [`RouteTarget::strip_prefix`].
+pub const PROTOCOL_VERSION: u32 = 2;
+
+/// The first protocol revision that routes by path.
+pub const PATH_ROUTES_PROTOCOL: u32 = 2;
+
+fn first_protocol() -> u32 {
+    1
+}
 
 /// A message from a session to the proxy.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -46,6 +68,9 @@ pub enum ProxyMessage {
         port: u16,
         /// Process id of the proxy.
         pid: u32,
+        /// The registration protocol the proxy speaks.
+        #[serde(default = "first_protocol")]
+        protocol: u32,
     },
     /// The registration is active.
     Registered,
@@ -80,11 +105,33 @@ pub struct Registration {
     pub routes: Vec<RouteTarget>,
 }
 
+impl Registration {
+    /// The oldest protocol revision whose proxy serves these routes as registered.
+    #[must_use]
+    pub fn required_protocol(&self) -> u32 {
+        if self.routes.iter().any(|route| route.path.is_some()) {
+            PATH_ROUTES_PROTOCOL
+        } else {
+            first_protocol()
+        }
+    }
+}
+
 /// One route of a registered session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RouteTarget {
     /// Hostname labels below the session domain, or `*` for the catch-all.
     pub host: String,
+    /// Path prefix the route serves, starting with `/`; `None` serves every path of the host.
+    ///
+    /// The prefix matches the request path as sent, before any percent-decoding, so `/rest/`
+    /// matches `/rest/x` but not `/rest` or `/REST/x`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// Whether the proxy removes `path` from the request path before forwarding; the forwarded
+    /// path always starts with `/`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub strip_prefix: bool,
     /// Upstream port on 127.0.0.1.
     pub port: u16,
     /// The service listening on the port, named on error pages.

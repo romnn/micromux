@@ -131,6 +131,8 @@ mod tests {
 
         let with = SessionStatus::new(summary(vec![Route {
             host: "app".to_string(),
+            path: None,
+            strip_prefix: false,
             url: "http://app.one.localhost/".to_string(),
             port: 20001,
             service: None,

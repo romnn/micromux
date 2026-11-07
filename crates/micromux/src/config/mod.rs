@@ -296,12 +296,17 @@ pub struct PortRangeConfig {
     pub end: Spanned<u16>,
 }
 
-/// One `routes` entry: a hostname under the session domain and the local port serving it.
+/// One `routes` entry: a hostname under the session domain, optionally narrowed to a path
+/// prefix, and the local port serving it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RouteConfig {
     /// Hostname labels below the session domain, such as `app` or `email.internal`, or `*`
     /// for the catch-all.
     pub host: Spanned<String>,
+    /// Path prefix the route serves, starting with `/`; `None` serves every path of the host.
+    pub path: Option<Spanned<String>>,
+    /// Whether the proxy removes `path` from the request path before forwarding.
+    pub strip_prefix: bool,
     /// Upstream port on 127.0.0.1, before interpolation.
     pub port: Spanned<String>,
 }
@@ -354,7 +359,14 @@ impl SessionConfig {
         let routes = |routes: &[RouteConfig]| {
             routes
                 .iter()
-                .map(|route| (route.host.inner.clone(), route.port.inner.clone()))
+                .map(|route| {
+                    (
+                        route.host.inner.clone(),
+                        route.path.as_ref().map(|path| path.inner.clone()),
+                        route.strip_prefix,
+                        route.port.inner.clone(),
+                    )
+                })
                 .collect::<Vec<_>>()
         };
         inner(&self.name) == inner(&other.name)
@@ -1110,6 +1122,16 @@ mod tests {
               interval: "15s"
               timeout: "3s"
               retries: 2
+            routes:
+              - host: api
+                path: /rest/
+                port: 8080
+              - host: api
+                port: 9090
+              - host: auth
+                path: /auth/v1/
+                strip_prefix: true
+                port: ${AUTH_PORT}
             services:
               api:
                 command: ["CMD", "sh", "-c", "echo api"]

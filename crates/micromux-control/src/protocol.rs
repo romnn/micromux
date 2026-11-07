@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// Bump the minor for additive changes (new optional/defaulted fields, new tools that reuse
 /// existing requests), and bump the major for incompatible request/response semantics.
-pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(3, 16);
+pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(3, 17);
 
 /// The first protocol revision whose sessions answer [`Request::GetEnvironment`].
 pub const ENVIRONMENT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(3, 15);

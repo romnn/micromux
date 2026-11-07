@@ -103,7 +103,15 @@ fn print_session(session: &micromux::SessionSummary) {
                 .as_deref()
                 .map(|service| format!(" ({service})"))
                 .unwrap_or_default();
-            println!("    - {} -> 127.0.0.1:{}{service}", route.url, route.port);
+            let stripped = if route.strip_prefix {
+                ", prefix stripped"
+            } else {
+                ""
+            };
+            println!(
+                "    - {} -> 127.0.0.1:{}{stripped}{service}",
+                route.url, route.port
+            );
         }
     }
     if !session.allocated_ports.is_empty() {

@@ -922,6 +922,10 @@ mod tests {
             routes:
               - host: app
                 port: ${APP_PORT}
+              - host: app
+                path: /auth/v1/
+                strip_prefix: true
+                port: 9998
               - host: "*"
                 port: 9999
             services:
@@ -930,6 +934,9 @@ mod tests {
                 ports: ["${APP_PORT}"]
                 environment:
                   APP_URL: "http://app.${MICROMUX_HOST_SUFFIX}"
+              auth:
+                command: ["sh", "-c", "sleep 60"]
+                ports: [9998]
         "#};
         std::fs::write(project.join("micromux.yaml"), raw)?;
         let mut config = from_str(raw, &project, 0usize, None, &mut Vec::new())?;
@@ -950,12 +957,25 @@ mod tests {
             &[
                 Route {
                     host: "app".to_string(),
+                    path: None,
+                    strip_prefix: false,
                     url: "http://app.luup2.localhost:8080/".to_string(),
                     port,
                     service: Some("web".to_string()),
                 },
+                // A path route of the same host has its own URL and owner.
+                Route {
+                    host: "app".to_string(),
+                    path: Some("/auth/v1/".to_string()),
+                    strip_prefix: true,
+                    url: "http://app.luup2.localhost:8080/auth/v1/".to_string(),
+                    port: 9998,
+                    service: Some("auth".to_string()),
+                },
                 Route {
                     host: "*".to_string(),
+                    path: None,
+                    strip_prefix: false,
                     url: "http://luup2.localhost:8080/".to_string(),
                     port: 9999,
                     service: None,
@@ -1009,9 +1029,9 @@ mod tests {
             .errors
             .iter()
             .map(|err| match err {
-                RouteError::ProxyPort { host, .. }
-                | RouteError::InvalidPort { host, .. }
-                | RouteError::Interpolation { host, .. } => host.as_str(),
+                RouteError::ProxyPort { route, .. }
+                | RouteError::InvalidPort { route, .. }
+                | RouteError::Interpolation { route, .. } => route.as_str(),
             })
             .collect::<Vec<_>>();
         assert_eq!(hosts, vec!["loop", "words", "unset"]);

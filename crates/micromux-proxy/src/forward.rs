@@ -1,6 +1,6 @@
 //! Forwarding one HTTP connection to the routes it names.
 //!
-//! Every request is looked up again by its `Host` header and sent over a fresh upstream
+//! Every request is looked up again by its `Host` header and path and sent over a fresh upstream
 //! connection, so a keep-alive browser connection never sticks to a route that has gone away.
 //! Bodies stream in both directions without buffering, and an upgrade (WebSocket) becomes a
 //! byte tunnel once the upstream answers `101 Switching Protocols`.
@@ -46,23 +46,31 @@ async fn handle(mut request: Request<Incoming>, shared: &Shared) -> Response<Bod
     let Some(host) = request_host(&request) else {
         return text(StatusCode::BAD_REQUEST, "the request names no host");
     };
-    let Some(target) = shared.lookup(&host) else {
+    let Some(target) = shared.lookup(&host, request.uri().path()) else {
         return html(
             StatusCode::NOT_FOUND,
-            pages::not_found(&host, &shared.listed_sessions()),
+            pages::not_found(&host, request.uri().path(), &shared.listed_sessions()),
         );
     };
+    let route = format!("{host}{}", target.path.as_deref().unwrap_or_default());
     let bad_gateway = |error: &str| {
         html(
             StatusCode::BAD_GATEWAY,
             pages::bad_gateway(
                 &target.session,
                 target.service.as_deref(),
-                &host,
+                &route,
                 target.port,
                 error,
             ),
         )
+    };
+    let origin_form = upstream_target(
+        request.uri(),
+        target.path.as_deref().filter(|_| target.strip_prefix),
+    );
+    let Ok(origin_form) = origin_form.parse() else {
+        return text(StatusCode::BAD_REQUEST, "the request target is invalid");
     };
 
     // Connect upstream
@@ -110,14 +118,7 @@ async fn handle(mut request: Request<Incoming>, shared: &Shared) -> Response<Bod
     if let Some(protocol) = &upgrade {
         mark_upgrade(request.headers_mut(), protocol.clone());
     }
-    let origin_form = request
-        .uri()
-        .path_and_query()
-        .map_or_else(|| "/".to_string(), ToString::to_string);
-    match origin_form.parse() {
-        Ok(uri) => *request.uri_mut() = uri,
-        Err(_) => return text(StatusCode::BAD_REQUEST, "the request target is invalid"),
-    }
+    *request.uri_mut() = origin_form;
 
     let mut response = match sender.send_request(request).await {
         Ok(response) => response,
@@ -140,6 +141,24 @@ async fn handle(mut request: Request<Incoming>, shared: &Shared) -> Response<Bod
 
     strip_hop_by_hop(response.headers_mut());
     response.map(BodyExt::boxed)
+}
+
+/// The origin-form target the upstream receives for `uri`: its path and query, with `strip`
+/// removed from the front of the path when given.
+///
+/// The path never ends up empty or relative: what remains after stripping gets a leading `/`.
+fn upstream_target(uri: &hyper::Uri, strip: Option<&str>) -> String {
+    let path = uri.path();
+    let path = match strip.and_then(|prefix| path.strip_prefix(prefix)) {
+        Some(rest) if rest.starts_with('/') => rest.to_string(),
+        Some(rest) => format!("/{rest}"),
+        None if path.is_empty() => "/".to_string(),
+        None => path.to_string(),
+    };
+    match uri.query() {
+        Some(query) => format!("{path}?{query}"),
+        None => path,
+    }
 }
 
 /// Splices an upgraded connection to its upstream until either side closes or the session's
@@ -311,6 +330,40 @@ mod tests {
 
         assert_eq!(headers.len(), 1);
         assert!(headers.contains_key(header::HOST));
+    }
+
+    /// Stripping removes exactly the matched prefix, keeps the query, and always leaves an
+    /// absolute path; without stripping the target passes through unchanged.
+    #[test]
+    fn upstream_targets_strip_the_prefix_and_keep_the_query() {
+        let target = |uri: &str, strip: Option<&str>| {
+            uri.parse::<hyper::Uri>()
+                .map(|uri| upstream_target(&uri, strip))
+                .unwrap_or_default()
+        };
+
+        // Stripped
+        assert_eq!(
+            target("/auth/v1/token?x=1", Some("/auth/v1/")),
+            "/token?x=1"
+        );
+        assert_eq!(target("/auth/v1/token", Some("/auth/v1")), "/token");
+        assert_eq!(target("/auth/v1/", Some("/auth/v1/")), "/");
+        assert_eq!(target("/auth/v1?x=1", Some("/auth/v1")), "/?x=1");
+        assert_eq!(target("/auth/v1x", Some("/auth/v1")), "/x");
+        assert_eq!(target("/auth/v1//x", Some("/auth/v1/")), "/x");
+        assert_eq!(target("/auth//x", Some("/auth")), "//x");
+        // A leading `//` stays a path rather than turning into an authority.
+        let reparsed = "//x".parse::<hyper::Uri>().ok();
+        assert_eq!(
+            reparsed.map(|uri| (uri.authority().is_none(), uri.path().to_string())),
+            Some((true, "//x".to_string()))
+        );
+
+        // Unchanged
+        assert_eq!(target("/rest/x?y", None), "/rest/x?y");
+        assert_eq!(target("http://app.one.localhost/a?b", None), "/a?b");
+        assert_eq!(target("http://app.one.localhost", None), "/");
     }
 
     #[test]

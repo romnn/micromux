@@ -58,6 +58,22 @@ pub enum ClientError {
         /// The acceptable ports, for the message.
         wanted: String,
     },
+    /// The running proxy speaks an older registration protocol that would serve the routes
+    /// differently, such as ignoring their paths.
+    #[error(
+        "the running micromux proxy (pid {pid}) speaks registration protocol {protocol}, but this \
+         session's routes need {required} (path routes); it was started by an older micromux and \
+         exits a minute after its last session stops, or stop it with `kill {pid}` and start \
+         this session again"
+    )]
+    OutdatedProxy {
+        /// Process id of the running proxy.
+        pid: u32,
+        /// The protocol the running proxy speaks.
+        protocol: u32,
+        /// The protocol the routes need.
+        required: u32,
+    },
     /// The proxy refused the registration because of a conflict with another session.
     #[error("the micromux proxy rejected the routes: {0}")]
     Rejected(String),
@@ -249,6 +265,19 @@ async fn register(
     };
     ensure_proxy(paths, exact, launcher).await?;
     let mut connection = connect(&paths.socket).await?;
+    // Ask on the registration connection itself, so the answer describes the very proxy that
+    // takes the routes even if another one replaced it since `ensure_proxy`.
+    match request(&mut connection, &ClientMessage::Hello).await? {
+        ProxyMessage::Info { pid, protocol, .. } if protocol < registration.required_protocol() => {
+            return Err(ClientError::OutdatedProxy {
+                pid,
+                protocol,
+                required: registration.required_protocol(),
+            });
+        }
+        ProxyMessage::Info { .. } => {}
+        other => return Err(ClientError::Protocol(format!("{other:?}"))),
+    }
     match request(
         &mut connection,
         &ClientMessage::Register(registration.clone()),

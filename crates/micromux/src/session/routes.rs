@@ -20,7 +20,16 @@ pub const CATCH_ALL_HOST: &str = "*";
 pub struct Route {
     /// Hostname labels below the session domain, such as `app`, or `*` for the catch-all.
     pub host: String,
-    /// Browser URL of the route; for the catch-all, the bare session domain.
+    /// Path prefix the route serves, such as `/rest/`; `None` serves every path of the host.
+    ///
+    /// The prefix matches the request path as plain text, so `/rest/` matches `/rest/x` but not
+    /// `/rest`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// Whether the proxy removes `path` from the request path before forwarding.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub strip_prefix: bool,
+    /// Browser URL of the route, ending in its path; for the catch-all, the bare session domain.
     pub url: String,
     /// Upstream port on 127.0.0.1.
     pub port: u16,
@@ -29,14 +38,53 @@ pub struct Route {
     pub service: Option<ServiceID>,
 }
 
+impl Route {
+    /// The URL for compact display: without the trailing `/` of a route that serves its whole
+    /// host, while a path route keeps its path exactly, since `/rest` and `/rest/` match
+    /// differently.
+    #[must_use]
+    pub fn display_url(&self) -> &str {
+        if self.path.is_some() {
+            &self.url
+        } else {
+            self.url.trim_end_matches('/')
+        }
+    }
+}
+
+/// Why `path` cannot be a route's path prefix, or `None` when it can.
+#[must_use]
+pub fn route_path_problem(path: &str) -> Option<&'static str> {
+    if !path.starts_with('/') {
+        return Some("must start with `/`");
+    }
+    if path == "/" {
+        return Some("matches every path; omit `path` to serve the whole host");
+    }
+    if !path
+        .bytes()
+        .all(|byte| byte.is_ascii_graphic() && byte != b'?' && byte != b'#')
+    {
+        return Some(
+            "must be printable ASCII without spaces, `?`, or `#`; percent-encode anything else",
+        );
+    }
+    None
+}
+
+/// Names a route in messages: its host, followed by its path when it has one.
+fn label(host: &str, path: Option<&str>) -> String {
+    format!("{host}{}", path.unwrap_or_default())
+}
+
 /// A route whose port cannot be used.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum RouteError {
     /// The port value references a variable that cannot be substituted.
-    #[error("cannot resolve the port of route `{host}`: {source}")]
+    #[error("cannot resolve the port of route `{route}`: {source}")]
     Interpolation {
-        /// The route's host.
-        host: String,
+        /// The route's host, followed by its path when it has one.
+        route: String,
         /// Location of the port value.
         span: Span,
         /// The failing reference.
@@ -44,20 +92,20 @@ pub enum RouteError {
         source: InterpolationError,
     },
     /// The port value is not a nonzero port number.
-    #[error("the port of route `{host}` resolves to `{value}`, which is not a port number")]
+    #[error("the port of route `{route}` resolves to `{value}`, which is not a port number")]
     InvalidPort {
-        /// The route's host.
-        host: String,
+        /// The route's host, followed by its path when it has one.
+        route: String,
         /// Location of the port value.
         span: Span,
         /// The resolved value.
         value: String,
     },
     /// The port is the proxy's own, so every request would loop back into the proxy.
-    #[error("route `{host}` points at port {port}, which is the proxy's own port")]
+    #[error("route `{route}` points at port {port}, which is the proxy's own port")]
     ProxyPort {
-        /// The route's host.
-        host: String,
+        /// The route's host, followed by its path when it has one.
+        route: String,
         /// Location of the port value.
         span: Span,
         /// The offending port.
@@ -130,33 +178,50 @@ pub(crate) fn resolve(
     let mut errors = Vec::new();
     for route in &session.settings.routes {
         let host = route.host.inner.clone();
+        let path = route.path.as_ref().map(|path| path.inner.clone());
+        let route_label = label(&host, path.as_deref());
         let span: Span = route.port.span.into();
         let value = match env::interpolate(&route.port.inner, &environment) {
             Ok(value) => value,
             Err(source) => {
-                errors.push(RouteError::Interpolation { host, span, source });
+                errors.push(RouteError::Interpolation {
+                    route: route_label,
+                    span,
+                    source,
+                });
                 continue;
             }
         };
         let port = match value.trim().parse::<u16>() {
             Ok(port) if port != 0 => port,
             _ => {
-                errors.push(RouteError::InvalidPort { host, span, value });
+                errors.push(RouteError::InvalidPort {
+                    route: route_label,
+                    span,
+                    value,
+                });
                 continue;
             }
         };
         if port == session.proxy_port {
-            errors.push(RouteError::ProxyPort { host, span, port });
+            errors.push(RouteError::ProxyPort {
+                route: route_label,
+                span,
+                port,
+            });
             continue;
         }
         let service = owner(port, services);
+        let url_path = path.as_deref().unwrap_or("/");
         let url = if host == CATCH_ALL_HOST {
-            format!("http://{suffix}/")
+            format!("http://{suffix}{url_path}")
         } else {
-            format!("http://{host}.{suffix}/")
+            format!("http://{host}.{suffix}{url_path}")
         };
         routes.push(Route {
             host,
+            path,
+            strip_prefix: route.strip_prefix,
             url,
             port,
             service,

@@ -1607,6 +1607,10 @@ mod tests {
             routes:
               - host: app
                 port: ${WEB_PORT}
+              - host: app
+                path: /auth/v1/
+                strip_prefix: true
+                port: 9998
               - host: "*"
                 port: 9999
             services:
@@ -1655,8 +1659,16 @@ mod tests {
             "Session · tui",
             "Session     tui.localhost",
             "Proxy       :8080",
-            &format!("Routes      http://app.tui.localhost:8080  → :{port}  web"),
-            "http://tui.localhost:8080      → :9999  no single service  (catch-all)",
+            // A path route keeps its trailing `/`, which is part of its prefix.
+            &format!(
+                "Routes      {:<38}  → :{port}  web",
+                "http://app.tui.localhost:8080"
+            ),
+            "http://app.tui.localhost:8080/auth/v1/  → :9998  no single service  (prefix stripped)",
+            &format!(
+                "{:<38}  → :9999  no single service  (catch-all)",
+                "http://tui.localhost:8080"
+            ),
             &format!("Ports       :{port}  WEB_PORT"),
         ] {
             assert!(session.contains(expected), "{expected}\n{session}");

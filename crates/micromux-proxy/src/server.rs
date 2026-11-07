@@ -14,7 +14,8 @@ use crate::listen::{self, BindError, PortPreference};
 use crate::pages::ListedSession;
 use crate::paths::ProxyPaths;
 use crate::protocol::{
-    ClientMessage, LEASE_TIMEOUT, MAX_MESSAGE_BYTES, ProxyMessage, Registration,
+    ClientMessage, LEASE_TIMEOUT, MAX_MESSAGE_BYTES, PROTOCOL_VERSION, ProxyMessage, Registration,
+    RouteTarget,
 };
 
 /// How long a starting proxy waits for a previous one to release the singleton lock.
@@ -234,8 +235,28 @@ pub(crate) struct Target {
     pub(crate) session: String,
     pub(crate) service: Option<String>,
     pub(crate) port: u16,
+    /// The matched route's path prefix, if it has one.
+    pub(crate) path: Option<String>,
+    /// Whether to remove `path` from the request path before forwarding.
+    pub(crate) strip_prefix: bool,
     /// Cancelled when the session's registration ends.
     pub(crate) cancel: CancellationToken,
+}
+
+/// The route among `routes` that serves `path`: the one with the longest prefix of `path`, or a
+/// route without a path, which matches every path, when no prefix does.
+fn best_route<'a>(
+    routes: impl Iterator<Item = &'a RouteTarget>,
+    path: &str,
+) -> Option<&'a RouteTarget> {
+    routes
+        .filter(|route| {
+            route
+                .path
+                .as_deref()
+                .is_none_or(|prefix| path.starts_with(prefix))
+        })
+        .max_by_key(|route| route.path.as_deref().map_or(0, str::len))
 }
 
 impl Shared {
@@ -243,29 +264,25 @@ impl Shared {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Finds the route serving `host`: an exact route of any session first, then the catch-all of
-    /// the most specific session domain containing it.
-    pub(crate) fn lookup(&self, host: &str) -> Option<Target> {
+    /// Finds the route serving `path` on `host`.
+    ///
+    /// The most specific route wins.
+    /// The routes of the exact host come first, and only when none of them matches `path` does
+    /// the catch-all of the most specific session domain containing `host` serve it.
+    /// Among the routes of one host, the longest path prefix wins, and a route without a path
+    /// matches every path.
+    pub(crate) fn lookup(&self, host: &str, path: &str) -> Option<Target> {
         let state = self.state();
-        let target = |entry: &Entry, route: &crate::protocol::RouteTarget| Target {
+        let target = |entry: &Entry, route: &RouteTarget| Target {
             session: entry.registration.session.clone(),
             service: route.service.clone(),
             port: route.port,
+            path: route.path.clone(),
+            strip_prefix: route.strip_prefix,
             cancel: entry.cancel.clone(),
         };
-        for (domain, entry) in &state.sessions {
-            for route in &entry.registration.routes {
-                if route.host != "*"
-                    && host.len() == route.host.len() + 1 + domain.len()
-                    && host.starts_with(route.host.as_str())
-                    && host.ends_with(domain.as_str())
-                    && host.as_bytes().get(route.host.len()) == Some(&b'.')
-                {
-                    return Some(target(entry, route));
-                }
-            }
-        }
-        state
+        // Session domains never nest, so at most one contains `host`; the longest wins anyway.
+        let (domain, entry) = state
             .sessions
             .iter()
             .filter(|(domain, _)| {
@@ -274,16 +291,22 @@ impl Shared {
                         .strip_suffix(domain.as_str())
                         .is_some_and(|prefix| prefix.ends_with('.'))
             })
-            .filter_map(|(domain, entry)| {
-                entry
-                    .registration
-                    .routes
-                    .iter()
-                    .find(|route| route.host == "*")
-                    .map(|route| (domain.len(), target(entry, route)))
+            .max_by_key(|(domain, _)| domain.len())?;
+        let labels = host
+            .strip_suffix(domain.as_str())
+            .and_then(|prefix| prefix.strip_suffix('.'));
+        let routes = &entry.registration.routes;
+        labels
+            .and_then(|labels| {
+                best_route(
+                    routes
+                        .iter()
+                        .filter(|route| route.host != "*" && route.host == labels),
+                    path,
+                )
             })
-            .max_by_key(|(length, _)| *length)
-            .map(|(_, target)| target)
+            .or_else(|| best_route(routes.iter().filter(|route| route.host == "*"), path))
+            .map(|route| target(entry, route))
     }
 
     /// The live sessions and their URLs, for the not-found page.
@@ -305,10 +328,11 @@ impl Shared {
                     .routes
                     .iter()
                     .map(|route| {
+                        let path = route.path.as_deref().unwrap_or("/");
                         if route.host == "*" {
-                            format!("http://{domain}{suffix}/")
+                            format!("http://{domain}{suffix}{path}")
                         } else {
-                            format!("http://{}.{domain}{suffix}/", route.host)
+                            format!("http://{}.{domain}{suffix}{path}", route.host)
                         }
                     })
                     .collect(),
@@ -545,6 +569,7 @@ async fn serve_registration(stream: UnixStream, shared: Arc<Shared>, stop: Cance
             Ok(ClientMessage::Hello) => ProxyMessage::Info {
                 port: shared.port,
                 pid: std::process::id(),
+                protocol: PROTOCOL_VERSION,
             },
             Ok(ClientMessage::Ping) => ProxyMessage::Pong,
             Ok(ClientMessage::Register(registration)) => {
@@ -607,6 +632,8 @@ pub(crate) mod tests {
                 .iter()
                 .map(|(host, port)| RouteTarget {
                     host: (*host).to_string(),
+                    path: None,
+                    strip_prefix: false,
                     port: *port,
                     service: None,
                 })
@@ -641,7 +668,7 @@ pub(crate) mod tests {
         )?;
         shared.register(registration("two", "/two", &[("app", 2001)]), None)?;
 
-        let port = |host: &str| shared.lookup(host).map(|target| target.port);
+        let port = |host: &str| shared.lookup(host, "/").map(|target| target.port);
         assert_eq!(port("app.one.localhost"), Some(1001));
         assert_eq!(port("email.internal.one.localhost"), Some(1002));
         assert_eq!(port("app.two.localhost"), Some(2001));
@@ -651,6 +678,78 @@ pub(crate) mod tests {
         assert_eq!(port("other.two.localhost"), None);
         assert_eq!(port("xone.localhost"), None);
         assert_eq!(port("app.three.localhost"), None);
+        Ok(())
+    }
+
+    /// Within a host the longest matching path prefix wins, a route without a path serves the
+    /// rest, and a path no route of the exact host matches falls through to the catch-all, which
+    /// follows the same rule.
+    #[test]
+    fn lookup_prefers_the_longest_path_prefix_then_the_catch_all() -> Result<(), Refusal> {
+        let shared = shared();
+        let mut one = registration(
+            "one",
+            "/one",
+            &[
+                ("api", 1001),
+                ("api", 1002),
+                ("api", 1003),
+                ("auth", 1004),
+                ("*", 1005),
+                ("*", 1006),
+            ],
+        );
+        for (route, path) in one.routes.iter_mut().zip([
+            None,
+            Some("/rest/"),
+            Some("/rest/admin/"),
+            Some("/auth/v1/"),
+            None,
+            Some("/static/"),
+        ]) {
+            route.path = path.map(ToString::to_string);
+        }
+        shared.register(one, None)?;
+
+        let port = |host: &str, path: &str| shared.lookup(host, path).map(|target| target.port);
+
+        // Longest prefix within the host, then the host's route without a path
+        assert_eq!(port("api.one.localhost", "/rest/admin/users"), Some(1003));
+        assert_eq!(port("api.one.localhost", "/rest/x"), Some(1002));
+        assert_eq!(port("api.one.localhost", "/rest/"), Some(1002));
+        assert_eq!(port("api.one.localhost", "/rest"), Some(1001));
+        assert_eq!(port("api.one.localhost", "/REST/x"), Some(1001));
+        assert_eq!(port("api.one.localhost", "/static/x"), Some(1001));
+
+        // A host whose path routes do not match falls through to the catch-all.
+        assert_eq!(port("auth.one.localhost", "/auth/v1/token"), Some(1004));
+        assert_eq!(port("auth.one.localhost", "/other"), Some(1005));
+        assert_eq!(port("auth.one.localhost", "/static/x"), Some(1006));
+
+        // The catch-all's own path routes and its fallback
+        assert_eq!(port("one.localhost", "/static/app.js"), Some(1006));
+        assert_eq!(port("deep.other.one.localhost", "/"), Some(1005));
+        Ok(())
+    }
+
+    /// Without a fallback anywhere, a path that no prefix matches is not served.
+    #[test]
+    fn unmatched_paths_without_a_fallback_are_not_found() -> Result<(), Refusal> {
+        let shared = shared();
+        let mut one = registration("one", "/one", &[("auth", 1001)]);
+        if let Some(route) = one.routes.first_mut() {
+            route.path = Some("/auth/v1/".to_string());
+            route.strip_prefix = true;
+        }
+        shared.register(one, None)?;
+
+        let target = shared.lookup("auth.one.localhost", "/auth/v1/token");
+        assert_eq!(
+            target.map(|target| (target.port, target.path, target.strip_prefix)),
+            Some((1001, Some("/auth/v1/".to_string()), true))
+        );
+        assert!(shared.lookup("auth.one.localhost", "/auth/v1").is_none());
+        assert!(shared.lookup("auth.one.localhost", "/").is_none());
         Ok(())
     }
 
@@ -668,12 +767,12 @@ pub(crate) mod tests {
         assert!(first.cancel.is_cancelled());
         shared.unregister(&first);
         assert_eq!(
-            shared.lookup("app.one.localhost").map(|t| t.port),
+            shared.lookup("app.one.localhost", "/").map(|t| t.port),
             Some(1002)
         );
 
         shared.unregister(&second);
-        assert!(shared.lookup("app.one.localhost").is_none());
+        assert!(shared.lookup("app.one.localhost", "/").is_none());
         assert!(second.cancel.is_cancelled());
         Ok(())
     }
@@ -686,7 +785,7 @@ pub(crate) mod tests {
         let shared = shared();
         let first = shared.register(registration("one", "/one", &[("app", 1001)]), None)?;
         let target = shared
-            .lookup("app.one.localhost")
+            .lookup("app.one.localhost", "/")
             .ok_or_else(|| Refusal::transient("app is not routed"))?;
 
         // Same connection
@@ -697,11 +796,11 @@ pub(crate) mod tests {
         assert_eq!(replaced.generation, first.generation);
         assert!(!target.cancel.is_cancelled());
         assert_eq!(
-            shared.lookup("app.one.localhost").map(|t| t.port),
+            shared.lookup("app.one.localhost", "/").map(|t| t.port),
             Some(1002)
         );
         assert_eq!(
-            shared.lookup("api.one.localhost").map(|t| t.port),
+            shared.lookup("api.one.localhost", "/").map(|t| t.port),
             Some(1003)
         );
 
@@ -710,7 +809,7 @@ pub(crate) mod tests {
         assert!(target.cancel.is_cancelled());
         shared.unregister(&replaced);
         assert_eq!(
-            shared.lookup("app.one.localhost").map(|t| t.port),
+            shared.lookup("app.one.localhost", "/").map(|t| t.port),
             Some(1004)
         );
         shared.unregister(&takeover);
