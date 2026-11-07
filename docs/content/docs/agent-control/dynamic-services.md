@@ -45,4 +45,4 @@ Agents manage runtime services with a small set of tools:
 
 Before creating one, an agent checks `capabilities.dynamic_services` on `list_sessions`. From the shell, `micromux ctl stop-dynamic <id>` retires a dynamic service while keeping its logs and state for inspection.
 
-Environment values can be sent inward or cloned server-side with `from_service`; snapshots omit the environment entirely, and receipts return only key names.
+Environment values can be sent inward or cloned server-side with `from_service`; snapshots omit the environment entirely, and receipts return only key names. A clone made with `from_service` does not inherit the original's [`cleanup`]({{< relref "../configuration/services.md" >}}#cleanup): it would tear down what the original still uses.
