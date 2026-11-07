@@ -328,8 +328,11 @@ pub struct ServiceSnapshot {
     /// Graceful-stop signal captured for this run.
     #[serde(default)]
     pub stop_signal: crate::spec::StopSignal,
-    /// Whether the current command, working directory, ports, healthcheck timing, stop grace, stop
-    /// signal, or cleanup differs from the configuration captured for this run.
+    /// Whether the service has a live run and its current definition differs from the one the run
+    /// started with in anything a restart would apply.
+    ///
+    /// That covers the command, working directory, environment (including `env_file` contents and
+    /// color), ports, healthcheck, stop grace period, stop signal, and cleanup.
     #[serde(default)]
     pub config_stale: bool,
     /// Active automatic-restart backoff, if the scheduler is delaying the next attempt.

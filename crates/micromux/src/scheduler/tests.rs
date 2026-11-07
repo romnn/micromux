@@ -694,15 +694,19 @@ fn project_snapshot_reports_runtime_identity_and_config_drift() -> eyre::Result<
     Ok(())
 }
 
-/// A change that only reaches the process through its environment still needs a restart, so it
-/// marks the run stale like a command change does.
+/// A change that only reaches the process through its environment or its probe loop still needs
+/// a restart, so it marks a live run stale like a command change does.
 #[test]
-fn project_snapshot_reports_environment_only_drift() -> eyre::Result<()> {
-    let service = Service::new(
+fn project_snapshot_reports_environment_and_healthcheck_drift() -> eyre::Result<()> {
+    let mut service = Service::new(
         "svc",
         Path::new("."),
         service_config("svc", ("sh", &["-c", "sleep 60"])),
     )?;
+    service.spec.healthcheck = Some(crate::HealthcheckSpec {
+        test: vec!["true".to_string()],
+        ..crate::HealthcheckSpec::default()
+    });
     let mut runtime = ServiceRuntime::new(ServiceRuntimeInit::from(&service));
     runtime.run_config = Some(RunConfig::from(&service));
     start_dummy_run(&mut runtime)?;
@@ -724,8 +728,28 @@ fn project_snapshot_reports_environment_only_drift() -> eyre::Result<()> {
     changed_color.enable_color = !service.enable_color;
     assert!(project_snapshot(&changed_color, &runtime).0.config_stale);
 
+    // The probe command and its start delay, which the run's probe loop never reloads
+    let mut changed_probe = service.clone();
+    if let Some(healthcheck) = &mut changed_probe.spec.healthcheck {
+        healthcheck.test = vec!["false".to_string()];
+    }
+    assert!(project_snapshot(&changed_probe, &runtime).0.config_stale);
+    let mut changed_delay = service.clone();
+    if let Some(healthcheck) = &mut changed_delay.spec.healthcheck {
+        healthcheck.start_delay = Some(Duration::from_secs(5));
+    }
+    assert!(project_snapshot(&changed_delay, &runtime).0.config_stale);
+
     // The unchanged definition stays current.
     assert!(!project_snapshot(&service, &runtime).0.config_stale);
+
+    // Once the run ended, the next start runs the current definition, so nothing is stale.
+    runtime.finish_current_run(&service.spec, 0);
+    assert!(
+        !project_snapshot(&changed_environment, &runtime)
+            .0
+            .config_stale
+    );
     Ok(())
 }
 

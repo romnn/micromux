@@ -257,7 +257,8 @@ pub(super) struct RunConfig {
     /// Whether the run got the color variables, which are part of its environment too.
     enable_color: bool,
     advertised_ports: Vec<u16>,
-    healthcheck: Option<HealthcheckConfig>,
+    /// The whole probe definition, because the run's probe loop keeps the one it started with.
+    healthcheck: Option<crate::spec::HealthcheckSpec>,
     stop_grace_period: Duration,
     stop_signal: crate::spec::StopSignal,
     cleanup: Option<crate::spec::CleanupSpec>,
@@ -265,20 +266,37 @@ pub(super) struct RunConfig {
 
 impl From<&Service> for RunConfig {
     fn from(service: &Service) -> Self {
+        // An exhaustive pattern makes every new spec field either captured here or explicitly left
+        // out, because a field a restart applies but this misses is never reported as stale.
+        let crate::spec::ServiceSpec {
+            // Display only.
+            name: _,
+            // Read when a run ends, so a change applies to the live run without a restart.
+            kind: _,
+            command,
+            // Captured below from the validated directory the run spawns in.
+            working_dir: _,
+            environment,
+            // Gates only when a run starts, so a change needs no restart.
+            depends_on: _,
+            healthcheck,
+            ports,
+            // A reconcile applies the policy to the runtime directly.
+            restart: _,
+            stop_grace_period,
+            stop_signal,
+            cleanup,
+        } = &service.spec;
         Self {
-            command: service.argv(),
+            command: command.clone(),
             working_dir: service.working_dir_display(),
-            environment: service.spec.environment.clone(),
+            environment: environment.clone(),
             enable_color: service.enable_color,
-            advertised_ports: service.spec.ports.clone(),
-            healthcheck: service
-                .spec
-                .healthcheck
-                .as_ref()
-                .map(HealthcheckConfig::from),
-            stop_grace_period: service.spec.stop_grace_period,
-            stop_signal: service.spec.stop_signal,
-            cleanup: service.spec.cleanup.clone(),
+            advertised_ports: ports.clone(),
+            healthcheck: healthcheck.clone(),
+            stop_grace_period: *stop_grace_period,
+            stop_signal: *stop_signal,
+            cleanup: cleanup.clone(),
         }
     }
 }
@@ -435,15 +453,18 @@ impl ServiceRuntime {
         self.retired.is_none()
     }
 
-    /// Whether `service`'s current definition differs from the one its latest run started with,
-    /// so a restart would change what runs.
+    /// Whether `service` has a live run whose definition differs from the current one, so a
+    /// restart would change what runs.
     ///
     /// The service snapshot's `config_stale` and the environment's `stale` both come from here,
     /// so the TUI, `ctl` and `env`/`exec` always agree.
+    /// Without a live run nothing is stale, because the next start runs the current definition.
     fn config_stale(&self, service: &Service) -> bool {
-        self.run_config
-            .as_ref()
-            .is_some_and(|captured| *captured != RunConfig::from(service))
+        self.running.is_some()
+            && self
+                .run_config
+                .as_ref()
+                .is_some_and(|captured| *captured != RunConfig::from(service))
     }
 
     fn is_retired(&self) -> bool {
@@ -772,7 +793,7 @@ pub(super) fn project_snapshot(
         started_at_unix_ms: runtime.started_at_unix_ms,
         advertised_ports: run_config.advertised_ports.clone(),
         healthcheck_configured: run_config.healthcheck.is_some(),
-        healthcheck: run_config.healthcheck.clone(),
+        healthcheck: run_config.healthcheck.as_ref().map(HealthcheckConfig::from),
         stop_grace_period: run_config.stop_grace_period,
         stop_signal: run_config.stop_signal,
         config_stale: runtime.config_stale(service),
