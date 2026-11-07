@@ -55,8 +55,9 @@ const UNSOLICITED_SUBSCRIPTION_FRAME_WINDOW: std::time::Duration =
     std::time::Duration::from_mins(1);
 /// A stalled subscriber must release its connection permit promptly.
 const SUBSCRIPTION_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
-/// Grace for a diagnostic shared lock to clear before startup concludes that an owner exists.
-const OWNER_PROBE_LOCK_GRACE: std::time::Duration = std::time::Duration::from_millis(50);
+/// Longest a starting session waits out diagnostic probes that keep the endpoint lock shared,
+/// which only an endless stream of probes can reach.
+const OWNER_PROBE_LOCK_WAIT_LIMIT: std::time::Duration = std::time::Duration::from_secs(5);
 const OWNER_PROBE_LOCK_RETRY: std::time::Duration = std::time::Duration::from_millis(1);
 
 #[derive(Clone, Copy)]
@@ -215,24 +216,35 @@ fn bind_unix(
     }))
 }
 
-/// Acquires the endpoint lock after allowing an overlapping diagnostic probe to finish.
+/// Acquires the endpoint lock unless another session owns it, waiting out overlapping
+/// diagnostic probes.
 ///
-/// BSD `flock` has no non-mutating ownership query. Probes therefore take a shared lock briefly,
-/// and startup gives that transient reader time to clear before treating contention as ownership.
+/// BSD `flock` has no non-mutating ownership query, so probes take a shared lock briefly, while an
+/// owner holds the lock exclusively for its lifetime.
+/// When the exclusive lock is contended, a shared lock tells the two apart: it can be taken
+/// beside probes but not beside an owner.
+/// The wait therefore lasts exactly as long as probes hold the lock, however slowly they are
+/// scheduled.
 fn try_lock_endpoint_owner(lock_file: &std::fs::File) -> std::io::Result<bool> {
-    let deadline = std::time::Instant::now() + OWNER_PROBE_LOCK_GRACE;
+    let would_block = |err: &std::io::Error| err.kind() == std::io::ErrorKind::WouldBlock;
+    let deadline = std::time::Instant::now() + OWNER_PROBE_LOCK_WAIT_LIMIT;
     loop {
         match fs2::FileExt::try_lock_exclusive(lock_file) {
             Ok(()) => return Ok(true),
-            Err(err)
-                if err.kind() == std::io::ErrorKind::WouldBlock
-                    && std::time::Instant::now() < deadline =>
-            {
-                std::thread::sleep(OWNER_PROBE_LOCK_RETRY);
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => return Ok(false),
+            Err(err) if would_block(&err) => {}
             Err(err) => return Err(err),
         }
+        match fs2::FileExt::try_lock_shared(lock_file) {
+            // Only probes hold the lock
+            Ok(()) => fs2::FileExt::unlock(lock_file)?,
+            // An owner holds it, or another session is just taking it
+            Err(err) if would_block(&err) => return Ok(false),
+            Err(err) => return Err(err),
+        }
+        if std::time::Instant::now() >= deadline {
+            return Ok(false);
+        }
+        std::thread::sleep(OWNER_PROBE_LOCK_RETRY);
     }
 }
 

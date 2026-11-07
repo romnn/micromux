@@ -1059,10 +1059,10 @@ async fn endpoint_startup_waits_for_an_overlapping_owner_probe() -> eyre::Result
         .truncate(false)
         .open(socket_path.with_extension("lock"))?;
     fs2::FileExt::try_lock_shared(&lock_file)?;
-    // Keep the shared lock long enough for `bind` to observe it, then release it within the
-    // diagnostic-probe grace period.
+    // A probe that holds its shared lock for a while, as a probe descheduled on a loaded machine
+    // does, still never reads as an owner.
     let release = std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_millis(5));
+        std::thread::sleep(std::time::Duration::from_millis(200));
         drop(lock_file);
     });
 
