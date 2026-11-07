@@ -235,6 +235,7 @@ micromux ctl log-runs api
 micromux ctl logs api --tail 50
 micromux ctl logs api --run-generation 2 --tail 200
 micromux ctl restart api
+micromux ctl wait api   # until healthy; fails fast behind a dependency that failed
 ```
 
 Runtime-created services are disabled by default. Enable and bound them in the target session's

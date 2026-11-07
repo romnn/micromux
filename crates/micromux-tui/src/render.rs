@@ -828,6 +828,12 @@ fn service_info_rows(
             .collect(),
     ));
     rows.extend(info_rows("Depends on", depends_on));
+    if let Some(failure) = &snapshot.dependency_failure {
+        rows.extend(info_rows(
+            "Blocked",
+            vec![failure.describe().fg(tailwind::RED.c400)],
+        ));
+    }
     rows.extend(info_rows("Restart", restart_rows(snapshot)));
     rows.extend(info_rows("Stop", vec![stop]));
     rows.extend(info_rows(

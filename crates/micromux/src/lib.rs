@@ -63,11 +63,11 @@ pub use env::{Error as EnvironmentError, InterpolationError};
 pub use graph::Error as GraphError;
 pub use health_check::Health;
 pub use model::{
-    ChangeKind, CleanupStatus, Desired, DiskLogRetention, DynamicServiceInfo, EVENT_HISTORY,
-    Execution, HealthAttempt, HealthLine, HealthResult, HealthcheckConfig, LogLimit, LogLine,
-    LogRetention, LogRun, LogRunReadError, LogRunSummary, MemoryLogRetention, OriginKind,
-    RestartState, RetiredReason, ServiceEvent, ServiceEventKind, ServiceSnapshot, SessionChange,
-    SessionModelReader, trim_to_last_bytes,
+    ChangeKind, CleanupStatus, DependencyFailure, DependencyFailureReason, Desired,
+    DiskLogRetention, DynamicServiceInfo, EVENT_HISTORY, Execution, HealthAttempt, HealthLine,
+    HealthResult, HealthcheckConfig, LogLimit, LogLine, LogRetention, LogRun, LogRunReadError,
+    LogRunSummary, MemoryLogRetention, OriginKind, RestartState, RetiredReason, ServiceEvent,
+    ServiceEventKind, ServiceSnapshot, SessionChange, SessionModelReader, trim_to_last_bytes,
 };
 pub use scheduler::{
     Command, CommandRejection, DynamicServiceAck, DynamicServiceResult, MAX_PTY_INPUT_BATCH_BYTES,

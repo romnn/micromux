@@ -1,8 +1,7 @@
-//! Mapping control responses into tool outputs, and the `wait_for_healthy` evaluation.
+//! Mapping control responses into tool outputs.
 
 use micromux::{
-    Desired, Execution, Health, HealthAttempt, LogLine, LogRunSummary, ServiceCommandAck,
-    ServiceEvent, ServiceSnapshot,
+    HealthAttempt, LogLine, LogRunSummary, ServiceCommandAck, ServiceEvent, ServiceSnapshot,
 };
 use micromux_control::{ErrorCode, Response};
 
@@ -195,156 +194,9 @@ pub fn shutting_down(response: Response) -> Result<(), ToolError> {
     }
 }
 
-/// The verdict of one `wait_for_healthy` evaluation against a fresh snapshot.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WaitOutcome {
-    /// Keep waiting.
-    Pending,
-    /// The target run is up (and healthy, if a healthcheck is configured).
-    Healthy,
-    /// The target run exited; carries its exit code.
-    Exited(Option<i32>),
-    /// The service is disabled or retired and will never become healthy.
-    InvalidState,
-}
-
-/// Return whether a snapshot belongs to the run selected by a generation gate.
-#[must_use]
-pub fn generation_ready(snapshot: &ServiceSnapshot, after: Option<u64>) -> bool {
-    match after {
-        Some(generation) => snapshot.run_generation > generation,
-        // `run_generation == 0` means never started: wait for the first run to come up.
-        None => snapshot.run_generation >= 1,
-    }
-}
-
-/// Evaluate the generation-aware healthy condition against a snapshot.
-///
-/// With `after = Some(G)` we resolve only on a run with `run_generation > G`, so a restart's caller
-/// never observes the pre-restart state. With `after = None` we accept the current run.
-#[must_use]
-pub fn evaluate(snapshot: &ServiceSnapshot, after: Option<u64>) -> WaitOutcome {
-    if snapshot.desired == Desired::Disabled {
-        // A disabled service will never become healthy — fail fast rather than time out.
-        return WaitOutcome::InvalidState;
-    }
-
-    if !generation_ready(snapshot, after) {
-        return WaitOutcome::Pending;
-    }
-
-    match snapshot.execution {
-        Execution::Exited => WaitOutcome::Exited(snapshot.last_exit_code),
-        Execution::Running => {
-            if !snapshot.healthcheck_configured || snapshot.health == Some(Health::Healthy) {
-                WaitOutcome::Healthy
-            } else {
-                WaitOutcome::Pending
-            }
-        }
-        Execution::Pending
-        | Execution::Blocked
-        | Execution::Starting
-        | Execution::Stopping
-        | Execution::Unknown => WaitOutcome::Pending,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use micromux::RestartPolicy;
-    use similar_asserts::assert_eq;
-
-    fn snapshot() -> ServiceSnapshot {
-        let mut snapshot = ServiceSnapshot::initial(
-            "svc".to_string(),
-            "svc".to_string(),
-            Vec::new(),
-            None,
-            RestartPolicy::Never,
-            Vec::new(),
-            None,
-        );
-        snapshot.execution = Execution::Running;
-        snapshot.run_generation = 1;
-        snapshot
-    }
-
-    #[test]
-    fn waits_for_a_new_generation_after_restart() {
-        let mut snap = snapshot();
-        snap.run_generation = 1;
-        // Restart returned G=1; the pre-restart Running state must not satisfy the wait.
-        assert_eq!(evaluate(&snap, Some(1)), WaitOutcome::Pending);
-        snap.run_generation = 2;
-        assert_eq!(evaluate(&snap, Some(1)), WaitOutcome::Healthy);
-    }
-
-    #[test]
-    fn requires_healthy_when_a_healthcheck_is_configured() {
-        let mut snap = snapshot();
-        snap.healthcheck_configured = true;
-        snap.health = None;
-        assert_eq!(evaluate(&snap, None), WaitOutcome::Pending);
-        snap.health = Some(Health::Unhealthy);
-        assert_eq!(evaluate(&snap, None), WaitOutcome::Pending);
-        snap.health = Some(Health::Healthy);
-        assert_eq!(evaluate(&snap, None), WaitOutcome::Healthy);
-    }
-
-    #[test]
-    fn disabled_fails_fast() {
-        let mut snap = snapshot();
-        snap.desired = Desired::Disabled;
-        assert_eq!(evaluate(&snap, None), WaitOutcome::InvalidState);
-    }
-
-    #[test]
-    fn exited_reports_exit_code() {
-        let mut snap = snapshot();
-        snap.execution = Execution::Exited;
-        snap.last_exit_code = Some(3);
-        assert_eq!(evaluate(&snap, None), WaitOutcome::Exited(Some(3)));
-    }
-
-    #[test]
-    fn never_started_waits_for_first_run() {
-        let mut snap = snapshot();
-        snap.run_generation = 0;
-        snap.execution = Execution::Pending;
-        assert_eq!(evaluate(&snap, None), WaitOutcome::Pending);
-    }
-
-    #[test]
-    fn new_generation_that_exited_reports_the_exit_code() {
-        // restart returned G=1; the new run (gen 2) crashed — the wait must surface the exit, not
-        // keep waiting.
-        let mut snap = snapshot();
-        snap.run_generation = 2;
-        snap.execution = Execution::Exited;
-        snap.last_exit_code = Some(1);
-        assert_eq!(evaluate(&snap, Some(1)), WaitOutcome::Exited(Some(1)));
-    }
-
-    #[test]
-    fn disabled_takes_precedence_over_the_generation_gate() {
-        // Even when waiting for a future generation, a disabled service fails fast (it will never
-        // become healthy) rather than blocking until timeout.
-        let mut snap = snapshot();
-        snap.desired = Desired::Disabled;
-        snap.run_generation = 1;
-        assert_eq!(evaluate(&snap, Some(5)), WaitOutcome::InvalidState);
-    }
-
-    #[test]
-    fn starting_and_stopping_are_pending() {
-        let mut snap = snapshot();
-        snap.execution = Execution::Starting;
-        assert_eq!(evaluate(&snap, None), WaitOutcome::Pending);
-        snap.execution = Execution::Stopping;
-        assert_eq!(evaluate(&snap, None), WaitOutcome::Pending);
-    }
 
     #[test]
     fn remote_error_maps_retryable_errors_to_busy() {

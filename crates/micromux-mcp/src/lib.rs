@@ -21,7 +21,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use micromux::{Desired, Execution, Health, HealthAttempt, ServiceSnapshot};
+use micromux::{DependencyFailure, Desired, Execution, Health, HealthAttempt, ServiceSnapshot};
 use micromux_control::{
     Client, ControlEndpoint, ControlError, ErrorCode, Request, Response, SessionInfo, endpoint_for,
     runtime_dir_statuses, transport_supported, usable_runtime_dirs,
@@ -46,9 +46,10 @@ use serde::{Deserialize, Serialize};
 use crate::select::ToolError;
 use crate::tools::events::{ServiceEventPage, SessionServiceEvent, merge_service_events};
 use crate::tools::health::{
-    ServiceDiagnosis, SnapshotWait, WaitConclusion, bounded_attempt, diagnose_service,
-    health_history, latest_health_for_snapshot, retired_service_message, service_needs_diagnosis,
-    service_snapshot, timeout_hint, wait_for_health, wait_for_snapshot,
+    ServiceDiagnosis, SnapshotWait, WaitConclusion, bounded_attempt, dependency_failed_error,
+    diagnose_service, health_history, latest_health_for_snapshot, retired_service_message,
+    service_needs_diagnosis, service_snapshot, timeout_hint, unavailable_error, wait_for_health,
+    wait_for_snapshot,
 };
 use crate::tools::logs::{
     FollowGap, ServiceFollowGap, compact_logs_since, current_cursors, current_service_cursor,
@@ -61,6 +62,7 @@ use crate::tools::sessions::{
 };
 #[cfg(unix)]
 use crate::tools::sessions::{ProcessExitWatch, STOP_CONFIRM_TIMEOUT};
+use micromux_control::wait::{self, WaitFor, WaitVerdict};
 
 type ToolResult<T> = Result<Json<T>, ErrorData>;
 
@@ -826,6 +828,8 @@ struct WaitResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     latest_healthcheck: Option<Nullable<HealthAttempt>>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    dependency_failure: Option<DependencyFailure>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     hint: Option<&'static str>,
 }
 
@@ -834,6 +838,7 @@ struct WaitResult {
 enum WaitStatus {
     Healthy,
     Exited,
+    DependencyFailed,
     Timeout,
 }
 
@@ -859,33 +864,15 @@ struct WaitForExitResult {
     waited_secs: u64,
 }
 
-enum ExitVerdict {
-    Exited,
-    InvalidState,
-}
-
-fn classify_exit(snapshot: &ServiceSnapshot, after_generation: Option<u64>) -> Option<ExitVerdict> {
-    let generation_ready = convert::generation_ready(snapshot, after_generation);
-    if generation_ready && snapshot.execution == Execution::Exited {
-        return Some(ExitVerdict::Exited);
-    }
-
-    let retired = snapshot.retired.is_some();
-    let unavailable = snapshot.desired == Desired::Disabled || retired;
-    let qualifying_run_in_flight = generation_ready
-        && matches!(
-            snapshot.execution,
-            Execution::Starting | Execution::Running | Execution::Stopping
-        );
-    (unavailable && !qualifying_run_in_flight).then_some(ExitVerdict::InvalidState)
-}
-
 impl WaitResult {
     fn from_conclusion(service: String, timeout: Duration, conclusion: &WaitConclusion) -> Self {
         match conclusion {
             WaitConclusion::Healthy(snapshot) => Self::healthy(service, snapshot.run_generation),
             WaitConclusion::Exited(snapshot) => {
                 Self::exited(service, snapshot.last_exit_code, snapshot.run_generation)
+            }
+            WaitConclusion::DependencyFailed { snapshot, failure } => {
+                Self::dependency_failed(service, snapshot, failure.clone())
             }
             WaitConclusion::Timeout {
                 snapshot,
@@ -912,6 +899,7 @@ impl WaitResult {
             health: None,
             uptime_secs: None,
             latest_healthcheck: None,
+            dependency_failure: None,
             hint: None,
         }
     }
@@ -929,7 +917,33 @@ impl WaitResult {
             health: None,
             uptime_secs: None,
             latest_healthcheck: None,
+            dependency_failure: None,
             hint: Some("the run exited before becoming healthy — inspect get_logs for why"),
+        }
+    }
+
+    fn dependency_failed(
+        service: String,
+        snapshot: &ServiceSnapshot,
+        failure: DependencyFailure,
+    ) -> Self {
+        Self {
+            status: WaitStatus::DependencyFailed,
+            service,
+            generation: None,
+            exit_code: None,
+            waited_secs: None,
+            execution: Some(snapshot.execution),
+            run_generation: Some(snapshot.run_generation),
+            healthcheck_configured: None,
+            health: None,
+            uptime_secs: None,
+            latest_healthcheck: None,
+            dependency_failure: Some(failure),
+            hint: Some(
+                "the service is blocked behind a dependency that cannot meet its condition — \
+                 restart or enable the dependency named in dependency_failure",
+            ),
         }
     }
 
@@ -951,6 +965,7 @@ impl WaitResult {
             health: Some(Nullable(snapshot.health)),
             uptime_secs: Some(Nullable(snapshot.uptime.map(|uptime| uptime.as_secs()))),
             latest_healthcheck: Some(Nullable(latest_healthcheck)),
+            dependency_failure: None,
             hint: Some(timeout_hint(snapshot)),
         }
     }
@@ -2643,7 +2658,10 @@ impl McpServer {
 
     #[tool(
         description = "Wait until a service becomes healthy (or its run exits, or a timeout). \
-        Pass after_generation (from restart_service/enable_service) to wait for the new run."
+        Pass after_generation (from restart_service/enable_service) to wait for the new run. A \
+        disabled service fails immediately, and so does one blocked behind a dependency that \
+        exited for good or is disabled or retired; the error names that dependency, its state, \
+        and its exit code."
     )]
     async fn wait_for_healthy(&self, args: Parameters<WaitArgs>) -> ToolResult<WaitResult> {
         let Parameters(args) = args;
@@ -2672,6 +2690,9 @@ impl McpServer {
                 return Err(error_data(enrich_unknown_service(&args.service, err).await));
             }
         };
+        if let WaitConclusion::DependencyFailed { failure, .. } = conclusion {
+            return Err(error_data(dependency_failed_error(&args.service, failure)));
+        }
         Ok(Json(WaitResult::from_conclusion(
             args.service,
             timeout,
@@ -2683,7 +2704,8 @@ impl McpServer {
         description = "Wait for a service run to exit and return its exit code plus compact logs \
         produced after this call began. Intended for one-shot jobs; use wait_for_healthy for \
         servers. Pass after_generation to require a newer run. A disabled or retired service with \
-        no qualifying run in flight fails immediately."
+        no qualifying run in flight, or one blocked behind a dependency that can no longer meet its \
+        condition, fails immediately."
     )]
     async fn wait_for_exit(
         &self,
@@ -2718,7 +2740,7 @@ impl McpServer {
                 &mut conn,
                 &args.service,
                 timeout,
-                |snapshot| classify_exit(snapshot, args.after_generation),
+                |snapshot| wait::evaluate(snapshot, WaitFor::Exit, args.after_generation),
             )
             .await,
         )
@@ -2726,21 +2748,36 @@ impl McpServer {
         let (status, exit_code, snapshot) = match waited {
             SnapshotWait::Matched {
                 snapshot,
-                verdict: ExitVerdict::Exited,
-            } => (WaitForExitStatus::Exited, snapshot.last_exit_code, snapshot),
+                verdict: WaitVerdict::Exited(exit_code),
+            } => (WaitForExitStatus::Exited, exit_code, snapshot),
             SnapshotWait::Matched {
                 snapshot,
-                verdict: ExitVerdict::InvalidState,
+                verdict: WaitVerdict::Unavailable,
             } => {
-                let message = if let Some(reason) = snapshot.retired {
-                    retired_service_message(&args.service, reason)
-                } else {
-                    format!(
-                        "service `{}` is disabled with no qualifying run in flight",
-                        args.service
-                    )
-                };
-                return Err(error_data(ToolError::InvalidState(message)));
+                return Err(error_data(unavailable_error(
+                    &args.service,
+                    &snapshot,
+                    || {
+                        format!(
+                            "service `{}` is disabled with no qualifying run in flight",
+                            args.service
+                        )
+                    },
+                )));
+            }
+            SnapshotWait::Matched {
+                verdict: WaitVerdict::DependencyFailed(failure),
+                ..
+            } => {
+                return Err(error_data(dependency_failed_error(&args.service, failure)));
+            }
+            SnapshotWait::Matched {
+                verdict: WaitVerdict::Healthy,
+                ..
+            } => {
+                return Err(error_data(ToolError::Unexpected(
+                    "an exit wait resolved as healthy".to_string(),
+                )));
             }
             SnapshotWait::Timeout(snapshot) => (WaitForExitStatus::Timeout, None, snapshot),
         };
@@ -2829,10 +2866,7 @@ impl McpServer {
                 return Err(error_data(enrich_unknown_service(&args.service, err).await));
             }
         };
-        if matches!(
-            convert::evaluate(&snapshot, None),
-            convert::WaitOutcome::Healthy
-        ) {
+        if wait::evaluate(&snapshot, WaitFor::Healthy, None) == Some(WaitVerdict::Healthy) {
             return Ok(Json(EnsureServiceReadyResult {
                 session_ref: SessionRef::from(&resolved.info),
                 service: args.service.clone(),
@@ -3074,6 +3108,10 @@ fn error_data(err: ToolError) -> ErrorData {
         ToolError::InvalidState(message) => {
             ErrorData::invalid_params(format!("invalid state: {message}"), None)
         }
+        ToolError::DependencyFailed { message, failure } => ErrorData::invalid_params(
+            format!("dependency failed: {message}"),
+            serde_json::to_value(failure).ok(),
+        ),
         ToolError::ConfigReload(message) => {
             ErrorData::invalid_params(format!("config reload failed: {message}"), None)
         }
@@ -3106,11 +3144,11 @@ pub async fn serve_stdio(
 #[cfg(test)]
 mod tests {
     use super::{
-        DynamicMutationResult, ExitVerdict, GREP_PATTERN_MAX_BYTES, McpServer, MutationResult,
+        DynamicMutationResult, GREP_PATTERN_MAX_BYTES, McpServer, MutationResult,
         RestartAndWaitResult, SessionMutationResult, SessionRef, StartDynamicAndWaitResult,
         StopSessionResult, WaitForExitResult, WaitForExitStatus, WaitResult,
-        best_effort_mutation_cursor, classify_exit, compile_grep, matching_service,
-        parse_since_text, session_has_service, session_selector,
+        best_effort_mutation_cursor, compile_grep, matching_service, parse_since_text,
+        session_has_service, session_selector,
     };
     use crate::select::ToolError;
     use crate::tools::health::health_attempt_matches_snapshot;
@@ -3119,9 +3157,7 @@ mod tests {
         truncate_wait_matches,
     };
     use color_eyre::eyre;
-    use micromux::{
-        Desired, Execution, HealthAttempt, LogLine, ServiceCommandAck, ServiceSnapshot,
-    };
+    use micromux::{Execution, HealthAttempt, LogLine, ServiceCommandAck, ServiceSnapshot};
     use micromux_control::{PROTOCOL_VERSION, ServiceBrief, SessionInfo};
     use similar_asserts::assert_eq;
     use std::collections::BTreeMap;
@@ -3143,8 +3179,8 @@ mod tests {
     use super::{
         DynamicServiceArgs, EnsureAction, EnsureActionKind, EnsureReadyArgs, LogFilterArgs,
         LogsArgs, ReconcileConfigArgs, RenewDynamicServiceArgs, ReplaceDynamicServiceArgs,
-        ServiceArgs, ServiceEventsArgs, ServiceEventsResult, SessionArgs,
-        SessionServiceEventsResult, StartDynamicAndWaitArgs, WaitForExitArgs, WaitStatus,
+        RestartAndWaitArgs, ServiceArgs, ServiceEventsArgs, ServiceEventsResult, SessionArgs,
+        SessionServiceEventsResult, StartDynamicAndWaitArgs, WaitArgs, WaitForExitArgs, WaitStatus,
         capture_mutation_cursor,
     };
 
@@ -3816,34 +3852,6 @@ services:
         Ok(())
     }
 
-    #[test]
-    fn exit_wait_allows_a_disabled_run_to_finish_draining() {
-        let mut snapshot = ServiceSnapshot::initial(
-            "job".to_string(),
-            "job".to_string(),
-            Vec::new(),
-            None,
-            micromux::RestartPolicy::Never,
-            Vec::new(),
-            None,
-        );
-        snapshot.desired = Desired::Disabled;
-        snapshot.execution = Execution::Stopping;
-        snapshot.run_generation = 1;
-        assert!(classify_exit(&snapshot, None).is_none());
-
-        snapshot.execution = Execution::Exited;
-        snapshot.last_exit_code = Some(3);
-        assert!(matches!(
-            classify_exit(&snapshot, None),
-            Some(ExitVerdict::Exited)
-        ));
-        assert!(matches!(
-            classify_exit(&snapshot, Some(1)),
-            Some(ExitVerdict::InvalidState)
-        ));
-    }
-
     #[cfg(unix)]
     #[tokio::test]
     async fn start_dynamic_and_wait_returns_success_failure_and_replay_context() -> eyre::Result<()>
@@ -3985,6 +3993,112 @@ services:
             .err()
             .ok_or_else(|| eyre::eyre!("disabled service unexpectedly waited"))?;
         assert!(disabled.message.contains("disabled with no qualifying run"));
+
+        session.finish().await?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn waits_fail_fast_behind_a_dependency_that_will_not_restart() -> eyre::Result<()> {
+        let project = tempfile::tempdir()?;
+        let (session, selector) = boot_dynamic_mcp_session(project.path())?;
+        let mut server = McpServer::new();
+        server.cwd = project.path().to_path_buf();
+        let Json(seed) = server
+            .start_dynamic_service(Parameters(DynamicServiceArgs {
+                session: Some(selector.clone()),
+                params: dynamic_params_for("seed", &["sh", "-c", "exit 4"], None),
+            }))
+            .await
+            .map_err(|err| eyre::eyre!(err.message))?;
+        server
+            .wait_for_exit(Parameters(WaitForExitArgs {
+                service: "seed".to_string(),
+                session: Some(selector.clone()),
+                after_generation: Some(seed.receipt.observed_generation),
+                timeout_secs: Some(5),
+                log_limit: Some(1),
+            }))
+            .await
+            .map_err(|err| eyre::eyre!(err.message))?;
+        let mut api = dynamic_params_for("api", &["sh", "-c", "sleep 60"], None);
+        api.spec.depends_on = Some(vec![micromux::DependencySpec {
+            service: "seed".to_string(),
+            condition: micromux::DependencyCondition::CompletedSuccessfully,
+        }]);
+        server
+            .start_dynamic_service(Parameters(DynamicServiceArgs {
+                session: Some(selector.clone()),
+                params: api,
+            }))
+            .await
+            .map_err(|err| eyre::eyre!(err.message))?;
+
+        let started = tokio::time::Instant::now();
+        let healthy = server
+            .wait_for_healthy(Parameters(WaitArgs {
+                service: "api".to_string(),
+                session: Some(selector.clone()),
+                after_generation: None,
+                timeout_secs: Some(30),
+            }))
+            .await
+            .err()
+            .ok_or_else(|| eyre::eyre!("a health wait behind a failed dependency resolved"))?;
+        let exit = server
+            .wait_for_exit(Parameters(WaitForExitArgs {
+                service: "api".to_string(),
+                session: Some(selector.clone()),
+                after_generation: None,
+                timeout_secs: Some(30),
+                log_limit: Some(1),
+            }))
+            .await
+            .err()
+            .ok_or_else(|| eyre::eyre!("an exit wait behind a failed dependency resolved"))?;
+        // A bundle reports the failure as its outcome, keeping what its mutation did.
+        let Json(bundle) = server
+            .restart_service_and_wait(Parameters(RestartAndWaitArgs {
+                service: "api".to_string(),
+                session: Some(selector.clone()),
+                timeout_secs: Some(30),
+                log_limit: Some(1),
+            }))
+            .await
+            .map_err(|err| eyre::eyre!(err.message))?;
+        assert!(matches!(
+            bundle.outcome.status,
+            WaitStatus::DependencyFailed
+        ));
+        assert_eq!(
+            bundle
+                .outcome
+                .dependency_failure
+                .as_ref()
+                .map(|failure| (failure.service.as_str(), failure.exit_code)),
+            Some(("seed", Some(4)))
+        );
+        assert!(
+            bundle
+                .events
+                .iter()
+                .any(|event| event.kind == micromux::ServiceEventKind::DependencyFailed)
+        );
+        assert!(started.elapsed() < Duration::from_secs(10));
+        for error in [healthy, exit] {
+            assert!(
+                error
+                    .message
+                    .contains("dependency `seed` exited with code 4 and will not restart"),
+                "{}",
+                error.message
+            );
+            assert_eq!(
+                error.data.as_ref().and_then(|data| data.get("exit_code")),
+                Some(&serde_json::json!(4))
+            );
+        }
 
         session.finish().await?;
         Ok(())
