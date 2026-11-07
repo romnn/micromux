@@ -1160,10 +1160,7 @@ impl PtyHandles {
                 pixel_height: 0,
             })
             .map_err(|err| Error::operation("failed to open test pty", err))?;
-        let writer = pair
-            .master
-            .take_writer()
-            .map_err(|err| Error::operation("failed to take test pty writer", err))?;
+        let writer = open_pty_writer(pair.master.as_ref())?;
         let log_reader = LogReaderHandle::test_dummy();
         let (events_tx, _events_rx) = mpsc::channel(1);
         let (handles, _shutdown) = Self::new(
@@ -1198,6 +1195,46 @@ impl AsRawFileDescriptor for BorrowedRawFd {
     }
 }
 
+/// Duplicates the master descriptor; `operation` names the duplicate's purpose in errors.
+#[cfg(unix)]
+fn dup_pty_master(
+    master: &(dyn portable_pty::MasterPty + Send),
+    operation: &'static str,
+) -> Result<FileDescriptor, Error> {
+    let pty_fd = master.as_raw_fd().ok_or_else(|| {
+        Error::operation(
+            "failed to access native pty",
+            "master did not expose a raw fd",
+        )
+    })?;
+    FileDescriptor::dup(&BorrowedRawFd(pty_fd)).map_err(|err| Error::operation(operation, err))
+}
+
+/// Opens the endpoint that writes input and terminal responses to the child.
+///
+/// On Unix this is a plain duplicate of the master descriptor, not portable-pty's
+/// [`take_writer`](portable_pty::MasterPty::take_writer).
+/// That writer sends a newline and the EOF character when it is dropped, which happens when a run
+/// is torn down.
+/// Those bytes would reach a child still holding the terminal as input nobody typed, and their
+/// echo would come back as a blank log record that the child never wrote.
+#[cfg(unix)]
+fn open_pty_writer(
+    master: &(dyn portable_pty::MasterPty + Send),
+) -> Result<Box<dyn Write + Send>, Error> {
+    let writer = dup_pty_master(master, "failed to clone pty writer fd")?;
+    Ok(Box::new(writer))
+}
+
+#[cfg(not(unix))]
+fn open_pty_writer(
+    master: &(dyn portable_pty::MasterPty + Send),
+) -> Result<Box<dyn Write + Send>, Error> {
+    master
+        .take_writer()
+        .map_err(|err| Error::operation("failed to take pty writer", err))
+}
+
 /// Enables readiness-based PTY writes and cancellable teardown.
 ///
 /// Unix master descriptors share one open file description, so setting the returned duplicate to
@@ -1208,14 +1245,7 @@ impl AsRawFileDescriptor for BorrowedRawFd {
 fn configure_nonblocking_pty(
     master: &(dyn portable_pty::MasterPty + Send),
 ) -> Result<FileDescriptor, Error> {
-    let pty_fd = master.as_raw_fd().ok_or_else(|| {
-        Error::operation(
-            "failed to access native pty",
-            "master did not expose a raw fd",
-        )
-    })?;
-    let mut descriptor = FileDescriptor::dup(&BorrowedRawFd(pty_fd))
-        .map_err(|err| Error::operation("failed to clone pty control fd", err))?;
+    let mut descriptor = dup_pty_master(master, "failed to clone pty control fd")?;
     descriptor
         .set_non_blocking(true)
         .map_err(|err| Error::operation("failed to make pty nonblocking", err))?;
@@ -1229,14 +1259,7 @@ impl PollingPtyReader {
         cancel_read: FileDescriptor,
         cancelled: Arc<AtomicBool>,
     ) -> Result<Self, Error> {
-        let pty_fd = master.as_raw_fd().ok_or_else(|| {
-            Error::operation(
-                "failed to access native pty",
-                "master did not expose a raw fd",
-            )
-        })?;
-        let poll_read = FileDescriptor::dup(&BorrowedRawFd(pty_fd))
-            .map_err(|err| Error::operation("failed to clone pty poll fd", err))?;
+        let poll_read = dup_pty_master(master, "failed to clone pty poll fd")?;
         let reader = master
             .try_clone_reader()
             .map_err(|err| Error::operation("failed to clone pty reader", err))?;
@@ -2748,10 +2771,7 @@ pub(super) fn start_service_with_pty_size(
 
     let (reader, log_reader) = PtyOutputReader::new(pair.master.as_ref())?;
 
-    let writer = pair
-        .master
-        .take_writer()
-        .map_err(|err| Error::operation("failed to take pty writer", err))?;
+    let writer = open_pty_writer(pair.master.as_ref())?;
 
     let size = Arc::new(AtomicU32::new(
         (u32::from(pty_size.rows) << 16) | u32::from(pty_size.cols),
@@ -3613,6 +3633,49 @@ mod tests {
             );
         }
 
+        /// Dropping the PTY writer at run teardown must not type anything into the terminal.
+        ///
+        /// A typed line would reach a child that still holds the terminal, and its echo would come
+        /// back to the log reader as a blank record the child never wrote.
+        #[test]
+        fn dropping_the_pty_writer_types_nothing_into_the_terminal() -> eyre::Result<()> {
+            let pair = portable_pty::native_pty_system()
+                .openpty(portable_pty::PtySize::default())
+                .map_err(|err| eyre::eyre!("failed to open test PTY: {err}"))?;
+            let mut reader = pair
+                .master
+                .try_clone_reader()
+                .map_err(|err| eyre::eyre!("failed to clone test PTY reader: {err}"))?;
+
+            drop(open_pty_writer(pair.master.as_ref())?);
+
+            // The slave stays open with the default echoing line discipline, which echoes master
+            // input back in order.
+            // Everything echoed before this sentinel therefore came from dropping the writer.
+            let mut sentinel = open_pty_writer(pair.master.as_ref())?;
+            sentinel.write_all(b"Z")?;
+
+            let (echo_tx, echo_rx) = std_mpsc::channel();
+            thread::spawn(move || {
+                let mut echo = Vec::new();
+                let mut buf = [0u8; 64];
+                while !echo.contains(&b'Z') {
+                    match reader.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => echo.extend_from_slice(buf.get(..n).unwrap_or_default()),
+                    }
+                }
+                let _ = echo_tx.send(echo);
+            });
+            let echo = echo_rx
+                .recv_timeout(Duration::from_secs(5))
+                .map_err(|err| eyre::eyre!("the sentinel echo never arrived: {err}"))?;
+
+            // Only the sentinel comes back, so the drop wrote nothing to the terminal.
+            assert_eq!(String::from_utf8_lossy(&echo), "Z");
+            Ok(())
+        }
+
         #[test]
         fn paste_occupies_one_atomic_writer_queue_entry() -> eyre::Result<()> {
             let (write_queue, queued) = std_mpsc::sync_channel(1);
@@ -3742,10 +3805,7 @@ mod tests {
                 .map_err(|err| eyre::eyre!("failed to spawn stalled raw-mode reader: {err}"))?;
             let poll_write = configure_nonblocking_pty(pair.master.as_ref())?;
             let (cancel_read, cancellation) = PtyCancellation::pipe()?;
-            let writer = pair
-                .master
-                .take_writer()
-                .map_err(|err| eyre::eyre!("failed to take test PTY writer: {err}"))?;
+            let writer = open_pty_writer(pair.master.as_ref())?;
             let (events_tx, _events_rx) = mpsc::channel(1);
             let mut writer = PtyWriter {
                 service_id: "svc".to_string(),
@@ -3808,10 +3868,7 @@ mod tests {
                 .slave
                 .spawn_command(command)
                 .map_err(|err| eyre::eyre!("failed to spawn stalled raw-mode reader: {err}"))?;
-            let writer = pair
-                .master
-                .take_writer()
-                .map_err(|err| eyre::eyre!("failed to take test PTY writer: {err}"))?;
+            let writer = open_pty_writer(pair.master.as_ref())?;
             let (would_block_tx, would_block_rx) = std::sync::mpsc::channel();
             let writer = ExitOnDropWriter {
                 writer: Some(writer),
@@ -3916,10 +3973,7 @@ mod tests {
                 .slave
                 .spawn_command(command)
                 .map_err(|err| eyre::eyre!("failed to spawn raw-mode reader: {err}"))?;
-            let writer = pair
-                .master
-                .take_writer()
-                .map_err(|err| eyre::eyre!("failed to take test PTY writer: {err}"))?;
+            let writer = open_pty_writer(pair.master.as_ref())?;
             let log_reader = LogReaderHandle::test_dummy();
             let (handles, shutdown) = test_pty_handles(
                 pair.master,
@@ -4120,10 +4174,7 @@ mod tests {
                 .slave
                 .spawn_command(command)
                 .map_err(|err| eyre::eyre!("failed to spawn delayed raw-mode reader: {err}"))?;
-            let writer = pair
-                .master
-                .take_writer()
-                .map_err(|err| eyre::eyre!("failed to take test PTY writer: {err}"))?;
+            let writer = open_pty_writer(pair.master.as_ref())?;
             let log_reader = LogReaderHandle::test_dummy();
             let (handles, shutdown) = test_pty_handles(
                 pair.master,
@@ -4189,10 +4240,7 @@ mod tests {
                 })
                 .map_err(|err| eyre::eyre!("failed to open test PTY: {err}"))?;
             let (mut reader, log_reader) = PtyOutputReader::new(pair.master.as_ref())?;
-            let writer = pair
-                .master
-                .take_writer()
-                .map_err(|err| eyre::eyre!("failed to take test PTY writer: {err}"))?;
+            let writer = open_pty_writer(pair.master.as_ref())?;
             let size = Arc::new(AtomicU32::new(0));
             let (handles, shutdown) = test_pty_handles(pair.master, writer, size, &log_reader)?;
 
@@ -4224,10 +4272,7 @@ mod tests {
                 .slave
                 .spawn_command(command)
                 .map_err(|err| eyre::eyre!("failed to spawn stalled raw-mode reader: {err}"))?;
-            let writer = pair
-                .master
-                .take_writer()
-                .map_err(|err| eyre::eyre!("failed to take test PTY writer: {err}"))?;
+            let writer = open_pty_writer(pair.master.as_ref())?;
             let (would_block_tx, would_block_rx) = std::sync::mpsc::channel();
             let (writer_dropped_tx, writer_dropped_rx) = std::sync::mpsc::channel();
             let writer = ExitOnDropWriter {
@@ -4286,10 +4331,7 @@ mod tests {
             let pair = portable_pty::native_pty_system()
                 .openpty(portable_pty::PtySize::default())
                 .map_err(|err| eyre::eyre!("failed to open test PTY: {err}"))?;
-            let writer = pair
-                .master
-                .take_writer()
-                .map_err(|err| eyre::eyre!("failed to take test PTY writer: {err}"))?;
+            let writer = open_pty_writer(pair.master.as_ref())?;
             let (child_exited_tx, child_exited_rx) = std::sync::mpsc::channel();
             let writer = ExitOnDropWriter {
                 writer: Some(writer),
