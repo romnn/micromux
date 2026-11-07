@@ -40,9 +40,9 @@ The header's right side lists the view keys, which change only what the panes sh
 | `?` | Show every key binding (close with `Esc`) |
 | `m` | Toggle mouse capture (see [Mouse](#mouse)) |
 | `Ctrl-Z` | Suspend to the shell; `fg` brings the TUI back |
-| `y` / `Enter` | Copy the mouse selection (see [Mouse](#mouse)) |
+| `y` / `Enter` | Copy the mouse selection; so do a right-click and the terminal's copy shortcut (see [Copying](#copying)) |
 | `Esc` | Clear the mouse selection |
-| `q` / `Ctrl-C` | Quit |
+| `q` / `Ctrl-C` twice | Quit; a single `Ctrl-C` only asks for a second within 2 seconds, so a stray one never stops the session |
 
 {{< figure src="images/service-details.png" alt="The service details popup over the log pane, listing the api service's state, ports, command, directory, dependencies, restart and stop policy, last healthcheck, and current run" caption="`i` describes the selected service in full; `u` shows the session's routes and ports the same way." >}}
 
@@ -58,15 +58,33 @@ With mouse capture on, which is the default, the mouse works as in most terminal
 - **Wheel** scrolls the pane under the pointer, without moving the focus: each notch moves the service list's selection by one service, and the log and healthcheck panes by three rows, also where the terminal sends a burst of events for one notch. A high-resolution wheel or a touchpad moves at most a step every 15 milliseconds. Scrolling up leaves follow-tail, as the keys do, but only when the view moves; a pane whose text fits, such as a full-screen program's live screen, keeps following. Scrolling back to the bottom follows the tail again. While a popup is open, the wheel scrolls the popup.
 - **Drag** selects text inside the pane where the drag started, never across panes, so a selection in the logs never picks up the sidebar. Dragging past the top or bottom of the pane scrolls it, and past its right edge selects to the end of the line, even where a line runs on beyond the pane. A double click selects a word, a triple click the whole line, even when it wraps over several rows or runs past the pane. `Esc` clears the selection.
 - **The selection stays on its text** until you clear it or start another: while new lines arrive and the pane scrolls, while a busy log drops its oldest lines, and while a live screen or a popup redraws. A resize keeps it too, unless wrapping lays the text out anew.
-- **Selecting only highlights.** Press `y` or `Enter`, or click `y Copy` in the footer, which takes the mouse toggle's place while text is selected, to copy the selection to the clipboard. `Ctrl+Shift+C` and `Super+C` copy too, but only where the terminal passes them on: most terminals keep these chords for their own copy, and without the kitty keyboard protocol `Ctrl+Shift+C` arrives as `Ctrl-C`, which quits micromux, or in PTY input mode interrupts the service. To copy as soon as a drag ends instead, turn on [`ui.copy_on_select`](#settings).
+- **Selecting only highlights.** Press `y` or `Enter`, right-click anywhere, or click `y Copy` in the footer, which takes the mouse toggle's place while text is selected, to copy the selection to the clipboard. The terminal's own copy shortcut can copy too, as [Copying](#copying) describes. A right-click copies when the button comes up and changes nothing else: not the selection, the focus or the selected service; without a selection it does nothing. To copy as soon as a drag ends instead, turn on [`ui.copy_on_select`](#settings).
 - **Copying** goes to the clipboard, and to the primary selection where there is one, through the terminal's OSC 52 support, which also works over ssh. The footer says what was copied. Some terminals ignore OSC 52, such as macOS Terminal and GNOME Terminal and other VTE-based terminals, so outside ssh micromux also hands the text to `pbcopy` on macOS, or to `wl-copy`, `xclip` or `xsel` on Linux, whichever is installed. Where neither works, use the terminal's own selection, described below.
 - **Click** a key hint in the header or footer to run its key, such as `H` to show the healthcheck pane or `?` for help. It acts when the button comes up on the hint it went down on, so sliding off cancels it. The `q` hint does nothing, so a stray click never ends the session, and neither do hints that name two keys, like `↑/↓`.
 - **Click** a URL in the Logs pane's title to open it in your browser.
 - **Click** outside an open popup to close it, as `Esc` does. In the level picker, click the threshold you want.
 
-In PTY input mode, neither clicks nor the wheel change which service receives your keystrokes, and `y` and `Enter` go to the service; leave the mode with `Alt+Esc` to copy.
+In PTY input mode, neither clicks nor the wheel change which service receives your keystrokes, a right-click copies nothing, and `y`, `Enter`, `Ctrl-C` and the copy shortcuts go to the service, as the bytes a terminal without the kitty keyboard protocol sends for them; leave the mode with `Alt+Esc` to copy.
 
 {{< figure src="images/mouse-selection.png" alt="Four request lines of the api service's logs highlighted by a mouse drag, with the footer reading copied 4 lines after y" caption="A drag selects lines inside the logs pane only, and y copies them." >}}
+
+### Copying
+
+Besides `y`, `Enter`, a right-click and the footer's `y Copy`, micromux copies the selection on the shortcuts terminals copy with: `Ctrl+Shift+C` and `Ctrl+Insert`, as on Linux and Windows, and `Super+C`, which is `Cmd+C` on macOS. A plain `Ctrl-C` never copies.
+
+Two things stand between these shortcuts and micromux:
+
+- **The terminal consumes its copy shortcut**, as long as it is bound, even when it has nothing selected, which under mouse capture it never has. To let it through when the terminal has no selection of its own, mark the binding `performable:` in Ghostty:
+
+  ```
+  keybind = performable:ctrl+shift+c=copy_to_clipboard:mixed
+  keybind = performable:super+c=copy_to_clipboard:mixed
+  ```
+
+  In WezTerm, a Lua `action_callback` can copy when `window:get_selection_text_for_pane(pane)` returns text and otherwise pass the key on with `window:perform_action(act.SendKey { key = 'c', mods = 'CTRL|SHIFT' }, pane)`. Where a terminal cannot pass the shortcut on, `Ctrl+Insert`, which few terminals bind, a right-click and `y` still copy.
+- **The kitty keyboard protocol tells `Ctrl+Shift+C` from `Ctrl-C`.** Without it, terminals send both as the same byte, and `Super` never reaches programs at all. micromux turns the protocol on wherever the terminal supports it, as Ghostty, kitty, WezTerm, foot and Alacritty do, and turns it off again whenever it lets go of the terminal. In a terminal without it, a copy shortcut passed on to programs arrives as `Ctrl-C`; that is the terminal's doing, not micromux's, and micromux then only asks for a second `Ctrl-C` instead of quitting.
+
+The protocol only changes how micromux's terminal reports keys: a service in PTY input mode never asked for it, so micromux sends it every key as a terminal without the protocol would.
 
 ### Using the terminal's own mouse handling
 
@@ -92,7 +110,7 @@ For each, the first of these that says wins:
 
 A project setting wins over your own because it describes something about that project, such as a team that copies a lot of log output with the terminal's selection; your user config is the default for projects that do not care.
 
-micromux releases the mouse whenever it lets go of the terminal: when it exits, however it is asked to, when you press `Ctrl-Z`, and when it panics. A stop signal sent from outside, such as `kill -TSTP` or `kill -STOP`, gives micromux no chance to let go first, but when it continues it takes the terminal over afresh and redraws.
+micromux releases the mouse, and the kitty keyboard protocol, whenever it lets go of the terminal: when it exits, however it is asked to, when you press `Ctrl-Z`, and when it panics. A stop signal sent from outside, such as `kill -TSTP` or `kill -STOP`, gives micromux no chance to let go first, but when it continues it takes the terminal over afresh and redraws.
 
 ### User config
 
@@ -152,4 +170,4 @@ A selector may be a bare session name or `name:`, `pid:`, or `hash:`. More than 
 An attached TUI follows service status, logs, and healthchecks, and its lifecycle keys (`r`, `R`, `d`) still restart, enable, and disable services. In v1 it does **not** forward service PTY input or terminal-resize events.
 
 > [!NOTE]
-> Pressing `q` or `Ctrl-C` in an attached client only **detaches** it — it never stops the session or its services. To stop a headless session explicitly, use `micromux ctl stop` or the MCP `stop_session` tool.
+> Pressing `q`, or `Ctrl-C` twice, in an attached client only **detaches** it — it never stops the session or its services. To stop a headless session explicitly, use `micromux ctl stop` or the MCP `stop_session` tool.

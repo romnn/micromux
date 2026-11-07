@@ -31,6 +31,8 @@ pub use source::{LocalSource, SessionSource};
 
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 const PENDING_PTY_INPUT_RETRY: Duration = Duration::from_millis(5);
+/// How long after a first Ctrl-C a second one quits.
+const QUIT_CONFIRM_WINDOW: Duration = Duration::from_secs(2);
 const TERMINAL_INPUT_CLOSED_NOTICE: &str = "terminal input closed; send SIGINT or SIGTERM to exit";
 
 fn format_byte_limit(bytes: usize) -> String {
@@ -141,6 +143,8 @@ pub struct App {
     mouse: mouse::MouseState,
     /// Index of the service on the services list's first row in the last frame.
     first_service: usize,
+    /// When Ctrl-C last asked for a second Ctrl-C to quit, while that request stands.
+    quit_prompt_at: Option<std::time::Instant>,
     /// Where the last frame drew what the mouse can act on.
     hits: mouse::Hits,
     /// Terminal work queued for the event loop.
@@ -221,6 +225,7 @@ impl App {
             popup_scroll: 0,
             mouse: mouse::MouseState::new(view_options.mouse),
             first_service: 0,
+            quit_prompt_at: None,
             hits: mouse::Hits::default(),
             effects: Vec::new(),
             pty_input_mode: false,
@@ -422,7 +427,8 @@ impl App {
             Change(SessionChange),
             /// The change broadcast lagged (or this is the initial draw): re-read everything.
             Resync,
-            PendingInput,
+            /// Queued PTY input is due for another try, or the quit prompt for one.
+            Timer,
             /// The session's URLs or routing status changed; only the header needs a redraw.
             Summary,
             /// The process continued after a stop, and the shell may have taken the terminal.
@@ -444,7 +450,7 @@ impl App {
         let mut last_frame = tokio::time::Instant::now();
 
         while self.is_running() {
-            let retry_pending_input = !self.pending_pty_input.is_empty();
+            let timer = self.next_timer();
             let wake = tokio::select! {
                 () = self.shutdown.cancelled() => None,
                 input = self.input_event_handler.next() => {
@@ -456,12 +462,11 @@ impl App {
                     Err(broadcast::error::RecvError::Closed) => None,
                 },
                 () = async {
-                    if retry_pending_input {
-                        tokio::time::sleep(PENDING_PTY_INPUT_RETRY).await;
-                    } else {
-                        std::future::pending::<()>().await;
+                    match timer {
+                        Some(at) => tokio::time::sleep_until(at.into()).await,
+                        None => std::future::pending::<()>().await,
                     }
-                } => Some(Wake::PendingInput),
+                } => Some(Wake::Timer),
                 () = async {
                     let changed = match self.summary_changes.as_mut() {
                         Some(summary) => summary.changed().await.is_ok(),
@@ -479,7 +484,7 @@ impl App {
                 Some(Wake::Input(event)) => self.handle_input_event(event),
                 Some(Wake::Change(change)) => needs_resync |= self.apply_change(&change),
                 Some(Wake::Resync) => needs_resync = true,
-                Some(Wake::PendingInput) => self.flush_pending_pty_input(),
+                Some(Wake::Timer) => self.on_timer(std::time::Instant::now()),
                 Some(Wake::Summary) => {}
                 Some(Wake::Continued) => self.take_terminal_again(&mut terminal)?,
                 None => {
@@ -523,6 +528,38 @@ impl App {
             last_frame = tokio::time::Instant::now();
         }
         Ok(())
+    }
+
+    /// When the event loop must wake by itself: to retry queued PTY input, or to take back the
+    /// quit prompt.
+    fn next_timer(&self) -> Option<std::time::Instant> {
+        let retry = (!self.pending_pty_input.is_empty())
+            .then(|| std::time::Instant::now() + PENDING_PTY_INPUT_RETRY);
+        let prompt = self.quit_prompt_at.map(|at| at + QUIT_CONFIRM_WINDOW);
+        retry.into_iter().chain(prompt).min()
+    }
+
+    /// Does what is due `now`: retries queued PTY input and takes back an expired quit prompt.
+    fn on_timer(&mut self, now: std::time::Instant) {
+        if !self.pending_pty_input.is_empty() {
+            self.flush_pending_pty_input();
+        }
+        if self
+            .quit_prompt_at
+            .is_some_and(|at| now.saturating_duration_since(at) >= QUIT_CONFIRM_WINDOW)
+        {
+            self.quit_prompt_at = None;
+        }
+    }
+
+    /// Ctrl-C pressed `now`: the first asks for a second, and only a second within
+    /// [`QUIT_CONFIRM_WINDOW`] quits, so a stray Ctrl-C, as from a copy chord a terminal sends
+    /// as Ctrl-C, never stops the session.
+    fn ctrl_c(&mut self, now: std::time::Instant) {
+        match self.quit_prompt_at {
+            Some(at) if now.saturating_duration_since(at) < QUIT_CONFIRM_WINDOW => self.exit(),
+            _ => self.quit_prompt_at = Some(now),
+        }
     }
 
     /// Does the terminal work that input queued, and returns whether a suspend was asked for,
@@ -729,23 +766,19 @@ impl App {
     fn handle_key_press(&mut self, key: crossterm::event::KeyEvent) {
         use crossterm::event::{KeyCode, KeyModifiers};
 
-        // Terminals copy with these chords, never meant for a service, so they copy a selection
-        // even in PTY input mode. They only arrive where the terminal reports them apart from
-        // Ctrl-C and has no binding of its own for them.
-        if is_copy_chord(key) && self.has_selection() {
-            self.copy_selection();
-            return;
-        }
-
-        // PTY mode forwards Ctrl-C to the selected process; command mode reserves the same chord
-        // for leaving the TUI.
+        // PTY mode forwards every key to the selected process, Ctrl-C and the copy chords
+        // included; command mode reserves Ctrl-C for leaving the TUI.
         if self.pty_input_mode {
             self.handle_key_press_pty_input_mode(key);
             return;
         }
 
         if key.code == KeyCode::Char('c') && key.modifiers == KeyModifiers::CONTROL {
-            self.exit();
+            self.ctrl_c(std::time::Instant::now());
+            return;
+        }
+        if is_copy_chord(key) {
+            self.copy_selection();
             return;
         }
         // Only Unix shells can suspend a job.
@@ -1163,75 +1196,132 @@ fn open_url(url: &str) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Whether `key` is a terminal's copy chord: Ctrl+Shift+C, as on Linux, or Super+C, as Cmd+C on
-/// macOS.
+/// Whether `key` is one of the terminals' standard copy shortcuts: Ctrl+Shift+C or Ctrl+Insert,
+/// as on Linux and Windows, or Super+C, as Cmd+C on macOS.
+///
+/// Ctrl+Shift+C and Super+C only arrive through the kitty keyboard protocol; elsewhere the first
+/// is sent as Ctrl-C, which never copies, and the second not at all.
 fn is_copy_chord(key: crossterm::event::KeyEvent) -> bool {
     use crossterm::event::{KeyCode, KeyModifiers};
 
-    let c = matches!(key.code, KeyCode::Char('c' | 'C'));
-    c && (key.modifiers == KeyModifiers::CONTROL | KeyModifiers::SHIFT
-        || key.modifiers == KeyModifiers::SUPER)
+    // With alternate keys reported, the terminal sends the shifted key and no Shift.
+    let (code, modifiers) = match key.code {
+        KeyCode::Char(c) if c.is_ascii_uppercase() => (
+            KeyCode::Char(c.to_ascii_lowercase()),
+            key.modifiers | KeyModifiers::SHIFT,
+        ),
+        code => (code, key.modifiers),
+    };
+    matches!(
+        (code, modifiers),
+        (KeyCode::Char('c'), m) if m == KeyModifiers::CONTROL | KeyModifiers::SHIFT
+            || m == KeyModifiers::SUPER
+    ) || (code == KeyCode::Insert && modifiers == KeyModifiers::CONTROL)
 }
 
+/// The bytes a terminal without the kitty keyboard protocol sends for `code` with `modifiers`,
+/// as xterm does, which is what a service in PTY input mode expects to read.
+///
+/// micromux may have asked its own terminal for the kitty protocol, which reports keys such as
+/// Ctrl+Shift+C or Alt+Shift+A apart; this folds them back into the legacy bytes. Super and the
+/// other modifiers legacy terminals cannot send are left out.
 fn key_event_to_bytes(
     code: crossterm::event::KeyCode,
     modifiers: crossterm::event::KeyModifiers,
 ) -> Option<Vec<u8>> {
-    use crossterm::event::KeyCode;
+    use crossterm::event::{KeyCode, KeyModifiers};
 
-    if modifiers.contains(crossterm::event::KeyModifiers::ALT)
-        && !modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
-        && !matches!(code, KeyCode::Esc)
-    {
-        let base_modifiers = modifiers - crossterm::event::KeyModifiers::ALT;
-        if let Some(mut bytes) = key_event_to_bytes(code, base_modifiers) {
-            let mut out = Vec::with_capacity(1 + bytes.len());
-            out.push(0x1b);
-            out.append(&mut bytes);
-            return Some(out);
+    let shift = modifiers.contains(KeyModifiers::SHIFT);
+    let alt = modifiers.contains(KeyModifiers::ALT);
+    let ctrl = modifiers.contains(KeyModifiers::CONTROL);
+    // xterm's modifier parameter for cursor, editing and function keys.
+    let parameter = 1 + u8::from(shift) + 2 * u8::from(alt) + 4 * u8::from(ctrl);
+    let cursor = |end: char| {
+        if parameter == 1 {
+            format!("\x1b[{end}")
+        } else {
+            format!("\x1b[1;{parameter}{end}")
         }
-    }
-
-    if modifiers.contains(crossterm::event::KeyModifiers::CONTROL) {
-        match code {
-            KeyCode::Char(c) => {
-                let c = c.to_ascii_lowercase();
-                if c.is_ascii_lowercase() {
-                    return Some(vec![(c as u8) - b'a' + 1]);
-                }
-                match c {
-                    '@' => return Some(vec![0x00]),
-                    '[' => return Some(vec![0x1b]),
-                    '\\' => return Some(vec![0x1c]),
-                    ']' => return Some(vec![0x1d]),
-                    '^' => return Some(vec![0x1e]),
-                    '_' => return Some(vec![0x1f]),
-                    _ => {}
-                }
-            }
-            KeyCode::Enter => return Some(vec![b'\n']),
-            _ => {}
+        .into_bytes()
+    };
+    let tilde = |number: u8| {
+        if parameter == 1 {
+            format!("\x1b[{number}~")
+        } else {
+            format!("\x1b[{number};{parameter}~")
         }
-    }
-
-    match code {
-        KeyCode::Esc => Some(vec![0x1b]),
-        KeyCode::Enter => Some(vec![b'\r']),
-        KeyCode::Tab => Some(vec![b'\t']),
-        KeyCode::BackTab => Some(b"\x1b[Z".to_vec()),
-        KeyCode::Backspace => Some(vec![0x7f]),
-        KeyCode::Char(c) => Some(c.to_string().into_bytes()),
-        KeyCode::Up => Some(b"\x1b[A".to_vec()),
-        KeyCode::Down => Some(b"\x1b[B".to_vec()),
-        KeyCode::Right => Some(b"\x1b[C".to_vec()),
-        KeyCode::Left => Some(b"\x1b[D".to_vec()),
-        KeyCode::Home => Some(b"\x1b[H".to_vec()),
-        KeyCode::End => Some(b"\x1b[F".to_vec()),
-        KeyCode::PageUp => Some(b"\x1b[5~".to_vec()),
-        KeyCode::PageDown => Some(b"\x1b[6~".to_vec()),
-        KeyCode::Delete => Some(b"\x1b[3~".to_vec()),
+        .into_bytes()
+    };
+    // These carry their modifiers in the parameter rather than an Escape prefix.
+    let special = match code {
+        KeyCode::Up => Some(cursor('A')),
+        KeyCode::Down => Some(cursor('B')),
+        KeyCode::Right => Some(cursor('C')),
+        KeyCode::Left => Some(cursor('D')),
+        KeyCode::Home => Some(cursor('H')),
+        KeyCode::End => Some(cursor('F')),
+        KeyCode::Insert => Some(tilde(2)),
+        KeyCode::Delete => Some(tilde(3)),
+        KeyCode::PageUp => Some(tilde(5)),
+        KeyCode::PageDown => Some(tilde(6)),
+        KeyCode::F(number @ 1..=4) => {
+            let end = char::from(b'P' + number - 1);
+            Some(if parameter == 1 {
+                format!("\x1bO{end}").into_bytes()
+            } else {
+                cursor(end)
+            })
+        }
+        KeyCode::F(number @ 5..=12) => {
+            const CODES: [u8; 8] = [15, 17, 18, 19, 20, 21, 23, 24];
+            CODES
+                .get(usize::from(number - 5))
+                .map(|&number| tilde(number))
+        }
         _ => None,
+    };
+    if special.is_some() {
+        return special;
     }
+
+    let mut bytes = match code {
+        KeyCode::Esc => vec![0x1b],
+        KeyCode::Enter => vec![b'\r'],
+        KeyCode::Tab => vec![b'\t'],
+        KeyCode::BackTab => b"\x1b[Z".to_vec(),
+        KeyCode::Backspace if ctrl => vec![0x08],
+        KeyCode::Backspace => vec![0x7f],
+        // xterm sends the key itself where Ctrl has no control character for it.
+        KeyCode::Char(c) if ctrl => {
+            control_byte(c).map_or_else(|| c.to_string().into_bytes(), |byte| vec![byte])
+        }
+        // The kitty protocol reports Alt+Shift+A as a lowercase `a` with Shift.
+        KeyCode::Char(c) if shift => c.to_uppercase().to_string().into_bytes(),
+        KeyCode::Char(c) => c.to_string().into_bytes(),
+        _ => return None,
+    };
+    if alt {
+        bytes.insert(0, 0x1b);
+    }
+    Some(bytes)
+}
+
+/// The control character xterm sends for Ctrl with `c`, if it has one.
+fn control_byte(c: char) -> Option<u8> {
+    let c = c.to_ascii_lowercase();
+    if c.is_ascii_lowercase() {
+        return u8::try_from(c).ok().map(|c| c - b'a' + 1);
+    }
+    Some(match c {
+        ' ' | '@' | '2' => 0x00,
+        '[' | '3' => 0x1b,
+        '\\' | '4' => 0x1c,
+        ']' | '5' => 0x1d,
+        '^' | '~' | '6' => 0x1e,
+        '_' | '/' | '7' => 0x1f,
+        '?' | '8' => 0x7f,
+        _ => return None,
+    })
 }
 
 #[cfg(test)]
@@ -1348,9 +1438,108 @@ mod tests {
         app.handle_key_press(key(KeyCode::Char('H'), KeyModifiers::SHIFT));
         assert!(app.show_healthcheck_pane);
 
+        // A first Ctrl-C only asks for a second, and a second one right after quits.
+        app.handle_key_press(key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(app.running);
+        assert!(!shutdown.is_cancelled());
         app.handle_key_press(key(KeyCode::Char('c'), KeyModifiers::CONTROL));
         assert!(!app.running);
         assert!(shutdown.is_cancelled());
+        Ok(())
+    }
+
+    /// A stray Ctrl-C never stops the session: only a second one within two seconds quits, the
+    /// footer says so meanwhile, and `q` quits at once.
+    #[tokio::test]
+    async fn ctrl_c_quits_only_when_pressed_twice_within_two_seconds() -> eyre::Result<()> {
+        let mut diagnostics = Vec::new();
+        let parsed = micromux::from_str(
+            "version: 1\nservices:\n  svc:\n    command: [\"sleep\", \"30\"]\n",
+            Path::new("."),
+            0usize,
+            None,
+            &mut diagnostics,
+        )?;
+        let mux = std::sync::Arc::new(micromux::Micromux::new(&parsed)?);
+        let shutdown = micromux::CancellationToken::new();
+        let (_runner, handles) = mux.start(shutdown.clone());
+        let mut app = App::new(
+            SessionSource::Local(LocalSource::new(handles.reader, handles.commands.clone())),
+            Some(handles.terminal.clone()),
+            shutdown.clone(),
+            ViewOptions::default(),
+        );
+        let now = std::time::Instant::now();
+        // Narrow enough that the prompt has no free room in the footer and covers its last row.
+        let footer = |app: &mut App| {
+            let area = ratatui::layout::Rect::new(0, 0, 60, 20);
+            let mut buffer = ratatui::buffer::Buffer::empty(area);
+            ratatui::widgets::Widget::render(&mut *app, area, &mut buffer);
+            (0..60)
+                .filter_map(|x| buffer.cell((x, 19)).map(ratatui::buffer::Cell::symbol))
+                .collect::<String>()
+        };
+
+        // The first press prompts, without stopping anything.
+        app.ctrl_c(now);
+        assert!(app.running);
+        assert!(footer(&mut app).contains("press Ctrl-C again within 2 s to quit (or q)"));
+
+        // Once the window passes, the prompt goes, and the next press only prompts again.
+        app.on_timer(now + QUIT_CONFIRM_WINDOW);
+        assert!(!footer(&mut app).contains("Ctrl-C again"));
+        app.ctrl_c(now + Duration::from_secs(3));
+        assert!(app.running);
+        assert!(!shutdown.is_cancelled());
+
+        // A second press within the window quits.
+        app.ctrl_c(now + Duration::from_millis(4500));
+        assert!(!app.running);
+        assert!(shutdown.is_cancelled());
+        Ok(())
+    }
+
+    /// In PTY input mode Ctrl-C and the copy chords belong to the service: none prompts, quits
+    /// nor copies.
+    #[tokio::test]
+    async fn ctrl_c_and_copy_chords_go_to_the_service_in_pty_input_mode() -> eyre::Result<()> {
+        let mut diagnostics = Vec::new();
+        let parsed = micromux::from_str(
+            "version: 1\nservices:\n  svc:\n    command: [\"sleep\", \"30\"]\n",
+            Path::new("."),
+            0usize,
+            None,
+            &mut diagnostics,
+        )?;
+        let mux = std::sync::Arc::new(micromux::Micromux::new(&parsed)?);
+        let shutdown = micromux::CancellationToken::new();
+        let (_runner, handles) = mux.start(shutdown.clone());
+        let mut app = App::new(
+            SessionSource::Local(LocalSource::new(handles.reader, handles.commands.clone())),
+            Some(handles.terminal.clone()),
+            shutdown.clone(),
+            ViewOptions::default(),
+        );
+        let key = |code, modifiers| KeyEvent {
+            code,
+            modifiers,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        };
+        app.handle_key_press(key(KeyCode::Char('a'), KeyModifiers::NONE));
+        assert!(app.pty_input_mode);
+        for _ in 0..2 {
+            app.handle_key_press(key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+            app.handle_key_press(key(
+                KeyCode::Char('c'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            ));
+            app.handle_key_press(key(KeyCode::Insert, KeyModifiers::CONTROL));
+            app.handle_key_press(key(KeyCode::Char('c'), KeyModifiers::SUPER));
+        }
+        assert!(app.running);
+        assert_eq!(app.quit_prompt_at, None);
+        assert_eq!(app.effects, Vec::new());
         Ok(())
     }
 
@@ -2037,56 +2226,136 @@ mod tests {
         Ok(())
     }
 
+    /// Keys reach a service as the bytes a legacy terminal sends, whether micromux's terminal
+    /// reported them in legacy form or through the kitty keyboard protocol, which reports some
+    /// apart that legacy terminals send alike.
     #[test]
-    fn special_keys_encode_as_expected() {
-        assert_eq!(
-            key_event_to_bytes(KeyCode::Esc, KeyModifiers::NONE),
-            Some(vec![0x1b])
-        );
-        assert_eq!(
-            key_event_to_bytes(KeyCode::Enter, KeyModifiers::NONE),
-            Some(vec![b'\r'])
-        );
-        assert_eq!(
-            key_event_to_bytes(KeyCode::Enter, KeyModifiers::CONTROL),
-            Some(vec![b'\n'])
-        );
-        assert_eq!(
-            key_event_to_bytes(KeyCode::Tab, KeyModifiers::NONE),
-            Some(vec![b'\t'])
-        );
-        assert_eq!(
-            key_event_to_bytes(KeyCode::BackTab, KeyModifiers::NONE),
-            Some(b"\x1b[Z".to_vec())
-        );
-        assert_eq!(
-            key_event_to_bytes(KeyCode::Backspace, KeyModifiers::NONE),
-            Some(vec![0x7f])
-        );
-        assert_eq!(
-            key_event_to_bytes(KeyCode::Up, KeyModifiers::NONE),
-            Some(b"\x1b[A".to_vec())
-        );
-        assert_eq!(
-            key_event_to_bytes(KeyCode::Delete, KeyModifiers::NONE),
-            Some(b"\x1b[3~".to_vec())
-        );
-        assert_eq!(
-            key_event_to_bytes(KeyCode::Home, KeyModifiers::NONE),
-            Some(b"\x1b[H".to_vec())
-        );
-        assert_eq!(
-            key_event_to_bytes(KeyCode::End, KeyModifiers::NONE),
-            Some(b"\x1b[F".to_vec())
-        );
+    fn keys_reach_a_service_as_a_legacy_terminal_sends_them() {
+        const NONE: KeyModifiers = KeyModifiers::NONE;
+        const SHIFT: KeyModifiers = KeyModifiers::SHIFT;
+        const CTRL: KeyModifiers = KeyModifiers::CONTROL;
+        const ALT: KeyModifiers = KeyModifiers::ALT;
+        const SUPER: KeyModifiers = KeyModifiers::SUPER;
+        let cases: &[(KeyCode, KeyModifiers, &[u8])] = &[
+            // Text.
+            (KeyCode::Char('a'), NONE, b"a"),
+            (KeyCode::Char('A'), SHIFT, b"A"),
+            (KeyCode::Char('!'), SHIFT, b"!"),
+            (KeyCode::Char('é'), NONE, "é".as_bytes()),
+            (KeyCode::Char(' '), NONE, b" "),
+            // Control characters, the first as the kitty protocol reports Ctrl+Shift+C, with
+            // alternate keys reported and without.
+            (KeyCode::Char('c'), CTRL, b"\x03"),
+            (KeyCode::Char('c'), CTRL | SHIFT, b"\x03"),
+            (KeyCode::Char('C'), CTRL, b"\x03"),
+            (KeyCode::Char('z'), CTRL, b"\x1a"),
+            (KeyCode::Char('h'), CTRL, b"\x08"),
+            (KeyCode::Char('i'), CTRL, b"\t"),
+            (KeyCode::Char('m'), CTRL, b"\r"),
+            (KeyCode::Char(' '), CTRL, b"\x00"),
+            (KeyCode::Char('@'), CTRL, b"\x00"),
+            (KeyCode::Char('['), CTRL, b"\x1b"),
+            (KeyCode::Char('\\'), CTRL, b"\x1c"),
+            (KeyCode::Char(']'), CTRL, b"\x1d"),
+            (KeyCode::Char('^'), CTRL, b"\x1e"),
+            (KeyCode::Char('_'), CTRL, b"\x1f"),
+            (KeyCode::Char('/'), CTRL, b"\x1f"),
+            (KeyCode::Char('?'), CTRL, b"\x7f"),
+            // Legacy terminals send Ctrl+4 to Ctrl+7 as these, which crossterm reads back as
+            // digits.
+            (KeyCode::Char('4'), CTRL, b"\x1c"),
+            (KeyCode::Char('7'), CTRL, b"\x1f"),
+            (KeyCode::Char('1'), CTRL, b"1"),
+            // Alt prefixes Escape, with Ctrl too, and Shift picks the capital.
+            (KeyCode::Char('x'), ALT, b"\x1bx"),
+            (KeyCode::Char('a'), ALT | SHIFT, b"\x1bA"),
+            (KeyCode::Char('>'), ALT, b"\x1b>"),
+            (KeyCode::Char('c'), CTRL | ALT, b"\x1b\x03"),
+            (KeyCode::Enter, ALT, b"\x1b\r"),
+            (KeyCode::Backspace, ALT, b"\x1b\x7f"),
+            // Super never reaches a legacy terminal's programs, so the key goes alone.
+            (KeyCode::Char('c'), SUPER, b"c"),
+            // Editing keys, with any modifier.
+            (KeyCode::Esc, NONE, b"\x1b"),
+            (KeyCode::Enter, NONE, b"\r"),
+            (KeyCode::Enter, SHIFT, b"\r"),
+            (KeyCode::Enter, CTRL, b"\r"),
+            (KeyCode::Tab, NONE, b"\t"),
+            (KeyCode::Tab, CTRL, b"\t"),
+            (KeyCode::BackTab, SHIFT, b"\x1b[Z"),
+            (KeyCode::Backspace, NONE, b"\x7f"),
+            (KeyCode::Backspace, CTRL, b"\x08"),
+            // Cursor and editing keys carry their modifiers as xterm's parameter.
+            (KeyCode::Up, NONE, b"\x1b[A"),
+            (KeyCode::Down, NONE, b"\x1b[B"),
+            (KeyCode::Right, NONE, b"\x1b[C"),
+            (KeyCode::Left, NONE, b"\x1b[D"),
+            (KeyCode::Home, NONE, b"\x1b[H"),
+            (KeyCode::End, NONE, b"\x1b[F"),
+            (KeyCode::Up, SHIFT, b"\x1b[1;2A"),
+            (KeyCode::Left, ALT, b"\x1b[1;3D"),
+            (KeyCode::Right, CTRL, b"\x1b[1;5C"),
+            (KeyCode::End, CTRL | SHIFT, b"\x1b[1;6F"),
+            (KeyCode::Insert, NONE, b"\x1b[2~"),
+            (KeyCode::Delete, NONE, b"\x1b[3~"),
+            (KeyCode::PageUp, NONE, b"\x1b[5~"),
+            (KeyCode::PageDown, NONE, b"\x1b[6~"),
+            (KeyCode::Delete, CTRL, b"\x1b[3;5~"),
+            (KeyCode::PageUp, SHIFT, b"\x1b[5;2~"),
+            // Function keys.
+            (KeyCode::F(1), NONE, b"\x1bOP"),
+            (KeyCode::F(4), NONE, b"\x1bOS"),
+            (KeyCode::F(1), SHIFT, b"\x1b[1;2P"),
+            (KeyCode::F(5), NONE, b"\x1b[15~"),
+            (KeyCode::F(6), NONE, b"\x1b[17~"),
+            (KeyCode::F(10), NONE, b"\x1b[21~"),
+            (KeyCode::F(11), NONE, b"\x1b[23~"),
+            (KeyCode::F(12), NONE, b"\x1b[24~"),
+            (KeyCode::F(5), CTRL, b"\x1b[15;5~"),
+        ];
+        for &(code, modifiers, bytes) in cases {
+            assert_eq!(
+                key_event_to_bytes(code, modifiers).as_deref(),
+                Some(bytes),
+                "{code:?} with {modifiers:?}"
+            );
+        }
+        // Keys a legacy terminal has no bytes for send nothing.
+        assert_eq!(key_event_to_bytes(KeyCode::F(13), NONE), None);
+        assert_eq!(key_event_to_bytes(KeyCode::CapsLock, NONE), None);
     }
 
+    /// Ctrl+Shift+C and Ctrl+Insert, as on Linux and Windows, and Super+C, as Cmd+C on macOS,
+    /// copy; Ctrl-C and the chords near these never do.
     #[test]
-    fn alt_char_is_esc_prefixed() {
-        assert_eq!(
-            key_event_to_bytes(KeyCode::Char('x'), KeyModifiers::ALT),
-            Some(vec![0x1b, b'x'])
-        );
+    fn the_terminals_copy_shortcuts_are_copy_chords_and_ctrl_c_is_not() {
+        let chord = |code, modifiers| {
+            is_copy_chord(KeyEvent {
+                code,
+                modifiers,
+                kind: KeyEventKind::Press,
+                state: KeyEventState::NONE,
+            })
+        };
+        let ctrl_shift = KeyModifiers::CONTROL | KeyModifiers::SHIFT;
+        assert!(chord(KeyCode::Char('c'), ctrl_shift));
+        // With alternate keys reported, the shifted key comes without Shift.
+        assert!(chord(KeyCode::Char('C'), KeyModifiers::CONTROL));
+        assert!(chord(KeyCode::Char('C'), ctrl_shift));
+        assert!(chord(KeyCode::Insert, KeyModifiers::CONTROL));
+        assert!(chord(KeyCode::Char('c'), KeyModifiers::SUPER));
+
+        assert!(!chord(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(!chord(KeyCode::Char('c'), KeyModifiers::NONE));
+        assert!(!chord(KeyCode::Char('C'), KeyModifiers::SHIFT));
+        assert!(!chord(KeyCode::Char('c'), KeyModifiers::ALT));
+        assert!(!chord(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT
+        ));
+        assert!(!chord(KeyCode::Char('C'), KeyModifiers::SUPER));
+        assert!(!chord(KeyCode::Insert, KeyModifiers::NONE));
+        assert!(!chord(KeyCode::Insert, KeyModifiers::SHIFT));
     }
 
     #[tokio::test]

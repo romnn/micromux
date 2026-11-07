@@ -1421,7 +1421,7 @@ const HELP_COLUMNS: [&[HelpSection]; 2] = [
                 },
                 HelpKey {
                     keys: "y / ↵",
-                    description: "Copy the mouse selection",
+                    description: "Copy selection; right-click too",
                 },
             ],
         },
@@ -1469,7 +1469,7 @@ const HELP_COLUMNS: [&[HelpSection]; 2] = [
                 },
                 HelpKey {
                     keys: "q",
-                    description: "Quit / detach",
+                    description: "Quit / detach (Ctrl-C twice)",
                 },
                 HelpKey {
                     keys: "?",
@@ -2507,20 +2507,56 @@ impl App {
     /// Draws what the last mouse release copied at the right end of the footer's last row, where
     /// the hints leave room, so it never changes the layout.
     fn render_mouse_notice(&self, footer: &[HintRow], area: Rect, buf: &mut Buffer) {
-        let (Some(notice), Some(last)) = (&self.mouse.notice, footer.last()) else {
+        // The quit prompt matters more than what the last copy took.
+        let quitting = self.quit_prompt_at.is_some();
+        let (notice, color) = if quitting {
+            let action = if self.source.attachment_status().is_some() {
+                "detach"
+            } else {
+                "quit"
+            };
+            (
+                Some(format!("press Ctrl-C again within 2 s to {action} (or q)")),
+                tailwind::YELLOW.c400,
+            )
+        } else {
+            (self.mouse.notice.clone(), tailwind::GREEN.c400)
+        };
+        let (Some(notice), Some(last)) = (notice, footer.last()) else {
             return;
         };
         let notice = format!("{notice} ");
         let width = rows_u16(notice.chars().count());
         let used = rows_u16(last.line.width()).saturating_add(2);
-        if area.height == 0 || used.saturating_add(width) > area.width {
+        if area.height == 0 {
+            return;
+        }
+        if used.saturating_add(width) > area.width {
+            // The quit prompt must show, so for its two seconds it covers the hints of the
+            // footer's last row; other notices wait for room.
+            if !quitting {
+                return;
+            }
+            let row = Rect {
+                y: area.bottom() - 1,
+                height: 1,
+                ..area
+            };
+            Clear.render(row, buf);
+            buf.set_stringn(
+                row.x,
+                row.y,
+                format!(" {notice}"),
+                usize::from(row.width),
+                Style::default().fg(color),
+            );
             return;
         }
         buf.set_string(
             area.right() - width,
             area.bottom() - 1,
             notice,
-            Style::default().fg(tailwind::GREEN.c400),
+            Style::default().fg(color),
         );
     }
 

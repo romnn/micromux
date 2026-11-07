@@ -20,6 +20,17 @@ const WAIT: Duration = Duration::from_secs(30);
 /// The sequence that switches mouse reporting on.
 const MOUSE_ON: &[u8] = b"\x1b[?1000h";
 
+/// The sequences that push and pop micromux's kitty keyboard flags.
+const KEYBOARD_PUSH: &[u8] = b"\x1b[>5u";
+const KEYBOARD_POP: &[u8] = b"\x1b[<1u";
+
+/// The terminal's queries for its kitty keyboard flags and its primary device attributes.
+const KEYBOARD_QUERY: &[u8] = b"\x1b[?u";
+const ATTRIBUTES_QUERY: &[u8] = b"\x1b[c";
+
+/// The OSC 52 copy of `hello` to the clipboard.
+const HELLO_COPIED: &[u8] = b"\x1b]52;c;aGVsbG8=";
+
 const CONFIG: &str = "version: 1\nservices:\n  app:\n    command: [\"sh\", \"-c\", \"echo hello world; sleep 30\"]\n";
 
 /// A program running in a pseudo-terminal, with the screen it drew and everything it wrote.
@@ -29,6 +40,10 @@ struct Terminal {
     output: Receiver<Vec<u8>>,
     parser: vt100::Parser,
     written: Vec<u8>,
+    /// How much of `written` was searched for queries to answer.
+    answered: usize,
+    /// Whether to answer as a terminal with the kitty keyboard protocol.
+    keyboard_protocol: bool,
 }
 
 impl Terminal {
@@ -73,6 +88,8 @@ impl Terminal {
             output,
             parser: vt100::Parser::new(30, 120, 0),
             written: Vec::new(),
+            answered: 0,
+            keyboard_protocol: false,
         })
     }
 
@@ -93,6 +110,7 @@ impl Terminal {
                 Ok(chunk) => {
                     self.parser.process(&chunk);
                     self.written.extend_from_slice(&chunk);
+                    self.answer_queries()?;
                 }
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => {
@@ -106,6 +124,35 @@ impl Terminal {
             }
         }
         Ok(())
+    }
+
+    /// Answers the queries written since the last call as a terminal does, which vt100 does not:
+    /// the keyboard flags only with the kitty protocol, the device attributes always.
+    fn answer_queries(&mut self) -> eyre::Result<()> {
+        loop {
+            let rest = self.written.get(self.answered..).unwrap_or_default();
+            let next = [KEYBOARD_QUERY, ATTRIBUTES_QUERY]
+                .into_iter()
+                .filter_map(|query| position(rest, query).map(|at| (at, query)))
+                .min_by_key(|&(at, _)| at);
+            let Some((at, query)) = next else {
+                return Ok(());
+            };
+            self.answered += at + query.len();
+            if query == ATTRIBUTES_QUERY {
+                self.send(b"\x1b[?62c")?;
+            } else if self.keyboard_protocol {
+                self.send(b"\x1b[?0u")?;
+            }
+        }
+    }
+
+    /// How often `needle` occurs in what the program wrote.
+    fn count(&self, needle: &[u8]) -> usize {
+        self.written
+            .windows(needle.len())
+            .filter(|window| *window == needle)
+            .count()
     }
 
     fn send(&mut self, keys: &[u8]) -> eyre::Result<()> {
@@ -124,9 +171,14 @@ impl Terminal {
     /// Quits the TUI with `q` and waits for the process to exit.
     fn quit(&mut self) -> eyre::Result<()> {
         self.send(b"q")?;
+        self.wait_for_exit()
+    }
+
+    /// Waits for the process to exit and reads what it wrote on its way out.
+    fn wait_for_exit(&mut self) -> eyre::Result<()> {
         let deadline = Instant::now() + WAIT;
         while self.child.try_wait()?.is_none() {
-            eyre::ensure!(Instant::now() < deadline, "micromux did not exit after q");
+            eyre::ensure!(Instant::now() < deadline, "micromux did not exit");
             std::thread::sleep(Duration::from_millis(50));
         }
         // Read what the TUI wrote on its way out.
@@ -144,9 +196,14 @@ impl Drop for Terminal {
 
 /// Whether `needle` occurs in `haystack`.
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    position(haystack, needle).is_some()
+}
+
+/// Where `needle` first occurs in `haystack`.
+fn position(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack
         .windows(needle.len())
-        .any(|window| window == needle)
+        .position(|window| window == needle)
 }
 
 /// A project in a fresh directory, with a home of its own so no user config leaks in.
@@ -217,13 +274,71 @@ fn mouse_report(code: u8, (column, row): (u16, u16), pressed: bool) -> Vec<u8> {
     format!("\x1b[<{code};{};{}{end}", column + 1, row + 1).into_bytes()
 }
 
-/// Capture comes back off whichever way the TUI lets go of the terminal: the `m` key, a
-/// suspend, and quitting.
+/// Selects `hello` in the logs, copies it with `y` and with Ctrl+Shift+C, and checks that a
+/// single Ctrl-C copies nothing and stops nothing.
+fn copy_hello_and_survive_a_ctrl_c(tui: &mut Terminal) -> eyre::Result<()> {
+    // Dragging over a word of the logs selects it, and only `y` copies it to the clipboard
+    // through OSC 52.
+    let (column, row) = find(tui.parser.screen(), "hello")?;
+    tui.send(&mouse_report(0, (column, row), true))?;
+    tui.send(&mouse_report(32, (column + 4, row), true))?;
+    tui.send(&mouse_report(0, (column + 4, row), false))?;
+    // Input is handled in order, so once `H` shows, the release before it was handled too.
+    tui.send(b"H")?;
+    tui.wait_until("the release and the copy key in the footer", |screen, _| {
+        screen.contents().contains("y Copy") && screen.contents().contains("Health:ON")
+    })?;
+    assert!(!contains(&tui.written, b"\x1b]52;"));
+    tui.send(b"y")?;
+    tui.wait_until("the copy", |_, written| contains(written, HELLO_COPIED))?;
+    // One copy to the clipboard and one to the primary selection.
+    assert_eq!(tui.count(b"\x1b]52;"), 2);
+
+    // Ctrl+Shift+C, as the kitty protocol reports it apart from Ctrl-C, copies the same way.
+    tui.send(b"\x1b[99;6u")?;
+    tui.wait_until("the copy with Ctrl+Shift+C", |_, written| {
+        written
+            .windows(HELLO_COPIED.len())
+            .filter(|window| *window == HELLO_COPIED)
+            .count()
+            == 2
+    })?;
+
+    // Ctrl-C never copies, even with text selected: a single one only asks for another, and
+    // stops nothing once its two seconds pass.
+    tui.send(b"\x1b[99;5u")?;
+    tui.wait_until("the quit prompt", |screen, _| {
+        screen
+            .contents()
+            .contains("press Ctrl-C again within 2 s to quit")
+    })?;
+    tui.wait_until("the quit prompt to go", |screen, _| {
+        !screen.contents().contains("Ctrl-C again")
+    })?;
+    eyre::ensure!(
+        tui.child.try_wait()?.is_none(),
+        "a single Ctrl-C stopped micromux"
+    );
+    assert_eq!(tui.count(HELLO_COPIED), 2);
+    Ok(())
+}
+
+/// Capture and the kitty keyboard flags come back off whichever way the TUI lets go of the
+/// terminal: the `m` key for capture, a suspend, and quitting.
 #[test]
 fn mouse_capture_is_released_by_the_toggle_a_suspend_and_quitting() -> eyre::Result<()> {
     let project = Project::new(CONFIG)?;
     let mut tui = project.micromux(&[])?;
+    tui.keyboard_protocol = true;
     tui.wait_for_tui()?;
+    // The flags go onto the alternate screen's stack.
+    let entered = position(&tui.written, b"\x1b[?1049h");
+    let pushed = position(&tui.written, KEYBOARD_PUSH);
+    assert!(
+        entered.is_some() && pushed.is_some() && entered < pushed,
+        "{:?}",
+        String::from_utf8_lossy(&tui.written)
+    );
     tui.wait_until("mouse capture", |screen, _| {
         screen.mouse_protocol_mode() == MouseProtocolMode::ButtonMotion
     })?;
@@ -239,29 +354,7 @@ fn mouse_capture_is_released_by_the_toggle_a_suspend_and_quitting() -> eyre::Res
         screen.contents().contains("Focus:LOGS")
     })?;
 
-    // Dragging over a word of the logs selects it, and only `y` copies it to the clipboard
-    // through OSC 52.
-    let (column, row) = find(tui.parser.screen(), "hello")?;
-    tui.send(&mouse_report(0, (column, row), true))?;
-    tui.send(&mouse_report(32, (column + 4, row), true))?;
-    tui.send(&mouse_report(0, (column + 4, row), false))?;
-    // Input is handled in order, so once `H` shows, the release before it was handled too.
-    tui.send(b"H")?;
-    tui.wait_until("the release and the copy key in the footer", |screen, _| {
-        screen.contents().contains("y Copy") && screen.contents().contains("Health:ON")
-    })?;
-    assert!(!contains(&tui.written, b"\x1b]52;"));
-    tui.send(b"y")?;
-    tui.wait_until("the copy", |_, written| {
-        contains(written, b"\x1b]52;c;aGVsbG8=")
-    })?;
-    // One copy to the clipboard and one to the primary selection.
-    let copies = tui
-        .written
-        .windows(b"\x1b]52;".len())
-        .filter(|window| *window == b"\x1b]52;")
-        .count();
-    assert_eq!(copies, 2);
+    copy_hello_and_survive_a_ctrl_c(&mut tui)?;
 
     // The toggle releases the mouse and takes it again.
     tui.send(b"m")?;
@@ -275,7 +368,8 @@ fn mouse_capture_is_released_by_the_toggle_a_suspend_and_quitting() -> eyre::Res
             && screen.contents().contains("Mouse:ON")
     })?;
 
-    // Ctrl-Z gives the terminal back before it stops.
+    // Ctrl-Z gives the terminal back before it stops, popping the keyboard flags off the
+    // alternate screen before leaving it.
     // Nothing can continue a process in this orphaned process group, so the system ignores the
     // stop and the TUI takes the terminal right back.
     let before = tui.written.len();
@@ -287,7 +381,12 @@ fn mouse_capture_is_released_by_the_toggle_a_suspend_and_quitting() -> eyre::Res
             let released = after
                 .windows(b"\x1b[?1049l".len())
                 .position(|window| window == b"\x1b[?1049l");
-            released.is_some_and(|at| contains(after.get(at..).unwrap_or_default(), MOUSE_ON))
+            let popped = position(after, KEYBOARD_POP);
+            released.is_some_and(|at| {
+                let again = after.get(at..).unwrap_or_default();
+                contains(again, MOUSE_ON) && contains(again, KEYBOARD_PUSH)
+            }) && popped.is_some()
+                && popped < released
                 && contains(after, b"\x1b[?1000l")
                 && screen.alternate_screen()
                 && screen.mouse_protocol_mode() == MouseProtocolMode::ButtonMotion
@@ -295,22 +394,37 @@ fn mouse_capture_is_released_by_the_toggle_a_suspend_and_quitting() -> eyre::Res
         },
     )?;
 
-    // Quitting releases the mouse and the alternate screen.
-    tui.quit()?;
+    // Two Ctrl-C in a row quit, releasing the mouse, the keyboard flags and the alternate
+    // screen.
+    let before = tui.written.len();
+    tui.send(b"\x03")?;
+    tui.send(b"\x03")?;
+    tui.wait_for_exit()?;
     let screen = tui.parser.screen();
     assert_eq!(screen.mouse_protocol_mode(), MouseProtocolMode::None);
     assert!(!screen.alternate_screen());
+    let after = tui.written.get(before..).unwrap_or_default();
+    let popped = position(after, KEYBOARD_POP);
+    assert!(
+        popped.is_some() && popped < position(after, b"\x1b[?1049l"),
+        "{:?}",
+        String::from_utf8_lossy(after)
+    );
     Ok(())
 }
 
 /// The flag beats the project config, which beats the user config, and "off" never sends the
 /// terminal a mouse sequence at all.
+///
+/// The terminal here has no kitty keyboard protocol, so micromux never asks it for one.
 #[test]
 fn the_mouse_setting_follows_the_flag_then_the_project_then_the_user() -> eyre::Result<()> {
     let run = |project: &Project, args: &[&str]| -> eyre::Result<bool> {
         let mut tui = project.micromux(args)?;
         tui.wait_for_tui()?;
         tui.quit()?;
+        assert!(!contains(&tui.written, b"\x1b[>"));
+        assert!(!contains(&tui.written, KEYBOARD_POP));
         Ok(contains(&tui.written, MOUSE_ON))
     };
 

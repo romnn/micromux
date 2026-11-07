@@ -99,11 +99,11 @@ from the TUI or with the control plane.
  - **PTY input mode (send input)**: `a` (exit input mode with `Alt+Esc`)
  - **Toggle panes/focus**: `Tab`, healthchecks pane: `H`
  - **Logs**: wrap `w`, follow-tail `t`, level threshold `L`, timestamps `T`, hidden fields `F`
- - **Mouse**: click to select and focus, wheel to scroll, drag to select text inside a pane and `y` to
+ - **Mouse**: click to select and focus, wheel to scroll, drag to select text inside a pane and `y` or a right-click to
    copy it; `m` toggles capture, Shift bypasses it, and `ui: { mouse: false }` or `--mouse off` turns it off
  - **Suspend**: `Ctrl-Z` (resume with `fg`)
  - **All keys**: `?`
- - **Quit**: `q` (or `Ctrl-C`)
+ - **Quit**: `q` (or `Ctrl-C` twice)
 
 ## Attach to a running session
 
@@ -121,7 +121,7 @@ observe and operate the same session at once.
 
 The attached TUI follows service status, logs, and healthchecks, and its lifecycle keys still
 restart, enable/disable, or retire services. In v1 it does not forward service PTY input or terminal
-resize events. Pressing `q` or Ctrl-C only detaches the client; it never stops the session or its
+resize events. Pressing `q`, or Ctrl-C twice, only detaches the client; it never stops the session or its
 services. To stop the session explicitly, use `micromux ctl stop` or the MCP `stop_session` tool.
 
  ## Agent control (MCP)

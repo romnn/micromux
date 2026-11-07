@@ -242,6 +242,13 @@ impl App {
             MouseEventKind::Down(MouseButton::Left) => self.press(position, at),
             MouseEventKind::Drag(MouseButton::Left) => self.drag_to(position),
             MouseEventKind::Up(MouseButton::Left) => self.release(position),
+            // A right-click copies the selection as `y` does, wherever it is, and leaves it, the
+            // focus and the selected service as they are.
+            MouseEventKind::Up(MouseButton::Right)
+                if !self.pty_input_mode && self.level_picker.is_none() =>
+            {
+                self.copy_selection();
+            }
             MouseEventKind::ScrollUp => self.wheel(position, false, at),
             MouseEventKind::ScrollDown => self.wheel(position, true, at),
             _ => {}

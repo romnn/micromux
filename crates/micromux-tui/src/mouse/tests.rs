@@ -868,9 +868,10 @@ async fn selecting_only_highlights_and_copying_takes_an_explicit_key() -> eyre::
         (KeyCode::Char('y'), KeyModifiers::NONE),
         (KeyCode::Enter, KeyModifiers::NONE),
         (
-            KeyCode::Char('C'),
+            KeyCode::Char('c'),
             KeyModifiers::CONTROL | KeyModifiers::SHIFT,
         ),
+        (KeyCode::Insert, KeyModifiers::CONTROL),
         (KeyCode::Char('c'), KeyModifiers::SUPER),
     ] {
         key_with(&mut app, code, modifiers);
@@ -878,6 +879,13 @@ async fn selecting_only_highlights_and_copying_takes_an_explicit_key() -> eyre::
     }
     assert_eq!(app.mouse.notice.as_deref(), Some("copied 6 characters"));
     assert!(app.running);
+
+    // Ctrl-C never copies, not even with text selected: it only asks for a second to quit.
+    key_with(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL);
+    assert_eq!(copied(&mut app), Vec::<String>::new());
+    assert!(app.quit_prompt_at.is_some());
+    assert!(app.running);
+    app.quit_prompt_at = None;
 
     // Clicking the copy hint copies too, without the press dropping the selection.
     let frame = draw(&mut app);
@@ -1129,5 +1137,104 @@ async fn the_copy_hint_copies_a_selection_in_a_popup_without_closing_it() -> eyr
     press_key(&mut app, KeyCode::Esc);
     press_key(&mut app, KeyCode::Char('L'));
     assert!(!footer(&mut app).contains("y Copy"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_copy_chord_copies_a_selection_in_a_popup() -> eyre::Result<()> {
+    let mut app = app(SERVICES)?;
+    press_key(&mut app, KeyCode::Char('i'));
+    let frame = draw(&mut app);
+    let text = find(&frame, "State")?;
+    drag(&mut app, text, &[Position::new(text.x + 4, text.y)]);
+    key_with(
+        &mut app,
+        KeyCode::Char('c'),
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+    );
+    assert_eq!(copied(&mut app), vec!["State".to_string()]);
+    assert!(app.info.is_some());
+    Ok(())
+}
+
+fn right_click(app: &mut App, position: Position) {
+    mouse(app, MouseEventKind::Down(MouseButton::Right), position);
+    mouse(app, MouseEventKind::Up(MouseButton::Right), position);
+}
+
+/// A right-click copies the selection as `y` does, wherever it lands, and changes nothing else:
+/// not the selection, the focus or the selected service.
+#[tokio::test]
+async fn a_right_click_copies_the_selection_and_changes_nothing_else() -> eyre::Result<()> {
+    let mut app = app(SERVICES)?;
+    set_logs(&mut app, numbered(5))?;
+    let frame = draw(&mut app);
+
+    // Without a selection it does nothing.
+    right_click(&mut app, find(&frame, "worker")?);
+    assert_eq!(copied(&mut app), Vec::<String>::new());
+    assert_eq!(app.state.selected_service, 0);
+
+    let line = find(&frame, "line 2 of")?;
+    drag(&mut app, line, &[Position::new(line.x + 5, line.y)]);
+    app.focus = Focus::Services;
+    let selection = app.mouse.selection.clone();
+
+    // Over another service, over other log text and over the selection itself.
+    for position in [
+        find(&frame, "worker")?,
+        find(&frame, "line 4 of")?,
+        Position::new(line.x + 2, line.y),
+    ] {
+        right_click(&mut app, position);
+        assert_eq!(copied(&mut app), vec!["line 2".to_string()], "{position:?}");
+        assert_eq!(app.mouse.selection, selection);
+        assert_eq!(app.focus, Focus::Services);
+        assert_eq!(app.state.selected_service, 0);
+    }
+    assert_eq!(app.mouse.notice.as_deref(), Some("copied 6 characters"));
+
+    // The release copies, so a press alone does nothing yet.
+    mouse(&mut app, MouseEventKind::Down(MouseButton::Right), line);
+    assert_eq!(copied(&mut app), Vec::<String>::new());
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_right_click_copies_in_the_healthcheck_pane_and_popups() -> eyre::Result<()> {
+    let mut app = app(SERVICES)?;
+    press_key(&mut app, KeyCode::Char('H'));
+    let frame = draw(&mut app);
+    let text = find(&frame, "no healthcheck")?;
+    drag(&mut app, text, &[Position::new(text.x + 1, text.y)]);
+    right_click(&mut app, Position::new(0, 0));
+    assert_eq!(copied(&mut app), vec!["no".to_string()]);
+
+    for (key, word) in [('?', "Select"), ('i', "State"), ('u', "reports")] {
+        press_key(&mut app, KeyCode::Esc);
+        press_key(&mut app, KeyCode::Char(key));
+        let frame = draw(&mut app);
+        let text = find(&frame, word)?;
+        let end = u16::try_from(word.len())? - 1;
+        drag(&mut app, text, &[Position::new(text.x + end, text.y)]);
+        // Outside the popup, where a left click would close it.
+        right_click(&mut app, Position::new(0, 0));
+        assert_eq!(copied(&mut app), vec![word.to_string()], "{key}");
+        assert!(app.show_help || app.info.is_some(), "{key}");
+    }
+    Ok(())
+}
+
+/// In PTY input mode the right button copies nothing.
+#[tokio::test]
+async fn a_right_click_copies_nothing_in_pty_input_mode() -> eyre::Result<()> {
+    let mut app = app(SERVICES)?;
+    set_logs(&mut app, numbered(5))?;
+    let frame = draw(&mut app);
+    let line = find(&frame, "line 2 of")?;
+    drag(&mut app, line, &[Position::new(line.x + 5, line.y)]);
+    app.pty_input_mode = true;
+    right_click(&mut app, line);
+    assert_eq!(copied(&mut app), Vec::<String>::new());
     Ok(())
 }

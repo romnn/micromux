@@ -1,21 +1,25 @@
 //! Taking the terminal over and giving it back as it was, on exit, on suspend and on a panic
 //! alike.
 //!
-//! While the TUI shows, the terminal is in raw mode on its alternate screen with bracketed paste
-//! and, when enabled, mouse capture.
+//! While the TUI shows, the terminal is in raw mode on its alternate screen with bracketed paste,
+//! the kitty keyboard protocol where the terminal has it, and, when enabled, mouse capture.
 //! Each mode is marked before it is switched on, so [`give_back`] undoes exactly what is on,
 //! however far taking the terminal over got, and only once.
 
 use std::fmt;
 use std::io::{self, Write};
-use std::sync::Once;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Once, OnceLock};
 
 #[cfg(windows)]
 use crossterm::event::EnableMouseCapture;
-use crossterm::event::{DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste};
+use crossterm::event::{
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, KeyboardEnhancementFlags,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+};
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    supports_keyboard_enhancement,
 };
 use crossterm::{cursor, execute};
 
@@ -27,6 +31,25 @@ static SCREEN: AtomicBool = AtomicBool::new(false);
 
 /// Whether the terminal reports the mouse.
 static MOUSE: AtomicBool = AtomicBool::new(false);
+
+/// Whether the TUI pushed kitty keyboard flags onto the alternate screen's stack.
+static KEYBOARD: AtomicBool = AtomicBool::new(false);
+
+/// What the TUI asks of the kitty keyboard protocol: Ctrl+Shift+C reported apart from Ctrl-C and
+/// Super+C reported at all, so the terminals' copy shortcuts arrive, and the shifted key with
+/// Shift, so a service in PTY input mode still gets the legacy bytes for Alt+Shift+.
+const KEYBOARD_FLAGS: KeyboardEnhancementFlags =
+    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+        .union(KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS);
+
+/// Whether the terminal has the kitty keyboard protocol.
+///
+/// It is asked once, before the input reader starts, which would otherwise take the answer.
+fn has_keyboard_protocol() -> bool {
+    static SUPPORTED: OnceLock<bool> = OnceLock::new();
+    // A terminal that does not answer has no protocol to speak.
+    *SUPPORTED.get_or_init(|| supports_keyboard_enhancement().unwrap_or(false))
+}
 
 /// Mouse reporting for presses, releases, drags and the wheel, in SGR encoding.
 ///
@@ -51,8 +74,8 @@ impl crossterm::Command for EnableButtonMouseCapture {
     }
 }
 
-/// Takes the terminal over: raw mode, the alternate screen, bracketed paste, and mouse capture
-/// when `mouse` is set.
+/// Takes the terminal over: raw mode, the alternate screen, bracketed paste, the kitty keyboard
+/// protocol where the terminal has it, and mouse capture when `mouse` is set.
 ///
 /// It also takes the terminal again after a suspend, setting every mode anew, since the shell
 /// may have put its own modes back meanwhile.
@@ -63,8 +86,15 @@ pub(crate) fn take_over(mouse: bool) -> io::Result<()> {
         disable_raw_mode()?;
     }
     enable_raw_mode()?;
+    let keyboard = has_keyboard_protocol();
     SCREEN.store(true, Ordering::SeqCst);
     execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
+    // The main and alternate screens keep separate flag stacks, so the flags go onto the
+    // alternate screen's and come off before leaving it.
+    if keyboard {
+        KEYBOARD.store(true, Ordering::SeqCst);
+        execute!(stdout, PushKeyboardEnhancementFlags(KEYBOARD_FLAGS))?;
+    }
     if mouse {
         MOUSE.store(true, Ordering::SeqCst);
         execute!(stdout, EnableButtonMouseCapture)?;
@@ -105,6 +135,9 @@ fn give_back_on(
             first = result;
         }
     };
+    if KEYBOARD.swap(false, Ordering::SeqCst) {
+        step(execute!(out, PopKeyboardEnhancementFlags));
+    }
     if MOUSE.swap(false, Ordering::SeqCst) {
         step(execute!(out, DisableMouseCapture));
     }
@@ -191,7 +224,7 @@ impl Continued {
 
 #[cfg(test)]
 mod tests {
-    use super::{MOUSE, RAW, SCREEN, give_back_on, set_mouse_capture_on};
+    use super::{KEYBOARD, MOUSE, RAW, SCREEN, give_back_on, set_mouse_capture_on};
     use color_eyre::eyre;
     use similar_asserts::assert_eq;
     use std::sync::atomic::Ordering;
@@ -199,6 +232,7 @@ mod tests {
     const MOUSE_OFF: &str = "\x1b[?1000l";
     const MOUSE_ON: &str = "\x1b[?1000h\x1b[?1002h\x1b[?1006h";
     const LEAVE_SCREEN: &str = "\x1b[?1049l";
+    const KEYBOARD_POP: &str = "\x1b[<1u";
 
     fn written(out: &[u8]) -> String {
         String::from_utf8_lossy(out).into_owned()
@@ -207,10 +241,12 @@ mod tests {
     /// The tests share the process-wide mode flags, so they run as one sequence.
     #[test]
     fn the_terminal_comes_back_exactly_once_with_whatever_was_on() -> eyre::Result<()> {
-        // Giving back a terminal with every mode on releases the mouse, leaves the alternate
+        // Giving back a terminal with every mode on pops the keyboard flags while still on the
+        // alternate screen, whose stack they are on, releases the mouse, leaves the alternate
         // screen and turns raw mode off.
         RAW.store(true, Ordering::SeqCst);
         SCREEN.store(true, Ordering::SeqCst);
+        KEYBOARD.store(true, Ordering::SeqCst);
         MOUSE.store(true, Ordering::SeqCst);
         let mut out = Vec::new();
         let mut raw_disabled = 0;
@@ -220,7 +256,10 @@ mod tests {
         })?;
         let out = written(&out);
         assert!(out.contains(MOUSE_OFF), "{out:?}");
-        assert!(out.contains(LEAVE_SCREEN), "{out:?}");
+        let pop = out.find(KEYBOARD_POP);
+        let leave = out.find(LEAVE_SCREEN);
+        assert!(pop.is_some() && leave.is_some() && pop < leave, "{out:?}");
+        assert_eq!(out.matches(KEYBOARD_POP).count(), 1, "{out:?}");
         assert_eq!(raw_disabled, 1);
 
         // A second give-back, as the panic hook may run after a normal exit, does nothing.
@@ -232,8 +271,9 @@ mod tests {
         assert!(again.is_empty(), "{:?}", written(&again));
         assert_eq!(raw_disabled, 1);
 
-        // With capture switched off at runtime, giving back leaves mouse modes alone, so a
-        // terminal that never captured sees no mouse sequence at all.
+        // Without the keyboard protocol nothing is popped, and with capture switched off at
+        // runtime, giving back leaves mouse modes alone, so a terminal that never captured sees
+        // no mouse sequence at all.
         SCREEN.store(true, Ordering::SeqCst);
         MOUSE.store(true, Ordering::SeqCst);
         let mut toggled = Vec::new();
@@ -242,6 +282,7 @@ mod tests {
         let mut out = Vec::new();
         give_back_on(&mut out, || Ok(()))?;
         assert!(!written(&out).contains("?1000"), "{:?}", written(&out));
+        assert!(!written(&out).contains(KEYBOARD_POP), "{:?}", written(&out));
 
         // Turning capture on twice sends the sequence once.
         let mut out = Vec::new();
