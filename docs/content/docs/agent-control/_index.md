@@ -13,7 +13,7 @@ micromux exposes an **MCP server** so coding agents — Claude Code, Codex — c
 Every running `micromux` opens a local, per-project **control endpoint** — a Unix domain socket under `$XDG_RUNTIME_DIR/micromux/`, same-user only, no network. Three clients speak to it:
 
 - the **TUI**, on your keypresses;
-- the **`micromux ctl`** command, for the shell — see [The control plane]({{< relref "control-plane.md" >}});
+- the **`micromux ctl`** command, for the shell, and `micromux env` and `micromux exec`, which hand a session's environment to your own commands — see [The control plane]({{< relref "control-plane.md" >}});
 - the **MCP server** (`micromux mcp`), a thin stdio proxy for agents.
 
 The control plane is **on by default**; opt out with `--no-control` or `control: { enabled: false }`.
@@ -53,6 +53,7 @@ name: my-project
 The tools cover the full lifecycle:
 
 - **Discovery** — `list_sessions`, `list_services`, `find_service` (locate a service across every running session), and `get_session_urls` (a session's browser URLs such as `http://app.luup2.localhost`, its [allocated ports]({{< relref "../configuration/sessions.md" >}}), and whether the proxy serves them).
+- **Environment** — `get_session_env`, for an agent that runs a dev task itself, such as a migration against the session's database: the session's variables with their values, or a service's resolved environment, whose values come back only for the `names` the agent asks for. `start_dynamic_service` remains the way to run a command under the session. See [Run commands in the session environment]({{< relref "control-plane.md" >}}#run-commands-in-the-session-environment).
 - **Logs** — `get_logs`, `follow_logs`, `follow_all_logs`, `list_log_runs`, with `grep`, time, trace-id, and — for JSON logs — structured `min_level` filters and a token-efficient `compact` format.
 - **Health & forensics** — `get_health`, `get_health_history`, `wait_for_healthy`, `get_service_events`, `diagnose` (a one-shot summary of exited or unhealthy services with likely-cause log lines).
 - **Mutations** — `restart_service`, `enable_service`, `disable_service`, `restart_all`; `restart_service`/`enable_service` return a run **generation** to pass to `wait_for_healthy(after_generation=…)` so you wait for the *new* run, not the old one.
@@ -68,10 +69,16 @@ Manual restarts, enables, and due automatic restarts reload the latest `micromux
 > [!WARNING]
 > The same-user control interface is operator-trusted, not a redacted security boundary. Discovery
 > reports config and working-directory paths, executable/runtime endpoint details, service and
-> healthcheck argv, and captured probe output. Environment values are excluded, but secrets placed
+> healthcheck argv, and captured probe output. Environment values appear only where they are asked
+> for explicitly, through `micromux env`, `micromux exec`, and `get_session_env`, but secrets placed
 > in argv or output are visible to connected clients.
+
+`micromux mcp` writes its log to a file. With `-v` or `--log`, micromux's own targets get more
+verbose, but the MCP SDK's `rmcp` target stays at `info` at most, so its `debug` records of tool
+results, which can hold `get_session_env` values, never reach the log. An explicit `RUST_LOG`
+replaces this default filter, cap included.
 
 ## In this section
 
-- **[The control plane]({{< relref "control-plane.md" >}})** — the `micromux ctl` client, `serve`, and reconciling on-disk edits.
+- **[The control plane]({{< relref "control-plane.md" >}})** — the `micromux ctl` client, `micromux env` and `micromux exec`, `serve`, and reconciling on-disk edits.
 - **[Dynamic services]({{< relref "dynamic-services.md" >}})** — runtime-created services and the policy that bounds them.

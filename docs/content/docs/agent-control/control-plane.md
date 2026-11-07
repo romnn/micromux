@@ -66,6 +66,54 @@ micromux ctl wait seed --exit --after-generation "$generation" && micromux ctl w
 
 The MCP `wait_for_healthy` and `wait_for_exit` tools follow the same rules; a dependency failure comes back as an error whose data names the failed dependency.
 
+## Run commands in the session environment
+
+A task you run yourself, such as a migration, a seed script, or a one-off `psql`, needs the ports and variables the session's services get. `micromux exec` runs it with them, and `micromux env` prints them:
+
+```bash
+micromux exec task migrations:reset                   # run with the session's variables
+micromux exec --service api -- cargo run --bin seed   # run with what the `api` service gets
+micromux env                                          # KEY=value lines, quoted for a shell
+psql -p "$(micromux env POSTGRES_PORT)"               # one name prints just its value
+eval "$(micromux env --export)"                       # load them into the current shell
+micromux env --service api --format json
+```
+
+Both read the environment from the running session over the control plane, so they match what its services got, and `exec` and `env` never disagree. Without a running session they fail instead of falling back to `.env` files. On success they print nothing besides the requested output.
+
+**Which session.** Like `ctl`, they use the session for the config found at or above the current directory, or for `--config <path>`. A session for any other config does not count, not even one in a subdirectory. `--session` selects a session by `name:`, `pid:`, or `hash:`, as [`micromux attach`]({{< relref "../tui.md" >}}#attach-to-a-running-session) does.
+
+**Which variables.**
+
+- Without `--service`, the variables the session injects into every service: `MICROMUX_SESSION`, `MICROMUX_SESSION_DOMAIN`, `MICROMUX_PROXY_PORT`, `MICROMUX_HOST_SUFFIX`, and every [allocated port]({{< relref "../configuration/sessions.md" >}}#allocated-ports).
+- With `--service <id>`, that service's `env_file` and `environment` entries, interpolated, with the session's variables applied. It takes the service id, not its display name. While the service runs, these are the values its process started with; when its config changed since, for example through `ctl reconcile`, a note on stderr says so. The variables micromux sets on every service process itself (`TERM`, `CLICOLOR`, `CLICOLOR_FORCE`, `FORCE_COLOR`) are not included.
+- Variables your shell already has, such as `PATH`, `AWS_PROFILE`, or a `DATABASE_URL` from direnv, come from your shell. `exec` keeps them, and only the session's configured variables override variables of the same name. The environment micromux itself was started with, which its services also inherit, is not part of it.
+
+### `micromux exec`
+
+The command replaces the micromux process: it runs in your terminal with your stdin, stdout, and stderr, receives your signals directly, and its exit status is the exit status of `micromux exec`. Everything after the command name belongs to the command, so `micromux exec ls -la` needs no `--`, and `--` works as well.
+
+| Code | Meaning |
+|---|---|
+| `125` | micromux failed before running the command: no session, a session too old for it, an unknown service, or a control-plane error. |
+| `126` | The command was found but cannot run. |
+| `127` | The command was not found. |
+| any other | The command's own exit status. |
+
+### `micromux env`
+
+- By default it prints sorted `KEY=value` lines. A value is single-quoted for a POSIX shell when it contains anything but letters, digits, and `_@%+=:,./-`.
+- `--export`, or `--format shell`, prints `export KEY=value` lines for `eval`.
+- `--format json` prints one JSON object.
+- Names after the options print only those variables, and a single name in the default format prints its bare value. A name that is not set fails the command, and nothing goes to stdout, so a script never runs with an empty port.
+- A key a shell cannot assign, anything but `[A-Za-z_][A-Za-z0-9_]*`, is left out of the line formats with a warning on stderr that names it. JSON keeps every key.
+- It exits 1 on any failure.
+
+> [!WARNING]
+> Values can be secrets from env files. They reach stdout or the command only when you run one of these commands, and micromux never logs them. The control socket is reachable by your user only.
+
+Agents read the same environment with the MCP `get_session_env` tool. For a service, it returns only the variable names unless the agent asks for `names`.
+
 ## Headless sessions: `micromux serve`
 
 `micromux serve` runs the supervisor **without a TUI**, serving the control plane until stopped. It's how agent-managed sessions run: an agent calls the MCP `start_session` tool (which spawns a detached `serve`), works against it, and you can watch with [`micromux attach`]({{< relref "../tui.md" >}}#attach-to-a-running-session) or steer it with `micromux ctl`.
@@ -93,4 +141,4 @@ Reconciliation **adds** newly-defined services, **retires** removed ones, and **
 
 ## Protocol compatibility
 
-Protocol 3 peers accept additive fields from newer minor revisions. Revision 3.8 changed transient disk-log rotation and reader saturation failures from `LimitExceeded` to the retryable `Busy` code. Revision 3.9 distinguishes an uninitialized disk-reader pool and reports reads that still occupy workers after their callers leave. Revision 3.11 adds `session` to the session description: its name, [browser URLs and allocated ports]({{< relref "../configuration/sessions.md" >}}), and whether the shared proxy serves its routes. Revision 3.12 adds `last_cleanup` to service snapshots and the `CleanupStarted`, `CleanupFinished`, and `CleanupFailed` event kinds for [cleanup commands]({{< relref "../configuration/services.md" >}}#cleanup); older peers read the new kinds as `Unknown`. Revision 3.13 adds `dependency_failure` to service snapshots, naming the dependency that keeps a blocked service from ever starting on its own, and the `DependencyFailed` event kind.
+Protocol 3 peers accept additive fields from newer minor revisions. Revision 3.8 changed transient disk-log rotation and reader saturation failures from `LimitExceeded` to the retryable `Busy` code. Revision 3.9 distinguishes an uninitialized disk-reader pool and reports reads that still occupy workers after their callers leave. Revision 3.11 adds `session` to the session description: its name, [browser URLs and allocated ports]({{< relref "../configuration/sessions.md" >}}), and whether the shared proxy serves its routes. Revision 3.12 adds `last_cleanup` to service snapshots and the `CleanupStarted`, `CleanupFinished`, and `CleanupFailed` event kinds for [cleanup commands]({{< relref "../configuration/services.md" >}}#cleanup); older peers read the new kinds as `Unknown`. Revision 3.13 adds `dependency_failure` to service snapshots, naming the dependency that keeps a blocked service from ever starting on its own, and the `DependencyFailed` event kind. Revision 3.15 adds the `GetEnvironment` request, which returns the session's variables or one service's resolved environment with their values; `micromux env`, `micromux exec`, and `get_session_env` refuse a session older than 3.15 and ask you to restart it.

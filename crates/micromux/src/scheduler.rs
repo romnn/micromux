@@ -51,9 +51,9 @@ pub use input::{
 mod control;
 pub(crate) use control::CommandAck;
 pub use control::{
-    CommandRejection, DynamicServiceAck, DynamicServiceResult, ReconcileAction,
-    ReconcileActionKind, ReconcileReceipt, ReconcileResult, SchedulerStopped, ServiceCommandAck,
-    ServiceCommandResult, ServiceControl,
+    CommandRejection, DynamicServiceAck, DynamicServiceResult, EnvironmentResult, ReconcileAction,
+    ReconcileActionKind, ReconcileReceipt, ReconcileResult, ResolvedEnvironment, SchedulerStopped,
+    ServiceCommandAck, ServiceCommandResult, ServiceControl,
 };
 
 #[path = "scheduler/pty.rs"]
@@ -175,6 +175,9 @@ pub(super) struct RunningService {
     since: tokio::time::Instant,
     /// When the process exited, while its cleanup still holds the run open.
     exited_at: Option<tokio::time::Instant>,
+    /// The configured environment the process was spawned with, which a reconcile can no longer
+    /// change.
+    environment: indexmap::IndexMap<String, String>,
 }
 
 impl RunningService {
@@ -934,6 +937,15 @@ impl TestEventSink {
     fn forward(&self, event: Event) {
         let _ = self.tx.try_send(event);
     }
+}
+
+fn sorted_variables(
+    variables: &indexmap::IndexMap<String, String>,
+) -> std::collections::BTreeMap<String, String> {
+    variables
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
 }
 
 /// A command's acknowledgement, held back until the scheduling pass the command triggers has run.
@@ -2512,6 +2524,37 @@ impl SchedulerRuntime {
         Ok(acks)
     }
 
+    /// The session's variables, or a service's environment as its live run got it.
+    ///
+    /// Without a live run, a service reports its current definition, which its next run gets.
+    fn environment(&self, services: &ServiceMap, service: Option<&ServiceID>) -> EnvironmentResult {
+        let Some(service_id) = service else {
+            return Ok(ResolvedEnvironment {
+                variables: sorted_variables(self.session.environment.variables()),
+                stale: false,
+            });
+        };
+        let service = services
+            .get(service_id)
+            .ok_or(CommandRejection::UnknownService)?;
+        let current = &service.spec.environment;
+        let running = self
+            .services
+            .get(service_id)
+            .and_then(|runtime| runtime.running.as_ref())
+            .map(|running| &running.environment);
+        Ok(match running {
+            Some(running) => ResolvedEnvironment {
+                variables: sorted_variables(running),
+                stale: running != current,
+            },
+            None => ResolvedEnvironment {
+                variables: sorted_variables(current),
+                stale: false,
+            },
+        })
+    }
+
     async fn handle_command(
         &mut self,
         services: &mut ServiceMap,
@@ -2563,6 +2606,11 @@ impl SchedulerRuntime {
             ),
             Command::StopDynamic { service, ack } => {
                 Reply::Dynamic(ack, self.stop_dynamic(services, &service))
+            }
+            // A read changes nothing, so it skips the scheduling pass a reply waits for.
+            Command::Environment { service, ack } => {
+                ack.send(self.environment(services, service.as_ref()));
+                return None;
             }
             Command::ResizeAll { cols, rows } => {
                 self.current_pty_size = portable_pty::PtySize {

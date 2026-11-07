@@ -22,10 +22,10 @@ pub(crate) async fn run(options: &Options, raw_session: Option<&str>) -> Result<
     let resolved =
         micromux_control::resolve_selector(&cwd, selector, options.config_path.as_deref())
             .await
-            .map_err(|error| crate::Error::Message(format_select_error(error)))?;
+            .map_err(|error| crate::Error::Message(format_select_error(error, "attach")))?;
     let remote = micromux_tui::RemoteSource::connect(resolved.endpoint)
         .await
-        .map_err(|error| crate::Error::Message(format_control_error(error)))?;
+        .map_err(|error| crate::Error::Message(format_control_error(error, "attach")))?;
 
     let shutdown = micromux::CancellationToken::new();
     crate::spawn_shutdown_handler(shutdown.clone());
@@ -41,22 +41,23 @@ pub(crate) async fn run(options: &Options, raw_session: Option<&str>) -> Result<
     Ok(app.render().await?)
 }
 
-fn format_select_error(error: SelectError) -> String {
+/// Explains why `micromux <client> --session` found no single session to use.
+pub(crate) fn format_select_error(error: SelectError, client: &str) -> String {
     match error {
-        SelectError::NoSession(report) => format_no_session(&report),
+        SelectError::NoSession(report) => format_no_session(&report, client),
         SelectError::Ambiguous(ambiguous) => format_ambiguous(&ambiguous),
         SelectError::Busy(message) if message.contains("protocol mismatch") => format!(
-            "{message}\nupgrade one side so the attach client and session use compatible control protocol versions"
+            "{message}\nupgrade one side so the {client} client and session use compatible control protocol versions"
         ),
         SelectError::Busy(message) => format!("{message}\ntry again, or choose another session"),
         SelectError::Unsupported => {
             "the micromux control plane is not supported on this platform".to_string()
         }
-        SelectError::Control(error) => format_control_error(error),
+        SelectError::Control(error) => format_control_error(error, client),
     }
 }
 
-fn format_no_session(report: &ProbeReport) -> String {
+fn format_no_session(report: &ProbeReport, client: &str) -> String {
     let mut message = report.summary.clone();
     if let Some(config_path) = &report.config_path {
         let _ = write!(message, "\nconfig: {config_path}");
@@ -81,8 +82,9 @@ fn format_no_session(report: &ProbeReport) -> String {
             let _ = write!(message, "\n  {}", format_probe(probe));
         }
     }
-    message.push_str(
-        "\nstart the session with `micromux serve` or the MCP `start_session` tool, then attach again",
+    let _ = write!(
+        message,
+        "\nstart the session with `micromux serve` or the MCP `start_session` tool, then run `micromux {client}` again"
     );
     message
 }
@@ -113,12 +115,13 @@ fn format_ambiguous(ambiguous: &AmbiguousSelection) -> String {
     message
 }
 
-fn format_control_error(error: ControlError) -> String {
+/// Explains why the `micromux <client>` client could not talk to the session it selected.
+pub(crate) fn format_control_error(error: ControlError, client: &str) -> String {
     match error {
         ControlError::ProtocolMismatch { peer, ours } => format!(
-            "control protocol version mismatch: session={peer}, attach_client={ours}; upgrade one side"
+            "control protocol version mismatch: session={peer}, {client}_client={ours}; upgrade one side"
         ),
-        other => format!("failed to connect the attach client: {other}"),
+        other => format!("failed to connect the {client} client: {other}"),
     }
 }
 

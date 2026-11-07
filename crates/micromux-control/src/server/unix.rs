@@ -612,6 +612,7 @@ async fn dispatch(server: &ControlServer, request: Request) -> Response {
         Request::StopDynamicService { service } => {
             acknowledge_dynamic(server.control.stop_dynamic(&service).await)
         }
+        Request::GetEnvironment { service } => environment(server, service.as_ref()).await,
         Request::ReconcileConfig { dry_run } => reconcile(server, dry_run).await,
         // Subscribe is intercepted before dispatch; reaching here is a protocol misuse.
         Request::Subscribe | Request::SubscribeWithVersion { .. } => Response::error(
@@ -627,6 +628,13 @@ async fn dispatch(server: &ControlServer, request: Request) -> Response {
 
 async fn reconcile(server: &ControlServer, dry_run: bool) -> Response {
     acknowledge_reconcile(server.control.reconcile_config(dry_run).await)
+}
+
+async fn environment(server: &ControlServer, service: Option<&micromux::ServiceID>) -> Response {
+    acknowledge_with(
+        server.control.environment(service).await,
+        Response::Environment,
+    )
 }
 
 fn get_events(

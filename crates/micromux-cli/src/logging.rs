@@ -43,6 +43,27 @@ fn prune_old_rolling_logs(cache_dir: &Path) {
     }
 }
 
+/// The filter used unless `RUST_LOG` replaces it.
+///
+/// The MCP SDK records tool results at `debug`, and a `get_session_env` result holds environment
+/// values, so its `rmcp` target never logs below `info` however verbose the level.
+fn default_log_directive(level: tracing::metadata::Level) -> String {
+    let level_name = |level: tracing::metadata::Level| level.to_string().to_ascii_lowercase();
+    ["none".to_string()]
+        .into_iter()
+        .chain(
+            ["micromux_cli", "micromux_tui", "micromux"]
+                .into_iter()
+                .map(|pkg| format!("{pkg}={}", level_name(level))),
+        )
+        .chain(std::iter::once(format!(
+            "rmcp={}",
+            level_name(level.min(tracing::metadata::Level::INFO))
+        )))
+        .collect::<Vec<String>>()
+        .join(",")
+}
+
 /// Setup logging
 ///
 /// # Errors
@@ -80,24 +101,10 @@ pub fn setup(
     };
 
     let default_log_level = log_level.unwrap_or(tracing::metadata::Level::WARN);
-    let default_log_directive = ["none".to_string()]
-        .into_iter()
-        .chain(
-            ["micromux_cli", "micromux_tui", "micromux"]
-                .into_iter()
-                .map(|pkg| {
-                    format!(
-                        "{pkg}={}",
-                        default_log_level.to_string().to_ascii_lowercase()
-                    )
-                }),
-        )
-        .collect::<Vec<String>>()
-        .join(",");
     let default_env_filter = tracing_subscriber::filter::EnvFilter::builder()
         .with_regex(true)
         .with_default_directive(default_log_level.into())
-        .parse(default_log_directive)?;
+        .parse(default_log_directive(default_log_level))?;
 
     // Only honor RUST_LOG when it is set *and* non-empty; an empty value must fall back to the
     // default filter rather than building an empty directive that silences everything.
@@ -128,4 +135,26 @@ pub fn setup(
         .with(env_filter);
     tracing::subscriber::set_global_default(subscriber)?;
     Ok(guard)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::default_log_directive;
+    use tracing::metadata::Level;
+
+    /// Verbose levels raise micromux's own targets but never let `rmcp` record tool results.
+    #[test]
+    fn default_filter_caps_the_mcp_sdk_at_info() {
+        let debug = default_log_directive(Level::DEBUG);
+        assert!(debug.contains("micromux=debug"), "{debug}");
+        assert!(debug.contains("rmcp=info"), "{debug}");
+        assert!(!debug.contains("rmcp=debug"), "{debug}");
+
+        let trace = default_log_directive(Level::TRACE);
+        assert!(trace.contains("rmcp=info"), "{trace}");
+
+        // A quieter level stays quiet.
+        let warn = default_log_directive(Level::WARN);
+        assert!(warn.contains("rmcp=warn"), "{warn}");
+    }
 }

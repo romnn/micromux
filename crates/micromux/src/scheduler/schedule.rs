@@ -338,6 +338,7 @@ fn finish_service_start(
                 pty: started.handles,
                 since: tokio::time::Instant::now(),
                 exited_at: None,
+                environment: service.spec.environment.clone(),
             });
             sync_model(ctx.writer, service, runtime);
             let mut event = service_event(
