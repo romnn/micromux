@@ -28,16 +28,6 @@ fn commands() -> Vec<(&'static str, &'static [&'static str])> {
     }
 }
 
-/// Starts `command` in a process group of its own, so Ctrl-Z, which stops micromux's group,
-/// does not also stop what it started, such as a clipboard daemon that `wl-copy` or `xclip`
-/// leaves serving the copied text, or a browser.
-pub(crate) fn detach(command: &mut Command) {
-    #[cfg(unix)]
-    std::os::unix::process::CommandExt::process_group(command, 0);
-    #[cfg(not(unix))]
-    let _ = command;
-}
-
 /// Whether the TUI runs over ssh, where a local clipboard command would copy, and a browser
 /// open, on the remote host.
 pub(crate) fn over_ssh() -> bool {
@@ -60,7 +50,7 @@ pub(crate) fn copy_locally(text: String) {
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        detach(&mut command);
+        crate::platform::detach(&mut command);
         let spawned = command.spawn();
         let Ok(mut child) = spawned else {
             continue;

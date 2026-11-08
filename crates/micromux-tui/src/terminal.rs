@@ -11,8 +11,6 @@ use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Once, OnceLock};
 
-#[cfg(windows)]
-use crossterm::event::EnableMouseCapture;
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, KeyboardEnhancementFlags,
     PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
@@ -114,7 +112,7 @@ impl crossterm::Command for EnableButtonMouseCapture {
 
     #[cfg(windows)]
     fn execute_winapi(&self) -> io::Result<()> {
-        EnableMouseCapture.execute_winapi()
+        crossterm::event::EnableMouseCapture.execute_winapi()
     }
 
     #[cfg(windows)]
@@ -265,7 +263,7 @@ fn tmux_reports_keys_as_csi_u() -> bool {
     ) else {
         return false;
     };
-    let Some(own_tty) = own_tty() else {
+    let Some(own_tty) = crate::platform::own_tty() else {
         return false;
     };
     let Ok(mut child) = Command::new("tmux")
@@ -306,18 +304,6 @@ fn tmux_reports_keys_as_csi_u() -> bool {
     pane_tty == Some(own_tty.as_str())
         && matches!(extended_keys, Some("on" | "always"))
         && format == Some("csi-u")
-}
-
-/// The path of the terminal micromux runs in, as tmux names a pane's.
-#[cfg(unix)]
-fn own_tty() -> Option<String> {
-    let path = nix::unistd::ttyname(io::stdin()).ok()?;
-    path.to_str().map(str::to_owned)
-}
-
-#[cfg(not(unix))]
-fn own_tty() -> Option<String> {
-    None
 }
 
 /// Turns mouse capture on or off while the TUI shows.
@@ -393,68 +379,18 @@ pub(crate) fn install_panic_hook() {
 ///
 /// Raw mode delivers Ctrl-Z as a key instead of the terminal's stop signal, so the TUI sends the
 /// signal itself.
-/// It signals the group, not just this process, so a wrapper that started micromux, such as
-/// `cargo run` or `sh -c`, stops with it and the shell sees the job stop.
-/// Services run in sessions and process groups of their own, so they keep running.
-/// The signal is `SIGTSTP` rather than `SIGSTOP` because the system ignores `SIGTSTP` in an
-/// orphaned process group, where no shell could ever continue it.
-#[cfg(unix)]
 pub(crate) fn stop_process_group() -> io::Result<()> {
-    use nix::sys::signal::{Signal, kill};
-    use nix::unistd::Pid;
-
     give_back()?;
-    // Pid 0 addresses the caller's process group.
-    kill(Pid::from_raw(0), Signal::SIGTSTP).map_err(io::Error::from)
-}
-
-/// Notices that the process continued after a stop, such as one sent from outside, which leaves
-/// the terminal as the shell left it.
-pub(crate) struct Continued {
-    #[cfg(unix)]
-    signal: Option<tokio::signal::unix::Signal>,
-}
-
-impl Continued {
-    /// Starts watching; without a way to watch, [`Self::recv`] never returns.
-    pub(crate) fn watch() -> Self {
-        #[cfg(unix)]
-        {
-            use tokio::signal::unix::{SignalKind, signal};
-            let kind = SignalKind::from_raw(nix::sys::signal::Signal::SIGCONT as i32);
-            Self {
-                signal: signal(kind).ok(),
-            }
-        }
-        #[cfg(not(unix))]
-        Self {}
-    }
-
-    /// Waits until the process continues after a stop.
-    pub(crate) async fn recv(&mut self) {
-        #[cfg(unix)]
-        if let Some(signal) = self.signal.as_mut()
-            && signal.recv().await.is_some()
-        {
-            return;
-        }
-        std::future::pending::<()>().await;
-    }
+    crate::platform::stop_process_group()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        KEYBOARD, Keyboard, MOUSE, RAW, SCREEN, ask_for_keyboard_on, give_back_on,
-        set_keyboard_reporting_on, set_mouse_capture_on,
-    };
+    use super::{KEYBOARD, Keyboard, SCREEN, ask_for_keyboard_on, set_keyboard_reporting_on};
     use color_eyre::eyre;
     use similar_asserts::assert_eq;
     use std::sync::atomic::Ordering;
 
-    const MOUSE_OFF: &str = "\x1b[?1000l";
-    const MOUSE_ON: &str = "\x1b[?1000h\x1b[?1002h\x1b[?1006h";
-    const LEAVE_SCREEN: &str = "\x1b[?1049l";
     const KEYBOARD_POP: &str = "\x1b[<1u";
     const KEYBOARD_PUSH: &str = "\x1b[>5u";
     const MODIFY_OTHER_KEYS_ON: &str = "\x1b[>4;2m";
@@ -462,101 +398,6 @@ mod tests {
 
     fn written(out: &[u8]) -> String {
         String::from_utf8_lossy(out).into_owned()
-    }
-
-    /// The tests share the process-wide mode flags, so they run as one sequence.
-    ///
-    /// On Windows crossterm sends the mouse and screen modes through the console API, which needs
-    /// a console a test does not have, so this runs where they are escape sequences;
-    /// [`keyboard_reporting_is_asked_for_once_per_kind`] covers the keyboard part everywhere.
-    #[cfg(unix)]
-    #[test]
-    fn the_terminal_comes_back_exactly_once_with_whatever_was_on() -> eyre::Result<()> {
-        // Giving back a terminal with every mode on pops the keyboard flags while still on the
-        // alternate screen, whose stack they are on, releases the mouse, leaves the alternate
-        // screen and turns raw mode off.
-        RAW.store(true, Ordering::SeqCst);
-        SCREEN.store(true, Ordering::SeqCst);
-        KEYBOARD.store(Keyboard::Kitty as u8, Ordering::SeqCst);
-        MOUSE.store(true, Ordering::SeqCst);
-        let mut out = Vec::new();
-        let mut raw_disabled = 0;
-        give_back_on(&mut out, || {
-            raw_disabled += 1;
-            Ok(())
-        })?;
-        let out = written(&out);
-        assert!(out.contains(MOUSE_OFF), "{out:?}");
-        let pop = out.find(KEYBOARD_POP);
-        let leave = out.find(LEAVE_SCREEN);
-        assert!(pop.is_some() && leave.is_some() && pop < leave, "{out:?}");
-        assert_eq!(out.matches(KEYBOARD_POP).count(), 1, "{out:?}");
-        assert_eq!(raw_disabled, 1);
-
-        // A second give-back, as the panic hook may run after a normal exit, does nothing.
-        let mut again = Vec::new();
-        give_back_on(&mut again, || {
-            raw_disabled += 1;
-            Ok(())
-        })?;
-        assert!(again.is_empty(), "{:?}", written(&again));
-        assert_eq!(raw_disabled, 1);
-
-        // Without the keyboard protocol nothing is popped, and with capture switched off at
-        // runtime, giving back leaves mouse modes alone, so a terminal that never captured sees
-        // no mouse sequence at all.
-        SCREEN.store(true, Ordering::SeqCst);
-        MOUSE.store(true, Ordering::SeqCst);
-        let mut toggled = Vec::new();
-        set_mouse_capture_on(&mut toggled, false)?;
-        assert!(written(&toggled).contains(MOUSE_OFF));
-        let mut out = Vec::new();
-        give_back_on(&mut out, || Ok(()))?;
-        assert!(!written(&out).contains("?1000"), "{:?}", written(&out));
-        assert!(!written(&out).contains(KEYBOARD_POP), "{:?}", written(&out));
-
-        // Turning capture on twice sends the sequence once.
-        let mut out = Vec::new();
-        set_mouse_capture_on(&mut out, true)?;
-        set_mouse_capture_on(&mut out, true)?;
-        assert_eq!(written(&out), MOUSE_ON);
-        MOUSE.store(false, Ordering::SeqCst);
-
-        // Taking the terminal again without having given it back, as after a continue signal,
-        // pushes the kitty flags only once, onto their stack, but asks for modifyOtherKeys, a
-        // plain setting a shell may have reset meanwhile, again; either way the one reset on the
-        // way out takes it back, before leaving the alternate screen.
-        let leave = "\x1b[?2004l\x1b[?1049l\x1b[?25h";
-        for (keyboard, expected) in [
-            (
-                Keyboard::Kitty,
-                format!("{KEYBOARD_PUSH}{KEYBOARD_POP}{leave}"),
-            ),
-            (
-                Keyboard::ModifyOtherKeys,
-                format!(
-                    "{MODIFY_OTHER_KEYS_ON}{MODIFY_OTHER_KEYS_ON}{MODIFY_OTHER_KEYS_RESET}{leave}"
-                ),
-            ),
-        ] {
-            SCREEN.store(true, Ordering::SeqCst);
-            let mut out = Vec::new();
-            ask_for_keyboard_on(&mut out, keyboard)?;
-            ask_for_keyboard_on(&mut out, keyboard)?;
-            give_back_on(&mut out, || Ok(()))?;
-            assert_eq!(written(&out), expected, "{keyboard:?}");
-        }
-
-        // Legacy reporting, or a terminal off the alternate screen, gets nothing.
-        let mut out = Vec::new();
-        SCREEN.store(true, Ordering::SeqCst);
-        ask_for_keyboard_on(&mut out, Keyboard::Legacy)?;
-        SCREEN.store(false, Ordering::SeqCst);
-        ask_for_keyboard_on(&mut out, Keyboard::Kitty)?;
-        assert!(out.is_empty(), "{:?}", written(&out));
-        assert_eq!(KEYBOARD.load(Ordering::SeqCst), Keyboard::Legacy as u8);
-
-        reporting_goes_off_and_on_with_pty_input_mode()
     }
 
     /// PTY input mode turns the keyboard reporting off and leaving it turns it on again, each once
@@ -611,5 +452,118 @@ mod tests {
             format!("{MODIFY_OTHER_KEYS_ON}{MODIFY_OTHER_KEYS_ON}")
         );
         reporting_goes_off_and_on_with_pty_input_mode()
+    }
+
+    /// Giving the terminal back with every mode it took over, where the mouse and screen modes are
+    /// escape sequences.
+    ///
+    /// On Windows crossterm sends those modes through the console API, which needs a console a
+    /// test does not have, so `keyboard_reporting_is_asked_for_once_per_kind` covers the keyboard
+    /// part there instead.
+    /// The tests share the process-wide mode flags, so each platform runs them as one sequence.
+    #[cfg(unix)]
+    mod escape_sequences {
+        use super::{
+            KEYBOARD, KEYBOARD_POP, KEYBOARD_PUSH, Keyboard, MODIFY_OTHER_KEYS_ON,
+            MODIFY_OTHER_KEYS_RESET, SCREEN, ask_for_keyboard_on,
+            reporting_goes_off_and_on_with_pty_input_mode, written,
+        };
+        use crate::terminal::{MOUSE, RAW, give_back_on, set_mouse_capture_on};
+        use color_eyre::eyre;
+        use similar_asserts::assert_eq;
+        use std::sync::atomic::Ordering;
+
+        const MOUSE_OFF: &str = "\x1b[?1000l";
+        const MOUSE_ON: &str = "\x1b[?1000h\x1b[?1002h\x1b[?1006h";
+        const LEAVE_SCREEN: &str = "\x1b[?1049l";
+
+        #[test]
+        fn the_terminal_comes_back_exactly_once_with_whatever_was_on() -> eyre::Result<()> {
+            // Giving back a terminal with every mode on pops the keyboard flags while still on the
+            // alternate screen, whose stack they are on, releases the mouse, leaves the alternate
+            // screen and turns raw mode off.
+            RAW.store(true, Ordering::SeqCst);
+            SCREEN.store(true, Ordering::SeqCst);
+            KEYBOARD.store(Keyboard::Kitty as u8, Ordering::SeqCst);
+            MOUSE.store(true, Ordering::SeqCst);
+            let mut out = Vec::new();
+            let mut raw_disabled = 0;
+            give_back_on(&mut out, || {
+                raw_disabled += 1;
+                Ok(())
+            })?;
+            let out = written(&out);
+            assert!(out.contains(MOUSE_OFF), "{out:?}");
+            let pop = out.find(KEYBOARD_POP);
+            let leave = out.find(LEAVE_SCREEN);
+            assert!(pop.is_some() && leave.is_some() && pop < leave, "{out:?}");
+            assert_eq!(out.matches(KEYBOARD_POP).count(), 1, "{out:?}");
+            assert_eq!(raw_disabled, 1);
+
+            // A second give-back, as the panic hook may run after a normal exit, does nothing.
+            let mut again = Vec::new();
+            give_back_on(&mut again, || {
+                raw_disabled += 1;
+                Ok(())
+            })?;
+            assert!(again.is_empty(), "{:?}", written(&again));
+            assert_eq!(raw_disabled, 1);
+
+            // Without the keyboard protocol nothing is popped, and with capture switched off at
+            // runtime, giving back leaves mouse modes alone, so a terminal that never captured sees
+            // no mouse sequence at all.
+            SCREEN.store(true, Ordering::SeqCst);
+            MOUSE.store(true, Ordering::SeqCst);
+            let mut toggled = Vec::new();
+            set_mouse_capture_on(&mut toggled, false)?;
+            assert!(written(&toggled).contains(MOUSE_OFF));
+            let mut out = Vec::new();
+            give_back_on(&mut out, || Ok(()))?;
+            assert!(!written(&out).contains("?1000"), "{:?}", written(&out));
+            assert!(!written(&out).contains(KEYBOARD_POP), "{:?}", written(&out));
+
+            // Turning capture on twice sends the sequence once.
+            let mut out = Vec::new();
+            set_mouse_capture_on(&mut out, true)?;
+            set_mouse_capture_on(&mut out, true)?;
+            assert_eq!(written(&out), MOUSE_ON);
+            MOUSE.store(false, Ordering::SeqCst);
+
+            // Taking the terminal again without having given it back, as after a continue signal,
+            // pushes the kitty flags only once, onto their stack, but asks for modifyOtherKeys, a
+            // plain setting a shell may have reset meanwhile, again; either way the one reset on
+            // the way out takes it back, before leaving the alternate screen.
+            let leave = "\x1b[?2004l\x1b[?1049l\x1b[?25h";
+            for (keyboard, expected) in [
+                (
+                    Keyboard::Kitty,
+                    format!("{KEYBOARD_PUSH}{KEYBOARD_POP}{leave}"),
+                ),
+                (
+                    Keyboard::ModifyOtherKeys,
+                    format!(
+                        "{MODIFY_OTHER_KEYS_ON}{MODIFY_OTHER_KEYS_ON}{MODIFY_OTHER_KEYS_RESET}{leave}"
+                    ),
+                ),
+            ] {
+                SCREEN.store(true, Ordering::SeqCst);
+                let mut out = Vec::new();
+                ask_for_keyboard_on(&mut out, keyboard)?;
+                ask_for_keyboard_on(&mut out, keyboard)?;
+                give_back_on(&mut out, || Ok(()))?;
+                assert_eq!(written(&out), expected, "{keyboard:?}");
+            }
+
+            // Legacy reporting, or a terminal off the alternate screen, gets nothing.
+            let mut out = Vec::new();
+            SCREEN.store(true, Ordering::SeqCst);
+            ask_for_keyboard_on(&mut out, Keyboard::Legacy)?;
+            SCREEN.store(false, Ordering::SeqCst);
+            ask_for_keyboard_on(&mut out, Keyboard::Kitty)?;
+            assert!(out.is_empty(), "{:?}", written(&out));
+            assert_eq!(KEYBOARD.load(Ordering::SeqCst), Keyboard::Legacy as u8);
+
+            reporting_goes_off_and_on_with_pty_input_mode()
+        }
     }
 }

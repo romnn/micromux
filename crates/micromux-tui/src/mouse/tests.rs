@@ -493,7 +493,7 @@ async fn m_toggles_capture_and_the_footer_says_so() -> eyre::Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
+/// Ctrl-Z suspends where Unix job control can continue micromux, and does nothing elsewhere.
 #[tokio::test]
 async fn ctrl_z_asks_the_event_loop_to_suspend() -> eyre::Result<()> {
     let mut app = app(SERVICES)?;
@@ -503,7 +503,12 @@ async fn ctrl_z_asks_the_event_loop_to_suspend() -> eyre::Result<()> {
         kind: KeyEventKind::Press,
         state: KeyEventState::NONE,
     });
-    assert_eq!(app.effects, vec![Effect::Suspend]);
+    let expected = if cfg!(unix) {
+        vec![Effect::Suspend]
+    } else {
+        Vec::new()
+    };
+    assert_eq!(app.effects, expected);
     assert!(app.running);
     Ok(())
 }
