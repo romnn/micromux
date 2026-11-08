@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.4.0
+
 - **Sessions get a name and stable, collision-free allocated ports.** Configure them with
   `session: {name, domain, port_range}` and `allocate_ports: [VAR, ...]`.
 - **A shared per-user `micromux proxy` serves each session's services at their own hostnames.**
