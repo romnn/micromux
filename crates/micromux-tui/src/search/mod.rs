@@ -24,7 +24,7 @@ use ratatui::widgets::{Paragraph, Widget as _, Wrap};
 use unicode_segmentation::UnicodeSegmentation as _;
 
 use crate::App;
-use crate::log_text::{LogText, RecordKey, RecordLine};
+use crate::log_text::{LogText, RecordKey, RecordLine, RemovedLines};
 use crate::state::{ShownLog, ShownLogs};
 
 #[cfg(test)]
@@ -360,8 +360,8 @@ impl LogSearch {
 
     /// Finds the matches again when `shown`'s text is not the one they were found in.
     ///
-    /// When the text only lost lines at its front and gained lines at its end since, the matches
-    /// on the lines it kept stay and only the new lines are searched.
+    /// When the text only had lines cut out and appended since, the matches on the lines it kept
+    /// stay and only the new lines are searched.
     /// In the same logs the current match follows its text; when its text is gone, the nearest
     /// newer match becomes current, or the newest one when none is newer.
     /// In other logs, such as another service's, no match is current until `n` or `N` moves to
@@ -382,7 +382,7 @@ impl LogSearch {
             .found_in
             .as_ref()
             .is_some_and(|previous| previous.shows == found_in.shows);
-        let edit = log.last_edit.filter(|edit| {
+        let edit = log.last_edit.as_ref().filter(|edit| {
             same_logs
                 && active
                     .found_in
@@ -391,12 +391,16 @@ impl LogSearch {
         });
         match edit {
             Some(edit) => {
+                let mut places = RemovedLines::new(&edit.removed_lines);
                 active
                     .matches
-                    .retain(|found| found.line >= edit.dropped_lines);
-                for found in &mut active.matches {
-                    found.line -= edit.dropped_lines;
-                }
+                    .retain_mut(|found| match places.place(found.line) {
+                        Some(line) => {
+                            found.line = line;
+                            true
+                        }
+                        None => false,
+                    });
                 active.matches.extend(find_matches_from(
                     &log.text,
                     edit.first_new_line,

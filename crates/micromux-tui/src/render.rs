@@ -2839,15 +2839,24 @@ pub mod log_view {
             }
         }
 
-        /// Forgets the first `lines` lines, dropped from the front of the text.
-        pub(crate) fn drop_front(&mut self, lines: usize) {
-            let lines = lines.min(self.starts.len());
-            let rows = self.starts.get(lines).copied().unwrap_or(self.total_lines);
-            self.starts.drain(..lines);
-            for start in &mut self.starts {
-                *start -= rows;
+        /// Forgets the lines `removed`, cut out of the text, in order and apart.
+        pub(crate) fn remove(&mut self, removed: &[std::ops::Range<usize>]) {
+            let mut places = crate::log_text::RemovedLines::new(removed);
+            let mut starts = Vec::with_capacity(self.starts.len());
+            let mut total_lines = 0usize;
+            for (line, start) in self.starts.iter().enumerate() {
+                let next = self
+                    .starts
+                    .get(line + 1)
+                    .copied()
+                    .unwrap_or(self.total_lines);
+                if places.place(line).is_some() {
+                    starts.push(total_lines);
+                    total_lines += next - start;
+                }
             }
-            self.total_lines -= rows;
+            self.starts = starts;
+            self.total_lines = total_lines;
         }
 
         /// Total rendered rows covered by this index.

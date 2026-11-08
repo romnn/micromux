@@ -47,6 +47,9 @@ impl RecordKey {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RecordStart {
     key: RecordKey,
+    /// Counts up through the records in the order of the text from its last full rebuild, so
+    /// it finds the record while records before it are cut out.
+    ordinal: u64,
     first_line: usize,
 }
 
@@ -74,13 +77,13 @@ pub(crate) struct TaggedRecord<'a> {
     pub tag: &'a [Span<'static>],
 }
 
-/// How the text changed in its last rebuild, when only lines at its ends did.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// How the text changed in its last change, when lines were only cut out and appended.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Edit {
     /// The generation the text had before.
     pub from_generation: u64,
-    /// How many lines were dropped from the front.
-    pub dropped_lines: usize,
+    /// The lines cut out, numbered as they were before, in order and apart.
+    pub removed_lines: Vec<std::ops::Range<usize>>,
     /// The first line appended after the lines that were kept, or the line count when none was.
     pub first_new_line: usize,
 }
@@ -97,12 +100,11 @@ struct RowLayout {
 #[derive(Debug, Default)]
 pub(crate) struct LogText {
     pub text: Text<'static>,
-    /// Where each record starts, in the order of the text.
+    /// Where each record starts, in the order of the text, and so by ordinal.
     record_starts: Vec<RecordStart>,
-    /// The ordinal of each record, which counts up from the text's first full rebuild; the
-    /// record at index `i` of `record_starts` has ordinal `first_ordinal + i`.
+    /// The ordinal of each record.
     ordinals: HashMap<RecordId, u64>,
-    first_ordinal: u64,
+    next_ordinal: u64,
     pub line_index: RenderedLineIndex,
     /// The layout `line_index` describes, or `None` before the first build.
     layout: Option<RowLayout>,
@@ -161,33 +163,19 @@ impl LogText {
         self.lay_out(wrap, width);
     }
 
-    /// Drops the first `dropped_records` records and appends `records`, each line led by its
-    /// record's tag, laying out only the new lines.
+    /// Cuts out the records `keep` rejects and appends `records`, each line led by its record's
+    /// tag, laying out only the new lines.
     ///
     /// The text must be laid out already; the change is recorded in [`Self::last_edit`].
     pub(crate) fn edit_tagged<'a>(
         &mut self,
-        dropped_records: usize,
+        keep: impl Fn(RecordKey) -> bool,
         records: impl IntoIterator<Item = TaggedRecord<'a>>,
     ) {
         let Some(RowLayout { wrap, width }) = self.layout else {
             return;
         };
-        let dropped_records = dropped_records.min(self.record_starts.len());
-        let dropped_lines = self
-            .record_starts
-            .get(dropped_records)
-            .map_or(self.text.lines.len(), |start| start.first_line);
-        for start in self.record_starts.drain(..dropped_records) {
-            self.ordinals.remove(&start.key.id);
-        }
-        self.first_ordinal += u64::try_from(dropped_records).unwrap_or(u64::MAX);
-        for start in &mut self.record_starts {
-            start.first_line -= dropped_lines;
-        }
-        self.text.lines.drain(..dropped_lines);
-        self.line_index.drop_front(dropped_lines);
-
+        let removed_lines = self.cut_out(keep);
         let first_new_line = self.text.lines.len();
         self.append_tagged(records);
         self.line_index.extend(
@@ -199,9 +187,57 @@ impl LogText {
         self.generation = self.generation.wrapping_add(1);
         self.last_edit = Some(Edit {
             from_generation,
-            dropped_lines,
+            removed_lines,
             first_new_line,
         });
+    }
+
+    /// Cuts out the records `keep` rejects, with their lines and rows, and returns the lines cut
+    /// out, numbered as they were.
+    fn cut_out(&mut self, keep: impl Fn(RecordKey) -> bool) -> Vec<std::ops::Range<usize>> {
+        let line_count = self.text.lines.len();
+        let mut removed_lines: Vec<std::ops::Range<usize>> = Vec::new();
+        for (index, start) in self.record_starts.iter().enumerate() {
+            if keep(start.key) {
+                continue;
+            }
+            let end = self
+                .record_starts
+                .get(index + 1)
+                .map_or(line_count, |next| next.first_line);
+            match removed_lines.last_mut() {
+                Some(last) if last.end == start.first_line => last.end = end,
+                _ => removed_lines.push(start.first_line..end),
+            }
+        }
+        if removed_lines.is_empty() {
+            return removed_lines;
+        }
+
+        // Records
+        let ordinals = &mut self.ordinals;
+        self.record_starts.retain(|start| {
+            let kept = keep(start.key);
+            if !kept {
+                ordinals.remove(&start.key.id);
+            }
+            kept
+        });
+        let mut places = RemovedLines::new(&removed_lines);
+        for start in &mut self.record_starts {
+            start.first_line = places.place(start.first_line).unwrap_or(start.first_line);
+        }
+
+        // Lines and their rows
+        let mut places = RemovedLines::new(&removed_lines);
+        let mut line = 0;
+        self.text.lines.retain(|_| {
+            let kept = places.place(line).is_some();
+            line += 1;
+            kept
+        });
+        self.line_index.remove(&removed_lines);
+        removed_lines
     }
 
     /// Lays the text out for `wrap` at `width` columns, unless it is laid out so already.
@@ -214,29 +250,26 @@ impl LogText {
         // The lines themselves stay as they are.
         self.last_edit = Some(Edit {
             from_generation,
-            dropped_lines: 0,
+            removed_lines: Vec::new(),
             first_new_line: self.text.lines.len(),
         });
-    }
-
-    /// How many records from the front of the text `before` holds for, which must hold for a
-    /// leading run of records and for none after it.
-    pub(crate) fn leading_records(&self, before: impl Fn(RecordKey) -> bool) -> usize {
-        self.record_starts
-            .partition_point(|start| before(start.key))
     }
 
     fn clear_records(&mut self) {
         self.record_starts.clear();
         self.ordinals.clear();
-        self.first_ordinal = 0;
+        self.next_ordinal = 0;
     }
 
     fn push_record(&mut self, key: RecordKey, first_line: usize) {
-        let ordinal =
-            self.first_ordinal + u64::try_from(self.record_starts.len()).unwrap_or(u64::MAX);
+        let ordinal = self.next_ordinal;
+        self.next_ordinal += 1;
         self.ordinals.insert(key.id, ordinal);
-        self.record_starts.push(RecordStart { key, first_line });
+        self.record_starts.push(RecordStart {
+            key,
+            ordinal,
+            first_line,
+        });
     }
 
     fn append_tagged<'a>(&mut self, records: impl IntoIterator<Item = TaggedRecord<'a>>) {
@@ -285,11 +318,13 @@ impl LogText {
     /// line now in its place: the first line of the first record captured at the same time or
     /// later.
     pub(crate) fn find_record_line(&self, key: RecordLine) -> Result<usize, usize> {
-        let found = self
-            .ordinals
-            .get(&key.record.id)
-            .and_then(|ordinal| usize::try_from(ordinal - self.first_ordinal).ok())
-            .and_then(|index| self.record_starts.get(index));
+        let found = self.ordinals.get(&key.record.id).and_then(|ordinal| {
+            let index = self
+                .record_starts
+                .binary_search_by_key(ordinal, |start| start.ordinal)
+                .ok()?;
+            self.record_starts.get(index)
+        });
         if let Some(start) = found {
             return Ok(start.first_line + key.line);
         }
@@ -331,6 +366,37 @@ impl LogText {
             }
             Err(line) => index.line_start(line).unwrap_or(index.total_lines()),
         }
+    }
+}
+
+/// Places lines, taken in order, in a text that lines were cut out of.
+#[derive(Debug)]
+pub(crate) struct RemovedLines<'a> {
+    /// The lines cut out, in order and apart, that come at or after the last line placed.
+    ranges: std::iter::Peekable<std::slice::Iter<'a, std::ops::Range<usize>>>,
+    /// How many lines were cut out before the last line placed.
+    before: usize,
+}
+
+impl<'a> RemovedLines<'a> {
+    pub(crate) fn new(removed: &'a [std::ops::Range<usize>]) -> Self {
+        Self {
+            ranges: removed.iter().peekable(),
+            before: 0,
+        }
+    }
+
+    /// Where `line`, numbered as before the cut, is now, or `None` when it was cut out.
+    ///
+    /// Lines must be placed in order.
+    pub(crate) fn place(&mut self, line: usize) -> Option<usize> {
+        while let Some(range) = self.ranges.next_if(|range| range.end <= line) {
+            self.before += range.end - range.start;
+        }
+        if self.ranges.peek().is_some_and(|range| range.start <= line) {
+            return None;
+        }
+        Some(line - self.before)
     }
 }
 

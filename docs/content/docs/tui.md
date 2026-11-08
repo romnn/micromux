@@ -71,7 +71,7 @@ The search stays while the log moves on: new lines are searched as they arrive, 
 - **Everything else works as in a single service's pane:** scrolling and follow-tail, wrapping, search with `/`, `n` and `N`, which also matches the service names, and selecting and copying with the mouse, which copies the names too. A view off the tail stays on its lines while services drop their oldest ones. Switching between the views follows the newest lines.
 - **Input.** `a` still types into the selected service; the pane shows that service's logs while PTY input mode lasts, so you see what you type, and every service's logs again once `Ctrl+]` leaves it.
 
-Only the lines that the services still keep in memory show, as in their own panes, so memory stays within each service's [log retention]({{< relref "configuration/logs.md" >}}). Services keep different amounts, a busy one only its most recent lines, and an attached TUI fewer than the session's own. So that no stretch of the pane silently lacks a service's lines, the pane starts at the oldest line still kept by the service that dropped lines most recently, by its retention or because a restart cleared them; older lines of the other services show in their own panes.
+Only the lines that the services still keep in memory show, as in their own panes, so memory stays within each service's [log retention]({{< relref "configuration/logs.md" >}}). A busy service drops its oldest lines sooner than a quiet one, so far back in the pane its lines may be missing.
 
 ## Mouse
 

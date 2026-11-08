@@ -418,7 +418,7 @@ fn a_live_screen_redrawn_in_place_stays_at_the_time_of_its_first_frame() {
 }
 
 #[test]
-fn editing_at_the_ends_builds_the_same_text_as_building_it_whole() {
+fn editing_builds_the_same_text_as_building_it_whole_wrapped_or_not() {
     /// What the services log before one render.
     struct Step {
         api: &'static [(u64, u64, &'static str)],
@@ -427,66 +427,78 @@ fn editing_at_the_ends_builds_the_same_text_as_building_it_whole() {
         api_first_retained: u64,
     }
 
-    let mut services = [service("api", &[]), service("web", &[])];
-    let mut edited = AllLogs::new();
+    // A chatty api drops its oldest lines from among the lines of a quiet web, which keeps its
+    // old ones, until api has dropped every line it had.
     let steps = [
         Step {
-            api: &[(1, 100, "a1"), (2, 300, "a2")],
-            web: &[(1, 200, "w1")],
+            api: &[(1, 150, "a1"), (2, 200, "a2 runs on past the width")],
+            web: &[(1, 100, "w1 is an old line that wraps")],
             api_first_retained: 1,
         },
         Step {
-            api: &[(3, 400, "a3")],
-            web: &[(2, 400, "w2"), (3, 500, "w3")],
-            api_first_retained: 1,
+            api: &[(3, 250, "a3")],
+            web: &[(2, 300, "w2")],
+            api_first_retained: 2,
         },
-        // api drops its first two lines, so the text starts at its oldest kept line.
         Step {
-            api: &[(4, 600, "a4")],
-            web: &[(4, 600, "w4")],
+            api: &[(4, 350, "a4\nscreen row two")],
+            web: &[],
             api_first_retained: 3,
         },
         Step {
             api: &[],
-            web: &[(5, 700, "w5\nsecond line")],
-            api_first_retained: 3,
+            web: &[],
+            api_first_retained: 5,
+        },
+        Step {
+            api: &[(5, 400, "a5")],
+            web: &[(3, 450, "w3")],
+            api_first_retained: 5,
         },
     ];
-    for (step, logged) in steps.iter().enumerate() {
-        let [api, web] = &mut services;
-        apply(api, logged.api_first_retained, logged.api);
-        apply(web, 1, logged.web);
-        edited.render_text(&services, false, 80);
+    for wrap in [false, true] {
+        let mut services = [service("api", &[]), service("web", &[])];
+        let mut edited = AllLogs::new();
+        for (step, logged) in steps.iter().enumerate() {
+            let [api, web] = &mut services;
+            apply(api, logged.api_first_retained, logged.api);
+            apply(web, 1, logged.web);
+            edited.render_text(&services, wrap, 12);
 
-        // After the first build, each step edits the text at its ends.
-        assert_eq!(edited.log.last_edit.is_some(), step > 0, "step {step}");
-        let whole = built(&services);
-        assert_eq!(lines(&edited), lines(&whole), "step {step}");
-        assert_eq!(
-            edited.log.line_index.total_lines(),
-            whole.log.line_index.total_lines()
-        );
-        // Every line names the same record in both.
-        for line in 0..whole.log.text.lines.len() {
-            let record_line = whole.log.record_line(line);
-            assert_eq!(edited.log.record_line(line), record_line, "step {step}");
-            if let Some(record_line) = record_line {
-                assert_eq!(edited.log.find_record_line(record_line), Ok(line));
+            // After the first build, each step edits the text.
+            assert_eq!(edited.log.last_edit.is_some(), step > 0, "step {step}");
+            let mut whole = AllLogs::new();
+            whole.render_text(&services, wrap, 12);
+            assert_eq!(lines(&edited), lines(&whole), "step {step}, wrap {wrap}");
+            assert_eq!(
+                edited.log.line_index.total_lines(),
+                whole.log.line_index.total_lines(),
+                "step {step}, wrap {wrap}"
+            );
+            // Every line names the same record and starts on the same row in both.
+            for line in 0..whole.log.text.lines.len() {
+                let record_line = whole.log.record_line(line);
+                assert_eq!(edited.log.record_line(line), record_line, "step {step}");
+                assert_eq!(
+                    edited.log.line_index.line_start(line),
+                    whole.log.line_index.line_start(line),
+                    "step {step}, wrap {wrap}"
+                );
+                if let Some(record_line) = record_line {
+                    assert_eq!(edited.log.find_record_line(record_line), Ok(line));
+                }
             }
         }
+        assert_eq!(
+            lines(&edited),
+            vec![
+                "web │ w1 is an old line that wraps",
+                "web │ w2",
+                "api │ a5",
+                "web │ w3",
+            ]
+        );
     }
-    assert_eq!(
-        lines(&edited),
-        vec![
-            "api │ a3",
-            "web │ w2",
-            "web │ w3",
-            "api │ a4",
-            "web │ w4",
-            "web │ w5",
-            "web │ second line",
-        ]
-    );
 }
 
 #[test]
@@ -516,10 +528,10 @@ fn a_replaced_record_or_a_new_line_out_of_order_builds_the_text_whole() {
 }
 
 #[test]
-fn lines_older_than_the_oldest_line_a_service_kept_are_left_out() {
+fn a_busy_services_dropped_lines_leave_the_quiet_services_old_lines_in_place() {
     let mut services = [service("api", &[]), service("web", &[])];
     let [api, web] = &mut services;
-    // api's model no longer has its first four records.
+    // api's model no longer has its first four records, while web keeps all of its.
     apply(
         api,
         5,
@@ -535,10 +547,16 @@ fn lines_older_than_the_oldest_line_a_service_kept_are_left_out() {
         ],
     );
 
-    // Before api's oldest kept line, its lines would be missing, so web's are left out too.
+    // Nothing is hidden: web's old lines show although api's lines of that time are gone.
     assert_eq!(
         lines(&built(&services)),
-        vec!["api │ api oldest kept", "web │ web", "api │ api newer"]
+        vec![
+            "web │ web old",
+            "web │ web older than api",
+            "api │ api oldest kept",
+            "web │ web",
+            "api │ api newer",
+        ]
     );
 }
 

@@ -22,8 +22,6 @@ pub struct Service {
     pub healthcheck_dirty: bool,
     /// Highest log sequence read into `cached_lines`, including records the format filtered out.
     pub log_cursor: u64,
-    /// The model's oldest retained sequence as last read, or `None` while its log is empty.
-    pub first_retained_seq: Option<u64>,
     /// Counts the changes to `cached_lines` other than appending lines and dropping the oldest,
     /// so a view built from them can tell when it must be built again.
     pub(crate) rewrites: u64,
@@ -64,7 +62,6 @@ impl Service {
             healthcheck_cached_wrap: None,
             healthcheck_dirty: true,
             log_cursor: 0,
-            first_retained_seq: None,
             rewrites: 0,
             cached_format: None,
             level_override: None,
@@ -118,7 +115,6 @@ impl Service {
         records: &[LogLine],
         format: &LineFormat,
     ) {
-        self.first_retained_seq = first_retained;
         match first_retained {
             None => {
                 if !self.cached_lines.is_empty() {

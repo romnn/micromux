@@ -13,11 +13,11 @@
 //!
 //! The text is merged from the lines each service keeps for its own pane, so memory stays within
 //! the services' own retention.
-//! Services keep different amounts, so the text starts at the oldest line of the service that
-//! dropped lines most recently: before it, that service's lines would be missing.
+//! A busy service drops its oldest lines sooner than a quiet one, so far back its lines may be
+//! missing among the others'.
 //!
-//! While services only log new lines and drop their oldest, the text is edited at its ends
-//! rather than built again.
+//! While services only log new lines and drop their oldest, the text is edited, dropped lines
+//! cut out wherever they are and new ones appended, rather than built again.
 
 use std::collections::HashMap;
 
@@ -60,11 +60,9 @@ pub(crate) struct AllLogs {
     tags: HashMap<u32, Vec<Span<'static>>>,
     /// What the text holds of each service, by its number.
     merged: HashMap<u32, MergedService>,
-    /// The last record in the text.
+    /// The last record appended to the text.
     last: Option<RecordKey>,
-    /// The record the text starts at, when a service dropped lines.
-    start: Option<RecordKey>,
-    /// Whether the text is in merge order, which editing it at its ends relies on.
+    /// Whether the text is in merge order, which editing it relies on.
     ordered: bool,
 }
 
@@ -73,6 +71,8 @@ pub(crate) struct AllLogs {
 struct MergedService {
     /// The service's [`Service::rewrites`] when its lines were merged.
     rewrites: u64,
+    /// The oldest sequence the service still kept, or `None` while it kept none.
+    oldest_seq: Option<u64>,
     /// The newest sequence merged.
     read_to_seq: u64,
     /// The capture time of the newest record merged.
@@ -89,7 +89,6 @@ impl AllLogs {
             tags: HashMap::new(),
             merged: HashMap::new(),
             last: None,
-            start: None,
             ordered: false,
         }
     }
@@ -127,7 +126,6 @@ impl AllLogs {
     /// Builds the text from every line of `services`.
     fn rebuild(&mut self, services: &[Service], numbers: &[u32], wrap: bool, wrap_width: u16) {
         let names = &self.names;
-        let start = start_record(names, services, numbers);
         let name_width = services
             .iter()
             .map(|service| Span::raw(service.snapshot.id.as_str()).width())
@@ -139,15 +137,12 @@ impl AllLogs {
             .zip(numbers)
             .map(|(service, number)| (*number, tag(&service.snapshot.id, *number, name_width)))
             .collect();
-        let records = merge(sources(services, numbers, |_| 0))
-            .filter(|record| starts_at_or_after(names, record.key, start))
-            .collect::<Vec<_>>();
+        let records = merge(sources(services, numbers, |_| 0)).collect::<Vec<_>>();
         self.ordered = records.windows(2).all(|pair| match pair {
             [before, after] => order(names, before.key) < order(names, after.key),
             _ => true,
         });
         self.last = records.last().map(|record| record.key);
-        self.start = start;
         let tags = &self.tags;
         self.log.rebuild_tagged(
             records.iter().filter_map(|record| tagged(tags, record)),
@@ -161,8 +156,8 @@ impl AllLogs {
             .collect();
     }
 
-    /// Edits the text at its ends for the lines `services` logged and dropped since it was
-    /// built, and returns whether that could be done.
+    /// Edits the text for the lines `services` logged and dropped since it was built, and
+    /// returns whether that could be done.
     ///
     /// It cannot when a service changed its lines otherwise, such as its last record, or when a
     /// new line would not go at the end.
@@ -170,32 +165,23 @@ impl AllLogs {
         if !self.ordered || self.merged.len() != services.len() {
             return false;
         }
-        let mut read_to = HashMap::new();
+        let mut before = HashMap::new();
         for (service, number) in services.iter().zip(numbers) {
             match self.merged.get(number) {
                 Some(merged) if merged.rewrites == service.rewrites => {
-                    read_to.insert(*number, *merged);
+                    before.insert(*number, *merged);
                 }
                 _ => return false,
             }
         }
         let names = &self.names;
-        let start = start_record(names, services, numbers);
-        let start_moved_back = match (self.start, start) {
-            (Some(before), Some(now)) => order(names, now) < order(names, before),
-            (Some(_), None) => true,
-            (None, _) => false,
-        };
-        if start_moved_back {
-            return false;
-        }
 
         // The lines each service logged since, which must be later than what it logged before.
         let new = merge(sources(services, numbers, |number| {
-            read_to.get(&number).map_or(0, |merged| merged.read_to_seq)
+            before.get(&number).map_or(0, |merged| merged.read_to_seq)
         }))
         .collect::<Vec<_>>();
-        let mut last_ms = read_to
+        let mut last_ms = before
             .iter()
             .map(|(number, merged)| (*number, merged.last_ms))
             .collect::<HashMap<_, _>>();
@@ -206,33 +192,44 @@ impl AllLogs {
             }
             *service_last_ms = record.key.timestamp_unix_ms;
         }
-        let kept = new
-            .iter()
-            .filter(|record| starts_at_or_after(names, record.key, start))
-            .collect::<Vec<_>>();
-        if let (Some(first), Some(last)) = (kept.first(), self.last)
+        if let (Some(first), Some(last)) = (new.first(), self.last)
             && order(names, first.key) <= order(names, last)
         {
             return false;
         }
 
-        // Every dropped line was older than the start, as it was older than its service's
-        // oldest line, which is no later than the start.
-        let dropped = start.map_or(0, |start| {
-            self.log
-                .leading_records(|key| order(names, key) < order(names, start))
-        });
-        if dropped > 0 || !kept.is_empty() {
+        // A service drops lines only from the front of its log, so the records it dropped are
+        // the ones older than the oldest it kept; one that kept none dropped them all.
+        let oldest = services
+            .iter()
+            .zip(numbers)
+            .map(|(service, number)| (*number, service.cached_lines.front().map(|line| line.seq)))
+            .collect::<HashMap<_, _>>();
+        let mut dropped_any = false;
+        for (number, merged) in &before {
+            let now = oldest.get(number).copied().flatten();
+            match (merged.oldest_seq, now) {
+                // An older line coming back is no drop.
+                (Some(was), Some(now)) if now < was => return false,
+                (was, now) => dropped_any |= was != now,
+            }
+        }
+        if dropped_any || !new.is_empty() {
             let tags = &self.tags;
             self.log.edit_tagged(
-                dropped,
-                kept.iter().filter_map(|record| tagged(tags, record)),
+                |key| {
+                    oldest
+                        .get(&key.id.service)
+                        .copied()
+                        .flatten()
+                        .is_some_and(|oldest| key.id.seq >= oldest)
+                },
+                new.iter().filter_map(|record| tagged(tags, record)),
             );
         }
-        if let Some(record) = kept.last() {
+        if let Some(record) = new.last() {
             self.last = Some(record.key);
         }
-        self.start = start;
         self.merged = services
             .iter()
             .zip(numbers)
@@ -247,6 +244,7 @@ fn merged_service(service: &Service) -> MergedService {
     let newest = service.cached_lines.back();
     MergedService {
         rewrites: service.rewrites,
+        oldest_seq: service.cached_lines.front().map(|line| line.seq),
         read_to_seq: newest.map_or(0, |line| line.seq),
         last_ms: newest.map_or(0, |line| line.timestamp_unix_ms),
     }
@@ -283,34 +281,6 @@ fn order(names: &[String], key: RecordKey) -> Order<'_> {
             .map_or("", String::as_str),
         seq: key.id.seq,
     }
-}
-
-/// Whether `key` goes at or after `start`, when there is one.
-fn starts_at_or_after(names: &[String], key: RecordKey, start: Option<RecordKey>) -> bool {
-    start.is_none_or(|start| order(names, key) >= order(names, start))
-}
-
-/// The record the text starts at: the oldest line of the service that dropped lines most
-/// recently, or `None` while no service dropped any.
-///
-/// A service whose log no longer starts at its first record dropped lines, by its retention or
-/// because a restart cleared them.
-fn start_record(names: &[String], services: &[Service], numbers: &[u32]) -> Option<RecordKey> {
-    services
-        .iter()
-        .zip(numbers)
-        .filter(|(service, _)| service.first_retained_seq > Some(1))
-        .filter_map(|(service, number)| {
-            let oldest = service.cached_lines.front()?;
-            Some(RecordKey {
-                id: RecordId {
-                    service: *number,
-                    seq: oldest.seq,
-                },
-                timestamp_unix_ms: oldest.timestamp_unix_ms,
-            })
-        })
-        .max_by(|left, right| order(names, *left).cmp(&order(names, *right)))
 }
 
 /// The spans that lead each line of the service `id` with `number`: its name in its color,
