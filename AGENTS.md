@@ -35,3 +35,13 @@ field keeps alive. Never silence `dead_code` by prefixing such a field with
 `_`: underscore fields look inert, hide the RAII intent, and invite deletion in
 refactors, while the `expect` reason documents the purpose and flags the
 suppression should the field ever gain a real read.
+
+## Changelog
+
+A pull request with a user-facing change (a new feature, a fix users can
+notice, or a behavior or breaking change) adds one bullet under `## Unreleased`
+in `CHANGELOG.md`: a bold one-line statement, optionally followed by one short
+sentence naming the config key, command or flag. CI, tooling, tests, refactors
+and dependency bumps get no entry. A release moves the Unreleased entries under
+the new `## vX.Y.Z` heading before the bump, which commits `CHANGELOG.md`
+through `.bumpversion.toml`.
