@@ -434,6 +434,11 @@ mod tests {
     }
 
     /// The tests share the process-wide mode flags, so they run as one sequence.
+    ///
+    /// On Windows crossterm sends the mouse and screen modes through the console API, which needs
+    /// a console a test does not have, so this runs where they are escape sequences;
+    /// [`keyboard_reporting_is_asked_for_once_per_kind`] covers the keyboard part everywhere.
+    #[cfg(unix)]
     #[test]
     fn the_terminal_comes_back_exactly_once_with_whatever_was_on() -> eyre::Result<()> {
         // Giving back a terminal with every mode on pops the keyboard flags while still on the
@@ -519,6 +524,30 @@ mod tests {
         ask_for_keyboard_on(&mut out, Keyboard::Kitty)?;
         assert!(out.is_empty(), "{:?}", written(&out));
         assert_eq!(KEYBOARD.load(Ordering::SeqCst), Keyboard::Legacy as u8);
+        Ok(())
+    }
+
+    /// The kitty flags go onto their stack once however often the terminal is taken, while
+    /// modifyOtherKeys, a plain setting, is asked for again each time; this needs no console, so
+    /// it runs on Windows too.
+    #[cfg(windows)]
+    #[test]
+    fn keyboard_reporting_is_asked_for_once_per_kind() -> eyre::Result<()> {
+        SCREEN.store(true, Ordering::SeqCst);
+        let mut out = Vec::new();
+        ask_for_keyboard_on(&mut out, Keyboard::Kitty)?;
+        ask_for_keyboard_on(&mut out, Keyboard::Kitty)?;
+        assert_eq!(written(&out), KEYBOARD_PUSH);
+
+        KEYBOARD.store(Keyboard::Legacy as u8, Ordering::SeqCst);
+        let mut out = Vec::new();
+        ask_for_keyboard_on(&mut out, Keyboard::ModifyOtherKeys)?;
+        ask_for_keyboard_on(&mut out, Keyboard::ModifyOtherKeys)?;
+        ask_for_keyboard_on(&mut out, Keyboard::Legacy)?;
+        assert_eq!(
+            written(&out),
+            format!("{MODIFY_OTHER_KEYS_ON}{MODIFY_OTHER_KEYS_ON}")
+        );
         Ok(())
     }
 }
