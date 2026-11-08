@@ -250,6 +250,26 @@ fn matches_widen_to_whole_graphemes() -> eyre::Result<()> {
     Ok(())
 }
 
+/// A match is placed on the wrapped row it is drawn on, except in a line too long to draw off
+/// screen cheaply, which scrolls to its first row.
+#[test]
+fn matches_are_placed_on_their_wrapped_row_unless_the_line_is_huge() {
+    let line_with_needle_after = |filler_words: usize| {
+        let text = format!("{}needle", "filler ".repeat(filler_words));
+        let start = text.len() - "needle".len();
+        (Line::raw(text), start..start + "needle".len())
+    };
+
+    // Three filler words fill a row of twenty columns, so the tenth starts the fourth row and
+    // the needle follows it there.
+    let (line, bytes) = line_with_needle_after(10);
+    assert_eq!(super::row_in_wrapped_line(&line, &bytes, 20), 3);
+
+    // A line past the limit is not drawn, however deep the match.
+    let (line, bytes) = line_with_needle_after(super::MAX_PLACED_LINE_BYTES / 7 + 1);
+    assert_eq!(super::row_in_wrapped_line(&line, &bytes, 20), 0);
+}
+
 #[test]
 fn matches_span_the_styled_runs_of_a_line() -> eyre::Result<()> {
     let text = Text::from(vec![

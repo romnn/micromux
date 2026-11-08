@@ -200,12 +200,24 @@ fn match_row(service: &Service, found: &Match) -> Option<usize> {
     Some(first_row + row_in_wrapped_line(line, &found.bytes, width))
 }
 
+/// Longest line, in bytes, whose wrapped rows a match is placed among; a longer one, such as a
+/// huge single-line JSON record, scrolls to its first row instead of being drawn off screen.
+const MAX_PLACED_LINE_BYTES: usize = 64 * 1024;
+
 /// The row that byte `bytes.start` of `line` is drawn on when the line wraps at `width` columns
-/// as the log pane wraps it.
+/// as the log pane wraps it, or its first row when the line is too long to place it cheaply.
 ///
 /// Wrapping depends on the text alone, so the line is drawn off screen with only the match
 /// styled, and the first styled cell gives the row.
 fn row_in_wrapped_line(line: &Line<'_>, bytes: &Range<usize>, width: u16) -> usize {
+    let line_bytes = line
+        .spans
+        .iter()
+        .map(|span| span.content.len())
+        .sum::<usize>();
+    if line_bytes > MAX_PLACED_LINE_BYTES {
+        return 0;
+    }
     let content = line
         .spans
         .iter()
@@ -386,7 +398,9 @@ impl LogSearch {
         let active = self.active.as_mut()?;
         let count = active.matches.len();
         let last = count.checked_sub(1)?;
-        let row_of = |found: &Match| match_row(service, found);
+        // Choosing compares the rows lines start on, which needs no drawing; only the chosen
+        // match is placed within its wrapped line.
+        let row_of = |found: &Match| service.cached_line_index.line_start(found.line);
         let wrap_newer = |index: usize| if index < count { index } else { 0 };
         let index = match (active.current, direction) {
             (Some(current), Direction::Older) => current.index.checked_sub(1).unwrap_or(last),
