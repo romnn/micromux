@@ -1,7 +1,8 @@
 //! The control client used by `micromux ctl` and the MCP proxy.
 //!
-//! Endpoint probing skips sockets that refuse a connection (dead), surfaces busy/incompatible
-//! endpoints, and never prunes them.
+//! Endpoint probing skips sockets that refuse a connection (dead), and removes those no session
+//! owns.
+//! It surfaces busy or incompatible endpoints and never prunes them.
 
 use std::path::{Path, PathBuf};
 
@@ -397,7 +398,7 @@ pub async fn probe_endpoint(endpoint: &ControlEndpoint) -> EndpointProbe {
             {
                 EndpointProbe {
                     endpoint: endpoint.clone(),
-                    result: EndpointProbeResult::Absent(format!("connect: {err}")),
+                    result: EndpointProbeResult::Absent(absent_after_connect(endpoint, &err)),
                 }
             }
             Ok(Err(ProbeError::Describe(ControlError::Io(err))))
@@ -426,6 +427,30 @@ pub async fn probe_endpoint(endpoint: &ControlEndpoint) -> EndpointProbe {
             result: EndpointProbeResult::Unreachable(
                 "the control plane is not supported on this platform".to_string(),
             ),
+        }
+    }
+}
+
+/// Describes an endpoint that nothing listens on, after pruning it when it is proven dead.
+///
+/// A socket or file left behind by a crashed session is removed once its ownership lock shows
+/// that no session owns it; see [`crate::server::prune_dead_socket`].
+#[cfg(unix)]
+fn absent_after_connect(endpoint: &ControlEndpoint, err: &std::io::Error) -> String {
+    let reason = format!("connect: {err}");
+    let ControlEndpoint::Unix(path) = endpoint else {
+        return reason;
+    };
+    // A missing path leaves nothing to remove, and taking its lock would create a lock file.
+    if err.kind() == std::io::ErrorKind::NotFound {
+        return reason;
+    }
+    match crate::server::prune_dead_socket(path) {
+        Ok(true) => format!("{reason}; removed the dead endpoint"),
+        Ok(false) => reason,
+        Err(prune) => {
+            tracing::debug!(%prune, path = %path.display(), "cannot prune a dead endpoint");
+            reason
         }
     }
 }

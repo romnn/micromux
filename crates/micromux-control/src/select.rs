@@ -77,7 +77,7 @@ pub struct SocketProbeDetail {
 }
 
 /// Result class for a control endpoint probe.
-#[derive(Debug, Clone, Copy, Serialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SocketProbeStatus {
     /// The endpoint answered with a compatible session description.
@@ -90,6 +90,48 @@ pub enum SocketProbeStatus {
     Unreachable,
 }
 
+/// Most probes that found nothing live which diagnostics list one by one; the rest are counted.
+pub const LISTED_ABSENT_PROBES: usize = 3;
+
+/// Probe diagnostics that stay bounded however many dead endpoints a scan finds.
+///
+/// Probes that found a session, an incompatible protocol, or an unusable endpoint are all listed,
+/// since a caller can act on each.
+/// Probes that found nothing live are summarized as a count with a few examples.
+#[derive(Debug, Clone, Default)]
+pub struct SocketProbeDetails {
+    /// Every probe that found something listening, then the first [`LISTED_ABSENT_PROBES`] that
+    /// found nothing live, in probe order.
+    pub socket_probes: Vec<SocketProbeDetail>,
+    /// How many probes found nothing live, including those listed in `socket_probes`.
+    pub absent_probe_count: usize,
+}
+
+impl SocketProbeDetails {
+    /// Converts probes into bounded diagnostics, keeping their order within each group.
+    #[must_use]
+    pub fn from_probes(probes: impl IntoIterator<Item = EndpointProbe>) -> Self {
+        let mut socket_probes = Vec::new();
+        let mut absent_examples = Vec::new();
+        let mut absent_probe_count = 0;
+        for probe in probes {
+            if matches!(probe.result, EndpointProbeResult::Absent(_)) {
+                absent_probe_count += 1;
+                if absent_examples.len() < LISTED_ABSENT_PROBES {
+                    absent_examples.push(probe_detail(probe));
+                }
+            } else {
+                socket_probes.push(probe_detail(probe));
+            }
+        }
+        socket_probes.extend(absent_examples);
+        Self {
+            socket_probes,
+            absent_probe_count,
+        }
+    }
+}
+
 /// Structured transport facts collected while resolving a selector.
 #[derive(Debug, Clone)]
 pub struct ProbeReport {
@@ -99,8 +141,11 @@ pub struct ProbeReport {
     pub config_path: Option<String>,
     /// Candidate runtime directories.
     pub runtime_dirs: Vec<RuntimeDirDetail>,
-    /// Probe result for each candidate endpoint.
+    /// Every probe that found something listening, then a few that found nothing live (see
+    /// [`SocketProbeDetails`]).
     pub socket_probes: Vec<SocketProbeDetail>,
+    /// How many probes found nothing live, including those listed in `socket_probes`.
+    pub absent_probe_count: usize,
 }
 
 /// A live session selected together with the endpoint that drives it.
@@ -195,7 +240,7 @@ pub async fn resolve_selector_with_statuses(
             "no runtime directory could be resolved".to_string(),
             None,
             dir_statuses,
-            Vec::new(),
+            SocketProbeDetails::default(),
         ))));
     }
     resolve_selector_in_runtime_dirs(&runtime_dirs, dir_statuses, cwd, selector, config_override)
@@ -229,7 +274,7 @@ pub async fn resolve_selector_in_runtime_dirs(
 async fn verify_any(
     endpoints: Vec<ControlEndpoint>,
     describe: &str,
-    absent: impl Fn(Vec<SocketProbeDetail>) -> ProbeReport,
+    absent: impl Fn(SocketProbeDetails) -> ProbeReport,
 ) -> Result<ResolvedSession, SelectError> {
     let probes = probe_endpoints(&endpoints).await;
     let matches = unique_answering_session_probes(&probes)
@@ -262,7 +307,7 @@ async fn resolve_current(
             },
             None,
             dir_statuses,
-            Vec::new(),
+            SocketProbeDetails::default(),
         )))
     })?;
     let endpoints = runtime_dirs
@@ -402,7 +447,7 @@ async fn resolve_hash(
             format!("no session with hash {hash}"),
             None,
             dir_statuses,
-            Vec::new(),
+            SocketProbeDetails::default(),
         ))));
     }
     let endpoints = runtime_dirs
@@ -494,7 +539,7 @@ fn classify_probe_matches(
     describe: &str,
     disambiguate_hint: &str,
     busy_unit: &str,
-    report: impl FnOnce(Vec<SocketProbeDetail>) -> ProbeReport,
+    report: impl FnOnce(SocketProbeDetails) -> ProbeReport,
 ) -> Result<ResolvedSession, SelectError> {
     if matches.len() > 1 {
         return Err(ambiguous_selection(
@@ -517,7 +562,7 @@ fn classify_probe_matches(
         )));
     }
     Err(SelectError::NoSession(Box::new(report(
-        probes.into_iter().map(probe_detail).collect(),
+        SocketProbeDetails::from_probes(probes),
     ))))
 }
 
@@ -592,8 +637,12 @@ fn probe_report(
     summary: String,
     config_path: Option<&Path>,
     dir_statuses: &[RuntimeDirStatus],
-    socket_probes: Vec<SocketProbeDetail>,
+    probes: SocketProbeDetails,
 ) -> ProbeReport {
+    let SocketProbeDetails {
+        socket_probes,
+        absent_probe_count,
+    } = probes;
     ProbeReport {
         summary,
         config_path: config_path.map(|path| path.display().to_string()),
@@ -606,6 +655,7 @@ fn probe_report(
             })
             .collect(),
         socket_probes,
+        absent_probe_count,
     }
 }
 
@@ -746,6 +796,51 @@ mod tests {
             Some(std::fs::canonicalize(config)?.as_path())
         );
         Ok(())
+    }
+
+    /// Absent probes collapse into a count with a few examples, however many there are, while
+    /// every probe that found something listening stays listed.
+    #[test]
+    fn probe_details_list_every_listener_and_sample_absent_probes() {
+        let endpoint =
+            |index: usize| ControlEndpoint::Unix(PathBuf::from(format!("/{index}.sock")));
+        let mut probes = (0..50)
+            .map(|index| EndpointProbe {
+                endpoint: endpoint(index),
+                result: EndpointProbeResult::Absent("connect: refused".to_string()),
+            })
+            .collect::<Vec<_>>();
+        probes.push(EndpointProbe {
+            endpoint: endpoint(50),
+            result: EndpointProbeResult::Unreachable("probe timed out".to_string()),
+        });
+        probes.push(EndpointProbe {
+            endpoint: endpoint(51),
+            result: EndpointProbeResult::ProtocolMismatch {
+                peer: ProtocolVersion::new(PROTOCOL_VERSION.major() + 1, 0),
+                ours: PROTOCOL_VERSION,
+            },
+        });
+
+        let details = SocketProbeDetails::from_probes(probes);
+
+        // Listeners come first, then the first absent probes in probe order.
+        let listed = details
+            .socket_probes
+            .iter()
+            .map(|probe| (probe.endpoint.as_str(), probe.status))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            listed,
+            vec![
+                ("/50.sock", SocketProbeStatus::Unreachable),
+                ("/51.sock", SocketProbeStatus::ProtocolMismatch),
+                ("/0.sock", SocketProbeStatus::Absent),
+                ("/1.sock", SocketProbeStatus::Absent),
+                ("/2.sock", SocketProbeStatus::Absent),
+            ]
+        );
+        assert_eq!(details.absent_probe_count, 50);
     }
 
     #[test]

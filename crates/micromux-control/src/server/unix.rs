@@ -214,21 +214,28 @@ pub(super) fn endpoint_owner_lock_held(endpoint: &ControlEndpoint) -> Result<boo
     }
 }
 
-fn bind_unix(
-    socket_path: &Path,
-    project_lock: Option<std::fs::File>,
-) -> Result<Option<EndpointGuard>, ControlError> {
+/// Opens the endpoint's ownership lock file, creating it when missing.
+fn open_endpoint_lock(socket_path: &Path) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 
-    let lock_path = socket_path.with_extension("lock");
     let lock_file = std::fs::OpenOptions::new()
         .create(true)
         .read(true)
         .write(true)
         .truncate(false)
         .mode(0o600)
-        .open(&lock_path)?;
+        .open(socket_path.with_extension("lock"))?;
     lock_file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    Ok(lock_file)
+}
+
+fn bind_unix(
+    socket_path: &Path,
+    project_lock: Option<std::fs::File>,
+) -> Result<Option<EndpointGuard>, ControlError> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let lock_file = open_endpoint_lock(socket_path)?;
 
     // The lifetime-held lock is the authoritative ownership signal — more robust than connect-probing
     // a possibly-wedged listener. "lock acquirable" ⇔ "no live owner".
@@ -284,6 +291,42 @@ fn try_lock_endpoint_owner(lock_file: &std::fs::File) -> std::io::Result<bool> {
         }
         std::thread::sleep(OWNER_PROBE_LOCK_RETRY);
     }
+}
+
+/// Unlinks a leftover socket at `socket_path` when no session owns the endpoint, and returns
+/// whether it removed one.
+///
+/// It takes the same proof as [`bind_unix`] before it unlinks a leaked socket: the ownership lock
+/// can be taken without blocking.
+/// An owner holds the lock exclusively from before it binds the socket until after it unlinks it,
+/// so a session that is running or still starting keeps its socket.
+///
+/// The lock is taken shared, which already excludes every owner.
+/// A session that starts meanwhile sees a shared holder as a probe and waits it out, as
+/// [`try_lock_endpoint_owner`] does, instead of mistaking the pruner for a live owner.
+/// Concurrent pruners share the lock too; the losers find the socket gone.
+///
+/// The lock file stays.
+/// Unlinking it is unsafe: a session that opened it just before would lock the orphaned inode
+/// while the next one creates a new file, leaving two owners of one endpoint, and sessions of
+/// older versions cannot detect that.
+/// Discovery never lists lock files, so they are invisible, and their number is bounded by the
+/// configs that ever ran.
+pub(super) fn prune_dead_socket(socket_path: &Path) -> std::io::Result<bool> {
+    let lock_file = open_endpoint_lock(socket_path)?;
+    match fs2::FileExt::try_lock_shared(&lock_file) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => return Ok(false),
+        Err(err) => return Err(err),
+    }
+    let removed = match std::fs::remove_file(socket_path) {
+        Ok(()) => Ok(true),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(err),
+    };
+    // Unlinking happens under the lock, which is released only now.
+    drop(lock_file);
+    removed
 }
 
 fn owner_lock_held_unix(socket_path: &Path) -> Result<bool, ControlError> {
@@ -1270,7 +1313,8 @@ mod tests {
         RESPONSE_MAX_BYTES, SubscriptionPolicy, bind_project, bound_follow_response_lines,
         bound_follow_response_lines_page, bound_health_attempt, bound_health_history,
         bound_tail_response_lines, claim_project_at, describe, encoded_len, lag_replay_changes,
-        log_read_error, logs_fit, response_within_frame, stream_changes,
+        log_read_error, logs_fit, open_endpoint_lock, prune_dead_socket, response_within_frame,
+        stream_changes,
     };
 
     fn line(seq: u64, len: usize) -> LogLine {
@@ -1592,6 +1636,94 @@ mod tests {
         ));
         drop(first_guard);
         assert!(bind_project(&second, &claim_project_at(&project_lock)?)?.is_some());
+        Ok(())
+    }
+
+    /// A pruner running in a tight loop never removes the socket of a bound endpoint, and a
+    /// session starting while it holds the lock never mistakes it for a live owner.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pruning_never_removes_or_blocks_a_bound_endpoint() -> eyre::Result<()> {
+        use std::os::unix::fs::FileTypeExt as _;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        const BINDS: usize = 300;
+
+        let directory = tempfile::tempdir()?;
+        let socket_path = directory.path().join("raced.sock");
+        let stop = Arc::new(AtomicBool::new(false));
+        let removed = Arc::new(AtomicUsize::new(0));
+        let pruning = std::thread::spawn({
+            let socket_path = socket_path.clone();
+            let stop = Arc::clone(&stop);
+            let removed = Arc::clone(&removed);
+            move || -> std::io::Result<()> {
+                while !stop.load(Ordering::Relaxed) {
+                    if prune_dead_socket(&socket_path)? {
+                        removed.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                Ok(())
+            }
+        });
+
+        let binding = tokio::task::spawn_blocking({
+            let socket_path = socket_path.clone();
+            move || -> eyre::Result<()> {
+                let endpoint = ControlEndpoint::Unix(socket_path.clone());
+                for attempt in 0..BINDS {
+                    let guard = super::bind(&endpoint)?
+                        .ok_or_else(|| eyre::eyre!("bind {attempt} read the pruner as an owner"))?;
+                    // Stay bound long enough for the pruner to try the socket many times.
+                    std::thread::sleep(std::time::Duration::from_micros(200));
+                    let bound = std::fs::symlink_metadata(&socket_path)
+                        .is_ok_and(|metadata| metadata.file_type().is_socket());
+                    if !bound {
+                        eyre::bail!("bind {attempt} lost its socket to the pruner");
+                    }
+                    drop(guard);
+                }
+                Ok(())
+            }
+        });
+        let binding_result = binding.await;
+        stop.store(true, Ordering::Relaxed);
+        let pruning_result = pruning
+            .join()
+            .map_err(|_| eyre::eyre!("pruning thread panicked"))?;
+        binding_result??;
+        pruning_result?;
+
+        // Every socket was unlinked by its own guard, so the pruner never found one to remove.
+        assert_eq!(removed.load(Ordering::Relaxed), 0);
+        Ok(())
+    }
+
+    /// Pruning removes a crash-leaked socket and leaves the lock file, but keeps a socket whose
+    /// lock a starting session holds.
+    #[test]
+    fn pruning_removes_only_sockets_without_an_owner() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+
+        // Crash-leaked: nothing listens and nothing holds the lock.
+        let leaked = directory.path().join("leaked.sock");
+        drop(std::os::unix::net::UnixListener::bind(&leaked)?);
+        assert!(prune_dead_socket(&leaked)?);
+        assert!(!leaked.exists());
+        assert!(leaked.with_extension("lock").exists());
+
+        // Starting: the session holds the lock but has not replaced the stale socket yet.
+        let starting = directory.path().join("starting.sock");
+        drop(std::os::unix::net::UnixListener::bind(&starting)?);
+        let owner = open_endpoint_lock(&starting)?;
+        fs2::FileExt::try_lock_exclusive(&owner)?;
+        assert!(!prune_dead_socket(&starting)?);
+        assert!(starting.exists());
+
+        // Once the owner is gone, the same socket is proven dead.
+        drop(owner);
+        assert!(prune_dead_socket(&starting)?);
+        assert!(!starting.exists());
         Ok(())
     }
 

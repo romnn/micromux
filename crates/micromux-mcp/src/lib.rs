@@ -24,7 +24,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use micromux::{DependencyFailure, Desired, Execution, Health, HealthAttempt, ServiceSnapshot};
 use micromux_control::{
     Client, ControlEndpoint, ControlError, ENVIRONMENT_PROTOCOL_VERSION, ErrorCode, Request,
-    Response, SessionInfo, endpoint_for, transport_supported, usable_runtime_dirs,
+    Response, SessionInfo, SocketProbeDetails, endpoint_for, transport_supported,
+    usable_runtime_dirs,
 };
 use regex::{Regex, RegexBuilder};
 use rmcp::{
@@ -1342,7 +1343,7 @@ impl McpServer {
                 "no runtime directory could be resolved".to_string(),
                 Some(&config_path),
                 &dir_statuses,
-                Vec::new(),
+                SocketProbeDetails::default(),
             );
             return Err(ErrorData::internal_error(
                 "no runtime directory could be resolved",
