@@ -567,6 +567,7 @@ version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d8b9f2e4c67f833b660cdb0a3523065869fb35570177239812ed4c905aeff87b"
 dependencies = [
+ "base64 0.22.1",
  "bitflags 2.13.2",
  "crossterm_winapi",
  "derive_more",
@@ -1591,6 +1592,7 @@ dependencies = [
  "micromux-proxy",
  "micromux-tui",
  "nix 0.31.3",
+ "portable-pty",
  "rustix",
  "serde_json",
  "similar-asserts",
@@ -1601,6 +1603,7 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "vt100",
 ]
 
 [[package]]
@@ -1696,6 +1699,7 @@ dependencies = [
  "itertools 0.15.0",
  "micromux",
  "micromux-control",
+ "nix 0.31.3",
  "parking_lot",
  "ratatui",
  "serde_json",

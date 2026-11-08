@@ -8,6 +8,9 @@ use crate::json_log::LineFormat;
 pub struct Service {
     pub snapshot: micromux::ServiceSnapshot,
     pub cached_lines: std::collections::VecDeque<(u64, String)>,
+    /// The line of `cached_text` each of `cached_lines` starts on; a record of a live screen
+    /// snapshot spans several.
+    pub record_starts: Vec<usize>,
     pub cached_text: ratatui::text::Text<'static>,
     pub text_dirty: bool,
     pub cached_line_index: crate::render::log_view::RenderedLineIndex,
@@ -34,6 +37,7 @@ impl Service {
         Self {
             snapshot,
             cached_lines: std::collections::VecDeque::new(),
+            record_starts: Vec::new(),
             cached_text: ratatui::text::Text::default(),
             text_dirty: true,
             cached_line_index: crate::render::log_view::RenderedLineIndex::default(),

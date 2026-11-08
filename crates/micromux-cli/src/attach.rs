@@ -23,19 +23,33 @@ pub(crate) async fn run(options: &Options, raw_session: Option<&str>) -> Result<
         micromux_control::resolve_selector(&cwd, selector, options.config_path.as_deref())
             .await
             .map_err(|error| crate::Error::Message(format_select_error(error, "attach")))?;
+    let config_path = std::path::PathBuf::from(&resolved.info.config_path);
     let remote = micromux_tui::RemoteSource::connect(resolved.endpoint)
         .await
         .map_err(|error| crate::Error::Message(format_control_error(error, "attach")))?;
 
+    // Before anything that may warn, so the warnings reach the log.
+    let _log_guard = crate::setup_logging(options)?;
+    let project_ui = crate::ui_settings::project_ui_config(&config_path).await;
+    let printer = crate::DiagnosticsPrinter::new(
+        options.color_choice.unwrap_or(termcolor::ColorChoice::Auto),
+    );
+    let mouse = crate::ui_settings::mouse_options(
+        options.ui_setting_flags(),
+        project_ui.as_ref(),
+        &printer,
+    )
+    .await?;
+
     let shutdown = micromux::CancellationToken::new();
     crate::spawn_shutdown_handler(shutdown.clone());
-    let _log_guard = crate::setup_logging(options)?;
     let app = micromux_tui::App::new(
         micromux_tui::SessionSource::Remote(remote),
         None,
         shutdown,
-        micromux_tui::LogViewOptions {
+        micromux_tui::ViewOptions {
             pretty_json: !options.no_pretty_json_logs,
+            mouse,
         },
     );
     Ok(app.render().await?)

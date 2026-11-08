@@ -49,6 +49,10 @@ const KILL_WAIT: Duration = Duration::from_secs(1);
 /// How often a starting session checks whether a previous session's cleanup released its lock.
 const LOCK_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
+/// How the line a starting session prints while it waits for a previous session's cleanups
+/// begins, for a process that only sees the session's stderr, such as the one that started it.
+pub const WAITING_FOR_PREVIOUS_CLEANUP: &str = "waiting for the cleanup of";
+
 /// Longest partial line kept while waiting for its newline.
 const LINE_MAX_BYTES: usize = 16 * 1024;
 
@@ -106,25 +110,60 @@ fn open_lock(path: &Path) -> std::io::Result<File> {
         .open(path)
 }
 
-/// Takes the cleanup lock at `path` if nobody holds it.
+/// How long a shim may hold a cleanup lock beyond the stop and cleanup it holds it for: the
+/// cleanup's stop grace, the supervisor's slack, and the reaping.
+pub(crate) const CLEANUP_LOCK_SLACK: Duration = CLEANUP_STOP_GRACE
+    .saturating_add(SHIM_SLACK)
+    .saturating_add(KILL_WAIT);
+
+/// Takes the cleanup lock at `path` if nobody holds it, for at most `hold` plus
+/// [`CLEANUP_LOCK_SLACK`].
 ///
 /// Returns `None` when it is held, or cannot be opened.
 #[cfg(unix)]
-pub(crate) fn try_lock(path: &Path) -> Option<File> {
+pub(crate) fn try_lock(path: &Path, hold: Duration) -> Option<File> {
     let file = open_lock(path).ok()?;
-    file.try_lock().ok().map(|()| file)
+    file.try_lock().ok()?;
+    record_deadline(&file, hold);
+    Some(file)
 }
 
-/// Takes the cleanup lock at `path`, waiting for its holder to release it.
+/// Takes the cleanup lock at `path`, waiting for its holder to release it, for at most `hold`
+/// plus [`CLEANUP_LOCK_SLACK`].
 ///
 /// # Errors
 ///
 /// Returns an error when the lock file cannot be opened or locked.
 #[cfg(unix)]
-pub(crate) fn lock(path: &Path) -> std::io::Result<File> {
+pub(crate) fn lock(path: &Path, hold: Duration) -> std::io::Result<File> {
     let file = open_lock(path)?;
     file.lock()?;
+    record_deadline(&file, hold);
     Ok(file)
+}
+
+/// Records in the held lock `file` that its holder holds it for at most `hold` plus
+/// [`CLEANUP_LOCK_SLACK`] from now, as Unix milliseconds, so a starting session knows how long to
+/// wait for it.
+///
+/// A deadline that cannot be recorded leaves the session to its own estimate.
+#[cfg(unix)]
+pub(crate) fn record_deadline(file: &File, hold: Duration) {
+    use std::io::Seek as _;
+
+    let deadline = std::time::SystemTime::now() + hold + CLEANUP_LOCK_SLACK;
+    let millis = deadline
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let mut file = file;
+    if let Err(err) = file
+        .set_len(0)
+        .and_then(|()| file.rewind())
+        .and_then(|()| write!(file, "{millis}"))
+    {
+        eprintln!("micromux shim: cannot record the cleanup lock's deadline: {err}");
+    }
 }
 
 /// Opens a cleanup log for writing, creating it and its private directory when missing.
@@ -200,57 +239,178 @@ fn append_line(path: &Path, line: &str) {
     }
 }
 
-/// [`wait_for_previous_cleanups`] stopped waiting because it was cancelled.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-#[error("cancelled while waiting for a previous session's cleanup")]
-pub struct CleanupWaitCancelled;
+/// Why [`wait_for_previous_cleanups`] stopped before every previous cleanup finished.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum CleanupWaitError {
+    /// The wait was cancelled, such as by an interrupt.
+    #[error("cancelled while waiting for a previous session's cleanup")]
+    Cancelled,
+    /// A previous cleanup still ran when the wait's bound ran out.
+    #[error(
+        "the cleanup of {} from the previous session did not finish within {}; check its log \
+         in {} and start this session again once it is done",
+        services.join(", "),
+        humantime::format_duration(*bound),
+        directory.display()
+    )]
+    TimedOut {
+        /// The services whose cleanups still ran.
+        services: Vec<ServiceID>,
+        /// How long the session waited.
+        bound: Duration,
+        /// The directory holding the cleanups' logs.
+        directory: PathBuf,
+    },
+}
+
+/// What a starting session waits for while a previous session's cleanups still run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreviousCleanupWait {
+    /// The services whose cleanups still run, sorted.
+    pub services: Vec<ServiceID>,
+    /// How long the session waits for them at most.
+    pub bound: Duration,
+}
+
+impl std::fmt::Display for PreviousCleanupWait {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{WAITING_FOR_PREVIOUS_CLEANUP} {} from the previous session (up to {} s)",
+            self.services.join(", "),
+            self.bound.as_secs()
+        )
+    }
+}
+
+/// The bounds of the previous-cleanup waits a starting session reported in `output`, its stderr,
+/// in the order it reported them; a later one replaces an earlier one.
+#[must_use]
+pub fn reported_previous_cleanup_waits(output: &str) -> Vec<Duration> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let (_, rest) = line.split_once(WAITING_FOR_PREVIOUS_CLEANUP)?;
+            let (_, bound) = rest.rsplit_once("(up to ")?;
+            let seconds = bound.strip_suffix(" s)")?.parse().ok()?;
+            Some(Duration::from_secs(seconds))
+        })
+        .collect()
+}
+
+/// How long a starting session waits for a cleanup lock whose holder recorded no deadline.
+///
+/// A shim whose supervisor died holds the cleanup lock while it stops its service and then runs
+/// the cleanup, each bounded by the service's settings, and records until when.
+/// A shim of an older micromux records nothing, so the longest stop and cleanup of the config's
+/// services stand in for it, or the defaults when those are longer, for a service the config no
+/// longer has.
+#[must_use]
+pub fn previous_cleanup_bound<F>(config_file: &crate::ConfigFile<F>) -> Duration {
+    let default = crate::spec::DEFAULT_STOP_GRACE_PERIOD + crate::spec::DEFAULT_CLEANUP_TIMEOUT;
+    let longest = config_file
+        .config
+        .services
+        .values()
+        .filter_map(|service| {
+            let cleanup = service.cleanup.as_ref()?;
+            Some(*service.stop_grace_period.as_ref() + cleanup.timeout)
+        })
+        .fold(default, Duration::max);
+    longest + CLEANUP_LOCK_SLACK
+}
 
 /// Waits until no earlier session of `config_file` is still running a cleanup.
 ///
 /// A session whose supervisor died leaves its cleanups to the service shims, and a session
 /// started on the same config must not start services while those cleanups tear them down.
 /// Every cleanup lock of the config counts, including those of services it no longer has.
-/// `on_wait` is called once, with the services whose cleanups are still running, if there is
-/// anything to wait for.
+/// The wait lasts until the latest deadline the cleanups' holders recorded, or
+/// [`previous_cleanup_bound`] for a holder that recorded none.
+/// `on_wait` is called with what the session waits for when it starts waiting, and again when a
+/// cleanup that starts later moves the end of the wait out.
 ///
 /// # Errors
 ///
-/// Returns [`CleanupWaitCancelled`] when `cancel` is cancelled before every lock is free.
+/// Returns [`CleanupWaitError::Cancelled`] when `cancel` is cancelled, and
+/// [`CleanupWaitError::TimedOut`] when a cleanup still runs after the wait's end.
 pub async fn wait_for_previous_cleanups<F>(
     config_file: &crate::ConfigFile<F>,
     cancel: &CancellationToken,
-    on_wait: impl FnOnce(&[ServiceID]),
-) -> Result<(), CleanupWaitCancelled> {
+    on_wait: impl FnMut(&PreviousCleanupWait),
+) -> Result<(), CleanupWaitError> {
     let Some(directory) = cleanup_state_directory(config_key_path(config_file)) else {
         return Ok(());
     };
-    wait_for_locks(&directory, cancel, on_wait).await
+    wait_for_locks(
+        &directory,
+        previous_cleanup_bound(config_file),
+        cancel,
+        on_wait,
+    )
+    .await
 }
 
-/// Waits until every `*.lock` file in `directory` can be locked.
+/// Waits until every `*.lock` file in `directory` can be locked, until the latest deadline their
+/// holders recorded, or for `fallback` after the wait started for a holder that recorded none.
 async fn wait_for_locks(
     directory: &Path,
+    fallback: Duration,
     cancel: &CancellationToken,
-    on_wait: impl FnOnce(&[ServiceID]),
-) -> Result<(), CleanupWaitCancelled> {
-    let mut on_wait = Some(on_wait);
+    mut on_wait: impl FnMut(&PreviousCleanupWait),
+) -> Result<(), CleanupWaitError> {
+    let started = tokio::time::Instant::now();
+    let mut announced: Option<tokio::time::Instant> = None;
     loop {
         let busy = busy_locks(directory);
         if busy.is_empty() {
             return Ok(());
         }
-        if let Some(on_wait) = on_wait.take() {
-            on_wait(&busy);
+        let now = tokio::time::Instant::now();
+        let wall_now = std::time::SystemTime::now();
+        // A recorded deadline only ever extends the session's own estimate: the wall clock it is
+        // recorded in runs on during a suspend, while the holder's timeouts do not, and a probe
+        // can read a previous holder's deadline before the new one records its own.
+        let estimate = started + fallback;
+        let deadline = busy
+            .iter()
+            .map(|(_, recorded)| {
+                recorded.map_or(estimate, |recorded| {
+                    (now + recorded.duration_since(wall_now).unwrap_or_default()).max(estimate)
+                })
+            })
+            .max()
+            .unwrap_or(now);
+        let services = busy
+            .into_iter()
+            .map(|(service, _)| service)
+            .collect::<Vec<_>>();
+        if now >= deadline {
+            return Err(CleanupWaitError::TimedOut {
+                services,
+                bound: now.duration_since(started),
+                directory: directory.to_path_buf(),
+            });
+        }
+        // Announce the wait, and again whenever its end moves out by more than a poll.
+        if announced.is_none_or(|announced| deadline > announced + Duration::from_secs(1)) {
+            announced = Some(deadline);
+            on_wait(&PreviousCleanupWait {
+                services,
+                // Rounded up, so a reader's bound never ends before the wait does.
+                bound: Duration::from_secs(deadline.duration_since(now).as_secs() + 1),
+            });
         }
         tokio::select! {
-            () = cancel.cancelled() => return Err(CleanupWaitCancelled),
+            () = cancel.cancelled() => return Err(CleanupWaitError::Cancelled),
             () = tokio::time::sleep(LOCK_POLL_INTERVAL) => {}
         }
     }
 }
 
-/// The services whose cleanup lock in `directory` is held, sorted.
-fn busy_locks(directory: &Path) -> Vec<ServiceID> {
+/// The services whose cleanup lock in `directory` is held, sorted, with the deadline the holder
+/// recorded, if it recorded one.
+fn busy_locks(directory: &Path) -> Vec<(ServiceID, Option<std::time::SystemTime>)> {
     let Ok(entries) = std::fs::read_dir(directory) else {
         return Vec::new();
     };
@@ -262,10 +422,18 @@ fn busy_locks(directory: &Path) -> Vec<ServiceID> {
                 return None;
             }
             let service = path.file_stem()?.to_str()?.to_owned();
-            let file = File::open(&path).ok()?;
+            let mut file = File::open(&path).ok()?;
             // A probe that takes the lock releases it when the file closes.
             match file.try_lock() {
-                Err(TryLockError::WouldBlock) => Some(service),
+                Err(TryLockError::WouldBlock) => {
+                    let mut recorded = String::new();
+                    let deadline = file
+                        .read_to_string(&mut recorded)
+                        .ok()
+                        .and_then(|_| recorded.trim().parse::<u64>().ok())
+                        .map(|millis| std::time::UNIX_EPOCH + Duration::from_millis(millis));
+                    Some((service, deadline))
+                }
                 Ok(()) | Err(TryLockError::Error(_)) => None,
             }
         })
@@ -749,8 +917,8 @@ mod tests {
             let directory = directory.path().to_path_buf();
             let cancel = cancel.clone();
             async move {
-                wait_for_locks(&directory, &cancel, |busy| {
-                    let _ = waited_tx.send(busy.to_vec());
+                wait_for_locks(&directory, Duration::from_secs(60), &cancel, |wait| {
+                    let _ = waited_tx.send(wait.services.clone());
                 })
                 .await
             }
@@ -786,11 +954,162 @@ mod tests {
         cancel.cancel();
         let result = tokio::time::timeout(
             Duration::from_secs(5),
-            wait_for_locks(directory.path(), &cancel, |_| {}),
+            wait_for_locks(directory.path(), Duration::from_secs(60), &cancel, |_| {}),
         )
         .await?;
-        assert_eq!(result, Err(CleanupWaitCancelled));
+        assert_eq!(result, Err(CleanupWaitError::Cancelled));
         drop(holder);
+        Ok(())
+    }
+
+    /// A cleanup whose holder recorded no deadline is waited for `fallback`, and one that still
+    /// runs then ends the wait with an error naming it.
+    #[tokio::test]
+    async fn waiting_for_a_previous_cleanup_is_bounded() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let held = files_in(directory.path(), "infra");
+        let holder = open_lock(&held.lock)?;
+        holder.lock()?;
+
+        let fallback = Duration::from_millis(300);
+        let result = wait_for_locks(
+            directory.path(),
+            fallback,
+            &CancellationToken::new(),
+            |_| {},
+        )
+        .await;
+        let Err(CleanupWaitError::TimedOut {
+            services,
+            bound,
+            directory: logs,
+        }) = result
+        else {
+            eyre::bail!("{result:?}");
+        };
+        assert_eq!(services, vec!["infra".to_string()]);
+        assert!(bound >= fallback, "{bound:?}");
+        assert_eq!(logs, directory.path());
+        drop(holder);
+        Ok(())
+    }
+
+    /// The deadline a cleanup's holder records extends the wait: a later one keeps the session
+    /// waiting past its own estimate, while a past one, as after a suspend, leaves the estimate.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_holders_deadline_bounds_the_wait() -> eyre::Result<()> {
+        use std::io::Seek as _;
+
+        let directory = tempfile::tempdir()?;
+        let held = files_in(directory.path(), "db");
+        let holder = try_lock(&held.lock, Duration::ZERO)
+            .ok_or_else(|| eyre::eyre!("the lock was taken"))?;
+
+        // Recorded deadline later than the session's estimate
+        let fallback = Duration::from_millis(100);
+        let (waits_tx, mut waits_rx) = tokio::sync::mpsc::unbounded_channel();
+        let wait = tokio::spawn({
+            let directory = directory.path().to_path_buf();
+            async move {
+                wait_for_locks(&directory, fallback, &CancellationToken::new(), |wait| {
+                    let _ = waits_tx.send(wait.bound);
+                })
+                .await
+            }
+        });
+        let reported = tokio::time::timeout(Duration::from_secs(5), waits_rx.recv())
+            .await?
+            .ok_or_else(|| eyre::eyre!("the wait was never reported"))?;
+        assert!(reported >= CLEANUP_LOCK_SLACK, "{reported:?}");
+        tokio::time::sleep(fallback * 5).await;
+        assert!(
+            !wait.is_finished(),
+            "the wait ended before the holder's deadline"
+        );
+        drop(holder);
+        tokio::time::timeout(Duration::from_secs(5), wait).await???;
+
+        // Recorded deadline already past
+        let mut holder = try_lock(&held.lock, Duration::ZERO)
+            .ok_or_else(|| eyre::eyre!("the lock was taken"))?;
+        holder.set_len(0)?;
+        holder.rewind()?;
+        write!(holder, "1000")?;
+        let fallback = Duration::from_millis(300);
+        let started = tokio::time::Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            wait_for_locks(
+                directory.path(),
+                fallback,
+                &CancellationToken::new(),
+                |_| {},
+            ),
+        )
+        .await?;
+        assert!(started.elapsed() >= fallback, "{:?}", started.elapsed());
+        assert!(
+            matches!(result, Err(CleanupWaitError::TimedOut { .. })),
+            "{result:?}"
+        );
+        drop(holder);
+        Ok(())
+    }
+
+    /// The line a waiting session prints carries the wait's bound, which a process that only reads
+    /// the session's stderr gets back from it.
+    #[test]
+    fn the_wait_line_reports_its_bound() {
+        let wait = PreviousCleanupWait {
+            services: vec!["db".to_string(), "infra".to_string()],
+            bound: Duration::from_secs(85),
+        };
+        assert_eq!(
+            wait.to_string(),
+            "waiting for the cleanup of db, infra from the previous session (up to 85 s)"
+        );
+        let later = PreviousCleanupWait {
+            bound: Duration::from_secs(120),
+            ..wait.clone()
+        };
+        assert_eq!(
+            reported_previous_cleanup_waits(&format!("starting\n{wait}\nmore\n{later}\n")),
+            vec![Duration::from_secs(85), Duration::from_secs(120)]
+        );
+        assert_eq!(reported_previous_cleanup_waits("starting\n"), Vec::new());
+    }
+
+    /// The bound covers the longest stop and cleanup of the config's services, and at least the
+    /// defaults, which a cleanup of a service the config no longer has may still run under.
+    #[test]
+    fn the_wait_is_bounded_by_the_longest_cleanup() -> eyre::Result<()> {
+        let config = |cleanup: &str| -> eyre::Result<crate::ConfigFile<usize>> {
+            let yaml = format!(
+                "version: 1\nservices:\n  db:\n    command: [\"true\"]\n    stop_grace_period: 30s\n{cleanup}"
+            );
+            Ok(crate::from_str(
+                &yaml,
+                Path::new("."),
+                0,
+                None,
+                &mut Vec::new(),
+            )?)
+        };
+        let slack = CLEANUP_STOP_GRACE + SHIM_SLACK + KILL_WAIT;
+        let default = crate::spec::DEFAULT_STOP_GRACE_PERIOD + crate::spec::DEFAULT_CLEANUP_TIMEOUT;
+
+        // No cleanup, or a short one
+        assert_eq!(previous_cleanup_bound(&config("")?), default + slack);
+        let short = "    cleanup:\n      command: [\"true\"]\n      timeout: 5s\n";
+        assert_eq!(previous_cleanup_bound(&config(short)?), default + slack);
+
+        // A long cleanup counts with its service's stop grace period.
+        let long = "    cleanup:\n      command: [\"true\"]\n      timeout: 10m\n";
+        assert_eq!(
+            previous_cleanup_bound(&config(long)?),
+            Duration::from_secs(30 + 600) + slack
+        );
         Ok(())
     }
 

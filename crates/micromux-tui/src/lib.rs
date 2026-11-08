@@ -4,14 +4,17 @@
 //! sender, a shutdown token, and display options; call [`App::render`] to run it. The TUI holds only
 //! view state and re-reads its synchronous source on each [`micromux::SessionChange`].
 
+mod clipboard;
 mod event;
 mod json_log;
 mod level;
+mod mouse;
 mod remote;
 mod render;
 mod source;
 mod state;
 mod style;
+mod terminal;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Duration;
@@ -28,6 +31,8 @@ pub use source::{LocalSource, SessionSource};
 
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 const PENDING_PTY_INPUT_RETRY: Duration = Duration::from_millis(5);
+/// How long the footer says how to quit after a Ctrl-C.
+const QUIT_HINT_DURATION: Duration = Duration::from_secs(2);
 const TERMINAL_INPUT_CLOSED_NOTICE: &str = "terminal input closed; send SIGINT or SIGTERM to exit";
 
 fn format_byte_limit(bytes: usize) -> String {
@@ -42,17 +47,57 @@ fn format_byte_limit(bytes: usize) -> String {
     }
 }
 
-/// Initial presentation of service logs in the TUI.
+/// Initial presentation of the TUI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct LogViewOptions {
+pub struct ViewOptions {
     /// Render structured JSON logs as compact colored lines instead of raw JSON.
     pub pretty_json: bool,
+    /// How the TUI handles the mouse.
+    pub mouse: MouseOptions,
 }
 
-impl Default for LogViewOptions {
+impl Default for ViewOptions {
     fn default() -> Self {
-        Self { pretty_json: true }
+        Self {
+            pretty_json: true,
+            mouse: MouseOptions::default(),
+        }
     }
+}
+
+/// How the TUI handles the mouse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MouseOptions {
+    /// Capture the mouse for clicks, the wheel and selecting text inside one pane.
+    ///
+    /// Without it the terminal keeps its own mouse handling, such as selecting text across the
+    /// whole screen; the `m` key switches capture at runtime either way.
+    pub capture: bool,
+    /// Copy a selection to the clipboard as soon as the drag ends, rather than only on an
+    /// explicit copy key.
+    pub copy_on_select: bool,
+}
+
+impl Default for MouseOptions {
+    fn default() -> Self {
+        Self {
+            capture: true,
+            copy_on_select: false,
+        }
+    }
+}
+
+/// What the app asks of the terminal, which only the event loop owns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Effect {
+    /// Turn mouse capture on or off.
+    MouseCapture(bool),
+    /// Put the text on the clipboard.
+    Copy(String),
+    /// Open the URL in the browser.
+    OpenUrl(String),
+    /// Give the terminal back and stop until the shell continues the process.
+    Suspend,
 }
 
 /// Errors from running or rendering the terminal interface.
@@ -93,8 +138,17 @@ pub struct App {
     show_help: bool,
     /// The details popup on screen, if any.
     info: Option<InfoView>,
-    /// First row of the details popup on screen, clamped when it renders.
-    info_scroll: usize,
+    /// First row of the help or details popup on screen, clamped when it renders.
+    popup_scroll: usize,
+    mouse: mouse::MouseState,
+    /// Index of the service on the services list's first row in the last frame.
+    first_service: usize,
+    /// When a Ctrl-C last had the footer say how to quit, while it says so.
+    quit_hint_at: Option<std::time::Instant>,
+    /// Where the last frame drew what the mouse can act on.
+    hits: mouse::Hits,
+    /// Terminal work queued for the event loop.
+    effects: Vec<Effect>,
     pty_input_mode: bool,
     focus: Focus,
     terminal_cols: u16,
@@ -129,7 +183,7 @@ impl App {
         source: SessionSource,
         input: Option<TerminalControl>,
         shutdown: micromux::CancellationToken,
-        log_view_options: LogViewOptions,
+        view_options: ViewOptions,
     ) -> Self {
         let changes = source.subscribe();
         let summary_changes = source.summary_changes();
@@ -164,11 +218,16 @@ impl App {
             log_view,
             healthcheck_view,
             show_healthcheck_pane: false,
-            pretty_json_logs: log_view_options.pretty_json,
+            pretty_json_logs: view_options.pretty_json,
             level_picker: None,
             show_help: false,
             info: None,
-            info_scroll: 0,
+            popup_scroll: 0,
+            mouse: mouse::MouseState::new(view_options.mouse),
+            first_service: 0,
+            quit_hint_at: None,
+            hits: mouse::Hits::default(),
+            effects: Vec::new(),
             pty_input_mode: false,
             focus: Focus::Services,
             terminal_cols: 80,
@@ -180,57 +239,12 @@ impl App {
 }
 
 impl App {
+    /// The size of the logs pane's text, which the service PTYs match.
     fn desired_pty_size(&self) -> (u16, u16) {
-        use ratatui::layout::{Constraint, Direction, Layout, Rect};
-
-        let area = Rect {
-            x: 0,
-            y: 0,
-            width: self.terminal_cols,
-            height: self.terminal_rows,
-        };
-
-        let chrome = self.chrome_rows(self.terminal_cols);
-        let [_header_area, main_area, _footer_area] = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                // Must match the vertical layout the renderer draws.
-                Constraint::Length(chrome.header),
-                Constraint::Min(0),
-                Constraint::Length(chrome.footer),
-            ])
-            .spacing(0)
-            .areas(area);
-
-        let [_services_area, main_right_area] = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Length(self.state.services_sidebar_width),
-                Constraint::Min(0),
-            ])
-            .spacing(0)
-            .areas(main_area);
-
-        let logs_area = if self.show_healthcheck_pane {
-            let [a, _b] = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-                .spacing(0)
-                .areas::<2>(main_right_area);
-            a
-        } else {
-            main_right_area
-        };
-
-        let [logs_pane_area, _scrollbar_area] = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Min(0), Constraint::Length(1)])
-            .spacing(0)
-            .areas(logs_area);
-
-        let cols = logs_pane_area.width.saturating_sub(2).max(1);
-        let rows = logs_pane_area.height.saturating_sub(2).max(1);
-        (cols, rows)
+        let area = ratatui::layout::Rect::new(0, 0, self.terminal_cols, self.terminal_rows);
+        let layout = self.screen_layout(area, self.chrome_rows(self.terminal_cols));
+        let text = render::log_view::text_area(layout.logs);
+        (text.width.max(1), text.height.max(1))
     }
 
     fn maybe_resize_pty(&mut self) {
@@ -413,10 +427,15 @@ impl App {
             Change(SessionChange),
             /// The change broadcast lagged (or this is the initial draw): re-read everything.
             Resync,
-            PendingInput,
+            /// Queued PTY input is due for another try, or the quit prompt for one.
+            Timer,
             /// The session's URLs or routing status changed; only the header needs a redraw.
             Summary,
+            /// The process continued after a stop, and the shell may have taken the terminal.
+            Continued,
         }
+
+        let mut continued = terminal::Continued::watch();
 
         let area = terminal.size()?;
         self.terminal_cols = area.width;
@@ -431,7 +450,7 @@ impl App {
         let mut last_frame = tokio::time::Instant::now();
 
         while self.is_running() {
-            let retry_pending_input = !self.pending_pty_input.is_empty();
+            let timer = self.next_timer();
             let wake = tokio::select! {
                 () = self.shutdown.cancelled() => None,
                 input = self.input_event_handler.next() => {
@@ -443,12 +462,11 @@ impl App {
                     Err(broadcast::error::RecvError::Closed) => None,
                 },
                 () = async {
-                    if retry_pending_input {
-                        tokio::time::sleep(PENDING_PTY_INPUT_RETRY).await;
-                    } else {
-                        std::future::pending::<()>().await;
+                    match timer {
+                        Some(at) => tokio::time::sleep_until(at.into()).await,
+                        None => std::future::pending::<()>().await,
                     }
-                } => Some(Wake::PendingInput),
+                } => Some(Wake::Timer),
                 () = async {
                     let changed = match self.summary_changes.as_mut() {
                         Some(summary) => summary.changed().await.is_ok(),
@@ -458,6 +476,7 @@ impl App {
                         std::future::pending::<()>().await;
                     }
                 } => Some(Wake::Summary),
+                () = continued.recv() => Some(Wake::Continued),
             };
 
             let mut needs_resync = false;
@@ -465,8 +484,9 @@ impl App {
                 Some(Wake::Input(event)) => self.handle_input_event(event),
                 Some(Wake::Change(change)) => needs_resync |= self.apply_change(&change),
                 Some(Wake::Resync) => needs_resync = true,
-                Some(Wake::PendingInput) => self.flush_pending_pty_input(),
+                Some(Wake::Timer) => self.on_timer(std::time::Instant::now()),
                 Some(Wake::Summary) => {}
+                Some(Wake::Continued) => self.take_terminal_again(&mut terminal)?,
                 None => {
                     self.running = false;
                     continue;
@@ -488,6 +508,12 @@ impl App {
                     ) => break,
                 }
             }
+            #[cfg(unix)]
+            if self.apply_effects(&mut terminal)? {
+                self.suspend(&mut terminal, &mut continued).await?;
+            }
+            #[cfg(not(unix))]
+            self.apply_effects(&mut terminal)?;
             if needs_resync {
                 self.resync();
             }
@@ -501,6 +527,103 @@ impl App {
             terminal.draw(|frame| frame.render_widget(&mut self, frame.area()))?;
             last_frame = tokio::time::Instant::now();
         }
+        Ok(())
+    }
+
+    /// When the event loop must wake by itself: to retry queued PTY input, or to take back the
+    /// quit hint.
+    fn next_timer(&self) -> Option<std::time::Instant> {
+        let retry = (!self.pending_pty_input.is_empty())
+            .then(|| std::time::Instant::now() + PENDING_PTY_INPUT_RETRY);
+        let hint = self.quit_hint_at.map(|at| at + QUIT_HINT_DURATION);
+        retry.into_iter().chain(hint).min()
+    }
+
+    /// Does what is due `now`: retries queued PTY input and takes back an expired quit hint.
+    fn on_timer(&mut self, now: std::time::Instant) {
+        if !self.pending_pty_input.is_empty() {
+            self.flush_pending_pty_input();
+        }
+        if self
+            .quit_hint_at
+            .is_some_and(|at| now.saturating_duration_since(at) >= QUIT_HINT_DURATION)
+        {
+            self.quit_hint_at = None;
+        }
+    }
+
+    /// Ctrl-C pressed `now`, which never quits: only `q` does, so a stray Ctrl-C, as from a copy
+    /// shortcut a terminal sends as Ctrl-C, cannot stop the session. It closes any popup, where
+    /// `q` means something else, and the footer says for a moment that `q` quits.
+    fn ctrl_c(&mut self, now: std::time::Instant) {
+        self.show_help = false;
+        self.info = None;
+        self.level_picker = None;
+        self.quit_hint_at = Some(now);
+    }
+
+    /// Does the terminal work that input queued, and returns whether a suspend was asked for,
+    /// which the caller does last.
+    fn apply_effects(&mut self, terminal: &mut DefaultTerminal) -> Result<bool, Error> {
+        use crossterm::clipboard::CopyToClipboard;
+
+        let mut suspend = false;
+        for effect in std::mem::take(&mut self.effects) {
+            match effect {
+                Effect::MouseCapture(enabled) => terminal::set_mouse_capture(enabled)?,
+                // Both the clipboard and Linux's primary selection, pasted with the middle button.
+                Effect::Copy(text) => {
+                    crossterm::execute!(
+                        terminal.backend_mut(),
+                        CopyToClipboard::to_clipboard_from(text.as_bytes()),
+                        CopyToClipboard::to_primary_from(text.as_bytes())
+                    )?;
+                    clipboard::copy_locally(text);
+                }
+                Effect::OpenUrl(url) => {
+                    if let Err(err) = open_url(&url) {
+                        tracing::warn!(?err, url, "cannot open the URL in a browser");
+                        self.mouse.notice = Some(format!("cannot open a browser: {err}"));
+                    }
+                }
+                Effect::Suspend => suspend = true,
+            }
+        }
+        Ok(suspend)
+    }
+
+    /// Suspends to the shell as Ctrl-Z does there, then takes the terminal again once the shell
+    /// continues micromux.
+    #[cfg(unix)]
+    async fn suspend(
+        &mut self,
+        terminal: &mut DefaultTerminal,
+        continued: &mut terminal::Continued,
+    ) -> Result<(), Error> {
+        /// How long to wait for the stop to land before taking the terminal back regardless, as
+        /// when nothing could ever continue the process and the system ignores the stop.
+        const STOP_LANDS_WITHIN: Duration = Duration::from_millis(100);
+
+        terminal::stop_process_group()?;
+        // The stop can reach another thread after the signal is sent, so wait for the process to
+        // be continued rather than take the terminal while it is about to stop.
+        let _ = tokio::time::timeout(STOP_LANDS_WITHIN, continued.recv()).await;
+        self.take_terminal_again(terminal)
+    }
+
+    /// Takes the terminal over again after the process continued from a stop, and has the next
+    /// frame draw every cell at the terminal's current size.
+    fn take_terminal_again(&mut self, terminal: &mut DefaultTerminal) -> Result<(), Error> {
+        use crossterm::terminal::{Clear, ClearType};
+
+        terminal::take_over(self.mouse.capture)?;
+        // A new terminal forgets what was drawn; ratatui's own `clear` would ask the terminal
+        // where its cursor is, an answer the input reader takes first.
+        *terminal =
+            ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(std::io::stdout()))?;
+        crossterm::execute!(terminal.backend_mut(), Clear(ClearType::All))?;
+        let size = terminal.size()?;
+        self.handle_crossterm_event(&crossterm::event::Event::Resize(size.width, size.height));
         Ok(())
     }
 
@@ -603,6 +726,7 @@ impl App {
     fn handle_input_event(&mut self, input_event: event::Input) {
         match input_event {
             event::Input::Event(event) => self.handle_crossterm_event(&event),
+            event::Input::Mouse { event, at } => self.handle_mouse(event, at),
             event::Input::Closed => {
                 if !self.terminal_input_closed {
                     tracing::warn!("terminal input closed; supervision will continue");
@@ -613,8 +737,26 @@ impl App {
     }
 
     fn handle_crossterm_event(&mut self, event: &crossterm::event::Event) {
-        use crossterm::event::KeyEventKind;
+        use crossterm::event::{KeyCode, KeyEventKind};
 
+        if let crossterm::event::Event::Key(key) = *event
+            && terminal::debug_keys()
+        {
+            // What is typed into a service, a password among it, stays out of the log.
+            let code = match key.code {
+                KeyCode::Char(_) if self.pty_input_mode => "Char(…)".to_string(),
+                code => format!("{code:?}"),
+            };
+            tracing::warn!(
+                target: "micromux::keys",
+                code,
+                modifiers = ?key.modifiers,
+                kind = ?key.kind,
+                state = ?key.state,
+                pty_input_mode = self.pty_input_mode,
+                "key"
+            );
+        }
         match *event {
             crossterm::event::Event::Resize(cols, rows) => {
                 self.terminal_cols = cols;
@@ -623,7 +765,11 @@ impl App {
                 self.maybe_resize_pty();
             }
             crossterm::event::Event::Key(key) if key.kind == KeyEventKind::Press => {
+                self.mouse.notice = None;
                 self.handle_key_press(key);
+            }
+            crossterm::event::Event::Mouse(mouse) => {
+                self.handle_mouse(mouse, std::time::Instant::now());
             }
             crossterm::event::Event::Paste(ref text) if self.pty_input_mode => {
                 if let Some(service) = self.state.current_service() {
@@ -638,48 +784,31 @@ impl App {
     fn handle_key_press(&mut self, key: crossterm::event::KeyEvent) {
         use crossterm::event::{KeyCode, KeyModifiers};
 
-        // PTY mode forwards Ctrl-C to the selected process; command mode reserves the same chord
-        // for leaving the TUI.
+        // PTY mode forwards every key to the selected process, Ctrl-C and the copy chords
+        // included; command mode reserves Ctrl-C for leaving the TUI.
         if self.pty_input_mode {
             self.handle_key_press_pty_input_mode(key);
             return;
         }
 
         if key.code == KeyCode::Char('c') && key.modifiers == KeyModifiers::CONTROL {
-            self.exit();
+            self.ctrl_c(std::time::Instant::now());
+            return;
+        }
+        if is_copy_chord(key) {
+            self.copy_selection();
+            return;
+        }
+        // Only Unix shells can suspend a job.
+        if cfg!(unix) && key.code == KeyCode::Char('z') && key.modifiers == KeyModifiers::CONTROL {
+            self.effects.push(Effect::Suspend);
             return;
         }
         if key.modifiers != KeyModifiers::NONE && key.modifiers != KeyModifiers::SHIFT {
             return;
         }
-        if self.show_help {
-            // The overlay swallows every other key, so a stray press cannot act behind it.
-            if matches!(key.code, KeyCode::Esc | KeyCode::Char('?')) {
-                self.show_help = false;
-            }
-            return;
-        }
-        if let Some(view) = self.info {
-            // Like help, the popup swallows every other key: its own key or Esc closes it, the
-            // other popup's key switches, and the movement keys scroll it.
-            const PAGE: usize = 10;
-            match key.code {
-                KeyCode::Esc => self.info = None,
-                KeyCode::Char('i') => self.toggle_info(view, InfoView::Service),
-                KeyCode::Char('u') => self.toggle_info(view, InfoView::Session),
-                KeyCode::Char('k') | KeyCode::Up => {
-                    self.info_scroll = self.info_scroll.saturating_sub(1);
-                }
-                KeyCode::Char('j') | KeyCode::Down => {
-                    self.info_scroll = self.info_scroll.saturating_add(1);
-                }
-                KeyCode::PageUp => self.info_scroll = self.info_scroll.saturating_sub(PAGE),
-                KeyCode::PageDown => self.info_scroll = self.info_scroll.saturating_add(PAGE),
-                KeyCode::Char('g') => self.info_scroll = 0,
-                // Rendering clamps it to the last page.
-                KeyCode::Char('G') => self.info_scroll = usize::MAX,
-                _ => {}
-            }
+        if self.show_help || self.info.is_some() {
+            self.handle_key_press_popup(key.code);
             return;
         }
         if self.level_picker.is_some() {
@@ -691,8 +820,16 @@ impl App {
             // Quit
             KeyCode::Char('q') if key.modifiers == KeyModifiers::NONE => self.exit(),
 
+            // Drop or copy the mouse selection
+            KeyCode::Esc => self.mouse.selection = None,
+            KeyCode::Char('y') => self.copy_selection(),
+            KeyCode::Enter if self.has_selection() => self.copy_selection(),
+
             // Toggle focus
             KeyCode::Tab => self.toggle_focus(),
+
+            // Toggle mouse capture
+            KeyCode::Char('m') => self.toggle_mouse_capture(),
 
             // Toggle PTY input mode
             KeyCode::Char('a') if self.input.is_some() => {
@@ -737,7 +874,10 @@ impl App {
             // Toggle automatic tailing for log viewer
             KeyCode::Char('t') => self.toggle_tail(),
 
-            KeyCode::Char('?') => self.show_help = true,
+            KeyCode::Char('?') => {
+                self.show_help = true;
+                self.popup_scroll = 0;
+            }
             // Without a selected service there is nothing to describe.
             KeyCode::Char('i') if self.state.current_service().is_some() => {
                 self.open_info(InfoView::Service);
@@ -760,9 +900,40 @@ impl App {
         }
     }
 
+    /// Keys while the help or a details popup shows, which swallow every other key so a stray
+    /// press cannot act behind them: the popup's own key or Esc closes it, the other details
+    /// popup's key switches to it, and the movement keys scroll it.
+    fn handle_key_press_popup(&mut self, code: crossterm::event::KeyCode) {
+        use crossterm::event::KeyCode;
+
+        const PAGE: usize = 10;
+        match (code, self.info) {
+            (KeyCode::Esc, _) => {
+                self.show_help = false;
+                self.info = None;
+            }
+            (KeyCode::Char('?'), None) => self.show_help = false,
+            (KeyCode::Char('y') | KeyCode::Enter, _) => self.copy_selection(),
+            (KeyCode::Char('i'), Some(view)) => self.toggle_info(view, InfoView::Service),
+            (KeyCode::Char('u'), Some(view)) => self.toggle_info(view, InfoView::Session),
+            (KeyCode::Char('k') | KeyCode::Up, _) => {
+                self.popup_scroll = self.popup_scroll.saturating_sub(1);
+            }
+            (KeyCode::Char('j') | KeyCode::Down, _) => {
+                self.popup_scroll = self.popup_scroll.saturating_add(1);
+            }
+            (KeyCode::PageUp, _) => self.popup_scroll = self.popup_scroll.saturating_sub(PAGE),
+            (KeyCode::PageDown, _) => self.popup_scroll = self.popup_scroll.saturating_add(PAGE),
+            (KeyCode::Char('g'), _) => self.popup_scroll = 0,
+            // Rendering clamps it to the last page.
+            (KeyCode::Char('G'), _) => self.popup_scroll = usize::MAX,
+            _ => {}
+        }
+    }
+
     fn open_info(&mut self, view: InfoView) {
         self.info = Some(view);
-        self.info_scroll = 0;
+        self.popup_scroll = 0;
     }
 
     /// Closes `target` when it is the popup on screen, and opens it otherwise.
@@ -916,51 +1087,42 @@ impl App {
     }
 
     fn scroll_logs_up(&mut self, lines: u16) {
-        self.log_view.follow_tail = false;
-        self.log_view.scroll_offset = self
-            .log_view
-            .scroll_offset
-            .saturating_sub(usize::from(lines));
+        self.scroll_logs(-isize::from(lines.cast_signed()));
     }
 
     fn scroll_logs_down(&mut self, lines: u16) {
-        self.log_view.follow_tail = false;
+        self.scroll_logs(isize::from(lines.cast_signed()));
+    }
+
+    /// Scrolls the logs by `rows`, up when negative, as [`render::log_view::LogView::scroll_by`]
+    /// does.
+    fn scroll_logs(&mut self, rows: isize) {
         let Some(service) = self.state.current_service() else {
             return;
         };
         // Wrap-aware count persisted by the renderer, so scrolling reaches the true bottom
         // even when wrapping is enabled (the raw entry count would stop short).
-        let num_lines = service.cached_line_index.total_lines();
+        let total = service.cached_line_index.total_lines();
         let viewport = usize::from(self.log_viewport_height());
-        let max_off = num_lines.saturating_sub(viewport);
-        self.log_view.scroll_offset = self
-            .log_view
-            .scroll_offset
-            .saturating_add(usize::from(lines))
-            .min(max_off);
+        self.log_view.scroll_by(rows, total, viewport);
     }
 
     fn scroll_healthchecks_up(&mut self, lines: u16) {
-        self.healthcheck_view.follow_tail = false;
-        self.healthcheck_view.scroll_offset = self
-            .healthcheck_view
-            .scroll_offset
-            .saturating_sub(usize::from(lines));
+        self.scroll_healthchecks(-isize::from(lines.cast_signed()));
     }
 
     fn scroll_healthchecks_down(&mut self, lines: u16) {
-        self.healthcheck_view.follow_tail = false;
+        self.scroll_healthchecks(isize::from(lines.cast_signed()));
+    }
+
+    /// Scrolls the healthcheck pane by `rows`, up when negative.
+    fn scroll_healthchecks(&mut self, rows: isize) {
         let Some(service) = self.state.current_service() else {
             return;
         };
-        let num_lines = service.healthcheck_cached_line_index.total_lines();
+        let total = service.healthcheck_cached_line_index.total_lines();
         let viewport = usize::from(self.log_viewport_height());
-        let max_off = num_lines.saturating_sub(viewport);
-        self.healthcheck_view.scroll_offset = self
-            .healthcheck_view
-            .scroll_offset
-            .saturating_add(usize::from(lines))
-            .min(max_off);
+        self.healthcheck_view.scroll_by(rows, total, viewport);
     }
 
     fn is_running(&self) -> bool {
@@ -1016,65 +1178,175 @@ impl App {
     }
 }
 
+/// Gives the terminal back if the TUI holds it, for an exit that skips the TUI's own teardown,
+/// such as a second interrupt.
+///
+/// It releases mouse capture, leaves the alternate screen and turns raw mode off, each only if
+/// it is on, so calling it again or without a TUI does nothing.
+pub fn release_terminal() {
+    // An exit path has nowhere better to report a failure to restore the terminal.
+    terminal::give_back().ok();
+}
+
+/// Opens `url` in the browser with the platform's opener, without waiting for it, unless the TUI
+/// runs over ssh, where the browser would open on the remote host, if anywhere.
+///
+/// The opener's output is discarded, since anything it prints would land on the TUI.
+fn open_url(url: &str) -> std::io::Result<()> {
+    use std::process::{Command, Stdio};
+
+    if clipboard::over_ssh() {
+        return Err(std::io::Error::other("micromux runs over ssh"));
+    }
+
+    let opener = if cfg!(target_os = "macos") {
+        "open"
+    } else if cfg!(windows) {
+        "explorer"
+    } else {
+        "xdg-open"
+    };
+    let mut command = Command::new(opener);
+    command
+        .arg(url)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    clipboard::detach(&mut command);
+    let mut child = command.spawn()?;
+    // Reap the opener once it exits, so it does not linger as a zombie.
+    std::thread::spawn(move || child.wait());
+    Ok(())
+}
+
+/// Whether `key` is one of the terminals' standard copy shortcuts: Ctrl+Shift+C or Ctrl+Insert,
+/// as on Linux and Windows, or Super+C, as Cmd+C on macOS.
+///
+/// Ctrl+Shift+C and Super+C only arrive through the kitty keyboard protocol; elsewhere the first
+/// is sent as Ctrl-C, which never copies, and the second not at all.
+fn is_copy_chord(key: crossterm::event::KeyEvent) -> bool {
+    use crossterm::event::{KeyCode, KeyModifiers};
+
+    // A terminal that reports the shifted key sends it without Shift.
+    let (code, modifiers) = match key.code {
+        KeyCode::Char(c) if c.is_ascii_uppercase() => (
+            KeyCode::Char(c.to_ascii_lowercase()),
+            key.modifiers | KeyModifiers::SHIFT,
+        ),
+        code => (code, key.modifiers),
+    };
+    matches!(
+        (code, modifiers),
+        (KeyCode::Char('c'), m) if m == KeyModifiers::CONTROL | KeyModifiers::SHIFT
+            || m == KeyModifiers::SUPER
+    ) || (code == KeyCode::Insert && modifiers == KeyModifiers::CONTROL)
+}
+
+/// The bytes a terminal without the kitty keyboard protocol sends for `code` with `modifiers`,
+/// as xterm does, which is what a service in PTY input mode expects to read.
+///
+/// micromux may have asked its own terminal for the kitty protocol, or tmux for modifyOtherKeys,
+/// which report keys such as Ctrl+Shift+C or Ctrl+I apart that legacy terminals send alike; this
+/// folds them back into the legacy bytes. Super and the other modifiers legacy terminals cannot send are left out.
 fn key_event_to_bytes(
     code: crossterm::event::KeyCode,
     modifiers: crossterm::event::KeyModifiers,
 ) -> Option<Vec<u8>> {
-    use crossterm::event::KeyCode;
+    use crossterm::event::{KeyCode, KeyModifiers};
 
-    if modifiers.contains(crossterm::event::KeyModifiers::ALT)
-        && !modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
-        && !matches!(code, KeyCode::Esc)
-    {
-        let base_modifiers = modifiers - crossterm::event::KeyModifiers::ALT;
-        if let Some(mut bytes) = key_event_to_bytes(code, base_modifiers) {
-            let mut out = Vec::with_capacity(1 + bytes.len());
-            out.push(0x1b);
-            out.append(&mut bytes);
-            return Some(out);
+    let shift = modifiers.contains(KeyModifiers::SHIFT);
+    let alt = modifiers.contains(KeyModifiers::ALT);
+    let ctrl = modifiers.contains(KeyModifiers::CONTROL);
+    // xterm's modifier parameter for cursor, editing and function keys.
+    let parameter = 1 + u8::from(shift) + 2 * u8::from(alt) + 4 * u8::from(ctrl);
+    let cursor = |end: char| {
+        if parameter == 1 {
+            format!("\x1b[{end}")
+        } else {
+            format!("\x1b[1;{parameter}{end}")
         }
-    }
-
-    if modifiers.contains(crossterm::event::KeyModifiers::CONTROL) {
-        match code {
-            KeyCode::Char(c) => {
-                let c = c.to_ascii_lowercase();
-                if c.is_ascii_lowercase() {
-                    return Some(vec![(c as u8) - b'a' + 1]);
-                }
-                match c {
-                    '@' => return Some(vec![0x00]),
-                    '[' => return Some(vec![0x1b]),
-                    '\\' => return Some(vec![0x1c]),
-                    ']' => return Some(vec![0x1d]),
-                    '^' => return Some(vec![0x1e]),
-                    '_' => return Some(vec![0x1f]),
-                    _ => {}
-                }
-            }
-            KeyCode::Enter => return Some(vec![b'\n']),
-            _ => {}
+        .into_bytes()
+    };
+    let tilde = |number: u8| {
+        if parameter == 1 {
+            format!("\x1b[{number}~")
+        } else {
+            format!("\x1b[{number};{parameter}~")
         }
-    }
-
-    match code {
-        KeyCode::Esc => Some(vec![0x1b]),
-        KeyCode::Enter => Some(vec![b'\r']),
-        KeyCode::Tab => Some(vec![b'\t']),
-        KeyCode::BackTab => Some(b"\x1b[Z".to_vec()),
-        KeyCode::Backspace => Some(vec![0x7f]),
-        KeyCode::Char(c) => Some(c.to_string().into_bytes()),
-        KeyCode::Up => Some(b"\x1b[A".to_vec()),
-        KeyCode::Down => Some(b"\x1b[B".to_vec()),
-        KeyCode::Right => Some(b"\x1b[C".to_vec()),
-        KeyCode::Left => Some(b"\x1b[D".to_vec()),
-        KeyCode::Home => Some(b"\x1b[H".to_vec()),
-        KeyCode::End => Some(b"\x1b[F".to_vec()),
-        KeyCode::PageUp => Some(b"\x1b[5~".to_vec()),
-        KeyCode::PageDown => Some(b"\x1b[6~".to_vec()),
-        KeyCode::Delete => Some(b"\x1b[3~".to_vec()),
+        .into_bytes()
+    };
+    // These carry their modifiers in the parameter rather than an Escape prefix.
+    let special = match code {
+        KeyCode::Up => Some(cursor('A')),
+        KeyCode::Down => Some(cursor('B')),
+        KeyCode::Right => Some(cursor('C')),
+        KeyCode::Left => Some(cursor('D')),
+        KeyCode::Home => Some(cursor('H')),
+        KeyCode::End => Some(cursor('F')),
+        KeyCode::Insert => Some(tilde(2)),
+        KeyCode::Delete => Some(tilde(3)),
+        KeyCode::PageUp => Some(tilde(5)),
+        KeyCode::PageDown => Some(tilde(6)),
+        KeyCode::F(number @ 1..=4) => {
+            let end = char::from(b'P' + number - 1);
+            Some(if parameter == 1 {
+                format!("\x1bO{end}").into_bytes()
+            } else {
+                cursor(end)
+            })
+        }
+        KeyCode::F(number @ 5..=12) => {
+            const CODES: [u8; 8] = [15, 17, 18, 19, 20, 21, 23, 24];
+            CODES
+                .get(usize::from(number - 5))
+                .map(|&number| tilde(number))
+        }
         _ => None,
+    };
+    if special.is_some() {
+        return special;
     }
+
+    let mut bytes = match code {
+        KeyCode::Esc => vec![0x1b],
+        KeyCode::Enter => vec![b'\r'],
+        KeyCode::Tab => vec![b'\t'],
+        KeyCode::BackTab => b"\x1b[Z".to_vec(),
+        KeyCode::Backspace if ctrl => vec![0x08],
+        KeyCode::Backspace => vec![0x7f],
+        // xterm sends the key itself where Ctrl has no control character for it.
+        KeyCode::Char(c) if ctrl => {
+            control_byte(c).map_or_else(|| c.to_string().into_bytes(), |byte| vec![byte])
+        }
+        // The kitty protocol reports Alt+Shift+A as a lowercase `a` with Shift.
+        KeyCode::Char(c) if shift && c.is_ascii_lowercase() => {
+            c.to_ascii_uppercase().to_string().into_bytes()
+        }
+        KeyCode::Char(c) => c.to_string().into_bytes(),
+        _ => return None,
+    };
+    if alt {
+        bytes.insert(0, 0x1b);
+    }
+    Some(bytes)
+}
+
+/// The control character xterm sends for Ctrl with `c`, if it has one.
+fn control_byte(c: char) -> Option<u8> {
+    let c = c.to_ascii_lowercase();
+    if c.is_ascii_lowercase() {
+        return u8::try_from(c).ok().map(|c| c - b'a' + 1);
+    }
+    Some(match c {
+        ' ' | '@' | '2' => 0x00,
+        '[' | '3' => 0x1b,
+        '\\' | '4' => 0x1c,
+        ']' | '5' => 0x1d,
+        '^' | '~' | '6' => 0x1e,
+        '_' | '/' | '7' => 0x1f,
+        '?' | '8' => 0x7f,
+        _ => return None,
+    })
 }
 
 #[cfg(test)]
@@ -1168,7 +1440,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn command_mode_quit_requires_plain_q_or_ctrl_c() -> eyre::Result<()> {
+    async fn only_plain_q_quits_in_command_mode() -> eyre::Result<()> {
         let mut diagnostics = Vec::new();
         let parsed = micromux::from_str(
             "version: 1\nservices: {}\n",
@@ -1185,7 +1457,7 @@ mod tests {
             SessionSource::Local(LocalSource::new(handles.reader, handles.commands.clone())),
             Some(handles.terminal.clone()),
             shutdown.clone(),
-            LogViewOptions::default(),
+            ViewOptions::default(),
         );
         let key = |code, modifiers| KeyEvent {
             code,
@@ -1201,9 +1473,84 @@ mod tests {
         app.handle_key_press(key(KeyCode::Char('H'), KeyModifiers::SHIFT));
         assert!(app.show_healthcheck_pane);
 
-        app.handle_key_press(key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        // Ctrl-C never quits, however often it comes; plain `q` does.
+        for _ in 0..3 {
+            app.handle_key_press(key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        }
+        assert!(app.running);
+        assert!(!shutdown.is_cancelled());
+        app.handle_key_press(key(KeyCode::Char('q'), KeyModifiers::NONE));
         assert!(!app.running);
         assert!(shutdown.is_cancelled());
+        Ok(())
+    }
+
+    /// Ctrl-C never stops the session: the footer only says for a moment that `q` quits.
+    #[tokio::test]
+    async fn ctrl_c_only_says_that_q_quits() -> eyre::Result<()> {
+        let mut diagnostics = Vec::new();
+        let parsed = micromux::from_str(
+            "version: 1\nservices:\n  svc:\n    command: [\"sleep\", \"30\"]\n",
+            Path::new("."),
+            0usize,
+            None,
+            &mut diagnostics,
+        )?;
+        let cache = tempfile::tempdir()?;
+        let mux = std::sync::Arc::new(test_micromux(&parsed, &cache)?);
+        let shutdown = micromux::CancellationToken::new();
+        let (_runner, handles) = mux.start(shutdown.clone());
+        let mut app = App::new(
+            SessionSource::Local(LocalSource::new(handles.reader, handles.commands.clone())),
+            Some(handles.terminal.clone()),
+            shutdown.clone(),
+            ViewOptions::default(),
+        );
+        let now = std::time::Instant::now();
+        // Narrow enough that the hint may have no free room in the footer and cover its last
+        // row. Every hint that takes clicks there still shows.
+        let footer = |app: &mut App| {
+            let area = ratatui::layout::Rect::new(0, 0, 40, 20);
+            let mut buffer = ratatui::buffer::Buffer::empty(area);
+            ratatui::widgets::Widget::render(&mut *app, area, &mut buffer);
+            let row = (0..40)
+                .filter_map(|x| buffer.cell((x, 19)).map(ratatui::buffer::Cell::symbol))
+                .collect::<Vec<_>>();
+            for hit in app.hits.hints.iter().filter(|hit| hit.area.y == 19) {
+                let shown = row
+                    .get(usize::from(hit.area.x)..)
+                    .unwrap_or_default()
+                    .concat();
+                assert!(shown.starts_with(hit.keys), "{} under {shown:?}", hit.keys);
+            }
+            row.concat()
+        };
+
+        // A press says how to quit, without stopping anything, and closes a popup, where `q`
+        // would not quit.
+        app.show_help = true;
+        app.ctrl_c(now);
+        assert!(app.running);
+        assert!(!app.show_help);
+        assert!(footer(&mut app).contains("press q to quit"));
+        app.handle_key_press(KeyEvent {
+            code: KeyCode::Char('L'),
+            modifiers: KeyModifiers::SHIFT,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        });
+        assert!(app.level_picker.is_some());
+        app.ctrl_c(now);
+        assert!(app.level_picker.is_none());
+
+        // Once its moment passes, the hint goes; however often Ctrl-C comes, nothing stops.
+        app.on_timer(now + QUIT_HINT_DURATION);
+        assert!(!footer(&mut app).contains("press q"));
+        for later in [3, 3, 4] {
+            app.ctrl_c(now + Duration::from_secs(later));
+        }
+        assert!(app.running);
+        assert!(!shutdown.is_cancelled());
         Ok(())
     }
 
@@ -1234,7 +1581,7 @@ mod tests {
             SessionSource::Local(LocalSource::new(handles.reader, handles.commands.clone())),
             Some(handles.terminal),
             shutdown.clone(),
-            LogViewOptions::default(),
+            ViewOptions::default(),
         );
         let press = |app: &mut App, code| {
             app.handle_key_press(KeyEvent {
@@ -1338,7 +1685,7 @@ mod tests {
             SessionSource::Local(LocalSource::new(handles.reader, handles.commands.clone())),
             Some(handles.terminal),
             micromux::CancellationToken::new(),
-            LogViewOptions::default(),
+            ViewOptions::default(),
         );
 
         // A wide terminal fits the status and the view controls on one header row and every action
@@ -1398,7 +1745,7 @@ mod tests {
             SessionSource::Local(LocalSource::new(handles.reader, handles.commands.clone())),
             Some(handles.terminal),
             micromux::CancellationToken::new(),
-            LogViewOptions::default(),
+            ViewOptions::default(),
         );
         let area = ratatui::layout::Rect::new(0, 0, 200, 24);
         let mut buffer = ratatui::buffer::Buffer::empty(area);
@@ -1441,7 +1788,7 @@ mod tests {
             SessionSource::Local(LocalSource::new(handles.reader, handles.commands.clone())),
             Some(handles.terminal),
             micromux::CancellationToken::new(),
-            LogViewOptions::default(),
+            ViewOptions::default(),
         );
         let area = ratatui::layout::Rect::new(0, 0, 200, 24);
         let mut buffer = ratatui::buffer::Buffer::empty(area);
@@ -1490,7 +1837,7 @@ mod tests {
             ),
             Some(handles.terminal),
             micromux::CancellationToken::new(),
-            LogViewOptions::default(),
+            ViewOptions::default(),
         );
         Ok((app, handles.session, ports))
     }
@@ -1590,6 +1937,83 @@ mod tests {
         assert!(
             rows[1].contains("routing unavailable: the proxy stopped answering"),
             "{rows:#?}"
+        );
+        Ok(())
+    }
+
+    /// A click on a URL in the Logs title opens that URL, since mouse capture keeps the
+    /// terminal from opening it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn clicking_a_url_in_the_logs_title_opens_it() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let yaml = indoc! {r#"
+            version: 1
+            session: { name: tui }
+            proxy: { port: 8080 }
+            routes:
+              - host: app
+                port: 9997
+              - host: app
+                path: /api/
+                port: 9998
+            services:
+              web:
+                command: ["sleep", "30"]
+                ports: [9997, 9998]
+        "#};
+        let (mut app, _session, _) = routed_app(directory.path(), yaml)?;
+        let screen = screen_text(&mut app, 200, 24);
+        let (y, row) = screen
+            .lines()
+            .enumerate()
+            .find(|(_, row)| row.contains("┌Logs"))
+            .ok_or_else(|| eyre::eyre!("no Logs title:\n{screen}"))?;
+        let column = |needle: &str| -> eyre::Result<u16> {
+            let byte = row
+                .find(needle)
+                .ok_or_else(|| eyre::eyre!("{needle} is not in {row}"))?;
+            Ok(u16::try_from(
+                row.get(..byte).unwrap_or_default().chars().count(),
+            )?)
+        };
+        let y = u16::try_from(y)?;
+        let click = |app: &mut App, x: u16| {
+            for kind in [
+                crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+            ] {
+                app.handle_mouse(
+                    crossterm::event::MouseEvent {
+                        kind,
+                        column: x,
+                        row: y,
+                        modifiers: KeyModifiers::NONE,
+                    },
+                    std::time::Instant::now(),
+                );
+            }
+        };
+
+        // Both ends of the second URL open it, path included, and the separator between the URLs
+        // opens nothing.
+        let api = "http://app.tui.localhost:8080/api/";
+        let start = column(api)?;
+        let width = u16::try_from(api.len())?;
+        click(&mut app, start);
+        click(&mut app, start + width - 1);
+        click(&mut app, start - 2);
+        assert_eq!(
+            std::mem::take(&mut app.effects),
+            vec![
+                Effect::OpenUrl(api.to_string()),
+                Effect::OpenUrl(api.to_string())
+            ]
+        );
+        click(&mut app, column("http://app.tui.localhost:8080")?);
+        assert_eq!(
+            app.effects,
+            vec![Effect::OpenUrl("http://app.tui.localhost:8080".to_string())]
         );
         Ok(())
     }
@@ -1738,7 +2162,7 @@ mod tests {
             SessionSource::Local(LocalSource::new(handles.reader, handles.commands.clone())),
             Some(handles.terminal),
             shutdown.clone(),
-            LogViewOptions::default(),
+            ViewOptions::default(),
         );
 
         // With no service to describe, `i` opens nothing that would swallow later keys.
@@ -1790,7 +2214,7 @@ mod tests {
             SessionSource::Local(LocalSource::new(handles.reader, handles.commands.clone())),
             Some(handles.terminal.clone()),
             micromux::CancellationToken::new(),
-            LogViewOptions::default(),
+            ViewOptions::default(),
         );
         app.show_healthcheck_pane = true;
         let area = ratatui::layout::Rect::new(0, 0, 120, 30);
@@ -1822,56 +2246,140 @@ mod tests {
         Ok(())
     }
 
+    /// Keys reach a service as the bytes a legacy terminal sends, whether micromux's terminal
+    /// reported them in legacy form, through the kitty keyboard protocol or through tmux's
+    /// modifyOtherKeys reports, which report some keys apart that legacy terminals send alike.
     #[test]
-    fn special_keys_encode_as_expected() {
-        assert_eq!(
-            key_event_to_bytes(KeyCode::Esc, KeyModifiers::NONE),
-            Some(vec![0x1b])
-        );
-        assert_eq!(
-            key_event_to_bytes(KeyCode::Enter, KeyModifiers::NONE),
-            Some(vec![b'\r'])
-        );
-        assert_eq!(
-            key_event_to_bytes(KeyCode::Enter, KeyModifiers::CONTROL),
-            Some(vec![b'\n'])
-        );
-        assert_eq!(
-            key_event_to_bytes(KeyCode::Tab, KeyModifiers::NONE),
-            Some(vec![b'\t'])
-        );
-        assert_eq!(
-            key_event_to_bytes(KeyCode::BackTab, KeyModifiers::NONE),
-            Some(b"\x1b[Z".to_vec())
-        );
-        assert_eq!(
-            key_event_to_bytes(KeyCode::Backspace, KeyModifiers::NONE),
-            Some(vec![0x7f])
-        );
-        assert_eq!(
-            key_event_to_bytes(KeyCode::Up, KeyModifiers::NONE),
-            Some(b"\x1b[A".to_vec())
-        );
-        assert_eq!(
-            key_event_to_bytes(KeyCode::Delete, KeyModifiers::NONE),
-            Some(b"\x1b[3~".to_vec())
-        );
-        assert_eq!(
-            key_event_to_bytes(KeyCode::Home, KeyModifiers::NONE),
-            Some(b"\x1b[H".to_vec())
-        );
-        assert_eq!(
-            key_event_to_bytes(KeyCode::End, KeyModifiers::NONE),
-            Some(b"\x1b[F".to_vec())
-        );
+    fn keys_reach_a_service_as_a_legacy_terminal_sends_them() {
+        const NONE: KeyModifiers = KeyModifiers::NONE;
+        const SHIFT: KeyModifiers = KeyModifiers::SHIFT;
+        const CTRL: KeyModifiers = KeyModifiers::CONTROL;
+        const ALT: KeyModifiers = KeyModifiers::ALT;
+        const SUPER: KeyModifiers = KeyModifiers::SUPER;
+        let cases: &[(KeyCode, KeyModifiers, &[u8])] = &[
+            // Text.
+            (KeyCode::Char('a'), NONE, b"a"),
+            (KeyCode::Char('A'), SHIFT, b"A"),
+            (KeyCode::Char('!'), SHIFT, b"!"),
+            (KeyCode::Char('é'), NONE, "é".as_bytes()),
+            (KeyCode::Char(' '), NONE, b" "),
+            // Control characters, the first as the kitty protocol reports Ctrl+Shift+C, with
+            // alternate keys reported and without.
+            (KeyCode::Char('c'), CTRL, b"\x03"),
+            (KeyCode::Char('c'), CTRL | SHIFT, b"\x03"),
+            (KeyCode::Char('C'), CTRL, b"\x03"),
+            (KeyCode::Char('z'), CTRL, b"\x1a"),
+            (KeyCode::Char('h'), CTRL, b"\x08"),
+            (KeyCode::Char('i'), CTRL, b"\t"),
+            (KeyCode::Char('m'), CTRL, b"\r"),
+            (KeyCode::Char(' '), CTRL, b"\x00"),
+            (KeyCode::Char('@'), CTRL, b"\x00"),
+            (KeyCode::Char('['), CTRL, b"\x1b"),
+            (KeyCode::Char('\\'), CTRL, b"\x1c"),
+            (KeyCode::Char(']'), CTRL, b"\x1d"),
+            (KeyCode::Char('^'), CTRL, b"\x1e"),
+            (KeyCode::Char('_'), CTRL, b"\x1f"),
+            (KeyCode::Char('/'), CTRL, b"\x1f"),
+            (KeyCode::Char('?'), CTRL, b"\x7f"),
+            // Legacy terminals send Ctrl+4 to Ctrl+7 as these, which crossterm reads back as
+            // digits.
+            (KeyCode::Char('4'), CTRL, b"\x1c"),
+            (KeyCode::Char('7'), CTRL, b"\x1f"),
+            (KeyCode::Char('1'), CTRL, b"1"),
+            // Alt prefixes Escape, with Ctrl too, and Shift picks the capital.
+            (KeyCode::Char('x'), ALT, b"\x1bx"),
+            (KeyCode::Char('a'), ALT | SHIFT, b"\x1bA"),
+            (KeyCode::Char('>'), ALT, b"\x1b>"),
+            // As tmux reports keys under modifyOtherKeys: Alt+Shift+C as a capital with Alt
+            // alone, Ctrl+Shift+Z with both.
+            (KeyCode::Char('C'), ALT, b"\x1bC"),
+            (KeyCode::Char('z'), CTRL | SHIFT, b"\x1a"),
+            (KeyCode::Char('c'), CTRL | ALT, b"\x1b\x03"),
+            (KeyCode::Enter, ALT, b"\x1b\r"),
+            (KeyCode::Backspace, ALT, b"\x1b\x7f"),
+            // Super never reaches a legacy terminal's programs, so the key goes alone.
+            (KeyCode::Char('c'), SUPER, b"c"),
+            // Editing keys, with any modifier.
+            (KeyCode::Esc, NONE, b"\x1b"),
+            (KeyCode::Enter, NONE, b"\r"),
+            (KeyCode::Enter, SHIFT, b"\r"),
+            (KeyCode::Enter, CTRL, b"\r"),
+            (KeyCode::Tab, NONE, b"\t"),
+            (KeyCode::Tab, CTRL, b"\t"),
+            (KeyCode::BackTab, SHIFT, b"\x1b[Z"),
+            (KeyCode::Backspace, NONE, b"\x7f"),
+            (KeyCode::Backspace, CTRL, b"\x08"),
+            // Cursor and editing keys carry their modifiers as xterm's parameter.
+            (KeyCode::Up, NONE, b"\x1b[A"),
+            (KeyCode::Down, NONE, b"\x1b[B"),
+            (KeyCode::Right, NONE, b"\x1b[C"),
+            (KeyCode::Left, NONE, b"\x1b[D"),
+            (KeyCode::Home, NONE, b"\x1b[H"),
+            (KeyCode::End, NONE, b"\x1b[F"),
+            (KeyCode::Up, SHIFT, b"\x1b[1;2A"),
+            (KeyCode::Left, ALT, b"\x1b[1;3D"),
+            (KeyCode::Right, CTRL, b"\x1b[1;5C"),
+            (KeyCode::End, CTRL | SHIFT, b"\x1b[1;6F"),
+            (KeyCode::Insert, NONE, b"\x1b[2~"),
+            (KeyCode::Delete, NONE, b"\x1b[3~"),
+            (KeyCode::PageUp, NONE, b"\x1b[5~"),
+            (KeyCode::PageDown, NONE, b"\x1b[6~"),
+            (KeyCode::Delete, CTRL, b"\x1b[3;5~"),
+            (KeyCode::PageUp, SHIFT, b"\x1b[5;2~"),
+            // Function keys.
+            (KeyCode::F(1), NONE, b"\x1bOP"),
+            (KeyCode::F(4), NONE, b"\x1bOS"),
+            (KeyCode::F(1), SHIFT, b"\x1b[1;2P"),
+            (KeyCode::F(5), NONE, b"\x1b[15~"),
+            (KeyCode::F(6), NONE, b"\x1b[17~"),
+            (KeyCode::F(10), NONE, b"\x1b[21~"),
+            (KeyCode::F(11), NONE, b"\x1b[23~"),
+            (KeyCode::F(12), NONE, b"\x1b[24~"),
+            (KeyCode::F(5), CTRL, b"\x1b[15;5~"),
+        ];
+        for &(code, modifiers, bytes) in cases {
+            assert_eq!(
+                key_event_to_bytes(code, modifiers).as_deref(),
+                Some(bytes),
+                "{code:?} with {modifiers:?}"
+            );
+        }
+        // Keys a legacy terminal has no bytes for send nothing.
+        assert_eq!(key_event_to_bytes(KeyCode::F(13), NONE), None);
+        assert_eq!(key_event_to_bytes(KeyCode::CapsLock, NONE), None);
     }
 
+    /// Ctrl+Shift+C and Ctrl+Insert, as on Linux and Windows, and Super+C, as Cmd+C on macOS,
+    /// copy; Ctrl-C and the chords near these never do.
     #[test]
-    fn alt_char_is_esc_prefixed() {
-        assert_eq!(
-            key_event_to_bytes(KeyCode::Char('x'), KeyModifiers::ALT),
-            Some(vec![0x1b, b'x'])
-        );
+    fn the_terminals_copy_shortcuts_are_copy_chords_and_ctrl_c_is_not() {
+        let chord = |code, modifiers| {
+            is_copy_chord(KeyEvent {
+                code,
+                modifiers,
+                kind: KeyEventKind::Press,
+                state: KeyEventState::NONE,
+            })
+        };
+        let ctrl_shift = KeyModifiers::CONTROL | KeyModifiers::SHIFT;
+        assert!(chord(KeyCode::Char('c'), ctrl_shift));
+        // With alternate keys reported, the shifted key comes without Shift.
+        assert!(chord(KeyCode::Char('C'), KeyModifiers::CONTROL));
+        assert!(chord(KeyCode::Char('C'), ctrl_shift));
+        assert!(chord(KeyCode::Insert, KeyModifiers::CONTROL));
+        assert!(chord(KeyCode::Char('c'), KeyModifiers::SUPER));
+
+        assert!(!chord(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(!chord(KeyCode::Char('c'), KeyModifiers::NONE));
+        assert!(!chord(KeyCode::Char('C'), KeyModifiers::SHIFT));
+        assert!(!chord(KeyCode::Char('c'), KeyModifiers::ALT));
+        assert!(!chord(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT
+        ));
+        assert!(!chord(KeyCode::Char('C'), KeyModifiers::SUPER));
+        assert!(!chord(KeyCode::Insert, KeyModifiers::NONE));
+        assert!(!chord(KeyCode::Insert, KeyModifiers::SHIFT));
     }
 
     #[tokio::test]
@@ -1890,7 +2398,7 @@ mod tests {
             SessionSource::Local(LocalSource::new(handles.reader, handles.commands.clone())),
             Some(handles.terminal),
             shutdown.clone(),
-            LogViewOptions::default(),
+            ViewOptions::default(),
         );
 
         app.enqueue_pty_input("svc".to_string(), b"first".to_vec());
@@ -1929,7 +2437,7 @@ mod tests {
             SessionSource::Local(LocalSource::new(handles.reader, handles.commands.clone())),
             Some(handles.terminal),
             micromux::CancellationToken::new(),
-            LogViewOptions::default(),
+            ViewOptions::default(),
         );
 
         app.handle_crossterm_event(&crossterm::event::Event::Paste("Rq".to_string()));
@@ -1964,7 +2472,7 @@ mod tests {
             SessionSource::Local(LocalSource::new(handles.reader, handles.commands.clone())),
             Some(handles.terminal),
             shutdown.clone(),
-            LogViewOptions::default(),
+            ViewOptions::default(),
         );
         let paste = vec![b'x'; micromux::MAX_PTY_INPUT_BATCH_BYTES + 17];
 
@@ -2003,7 +2511,7 @@ mod tests {
             SessionSource::Local(LocalSource::new(handles.reader, handles.commands.clone())),
             Some(handles.terminal.clone()),
             micromux::CancellationToken::new(),
-            LogViewOptions::default(),
+            ViewOptions::default(),
         );
         let paste = vec![b'x'; micromux::MAX_PTY_PASTE_BYTES + 1];
 
@@ -2070,7 +2578,7 @@ mod tests {
             SessionSource::Local(LocalSource::new(handles.reader, handles.commands.clone())),
             Some(handles.terminal),
             shutdown.clone(),
-            LogViewOptions::default(),
+            ViewOptions::default(),
         );
         let runner = tokio::spawn(runner);
 
@@ -2138,7 +2646,7 @@ mod tests {
             ),
             Some(handles.terminal),
             micromux::CancellationToken::new(),
-            LogViewOptions::default(),
+            ViewOptions::default(),
         );
         app.input_notice = Some("input warning".to_string());
         app.terminal_input_closed = true;
@@ -2185,7 +2693,7 @@ mod tests {
             )),
             Some(handles.terminal.clone()),
             shutdown,
-            LogViewOptions::default(),
+            ViewOptions::default(),
         );
         app.focus = Focus::Services;
         app.show_healthcheck_pane = false;
@@ -2227,7 +2735,7 @@ mod tests {
             SessionSource::Local(LocalSource::new(handles.reader, commands_tx)),
             None,
             shutdown,
-            LogViewOptions::default(),
+            ViewOptions::default(),
         );
         let key = |code| KeyEvent {
             code,
@@ -2284,7 +2792,7 @@ mod tests {
             SessionSource::Local(LocalSource::new(handles.reader.clone(), commands_tx)),
             Some(handles.terminal),
             shutdown,
-            LogViewOptions::default(),
+            ViewOptions::default(),
         );
 
         // Hand the viewer one red, bold line as if the service had printed it.
@@ -2382,7 +2890,7 @@ mod tests {
             )),
             Some(handles.terminal),
             shutdown,
-            LogViewOptions::default(),
+            ViewOptions::default(),
         );
         if let Some(service) = app.state.current_service_mut() {
             service.snapshot.desired = micromux::Desired::Disabled;
@@ -2432,7 +2940,7 @@ mod tests {
             )),
             Some(handles.terminal),
             shutdown,
-            LogViewOptions::default(),
+            ViewOptions::default(),
         );
         let stop_key = KeyEvent {
             code: KeyCode::Char('s'),
@@ -2505,7 +3013,7 @@ mod tests {
             SessionSource::Local(LocalSource::new(initial.reader, initial.commands.clone())),
             Some(initial.terminal),
             shutdown,
-            LogViewOptions::default(),
+            ViewOptions::default(),
         );
         app.state.selected_service = 1;
         if let Some(service) = app.state.current_service_mut() {

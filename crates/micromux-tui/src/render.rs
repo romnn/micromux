@@ -54,6 +54,7 @@ mod tests {
                 title: Line::raw("Logs"),
                 status: None,
                 detail: None,
+                focused: false,
             },
             buf,
         )
@@ -97,7 +98,11 @@ mod tests {
 
         let one_row = pack_key_hints(&hints, 80);
         let wrapped = pack_key_hints(&hints, 24);
-        let rows = |lines: &[Line<'_>]| lines.iter().map(Line::to_string).collect::<Vec<_>>();
+        let rows = |rows: &[super::HintRow]| {
+            rows.iter()
+                .map(|row| row.line.to_string())
+                .collect::<Vec<_>>()
+        };
 
         assert_eq!(
             rows(&one_row),
@@ -108,7 +113,35 @@ mod tests {
             rows(&wrapped),
             vec![" ? Help", " Tab Focus:SERVICES", " r Restart"]
         );
-        assert!(wrapped.iter().all(|line| line.width() <= 24));
+        assert!(wrapped.iter().all(|row| row.line.width() <= 24));
+
+        // Each hint's place covers exactly its own text, which a click on it runs.
+        let hint_texts = |row: &super::HintRow| {
+            let text = row.line.to_string();
+            row.hints
+                .iter()
+                .map(|&(x, width, keys)| {
+                    let shown = text.chars().skip(x).take(width).collect::<String>();
+                    (shown, keys)
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            one_row.iter().flat_map(hint_texts).collect::<Vec<_>>(),
+            vec![
+                ("? Help".to_string(), "?"),
+                ("Tab Focus:SERVICES".to_string(), "Tab"),
+                ("r Restart".to_string(), "r"),
+            ]
+        );
+        assert_eq!(
+            wrapped.iter().flat_map(hint_texts).collect::<Vec<_>>(),
+            vec![
+                ("? Help".to_string(), "?"),
+                ("Tab Focus:SERVICES".to_string(), "Tab"),
+                ("r Restart".to_string(), "r"),
+            ]
+        );
     }
 
     #[test]
@@ -216,6 +249,7 @@ mod tests {
                 title: Line::raw("Logs"),
                 status: None,
                 detail: Some(service_detail(&snapshot, 1_000)),
+                focused: false,
             },
             &mut buf,
         );
@@ -1208,6 +1242,20 @@ fn centered_popup(area: Rect, content_width: usize, content_rows: usize) -> Rect
     }
 }
 
+/// Where each part of the screen goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ScreenLayout {
+    pub header: Rect,
+    /// Everything between the header and the footer, where popups center.
+    pub main: Rect,
+    pub services: Rect,
+    /// The logs pane, borders and scrollbar included.
+    pub logs: Rect,
+    /// The healthcheck pane, or an empty area while it is hidden.
+    pub health: Rect,
+    pub footer: Rect,
+}
+
 /// Heights of the header and footer rows around the panes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ChromeRows {
@@ -1215,18 +1263,54 @@ pub(crate) struct ChromeRows {
     pub footer: u16,
 }
 
-fn rows_u16(rows: usize) -> u16 {
+pub(crate) fn rows_u16(rows: usize) -> u16 {
     u16::try_from(rows).unwrap_or(u16::MAX)
+}
+
+/// Each hint's first column, counted from its row's left edge, its width and its keys.
+type HintPlaces = Vec<(usize, usize, &'static str)>;
+
+/// One row of the header or footer, and where on it each key hint sits.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct HintRow {
+    pub(crate) line: Line<'static>,
+    pub(crate) hints: HintPlaces,
+}
+
+impl HintRow {
+    /// A row without hints.
+    fn plain(line: Line<'static>) -> Self {
+        Self {
+            line,
+            hints: Vec::new(),
+        }
+    }
+
+    /// The row moved `columns` to the right, as when text is put before it.
+    fn shifted(mut self, columns: usize) -> Self {
+        for (x, _, _) in &mut self.hints {
+            *x += columns;
+        }
+        self
+    }
+
+    /// The row right-aligned in `width` columns, as the header draws its wrapped controls.
+    fn right_aligned(self, width: usize) -> Self {
+        let shift = width.saturating_sub(self.line.width());
+        let mut row = self.shifted(shift);
+        row.line = row.line.right_aligned();
+        row
+    }
 }
 
 /// Packs key hints into rows no wider than `width`, never splitting a hint across rows.
 ///
 /// A hint wider than `width` gets a row of its own and is truncated when drawn.
-fn pack_key_hints(hints: &[KeyHint], width: usize) -> Vec<Line<'static>> {
+fn pack_key_hints(hints: &[KeyHint], width: usize) -> Vec<HintRow> {
     const FIRST_GAP: usize = 1;
     const GAP: usize = 2;
 
-    let mut rows: Vec<Vec<Span<'static>>> = Vec::new();
+    let mut rows: Vec<(Vec<Span<'static>>, HintPlaces)> = Vec::new();
     let mut row_width = 0;
     for KeyHint {
         keys,
@@ -1243,20 +1327,26 @@ fn pack_key_hints(hints: &[KeyHint], width: usize) -> Vec<Line<'static>> {
         }
         let hint_width = hint.iter().map(Span::width).sum::<usize>();
         match rows.last_mut() {
-            Some(row) if row_width + GAP + hint_width <= width => {
+            Some((row, at)) if row_width + GAP + hint_width <= width => {
                 row.push(" ".repeat(GAP).into());
                 row.extend(hint);
+                at.push((row_width + GAP, hint_width, *keys));
                 row_width += GAP + hint_width;
             }
             _ => {
                 let mut row = vec![" ".repeat(FIRST_GAP).into()];
                 row.extend(hint);
-                rows.push(row);
+                rows.push((row, vec![(FIRST_GAP, hint_width, *keys)]));
                 row_width = FIRST_GAP + hint_width;
             }
         }
     }
-    rows.into_iter().map(Line::from).collect()
+    rows.into_iter()
+        .map(|(spans, hints)| HintRow {
+            line: Line::from(spans),
+            hints,
+        })
+        .collect()
 }
 
 /// A group of key bindings in the help overlay.
@@ -1325,6 +1415,14 @@ const HELP_COLUMNS: [&[HelpSection]; 2] = [
                     keys: "Tab",
                     description: "Switch pane focus",
                 },
+                HelpKey {
+                    keys: "m",
+                    description: "Mouse capture; Shift bypasses",
+                },
+                HelpKey {
+                    keys: "y / ↵",
+                    description: "Copy selection; right-click too",
+                },
             ],
         },
     ],
@@ -1364,6 +1462,10 @@ const HELP_COLUMNS: [&[HelpSection]; 2] = [
                 HelpKey {
                     keys: "a",
                     description: "PTY input (Alt+Esc exits)",
+                },
+                HelpKey {
+                    keys: "Ctrl-Z",
+                    description: "Suspend to the shell",
                 },
                 HelpKey {
                     keys: "q",
@@ -1449,13 +1551,16 @@ const LOGS_TITLE_GAP: usize = 2;
 
 /// The Logs pane title: "Logs", then the browser URLs of the routes the service serves, as many
 /// as fit in `width` columns, with the rest counted.
-fn logs_title(urls: &[String], width: usize) -> Line<'static> {
+///
+/// Also returns each URL shown with the column it starts at in the title.
+fn logs_title(urls: &[String], width: usize) -> (Line<'static>, Vec<(usize, String)>) {
     let separator = || " · ".fg(Color::White);
     let more = |hidden: usize| format!("+{hidden} more").fg(tailwind::GRAY.c400);
     let mut spans = vec![Span::raw("Logs")];
     // A trailing space keeps the border dashes out of the last URL, which terminals that detect
     // links would otherwise take as part of it.
     let mut used = "Logs".len() + 1;
+    let mut columns = Vec::new();
     for (shown, url) in urls.iter().enumerate() {
         let hidden_after = urls.len() - shown - 1;
         // A URL fits when the count of the ones after it still fits behind it.
@@ -1472,13 +1577,16 @@ fn logs_title(urls: &[String], width: usize) -> Line<'static> {
             }
             break;
         }
+        // The URL follows "Logs" and the separators so far, each three columns wide.
+        let start = spans.iter().map(Span::width).sum::<usize>() + 3;
         spans.extend([separator(), url.clone().fg(tailwind::CYAN.c400)]);
+        columns.push((start, url.clone()));
         used += url_width;
     }
     if spans.len() > 1 {
         spans.push(Span::raw(" "));
     }
-    Line::from(spans)
+    (Line::from(spans), columns)
 }
 
 /// The browser URLs of the routes whose port belongs to `service`, in config order.
@@ -1560,6 +1668,38 @@ fn lease_phrase(expires_at_unix_ms: Option<u64>, now_unix_ms: u64) -> String {
     }
 }
 
+/// A pane's frame, which shows whether the pane has the focus: thick and in the accent color
+/// when it has, plain and dim when not.
+///
+/// The thickness alone tells the focused pane apart where the terminal shows no color.
+fn pane_block<'a>(focused: bool) -> Block<'a> {
+    let block = Block::default().borders(Borders::ALL);
+    if focused {
+        block
+            .border_type(ratatui::widgets::BorderType::Thick)
+            .border_style(Style::default().fg(FOCUS_COLOR))
+    } else {
+        block.border_style(Style::default().fg(UNFOCUSED_COLOR))
+    }
+}
+
+/// A pane's name for its frame's title: bold and in the accent color when the pane has the
+/// focus, dim when not.
+fn pane_name(name: &str, focused: bool) -> Span<'static> {
+    let span = Span::raw(name.to_string());
+    if focused {
+        span.bold().fg(FOCUS_COLOR)
+    } else {
+        span.fg(tailwind::GRAY.c400)
+    }
+}
+
+/// The accent of the focused pane's frame.
+pub(crate) const FOCUS_COLOR: Color = tailwind::SKY.c400;
+
+/// The frame of a pane without the focus.
+const UNFOCUSED_COLOR: Color = tailwind::GRAY.c600;
+
 /// Color of the command in the logs pane's bottom border.
 const BORDER_COMMAND_COLOR: Color = tailwind::GRAY.c400;
 /// Color of the run facts in the logs pane's bottom border.
@@ -1625,53 +1765,82 @@ fn short_local_time(unix_ms: u64) -> Option<String> {
 
 impl Widget for &mut App {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        let header = self.header_lines(area.width);
-        let footer = self.footer_lines(area.width);
-        let [header_area, main_area, footer_area] = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(rows_u16(header.len())),
-                Constraint::Min(0),
-                Constraint::Length(rows_u16(footer.len())),
-            ])
-            .spacing(0)
-            .areas(area);
-
-        let [services_area, main_right_area] = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Length(self.state.services_sidebar_width),
-                Constraint::Min(0),
-            ])
-            .spacing(0)
-            .areas(main_area);
-
-        let [logs_area, health_area] = if self.show_healthcheck_pane {
-            let [a, b] = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-                .spacing(0)
-                .areas::<2>(main_right_area);
-            [a, b]
-        } else {
-            [main_right_area, Rect::default()]
+        let header = self.header_rows(area.width);
+        let footer = self.footer_rows(area.width);
+        let chrome = ChromeRows {
+            header: rows_u16(header.len()),
+            footer: rows_u16(footer.len()),
         };
+        let layout = self.screen_layout(area, chrome);
 
-        Paragraph::new(header).render(header_area, buf);
-        self.render_services(services_area, buf);
-        self.render_logs(logs_area, buf);
+        Paragraph::new(
+            header
+                .iter()
+                .map(|row| row.line.clone())
+                .collect::<Vec<_>>(),
+        )
+        .render(layout.header, buf);
+        let (service_rows, first_service) = self.render_services(layout.services, buf);
+        let links = self.render_logs(layout.logs, buf);
         if self.show_healthcheck_pane {
-            self.render_healthchecks(health_area, buf);
+            self.render_healthchecks(layout.health, buf);
         }
-        Paragraph::new(footer).render(footer_area, buf);
-        self.render_level_picker(logs_area, buf);
+        Paragraph::new(
+            footer
+                .iter()
+                .map(|row| row.line.clone())
+                .collect::<Vec<_>>(),
+        )
+        .render(layout.footer, buf);
+        let covered = self.render_mouse_notice(&footer, layout.footer, buf);
+
+        // The popups below record themselves as they draw.
+        self.hits = crate::mouse::Hits {
+            services: layout.services,
+            service_rows,
+            first_service,
+            logs: layout.logs,
+            health: layout.health,
+            // The hints the quit hint covers cannot be clicked, since they do not show.
+            hints: [(&header, layout.header), (&footer, layout.footer)]
+                .into_iter()
+                .flat_map(|(rows, area)| hint_hits(rows, area))
+                .filter(|hit| Some(hit.area.y) != covered)
+                .collect(),
+            links,
+            popup: None,
+        };
+        self.render_level_picker(layout.logs, buf);
         if let Some(view) = self.info {
-            self.render_info(view, main_area, buf);
+            self.render_info(view, layout.main, buf);
         }
         if self.show_help {
-            App::render_help(main_area, buf);
+            self.render_help(layout.main, buf);
+        }
+        self.paint_selection(buf);
+    }
+}
+
+/// Where each key hint of `rows`, drawn in `area`, landed on screen.
+fn hint_hits(rows: &[HintRow], area: Rect) -> Vec<crate::mouse::HintHit> {
+    let mut hits = Vec::new();
+    for (row, line) in rows.iter().zip(area.rows()) {
+        for &(x, width, keys) in &row.hints {
+            let x = area.x.saturating_add(rows_u16(x));
+            if x < area.right() {
+                hits.push(crate::mouse::HintHit {
+                    area: Rect {
+                        x,
+                        y: line.y,
+                        width: rows_u16(width).min(area.right() - x),
+                        height: 1,
+                    },
+                    keys,
+                });
+            }
         }
     }
+    hits
 }
 
 impl App {
@@ -1730,23 +1899,29 @@ impl App {
     ///
     /// When the controls do not fit beside the status, they wrap onto right-aligned rows below
     /// it, so warnings and attach state always keep the first row.
-    pub(crate) fn header_lines(&self, width: u16) -> Vec<Line<'static>> {
+    pub(crate) fn header_rows(&self, width: u16) -> Vec<HintRow> {
         let width = usize::from(width);
-        let urls = self.routing_problem_line();
+        let urls = self.routing_problem_line().map(HintRow::plain);
         let status = self.status_line();
-        let mut controls = pack_key_hints(&self.view_key_hints(), width);
-        if let [single_row] = controls.as_mut_slice()
-            && status.width() + 1 + single_row.width() <= width
+        let controls = pack_key_hints(&self.view_key_hints(), width);
+        if let [single_row] = controls.as_slice()
+            && status.width() + 1 + single_row.line.width() <= width
         {
-            let gap = width - status.width() - single_row.width();
+            let gap = width - status.width() - single_row.line.width();
+            let shift = status.width() + gap;
+            let row = single_row.clone().shifted(shift);
             let mut spans = status.spans;
             spans.push(" ".repeat(gap).into());
-            spans.append(&mut single_row.spans);
-            return std::iter::once(Line::from(spans)).chain(urls).collect();
+            spans.extend(row.line.spans);
+            let first = HintRow {
+                line: Line::from(spans),
+                hints: row.hints,
+            };
+            return std::iter::once(first).chain(urls).collect();
         }
-        std::iter::once(status)
+        std::iter::once(HintRow::plain(status))
             .chain(urls)
-            .chain(controls.into_iter().map(Line::right_aligned))
+            .chain(controls.into_iter().map(|row| row.right_aligned(width)))
             .collect()
     }
 
@@ -1767,15 +1942,57 @@ impl App {
     }
 
     /// The footer rows at `width`, wrapping whole key hints onto further rows as needed.
-    pub(crate) fn footer_lines(&self, width: u16) -> Vec<Line<'static>> {
+    pub(crate) fn footer_rows(&self, width: u16) -> Vec<HintRow> {
         pack_key_hints(&self.action_key_hints(), usize::from(width))
     }
 
     /// Header and footer heights at `width`; the panes get the rows in between.
     pub(crate) fn chrome_rows(&self, width: u16) -> ChromeRows {
         ChromeRows {
-            header: rows_u16(self.header_lines(width).len()),
-            footer: rows_u16(self.footer_lines(width).len()),
+            header: rows_u16(self.header_rows(width).len()),
+            footer: rows_u16(self.footer_rows(width).len()),
+        }
+    }
+
+    /// Where the frame puts each part of the screen in `area`, with `chrome` rows for the header
+    /// and footer.
+    ///
+    /// Drawing, hit-testing and the service PTY size all derive from it, so they cannot drift
+    /// apart.
+    pub(crate) fn screen_layout(&self, area: Rect, chrome: ChromeRows) -> ScreenLayout {
+        let [header, main, footer] = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(chrome.header),
+                Constraint::Min(0),
+                Constraint::Length(chrome.footer),
+            ])
+            .spacing(0)
+            .areas(area);
+        let [services, right] = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Length(self.state.services_sidebar_width),
+                Constraint::Min(0),
+            ])
+            .spacing(0)
+            .areas(main);
+        let [logs, health] = if self.show_healthcheck_pane {
+            Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .spacing(0)
+                .areas(right)
+        } else {
+            [right, Rect::default()]
+        };
+        ScreenLayout {
+            header,
+            main,
+            services,
+            logs,
+            health,
+            footer,
         }
     }
 
@@ -1845,6 +2062,19 @@ impl App {
                 hints.push(KeyHint::new("a", "PTY input"));
             }
         }
+        // While text is selected, the copy key takes the mouse toggle's place, padded to its
+        // width, so the footer keeps its rows and the panes and service terminals their size.
+        // Capture is on whenever there is a selection, so the toggle has nothing to report.
+        // The level picker takes `y` for nothing, so the hint would promise what it cannot do.
+        if self.has_selection() && !self.pty_input_mode && self.level_picker.is_none() {
+            hints.push(KeyHint::new("y", "Copy    "));
+        } else {
+            hints.push(KeyHint::toggle(
+                "m",
+                "Mouse",
+                if self.mouse.capture { "ON" } else { "OFF" },
+            ));
+        }
         hints.push(KeyHint::new(
             "q",
             if self.source.attachment_status().is_some() {
@@ -1862,7 +2092,9 @@ impl App {
             .or(self.input_notice.as_deref())
     }
 
-    fn render_services(&self, area: Rect, buf: &mut Buffer) {
+    /// Draws the services list and returns the rows it was drawn in and the index of the service
+    /// on the first of them.
+    fn render_services(&mut self, area: Rect, buf: &mut Buffer) -> (Rect, usize) {
         let items: Vec<ListItem> = self
             .state
             .services
@@ -1887,11 +2119,23 @@ impl App {
             })
             .collect();
 
-        let mut state = ListState::default();
-        state.select(Some(self.state.selected_service));
-
+        let block = pane_block(self.focus == crate::Focus::Services)
+            .title(pane_name("Services", self.focus == crate::Focus::Services));
+        let rows = block.inner(area);
+        // The list scrolls on from where the last frame left it, so the rows a click lands on
+        // stay put once the selection moves to one of them.
+        // Rows freed by a taller pane or a shorter roster go to the services above, which ratatui
+        // would leave scrolled out of view.
+        let max_offset = self
+            .state
+            .services
+            .len()
+            .saturating_sub(usize::from(rows.height));
+        let mut state = ListState::default()
+            .with_offset(self.first_service.min(max_offset))
+            .with_selected(Some(self.state.selected_service));
         let sidebar = List::new(items)
-            .block(Block::default().borders(Borders::ALL).title("Services"))
+            .block(block)
             .highlight_style(
                 Style::default()
                     .bg(Self::HIGHLIGHT_COLOR)
@@ -1899,12 +2143,15 @@ impl App {
             )
             .highlight_symbol(" > ");
         StatefulWidget::render(&sidebar, area, buf, &mut state);
+        self.first_service = state.offset();
+        (rows, state.offset())
     }
 
-    fn render_logs(&mut self, area: Rect, buf: &mut Buffer) {
+    /// Draws the selected service's logs and returns where the URLs in its title landed.
+    fn render_logs(&mut self, area: Rect, buf: &mut Buffer) -> Vec<crate::mouse::LinkHit> {
         let session = self.source.session_summary();
         let Some(service) = self.state.current_service_mut() else {
-            return;
+            return Vec::new();
         };
         let format = service.line_format(self.pretty_json_logs);
         service.use_format(&format);
@@ -1935,6 +2182,17 @@ impl App {
                 );
                 escaped.into()
             });
+            // A selection finds its lines by the records they came from.
+            service.record_starts.clear();
+            let mut next = 0;
+            for (_, line) in &service.cached_lines {
+                service.record_starts.push(next);
+                next += 1 + line.matches('\n').count();
+            }
+            // Joining drops the line of a blank last record, which keeps a line of its own.
+            if service.cached_text.lines.len() < next {
+                service.cached_text.lines.resize(next, Line::default());
+            }
             service
                 .cached_line_index
                 .rebuild(&service.cached_text, wrap, wrap_width);
@@ -1943,7 +2201,7 @@ impl App {
         }
 
         let Some(current_service) = self.state.current_service() else {
-            return;
+            return Vec::new();
         };
         let text = &current_service.cached_text;
         let detail = service_detail(&current_service.snapshot, now_unix_ms());
@@ -1953,10 +2211,27 @@ impl App {
             .saturating_sub(3)
             .saturating_sub(status.as_ref().map_or(0, Line::width))
             .saturating_sub(LOGS_TITLE_GAP);
-        let title = logs_title(
+        let (title, url_columns) = logs_title(
             &service_urls(session.as_ref(), &current_service.snapshot.id),
             title_width,
         );
+        let mut title = title;
+        if let Some(name) = title.spans.first_mut() {
+            *name = pane_name("Logs", self.focus == crate::Focus::Logs);
+        }
+        // The title starts right after the pane's top-left corner.
+        let links = url_columns
+            .into_iter()
+            .map(|(column, url)| crate::mouse::LinkHit {
+                area: Rect {
+                    x: area.x.saturating_add(1).saturating_add(rows_u16(column)),
+                    y: area.y,
+                    width: rows_u16(url.chars().count()),
+                    height: 1,
+                },
+                url,
+            })
+            .collect();
         tracing::trace!(
             service_id = current_service.snapshot.id,
             num_lines = current_service.cached_line_index.total_lines(),
@@ -1971,6 +2246,7 @@ impl App {
                 title,
                 status,
                 detail: Some(detail),
+                focused: self.focus == crate::Focus::Logs,
             },
             buf,
         );
@@ -1979,6 +2255,7 @@ impl App {
         if crate::style::is_frozen(&current_service.snapshot) {
             crate::style::freeze(buf, area);
         }
+        links
     }
 
     fn render_healthchecks(&mut self, area: Rect, buf: &mut Buffer) {
@@ -2037,15 +2314,19 @@ impl App {
             &service.healthcheck_cached_line_index,
             &service.healthcheck_cached_text,
             log_view::PaneBorders {
-                title: Line::raw("Healthcheck"),
+                title: Line::from(pane_name(
+                    "Healthcheck",
+                    self.focus == crate::Focus::Healthcheck,
+                )),
                 status: None,
                 detail: None,
+                focused: self.focus == crate::Focus::Healthcheck,
             },
             buf,
         );
     }
 
-    fn render_level_picker(&self, area: Rect, buf: &mut Buffer) {
+    fn render_level_picker(&mut self, area: Rect, buf: &mut Buffer) {
         let Some(picker) = &self.level_picker else {
             return;
         };
@@ -2078,14 +2359,14 @@ impl App {
             .max(widest_item.saturating_add(3));
         let popup = centered_popup(area, content_width, items.len());
 
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .padding(POPUP_PADDING)
+            .title(title)
+            .title_bottom(hint.fg(tailwind::GRAY.c500));
+        let rows = block.inner(popup);
         let list = List::new(items)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .padding(POPUP_PADDING)
-                    .title(title)
-                    .title_bottom(hint.fg(tailwind::GRAY.c500)),
-            )
+            .block(block)
             .highlight_style(
                 Style::default()
                     .bg(Self::HIGHLIGHT_COLOR)
@@ -2096,6 +2377,13 @@ impl App {
         state.select(Some(picker.cursor));
         Clear.render(popup, buf);
         StatefulWidget::render(&list, popup, buf, &mut state);
+        self.hits.popup = Some(crate::mouse::PopupHit {
+            area: popup,
+            content: crate::mouse::PopupContent::Levels {
+                rows,
+                first: state.offset(),
+            },
+        });
     }
 
     fn render_info(&mut self, view: crate::InfoView, area: Rect, buf: &mut Buffer) {
@@ -2153,41 +2441,124 @@ impl App {
         let popup = centered_popup(area, content_width, rows.len());
         let visible = usize::from(popup.height).saturating_sub(vertical_chrome);
         let max_scroll = rows.len().saturating_sub(visible);
-        self.info_scroll = self.info_scroll.min(max_scroll);
+        self.popup_scroll = self.popup_scroll.min(max_scroll);
         let mut block = Block::default()
             .borders(Borders::ALL)
             .padding(POPUP_PADDING)
             .title(title)
             .title_bottom(format!(" {key} or Esc closes ").fg(tailwind::GRAY.c500));
         if max_scroll > 0 {
-            let first = self.info_scroll + 1;
-            let last = (self.info_scroll + visible).min(rows.len());
-            block = block.title_bottom(
-                format!(" ↑/↓ scroll · {first}-{last} of {} ", rows.len())
-                    .fg(tailwind::GRAY.c500)
-                    .into_right_aligned_line(),
-            );
+            block = block.title_bottom(self.scroll_position(visible, rows.len()));
         }
-        let info = Paragraph::new(rows)
-            .block(block)
-            .scroll((rows_u16(self.info_scroll), 0));
-        Clear.render(popup, buf);
-        Widget::render(&info, popup, buf);
+        self.render_text_popup(crate::mouse::TextPane::Info(view), popup, block, rows, buf);
     }
 
-    fn render_help(area: Rect, buf: &mut Buffer) {
+    /// Where a scrolled popup is, for its bottom border's right side.
+    fn scroll_position(&self, visible: usize, rows: usize) -> Line<'static> {
+        let first = self.popup_scroll + 1;
+        let last = (self.popup_scroll + visible).min(rows);
+        format!(" ↑/↓ scroll · {first}-{last} of {rows} ")
+            .fg(tailwind::GRAY.c500)
+            .into_right_aligned_line()
+    }
+
+    /// Draws a popup of `rows` scrolled to the current popup row, and records it for the mouse.
+    fn render_text_popup(
+        &mut self,
+        pane: crate::mouse::TextPane,
+        popup: Rect,
+        block: Block<'_>,
+        rows: Vec<Line<'static>>,
+        buf: &mut Buffer,
+    ) {
+        let text_area = block.inner(popup);
+        let paragraph = Paragraph::new(rows.clone())
+            .block(block)
+            .scroll((rows_u16(self.popup_scroll), 0));
+        Clear.render(popup, buf);
+        Widget::render(&paragraph, popup, buf);
+        self.hits.popup = Some(crate::mouse::PopupHit {
+            area: popup,
+            content: crate::mouse::PopupContent::Text {
+                pane,
+                area: text_area,
+                lines: rows,
+            },
+        });
+    }
+
+    fn render_help(&mut self, area: Rect, buf: &mut Buffer) {
         let rows = help_rows();
         let content_width = rows.iter().map(Line::width).max().unwrap_or_default();
         let popup = centered_popup(area, content_width, rows.len());
-        let help = Paragraph::new(rows).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .padding(POPUP_PADDING)
-                .title(" Keys ")
-                .title_bottom(" Esc closes ".fg(tailwind::GRAY.c500)),
+        let vertical_chrome = usize::from(POPUP_PADDING.top + POPUP_PADDING.bottom + 2);
+        let visible = usize::from(popup.height).saturating_sub(vertical_chrome);
+        let max_scroll = rows.len().saturating_sub(visible);
+        self.popup_scroll = self.popup_scroll.min(max_scroll);
+        let mut block = Block::default()
+            .borders(Borders::ALL)
+            .padding(POPUP_PADDING)
+            .title(" Keys ")
+            .title_bottom(" Esc closes ".fg(tailwind::GRAY.c500));
+        if max_scroll > 0 {
+            block = block.title_bottom(self.scroll_position(visible, rows.len()));
+        }
+        self.render_text_popup(crate::mouse::TextPane::Help, popup, block, rows, buf);
+    }
+
+    /// Draws what the last mouse release copied at the right end of the footer's last row, where
+    /// the hints leave room, so it never changes the layout; returns the row the quit hint covers
+    /// instead, when there is no room for it.
+    fn render_mouse_notice(&self, footer: &[HintRow], area: Rect, buf: &mut Buffer) -> Option<u16> {
+        // How to quit matters more than what the last copy took.
+        let quitting = self.quit_hint_at.is_some();
+        let (notice, color) = if quitting {
+            let action = if self.source.attachment_status().is_some() {
+                "detach"
+            } else {
+                "quit"
+            };
+            (Some(format!("press q to {action}")), tailwind::YELLOW.c400)
+        } else {
+            (self.mouse.notice.clone(), tailwind::GREEN.c400)
+        };
+        let (Some(notice), Some(last)) = (notice, footer.last()) else {
+            return None;
+        };
+        let notice = format!("{notice} ");
+        let width = rows_u16(notice.chars().count());
+        let used = rows_u16(last.line.width()).saturating_add(2);
+        if area.height == 0 {
+            return None;
+        }
+        if used.saturating_add(width) > area.width {
+            // The quit hint must show, so for its two seconds it covers the hints of the
+            // footer's last row; other notices wait for room.
+            if !quitting {
+                return None;
+            }
+            let row = Rect {
+                y: area.bottom() - 1,
+                height: 1,
+                ..area
+            };
+            Clear.render(row, buf);
+            buf.set_stringn(
+                row.x,
+                row.y,
+                format!(" {notice}"),
+                usize::from(row.width),
+                Style::default().fg(color),
+            );
+            return Some(row.y);
+        }
+        buf.set_string(
+            area.right() - width,
+            area.bottom() - 1,
+            notice,
+            Style::default().fg(color),
         );
-        Clear.render(popup, buf);
-        Widget::render(&help, popup, buf);
+        None
     }
 
     /// Run the application in the terminal.
@@ -2199,21 +2570,24 @@ impl App {
     /// - The terminal backend fails to initialize or restore.
     /// - The underlying event loop (`App::run`) fails.
     pub async fn render(self) -> Result<(), crate::Error> {
-        use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
-
-        let terminal = ratatui::try_init()?;
-        let mut stdout = std::io::stdout();
-        if let Err(err) = crossterm::execute!(stdout, EnableBracketedPaste) {
-            ratatui::restore();
+        crate::terminal::install_panic_hook();
+        if let Err(err) = crate::terminal::take_over(self.mouse.capture) {
+            // The failure to take the terminal over is the one to report.
+            crate::terminal::give_back().ok();
             return Err(err.into());
         }
-        // Always restore the terminal, even when the event loop returns an error, so a failure
-        // never leaves the user's shell stuck in raw mode / the alternate screen.
-        let result = self.run(terminal).await;
-        let disable_paste = crossterm::execute!(stdout, DisableBracketedPaste);
-        ratatui::restore();
+        // Always give the terminal back, even when the event loop returns an error, so a failure
+        // never leaves the user's shell in raw mode, on the alternate screen or capturing the
+        // mouse.
+        let result = match ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(
+            std::io::stdout(),
+        )) {
+            Ok(terminal) => self.run(terminal).await,
+            Err(err) => Err(err.into()),
+        };
+        let given_back = crate::terminal::give_back();
         result?;
-        disable_paste?;
+        given_back?;
         Ok(())
     }
 }
@@ -2222,10 +2596,7 @@ pub mod log_view {
     use ratatui::{
         buffer::Buffer,
         layout::{Constraint, Direction, Layout, Rect},
-        widgets::{
-            Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarState, StatefulWidget, Widget,
-            Wrap,
-        },
+        widgets::{Clear, Paragraph, Scrollbar, ScrollbarState, StatefulWidget, Widget, Wrap},
     };
 
     /// Narrowest left border text worth drawing; below it the truncation marker would crowd out
@@ -2245,6 +2616,8 @@ pub mod log_view {
         pub status: Option<ratatui::text::Line<'static>>,
         /// Identity facts along the bottom border.
         pub detail: Option<BorderDetail>,
+        /// Whether the pane has the focus, which its frame shows.
+        pub focused: bool,
     }
 
     /// Facts drawn into a pane's bottom border.
@@ -2289,6 +2662,22 @@ pub mod log_view {
             self.total_lines
         }
 
+        /// The rendered row that logical line `line` starts on.
+        #[must_use]
+        pub(crate) fn line_start(&self, line: usize) -> Option<usize> {
+            self.starts.get(line).copied()
+        }
+
+        /// The logical line that rendered `row` belongs to, and the row it starts on.
+        #[must_use]
+        pub(crate) fn line_of_row(&self, row: usize) -> Option<(usize, usize)> {
+            let line = self
+                .starts
+                .partition_point(|start| *start <= row)
+                .checked_sub(1)?;
+            Some((line, *self.starts.get(line)?))
+        }
+
         fn source_window(
             &self,
             offset: usize,
@@ -2315,6 +2704,35 @@ pub mod log_view {
         }
     }
 
+    /// Where a pane drawn in `area` puts its text: inside its border, left of its scrollbar.
+    #[must_use]
+    pub(crate) fn text_area(area: Rect) -> Rect {
+        Rect {
+            x: area.x.saturating_add(1),
+            y: area.y.saturating_add(1),
+            width: area.width.saturating_sub(3),
+            height: area.height.saturating_sub(2),
+        }
+    }
+
+    /// The text a pane shows from rendered row `offset` on, for `height` rows.
+    ///
+    /// Panes draw it, and copying a selection draws it again off screen, so both wrap the same.
+    pub(crate) fn content_paragraph<'a>(
+        text: &'a ratatui::text::Text<'_>,
+        line_index: &RenderedLineIndex,
+        offset: usize,
+        height: usize,
+        wrap: bool,
+    ) -> Paragraph<'a> {
+        let (text, paragraph_offset) = window_text(text, line_index, offset, height);
+        let mut paragraph = Paragraph::new(text).scroll((paragraph_offset, 0));
+        if wrap {
+            paragraph = paragraph.wrap(Wrap { trim: false });
+        }
+        paragraph
+    }
+
     #[derive(Debug)]
     pub struct LogView {
         /// Number of rendered rows scrolled from the top.
@@ -2339,6 +2757,25 @@ pub mod log_view {
     }
 
     impl LogView {
+        /// Scrolls by `rows`, up when negative, through `total` rows shown `viewport` at a time.
+        ///
+        /// Following the tail stops only when the view leaves the bottom, so a pane whose text
+        /// fits, such as a full-screen program's live screen, keeps following however the wheel
+        /// turns; scrolling down to the bottom follows again.
+        pub(crate) fn scroll_by(&mut self, rows: isize, total: usize, viewport: usize) {
+            let max_off = total.saturating_sub(viewport);
+            let from = if self.follow_tail {
+                max_off
+            } else {
+                self.scroll_offset.min(max_off)
+            };
+            let to = from.saturating_add_signed(rows).min(max_off);
+            self.scroll_offset = to;
+            if to != from || rows > 0 {
+                self.follow_tail = to == max_off;
+            }
+        }
+
         /// Render a scrollable text pane and return its wrap-aware rendered line count, so callers
         /// can clamp keyboard scrolling consistently with the scrollbar/follow-tail behavior.
         ///
@@ -2355,6 +2792,7 @@ pub mod log_view {
                 title,
                 status,
                 detail,
+                focused,
             } = borders;
             let num_lines = line_index.total_lines();
             let [log_area, scrollbar_area] = Layout::default()
@@ -2388,14 +2826,15 @@ pub mod log_view {
                 .viewport_content_length(viewport_height)
                 .position(self.scroll_offset);
 
-            let (text, paragraph_offset) =
-                window_text(text, line_index, self.scroll_offset, viewport_height);
-            let mut paragraph = Paragraph::new(text);
-            if self.wrap {
-                paragraph = paragraph.wrap(Wrap { trim: false });
-            }
+            let paragraph = content_paragraph(
+                text,
+                line_index,
+                self.scroll_offset,
+                viewport_height,
+                self.wrap,
+            );
 
-            let mut block = Block::default().borders(Borders::ALL).title(title);
+            let mut block = super::pane_block(focused).title(title);
             if let Some(status) = status {
                 block = block.title(status.right_aligned());
             }
@@ -2411,7 +2850,7 @@ pub mod log_view {
                 }
                 block = block.title_bottom(right.right_aligned());
             }
-            let paragraph = paragraph.block(block).scroll((paragraph_offset, 0));
+            let paragraph = paragraph.block(block);
 
             Widget::render(&paragraph, log_area, buf);
 

@@ -143,35 +143,66 @@ pub(super) fn bind(endpoint: &ControlEndpoint) -> Result<Option<EndpointGuard>, 
     }
 }
 
-pub(super) fn bind_project(
-    endpoint: &ControlEndpoint,
+pub(super) fn claim_project(
     config_path: &CanonicalConfigPath,
-) -> Result<Option<EndpointGuard>, ControlError> {
-    bind_project_locked_at(endpoint, &project_lock_path(config_path)?)
+) -> Result<super::ProjectClaim, super::ClaimError> {
+    claim_project_at(&project_lock_path(config_path).map_err(ControlError::from)?)
 }
 
-/// Binds `endpoint` while holding the project lock at `lock_path`.
-fn bind_project_locked_at(
-    endpoint: &ControlEndpoint,
-    lock_path: &Path,
-) -> Result<Option<EndpointGuard>, ControlError> {
+/// Claims the project lock at `lock_path`.
+pub(super) fn claim_project_at(lock_path: &Path) -> Result<super::ProjectClaim, super::ClaimError> {
+    use std::io::{Read as _, Seek as _, Write as _};
     use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 
-    let project_lock = std::fs::OpenOptions::new()
+    let mut project_lock = std::fs::OpenOptions::new()
         .create(true)
         .read(true)
         .write(true)
         .truncate(false)
         .mode(0o600)
-        .open(lock_path)?;
-    project_lock.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        .open(lock_path)
+        .map_err(ControlError::from)?;
+    project_lock
+        .set_permissions(std::fs::Permissions::from_mode(0o600))
+        .map_err(ControlError::from)?;
     match fs2::FileExt::try_lock_exclusive(&project_lock) {
         Ok(()) => {}
-        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
-        Err(err) => return Err(err.into()),
+        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+            // The holder writes its pid right after locking, so a reader rarely sees none.
+            let mut recorded = String::new();
+            let pid = project_lock
+                .read_to_string(&mut recorded)
+                .ok()
+                .and_then(|_| recorded.trim().parse().ok());
+            return Err(super::ClaimError::Held { pid });
+        }
+        Err(err) => return Err(ControlError::from(err).into()),
     }
+    // The pid only names the holder in another start's error; failing to record it is harmless.
+    if let Err(err) = project_lock
+        .set_len(0)
+        .and_then(|()| project_lock.rewind())
+        .and_then(|()| write!(project_lock, "{}", std::process::id()))
+    {
+        tracing::debug!(%err, "cannot record this session's pid in its owner lock");
+    }
+    Ok(super::ProjectClaim {
+        lock: Some(project_lock),
+    })
+}
+
+pub(super) fn bind_project(
+    endpoint: &ControlEndpoint,
+    claim: &super::ProjectClaim,
+) -> Result<Option<EndpointGuard>, ControlError> {
+    // A duplicate descriptor shares the lock instead of taking it again.
+    let project_lock = claim
+        .lock
+        .as_ref()
+        .map(std::fs::File::try_clone)
+        .transpose()?;
     match endpoint {
-        ControlEndpoint::Unix(path) => bind_unix(path, Some(project_lock)),
+        ControlEndpoint::Unix(path) => bind_unix(path, project_lock),
         ControlEndpoint::WindowsNamedPipe(_) => Err(ControlError::Unsupported),
     }
 }
@@ -1236,9 +1267,9 @@ mod tests {
 
     use super::{
         InboundFrameRate, MAX_LOG_TAIL, MAX_UNSOLICITED_SUBSCRIPTION_FRAMES_PER_WINDOW,
-        RESPONSE_MAX_BYTES, SubscriptionPolicy, bind_project_locked_at,
-        bound_follow_response_lines, bound_follow_response_lines_page, bound_health_attempt,
-        bound_health_history, bound_tail_response_lines, describe, encoded_len, lag_replay_changes,
+        RESPONSE_MAX_BYTES, SubscriptionPolicy, bind_project, bound_follow_response_lines,
+        bound_follow_response_lines_page, bound_health_attempt, bound_health_history,
+        bound_tail_response_lines, claim_project_at, describe, encoded_len, lag_replay_changes,
         log_read_error, logs_fit, response_within_frame, stream_changes,
     };
 
@@ -1525,6 +1556,8 @@ mod tests {
         assert_eq!(lines.first().map(|line| line.seq), Some(1));
     }
 
+    /// The owner lock is claimed before any endpoint exists, a second claim names its holder,
+    /// and the endpoint bound under the claim keeps the lock until it is dropped.
     #[tokio::test]
     async fn project_lock_blocks_a_second_endpoint_for_the_same_config() -> eyre::Result<()> {
         use std::os::unix::fs::PermissionsExt as _;
@@ -1536,8 +1569,14 @@ mod tests {
         // directory.
         let project_lock = directory.path().join("project.session.lock");
 
-        let first_guard = bind_project_locked_at(&first, &project_lock)?
-            .ok_or_else(|| eyre::eyre!("lock busy"))?;
+        let claim = claim_project_at(&project_lock)?;
+        let held = claim_project_at(&project_lock);
+        assert!(
+            matches!(held, Err(crate::ClaimError::Held { pid: Some(pid) }) if pid == std::process::id()),
+            "{held:?}"
+        );
+        let first_guard = bind_project(&first, &claim)?.ok_or_else(|| eyre::eyre!("lock busy"))?;
+        drop(claim);
         let ControlEndpoint::Unix(first_path) = &first else {
             eyre::bail!("test endpoint was not Unix");
         };
@@ -1547,9 +1586,12 @@ mod tests {
                 0o600
             );
         }
-        assert!(bind_project_locked_at(&second, &project_lock)?.is_none());
+        assert!(matches!(
+            claim_project_at(&project_lock),
+            Err(crate::ClaimError::Held { .. })
+        ));
         drop(first_guard);
-        assert!(bind_project_locked_at(&second, &project_lock)?.is_some());
+        assert!(bind_project(&second, &claim_project_at(&project_lock)?)?.is_some());
         Ok(())
     }
 

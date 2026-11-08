@@ -81,6 +81,26 @@ pub struct Options {
     pub no_pretty_json_logs: bool,
 
     #[arg(
+        long = "mouse",
+        env = "MICROMUX_MOUSE",
+        global = true,
+        value_name = "on|off",
+        value_parser = clap::builder::BoolishValueParser::new(),
+        help = "capture the mouse in the TUI for clicks, scrolling and selection; overrides `ui: { mouse: ... }` in the project and user configs"
+    )]
+    pub mouse: Option<bool>,
+
+    #[arg(
+        long = "copy-on-select",
+        env = "MICROMUX_COPY_ON_SELECT",
+        global = true,
+        value_name = "on|off",
+        value_parser = clap::builder::BoolishValueParser::new(),
+        help = "copy a mouse selection in the TUI as soon as the drag ends instead of on y or Enter; overrides `ui: { copy_on_select: ... }` in the project and user configs"
+    )]
+    pub copy_on_select: Option<bool>,
+
+    #[arg(
         long = "no-control",
         env = "MICROMUX_NO_CONTROL",
         help = "disable the agent control plane (also configurable via `control: { enabled: false }`)"
@@ -89,6 +109,16 @@ pub struct Options {
 
     #[command(subcommand)]
     pub command: Option<Command>,
+}
+
+impl Options {
+    /// The TUI settings the flags set, which take precedence over the configs.
+    pub(crate) fn ui_setting_flags(&self) -> crate::ui_settings::Layers {
+        crate::ui_settings::Layers {
+            mouse: self.mouse,
+            copy_on_select: self.copy_on_select,
+        }
+    }
 }
 
 /// A micromux subcommand. With no subcommand, micromux runs the TUI for the current project.

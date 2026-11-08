@@ -14,6 +14,7 @@ mod mcp;
 mod options;
 mod proxy;
 mod session_env;
+mod ui_settings;
 
 use clap::Parser;
 use codespan_reporting::diagnostic::Diagnostic;
@@ -54,9 +55,13 @@ enum Error {
     /// condition; the process exits with this code.
     #[error("the command failed with exit code {0}")]
     Exit(i32),
-    /// The session was asked to stop before it started.
+    /// A previous session's cleanups kept this session from starting, or it was asked to stop
+    /// while it waited for them.
     #[error(transparent)]
-    Interrupted(#[from] micromux::CleanupWaitCancelled),
+    CleanupWait(#[from] micromux::CleanupWaitError),
+    /// Another session holds this config.
+    #[error(transparent)]
+    Claim(#[from] micromux_control::ClaimError),
 }
 
 /// Exit status of a session that an interrupt ended before it could stop cleanly, as a shell
@@ -122,6 +127,8 @@ fn spawn_second_interrupt_handler(shutdown: micromux::CancellationToken) {
     tokio::spawn(async move {
         shutdown.cancelled().await;
         if tokio::signal::ctrl_c().await.is_ok() {
+            // The TUI may not have given the terminal back yet, and exiting skips its teardown.
+            micromux_tui::release_terminal();
             eprintln!("exiting; service shims finish the remaining stops and cleanups");
             std::process::exit(EXIT_INTERRUPTED);
         }
@@ -276,6 +283,17 @@ struct Supervisor {
     mux: std::sync::Arc<micromux::Micromux>,
     /// Held so the routes stay registered while the session runs.
     routes: Option<proxy::RouteRegistration>,
+    /// The config's owner lock, which the control plane serves under.
+    claim: Option<micromux_control::ProjectClaim>,
+}
+
+/// Whether a session can run without its config's owner lock when the lock file is unusable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaimPolicy {
+    /// A headless session needs the lock for its control plane anyway.
+    Required,
+    /// The TUI runs without it, as it runs without a control plane.
+    BestEffort,
 }
 
 /// Establishes the session (identity, allocated ports, and the proxy port), builds the
@@ -284,19 +302,37 @@ async fn start_supervisor(
     config: &micromux::ConfigFile<usize>,
     printer: &DiagnosticsPrinter,
     shutdown: &micromux::CancellationToken,
+    claim_policy: ClaimPolicy,
 ) -> Result<Supervisor, Error> {
     // Every service and healthcheck runs under the containment shim, so their process trees die
     // with this supervisor even when it is SIGKILLed.
     micromux::containment::enable(shim_executable()?);
+    // Claim the config before waiting for anything, so a second start for it fails at once
+    // instead of waiting alongside this one and starting the same services.
+    // A stopping session releases its claim as it starts stopping, so its cleanups are waited
+    // for below.
+    let claim = match config
+        .config_path
+        .as_deref()
+        .map(micromux_control::CanonicalConfigPath::new)
+        .transpose()?
+        .map(|config_path| micromux_control::claim_project(&config_path))
+        .transpose()
+    {
+        Ok(claim) => claim,
+        Err(micromux_control::ClaimError::Control(err))
+            if claim_policy == ClaimPolicy::BestEffort =>
+        {
+            tracing::warn!(%err, "cannot claim the config; running without its owner lock");
+            None
+        }
+        Err(err) => return Err(err.into()),
+    };
     // A previous session that died may have left cleanups to its shims, which must finish before
     // this session starts the same services again.
-    micromux::wait_for_previous_cleanups(config, shutdown, |busy| {
-        eprintln!(
-            "waiting for the cleanup of {} from the previous session",
-            busy.join(", ")
-        );
-    })
-    .await?;
+    // The MCP `start_session` tool reads this line from a headless session's stderr to give the
+    // session the time the wait needs.
+    micromux::wait_for_previous_cleanups(config, shutdown, |wait| eprintln!("{wait}")).await?;
     let mut session = micromux::Session::establish(config, &micromux::PortRegistry::user())?;
     proxy::latch_port(&mut session).await?;
     let mux = build_supervisor(config, printer, session)?;
@@ -307,6 +343,7 @@ async fn start_supervisor(
     Ok(Supervisor {
         mux: std::sync::Arc::new(mux),
         routes,
+        claim,
     })
 }
 
@@ -436,9 +473,56 @@ async fn run_command(command: options::Command, options: options::Options) -> Re
     }
 }
 
-async fn run() -> Result<(), Error> {
-    let mut options = options::Options::parse();
-    // Every micromux of an isolated setup must agree on its directory, wherever it starts.
+/// Starts the TUI session's control plane under `claim`, unless the session opted out, and
+/// returns the notice to show when it is unavailable.
+///
+/// Control is default on, with an opt-out via `--no-control` or `control: { enabled: false }`.
+/// The claim is released when `shutdown` fires either way.
+async fn start_tui_control(
+    options: &options::Options,
+    config: &micromux::ConfigFile<usize>,
+    handles: &micromux::Handles,
+    claim: Option<micromux_control::ProjectClaim>,
+    shutdown: &micromux::CancellationToken,
+) -> Result<Option<String>, Error> {
+    if options.no_control || !config.config.control.enabled {
+        control::release_at_shutdown(claim, shutdown.clone());
+        return Ok(None);
+    }
+    let unavailable = || Some("the control plane is unavailable for this session".to_string());
+    let working_dir = std::env::current_dir()?;
+    match control::resolve_config_path(options.config_path.as_deref(), &working_dir).await {
+        Ok(config_path) => Ok(
+            match control::spawn(
+                handles,
+                claim,
+                &config_path,
+                &working_dir,
+                config.config.name.clone(),
+                shutdown.clone(),
+            ) {
+                control::SpawnStatus::Started => None,
+                control::SpawnStatus::OwnedByOther => Some(
+                    "another micromux already owns this project; both copies may run services"
+                        .to_string(),
+                ),
+                control::SpawnStatus::Unavailable => unavailable(),
+            },
+        ),
+        Err(err) => {
+            tracing::warn!(
+                ?err,
+                "control plane disabled: could not resolve config path"
+            );
+            control::release_at_shutdown(claim, shutdown.clone());
+            Ok(unavailable())
+        }
+    }
+}
+
+/// Refuses a relative `MICROMUX_STATE_DIR`: every micromux of an isolated setup must agree on its
+/// directory, wherever it starts.
+fn check_state_dir() -> Result<(), Error> {
     if let Some(state) = std::env::var_os(micromux::STATE_DIR_VARIABLE)
         && !state.is_empty()
         && !std::path::Path::new(&state).is_absolute()
@@ -449,6 +533,12 @@ async fn run() -> Result<(), Error> {
             std::path::Path::new(&state).display()
         )));
     }
+    Ok(())
+}
+
+async fn run() -> Result<(), Error> {
+    let mut options = options::Options::parse();
+    check_state_dir()?;
     // `exec` replaces this process, and the command it runs keeps the caller's open-file limit.
     if !matches!(options.command, Some(options::Command::Exec { .. })) {
         raise_file_descriptor_limit();
@@ -467,49 +557,22 @@ async fn run() -> Result<(), Error> {
     let _log_guard = setup_logging(&options)?;
 
     let LoadedConfig { config, printer } = load_config(&options, color_choice).await?;
+    // Settle the TUI's settings before any service starts, so a broken user config stops nothing.
+    let mouse = ui_settings::mouse_options(
+        options.ui_setting_flags(),
+        Some(&config.config.ui_config),
+        &printer,
+    )
+    .await?;
 
-    let Supervisor { mux, routes } = start_supervisor(&config, &printer, &shutdown).await?;
+    let Supervisor { mux, routes, claim } =
+        start_supervisor(&config, &printer, &shutdown, ClaimPolicy::BestEffort).await?;
     let (runner, handles) = mux.clone().start(shutdown.clone());
     if let Some(routes) = &routes {
         routes.report_to(handles.session.clone(), shutdown.clone());
     }
 
-    // Default-on control plane, opt out via `--no-control` or `control: { enabled: false }`.
-    let mut control_warning = None;
-    if !options.no_control && config.config.control.enabled {
-        let working_dir = std::env::current_dir()?;
-        match control::resolve_config_path(options.config_path.as_deref(), &working_dir).await {
-            Ok(config_path) => {
-                match control::spawn(
-                    &handles,
-                    &config_path,
-                    &working_dir,
-                    config.config.name.clone(),
-                    shutdown.clone(),
-                ) {
-                    control::SpawnStatus::Started => {}
-                    control::SpawnStatus::OwnedByOther => {
-                        control_warning = Some(
-                        "another micromux already owns this project; both copies may run services"
-                            .to_string(),
-                        );
-                    }
-                    control::SpawnStatus::Unavailable => {
-                        control_warning =
-                            Some("the control plane is unavailable for this session".to_string());
-                    }
-                }
-            }
-            Err(err) => {
-                tracing::warn!(
-                    ?err,
-                    "control plane disabled: could not resolve config path"
-                );
-                control_warning =
-                    Some("the control plane is unavailable for this session".to_string());
-            }
-        }
-    }
+    let control_warning = start_tui_control(&options, &config, &handles, claim, &shutdown).await?;
 
     let input = handles.terminal.clone();
     let mut source =
@@ -522,8 +585,9 @@ async fn run() -> Result<(), Error> {
         micromux_tui::SessionSource::Local(source),
         Some(input),
         shutdown.clone(),
-        micromux_tui::LogViewOptions {
+        micromux_tui::ViewOptions {
             pretty_json: config.config.ui_config.pretty_json_logs && !options.no_pretty_json_logs,
+            mouse,
         },
     );
 
@@ -568,7 +632,8 @@ async fn run_headless(options: options::Options) -> Result<(), Error> {
     let color_choice = options.color_choice.unwrap_or(termcolor::ColorChoice::Auto);
     let LoadedConfig { config, printer } = load_config(&options, color_choice).await?;
 
-    let Supervisor { mux, routes } = start_supervisor(&config, &printer, &shutdown).await?;
+    let Supervisor { mux, routes, claim } =
+        start_supervisor(&config, &printer, &shutdown, ClaimPolicy::Required).await?;
     let (runner, handles) = mux.clone().start(shutdown.clone());
     if let Some(routes) = &routes {
         routes.report_to(handles.session.clone(), shutdown.clone());
@@ -581,6 +646,7 @@ async fn run_headless(options: options::Options) -> Result<(), Error> {
         control::resolve_config_path(options.config_path.as_deref(), &working_dir).await?;
     let status = control::spawn(
         &handles,
+        claim,
         &config_path,
         &working_dir,
         config.config.name.clone(),
@@ -634,7 +700,9 @@ async fn async_main() -> color_eyre::Result<()> {
         // The diagnostics already explained the failure; a report with a location and a
         // backtrace hint would make a config typo read like a crash.
         Err(Error::DiagnosticsEmitted) => std::process::exit(1),
-        Err(Error::Interrupted(_)) => std::process::exit(EXIT_INTERRUPTED),
+        Err(Error::CleanupWait(micromux::CleanupWaitError::Cancelled)) => {
+            std::process::exit(EXIT_INTERRUPTED)
+        }
         #[cfg(unix)]
         Err(Error::Proxy(micromux_proxy::ClientError::Cancelled)) => {
             std::process::exit(EXIT_INTERRUPTED)
