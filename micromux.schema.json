@@ -240,7 +240,7 @@
               "type": "integer",
               "minimum": 1024,
               "maximum": 65535,
-              "description": "Port the variable takes whenever no other live session holds it and nothing else listens on it, otherwise falling back to session.port_range. May lie outside the range, but not on a proxy port or another entry's preferred port."
+              "description": "Port the variable takes when no other session, running or stopped, has it assigned and nothing else listens on it, otherwise keeping its previous port or falling back to session.port_range. May lie outside the range, but not on a proxy port or another entry's preferred port."
             }
           }
         }

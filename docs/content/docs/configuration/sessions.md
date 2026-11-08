@@ -48,7 +48,7 @@ allocate_ports:
   - { name: WEB_PORT, prefer: 3000 }
 ```
 
-A session takes the preferred port whenever no other live session holds it and no other process listens on it. Otherwise it keeps the port it had, or gets a new one from `session.port_range`, so a second checkout started while the first runs falls back to the range instead of failing. A session that had to fall back moves to its preferred port at the first start where that port is available. Once a session has its preferred port, it keeps it like any assigned port: if another process holds it at the next start, the session fails to start.
+A session takes the preferred port when no other session, running or stopped, has it assigned and no other process listens on it. Otherwise it keeps the port it had, or gets a new one from `session.port_range`, so a second checkout falls back to the range instead of failing. Once a session has its preferred port, it keeps it like any assigned port, also while it is stopped: a checkout started in the meantime falls back, and if another process holds the port at the next start, the session fails to start. A session that had to fall back moves to its preferred port once no other session claims it, because that session's project was deleted or its config dropped the preference.
 
 The preferred port may lie outside `session.port_range`, but it must be at least `1024`, and two entries cannot prefer the same port, nor a [proxy](#the-proxy) port. Removing `prefer` from an entry keeps its port only if it lies inside the range.
 
@@ -151,7 +151,7 @@ The port a session started with stays its port: if the proxy goes away, the sess
 
 `session` (including `port_range`), `allocate_ports`, `routes`, and `proxy` are read once, when the session starts. A config reload — [`reconcile_config`]({{< relref "../agent-control/control-plane.md" >}}), or a restart that re-reads the config — that changes any of them is rejected; restart the session to apply the change.
 
-`validate_config` never reserves anything. It uses the assignment a session already has, or provisional values for names that were never assigned, and says so in a note.
+`validate_config` never reserves anything. It uses the assignment a session already has, or provisional values for names that were never assigned or may move to their preferred port, and says so in a note.
 
 ## Isolated state
 

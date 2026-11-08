@@ -411,7 +411,7 @@ pub fn validate_config_file(
 /// what goes wrong to `diagnostics`, and returns the ids of the services that materialized.
 ///
 /// Validation never reserves ports: it shows the persisted assignment, or provisional values for
-/// names a session has not been assigned yet.
+/// names a session has not been assigned yet or that may move to their preferred port.
 fn validate_materialization(
     config: &config::ConfigFile<usize>,
     file_id: usize,
@@ -421,7 +421,7 @@ fn validate_materialization(
     if !session.provisional_ports().is_empty() {
         diagnostics.push(
             codespan_reporting::diagnostic::Diagnostic::note().with_message(format!(
-                "no port is assigned yet to {}; validated with provisional values, the \
+                "no final port is known yet for {}; validated with provisional values, the \
                  session assigns real ones when it starts",
                 session.provisional_ports().join(", ")
             )),

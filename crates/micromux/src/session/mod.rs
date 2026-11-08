@@ -335,8 +335,9 @@ impl Session {
     /// Names with a persisted assignment the config still allows use it; every other name gets a
     /// distinct provisional port, listed by [`Self::provisional_ports`], since the next start
     /// assigns it anew.
-    /// A provisional port is the preferred port where the config names one, and otherwise one
-    /// from the port range.
+    /// A name whose persisted port is not its preferred one is provisional too, showing the
+    /// preferred port the next start tries first; other sessions' records are not consulted.
+    /// Every other provisional port comes from the port range.
     /// Crate-private because a preview holds no reservation and must never run services.
     pub(crate) fn preview<F>(config: &ConfigFile<F>, registry: &PortRegistry) -> Self {
         let settings = config.config.session.clone();
@@ -368,22 +369,27 @@ impl Session {
         let mut provisional = Vec::new();
         let mut next = *range.start();
         for request in &requests {
-            let port = if let Some(port) = kept(request) {
-                port
-            } else {
-                provisional.push(request.name.clone());
-                match request.prefer {
-                    Some(prefer) if !kept_ports.contains(&prefer) => prefer,
-                    _ => {
-                        let port = (next..=u16::MAX)
-                            .find(|candidate| {
-                                !reserved.contains(candidate)
-                                    && !ports.values().any(|assigned| assigned == candidate)
-                            })
-                            .unwrap_or(next);
-                        next = port.saturating_add(1);
-                        port
-                    }
+            let kept_port = kept(request);
+            // Mirrors the registry: a preferred port another name keeps is out of reach.
+            let preferred = request
+                .prefer
+                .filter(|prefer| kept_port != Some(*prefer) && !kept_ports.contains(prefer));
+            let port = match (preferred, kept_port) {
+                (Some(prefer), _) => {
+                    provisional.push(request.name.clone());
+                    prefer
+                }
+                (None, Some(port)) => port,
+                (None, None) => {
+                    provisional.push(request.name.clone());
+                    let port = (next..=u16::MAX)
+                        .find(|candidate| {
+                            !reserved.contains(candidate)
+                                && !ports.values().any(|assigned| assigned == candidate)
+                        })
+                        .unwrap_or(next);
+                    next = port.saturating_add(1);
+                    port
                 }
             };
             ports.insert(request.name.clone(), port);
@@ -716,6 +722,26 @@ mod tests {
         );
         assert_eq!(preview.ports().get("WEB"), Some(&40000));
         assert_eq!(preview.ports().get("API"), Some(&40001));
+        Ok(())
+    }
+
+    /// Validation shows a persisted port as provisional when the name now prefers another one,
+    /// since the next start tries the preferred port first, and keeps the other names' ports.
+    #[test]
+    fn previews_show_persisted_fallbacks_as_provisional() -> color_eyre::eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let registry = PortRegistry::at(directory.path());
+        let plain = session_config("allocate_ports: [WEB, API]")?;
+        let preferring = session_config("allocate_ports: [{ name: WEB, prefer: 3000 }, API]")?;
+        let established = Session::establish(&plain, &registry)?;
+        let api = established.ports().get("API").copied();
+        drop(established);
+
+        let preview = Session::preview(&preferring, &registry);
+
+        assert_eq!(preview.provisional_ports(), ["WEB".to_string()]);
+        assert_eq!(preview.ports().get("WEB"), Some(&3000));
+        assert_eq!(preview.ports().get("API").copied(), api);
         Ok(())
     }
 
