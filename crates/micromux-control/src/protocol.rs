@@ -7,6 +7,7 @@
 //! The session and the proxy accept peers that speak the same major protocol version, so
 //! additive payload changes do not orphan already-running sessions.
 
+use base64::Engine as _;
 use micromux::{
     DynamicServiceAck, DynamicServiceParams, HealthAttempt, Lease, LogLine, LogRunSummary,
     ReconcileReceipt, ResolvedEnvironment, ServiceCommandAck, ServiceEvent, ServiceID,
@@ -19,10 +20,25 @@ use serde::{Deserialize, Serialize};
 ///
 /// Bump the minor for additive changes (new optional/defaulted fields, new tools that reuse
 /// existing requests), and bump the major for incompatible request/response semantics.
-pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(3, 17);
+pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(3, 18);
 
 /// The first protocol revision whose sessions answer [`Request::GetEnvironment`].
 pub const ENVIRONMENT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(3, 15);
+
+/// The first protocol revision whose sessions answer [`Request::SendInput`] and
+/// [`Request::ResizeTerminal`].
+pub const TERMINAL_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(3, 18);
+
+/// The largest paste one [`Request::SendInput`] carries.
+///
+/// Its base64 encoding, about a third larger, must fit one [`crate::MAX_FRAME_BYTES`] frame with
+/// room for the envelope, so it stays below the in-process TUI's [`micromux::MAX_PTY_PASTE_BYTES`].
+pub const MAX_REMOTE_PASTE_BYTES: usize = 512 * 1024;
+
+const _: () = assert!(
+    MAX_REMOTE_PASTE_BYTES.div_ceil(3) * 4 + 64 * 1024 <= crate::MAX_FRAME_BYTES,
+    "a maximal remote paste must fit one control frame"
+);
 
 pub(crate) const fn supports_versioned_subscriptions(version: ProtocolVersion) -> bool {
     version.major() == PROTOCOL_VERSION.major() && version.minor() >= 7
@@ -202,6 +218,34 @@ pub enum Request {
         /// field: omission must never silently mean "apply".
         dry_run: bool,
     },
+    /// Write bytes to a service's PTY, as typed into an attached TUI.
+    ///
+    /// Sessions answer it from protocol [`TERMINAL_PROTOCOL_VERSION`] on; older ones reject it as a
+    /// bad request.
+    /// Input from every client, the session's own TUI included, is written in the order the
+    /// session receives it, and one request's bytes are written contiguously.
+    /// The MCP server never sends it: agents get no tool that types into a service.
+    SendInput {
+        /// Target service id, matched exactly.
+        service: ServiceID,
+        /// The bytes to write, at most [`micromux::MAX_PTY_INPUT_BATCH_BYTES`] unless `paste` is
+        /// set.
+        data: InputBytes,
+        /// Whether the bytes are one paste, which may be up to [`MAX_REMOTE_PASTE_BYTES`].
+        #[serde(default)]
+        paste: bool,
+    },
+    /// Resize every service PTY in the session.
+    ///
+    /// Sessions answer it from protocol [`TERMINAL_PROTOCOL_VERSION`] on.
+    /// The last resize the session receives wins, whichever client sent it, the session's own TUI
+    /// included, and runs started later take that size too.
+    ResizeTerminal {
+        /// Columns, at least one.
+        cols: u16,
+        /// Rows, at least one.
+        rows: u16,
+    },
     /// Stop the whole session: stop every service and exit the session process (graceful, like the
     /// operator pressing Ctrl-C), freeing its ports. Acknowledged with [`Response::ShuttingDown`]
     /// just before the endpoint goes away.
@@ -236,6 +280,69 @@ impl Request {
                 | Self::GetEnvironment { .. }
                 | Self::ReconcileConfig { dry_run: true }
         )
+    }
+}
+
+/// Raw PTY input carried by [`Request::SendInput`].
+///
+/// It travels as standard padded base64, so arbitrary bytes, control characters included, take a
+/// predictable share of a frame.
+/// Its `Debug` output names only the length, because the bytes may be a typed password.
+#[derive(Clone, PartialEq, Eq)]
+pub struct InputBytes(Vec<u8>);
+
+impl InputBytes {
+    /// The raw bytes.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    /// Consumes the wrapper, returning the raw bytes.
+    #[must_use]
+    pub fn into_inner(self) -> Vec<u8> {
+        self.0
+    }
+}
+
+impl From<Vec<u8>> for InputBytes {
+    fn from(bytes: Vec<u8>) -> Self {
+        Self(bytes)
+    }
+}
+
+impl std::fmt::Debug for InputBytes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "InputBytes({} bytes)", self.0.len())
+    }
+}
+
+impl Serialize for InputBytes {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&base64::engine::general_purpose::STANDARD.encode(&self.0))
+    }
+}
+
+impl<'de> Deserialize<'de> for InputBytes {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let encoded = String::deserialize(deserializer)?;
+        base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .map(Self)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+impl JsonSchema for InputBytes {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "InputBytes".into()
+    }
+
+    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({
+            "type": "string",
+            "contentEncoding": "base64",
+        })
     }
 }
 
@@ -463,6 +570,12 @@ pub enum Response {
     Environment(ResolvedEnvironment),
     /// A streamed change notification (only after [`Request::Subscribe`]).
     Change(SessionChange),
+    /// Reply to [`Request::SendInput`] and [`Request::ResizeTerminal`]: the session queued the input
+    /// or resize for its PTYs.
+    ///
+    /// Input for a service without a running PTY is dropped later, and recorded as an
+    /// `InputDropped` service event.
+    TerminalQueued,
     /// Acknowledgement of [`Request::Shutdown`], written just before the session begins exiting.
     ShuttingDown,
     /// A typed error.
@@ -524,7 +637,7 @@ mod tests {
     fn protocol_version_uses_major_minor_shape_and_accepts_same_major() {
         assert_eq!(
             serde_json::to_value(PROTOCOL_VERSION).unwrap(),
-            json!({ "major": 3, "minor": 17 })
+            json!({ "major": 3, "minor": 18 })
         );
         assert_eq!(
             serde_json::from_value::<ProtocolVersion>(json!({ "major": 1, "minor": 0 })).unwrap(),
@@ -547,6 +660,96 @@ mod tests {
         assert!(!ProtocolVersion::new(3, 14).supports(ENVIRONMENT_PROTOCOL_VERSION));
         assert!(!ProtocolVersion::new(4, 15).supports(ENVIRONMENT_PROTOCOL_VERSION));
         assert!(PROTOCOL_VERSION.supports(ENVIRONMENT_PROTOCOL_VERSION));
+    }
+
+    /// A session answers terminal requests only from 3.18 on, and never across a major line.
+    #[test]
+    fn terminal_requests_require_protocol_3_18_on_the_same_major_line() {
+        assert!(ProtocolVersion::new(3, 18).supports(TERMINAL_PROTOCOL_VERSION));
+        assert!(!ProtocolVersion::new(3, 17).supports(TERMINAL_PROTOCOL_VERSION));
+        assert!(!ProtocolVersion::new(4, 18).supports(TERMINAL_PROTOCOL_VERSION));
+        assert!(PROTOCOL_VERSION.supports(TERMINAL_PROTOCOL_VERSION));
+    }
+
+    /// Input travels as base64, so control and non-UTF-8 bytes survive the JSON frame unchanged.
+    #[test]
+    fn send_input_round_trips_arbitrary_bytes_as_base64() -> serde_json::Result<()> {
+        let bytes = vec![0x1b, b'[', b'A', 0x00, 0xff, b'\r'];
+        let request = Request::SendInput {
+            service: "shell".to_string(),
+            data: InputBytes::from(bytes.clone()),
+            paste: true,
+        };
+
+        let encoded = serde_json::to_value(&request)?;
+        assert_eq!(
+            encoded,
+            json!({ "SendInput": { "service": "shell", "data": "G1tBAP8N", "paste": true } })
+        );
+        assert_matches!(
+            serde_json::from_value::<Request>(encoded)?,
+            Request::SendInput { service, data, paste: true }
+                if service == "shell" && data.as_bytes() == bytes.as_slice()
+        );
+
+        // `paste` is additive and defaults to key input.
+        assert_matches!(
+            serde_json::from_value::<Request>(
+                json!({ "SendInput": { "service": "shell", "data": "" } })
+            )?,
+            Request::SendInput { data, paste: false, .. } if data.as_bytes().is_empty()
+        );
+        assert!(
+            serde_json::from_value::<Request>(
+                json!({ "SendInput": { "service": "shell", "data": "not base64!" } })
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+
+    /// Debug output reaches logs and "unexpected response" messages, so it must never carry
+    /// typed bytes, which may be a password.
+    #[test]
+    fn send_input_debug_output_names_only_the_length() {
+        let request = Request::SendInput {
+            service: "shell".to_string(),
+            data: InputBytes::from(b"hunter2".to_vec()),
+            paste: false,
+        };
+
+        let debug = format!("{request:?}");
+
+        assert!(debug.contains("7 bytes"), "{debug}");
+        assert!(!debug.contains("hunter2"), "{debug}");
+        assert!(!debug.contains("104"), "{debug}");
+    }
+
+    #[test]
+    fn resize_and_terminal_acknowledgement_round_trip() -> serde_json::Result<()> {
+        let encoded = serde_json::to_value(Request::ResizeTerminal {
+            cols: 120,
+            rows: 40,
+        })?;
+        assert_eq!(
+            encoded,
+            json!({ "ResizeTerminal": { "cols": 120, "rows": 40 } })
+        );
+        assert_matches!(
+            serde_json::from_value::<Request>(encoded)?,
+            Request::ResizeTerminal {
+                cols: 120,
+                rows: 40
+            }
+        );
+
+        let encoded = serde_json::to_value(Response::TerminalQueued)?;
+        assert_eq!(encoded, json!("TerminalQueued"));
+        assert_matches!(
+            serde_json::from_value::<Response>(encoded)?,
+            Response::TerminalQueued
+        );
+        Ok(())
     }
 
     #[test]
@@ -809,7 +1012,7 @@ mod tests {
     fn protocol_version_ignores_additive_fields() {
         let version = serde_json::from_value::<ProtocolVersion>(json!({
             "major": 3,
-            "minor": 17,
+            "minor": 18,
             "future_capability": true
         }))
         .unwrap();
@@ -830,6 +1033,16 @@ mod tests {
         assert!(!Request::RestartAll.is_retry_safe());
         assert!(!Request::ReconcileConfig { dry_run: false }.is_retry_safe());
         assert!(!Request::Shutdown.is_retry_safe());
+        // A replayed keystroke would type twice.
+        assert!(
+            !Request::SendInput {
+                service: "api".to_string(),
+                data: InputBytes::from(b"y".to_vec()),
+                paste: false,
+            }
+            .is_retry_safe()
+        );
+        assert!(!Request::ResizeTerminal { cols: 80, rows: 24 }.is_retry_safe());
     }
 
     #[test]

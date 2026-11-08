@@ -314,8 +314,8 @@ fn print_response(response: &Response) -> Result<(), crate::Error> {
         Response::ShuttingDown => {
             println!("session is shutting down");
         }
-        // `ctl` never subscribes or asks for environment values.
-        Response::Change(_) | Response::Environment(_) => {}
+        // `ctl` never subscribes, asks for environment values, or drives service terminals.
+        Response::Change(_) | Response::Environment(_) | Response::TerminalQueued => {}
     }
     Ok(())
 }

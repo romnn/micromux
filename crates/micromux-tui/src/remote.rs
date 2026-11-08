@@ -7,11 +7,13 @@ use std::time::Duration;
 use futures::FutureExt as _;
 use indexmap::IndexMap;
 use micromux::{
-    CancellationToken, ChangeKind, HealthAttempt, LogLine, ServiceCommandAck, ServiceID,
-    ServiceSnapshot, SessionChange,
+    CancellationToken, ChangeKind, HealthAttempt, LogLine, PreparedPtyInput, PtyInputKind,
+    ServiceCommandAck, ServiceID, ServiceSnapshot, SessionChange, TerminalControl,
+    TerminalForwarding, TerminalSize,
 };
 use micromux_control::{
-    Client, ControlEndpoint, ControlError, ErrorCode, Request, Response, SessionInfo, Subscription,
+    Client, ControlEndpoint, ControlError, ErrorCode, InputBytes, MAX_REMOTE_PASTE_BYTES, Request,
+    Response, SessionInfo, Subscription, TERMINAL_PROTOCOL_VERSION,
 };
 use parking_lot::RwLock;
 use tokio::sync::{broadcast, mpsc};
@@ -28,10 +30,13 @@ const STABLE_CONNECTION_DURATION: Duration = Duration::from_secs(30);
 const SESSION_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 
 /// A synchronous mirror of a remote session, maintained by one background task.
+///
+/// The same task forwards PTY input and resizes from [`RemoteSource::terminal`] to the session.
 pub struct RemoteSource {
     store: Arc<RwLock<MirrorStore>>,
     changes: broadcast::Sender<SessionChange>,
     commands: mpsc::UnboundedSender<RemoteCommand>,
+    terminal: TerminalControl,
     shutdown: CancellationToken,
 }
 
@@ -51,6 +56,12 @@ struct MirrorEntry {
     // Manual restarts clear visible logs without resetting their sequence. The acknowledged
     // generation distinguishes that clear from an automatic restart, which retains logs.
     clear_logs_after_generation: Option<u64>,
+}
+
+/// What the TUI asks of the session, drained by the mirror task.
+struct RemoteInbox {
+    commands: mpsc::UnboundedReceiver<RemoteCommand>,
+    terminal: TerminalForwarding,
 }
 
 enum RemoteCommand {
@@ -146,12 +157,16 @@ impl RemoteSource {
         publish_full_refresh(&changes, &service_ids);
 
         let (commands, command_rx) = mpsc::unbounded_channel();
+        let (terminal, forwarding) = TerminalControl::forwarding(MAX_REMOTE_PASTE_BYTES);
         let shutdown = CancellationToken::new();
         tokio::spawn(run_remote(
             endpoint,
             Arc::clone(&store),
             changes.clone(),
-            command_rx,
+            RemoteInbox {
+                commands: command_rx,
+                terminal: forwarding,
+            },
             shutdown.clone(),
             request,
             subscription,
@@ -161,8 +176,22 @@ impl RemoteSource {
             store,
             changes,
             commands,
+            terminal,
             shutdown,
         })
+    }
+
+    /// Returns a capability that types into the session's services and resizes their PTYs.
+    ///
+    /// It is `None` when the session predates [`TERMINAL_PROTOCOL_VERSION`].
+    /// Input reaches the session in the order it was sent, over the same connection as the
+    /// mirror's lifecycle commands, and other clients' input interleaves with it only between
+    /// requests.
+    /// The last resize the session receives, from any client, sets every PTY's size.
+    /// Input sent while the mirror is reconnecting is discarded rather than replayed later.
+    #[must_use]
+    pub fn terminal(&self) -> Option<TerminalControl> {
+        accepts_terminal(&self.store.read().session).then(|| self.terminal.clone())
     }
 
     pub(crate) fn attachment_status(&self) -> AttachmentStatus {
@@ -281,7 +310,7 @@ async fn run_remote(
     endpoint: ControlEndpoint,
     store: Arc<RwLock<MirrorStore>>,
     changes: broadcast::Sender<SessionChange>,
-    mut commands: mpsc::UnboundedReceiver<RemoteCommand>,
+    mut inbox: RemoteInbox,
     shutdown: CancellationToken,
     mut request: Client,
     mut subscription: Subscription,
@@ -294,7 +323,7 @@ async fn run_remote(
             &mut subscription,
             &store,
             &changes,
-            &mut commands,
+            &mut inbox,
             &shutdown,
         )
         .await
@@ -306,11 +335,20 @@ async fn run_remote(
             backoff.reset();
         }
 
+        let previous_session = store.read().session.clone();
+        let mut discarded_input = false;
         loop {
-            let delay = backoff.next_delay();
-            tokio::select! {
-                () = shutdown.cancelled() => return,
-                () = tokio::time::sleep(delay) => {}
+            let wait = tokio::time::sleep(backoff.next_delay());
+            tokio::pin!(wait);
+            loop {
+                tokio::select! {
+                    () = shutdown.cancelled() => return,
+                    () = &mut wait => break,
+                    Some(input) = inbox.terminal.input.recv() => {
+                        drop(input);
+                        discarded_input = true;
+                    }
+                }
             }
 
             let established = tokio::select! {
@@ -329,6 +367,23 @@ async fn run_remote(
                 }
             }
         }
+
+        while let Ok(input) = inbox.terminal.input.try_recv() {
+            drop(input);
+            discarded_input = true;
+        }
+        if discarded_input {
+            record_notice(
+                &store,
+                &changes,
+                "terminal input typed while reconnecting was discarded".to_string(),
+            );
+        }
+        // A replacement session starts its PTYs at its own default size, so assert ours again.
+        // The same session still holds the last size it received, which may be another client's.
+        if !store.read().session.is_same_instance(&previous_session) {
+            inbox.terminal.size.mark_changed();
+        }
     }
 }
 
@@ -337,7 +392,7 @@ async fn run_connected(
     subscription: &mut Subscription,
     store: &Arc<RwLock<MirrorStore>>,
     changes: &broadcast::Sender<SessionChange>,
-    commands: &mut mpsc::UnboundedReceiver<RemoteCommand>,
+    inbox: &mut RemoteInbox,
     shutdown: &CancellationToken,
 ) -> ConnectedLoopExit {
     // The session's routing status changes without any service event, so poll its description.
@@ -356,11 +411,31 @@ async fn run_connected(
                     Err(err) => record_notice(store, changes, err.to_string()),
                 }
             }
-            command = commands.recv() => {
+            command = inbox.commands.recv() => {
                 let Some(command) = command else {
                     return ConnectedLoopExit::Shutdown;
                 };
                 if let Err(err) = execute_command(request, store, changes, command).await {
+                    if reconnect_after_refresh_error(&err) {
+                        return ConnectedLoopExit::Reconnect;
+                    }
+                    record_notice(store, changes, err.to_string());
+                }
+            }
+            Some(input) = inbox.terminal.input.recv() => {
+                if let Err(err) = forward_input(request, store, changes, input).await {
+                    if reconnect_after_refresh_error(&err) {
+                        return ConnectedLoopExit::Reconnect;
+                    }
+                    record_notice(store, changes, err.to_string());
+                }
+            }
+            Ok(()) = inbox.terminal.size.changed() => {
+                let size = *inbox.terminal.size.borrow_and_update();
+                let Some(size) = size else {
+                    continue;
+                };
+                if let Err(err) = forward_resize(request, store, changes, size).await {
                     if reconnect_after_refresh_error(&err) {
                         return ConnectedLoopExit::Reconnect;
                     }
@@ -795,6 +870,86 @@ async fn execute_command(
     Ok(())
 }
 
+fn accepts_terminal(session: &SessionInfo) -> bool {
+    session.protocol_version.supports(TERMINAL_PROTOCOL_VERSION)
+}
+
+/// Sends one prepared input to the session, keeping its byte reservation until the session has
+/// queued it, so the forwarding budgets also bound input in flight.
+async fn forward_input<C: RequestConnection>(
+    request: &mut C,
+    store: &Arc<RwLock<MirrorStore>>,
+    changes: &broadcast::Sender<SessionChange>,
+    input: PreparedPtyInput,
+) -> Result<(), ControlError> {
+    // A reconnect may land on an older session than the one the TUI checked at startup.
+    if !accepts_terminal(&store.read().session) {
+        record_notice(
+            store,
+            changes,
+            "input discarded: this session does not accept terminal input".to_string(),
+        );
+        return Ok(());
+    }
+    let response = request
+        .request(Request::SendInput {
+            service: input.service_id().to_string(),
+            data: InputBytes::from(input.data().to_vec()),
+            paste: input.kind() == PtyInputKind::Paste,
+        })
+        .await?;
+    drop(input);
+    settle_terminal_response(store, changes, response);
+    Ok(())
+}
+
+async fn forward_resize<C: RequestConnection>(
+    request: &mut C,
+    store: &Arc<RwLock<MirrorStore>>,
+    changes: &broadcast::Sender<SessionChange>,
+    size: TerminalSize,
+) -> Result<(), ControlError> {
+    if !accepts_terminal(&store.read().session) {
+        return Ok(());
+    }
+    let TerminalSize { cols, rows } = size;
+    let response = request
+        .request(Request::ResizeTerminal { cols, rows })
+        .await?;
+    settle_terminal_response(store, changes, response);
+    Ok(())
+}
+
+/// Shows a refused input or resize in the header, and clears the notice once one succeeds again.
+///
+/// A success publishes nothing while there is no notice, so keystrokes do not wake the TUI for
+/// nothing.
+fn settle_terminal_response(
+    store: &Arc<RwLock<MirrorStore>>,
+    changes: &broadcast::Sender<SessionChange>,
+    response: Response,
+) {
+    let notice = match response {
+        Response::TerminalQueued => None,
+        Response::Error { message, .. } => Some(message),
+        other => Some(format!("unexpected control response: {other:?}")),
+    };
+    {
+        let mut guard = store.write();
+        if notice.is_none() && guard.notice.is_none() {
+            return;
+        }
+        guard.notice = notice;
+    }
+    publish(
+        changes,
+        SessionChange {
+            service_id: SessionChange::SESSION_WIDE.to_string(),
+            kind: ChangeKind::Status,
+        },
+    );
+}
+
 fn mark_pending_log_clears(store: &Arc<RwLock<MirrorStore>>, services: &[ServiceCommandAck]) {
     let mut guard = store.write();
     for acknowledgement in services {
@@ -1040,10 +1195,12 @@ mod tests {
     fn source_for(store: Arc<RwLock<MirrorStore>>) -> RemoteSource {
         let (changes, _) = broadcast::channel(8);
         let (commands, _) = mpsc::unbounded_channel();
+        let (terminal, _) = TerminalControl::forwarding(MAX_REMOTE_PASTE_BYTES);
         RemoteSource {
             store,
             changes,
             commands,
+            terminal,
             shutdown: CancellationToken::new(),
         }
     }
@@ -1221,6 +1378,111 @@ mod tests {
             request.requests.first(),
             Some(Request::FollowLogs { after: Some(6), .. })
         ));
+        Ok(())
+    }
+
+    /// Forwarded input names its service and kind, and a refusal shows in the header until the
+    /// next input succeeds.
+    #[tokio::test]
+    async fn forwarded_input_reports_refusals_until_input_succeeds() -> eyre::Result<()> {
+        let store = store_with(entry_with_log(1, "line"));
+        let (changes, mut received) = broadcast::channel(8);
+        let (terminal, _forwarding) = TerminalControl::forwarding(MAX_REMOTE_PASTE_BYTES);
+        let mut request = ScriptedConnection::new([
+            Response::error(ErrorCode::LimitExceeded, "backlog is full"),
+            Response::TerminalQueued,
+            Response::TerminalQueued,
+        ]);
+
+        let paste = terminal.prepare_paste("svc".to_string(), b"pasted".to_vec())?;
+        forward_input(&mut request, &store, &changes, paste).await?;
+        assert_eq!(store.read().notice.as_deref(), Some("backlog is full"));
+        assert_eq!(received.try_recv()?.kind, ChangeKind::Status);
+
+        let key = terminal.prepare_input("svc".to_string(), b"k".to_vec())?;
+        forward_input(&mut request, &store, &changes, key).await?;
+        assert_eq!(store.read().notice, None);
+        assert_eq!(received.try_recv()?.kind, ChangeKind::Status);
+
+        // With no notice to clear, a success does not wake the TUI.
+        let key = terminal.prepare_input("svc".to_string(), b"j".to_vec())?;
+        forward_input(&mut request, &store, &changes, key).await?;
+        assert_matches!(
+            received.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        );
+
+        assert_matches!(
+            request.requests.as_slice(),
+            [
+                Request::SendInput { service: first, data: pasted, paste: true },
+                Request::SendInput { paste: false, .. },
+                Request::SendInput { data: last, paste: false, .. },
+            ] if first == "svc" && pasted.as_bytes() == b"pasted" && last.as_bytes() == b"j"
+        );
+        Ok(())
+    }
+
+    /// A session older than the terminal protocol never sees input or resizes, which it would
+    /// reject as malformed and close the mirror's connection over.
+    #[tokio::test]
+    async fn older_sessions_never_receive_terminal_requests() -> eyre::Result<()> {
+        let store = store_with(entry_with_log(1, "line"));
+        store.write().session.protocol_version = micromux_control::ProtocolVersion::new(3, 17);
+        let (changes, _received) = broadcast::channel(8);
+        let (terminal, _forwarding) = TerminalControl::forwarding(MAX_REMOTE_PASTE_BYTES);
+        let source = source_for(Arc::clone(&store));
+        assert!(source.terminal().is_none());
+        let mut request = ScriptedConnection::new([]);
+
+        let key = terminal.prepare_input("svc".to_string(), b"k".to_vec())?;
+        forward_input(&mut request, &store, &changes, key).await?;
+        forward_resize(
+            &mut request,
+            &store,
+            &changes,
+            TerminalSize { cols: 80, rows: 24 },
+        )
+        .await?;
+
+        assert!(request.requests.is_empty());
+        assert!(
+            store
+                .read()
+                .notice
+                .as_deref()
+                .is_some_and(|notice| notice.contains("does not accept terminal input"))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn forwarded_resize_carries_the_latest_size() -> eyre::Result<()> {
+        let store = store_with(entry_with_log(1, "line"));
+        let (changes, _received) = broadcast::channel(8);
+        let source = source_for(Arc::clone(&store));
+        assert!(source.terminal().is_some());
+        let mut request = ScriptedConnection::new([Response::TerminalQueued]);
+
+        forward_resize(
+            &mut request,
+            &store,
+            &changes,
+            TerminalSize {
+                cols: 132,
+                rows: 43,
+            },
+        )
+        .await?;
+
+        assert_matches!(
+            request.requests.as_slice(),
+            [Request::ResizeTerminal {
+                cols: 132,
+                rows: 43
+            }]
+        );
+        assert_eq!(store.read().notice, None);
         Ok(())
     }
 

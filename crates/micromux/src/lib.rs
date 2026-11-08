@@ -80,7 +80,8 @@ pub use scheduler::{
     MAX_PTY_INPUT_BATCH_BYTES, MAX_PTY_PASTE_BYTES, OutputStream, PreparedPtyInput, PtyInputKind,
     PtyInputPrepareError, PtyInputSendError, ReconcileAction, ReconcileActionKind,
     ReconcileReceipt, ReconcileResult, ResolvedEnvironment, SchedulerStopped, ServiceCommandAck,
-    ServiceCommandResult, ServiceControl, ServiceID, TerminalControl,
+    ServiceCommandResult, ServiceControl, ServiceID, TerminalControl, TerminalForwarding,
+    TerminalSize,
 };
 pub use service::{
     Error as ServiceError, RestartPolicy, Site as ServiceSite, SkipReason as EnvFileSkipReason,
@@ -511,13 +512,14 @@ pub struct Micromux {
 ///
 /// The model writer never escapes the core, so the only handles an adapter can hold are the read
 /// capability and narrow command capabilities. The policy-enforcing [`ServiceControl`] port has no
-/// input forwarding; the trusted in-process TUI also receives [`Handles::terminal`].
+/// input forwarding; the trusted in-process TUI, and the control server on behalf of attached
+/// TUIs, also receive [`Handles::terminal`].
 pub struct Handles {
     /// Read capability over the session model: query + `subscribe`.
     pub reader: SessionModelReader,
     /// Full trusted in-process lifecycle command sender for the TUI/CLI.
     pub commands: mpsc::Sender<Command>,
-    /// Bounded PTY-input and resize capability for the in-process TUI.
+    /// Bounded PTY-input and resize capability for the in-process TUI and attached TUIs.
     pub terminal: TerminalControl,
     /// Dynamic-service limits latched when the session started.
     pub dynamic_services: DynamicServicesPolicy,

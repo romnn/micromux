@@ -45,6 +45,7 @@ pub(crate) use types::{LogUpdateKind, ProcessEvent, RunId, State};
 mod input;
 pub use input::{
     PreparedPtyInput, PtyInputKind, PtyInputPrepareError, PtyInputSendError, TerminalControl,
+    TerminalForwarding, TerminalSize,
 };
 
 #[path = "scheduler/control.rs"]

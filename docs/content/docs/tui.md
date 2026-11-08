@@ -177,7 +177,14 @@ micromux attach --session name:my-project
 
 A selector may be a bare session name or `name:`, `pid:`, or `hash:`. More than one attach client can observe and operate the same session at once.
 
-An attached TUI follows service status, logs, and healthchecks, and its lifecycle keys (`r`, `R`, `d`) still restart, enable, and disable services. In v1 it does **not** forward service PTY input or terminal-resize events.
+An attached TUI follows service status, logs, and healthchecks, and its lifecycle keys (`r`, `R`, `d`) still restart, enable, and disable services. `a` types into the selected service as it does locally, so an interactive service of a headless session can be driven from an attached TUI.
+
+With several clients on one session, the last writer wins:
+
+- **Resizes.** Every service PTY takes the size of the most recent resize the session receives, from any client: an attached TUI when it starts and whenever its log pane changes size, and the session's own TUI likewise. Detaching does not restore an earlier size; the next resize from any client sets it.
+- **Input.** Keystrokes and pastes from every client reach the service in the order the session receives them, with no lock or turn-taking, like two terminals typing into one tmux pane. Each client's input stays in its own order, and one batch of keys or one paste is written whole, never split by another client's. Input typed while an attached TUI shows `reconnecting…` is discarded rather than sent later.
+
+An attached paste is limited to 512 KiB, half the local limit, so it fits one control-protocol message. A session older than micromux's protocol 3.18 accepts no input or resizes; `a` is then unavailable.
 
 > [!NOTE]
 > Pressing `q` in an attached client only **detaches** it — it never stops the session or its services. To stop a headless session explicitly, use `micromux ctl stop` or the MCP `stop_session` tool.

@@ -3,8 +3,9 @@
 //! The server holds two model capabilities — a [`SessionModelReader`] (queries + `subscribe`) and a
 //! [`ServiceControl`] (mutations and the environment read) — plus the session's shutdown token
 //! (passed to `serve`), which a `Request::Shutdown` cancels to stop the whole session.
-//! It has no model writer, so a request becomes a write only after the scheduler processes it,
-//! and no terminal port, so PTY input and resize requests are not expressible.
+//! It has no model writer, so a request becomes a write only after the scheduler processes it.
+//! PTY input and resize requests reach the session only through the [`TerminalControl`] given to
+//! [`ControlServer::with_terminal`]; without one the server refuses them.
 
 #[cfg(not(unix))]
 #[path = "server/unsupported.rs"]
@@ -18,7 +19,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use micromux::{ServiceControl, SessionModelReader};
+use micromux::{ServiceControl, SessionModelReader, TerminalControl};
 use tokio_util::sync::CancellationToken;
 
 use crate::ControlError;
@@ -216,6 +217,7 @@ pub struct ControlServer {
     identity: SessionIdentity,
     dynamic_policy: micromux::DynamicServicesPolicy,
     session: Option<micromux::SessionStatus>,
+    terminal: Option<TerminalControl>,
 }
 
 impl ControlServer {
@@ -233,6 +235,7 @@ impl ControlServer {
             identity,
             dynamic_policy,
             session: None,
+            terminal: None,
         }
     }
 
@@ -240,6 +243,16 @@ impl ControlServer {
     #[must_use]
     pub fn with_session_status(mut self, session: micromux::SessionStatus) -> Self {
         self.session = Some(session);
+        self
+    }
+
+    /// Forwards attached TUIs' PTY input and resizes to the session through `terminal`.
+    ///
+    /// Clones share their byte budgets, so remote input counts against the same session-wide and
+    /// per-service limits as the session's own TUI.
+    #[must_use]
+    pub fn with_terminal(mut self, terminal: TerminalControl) -> Self {
+        self.terminal = Some(terminal);
         self
     }
 

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **`micromux attach` types into services and resizes their PTYs.** Press `a` in an attached TUI;
+  the most recent resize from any client sets the size.
 - **The TUI draws with your terminal theme's colors instead of fixed ones,** so it stays
   readable in light and dark themes alike. A `▶` in the service's status color marks the selected
   service.

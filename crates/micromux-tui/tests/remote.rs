@@ -33,6 +33,13 @@ services:
     command: ["sh", "-c", "echo attached-line-$$; while true; do echo tick; sleep 0.1; done"]
 "#;
 
+/// An interactive service that reports its PTY size after each line it reads.
+const INTERACTIVE_YAML: &str = r#"version: 1
+services:
+  svc:
+    command: ["sh", "-c", "while read line; do echo got:$$line; stty size; done"]
+"#;
+
 fn unique_dir(prefix: &str) -> eyre::Result<tempfile::TempDir> {
     Ok(tempfile::Builder::new()
         .prefix(&format!("micromux-tui-{prefix}-"))
@@ -81,12 +88,15 @@ fn build_session(dir: &Path, yaml: &str) -> eyre::Result<Session> {
     let identity = SessionIdentity::new("attach-test".to_string(), dir, &config_path);
     let service_control = handles.service_control();
     let reader = handles.reader.clone();
-    let server = Arc::new(ControlServer::new(
-        handles.reader,
-        service_control,
-        identity,
-        handles.dynamic_services,
-    ));
+    let server = Arc::new(
+        ControlServer::new(
+            handles.reader,
+            service_control,
+            identity,
+            handles.dynamic_services,
+        )
+        .with_terminal(handles.terminal),
+    );
     tokio::spawn({
         let shutdown = shutdown.clone();
         async move { server.serve(guard, shutdown).await }
@@ -158,6 +168,41 @@ async fn remote_source_observes_logs_and_restart_generation() -> eyre::Result<()
             eyre::bail!("remote source did not observe the restart generation");
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    source.cancel();
+    session.shutdown.cancel();
+    Ok(())
+}
+
+/// An attached TUI types into a service and resizes its PTY through the mirror's terminal, and
+/// sees the result through the mirror's logs.
+#[tokio::test]
+async fn remote_terminal_types_into_and_resizes_the_service() -> eyre::Result<()> {
+    let dir = unique_dir("remote-terminal")?;
+    let session = build_session(dir.path(), INTERACTIVE_YAML)?;
+    let source = RemoteSource::connect(session.endpoint.clone()).await?;
+    let terminal = source
+        .terminal()
+        .ok_or_else(|| eyre::eyre!("a current session accepts terminal input"))?;
+    wait_for_running(&source).await?;
+
+    assert!(terminal.try_resize(120, 33));
+    // The resize and the input travel separately, so keep typing until a line reports the size.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let input = terminal.prepare_input("svc".to_string(), b"ping\r".to_vec())?;
+        terminal.try_send(input)?;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let lines = source.logs_since("svc", 0).1;
+        let echoed = lines.iter().any(|line| line.line.trim() == "got:ping");
+        let resized = lines.iter().any(|line| line.line.trim() == "33 120");
+        if echoed && resized {
+            break;
+        }
+        if Instant::now() >= deadline {
+            eyre::bail!("the service did not report the forwarded input and size");
+        }
     }
 
     source.cancel();

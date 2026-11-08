@@ -37,6 +37,8 @@ struct Session {
     reader: micromux::SessionModelReader,
     /// The live summary the TUI reads in process.
     status: micromux::SessionStatus,
+    /// The terminal capability the session's own TUI would hold.
+    terminal: micromux::TerminalControl,
     shutdown: CancellationToken,
     _runner: tokio::task::JoinHandle<Result<(), micromux::Error>>,
 }
@@ -103,7 +105,8 @@ fn build_session_with(
             identity,
             handles.dynamic_services.clone(),
         )
-        .with_session_status(handles.session.clone()),
+        .with_session_status(handles.session.clone())
+        .with_terminal(handles.terminal.clone()),
     );
     tokio::spawn({
         let shutdown = shutdown.clone();
@@ -114,6 +117,7 @@ fn build_session_with(
         endpoint,
         reader: handles.reader,
         status: handles.session,
+        terminal: handles.terminal,
         shutdown,
         _runner: runner,
     })
@@ -369,6 +373,99 @@ where
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+}
+
+fn has_log_line(reader: &micromux::SessionModelReader, expected: &str) -> bool {
+    reader
+        .logs("svc", None)
+        .iter()
+        .any(|line| line.line.trim() == expected)
+}
+
+/// Sends `request` over `client` until the service logs `expected`, because input written before
+/// a resize the scheduler has not applied yet, or before the service runs, cannot produce it.
+async fn send_until_logged(
+    client: &mut Client,
+    reader: &micromux::SessionModelReader,
+    request: Request,
+    expected: &str,
+) -> eyre::Result<()> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let response = client.request(request.clone()).await?;
+        assert!(
+            matches!(response, Response::TerminalQueued),
+            "unexpected response: {response:?}"
+        );
+        let poll_until = tokio::time::Instant::now() + Duration::from_millis(200);
+        while tokio::time::Instant::now() < poll_until {
+            if has_log_line(reader, expected) {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            eyre::bail!("the service never logged {expected:?}");
+        }
+    }
+}
+
+/// An attached client types into a service's PTY and resizes it over the socket, and the last
+/// resize from any client, the session's own TUI included, sets the size.
+#[tokio::test]
+async fn input_and_resizes_reach_the_service_pty_over_the_socket() -> eyre::Result<()> {
+    let dir = unique_dir("terminal")?;
+    let session = build_session(
+        dir.path(),
+        "while read line; do echo got:$$line; stty size; done",
+    )?;
+    let mut first = Client::connect(&session.endpoint).await?;
+    let mut second = Client::connect(&session.endpoint).await?;
+    let enter = |text: &str, paste: bool| Request::SendInput {
+        service: "svc".to_string(),
+        data: micromux_control::InputBytes::from(format!("{text}\r").into_bytes()),
+        paste,
+    };
+
+    // Key input and a paste both arrive as the service's stdin.
+    send_until_logged(
+        &mut first,
+        &session.reader,
+        enter("typed", false),
+        "got:typed",
+    )
+    .await?;
+    send_until_logged(
+        &mut second,
+        &session.reader,
+        enter("pasted", true),
+        "got:pasted",
+    )
+    .await?;
+
+    // An attached client's resize applies to the running PTY.
+    let resized = first
+        .request(Request::ResizeTerminal {
+            cols: 120,
+            rows: 33,
+        })
+        .await?;
+    assert!(matches!(resized, Response::TerminalQueued), "{resized:?}");
+    send_until_logged(&mut first, &session.reader, enter("a", false), "33 120").await?;
+
+    // The session's own TUI resizing later wins over the attached client.
+    assert!(session.terminal.try_resize(100, 25));
+    send_until_logged(&mut first, &session.reader, enter("b", false), "25 100").await?;
+
+    // And another attached client resizing after that wins again.
+    let resized = second
+        .request(Request::ResizeTerminal { cols: 90, rows: 21 })
+        .await?;
+    assert!(matches!(resized, Response::TerminalQueued), "{resized:?}");
+    send_until_logged(&mut first, &session.reader, enter("c", false), "21 90").await?;
+
+    session.shutdown.cancel();
+    Ok(())
 }
 
 #[tokio::test]

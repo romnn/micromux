@@ -5,8 +5,9 @@
 //! ([`Request`]/[`Response`]), and probe local endpoint paths, removing only the stale sockets no
 //! session owns.
 //! The core knows nothing about any of this; the server is driven by a
-//! [`micromux::SessionModelReader`] (reads) and a [`micromux::ServiceControl`] (mutations and the
-//! environment read), so it can observe and command but never mutate the model directly.
+//! [`micromux::SessionModelReader`] (reads), a [`micromux::ServiceControl`] (mutations and the
+//! environment read), and optionally a [`micromux::TerminalControl`] (PTY input and resizes from
+//! attached TUIs), so it can observe and command but never mutate the model directly.
 
 mod client;
 mod endpoint;
@@ -45,9 +46,9 @@ pub use micromux::{
     DynamicServiceAck, ReconcileAction, ReconcileActionKind, ReconcileReceipt, ResolvedEnvironment,
 };
 pub use protocol::{
-    DiskLogReadHealth, DynamicServicesCaps, ENVIRONMENT_PROTOCOL_VERSION, ErrorCode,
-    PROTOCOL_VERSION, ProtocolVersion, Request, Response, ServiceBrief, SessionCapabilities,
-    SessionInfo,
+    DiskLogReadHealth, DynamicServicesCaps, ENVIRONMENT_PROTOCOL_VERSION, ErrorCode, InputBytes,
+    MAX_REMOTE_PASTE_BYTES, PROTOCOL_VERSION, ProtocolVersion, Request, Response, ServiceBrief,
+    SessionCapabilities, SessionInfo, TERMINAL_PROTOCOL_VERSION,
 };
 pub use select::{
     AmbiguousSelection, LISTED_ABSENT_PROBES, ProbeReport, ResolvedSession, RuntimeDirDetail,
