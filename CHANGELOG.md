@@ -8,6 +8,8 @@
 - **Session discovery removes the sockets of crashed sessions, and diagnostics stay small.**
   `list_sessions` and other `socket_probes` reports count dead endpoints in `absent_probe_count`
   and list only a few.
+- **An allocated port can prefer a well-known port and takes it whenever it is free.** Write
+  `{ name: WEB_PORT, prefer: 3000 }` under `allocate_ports`.
 
 ## v0.4.0
 

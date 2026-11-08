@@ -100,7 +100,9 @@ Give each checkout its own ports and browser URLs, so git worktrees never collid
 session:
   name: shop # defaults to the directory name
 
-allocate_ports: [API_PORT, WEB_PORT] # stable, free ports, injected as env vars
+allocate_ports: # stable, free ports, injected as env vars
+  - API_PORT
+  - { name: WEB_PORT, prefer: 3000 } # 3000 whenever it is free
 
 routes:
   - host: app # http://app.shop.localhost

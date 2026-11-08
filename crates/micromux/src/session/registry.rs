@@ -75,6 +75,23 @@ struct Record {
     ports: IndexMap<String, u16>,
 }
 
+/// One variable a session asks a port for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PortRequest {
+    /// The variable name.
+    pub(crate) name: String,
+    /// Port the variable takes whenever it is available, even outside the allocation range.
+    pub(crate) prefer: Option<u16>,
+}
+
+impl PortRequest {
+    /// Whether a persisted port still fits the config: it lies in `range` or is the preferred
+    /// port.
+    pub(crate) fn allows(&self, port: u16, range: &RangeInclusive<u16>) -> bool {
+        range.contains(&port) || self.prefer == Some(port)
+    }
+}
+
 /// Keeps a session's ports reserved while held.
 #[derive(Debug)]
 pub(crate) struct Lease {
@@ -160,15 +177,21 @@ impl PortRegistry {
         read_record(&path).ok().flatten().map(|record| record.ports)
     }
 
-    /// Reserves a port in `range` for every name in `names`, reusing this session's persisted
-    /// assignment where it still lies in `range`.
+    /// Reserves a port for every request and returns them in request order.
+    ///
+    /// A request with a preferred port gets it when no other live session holds it and nothing
+    /// on the host listens on it.
+    /// Otherwise it keeps this session's persisted port where the config still allows it, or
+    /// gets a free port in `range`.
+    /// A session that had to fall back therefore moves to its preferred port at the first start
+    /// where that port is available.
     ///
     /// The returned lease marks the session live until it is dropped.
     pub(crate) fn acquire(
         &self,
         config_path: &Path,
         session_name: &str,
-        names: &[String],
+        requests: &[PortRequest],
         excluded: &[u16],
         range: &RangeInclusive<u16>,
     ) -> Result<(IndexMap<String, u16>, Lease), SessionError> {
@@ -221,28 +244,37 @@ impl PortRegistry {
         let mut taken: HashSet<u16> = survey.live.clone();
         taken.extend(excluded.iter().copied());
         // A name that needs a new port must not take one another name keeps.
-        taken.extend(
-            names
-                .iter()
-                .filter_map(|name| persisted.get(name).copied())
-                .filter(|port| range.contains(port) && !survey.live.contains(port)),
-        );
-        for name in names {
-            let port = match persisted.get(name).copied() {
-                // A range changed since the assignment: a new one in the range replaces it.
-                Some(port) if !range.contains(&port) => {
-                    self.pick_port(&key, name, range, &taken, &survey.dormant)?
-                }
-                Some(port) if excluded.contains(&port) => {
-                    return Err(SessionError::PortReserved {
-                        variable: name.clone(),
-                        port,
-                        record: record_path,
-                    });
-                }
-                Some(port)
-                    if !survey.live.contains(&port) && !ports.values().any(|p| *p == port) =>
-                {
+        taken.extend(requests.iter().filter_map(|request| {
+            persisted
+                .get(&request.name)
+                .copied()
+                .filter(|port| request.allows(*port, range) && !survey.live.contains(port))
+        }));
+        for request in requests {
+            let name = &request.name;
+            // A changed range or preference replaces a persisted port the config no longer allows.
+            let persisted_port = persisted
+                .get(name)
+                .copied()
+                .filter(|port| request.allows(*port, range));
+            if let Some(port) = persisted_port
+                && excluded.contains(&port)
+            {
+                return Err(SessionError::PortReserved {
+                    variable: name.clone(),
+                    port,
+                    record: record_path,
+                });
+            }
+            let kept = persisted_port.filter(|port| {
+                !survey.live.contains(port) && !ports.values().any(|assigned| assigned == port)
+            });
+            let preferred = request.prefer.filter(|prefer| {
+                kept != Some(*prefer) && !taken.contains(prefer) && (self.port_is_free)(*prefer)
+            });
+            let port = match (preferred, kept) {
+                (Some(port), _) => port,
+                (None, Some(port)) => {
                     if !(self.port_is_free)(port) {
                         return Err(SessionError::PortBusy {
                             variable: name.clone(),
@@ -251,7 +283,7 @@ impl PortRegistry {
                     }
                     port
                 }
-                _ => self.pick_port(&key, name, range, &taken, &survey.dormant)?,
+                (None, None) => self.pick_port(&key, name, range, &taken, &survey.dormant)?,
             };
             taken.insert(port);
             ports.insert(name.clone(), port);
@@ -650,8 +682,180 @@ mod tests {
     use color_eyre::eyre;
     use similar_asserts::assert_eq;
 
-    fn names(names: &[&str]) -> Vec<String> {
-        names.iter().map(ToString::to_string).collect()
+    fn names(names: &[&str]) -> Vec<PortRequest> {
+        names
+            .iter()
+            .map(|name| PortRequest {
+                name: (*name).to_string(),
+                prefer: None,
+            })
+            .collect()
+    }
+
+    fn preferring(name: &str, port: u16) -> PortRequest {
+        PortRequest {
+            name: name.to_string(),
+            prefer: Some(port),
+        }
+    }
+
+    /// A free preferred port is taken even outside the range, kept across restarts, and leaves
+    /// the names without a preference to the range.
+    #[test]
+    fn free_preferred_ports_are_taken() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let registry = PortRegistry::ignoring_host_listeners(directory.path());
+        let config = Path::new("/projects/one/micromux.yaml");
+        let range = 40000..=40999;
+        let requests = [
+            preferring("WEB", 3000),
+            PortRequest {
+                name: "API".to_string(),
+                prefer: None,
+            },
+        ];
+
+        let (ports, lease) = registry.acquire(config, "one", &requests, &[], &range)?;
+        drop(lease);
+        let (again, _lease) = registry.acquire(config, "one", &requests, &[], &range)?;
+
+        assert_eq!(ports.get("WEB"), Some(&3000));
+        assert!(
+            ports.get("API").is_some_and(|port| range.contains(port)),
+            "{ports:?}"
+        );
+        assert_eq!(again, ports);
+        Ok(())
+    }
+
+    /// A preferred port another live session holds sends the session to the range, and the
+    /// session moves to its preferred port at the first start where no live session holds it.
+    #[test]
+    fn preferred_ports_held_by_live_sessions_fall_back_to_the_range() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let registry = PortRegistry::ignoring_host_listeners(directory.path());
+        let main = Path::new("/projects/main/micromux.yaml");
+        let worktree = Path::new("/projects/worktree/micromux.yaml");
+        let range = 40000..=40999;
+        let requests = [preferring("WEB", 3000)];
+
+        // The main checkout takes the preferred port, so the worktree falls back to the range.
+        let (main_ports, main_lease) = registry.acquire(main, "main", &requests, &[], &range)?;
+        let (fallback, worktree_lease) =
+            registry.acquire(worktree, "worktree", &requests, &[], &range)?;
+        assert_eq!(main_ports.get("WEB"), Some(&3000));
+        assert!(
+            fallback.get("WEB").is_some_and(|port| range.contains(port)),
+            "{fallback:?}"
+        );
+
+        // Once the main checkout stops, the worktree's next start takes the preferred port.
+        drop(worktree_lease);
+        drop(main_lease);
+        let (moved, worktree_lease) =
+            registry.acquire(worktree, "worktree", &requests, &[], &range)?;
+        assert_eq!(moved.get("WEB"), Some(&3000));
+
+        // The main checkout's own record names the port, but a live session holds it now.
+        let (displaced, _main_lease) = registry.acquire(main, "main", &requests, &[], &range)?;
+        assert!(
+            displaced
+                .get("WEB")
+                .is_some_and(|port| range.contains(port)),
+            "{displaced:?}"
+        );
+        drop(worktree_lease);
+        Ok(())
+    }
+
+    /// A preferred port some other process listens on sends a first assignment to the range
+    /// instead of failing the start.
+    #[test]
+    fn preferred_ports_bound_by_other_processes_fall_back_to_the_range() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let registry = PortRegistry::at(directory.path());
+        let config = Path::new("/projects/preferred-busy/micromux.yaml");
+        let foreign = TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0))?;
+        let busy = foreign.local_addr()?.port();
+
+        let (ports, _lease) = registry.acquire(
+            config,
+            "one",
+            &[preferring("WEB", busy)],
+            &[],
+            &DEFAULT_PORT_RANGE,
+        )?;
+
+        let port = *ports.get("WEB").ok_or_else(|| eyre::eyre!("no port"))?;
+        assert_ne!(port, busy);
+        assert!(DEFAULT_PORT_RANGE.contains(&port), "{ports:?}");
+        Ok(())
+    }
+
+    /// A session that already has its preferred port treats it like any assigned port: another
+    /// process holding it at the next start fails the start, since that process may be a
+    /// leftover of an earlier run.
+    #[test]
+    fn a_held_preferred_port_that_becomes_busy_fails_startup() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let registry = PortRegistry::at(directory.path());
+        let config = Path::new("/projects/preferred-sticky/micromux.yaml");
+        let probe = TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0))?;
+        let preferred = probe.local_addr()?.port();
+        drop(probe);
+        let requests = [preferring("WEB", preferred)];
+
+        let (ports, lease) =
+            registry.acquire(config, "one", &requests, &[], &DEFAULT_PORT_RANGE)?;
+        drop(lease);
+        assert_eq!(ports.get("WEB"), Some(&preferred));
+
+        let _foreign = TcpListener::bind((Ipv4Addr::LOCALHOST, preferred))?;
+        let result = registry.acquire(config, "one", &requests, &[], &DEFAULT_PORT_RANGE);
+
+        assert!(
+            matches!(&result, Err(SessionError::PortBusy { variable, port }) if variable == "WEB" && *port == preferred),
+            "{result:?}"
+        );
+        Ok(())
+    }
+
+    /// Adding a preference moves a sticky port only to a preferred port that is available, and
+    /// otherwise keeps it; dropping the preference again replaces a preferred port outside the
+    /// range.
+    #[test]
+    fn preference_changes_keep_sticky_ports_unless_the_preferred_one_is_available()
+    -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let registry = PortRegistry::ignoring_host_listeners(directory.path());
+        let config = Path::new("/projects/one/micromux.yaml");
+        let other = Path::new("/projects/two/micromux.yaml");
+        let range = 40000..=40999;
+
+        // Another live session holds the newly preferred port, so the sticky one stays.
+        let (sticky, lease) = registry.acquire(config, "one", &names(&["WEB"]), &[], &range)?;
+        drop(lease);
+        let (_, other_lease) =
+            registry.acquire(other, "two", &[preferring("WEB", 3000)], &[], &range)?;
+        let (kept, lease) =
+            registry.acquire(config, "one", &[preferring("WEB", 3000)], &[], &range)?;
+        drop(lease);
+        assert_eq!(kept, sticky);
+
+        // Once the port is available, the next start moves to it.
+        drop(other_lease);
+        let (moved, lease) =
+            registry.acquire(config, "one", &[preferring("WEB", 3000)], &[], &range)?;
+        drop(lease);
+        assert_eq!(moved.get("WEB"), Some(&3000));
+
+        // Without the preference, a port outside the range is replaced by one inside it.
+        let (dropped, _lease) = registry.acquire(config, "one", &names(&["WEB"]), &[], &range)?;
+        assert!(
+            dropped.get("WEB").is_some_and(|port| range.contains(port)),
+            "{dropped:?}"
+        );
+        Ok(())
     }
 
     /// A restarted session gets back exactly the ports it had, and a second live session never
