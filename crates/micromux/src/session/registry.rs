@@ -571,12 +571,28 @@ fn user_registry_directory() -> Option<PathBuf> {
 
 /// The directory [`STATE_DIR_VARIABLE`] names, or `None` when it is unset or empty.
 ///
+/// The crate's own unit tests fall back to a temporary directory of their own instead.
+///
 /// A relative path is made absolute against the current directory, so the paths micromux derives
 /// from it stay valid for the shims and proxy it starts in other directories.
 /// Other micromux processes resolve it against their own directories, so give an absolute path.
 #[must_use]
 pub fn state_directory_override() -> Option<PathBuf> {
-    resolve_override(std::env::var_os(STATE_DIR_VARIABLE))
+    resolve_override(std::env::var_os(STATE_DIR_VARIABLE)).or_else(test_state_directory)
+}
+
+/// The state directory of the crate's own tests, which never use the user's.
+///
+/// It is named after the user, like the coordination directory, so test runs of different
+/// users on one host do not share it.
+fn test_state_directory() -> Option<PathBuf> {
+    cfg!(test).then(|| {
+        #[cfg(unix)]
+        let name = format!("micromux-test-state-{}", nix::unistd::Uid::current());
+        #[cfg(not(unix))]
+        let name = "micromux-test-state".to_string();
+        std::env::temp_dir().join(name)
+    })
 }
 
 fn resolve_override(value: Option<std::ffi::OsString>) -> Option<PathBuf> {

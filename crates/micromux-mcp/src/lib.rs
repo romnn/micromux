@@ -24,8 +24,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use micromux::{DependencyFailure, Desired, Execution, Health, HealthAttempt, ServiceSnapshot};
 use micromux_control::{
     Client, ControlEndpoint, ControlError, ENVIRONMENT_PROTOCOL_VERSION, ErrorCode, Request,
-    Response, SessionInfo, endpoint_for, runtime_dir_statuses, transport_supported,
-    usable_runtime_dirs,
+    Response, SessionInfo, endpoint_for, transport_supported, usable_runtime_dirs,
 };
 use regex::{Regex, RegexBuilder};
 use rmcp::{
@@ -132,6 +131,8 @@ human can run `micromux attach` to observe it. Use `stop_session` to stop it exp
 #[derive(Clone)]
 pub struct McpServer {
     cwd: PathBuf,
+    /// Where tools look for sessions.
+    discovery: select::Discovery,
     allow_session_start: bool,
     session_start: Arc<tokio::sync::Semaphore>,
     session_start_budget: Arc<tokio::sync::Semaphore>,
@@ -1117,7 +1118,11 @@ async fn service_in_session(resolved: &select::Resolved, service: &str) -> Optio
 /// Enrich a bare `UnknownService` error with the sibling sessions that *do* resolve the service, so
 /// the agent can retarget instead of guessing. Any other error passes through untouched. Best-effort:
 /// a discovery failure leaves the error as-is rather than masking it.
-async fn enrich_unknown_service(service: &str, mut err: ToolError) -> ToolError {
+async fn enrich_unknown_service(
+    discovery: &select::Discovery,
+    service: &str,
+    mut err: ToolError,
+) -> ToolError {
     let ToolError::Remote {
         code: ErrorCode::UnknownService,
         message,
@@ -1125,7 +1130,8 @@ async fn enrich_unknown_service(service: &str, mut err: ToolError) -> ToolError 
     else {
         return err;
     };
-    let siblings = select::answering_sessions()
+    let siblings = discovery
+        .answering_sessions()
         .await
         .unwrap_or_default()
         .into_iter();
@@ -1164,6 +1170,7 @@ async fn enrich_unknown_service(service: &str, mut err: ToolError) -> ToolError 
 /// the sibling sessions that do have the service so the agent can retarget in one hop.
 /// Recent lifecycle events for one service, bounded by the model's retention.
 async fn service_events_tail(
+    discovery: &select::Discovery,
     conn: &mut SessionConn,
     service: &str,
 ) -> Result<Vec<micromux::ServiceEvent>, ErrorData> {
@@ -1175,14 +1182,20 @@ async fn service_events_tail(
         })
         .await
         .map_err(error_data)?;
-    let (events, _) = service_result(service, convert::events(response)).await?;
+    let (events, _) = service_result(discovery, service, convert::events(response)).await?;
     Ok(events)
 }
 
-async fn service_result<T>(service: &str, result: Result<T, ToolError>) -> Result<T, ErrorData> {
+async fn service_result<T>(
+    discovery: &select::Discovery,
+    service: &str,
+    result: Result<T, ToolError>,
+) -> Result<T, ErrorData> {
     match result {
         Ok(value) => Ok(value),
-        Err(err) => Err(error_data(enrich_unknown_service(service, err).await)),
+        Err(err) => Err(error_data(
+            enrich_unknown_service(discovery, service, err).await,
+        )),
     }
 }
 
@@ -1241,6 +1254,7 @@ impl McpServer {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         Self {
             cwd,
+            discovery: select::Discovery::default(),
             allow_session_start,
             session_start: Arc::new(tokio::sync::Semaphore::new(1)),
             session_start_budget: Arc::new(tokio::sync::Semaphore::new(
@@ -1256,7 +1270,9 @@ impl McpServer {
         request: Request,
         service: &str,
     ) -> ToolResult<MutationResult> {
-        let resolved = select::resolve(&self.cwd, session)
+        let resolved = self
+            .discovery
+            .resolve(&self.cwd, session)
             .await
             .map_err(error_data)?;
         let log_cursor = capture_mutation_cursor(&resolved.endpoint, service).await;
@@ -1264,7 +1280,7 @@ impl McpServer {
             .await
             .map_err(error_data)?;
         let response = conn.request(request).await.map_err(error_data)?;
-        let acks = service_result(service, convert::accepted(response)).await?;
+        let acks = service_result(&self.discovery, service, convert::accepted(response)).await?;
         let generation = acks
             .iter()
             .find(|ack| ack.service == service)
@@ -1318,7 +1334,7 @@ impl McpServer {
                 None,
             )
         })?;
-        let dir_statuses = runtime_dir_statuses();
+        let dir_statuses = self.discovery.runtime_dir_statuses();
         let runtime_dirs = usable_runtime_dirs(&dir_statuses);
         if runtime_dirs.is_empty() {
             let diagnostics = select::discovery_diagnostics(
@@ -1387,14 +1403,17 @@ impl McpServer {
         service: &str,
         request: Request,
     ) -> Result<DynamicMutation, ErrorData> {
-        let resolved = select::resolve(&self.cwd, session)
+        let resolved = self
+            .discovery
+            .resolve(&self.cwd, session)
             .await
             .map_err(error_data)?;
         Self::require_dynamic_capability(&resolved.info)?;
         let response = send_request(&resolved.endpoint, request)
             .await
             .map_err(error_data)?;
-        let receipt = service_result(service, convert::dynamic_service(response)).await?;
+        let receipt =
+            service_result(&self.discovery, service, convert::dynamic_service(response)).await?;
         Ok(DynamicMutation { resolved, receipt })
     }
 }
@@ -1443,7 +1462,7 @@ impl McpServer {
         and routing status."
     )]
     async fn list_sessions(&self) -> ToolResult<SessionListResult> {
-        let list = select::list_sessions().await.map_err(error_data)?;
+        let list = self.discovery.list_sessions().await.map_err(error_data)?;
         Ok(Json(SessionListResult {
             sessions: list.sessions,
             diagnostics: list.diagnostics,
@@ -1461,7 +1480,9 @@ impl McpServer {
         args: Parameters<SessionArgs>,
     ) -> ToolResult<SessionUrlsResult> {
         let Parameters(args) = args;
-        let resolved = select::resolve(&self.cwd, args.session)
+        let resolved = self
+            .discovery
+            .resolve(&self.cwd, args.session)
             .await
             .map_err(error_data)?;
         Ok(Json(SessionUrlsResult {
@@ -1486,7 +1507,9 @@ impl McpServer {
         args: Parameters<SessionEnvArgs>,
     ) -> ToolResult<SessionEnvResult> {
         let Parameters(args) = args;
-        let resolved = select::resolve(&self.cwd, args.session)
+        let resolved = self
+            .discovery
+            .resolve(&self.cwd, args.session)
             .await
             .map_err(error_data)?;
         let version = resolved.info.protocol_version;
@@ -1510,7 +1533,9 @@ impl McpServer {
         .await
         .map_err(error_data)?;
         let environment = match &args.service {
-            Some(service) => service_result(service, convert::environment(response)).await?,
+            Some(service) => {
+                service_result(&self.discovery, service, convert::environment(response)).await?
+            }
             None => convert::environment(response).map_err(error_data)?,
         };
         let micromux::ResolvedEnvironment {
@@ -1590,7 +1615,9 @@ impl McpServer {
         args: Parameters<ReconcileConfigArgs>,
     ) -> ToolResult<ReconcileConfigResult> {
         let Parameters(args) = args;
-        let resolved = select::resolve(&self.cwd, args.session)
+        let resolved = self
+            .discovery
+            .resolve(&self.cwd, args.session)
             .await
             .map_err(error_data)?;
         let response = send_request(
@@ -1617,7 +1644,9 @@ impl McpServer {
     )]
     async fn list_services(&self, args: Parameters<SessionArgs>) -> ToolResult<ServiceListResult> {
         let Parameters(args) = args;
-        let resolved = select::resolve(&self.cwd, args.session)
+        let resolved = self
+            .discovery
+            .resolve(&self.cwd, args.session)
             .await
             .map_err(error_data)?;
         let response = send_request(&resolved.endpoint, Request::ListServices)
@@ -1647,7 +1676,11 @@ impl McpServer {
         let Parameters(args) = args;
         // Source sessions directly so a hard discovery error (e.g. unsupported platform) is
         // surfaced rather than masked as "no matches"; match by id or name for discovery.
-        let sessions = select::answering_sessions().await.map_err(error_data)?;
+        let sessions = self
+            .discovery
+            .answering_sessions()
+            .await
+            .map_err(error_data)?;
         let mut matches = Vec::new();
         for resolved in sessions {
             let Some(snapshot) = service_in_session(&resolved, &args.service).await else {
@@ -1685,7 +1718,9 @@ impl McpServer {
     async fn get_logs(&self, args: Parameters<LogsArgs>) -> ToolResult<LogsResult> {
         let Parameters(args) = args;
         let filters = LogFilters::from_args(&args.filters)?;
-        let resolved = select::resolve(&self.cwd, args.session)
+        let resolved = self
+            .discovery
+            .resolve(&self.cwd, args.session)
             .await
             .map_err(error_data)?;
         let filtering = filters.filters_records();
@@ -1723,6 +1758,7 @@ impl McpServer {
             let mut truncated = false;
             for service in services {
                 let (mut shaped, window_full, server_truncated) = fetch_and_shape_tail(
+                    &self.discovery,
                     &mut conn,
                     &service.id,
                     None,
@@ -1754,6 +1790,7 @@ impl McpServer {
             .await
             .map_err(error_data)?;
         let (mut entries, window_full, server_truncated) = fetch_and_shape_tail(
+            &self.discovery,
             &mut conn,
             &args.service,
             args.run_generation,
@@ -1787,7 +1824,9 @@ impl McpServer {
     )]
     async fn list_log_runs(&self, args: Parameters<ServiceArgs>) -> ToolResult<LogRunsResult> {
         let Parameters(args) = args;
-        let resolved = select::resolve(&self.cwd, args.session)
+        let resolved = self
+            .discovery
+            .resolve(&self.cwd, args.session)
             .await
             .map_err(error_data)?;
         let response = send_request(
@@ -1798,7 +1837,8 @@ impl McpServer {
         )
         .await
         .map_err(error_data)?;
-        let runs = service_result(&args.service, convert::log_runs(response)).await?;
+        let runs =
+            service_result(&self.discovery, &args.service, convert::log_runs(response)).await?;
         Ok(Json(LogRunsResult {
             service: args.service,
             config_path: resolved.info.config_path,
@@ -1816,7 +1856,9 @@ impl McpServer {
         args: Parameters<LogFilePathArgs>,
     ) -> ToolResult<LogFilePathResult> {
         let Parameters(args) = args;
-        let resolved = select::resolve(&self.cwd, args.session)
+        let resolved = self
+            .discovery
+            .resolve(&self.cwd, args.session)
             .await
             .map_err(error_data)?;
         let response = send_request(
@@ -1827,7 +1869,8 @@ impl McpServer {
         )
         .await
         .map_err(error_data)?;
-        let runs = service_result(&args.service, convert::log_runs(response)).await?;
+        let runs =
+            service_result(&self.discovery, &args.service, convert::log_runs(response)).await?;
         let run = match args.run_generation {
             Some(run_generation) => runs
                 .into_iter()
@@ -1868,7 +1911,9 @@ impl McpServer {
     )]
     async fn log_cursors(&self, args: Parameters<SessionArgs>) -> ToolResult<LogCursorsResult> {
         let Parameters(args) = args;
-        let resolved = select::resolve(&self.cwd, args.session)
+        let resolved = self
+            .discovery
+            .resolve(&self.cwd, args.session)
             .await
             .map_err(error_data)?;
         let mut conn = SessionConn::connect(&resolved.endpoint)
@@ -1913,7 +1958,9 @@ impl McpServer {
         args: Parameters<RestartAndWaitArgs>,
     ) -> ToolResult<RestartAndWaitResult> {
         let Parameters(args) = args;
-        let resolved = select::resolve(&self.cwd, args.session)
+        let resolved = self
+            .discovery
+            .resolve(&self.cwd, args.session)
             .await
             .map_err(error_data)?;
         let timeout = Duration::from_secs(
@@ -1930,6 +1977,7 @@ impl McpServer {
             .map_err(error_data)?;
 
         let before = service_result(
+            &self.discovery,
             &args.service,
             service_snapshot(&mut conn, &args.service).await,
         )
@@ -1950,7 +1998,8 @@ impl McpServer {
             })
             .await
             .map_err(error_data)?;
-        let acks = service_result(&args.service, convert::accepted(response)).await?;
+        let acks =
+            service_result(&self.discovery, &args.service, convert::accepted(response)).await?;
         let previous_generation = acks
             .iter()
             .find(|ack| ack.service == args.service)
@@ -1963,6 +2012,7 @@ impl McpServer {
             })?;
 
         let conclusion = service_result(
+            &self.discovery,
             &args.service,
             wait_for_health(
                 &resolved.endpoint,
@@ -1977,6 +2027,7 @@ impl McpServer {
         let snapshot = conclusion.snapshot().clone();
         let cursor = cursors.get(&args.service).copied().unwrap_or(0);
         let (logs, logs_truncated) = service_result(
+            &self.discovery,
             &args.service,
             compact_logs_since(&mut conn, &args.service, cursor, log_limit).await,
         )
@@ -1984,15 +2035,22 @@ impl McpServer {
         let diagnosis = if conclusion.needs_diagnosis() {
             Some(
                 service_result(
+                    &self.discovery,
                     &args.service,
-                    diagnose_service(&mut conn, snapshot.clone(), DEFAULT_DIAGNOSE_TAIL).await,
+                    diagnose_service(
+                        &mut conn,
+                        &self.discovery,
+                        snapshot.clone(),
+                        DEFAULT_DIAGNOSE_TAIL,
+                    )
+                    .await,
                 )
                 .await?,
             )
         } else {
             None
         };
-        let events = service_events_tail(&mut conn, &args.service)
+        let events = service_events_tail(&self.discovery, &mut conn, &args.service)
             .await?
             .into_iter()
             .filter(|event| event.run_generation >= previous_generation)
@@ -2024,7 +2082,9 @@ impl McpServer {
         args: Parameters<SessionArgs>,
     ) -> ToolResult<SessionMutationResult> {
         let Parameters(args) = args;
-        let resolved = select::resolve(&self.cwd, args.session)
+        let resolved = self
+            .discovery
+            .resolve(&self.cwd, args.session)
             .await
             .map_err(error_data)?;
         let response = send_request(&resolved.endpoint, Request::RestartAll)
@@ -2132,6 +2192,7 @@ impl McpServer {
             .await
             .map_err(error_data)?;
         let conclusion = service_result(
+            &self.discovery,
             &service,
             wait_for_health(
                 &mutation.resolved.endpoint,
@@ -2145,6 +2206,7 @@ impl McpServer {
         .await?;
         let snapshot = conclusion.snapshot().clone();
         let (logs, logs_truncated) = service_result(
+            &self.discovery,
             &service,
             compact_logs_since(&mut conn, &service, 0, log_limit).await,
         )
@@ -2152,8 +2214,15 @@ impl McpServer {
         let diagnosis = if conclusion.needs_diagnosis() {
             Some(
                 service_result(
+                    &self.discovery,
                     &service,
-                    diagnose_service(&mut conn, snapshot.clone(), DEFAULT_DIAGNOSE_TAIL).await,
+                    diagnose_service(
+                        &mut conn,
+                        &self.discovery,
+                        snapshot.clone(),
+                        DEFAULT_DIAGNOSE_TAIL,
+                    )
+                    .await,
                 )
                 .await?,
             )
@@ -2164,7 +2233,7 @@ impl McpServer {
         // — including an idempotent replay of a long-lived service — the full retained history
         // would be noise, not evidence.
         let events = if conclusion.needs_diagnosis() {
-            service_events_tail(&mut conn, &service).await?
+            service_events_tail(&self.discovery, &mut conn, &service).await?
         } else {
             Vec::new()
         };
@@ -2261,7 +2330,9 @@ impl McpServer {
     )]
     async fn stop_session(&self, args: Parameters<SessionArgs>) -> ToolResult<StopSessionResult> {
         let Parameters(args) = args;
-        let resolved = select::resolve(&self.cwd, args.session)
+        let resolved = self
+            .discovery
+            .resolve(&self.cwd, args.session)
             .await
             .map_err(error_data)?;
         #[cfg(unix)]
@@ -2324,7 +2395,9 @@ impl McpServer {
     async fn follow_logs(&self, args: Parameters<FollowArgs>) -> ToolResult<FollowLogsResult> {
         let Parameters(args) = args;
         let filters = LogFilters::from_args(&args.filters)?;
-        let resolved = select::resolve(&self.cwd, args.session)
+        let resolved = self
+            .discovery
+            .resolve(&self.cwd, args.session)
             .await
             .map_err(error_data)?;
         let response = send_request(
@@ -2337,7 +2410,7 @@ impl McpServer {
         )
         .await
         .map_err(error_data)?;
-        let logs = service_result(&args.service, convert::logs(response)).await?;
+        let logs = service_result(&self.discovery, &args.service, convert::logs(response)).await?;
         // Cursor + gap are computed from the raw records (seq is per record), so `next_seq` advances
         // past filtered-out entries and following never re-fetches them.
         let next_seq = next_follow_cursor(&logs.lines, args.after_seq);
@@ -2378,7 +2451,9 @@ impl McpServer {
             .limit
             .unwrap_or(DEFAULT_LOG_TAIL)
             .clamp(1, MAX_LOG_TAIL);
-        let resolved = select::resolve(&self.cwd, args.session)
+        let resolved = self
+            .discovery
+            .resolve(&self.cwd, args.session)
             .await
             .map_err(error_data)?;
         let mut conn = SessionConn::connect(&resolved.endpoint)
@@ -2413,7 +2488,9 @@ impl McpServer {
                 .unwrap_or(DEFAULT_WAIT_TIMEOUT_SECS)
                 .min(MAX_WAIT_TIMEOUT_SECS),
         );
-        let resolved = select::resolve(&self.cwd, args.session)
+        let resolved = self
+            .discovery
+            .resolve(&self.cwd, args.session)
             .await
             .map_err(error_data)?;
         let mut conn = SessionConn::connect(&resolved.endpoint)
@@ -2477,7 +2554,8 @@ impl McpServer {
                 })
                 .await
                 .map_err(error_data)?;
-            let logs = service_result(&args.service, convert::logs(response)).await?;
+            let logs =
+                service_result(&self.discovery, &args.service, convert::logs(response)).await?;
             let raw_next_seq = next_follow_cursor(&logs.lines, Some(cursor)).unwrap_or(cursor);
             let mut entries = logproc::shape(&logs.lines, &filters.shape(raw, None));
             if !entries.is_empty() {
@@ -2519,13 +2597,16 @@ impl McpServer {
     )]
     async fn get_health(&self, args: Parameters<ServiceArgs>) -> ToolResult<HealthResult> {
         let Parameters(args) = args;
-        let resolved = select::resolve(&self.cwd, args.session)
+        let resolved = self
+            .discovery
+            .resolve(&self.cwd, args.session)
             .await
             .map_err(error_data)?;
         let mut conn = SessionConn::connect(&resolved.endpoint)
             .await
             .map_err(error_data)?;
         let snapshot = service_result(
+            &self.discovery,
             &args.service,
             service_snapshot(&mut conn, &args.service).await,
         )
@@ -2552,7 +2633,9 @@ impl McpServer {
         args: Parameters<ServiceArgs>,
     ) -> ToolResult<HealthHistoryResult> {
         let Parameters(args) = args;
-        let resolved = select::resolve(&self.cwd, args.session)
+        let resolved = self
+            .discovery
+            .resolve(&self.cwd, args.session)
             .await
             .map_err(error_data)?;
         let mut conn = SessionConn::connect(&resolved.endpoint)
@@ -2561,11 +2644,13 @@ impl McpServer {
         // The snapshot fetch first: it enriches an unknown-service error with sibling-session
         // pointers and gives the caller run context for the attempts.
         let snapshot = service_result(
+            &self.discovery,
             &args.service,
             service_snapshot(&mut conn, &args.service).await,
         )
         .await?;
         let attempts = service_result(
+            &self.discovery,
             &args.service,
             health_history(&mut conn, &args.service).await,
         )
@@ -2592,7 +2677,9 @@ impl McpServer {
         args: Parameters<ServiceEventsArgs>,
     ) -> ToolResult<ServiceEventsResult> {
         let Parameters(args) = args;
-        let resolved = select::resolve(&self.cwd, args.session)
+        let resolved = self
+            .discovery
+            .resolve(&self.cwd, args.session)
             .await
             .map_err(error_data)?;
         if args.service == "*" {
@@ -2673,7 +2760,8 @@ impl McpServer {
         )
         .await
         .map_err(error_data)?;
-        let (events, truncated) = service_result(&args.service, convert::events(response)).await?;
+        let (events, truncated) =
+            service_result(&self.discovery, &args.service, convert::events(response)).await?;
         let next_seq = events.last().map(|event| event.seq).or(args.after_seq);
         Ok(Json(ServiceEventsResult::Single(
             SingleServiceEventsResult {
@@ -2694,7 +2782,9 @@ impl McpServer {
     )]
     async fn diagnose(&self, args: Parameters<DiagnoseArgs>) -> ToolResult<DiagnoseResult> {
         let Parameters(args) = args;
-        let resolved = select::resolve(&self.cwd, args.session)
+        let resolved = self
+            .discovery
+            .resolve(&self.cwd, args.session)
             .await
             .map_err(error_data)?;
         let tail = args
@@ -2712,7 +2802,7 @@ impl McpServer {
         let mut diagnoses = Vec::new();
         for snapshot in services.into_iter().filter(service_needs_diagnosis) {
             diagnoses.push(
-                diagnose_service(&mut conn, snapshot, tail)
+                diagnose_service(&mut conn, &self.discovery, snapshot, tail)
                     .await
                     .map_err(error_data)?,
             );
@@ -2741,7 +2831,9 @@ impl McpServer {
     )]
     async fn wait_for_healthy(&self, args: Parameters<WaitArgs>) -> ToolResult<WaitResult> {
         let Parameters(args) = args;
-        let resolved = select::resolve(&self.cwd, args.session)
+        let resolved = self
+            .discovery
+            .resolve(&self.cwd, args.session)
             .await
             .map_err(error_data)?;
         let timeout = Duration::from_secs(
@@ -2763,7 +2855,9 @@ impl McpServer {
         {
             Ok(conclusion) => conclusion,
             Err(err) => {
-                return Err(error_data(enrich_unknown_service(&args.service, err).await));
+                return Err(error_data(
+                    enrich_unknown_service(&self.discovery, &args.service, err).await,
+                ));
             }
         };
         if let WaitConclusion::DependencyFailed { failure, .. } = conclusion {
@@ -2788,7 +2882,9 @@ impl McpServer {
         args: Parameters<WaitForExitArgs>,
     ) -> ToolResult<WaitForExitResult> {
         let Parameters(args) = args;
-        let resolved = select::resolve(&self.cwd, args.session)
+        let resolved = self
+            .discovery
+            .resolve(&self.cwd, args.session)
             .await
             .map_err(error_data)?;
         let timeout = Duration::from_secs(
@@ -2804,12 +2900,14 @@ impl McpServer {
             .await
             .map_err(error_data)?;
         let cursor = service_result(
+            &self.discovery,
             &args.service,
             current_service_cursor(&mut conn, &args.service).await,
         )
         .await?;
         let started = tokio::time::Instant::now();
         let waited = service_result(
+            &self.discovery,
             &args.service,
             wait_for_snapshot(
                 &resolved.endpoint,
@@ -2864,6 +2962,7 @@ impl McpServer {
             SnapshotWait::Timeout(snapshot) => (WaitForExitStatus::Timeout, None, snapshot),
         };
         let (logs, logs_truncated) = service_result(
+            &self.discovery,
             &args.service,
             compact_logs_since(&mut conn, &args.service, cursor, log_limit).await,
         )
@@ -2909,7 +3008,7 @@ impl McpServer {
         // NoSession must propagate, or the tool could silently start and then drive a session
         // for a different project than the one the caller named.
         let explicit_selector = args.session.is_some();
-        let resolved = match select::resolve(&self.cwd, args.session).await {
+        let resolved = match self.discovery.resolve(&self.cwd, args.session).await {
             Ok(resolved) => resolved,
             Err(ToolError::NoSession(diagnostics)) if explicit_selector => {
                 return Err(error_data(ToolError::NoSession(diagnostics)));
@@ -2940,7 +3039,8 @@ impl McpServer {
                         "found the session started concurrently".to_string()
                     },
                 });
-                select::resolve(&self.cwd, Some(format!("hash:{id}")))
+                self.discovery
+                    .resolve(&self.cwd, Some(format!("hash:{id}")))
                     .await
                     .map_err(error_data)?
             }
@@ -2952,7 +3052,9 @@ impl McpServer {
         let mut snapshot = match service_snapshot(&mut conn, &args.service).await {
             Ok(snapshot) => snapshot,
             Err(err) => {
-                return Err(error_data(enrich_unknown_service(&args.service, err).await));
+                return Err(error_data(
+                    enrich_unknown_service(&self.discovery, &args.service, err).await,
+                ));
             }
         };
         let ready = match wait::evaluate(&snapshot, WaitFor::Healthy, None) {
@@ -3049,15 +3151,18 @@ impl McpServer {
         {
             Ok(conclusion) => conclusion,
             Err(err) => {
-                return Err(error_data(enrich_unknown_service(&args.service, err).await));
+                return Err(error_data(
+                    enrich_unknown_service(&self.discovery, &args.service, err).await,
+                ));
             }
         };
         snapshot = conclusion.snapshot().clone();
         let diagnosis = if conclusion.needs_diagnosis() {
             Some(
                 service_result(
+                    &self.discovery,
                     &args.service,
-                    diagnose_service(&mut conn, snapshot.clone(), log_limit).await,
+                    diagnose_service(&mut conn, &self.discovery, snapshot.clone(), log_limit).await,
                 )
                 .await?,
             )
@@ -3497,6 +3602,8 @@ mod tests {
 
     #[cfg(unix)]
     struct RunningMcpSession {
+        /// The private runtime directory the session's control socket lives in.
+        runtime_dir: std::path::PathBuf,
         shutdown: micromux::CancellationToken,
         runner: Option<tokio::task::JoinHandle<Result<(), micromux::Error>>>,
         server: Option<tokio::task::JoinHandle<Result<(), micromux_control::ControlError>>>,
@@ -3515,6 +3622,16 @@ mod tests {
 
     #[cfg(unix)]
     impl RunningMcpSession {
+        /// A server that discovers sessions only in this session's private runtime directory.
+        fn server(&self) -> McpServer {
+            McpServer {
+                discovery: crate::select::Discovery::in_runtime_dirs(vec![
+                    self.runtime_dir.clone(),
+                ]),
+                ..McpServer::new()
+            }
+        }
+
         async fn finish(mut self) -> eyre::Result<()> {
             self.shutdown.cancel();
             if let Some(runner) = self.runner.take() {
@@ -3571,20 +3688,28 @@ services:
 
         // A port registry of the test's own, so the session never registers with the user's.
         let registry = micromux::PortRegistry::at(project_dir.join("registry"));
-        let mux = Arc::new(micromux::Micromux::with_session(
-            &config,
-            micromux::Session::establish(&config, &registry)?,
-        )?);
+        let mux = Arc::new(
+            micromux::Micromux::with_session(
+                &config,
+                micromux::Session::establish(&config, &registry)?,
+            )?
+            .with_cache_directory(project_dir.join("cache")),
+        );
         let shutdown = micromux::CancellationToken::new();
         let (runner, handles) = mux.clone().start(shutdown.clone());
         let runner = tokio::spawn(runner);
 
-        let runtime_dirs =
-            micromux_control::usable_runtime_dirs(&micromux_control::runtime_dir_statuses());
-        let runtime_dir = runtime_dirs
-            .first()
-            .ok_or_else(|| eyre::eyre!("no usable control runtime directory"))?;
-        let endpoint = micromux_control::endpoint_for(runtime_dir, &config_path);
+        // A runtime directory of the test's own, so the session never shows up in the user's.
+        let runtime_dir = project_dir.join("run");
+        {
+            use std::os::unix::fs::DirBuilderExt as _;
+
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&runtime_dir)?;
+        }
+        let endpoint = micromux_control::endpoint_for(&runtime_dir, &config_path);
         let guard = micromux_control::bind(&endpoint)?
             .ok_or_else(|| eyre::eyre!("control endpoint is already owned"))?;
         let identity =
@@ -3603,6 +3728,7 @@ services:
 
         Ok((
             RunningMcpSession {
+                runtime_dir,
                 shutdown,
                 runner: Some(runner),
                 server: Some(server),
@@ -3869,7 +3995,7 @@ services:
     async fn session_events_merge_and_page_with_per_service_cursors() -> eyre::Result<()> {
         let project = tempfile::tempdir()?;
         let (session, selector) = boot_dynamic_mcp_session(project.path())?;
-        let mut server = McpServer::new();
+        let mut server = session.server();
         server.cwd = project.path().to_path_buf();
 
         start_event_test_services(&server, &selector).await?;
@@ -4001,7 +4127,7 @@ services:
 "#;
         let (session, selector) =
             boot_mcp_session_with_yaml(project.path(), "mcp-health-history-test", yaml)?;
-        let mut server = McpServer::new();
+        let mut server = session.server();
         server.cwd = project.path().to_path_buf();
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -4061,7 +4187,7 @@ services:
       SECRET: "s3cr3t"
 "#;
         let (session, selector) = boot_mcp_session_with_yaml(project.path(), "mcp-env-test", yaml)?;
-        let mut server = McpServer::new();
+        let mut server = session.server();
         server.cwd = project.path().to_path_buf();
         let env = |service: Option<&str>, names: Option<&[&str]>| SessionEnvArgs {
             session: Some(selector.clone()),
@@ -4143,7 +4269,7 @@ services:
     async fn reconcile_config_round_trips_through_the_mcp_tool() -> eyre::Result<()> {
         let project = tempfile::tempdir()?;
         let (session, selector) = boot_dynamic_mcp_session(project.path())?;
-        let mut server = McpServer::new();
+        let mut server = session.server();
         server.cwd = project.path().to_path_buf();
         std::fs::write(
             project.path().join("micromux.yaml"),
@@ -4229,7 +4355,7 @@ services:
     {
         let project = tempfile::tempdir()?;
         let (session, selector) = boot_dynamic_mcp_session(project.path())?;
-        let mut server = McpServer::new();
+        let mut server = session.server();
         server.cwd = project.path().to_path_buf();
         let mut healthy_params = dynamic_params_for(
             "healthy-job",
@@ -4314,7 +4440,7 @@ services:
     async fn wait_for_exit_returns_job_output_times_out_and_rejects_disabled() -> eyre::Result<()> {
         let project = tempfile::tempdir()?;
         let (session, selector) = boot_dynamic_mcp_session(project.path())?;
-        let mut server = McpServer::new();
+        let mut server = session.server();
         server.cwd = project.path().to_path_buf();
         let params = dynamic_params_for("job", &["sh", "-c", "sleep 0.2; echo done; exit 3"], None);
         let Json(started) = server
@@ -4389,7 +4515,7 @@ services:
 "#;
         let (session, selector) =
             boot_mcp_session_with_yaml(project.path(), "mcp-jobs-test", yaml)?;
-        let mut server = McpServer::new();
+        let mut server = session.server();
         server.cwd = project.path().to_path_buf();
 
         for (service, expected) in [
@@ -4441,7 +4567,7 @@ services:
     async fn waits_fail_fast_behind_a_dependency_that_will_not_restart() -> eyre::Result<()> {
         let project = tempfile::tempdir()?;
         let (session, selector) = boot_dynamic_mcp_session(project.path())?;
-        let mut server = McpServer::new();
+        let mut server = session.server();
         server.cwd = project.path().to_path_buf();
         let Json(seed) = server
             .start_dynamic_service(Parameters(DynamicServiceArgs {
@@ -4605,7 +4731,7 @@ services:
     async fn dynamic_service_lifecycle_crosses_the_mcp_tool_layer() -> eyre::Result<()> {
         let project = tempfile::tempdir()?;
         let (session, selector) = boot_dynamic_mcp_session(project.path())?;
-        let mut server = McpServer::new();
+        let mut server = session.server();
         server.cwd = project.path().to_path_buf();
         let params = dynamic_params(Some("create-debug"));
 
@@ -4697,7 +4823,7 @@ services:
     async fn ensure_ready_enables_waits_short_circuits_and_enriches_misses() -> eyre::Result<()> {
         let project = tempfile::tempdir()?;
         let (session, selector) = boot_dynamic_mcp_session(project.path())?;
-        let mut server = McpServer::new();
+        let mut server = session.server();
         server.cwd = project.path().to_path_buf();
 
         let Json(enabled) = server

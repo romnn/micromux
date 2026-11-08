@@ -1364,6 +1364,15 @@ mod tests {
     use similar_asserts::assert_eq;
     use tokio::sync::mpsc;
 
+    /// A supervisor for `parsed` whose run-log spool goes to the test's own `cache` directory,
+    /// never the user's.
+    fn test_micromux(
+        parsed: &micromux::ConfigFile<usize>,
+        cache: &tempfile::TempDir,
+    ) -> Result<micromux::Micromux, micromux::Error> {
+        Ok(micromux::Micromux::new(parsed)?.with_cache_directory(cache.path()))
+    }
+
     fn tab_press() -> crate::event::Input {
         crate::event::Input::Event(crossterm::event::Event::Key(KeyEvent {
             code: KeyCode::Tab,
@@ -1440,7 +1449,8 @@ mod tests {
             None,
             &mut diagnostics,
         )?;
-        let mux = std::sync::Arc::new(micromux::Micromux::new(&parsed)?);
+        let cache = tempfile::tempdir()?;
+        let mux = std::sync::Arc::new(test_micromux(&parsed, &cache)?);
         let shutdown = micromux::CancellationToken::new();
         let (_runner, handles) = mux.start(shutdown.clone());
         let mut app = App::new(
@@ -1486,7 +1496,8 @@ mod tests {
             None,
             &mut diagnostics,
         )?;
-        let mux = std::sync::Arc::new(micromux::Micromux::new(&parsed)?);
+        let cache = tempfile::tempdir()?;
+        let mux = std::sync::Arc::new(test_micromux(&parsed, &cache)?);
         let shutdown = micromux::CancellationToken::new();
         let (_runner, handles) = mux.start(shutdown.clone());
         let mut app = App::new(
@@ -1562,7 +1573,8 @@ mod tests {
         "#};
         let mut diagnostics = Vec::new();
         let parsed = micromux::from_str(yaml, Path::new("."), 0usize, None, &mut diagnostics)?;
-        let mux = std::sync::Arc::new(micromux::Micromux::new(&parsed)?);
+        let cache = tempfile::tempdir()?;
+        let mux = std::sync::Arc::new(test_micromux(&parsed, &cache)?);
         let shutdown = micromux::CancellationToken::new();
         let (_runner, handles) = mux.start(shutdown.clone());
         let mut app = App::new(
@@ -1666,7 +1678,8 @@ mod tests {
         "#};
         let mut diagnostics = Vec::new();
         let parsed = micromux::from_str(yaml, Path::new("."), 0usize, None, &mut diagnostics)?;
-        let mux = std::sync::Arc::new(micromux::Micromux::new(&parsed)?);
+        let cache = tempfile::tempdir()?;
+        let mux = std::sync::Arc::new(test_micromux(&parsed, &cache)?);
         let (_runner, handles) = mux.start(micromux::CancellationToken::new());
         let mut app = App::new(
             SessionSource::Local(LocalSource::new(handles.reader, handles.commands.clone())),
@@ -1725,7 +1738,8 @@ mod tests {
         "#};
         let mut diagnostics = Vec::new();
         let parsed = micromux::from_str(yaml, Path::new("."), 0usize, None, &mut diagnostics)?;
-        let mux = std::sync::Arc::new(micromux::Micromux::new(&parsed)?);
+        let cache = tempfile::tempdir()?;
+        let mux = std::sync::Arc::new(test_micromux(&parsed, &cache)?);
         let (_runner, handles) = mux.start(micromux::CancellationToken::new());
         let mut app = App::new(
             SessionSource::Local(LocalSource::new(handles.reader, handles.commands.clone())),
@@ -1767,7 +1781,8 @@ mod tests {
         "#};
         let mut diagnostics = Vec::new();
         let parsed = micromux::from_str(yaml, Path::new("."), 0usize, None, &mut diagnostics)?;
-        let mux = std::sync::Arc::new(micromux::Micromux::new(&parsed)?);
+        let cache = tempfile::tempdir()?;
+        let mux = std::sync::Arc::new(test_micromux(&parsed, &cache)?);
         let (_runner, handles) = mux.start(micromux::CancellationToken::new());
         let mut app = App::new(
             SessionSource::Local(LocalSource::new(handles.reader, handles.commands.clone())),
@@ -1810,7 +1825,10 @@ mod tests {
         let registry = micromux::PortRegistry::at(directory.join("registry"));
         let session = micromux::Session::establish(&parsed, &registry)?;
         let ports = session.ports().clone();
-        let mux = std::sync::Arc::new(micromux::Micromux::with_session(&parsed, session)?);
+        let mux = std::sync::Arc::new(
+            micromux::Micromux::with_session(&parsed, session)?
+                .with_cache_directory(directory.join("cache")),
+        );
         let (_runner, handles) = mux.start(micromux::CancellationToken::new());
         let app = App::new(
             SessionSource::Local(
@@ -2136,7 +2154,8 @@ mod tests {
             None,
             &mut diagnostics,
         )?;
-        let mux = std::sync::Arc::new(micromux::Micromux::new(&parsed)?);
+        let cache = tempfile::tempdir()?;
+        let mux = std::sync::Arc::new(test_micromux(&parsed, &cache)?);
         let shutdown = micromux::CancellationToken::new();
         let (_runner, handles) = mux.start(shutdown.clone());
         let mut app = App::new(
@@ -2188,7 +2207,8 @@ mod tests {
         "#};
         let mut diagnostics = Vec::new();
         let parsed = micromux::from_str(yaml, Path::new("."), 0usize, None, &mut diagnostics)?;
-        let mux = std::sync::Arc::new(micromux::Micromux::new(&parsed)?);
+        let cache = tempfile::tempdir()?;
+        let mux = std::sync::Arc::new(test_micromux(&parsed, &cache)?);
         let (_runner, handles) = mux.start(micromux::CancellationToken::new());
         let mut app = App::new(
             SessionSource::Local(LocalSource::new(handles.reader, handles.commands.clone())),
@@ -2369,7 +2389,8 @@ mod tests {
         let mut diagnostics: Vec<Diagnostic<usize>> = Vec::new();
         let parsed = micromux::from_str(yaml, Path::new("."), 0, None, &mut diagnostics)
             .map_err(|err| eyre::eyre!(err.to_string()))?;
-        let mux = std::sync::Arc::new(micromux::Micromux::new(&parsed)?);
+        let cache = tempfile::tempdir()?;
+        let mux = std::sync::Arc::new(test_micromux(&parsed, &cache)?);
         let shutdown = micromux::CancellationToken::new();
         let (runner, handles) = mux.start(shutdown.clone());
         assert_eq!(fill_terminal_queue(&handles.terminal)?, 64);
@@ -2408,7 +2429,8 @@ mod tests {
         let mut diagnostics: Vec<Diagnostic<usize>> = Vec::new();
         let parsed = micromux::from_str(yaml, Path::new("."), 0, None, &mut diagnostics)
             .map_err(|err| eyre::eyre!(err.to_string()))?;
-        let mux = std::sync::Arc::new(micromux::Micromux::new(&parsed)?);
+        let cache = tempfile::tempdir()?;
+        let mux = std::sync::Arc::new(test_micromux(&parsed, &cache)?);
         let (_runner, handles) = mux.start(micromux::CancellationToken::new());
         assert_eq!(fill_terminal_queue(&handles.terminal)?, 64);
         let mut app = App::new(
@@ -2441,7 +2463,8 @@ mod tests {
         let mut diagnostics: Vec<Diagnostic<usize>> = Vec::new();
         let parsed = micromux::from_str(yaml, Path::new("."), 0, None, &mut diagnostics)
             .map_err(|err| eyre::eyre!(err.to_string()))?;
-        let mux = std::sync::Arc::new(micromux::Micromux::new(&parsed)?);
+        let cache = tempfile::tempdir()?;
+        let mux = std::sync::Arc::new(test_micromux(&parsed, &cache)?);
         let shutdown = micromux::CancellationToken::new();
         let (runner, handles) = mux.start(shutdown.clone());
         assert_eq!(fill_terminal_queue(&handles.terminal)?, 64);
@@ -2481,7 +2504,8 @@ mod tests {
         let yaml = "version: 1\nservices:\n  svc:\n    command: [\"true\"]\n";
         let mut diagnostics = Vec::new();
         let parsed = micromux::from_str(yaml, Path::new("."), 0usize, None, &mut diagnostics)?;
-        let mux = std::sync::Arc::new(micromux::Micromux::new(&parsed)?);
+        let cache = tempfile::tempdir()?;
+        let mux = std::sync::Arc::new(test_micromux(&parsed, &cache)?);
         let (_runner, handles) = mux.start(micromux::CancellationToken::new());
         let mut app = App::new(
             SessionSource::Local(LocalSource::new(handles.reader, handles.commands.clone())),
@@ -2543,7 +2567,8 @@ mod tests {
         "#};
         let mut diagnostics = Vec::new();
         let parsed = micromux::from_str(yaml, Path::new("."), 0usize, None, &mut diagnostics)?;
-        let mux = std::sync::Arc::new(micromux::Micromux::new(&parsed)?);
+        let cache = tempfile::tempdir()?;
+        let mux = std::sync::Arc::new(test_micromux(&parsed, &cache)?);
         let shutdown = micromux::CancellationToken::new();
         let (runner, handles) = mux.start(shutdown.clone());
         let reader = handles.reader.clone();
@@ -2611,7 +2636,8 @@ mod tests {
         let yaml = "version: 1\nservices:\n  svc:\n    command: [\"true\"]\n";
         let mut diagnostics = Vec::new();
         let parsed = micromux::from_str(yaml, Path::new("."), 0usize, None, &mut diagnostics)?;
-        let mux = std::sync::Arc::new(micromux::Micromux::new(&parsed)?);
+        let cache = tempfile::tempdir()?;
+        let mux = std::sync::Arc::new(test_micromux(&parsed, &cache)?);
         let (_runner, handles) = mux.start(micromux::CancellationToken::new());
         let (commands, _commands_rx) = mpsc::channel(1);
         let mut app = App::new(
@@ -2651,8 +2677,9 @@ mod tests {
         let mut diagnostics: Vec<Diagnostic<usize>> = vec![];
         let parsed = micromux::from_str(yaml, Path::new("."), 0usize, None, &mut diagnostics)
             .map_err(|err| eyre::eyre!(err.to_string()))?;
+        let cache = tempfile::tempdir()?;
         let mux = std::sync::Arc::new(
-            micromux::Micromux::new(&parsed).map_err(|err| eyre::eyre!(err.to_string()))?,
+            test_micromux(&parsed, &cache).map_err(|err| eyre::eyre!(err.to_string()))?,
         );
         let shutdown = micromux::CancellationToken::new();
         // The runner is not spawned; the model reader is seeded with initial snapshots and is all
@@ -2699,7 +2726,8 @@ mod tests {
         let mut diagnostics: Vec<Diagnostic<usize>> = vec![];
         let parsed = micromux::from_str(yaml, Path::new("."), 0usize, None, &mut diagnostics)
             .map_err(|err| eyre::eyre!(err.to_string()))?;
-        let mux = std::sync::Arc::new(micromux::Micromux::new(&parsed)?);
+        let cache = tempfile::tempdir()?;
+        let mux = std::sync::Arc::new(test_micromux(&parsed, &cache)?);
         let shutdown = micromux::CancellationToken::new();
         let (_runner, handles) = mux.start(shutdown.clone());
         let (commands_tx, mut commands_rx) = mpsc::channel(4);
@@ -2753,8 +2781,9 @@ mod tests {
         let mut diagnostics: Vec<Diagnostic<usize>> = vec![];
         let parsed = micromux::from_str(yaml, Path::new("."), 0usize, None, &mut diagnostics)
             .map_err(|err| eyre::eyre!(err.to_string()))?;
+        let cache = tempfile::tempdir()?;
         let mux = std::sync::Arc::new(
-            micromux::Micromux::new(&parsed).map_err(|err| eyre::eyre!(err.to_string()))?,
+            test_micromux(&parsed, &cache).map_err(|err| eyre::eyre!(err.to_string()))?,
         );
         let shutdown = micromux::CancellationToken::new();
         let (_runner, handles) = mux.start(shutdown.clone());
@@ -2846,8 +2875,9 @@ mod tests {
         let mut diagnostics: Vec<Diagnostic<usize>> = vec![];
         let parsed = micromux::from_str(yaml, Path::new("."), 0usize, None, &mut diagnostics)
             .map_err(|err| eyre::eyre!(err.to_string()))?;
+        let cache = tempfile::tempdir()?;
         let mux = std::sync::Arc::new(
-            micromux::Micromux::new(&parsed).map_err(|err| eyre::eyre!(err.to_string()))?,
+            test_micromux(&parsed, &cache).map_err(|err| eyre::eyre!(err.to_string()))?,
         );
         let shutdown = micromux::CancellationToken::new();
         let (_runner, handles) = mux.start(shutdown.clone());
@@ -2896,8 +2926,9 @@ mod tests {
         let mut diagnostics: Vec<Diagnostic<usize>> = vec![];
         let parsed = micromux::from_str(yaml, Path::new("."), 0usize, None, &mut diagnostics)
             .map_err(|err| eyre::eyre!(err.to_string()))?;
+        let cache = tempfile::tempdir()?;
         let mux = std::sync::Arc::new(
-            micromux::Micromux::new(&parsed).map_err(|err| eyre::eyre!(err.to_string()))?,
+            test_micromux(&parsed, &cache).map_err(|err| eyre::eyre!(err.to_string()))?,
         );
         let shutdown = micromux::CancellationToken::new();
         let (_runner, handles) = mux.start(shutdown.clone());
@@ -2965,7 +2996,8 @@ mod tests {
             let mut diagnostics: Vec<Diagnostic<usize>> = Vec::new();
             let parsed = micromux::from_str(yaml, Path::new("."), 0, None, &mut diagnostics)
                 .map_err(|err| eyre::eyre!(err.to_string()))?;
-            let mux = std::sync::Arc::new(micromux::Micromux::new(&parsed)?);
+            let cache = tempfile::tempdir()?;
+            let mux = std::sync::Arc::new(test_micromux(&parsed, &cache)?);
             let (_runner, handles) = mux.start(micromux::CancellationToken::new());
             Ok(handles)
         }

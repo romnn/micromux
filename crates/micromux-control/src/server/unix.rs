@@ -146,17 +146,21 @@ pub(super) fn bind(endpoint: &ControlEndpoint) -> Result<Option<EndpointGuard>, 
 pub(super) fn claim_project(
     config_path: &CanonicalConfigPath,
 ) -> Result<super::ProjectClaim, super::ClaimError> {
+    claim_project_at(&project_lock_path(config_path).map_err(ControlError::from)?)
+}
+
+/// Claims the project lock at `lock_path`.
+pub(super) fn claim_project_at(lock_path: &Path) -> Result<super::ProjectClaim, super::ClaimError> {
     use std::io::{Read as _, Seek as _, Write as _};
     use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 
-    let lock_path = project_lock_path(config_path).map_err(ControlError::from)?;
     let mut project_lock = std::fs::OpenOptions::new()
         .create(true)
         .read(true)
         .write(true)
         .truncate(false)
         .mode(0o600)
-        .open(&lock_path)
+        .open(lock_path)
         .map_err(ControlError::from)?;
     project_lock
         .set_permissions(std::fs::Permissions::from_mode(0o600))
@@ -1265,8 +1269,8 @@ mod tests {
         InboundFrameRate, MAX_LOG_TAIL, MAX_UNSOLICITED_SUBSCRIPTION_FRAMES_PER_WINDOW,
         RESPONSE_MAX_BYTES, SubscriptionPolicy, bind_project, bound_follow_response_lines,
         bound_follow_response_lines_page, bound_health_attempt, bound_health_history,
-        bound_tail_response_lines, describe, encoded_len, lag_replay_changes, log_read_error,
-        logs_fit, project_lock_path, response_within_frame, stream_changes,
+        bound_tail_response_lines, claim_project_at, describe, encoded_len, lag_replay_changes,
+        log_read_error, logs_fit, response_within_frame, stream_changes,
     };
 
     fn line(seq: u64, len: usize) -> LogLine {
@@ -1552,15 +1556,6 @@ mod tests {
         assert_eq!(lines.first().map(|line| line.seq), Some(1));
     }
 
-    /// Removes a file when the test ends, however it ends.
-    struct RemoveOnDrop(std::path::PathBuf);
-
-    impl Drop for RemoveOnDrop {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.0);
-        }
-    }
-
     /// The owner lock is claimed before any endpoint exists, a second claim names its holder,
     /// and the endpoint bound under the claim keeps the lock until it is dropped.
     #[tokio::test]
@@ -1568,17 +1563,14 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
 
         let directory = tempfile::tempdir()?;
-        let config = directory.path().join("micromux.yaml");
-        std::fs::write(&config, "version: 1\nservices: {}\n")?;
-        let config = CanonicalConfigPath::new(config)?;
         let first = ControlEndpoint::Unix(directory.path().join("first.sock"));
         let second = ControlEndpoint::Unix(directory.path().join("second.sock"));
-        // The project lock lives in the user's coordination directory, keyed by this test's
-        // temporary config, so nobody else ever uses it.
-        let _project_lock = RemoveOnDrop(project_lock_path(&config)?);
+        // The project lock of the test's own, in place of the one in the user's coordination
+        // directory.
+        let project_lock = directory.path().join("project.session.lock");
 
-        let claim = crate::claim_project(&config)?;
-        let held = crate::claim_project(&config);
+        let claim = claim_project_at(&project_lock)?;
+        let held = claim_project_at(&project_lock);
         assert!(
             matches!(held, Err(crate::ClaimError::Held { pid: Some(pid) }) if pid == std::process::id()),
             "{held:?}"
@@ -1588,21 +1580,18 @@ mod tests {
         let ControlEndpoint::Unix(first_path) = &first else {
             eyre::bail!("test endpoint was not Unix");
         };
-        for lock_path in [
-            first_path.with_extension("lock"),
-            project_lock_path(&config)?,
-        ] {
+        for lock_path in [first_path.with_extension("lock"), project_lock.clone()] {
             assert_eq!(
                 std::fs::metadata(lock_path)?.permissions().mode() & 0o777,
                 0o600
             );
         }
         assert!(matches!(
-            crate::claim_project(&config),
+            claim_project_at(&project_lock),
             Err(crate::ClaimError::Held { .. })
         ));
         drop(first_guard);
-        assert!(bind_project(&second, &crate::claim_project(&config)?)?.is_some());
+        assert!(bind_project(&second, &claim_project_at(&project_lock)?)?.is_some());
         Ok(())
     }
 
@@ -1618,7 +1607,9 @@ mod tests {
         let config_path = CanonicalConfigPath::new(config_path)?;
         let mut diagnostics = Vec::new();
         let config = micromux::from_str(yaml, directory.path(), 0usize, None, &mut diagnostics)?;
-        let mux = Arc::new(micromux::Micromux::new(&config)?);
+        let mux = Arc::new(
+            micromux::Micromux::new(&config)?.with_cache_directory(directory.path().join("cache")),
+        );
         let (_runner, handles) = mux.start(micromux::CancellationToken::new());
         let control = handles.service_control();
         let server = Arc::new(ControlServer::new(

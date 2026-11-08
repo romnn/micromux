@@ -33,7 +33,11 @@ const SERVICES: &str = indoc! {r#"
 fn app(yaml: &str) -> eyre::Result<App> {
     let mut diagnostics = Vec::new();
     let parsed = micromux::from_str(yaml, Path::new("."), 0usize, None, &mut diagnostics)?;
-    let mux = std::sync::Arc::new(micromux::Micromux::new(&parsed)?);
+    // The run-log spool goes to a directory of the test's own, never the user's cache.
+    // The runner never runs, so nothing writes to it after it is removed with this function.
+    let cache = tempfile::tempdir()?;
+    let mux =
+        std::sync::Arc::new(micromux::Micromux::new(&parsed)?.with_cache_directory(cache.path()));
     let (_runner, handles) = mux.start(micromux::CancellationToken::new());
     let mut app = App::new(
         SessionSource::Local(LocalSource::new(handles.reader, handles.commands.clone())),

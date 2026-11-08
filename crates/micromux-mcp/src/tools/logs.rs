@@ -6,7 +6,7 @@ use rmcp::ErrorData;
 use schemars::JsonSchema;
 use serde::Serialize;
 
-use crate::select::ToolError;
+use crate::select::{Discovery, ToolError};
 use crate::{LogFilters, SessionConn, convert, error_data, logproc, service_result};
 
 #[derive(Serialize, JsonSchema)]
@@ -177,6 +177,7 @@ fn returned_cursors(entries: &[logproc::ProcessedEntry]) -> BTreeMap<String, u64
 }
 
 pub(crate) async fn fetch_and_shape_tail(
+    discovery: &Discovery,
     conn: &mut SessionConn,
     service_id: &str,
     run_generation: Option<u64>,
@@ -192,7 +193,7 @@ pub(crate) async fn fetch_and_shape_tail(
         })
         .await
         .map_err(error_data)?;
-    let logs = service_result(service_id, convert::logs(response)).await?;
+    let logs = service_result(discovery, service_id, convert::logs(response)).await?;
     let window_full = logs.lines.len() >= fetch_tail;
     let server_truncated = logs.truncated;
     let entries = logproc::shape(&logs.lines, &filters.shape(raw, None));

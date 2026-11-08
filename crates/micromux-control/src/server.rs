@@ -152,6 +152,17 @@ pub fn claim_project(config_path: &CanonicalConfigPath) -> Result<ProjectClaim, 
     platform::claim_project(config_path)
 }
 
+/// Claims the owner lock at `lock_path` like [`claim_project`], for tests that keep their locks
+/// out of the user's coordination directory.
+///
+/// # Errors
+///
+/// Returns the same errors as [`claim_project`].
+#[cfg(unix)]
+pub fn claim_project_at(lock_path: &std::path::Path) -> Result<ProjectClaim, ClaimError> {
+    platform::claim_project_at(lock_path)
+}
+
 /// Binds a session endpoint under the config's owner lock, which `claim` holds.
 ///
 /// The returned guard shares the owner lock, which stays held until both the guard and `claim`

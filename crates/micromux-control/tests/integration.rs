@@ -52,7 +52,8 @@ fn build_session_yaml(dir: &Path, yaml: &str) -> eyre::Result<Session> {
         Ok(micromux::Micromux::with_session(
             config,
             micromux::Session::establish(config, &private_registry(dir))?,
-        )?)
+        )?
+        .with_cache_directory(dir.join("cache")))
     })
 }
 
@@ -62,7 +63,8 @@ fn build_routed_session(dir: &Path, yaml: &str) -> eyre::Result<Session> {
     build_session_with(dir, yaml, |config| {
         let mut session = micromux::Session::establish(config, &private_registry(dir))?;
         session.set_proxy_port(8080);
-        Ok(micromux::Micromux::with_session(config, session)?)
+        Ok(micromux::Micromux::with_session(config, session)?
+            .with_cache_directory(dir.join("cache")))
     })
 }
 
@@ -1112,7 +1114,8 @@ async fn one_unreachable_endpoint_does_not_de_list_healthy_sessions() -> eyre::R
 
     // A live socket that answers with garbage fails `Describe` fast with a *non-hard* error. It must
     // be counted as unreachable — never abort the scan or hide the healthy session.
-    let garbage_path = dir.path().join("garbage.sock");
+    // Discovery only probes sockets named like a session's, after an endpoint hash.
+    let garbage_path = dir.path().join(format!("{:016x}.sock", 1));
     let listener = tokio::net::UnixListener::bind(&garbage_path)?;
     tokio::spawn(async move {
         while let Ok((mut stream, _)) = listener.accept().await {
@@ -1121,11 +1124,21 @@ async fn one_unreachable_endpoint_does_not_de_list_healthy_sessions() -> eyre::R
         }
     });
 
-    let closed_path = dir.path().join("closed.sock");
+    let closed_path = dir.path().join(format!("{:016x}.sock", 2));
     let listener = tokio::net::UnixListener::bind(&closed_path)?;
     tokio::spawn(async move {
         while let Ok((stream, _)) = listener.accept().await {
             drop(stream);
+        }
+    });
+
+    // A live socket not named like a session's, as the shared proxy's when the runtime directory
+    // doubles as the coordination directory, is never probed at all.
+    let proxy_path = dir.path().join("proxy.sock");
+    let listener = tokio::net::UnixListener::bind(&proxy_path)?;
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let _ = stream.write_all(b"not json\n").await;
         }
     });
 
@@ -1142,6 +1155,12 @@ async fn one_unreachable_endpoint_does_not_de_list_healthy_sessions() -> eyre::R
     assert_eq!(
         unreachable, 2,
         "live-but-bad endpoints must be counted, not hidden"
+    );
+    assert!(
+        probes
+            .iter()
+            .all(|probe| probe.endpoint != ControlEndpoint::Unix(proxy_path.clone())),
+        "the proxy's socket is not a session"
     );
 
     session.shutdown.cancel();

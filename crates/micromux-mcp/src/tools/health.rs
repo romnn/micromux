@@ -11,9 +11,9 @@ use micromux_control::{Client, ControlEndpoint, ErrorCode, Request};
 use schemars::JsonSchema;
 use serde::Serialize;
 
-use crate::select::ToolError;
+use crate::select::{Discovery, ToolError};
 use crate::tools::portowner;
-use crate::{DIAGNOSE_LOG_SCAN, SessionConn, WAIT_POLL_FLOOR, convert, logproc, select};
+use crate::{DIAGNOSE_LOG_SCAN, SessionConn, WAIT_POLL_FLOOR, convert, logproc};
 
 const PORT_PROBE_BUDGET: Duration = Duration::from_millis(50);
 
@@ -300,7 +300,7 @@ async fn probe_port(port: u16) -> PortProbe {
     }
 }
 
-async fn port_signals(snapshot: &ServiceSnapshot) -> Vec<Signal> {
+async fn port_signals(discovery: &Discovery, snapshot: &ServiceSnapshot) -> Vec<Signal> {
     // Probe only when micromux holds no live process for this service: a Running service has
     // plausibly bound its own port, a Stopping one is still draining and may hold it too, and
     // Unknown (a newer peer's state) gives no basis to attribute the holder. A held port while
@@ -323,7 +323,7 @@ async fn port_signals(snapshot: &ServiceSnapshot) -> Vec<Signal> {
                 "advertised port {port} is already held on 127.0.0.1 while the service is {:?}",
                 snapshot.execution
             );
-            let micromux_owner = micromux_port_owner(*port).await;
+            let micromux_owner = micromux_port_owner(discovery, *port).await;
             if let Some(owner) = &micromux_owner {
                 let _ = write!(
                     detail,
@@ -369,8 +369,8 @@ struct MicromuxPortOwner {
     config_path: String,
 }
 
-async fn micromux_port_owner(port: u16) -> Option<MicromuxPortOwner> {
-    for resolved in select::answering_sessions().await.ok()? {
+async fn micromux_port_owner(discovery: &Discovery, port: u16) -> Option<MicromuxPortOwner> {
+    for resolved in discovery.answering_sessions().await.ok()? {
         let Ok(mut client) = Client::connect(&resolved.endpoint).await else {
             continue;
         };
@@ -395,6 +395,7 @@ async fn micromux_port_owner(port: u16) -> Option<MicromuxPortOwner> {
 }
 
 pub(crate) async fn supervisor_signals(
+    discovery: &Discovery,
     snapshot: &ServiceSnapshot,
     latest_healthcheck: Option<&HealthAttempt>,
 ) -> Vec<Signal> {
@@ -407,19 +408,20 @@ pub(crate) async fn supervisor_signals(
     .into_iter()
     .flatten()
     .collect::<Vec<_>>();
-    signals.extend(port_signals(snapshot).await);
+    signals.extend(port_signals(discovery, snapshot).await);
     signals
 }
 
 pub(crate) async fn diagnose_service(
     conn: &mut SessionConn,
+    discovery: &Discovery,
     snapshot: ServiceSnapshot,
     tail: usize,
 ) -> Result<ServiceDiagnosis, ToolError> {
     let latest_healthcheck = latest_health_for_snapshot(conn, &snapshot)
         .await
         .map(bounded_attempt);
-    let signals = supervisor_signals(&snapshot, latest_healthcheck.as_ref()).await;
+    let signals = supervisor_signals(discovery, &snapshot, latest_healthcheck.as_ref()).await;
     let timeline = conn
         .request(Request::GetEvents {
             service: snapshot.id.clone(),
@@ -880,7 +882,7 @@ mod tests {
         let mut snapshot = snapshot(Execution::Exited);
         snapshot.advertised_ports = vec![port];
 
-        let signals = port_signals(&snapshot).await;
+        let signals = port_signals(&Discovery::in_runtime_dirs(Vec::new()), &snapshot).await;
 
         assert_eq!(signals.len(), 1);
         assert_eq!(
@@ -891,7 +893,10 @@ mod tests {
         // A draining service plausibly holds its own port — probing would blame the service for
         // its own bind, so live-process states must not emit the signal.
         snapshot.execution = Execution::Stopping;
-        assert_eq!(port_signals(&snapshot).await, Vec::new());
+        assert_eq!(
+            port_signals(&Discovery::in_runtime_dirs(Vec::new()), &snapshot).await,
+            Vec::new()
+        );
         Ok(())
     }
 
