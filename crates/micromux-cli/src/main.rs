@@ -439,9 +439,9 @@ async fn run_command(command: options::Command, options: options::Options) -> Re
     }
 }
 
-async fn run() -> Result<(), Error> {
-    let mut options = options::Options::parse();
-    // Every micromux of an isolated setup must agree on its directory, wherever it starts.
+/// Refuses a relative `MICROMUX_STATE_DIR`: every micromux of an isolated setup must agree on its
+/// directory, wherever it starts.
+fn check_state_dir() -> Result<(), Error> {
     if let Some(state) = std::env::var_os(micromux::STATE_DIR_VARIABLE)
         && !state.is_empty()
         && !std::path::Path::new(&state).is_absolute()
@@ -452,6 +452,12 @@ async fn run() -> Result<(), Error> {
             std::path::Path::new(&state).display()
         )));
     }
+    Ok(())
+}
+
+async fn run() -> Result<(), Error> {
+    let mut options = options::Options::parse();
+    check_state_dir()?;
     // `exec` replaces this process, and the command it runs keeps the caller's open-file limit.
     if !matches!(options.command, Some(options::Command::Exec { .. })) {
         raise_file_descriptor_limit();
