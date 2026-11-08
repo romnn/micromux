@@ -1,3 +1,4 @@
+use ansi_to_tui::IntoText as _;
 use micromux::LogLine;
 
 use crate::json_log::LineFormat;
@@ -13,6 +14,9 @@ pub struct Service {
     pub record_starts: Vec<usize>,
     pub cached_text: ratatui::text::Text<'static>,
     pub text_dirty: bool,
+    /// Counts the rebuilds of `cached_text`, so what was computed from it, such as search
+    /// matches, can tell when it is stale.
+    pub text_generation: u64,
     pub cached_line_index: crate::render::log_view::RenderedLineIndex,
     pub cached_wrap: Option<(bool, u16)>,
     pub logs_dirty: bool,
@@ -40,6 +44,7 @@ impl Service {
             record_starts: Vec::new(),
             cached_text: ratatui::text::Text::default(),
             text_dirty: true,
+            text_generation: 0,
             cached_line_index: crate::render::log_view::RenderedLineIndex::default(),
             cached_wrap: None,
             logs_dirty: true,
@@ -122,6 +127,62 @@ impl Service {
         self.logs_dirty = false;
     }
 
+    /// Renders `cached_lines` into `cached_text` and indexes its rows for `wrap` at `wrap_width`
+    /// columns, unless that is done already.
+    pub(crate) fn render_text(&mut self, wrap: bool, wrap_width: u16) {
+        if !self.text_dirty && self.cached_wrap == Some((wrap, wrap_width)) {
+            return;
+        }
+        let joined = self
+            .cached_lines
+            .iter()
+            .map(|(_, line)| line.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        self.cached_text = joined.as_str().into_text().unwrap_or_else(|err| {
+            let escaped = strip_ansi_escapes::strip_str(&joined);
+            tracing::error!(
+                ?err,
+                input_bytes = joined.len(),
+                "failed to sanitize log buffer"
+            );
+            escaped.into()
+        });
+        // A selection finds its lines by the records they came from.
+        self.record_starts.clear();
+        let mut next = 0;
+        for (_, line) in &self.cached_lines {
+            self.record_starts.push(next);
+            next += 1 + line.matches('\n').count();
+        }
+        // Joining drops the line of a blank last record, which keeps a line of its own.
+        if self.cached_text.lines.len() < next {
+            self.cached_text
+                .lines
+                .resize(next, ratatui::text::Line::default());
+        }
+        self.cached_line_index
+            .rebuild(&self.cached_text, wrap, wrap_width);
+        self.cached_wrap = Some((wrap, wrap_width));
+        self.text_dirty = false;
+        self.text_generation = self.text_generation.wrapping_add(1);
+    }
+
+    /// The record line `line` of `cached_text` comes from, which stays with the line while older
+    /// records are dropped, or `None` before any record was rendered.
+    pub(crate) fn record_line(&self, line: usize) -> Option<RecordLine> {
+        let record = self
+            .record_starts
+            .partition_point(|start| *start <= line)
+            .checked_sub(1)?;
+        let start = self.record_starts.get(record)?;
+        let (seq, _) = self.cached_lines.get(record)?;
+        Some(RecordLine {
+            seq: *seq,
+            line: line - start,
+        })
+    }
+
     /// Whether structured records lead with their timestamp: the viewer's toggle, else the config.
     pub(crate) fn shows_timestamps(&self) -> bool {
         self.timestamps_override
@@ -155,6 +216,15 @@ impl Service {
             },
         }
     }
+}
+
+/// A line of the log pane's text by the record it comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct RecordLine {
+    /// The record's sequence number.
+    pub seq: u64,
+    /// The line within the record, which a live screen snapshot has several of.
+    pub line: usize,
 }
 
 #[derive(Debug)]

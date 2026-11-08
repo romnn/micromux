@@ -32,6 +32,8 @@ The header's right side lists the view keys, which change only what the panes sh
 | `H` | Toggle the healthcheck pane |
 | `w` | Toggle log wrapping |
 | `t` | Toggle follow-tail (stick to the newest logs) |
+| `/` | Search the selected service's logs (see [Searching logs](#searching-logs)) |
+| `n` / `N` | Move to the next older / newer search match |
 | `L` | Pick the selected service's log level threshold (`ALL`, `DEBUG`, `INFO`, `WARN`, `ERROR`) |
 | `T` | Toggle timestamps on the selected service's structured JSON log lines |
 | `F` | Toggle the selected service's fields that `logs.fields` hides |
@@ -41,7 +43,7 @@ The header's right side lists the view keys, which change only what the panes sh
 | `m` | Toggle mouse capture (see [Mouse](#mouse)) |
 | `Ctrl-Z` | Suspend to the shell; `fg` brings the TUI back |
 | `y` / `Enter` | Copy the mouse selection; so do a right-click and the terminal's copy shortcut (see [Copying](#copying)) |
-| `Esc` | Clear the mouse selection |
+| `Esc` | Clear the mouse selection, or else the search |
 | `q` | Quit. `Ctrl-C` never quits, so a stray one cannot stop the session; the footer only says to press `q`. To stop micromux from outside, send it `SIGINT` or `SIGTERM` |
 
 {{< figure src="images/service-details.png" alt="The service details popup over the log pane, listing the api service's state, URL, ports, command, directory, dependencies, restart and stop policy, last healthcheck, and current run" caption="`i` describes the selected service in full; `u` shows the session's routes and ports the same way." >}}
@@ -49,6 +51,14 @@ The header's right side lists the view keys, which change only what the panes sh
 `Ctrl-Z` gives the terminal back and stops micromux as the shell would stop any foreground job, together with whatever started it in the same job, such as `cargo run` or a task runner. Until you resume it with `fg`, micromux supervises nothing: the services keep running, but their output piles up unread until they block on it, healthchecks and restart policies pause, agents talking to the session get no answer, and after about 15 seconds the shared proxy drops the session's routes, so its `*.localhost` URLs stop answering until micromux continues.
 
 Restart, disable, and enable all go through the [control plane]({{< relref "agent-control/control-plane.md" >}}), so they respect dependency gating and restart policy.
+
+## Searching logs
+
+`/` opens a prompt over the footer's last row: type a query and press `Enter` to search the selected service's logs, or `Esc` to cancel; `Backspace` edits it. The query matches literal text, the way the pane shows it, and ignores case unless it has an uppercase letter, as vim's smartcase does: `error` finds `ERROR` too, `Error` finds only `Error`.
+
+The newest lines are at the bottom, so a search goes back in time, like vim's `?`: `Enter` moves to the newest match at or above the bottom of the view, `n` to the next older match and `N` to the next newer one, wrapping around at either end. A match off screen scrolls to the middle of the pane, and follow-tail stops, so the match stays put while new lines arrive; `t` follows the tail again. Every match on screen is highlighted, the current one in the focus color, and the Logs pane's top-right corner shows the query with the current match's place, such as `/error 3/17`, or `no match`.
+
+The search stays while the log moves on: new lines are searched as they arrive, and the current match stays on its line until that line is dropped from the log. Selecting another service searches its logs for the same query, with no match current until `n` or `N` moves to one. `Esc` ends the search and its highlighting, once any mouse selection is cleared. In PTY input mode `/`, `n` and `N` go to the service like any other key. Without wrapping (`w`), a match past the pane's right edge is not visible.
 
 ## Mouse
 

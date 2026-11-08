@@ -12,6 +12,7 @@ use ratatui::widgets::{Paragraph, Widget as _};
 
 use super::{PopupContent, PopupHit};
 use crate::render::rows_u16;
+use crate::state::RecordLine;
 use crate::{App, InfoView};
 
 /// Fills the cells of an off-screen render that no text was drawn into, so copying tells
@@ -301,30 +302,14 @@ impl App {
             record: u64::try_from(index).unwrap_or(u64::MAX),
             line: 0,
         };
-        let Some(service) = self
-            .state
+        self.state
             .current_service()
             .filter(|_| pane == TextPane::Logs)
-        else {
-            return index_key;
-        };
-        let Some(record) = service
-            .record_starts
-            .partition_point(|start| *start <= index)
-            .checked_sub(1)
-        else {
-            return index_key;
-        };
-        match (
-            service.cached_lines.get(record),
-            service.record_starts.get(record),
-        ) {
-            (Some((seq, _)), Some(start)) => LineKey {
-                record: *seq,
-                line: index - start,
-            },
-            _ => index_key,
-        }
+            .and_then(|service| service.record_line(index))
+            .map_or(index_key, |RecordLine { seq, line }| LineKey {
+                record: seq,
+                line,
+            })
     }
 
     /// The index of the line `key` names in `pane`, or, when its record was dropped, `Err` with
@@ -470,6 +455,7 @@ impl App {
                 rows.start,
                 rows.len(),
                 context.wrap,
+                crate::render::log_view::Highlights::default(),
             )
             .render(area, &mut buf);
         } else {
