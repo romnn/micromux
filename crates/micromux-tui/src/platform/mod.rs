@@ -5,13 +5,8 @@
 //! Other platforms have none of these, so their side does nothing, never fires or reports that
 //! the operation is unsupported.
 
-cfg_select! {
-    unix => {
-        mod unix;
-        pub(crate) use unix::{Continued, detach, own_tty, stop_process_group};
-    }
-    _ => {
-        mod other;
-        pub(crate) use other::{Continued, detach, own_tty, stop_process_group};
-    }
-}
+#[cfg_attr(unix, path = "unix.rs")]
+#[cfg_attr(not(unix), path = "other.rs")]
+mod imp;
+
+pub(crate) use imp::{Continued, detach, own_tty, stop_process_group};
