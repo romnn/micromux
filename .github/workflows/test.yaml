@@ -10,6 +10,9 @@ on:
 env:
   MISE_GITHUB_TOKEN: ${{ github.token }}
   MISE_AUTO_INSTALL: "0"
+  # Runners sometimes fail release downloads for several seconds, longer than the default
+  # three retries with backoff last.
+  MISE_HTTP_RETRIES: "8"
 
 jobs:
   test:
