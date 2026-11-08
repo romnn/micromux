@@ -12,6 +12,7 @@ mod mouse;
 mod platform;
 mod remote;
 mod render;
+mod search;
 mod source;
 mod state;
 mod style;
@@ -137,6 +138,8 @@ pub struct App {
     show_healthcheck_pane: bool,
     pretty_json_logs: bool,
     level_picker: Option<level::LevelPicker>,
+    /// The search of the log pane.
+    search: search::LogSearch,
     show_help: bool,
     /// The details popup on screen, if any.
     info: Option<InfoView>,
@@ -226,6 +229,7 @@ impl App {
             show_healthcheck_pane: false,
             pretty_json_logs: view_options.pretty_json,
             level_picker: None,
+            search: search::LogSearch::default(),
             show_help: false,
             info: None,
             popup_scroll: 0,
@@ -583,12 +587,14 @@ impl App {
     }
 
     /// Ctrl-C pressed `now`, which never quits: only `q` does, so a stray Ctrl-C, as from a copy
-    /// shortcut a terminal sends as Ctrl-C, cannot stop the session. It closes any popup, where
-    /// `q` means something else, and the footer says for a moment that `q` quits.
+    /// shortcut a terminal sends as Ctrl-C, cannot stop the session. It closes any popup and the
+    /// search prompt, where `q` means something else, and the footer says for a moment that `q`
+    /// quits.
     fn ctrl_c(&mut self, now: std::time::Instant) {
         self.show_help = false;
         self.info = None;
         self.level_picker = None;
+        self.search.prompt = None;
         self.quit_hint_at = Some(now);
     }
 
@@ -806,6 +812,7 @@ impl App {
                     self.enqueue_pty_paste(&service_id, text.as_bytes());
                 }
             }
+            crossterm::event::Event::Paste(ref text) => self.paste_into_search_prompt(text),
             _ => {}
         }
     }
@@ -833,6 +840,17 @@ impl App {
             self.effects.push(Effect::Suspend);
             return;
         }
+        // The prompt takes characters typed with Alt and AltGr as well, which Windows reports as
+        // Ctrl+Alt, so `@`, `{` or `\` can be typed on layouts that put them there; only Ctrl
+        // chords stay out of the query.
+        if self.search.prompt.is_some() {
+            let control_chord = key.modifiers.contains(KeyModifiers::CONTROL)
+                && !key.modifiers.contains(KeyModifiers::ALT);
+            if !control_chord {
+                self.handle_key_press_search_prompt(key.code);
+            }
+            return;
+        }
         if key.modifiers != KeyModifiers::NONE && key.modifiers != KeyModifiers::SHIFT {
             return;
         }
@@ -849,8 +867,11 @@ impl App {
             // Quit
             KeyCode::Char('q') if key.modifiers == KeyModifiers::NONE => self.exit(),
 
-            // Drop or copy the mouse selection
-            KeyCode::Esc => self.mouse.selection = None,
+            // Drop the mouse selection, else the search
+            KeyCode::Esc if self.mouse.selection.is_some() => self.mouse.selection = None,
+            KeyCode::Esc => self.search.clear(),
+
+            // Copy the mouse selection
             KeyCode::Char('y') => self.copy_selection(),
             KeyCode::Enter if self.has_selection() => self.copy_selection(),
 
@@ -900,6 +921,15 @@ impl App {
 
             // Toggle automatic tailing for log viewer
             KeyCode::Char('t') => self.toggle_tail(),
+
+            // Search the logs
+            KeyCode::Char('/') => self.open_search_prompt(),
+            KeyCode::Char('n') if self.search.is_active() => {
+                self.jump_to_match(search::Direction::Older);
+            }
+            KeyCode::Char('N') if self.search.is_active() => {
+                self.jump_to_match(search::Direction::Newer);
+            }
 
             KeyCode::Char('?') => {
                 self.show_help = true;

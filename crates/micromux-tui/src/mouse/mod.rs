@@ -279,6 +279,12 @@ impl App {
         self.mouse.dragging = false;
         self.mouse.pressed = None;
 
+        // A press closes the search prompt and does nothing else, as one outside a popup does,
+        // so a click on a hint cannot type its key into the query.
+        if self.search.prompt.take().is_some() {
+            return;
+        }
+
         // A hint or URL acts on release and keeps the selection, which the copy hint copies.
         // Under a popup only the copy hint does, since copying text selected in the popup is the
         // one thing a click outside it may do without closing it.

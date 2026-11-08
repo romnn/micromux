@@ -46,6 +46,8 @@ chrono = { workspace = true, features = ["clock"] }
 ratatui = { version = "=0.30.2", features = ["unstable-rendered-line-info"] }
 ansi-to-tui = "8"
 strip-ansi-escapes.workspace = true
+# Search matches end on whole graphemes, which ratatui draws as one cell run.
+unicode-segmentation = "1"
 # osc52 copies a mouse selection to the clipboard, which also works over ssh.
 crossterm = { version = "0.29", features = ["event-stream", "osc52"] }
 

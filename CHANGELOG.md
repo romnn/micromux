@@ -4,6 +4,8 @@
 
 - **`micromux attach` types into services and resizes their PTYs.** Press `a` in an attached TUI;
   it resizes the PTYs only while in PTY input mode, so watching never changes them.
+- **`/` searches the selected service's logs in the TUI, and `n` / `N` move between the
+  highlighted matches.** Matching is literal and smartcase, and works in attached TUIs too.
 - **The TUI draws with your terminal theme's colors instead of fixed ones,** so it stays
   readable in light and dark themes alike. A `▶` in the service's status color marks the selected
   service.

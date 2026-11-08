@@ -12,6 +12,7 @@ use ratatui::widgets::{Paragraph, Widget as _};
 
 use super::{PopupContent, PopupHit};
 use crate::render::rows_u16;
+use crate::state::RecordLine;
 use crate::{App, InfoView};
 
 /// Fills the cells of an off-screen render that no text was drawn into, so copying tells
@@ -301,30 +302,14 @@ impl App {
             record: u64::try_from(index).unwrap_or(u64::MAX),
             line: 0,
         };
-        let Some(service) = self
-            .state
+        self.state
             .current_service()
             .filter(|_| pane == TextPane::Logs)
-        else {
-            return index_key;
-        };
-        let Some(record) = service
-            .record_starts
-            .partition_point(|start| *start <= index)
-            .checked_sub(1)
-        else {
-            return index_key;
-        };
-        match (
-            service.cached_lines.get(record),
-            service.record_starts.get(record),
-        ) {
-            (Some((seq, _)), Some(start)) => LineKey {
-                record: *seq,
-                line: index - start,
-            },
-            _ => index_key,
-        }
+            .and_then(|service| service.record_line(index))
+            .map_or(index_key, |RecordLine { seq, line }| LineKey {
+                record: seq,
+                line,
+            })
     }
 
     /// The index of the line `key` names in `pane`, or, when its record was dropped, `Err` with
@@ -338,20 +323,10 @@ impl App {
         else {
             return Ok(index_key);
         };
-        let start_of = |record: usize| {
-            service
-                .record_starts
-                .get(record)
-                .copied()
-                .unwrap_or(service.cached_text.lines.len())
-        };
-        match service
-            .cached_lines
-            .binary_search_by_key(&key.record, |(seq, _)| *seq)
-        {
-            Ok(record) => Ok(start_of(record) + key.line),
-            Err(record) => Err(start_of(record)),
-        }
+        service.find_record_line(RecordLine {
+            seq: key.record,
+            line: key.line,
+        })
     }
 
     /// The anchor for `pos` in `pane`'s text.
@@ -470,6 +445,7 @@ impl App {
                 rows.start,
                 rows.len(),
                 context.wrap,
+                crate::render::log_view::Highlights::default(),
             )
             .render(area, &mut buf);
         } else {
@@ -713,8 +689,10 @@ impl App {
                 if covered.is_some_and(|popup| popup.contains(position)) {
                     continue;
                 }
+                // Reverse video flips, so a selection over text already reversed, such as a
+                // search match, still shows.
                 if let Some(cell) = buf.cell_mut(position) {
-                    cell.modifier.insert(Modifier::REVERSED);
+                    cell.modifier.toggle(Modifier::REVERSED);
                 }
             }
         }

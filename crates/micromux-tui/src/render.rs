@@ -14,7 +14,7 @@ use ratatui::{
 mod tests {
     use super::{
         command_rows, lease_phrase,
-        log_view::{LogView, PaneBorders, RenderedLineIndex, window_text},
+        log_view::{Highlights, LogView, PaneBorders, RenderedLineIndex, window_text},
         service_detail, short_local_time, state_name,
     };
     use ratatui::{
@@ -56,6 +56,7 @@ mod tests {
                 detail: None,
                 focused: false,
             },
+            Highlights::default(),
             buf,
         )
     }
@@ -251,6 +252,7 @@ mod tests {
                 detail: Some(service_detail(&snapshot, 1_000)),
                 focused: false,
             },
+            Highlights::default(),
             &mut buf,
         );
 
@@ -608,7 +610,8 @@ mod tests {
 
         let mut index = RenderedLineIndex::default();
         index.rebuild(&text, false, 80);
-        let (window, local_offset) = window_text(&text, &index, line_count - 1, 1);
+        let (window, local_offset) =
+            window_text(&text, &index, line_count - 1, 1, Highlights::default());
         let expected = line_count.saturating_sub(1).to_string();
 
         assert_eq!(local_offset, 0);
@@ -633,7 +636,7 @@ mod tests {
 
         let mut index = RenderedLineIndex::default();
         index.rebuild(&text, false, 80);
-        let (window, _) = window_text(&text, &index, 0, 1);
+        let (window, _) = window_text(&text, &index, 0, 1, Highlights::default());
         let borrowed = window
             .lines
             .first()
@@ -641,6 +644,90 @@ mod tests {
             .map(|span| span.content.as_ptr());
 
         assert_eq!(borrowed, original);
+    }
+
+    /// A match that crosses a span boundary and covers wide characters is highlighted cell for
+    /// cell, over the colors of the spans it covers, and the current match apart from the rest.
+    #[test]
+    fn log_window_highlights_matches_across_spans_and_wide_characters() {
+        use ratatui::style::{Color, Modifier, Style};
+        use ratatui::widgets::Widget as _;
+
+        let red = Style::new().fg(Color::Red);
+        let text = Text::from(vec![
+            Line::from(vec![Span::styled("日本", red), Span::raw("語 ok")]),
+            Line::raw("ok ok"),
+        ]);
+        let mut index = RenderedLineIndex::default();
+        index.rebuild(&text, false, 20);
+        let matches = [
+            // "本語" ends in the second span.
+            crate::search::Match {
+                line: 0,
+                bytes: 3..9,
+            },
+            crate::search::Match {
+                line: 1,
+                bytes: 3..5,
+            },
+        ];
+        let (window, _) = window_text(
+            &text,
+            &index,
+            0,
+            2,
+            Highlights {
+                matches: &matches,
+                current: Some(1),
+            },
+        );
+        let area = Rect::new(0, 0, 10, 2);
+        let mut buf = Buffer::empty(area);
+        ratatui::widgets::Paragraph::new(window).render(area, &mut buf);
+
+        let style_at = |x: u16, y: u16| {
+            buf.cell((x, y))
+                .map(|cell| (cell.symbol().to_string(), cell.fg, cell.modifier))
+        };
+        // "日" keeps its red; "本" and "語", two cells each, are reversed yellow; " ok" is plain.
+        assert_eq!(
+            style_at(0, 0),
+            Some(("日".to_string(), Color::Red, Modifier::empty()))
+        );
+        assert_eq!(
+            style_at(2, 0),
+            Some(("本".to_string(), Color::Yellow, Modifier::REVERSED))
+        );
+        assert_eq!(
+            style_at(4, 0),
+            Some(("語".to_string(), Color::Yellow, Modifier::REVERSED))
+        );
+        assert_eq!(
+            style_at(7, 0),
+            Some(("o".to_string(), Color::Reset, Modifier::empty()))
+        );
+        // The current match is bold reverse video of the focus accent.
+        assert_eq!(
+            style_at(3, 1),
+            Some((
+                "o".to_string(),
+                super::FOCUS_COLOR,
+                Modifier::REVERSED | Modifier::BOLD
+            ))
+        );
+        assert_eq!(
+            style_at(0, 1),
+            Some(("o".to_string(), Color::Reset, Modifier::empty()))
+        );
+        // Highlighting changes styles only, never the text.
+        assert_eq!(
+            window_text(&text, &index, 0, 1, Highlights::default())
+                .0
+                .lines
+                .first()
+                .map(Line::to_string),
+            Some("日本語 ok".to_string())
+        );
     }
 
     #[test]
@@ -653,7 +740,7 @@ mod tests {
         let mut index = RenderedLineIndex::default();
         index.rebuild(&text, false, 80);
 
-        let (window, local_offset) = window_text(&text, &index, 900, 10);
+        let (window, local_offset) = window_text(&text, &index, 900, 10, Highlights::default());
 
         assert_eq!(local_offset, 0);
         assert_eq!(window.lines.len(), 10);
@@ -1438,6 +1525,14 @@ const HELP_COLUMNS: [&[HelpSection]; 2] = [
                     keys: "u",
                     description: "Session URLs and ports",
                 },
+                HelpKey {
+                    keys: "/",
+                    description: "Search logs (Esc clears)",
+                },
+                HelpKey {
+                    keys: "n / N",
+                    description: "Older / newer match",
+                },
             ],
         },
         HelpSection {
@@ -1523,8 +1618,12 @@ fn help_rows() -> Vec<Line<'static>> {
         .collect()
 }
 
-/// The active logs filters for the pane's top-right corner, or `None` when nothing is hidden.
-fn logs_filters(format: &crate::json_log::LineFormat) -> Option<Line<'static>> {
+/// The logs pane's top-right corner: the active filters and the search, or `None` when nothing
+/// is hidden or searched for.
+fn logs_status(
+    format: &crate::json_log::LineFormat,
+    search: Option<crate::search::SearchStatus<'_>>,
+) -> Option<Line<'static>> {
     let mut filters = Vec::new();
     if format.min_level.is_some() {
         filters.push(format!(
@@ -1537,8 +1636,42 @@ fn logs_filters(format: &crate::json_log::LineFormat) -> Option<Line<'static>> {
         1 => filters.push("1 field hidden".to_string()),
         hidden => filters.push(format!("{hidden} fields hidden")),
     }
-    (!filters.is_empty())
-        .then(|| border_facts(filters.into_iter().map(|filter| filter.fg(Color::DarkGray))))
+    let mut facts = filters
+        .into_iter()
+        .map(|filter| filter.fg(Color::DarkGray))
+        .collect::<Vec<_>>();
+    if let Some(search) = search {
+        facts.push(search_fact(search));
+    }
+    (!facts.is_empty()).then(|| border_facts(facts))
+}
+
+/// Longest query the logs pane's border shows in full.
+const MAX_SHOWN_QUERY_CHARS: usize = 24;
+
+/// The search for the logs pane's border: the query and which match is current, how many there
+/// are, or that there is none.
+fn search_fact(search: crate::search::SearchStatus<'_>) -> Span<'static> {
+    let crate::search::SearchStatus {
+        query,
+        current,
+        count,
+    } = search;
+    let query = if query.chars().count() > MAX_SHOWN_QUERY_CHARS {
+        let kept = query
+            .chars()
+            .take(MAX_SHOWN_QUERY_CHARS - 1)
+            .collect::<String>();
+        format!("{kept}…")
+    } else {
+        query.to_string()
+    };
+    match (current, count) {
+        (_, 0) => format!("/{query} no match").fg(Color::Red),
+        (Some(index), count) => format!("/{query} {}/{count}", index + 1).fg(Color::Yellow),
+        (None, 1) => format!("/{query} 1 match").fg(Color::Yellow),
+        (None, count) => format!("/{query} {count} matches").fg(Color::Yellow),
+    }
 }
 
 /// Fewest border dashes kept between the Logs title and the filters on the right.
@@ -1784,6 +1917,7 @@ impl Widget for &mut App {
         )
         .render(layout.footer, buf);
         let covered = self.render_mouse_notice(&footer, layout.footer, buf);
+        let covered = self.render_search_prompt(layout.footer, buf).or(covered);
 
         // The popups below record themselves as they draw.
         self.hits = crate::mouse::Hits {
@@ -2027,6 +2161,7 @@ impl App {
             KeyHint::new("?", "Help"),
             KeyHint::new("i", "Info"),
             KeyHint::new("u", "URLs"),
+            KeyHint::new("/", "Search"),
             KeyHint::new("↑/↓", "Move"),
             KeyHint::new("←/→", "Resize"),
             KeyHint::toggle("Tab", "Focus", focus),
@@ -2149,11 +2284,19 @@ impl App {
     }
 
     /// Draws the selected service's logs and returns where the URLs in its title landed.
-    fn render_logs(&mut self, area: Rect, buf: &mut Buffer) -> Vec<crate::mouse::LinkHit> {
-        let session = self.source.session_summary();
-        let Some(service) = self.state.current_service_mut() else {
-            return Vec::new();
+    /// Reads the selected service's new log records and renders its text for a pane `area`
+    /// wide, and returns the format it is rendered with.
+    ///
+    /// A view off the tail stays on the rows it shows while new lines arrive and the oldest are
+    /// dropped, which would otherwise shift the text up under it.
+    fn update_log_text(&mut self, area: Rect) -> Option<crate::json_log::LineFormat> {
+        let service = self.state.current_service_mut()?;
+        let top = if self.log_view.follow_tail {
+            None
+        } else {
+            service.row_anchor(self.log_view.scroll_offset)
         };
+        let generation = service.text_generation;
         let format = service.line_format(self.pretty_json_logs);
         service.use_format(&format);
         if service.logs_dirty {
@@ -2162,51 +2305,28 @@ impl App {
                 .logs_since(&service.snapshot.id, service.log_read_cursor());
             service.apply_log_records(first_retained, &records, &format);
         }
-
-        let wrap = self.log_view.wrap;
-        let wrap_width = area.width.saturating_sub(3);
-        if let Some(service) = self.state.current_service_mut()
-            && (service.text_dirty || service.cached_wrap != Some((wrap, wrap_width)))
+        service.render_text(self.log_view.wrap, area.width.saturating_sub(3));
+        if let Some(top) = top
+            && service.text_generation != generation
         {
-            let joined = service
-                .cached_lines
-                .iter()
-                .map(|(_, line)| line.as_str())
-                .collect::<Vec<_>>()
-                .join("\n");
-            service.cached_text = joined.as_str().into_text().unwrap_or_else(|err| {
-                let escaped = strip_ansi_escapes::strip_str(&joined);
-                tracing::error!(
-                    ?err,
-                    input_bytes = joined.len(),
-                    "failed to sanitize log buffer"
-                );
-                escaped.into()
-            });
-            // A selection finds its lines by the records they came from.
-            service.record_starts.clear();
-            let mut next = 0;
-            for (_, line) in &service.cached_lines {
-                service.record_starts.push(next);
-                next += 1 + line.matches('\n').count();
-            }
-            // Joining drops the line of a blank last record, which keeps a line of its own.
-            if service.cached_text.lines.len() < next {
-                service.cached_text.lines.resize(next, Line::default());
-            }
-            service
-                .cached_line_index
-                .rebuild(&service.cached_text, wrap, wrap_width);
-            service.cached_wrap = Some((wrap, wrap_width));
-            service.text_dirty = false;
+            self.log_view.scroll_offset = service.anchored_row(top);
         }
+        Some(format)
+    }
+
+    fn render_logs(&mut self, area: Rect, buf: &mut Buffer) -> Vec<crate::mouse::LinkHit> {
+        let session = self.source.session_summary();
+        let Some(format) = self.update_log_text(area) else {
+            return Vec::new();
+        };
 
         let Some(current_service) = self.state.current_service() else {
             return Vec::new();
         };
+        self.search.refresh(current_service);
         let text = &current_service.cached_text;
         let detail = service_detail(&current_service.snapshot, now_unix_ms());
-        let status = logs_filters(&format);
+        let status = logs_status(&format, self.search.status());
         // The pane's border spans its width less the scrollbar column and both corners.
         let title_width = usize::from(area.width)
             .saturating_sub(3)
@@ -2249,6 +2369,7 @@ impl App {
                 detail: Some(detail),
                 focused: self.focus == crate::Focus::Logs,
             },
+            self.search.highlights(),
             buf,
         );
         // A stopped service's logs are a record, not a live view, so the whole pane goes gray
@@ -2323,6 +2444,7 @@ impl App {
                 detail: None,
                 focused: self.focus == crate::Focus::Healthcheck,
             },
+            log_view::Highlights::default(),
             buf,
         );
     }
@@ -2558,6 +2680,51 @@ impl App {
         None
     }
 
+    /// Draws the search prompt over the footer's last row while it is open, so it never changes
+    /// the layout, and returns the row it covers.
+    ///
+    /// A query wider than the row shows its end, where typing happens.
+    fn render_search_prompt(&self, area: Rect, buf: &mut Buffer) -> Option<u16> {
+        let prompt = self.search.prompt.as_deref()?;
+        if area.height == 0 {
+            return None;
+        }
+        let row = Rect {
+            y: area.bottom() - 1,
+            height: 1,
+            ..area
+        };
+        let width = usize::from(row.width);
+        // The query's end that fits beside the " /" before it and the cursor after it.
+        let room = width.saturating_sub(3);
+        let mut used = 0;
+        let mut shown_from = prompt.len();
+        for (start, ch) in prompt.char_indices().rev() {
+            let ch_width = prompt
+                .get(start..start + ch.len_utf8())
+                .map_or(0, |text| Span::raw(text).width());
+            if used + ch_width > room {
+                break;
+            }
+            used += ch_width;
+            shown_from = start;
+        }
+        let line = Line::from(vec![
+            " /".fg(Color::Yellow).bold(),
+            Span::raw(prompt.get(shown_from..).unwrap_or_default()),
+            Span::styled(" ", Style::new().add_modifier(Modifier::REVERSED)),
+        ]);
+        let hint = " ↵ search · Esc cancel ".fg(Color::DarkGray);
+        let gap = width.saturating_sub(line.width() + hint.width());
+        let mut spans = line.spans;
+        if gap > 0 {
+            spans.extend([Span::raw(" ".repeat(gap)), hint]);
+        }
+        Clear.render(row, buf);
+        buf.set_line(row.x, row.y, &Line::from(spans), row.width);
+        Some(row.y)
+    }
+
     /// Run the application in the terminal.
     ///
     /// # Errors
@@ -2593,6 +2760,7 @@ pub mod log_view {
     use ratatui::{
         buffer::Buffer,
         layout::{Constraint, Direction, Layout, Rect},
+        style::{Color, Modifier, Style},
         widgets::{Clear, Paragraph, Scrollbar, ScrollbarState, StatefulWidget, Widget, Wrap},
     };
 
@@ -2701,6 +2869,27 @@ pub mod log_view {
         }
     }
 
+    /// A search match, in reverse video of the theme's yellow, so it reads apart from a mouse
+    /// selection's plain reverse video.
+    const MATCH_STYLE: Style = Style::new()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::REVERSED);
+
+    /// The current search match, in bold reverse video of the focus accent.
+    const CURRENT_MATCH_STYLE: Style = Style::new()
+        .fg(super::FOCUS_COLOR)
+        .add_modifier(Modifier::REVERSED)
+        .add_modifier(Modifier::BOLD);
+
+    /// Search matches a pane draws highlighted.
+    #[derive(Debug, Clone, Copy, Default)]
+    pub(crate) struct Highlights<'a> {
+        /// The matches, ordered by line and then by position, none overlapping.
+        pub matches: &'a [crate::search::Match],
+        /// The index of the match drawn as the current one.
+        pub current: Option<usize>,
+    }
+
     /// Where a pane drawn in `area` puts its text: inside its border, left of its scrollbar.
     #[must_use]
     pub(crate) fn text_area(area: Rect) -> Rect {
@@ -2721,8 +2910,9 @@ pub mod log_view {
         offset: usize,
         height: usize,
         wrap: bool,
+        highlights: Highlights<'_>,
     ) -> Paragraph<'a> {
-        let (text, paragraph_offset) = window_text(text, line_index, offset, height);
+        let (text, paragraph_offset) = window_text(text, line_index, offset, height, highlights);
         let mut paragraph = Paragraph::new(text).scroll((paragraph_offset, 0));
         if wrap {
             paragraph = paragraph.wrap(Wrap { trim: false });
@@ -2783,6 +2973,7 @@ pub mod log_view {
             line_index: &RenderedLineIndex,
             text: &ratatui::text::Text<'_>,
             borders: PaneBorders<'_>,
+            highlights: Highlights<'_>,
             buf: &mut Buffer,
         ) -> usize {
             let PaneBorders {
@@ -2829,6 +3020,7 @@ pub mod log_view {
                 self.scroll_offset,
                 viewport_height,
                 self.wrap,
+                highlights,
             );
 
             let mut block = super::pane_block(focused).title(title);
@@ -2868,25 +3060,104 @@ pub mod log_view {
         line_index: &RenderedLineIndex,
         offset: usize,
         viewport_height: usize,
+        highlights: Highlights<'_>,
     ) -> (ratatui::text::Text<'a>, u16) {
         let (source_lines, local_offset) = line_index.source_window(offset, viewport_height);
-        (borrow_text_range(text, source_lines), local_offset)
+        (
+            borrow_text_range(text, source_lines, highlights),
+            local_offset,
+        )
     }
 
     fn borrow_text_range<'a>(
         text: &'a ratatui::text::Text<'_>,
         source_lines: std::ops::Range<usize>,
+        highlights: Highlights<'_>,
     ) -> ratatui::text::Text<'a> {
+        let first = highlights
+            .matches
+            .partition_point(|found| found.line < source_lines.start);
+        let mut pending = highlights.matches.iter().enumerate().skip(first).peekable();
+        let lines = text
+            .lines
+            .get(source_lines.clone())
+            .unwrap_or_default()
+            .iter()
+            .zip(source_lines)
+            .map(|(line, index)| {
+                let mut marks = Vec::new();
+                while let Some((at, found)) = pending.next_if(|(_, found)| found.line == index) {
+                    marks.push(Mark {
+                        bytes: found.bytes.clone(),
+                        style: if highlights.current == Some(at) {
+                            CURRENT_MATCH_STYLE
+                        } else {
+                            MATCH_STYLE
+                        },
+                    });
+                }
+                if marks.is_empty() {
+                    borrow_line(line)
+                } else {
+                    highlight_line(line, &marks)
+                }
+            })
+            .collect();
         ratatui::text::Text {
             alignment: text.alignment,
             style: text.style,
-            lines: text
-                .lines
-                .get(source_lines)
-                .unwrap_or_default()
-                .iter()
-                .map(borrow_line)
-                .collect(),
+            lines,
+        }
+    }
+
+    /// Bytes of a line's text drawn in a style of their own.
+    struct Mark {
+        bytes: std::ops::Range<usize>,
+        style: Style,
+    }
+
+    /// `line` with each of `marks`, ordered and apart, patched over the styles of the spans it
+    /// covers, splitting spans where a mark starts or ends inside them.
+    fn highlight_line<'a>(
+        line: &'a ratatui::text::Line<'_>,
+        marks: &[Mark],
+    ) -> ratatui::text::Line<'a> {
+        let mut spans = Vec::new();
+        let mut marks = marks.iter().peekable();
+        let mut span_start = 0;
+        for span in &line.spans {
+            let content: &'a str = span.content.as_ref();
+            let span_end = span_start + content.len();
+            let mut push = |from: usize, to: usize, style: Style| {
+                if let Some(part) = content.get(from - span_start..to - span_start)
+                    && !part.is_empty()
+                {
+                    spans.push(ratatui::text::Span::styled(part, style));
+                }
+            };
+            let mut cursor = span_start;
+            while cursor < span_end {
+                while marks.next_if(|mark| mark.bytes.end <= cursor).is_some() {}
+                match marks.peek() {
+                    Some(mark) if mark.bytes.start < span_end => {
+                        let start = mark.bytes.start.max(cursor);
+                        let end = mark.bytes.end.min(span_end);
+                        push(cursor, start, span.style);
+                        push(start, end, span.style.patch(mark.style));
+                        cursor = end;
+                    }
+                    _ => {
+                        push(cursor, span_end, span.style);
+                        cursor = span_end;
+                    }
+                }
+            }
+            span_start = span_end;
+        }
+        ratatui::text::Line {
+            style: line.style,
+            alignment: line.alignment,
+            spans,
         }
     }
 
