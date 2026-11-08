@@ -150,6 +150,15 @@ pub async fn resolve_config_path(
 mod tests {
     use color_eyre::eyre;
 
+    /// Removes a file when the test ends, however it ends.
+    struct RemoveOnDrop(std::path::PathBuf);
+
+    impl Drop for RemoveOnDrop {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
     /// A session's claim on its config lasts until the session starts stopping, so a session
     /// started meanwhile can claim the config and wait for the stopping one's cleanups.
     #[tokio::test]
@@ -158,6 +167,12 @@ mod tests {
         let config_path = directory.path().join("micromux.yaml");
         std::fs::write(&config_path, "version: 1\nservices: {}\n")?;
         let config = micromux_control::CanonicalConfigPath::new(&config_path)?;
+        // The lock lives in the user's coordination directory, keyed by this test's temporary
+        // config, so nobody else uses it; it goes once the test ends.
+        let _lock_file = RemoveOnDrop(micromux_control::coordination_dir()?.join(format!(
+            "{}.session.lock",
+            micromux_control::endpoint_hash(&config)
+        )));
         let shutdown = micromux::CancellationToken::new();
 
         super::release_at_shutdown(

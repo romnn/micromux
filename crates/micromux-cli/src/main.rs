@@ -287,8 +287,6 @@ struct Supervisor {
     claim: Option<micromux_control::ProjectClaim>,
 }
 
-/// Establishes the session (identity, allocated ports, and the proxy port), builds the
-/// supervisor, and registers its routes before any service starts.
 /// Whether a session can run without its config's owner lock when the lock file is unusable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ClaimPolicy {
@@ -298,6 +296,8 @@ enum ClaimPolicy {
     BestEffort,
 }
 
+/// Establishes the session (identity, allocated ports, and the proxy port), builds the
+/// supervisor, and registers its routes before any service starts.
 async fn start_supervisor(
     config: &micromux::ConfigFile<usize>,
     printer: &DiagnosticsPrinter,
