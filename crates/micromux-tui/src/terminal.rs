@@ -53,9 +53,9 @@ const MODIFY_OTHER_KEYS_ON: &[u8] = b"\x1b[>4;2m";
 const MODIFY_OTHER_KEYS_RESET: &[u8] = b"\x1b[>4m";
 
 /// What the TUI asks of the kitty keyboard protocol: Ctrl+Shift+C reported apart from Ctrl-C and
-/// Super+C reported at all, so the terminals' copy shortcuts arrive, Alt+Esc apart from Esc, so
-/// it leaves PTY input mode, and the shifted key with Shift, so a service in PTY input mode still
-/// gets the legacy bytes for Alt+Shift+1.
+/// Super+C reported at all, so the terminals' copy shortcuts arrive, and the shifted key with
+/// Shift, so keys reported just before PTY input mode turns the protocol off still fold into the
+/// legacy bytes for Alt+Shift+1.
 const KEYBOARD_FLAGS: KeyboardEnhancementFlags =
     KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
         .union(KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS);
@@ -128,7 +128,7 @@ impl crossterm::Command for EnableButtonMouseCapture {
 ///
 /// It also takes the terminal again after a suspend, setting every mode anew, since the shell
 /// may have put its own modes back meanwhile.
-pub(crate) fn take_over(mouse: bool) -> io::Result<()> {
+pub(crate) fn take_over(mouse: bool, keyboard_reporting: bool) -> io::Result<()> {
     let mut stdout = io::stdout();
     // crossterm counts raw mode as on even when a shell turned it off during a suspend.
     if RAW.swap(true, Ordering::SeqCst) {
@@ -139,12 +139,43 @@ pub(crate) fn take_over(mouse: bool) -> io::Result<()> {
     let keyboard = keyboard();
     SCREEN.store(true, Ordering::SeqCst);
     execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
-    ask_for_keyboard_on(&mut stdout, keyboard)?;
+    if keyboard_reporting {
+        ask_for_keyboard_on(&mut stdout, keyboard)?;
+    }
     if mouse {
         MOUSE.store(true, Ordering::SeqCst);
         execute!(stdout, EnableButtonMouseCapture)?;
     }
     Ok(())
+}
+
+/// Turns the keyboard reporting micromux asks for on or off while the TUI shows.
+///
+/// PTY input mode turns it off, so the terminal sends a service's keys as it would without
+/// micromux, Ctrl chords on any keyboard layout included; turning it on again while it is on
+/// sends nothing.
+pub(crate) fn set_keyboard_reporting(enabled: bool) -> io::Result<()> {
+    let mut stdout = io::stdout();
+    if !enabled {
+        return reset_keyboard_on(&mut stdout);
+    }
+    if KEYBOARD.load(Ordering::SeqCst) != Keyboard::Legacy as u8 {
+        return Ok(());
+    }
+    ask_for_keyboard_on(&mut stdout, keyboard())
+}
+
+/// Takes back the keyboard reporting micromux asked for, once: pops the kitty flags or resets
+/// modifyOtherKeys.
+fn reset_keyboard_on(out: &mut impl Write) -> io::Result<()> {
+    match KEYBOARD.swap(Keyboard::Legacy as u8, Ordering::SeqCst) {
+        kitty if kitty == Keyboard::Kitty as u8 => write_ansi(out, PopKeyboardEnhancementFlags),
+        other if other == Keyboard::ModifyOtherKeys as u8 => {
+            out.write_all(MODIFY_OTHER_KEYS_RESET)?;
+            out.flush()
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Asks the terminal to report keys as `keyboard` says, so the single reset in [`give_back`]
@@ -315,18 +346,7 @@ fn give_back_on(
             first = result;
         }
     };
-    match KEYBOARD.swap(Keyboard::Legacy as u8, Ordering::SeqCst) {
-        kitty if kitty == Keyboard::Kitty as u8 => {
-            step(write_ansi(out, PopKeyboardEnhancementFlags));
-        }
-        other if other == Keyboard::ModifyOtherKeys as u8 => {
-            step(
-                out.write_all(MODIFY_OTHER_KEYS_RESET)
-                    .and_then(|()| out.flush()),
-            );
-        }
-        _ => {}
-    }
+    step(reset_keyboard_on(out));
     if MOUSE.swap(false, Ordering::SeqCst) {
         step(execute!(out, DisableMouseCapture));
     }

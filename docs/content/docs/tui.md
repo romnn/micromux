@@ -27,7 +27,7 @@ The header's right side lists the view keys, which change only what the panes sh
 | `r` | Restart the selected service, or run the selected job again |
 | `R` | Restart all services |
 | `d` | Disable / enable the selected service |
-| `a` | Enter PTY **input mode** — send keystrokes to the service (exit with `Alt+Esc`) |
+| `a` | Enter PTY **input mode** — send keystrokes to the service (exit with `Ctrl+]`) |
 | `Tab` | Move focus between panes |
 | `H` | Toggle the healthcheck pane |
 | `w` | Toggle log wrapping |
@@ -64,7 +64,7 @@ With mouse capture on, which is the default, the mouse works as in most terminal
 - **Click** a URL in the Logs pane's title to open it in your browser.
 - **Click** outside an open popup to close it, as `Esc` does. In the level picker, click the threshold you want.
 
-In PTY input mode, neither clicks nor the wheel change which service receives your keystrokes, a right-click copies nothing, and `y`, `Enter`, `Ctrl-C` and the copy shortcuts go to the service, as the bytes a terminal without the kitty keyboard protocol sends for them; leave the mode with `Alt+Esc` to copy.
+In PTY input mode, neither clicks nor the wheel change which service receives your keystrokes, a right-click copies nothing, and `y`, `Enter`, `Ctrl-C` and the copy shortcuts go to the service, as the bytes a terminal without the kitty keyboard protocol sends for them; leave the mode with `Ctrl+]` to copy.
 
 {{< figure src="images/mouse-selection.png" alt="Four request lines of the api service's logs highlighted by a mouse drag, with the footer reading copied 4 lines after y" caption="A drag selects lines inside the logs pane only, and y copies them." >}}
 
@@ -94,7 +94,7 @@ Two things stand between these shortcuts and micromux:
 
 To see what micromux receives, start it with `MICROMUX_DEBUG_KEYS=1`: its log, `~/.cache/micromux/micromux.log.<date>` on Linux, `~/Library/Caches/com.romnn.micromux/micromux.log.<date>` on macOS, or the file `--log-file` names, then records whether the terminal has the protocol, what tmux said, and every key as micromux reads it; in PTY input mode it leaves out which character was typed, so a password typed into a service stays out of the log.
 
-A service in PTY input mode never asked for the protocol, so micromux sends it every key as the bytes a terminal without the protocol sends. Two limits come with the protocol: on a non-Latin keyboard layout, such as Russian or Greek, `Ctrl` chords arrive as the layout's letter, so `Ctrl-C` and `Ctrl-Z` reach neither micromux nor a service as such; switch to a Latin layout for them. And `Alt+Esc` leaves PTY input mode only in terminals with the protocol, or tmux set as above, since the others send it as a plain `Esc`; there, click the `Alt+Esc Exit` hint instead.
+A service in PTY input mode never asked for the protocol, so micromux turns it, and modifyOtherKeys in tmux, off while the mode lasts: the terminal then sends the service its keys as it would without micromux, `Ctrl` chords on any keyboard layout included. `Ctrl+]`, which every terminal sends apart, leaves the mode, and the protocol comes back on. Outside PTY input mode one limit remains: on a non-Latin keyboard layout, such as Russian or Greek, the protocol reports `Ctrl` chords as the layout's letter, so `Ctrl-C` and `Ctrl-Z` do not reach micromux as such; switch to a Latin layout for them.
 
 ### Using the terminal's own mouse handling
 
@@ -155,7 +155,7 @@ The logs pane's top-right corner names any active filter, such as `level ≥ INF
 
 ## Sending input to a service
 
-Some processes want input — a REPL, a prompt, a dev server waiting on a keypress. Press `a` to enter **input mode**: keystrokes are forwarded to the selected service's PTY until you leave input mode with `Alt+Esc`.
+Some processes want input — a REPL, a prompt, a dev server waiting on a keypress. Press `a` to enter **input mode**: keystrokes are forwarded to the selected service's PTY until you leave input mode with `Ctrl+]`.
 
 ## Disabling on the fly
 

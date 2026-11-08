@@ -479,15 +479,25 @@ fn mouse_capture_is_released_by_the_toggle_a_suspend_and_quitting() -> eyre::Res
 
     copy_hello_and_survive_a_ctrl_c(&mut tui)?;
 
-    // With the protocol, Alt+Esc arrives apart from Esc and leaves PTY input mode.
+    // PTY input mode pops the keyboard flags, so the terminal sends the service its keys as
+    // without micromux, and Ctrl+], which every terminal sends as the byte 0x1d, leaves it and
+    // pushes them again.
     tui.send(b"a")?;
-    tui.wait_until("PTY input mode", |screen, _| {
-        screen.contents().contains("Alt+Esc Exit")
+    tui.wait_until("PTY input mode and the flags popped", |screen, written| {
+        screen.contents().contains("Ctrl+] Exit") && contains(written, KEYBOARD_POP)
     })?;
-    tui.send(b"\x1b[27;3u")?;
-    tui.wait_until("PTY input mode to end", |screen, _| {
-        !screen.contents().contains("Alt+Esc Exit")
-    })?;
+    tui.send(b"\x1d")?;
+    tui.wait_until(
+        "PTY input mode to end and the flags back",
+        |screen, written| {
+            !screen.contents().contains("Ctrl+] Exit")
+                && written
+                    .windows(KEYBOARD_PUSH.len())
+                    .filter(|window| *window == KEYBOARD_PUSH)
+                    .count()
+                    == 2
+        },
+    )?;
 
     // The toggle releases the mouse and takes it again.
     tui.send(b"m")?;

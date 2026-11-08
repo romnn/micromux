@@ -1339,3 +1339,30 @@ async fn a_single_cell_can_be_selected() -> eyre::Result<()> {
     assert!(!footer(&mut app).contains("y Copy"));
     Ok(())
 }
+
+/// Ctrl+] leaves PTY input mode as every terminal sends it, the byte 0x1d that crossterm reads as
+/// Ctrl+5, and as the kitty protocol reports it; so does Alt+Esc where it arrives apart, while a
+/// plain Esc goes to the service.
+#[tokio::test]
+async fn ctrl_close_bracket_leaves_pty_input_mode() -> eyre::Result<()> {
+    let mut app = app(SERVICES)?;
+    for (code, modifiers) in [
+        (KeyCode::Char('5'), KeyModifiers::CONTROL),
+        (KeyCode::Char(']'), KeyModifiers::CONTROL),
+        (KeyCode::Esc, KeyModifiers::ALT),
+    ] {
+        press_key(&mut app, KeyCode::Char('a'));
+        assert!(app.pty_input_mode);
+        press_key(&mut app, KeyCode::Esc);
+        assert!(app.pty_input_mode);
+        key_with(&mut app, code, modifiers);
+        assert!(!app.pty_input_mode, "{code:?} {modifiers:?}");
+    }
+
+    // Its footer hint says so, and a click on it leaves the mode too.
+    press_key(&mut app, KeyCode::Char('a'));
+    let frame = draw(&mut app);
+    click(&mut app, find(&frame, "Ctrl+] Exit")?);
+    assert!(!app.pty_input_mode);
+    Ok(())
+}
