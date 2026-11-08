@@ -44,7 +44,7 @@ The header's right side lists the view keys, which change only what the panes sh
 | `Esc` | Clear the mouse selection |
 | `q` | Quit. `Ctrl-C` never quits, so a stray one cannot stop the session; the footer only says to press `q`. To stop micromux from outside, send it `SIGINT` or `SIGTERM` |
 
-{{< figure src="images/service-details.png" alt="The service details popup over the log pane, listing the api service's state, ports, command, directory, dependencies, restart and stop policy, last healthcheck, and current run" caption="`i` describes the selected service in full; `u` shows the session's routes and ports the same way." >}}
+{{< figure src="images/service-details.png" alt="The service details popup over the log pane, listing the api service's state, URL, ports, command, directory, dependencies, restart and stop policy, last healthcheck, and current run" caption="`i` describes the selected service in full; `u` shows the session's routes and ports the same way." >}}
 
 `Ctrl-Z` gives the terminal back and stops micromux as the shell would stop any foreground job, together with whatever started it in the same job, such as `cargo run` or a task runner. Until you resume it with `fg`, micromux supervises nothing: the services keep running, but their output piles up unread until they block on it, healthchecks and restart policies pause, agents talking to the session get no answer, and after about 15 seconds the shared proxy drops the session's routes, so its `*.localhost` URLs stop answering until micromux continues.
 
@@ -66,7 +66,7 @@ With mouse capture on, which is the default, the mouse works as in most terminal
 
 In PTY input mode, neither clicks nor the wheel change which service receives your keystrokes, a right-click copies nothing, and `y`, `Enter`, `Ctrl-C` and the copy shortcuts go to the service, as the bytes a terminal without the kitty keyboard protocol sends for them; leave the mode with `Ctrl+]` to copy.
 
-{{< figure src="images/mouse-selection.png" alt="Four request lines of the api service's logs highlighted by a mouse drag, with the footer reading copied 4 lines after y" caption="A drag selects lines inside the logs pane only, and y copies them." >}}
+{{< figure src="images/mouse-selection.png" alt="Four request lines of the api service's logs highlighted by a mouse drag, with the footer offering y to copy them" caption="A drag selects lines inside the logs pane only, and y copies them." >}}
 
 ### Copying
 

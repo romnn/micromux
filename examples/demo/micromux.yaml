@@ -5,17 +5,31 @@
 # Every service is deterministic and self-contained: each script in bin/ prints a fixed, colorized
 # banner and then sleeps (or exits), and every healthcheck resolves on its first probe with a long
 # interval, so the UI settles into a stable frame within a second. The set is arranged so one
-# capture shows every lifecycle state at once: healthy, running, completed (exited), unhealthy, and
-# blocked on a dependency. The worker logs structured JSON to show timestamps and hidden fields.
+# capture shows every lifecycle state at once: healthy, running, a completed job, unhealthy, blocked
+# on a dependency, and an idle manual job. The worker logs structured JSON to show timestamps and
+# hidden fields.
 version: "1"
+
+# Browser URLs such as http://shop.demo.localhost:8480, served by the shared micromux proxy.
+session:
+  name: demo
+proxy:
+  # A port of its own, so the demo never competes with the proxy of your real sessions on port 80.
+  port: 8480
+routes:
+  - host: shop
+    port: 3000
+  - host: shop
+    path: /api/
+    port: 8080
+
 services:
   api:
     command: ["./bin/api.sh"]
     ports:
       - 8080
     depends_on:
-      - name: postgres
-        condition: healthy
+      - migrate # a bare dependency on a job waits for it to complete
       - name: redis
         condition: healthy
     healthcheck:
@@ -47,6 +61,9 @@ services:
       start_delay: "100ms"
       interval: "1h"
       timeout: "2s"
+    # Runs after every exit of postgres, such as `docker compose down` for a containerized one.
+    cleanup:
+      command: ["sh", "-c", "echo 'postgres stopped'"]
 
   redis:
     command: ["./bin/redis.sh"]
@@ -58,9 +75,13 @@ services:
       interval: "1h"
       timeout: "2s"
 
+  # Jobs run to completion instead of being kept up.
   migrate:
+    kind: job
     command: ["./bin/migrate.sh"]
-    restart: "no"
+    depends_on:
+      - name: postgres
+        condition: healthy
 
   payments:
     command: ["./bin/payments.sh"]
@@ -78,3 +99,11 @@ services:
     depends_on:
       - name: payments
         condition: healthy
+
+  # A manual job runs only on request, with `r` in the TUI or `micromux ctl restart seed`.
+  seed:
+    kind: job
+    run: manual
+    command: ["./bin/seed.sh"]
+    depends_on:
+      - migrate
