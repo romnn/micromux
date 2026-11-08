@@ -508,6 +508,8 @@ impl App {
                     ) => break,
                 }
             }
+            // PTY input mode lets the terminal send a service's keys as it would without micromux.
+            terminal::set_keyboard_reporting(!self.pty_input_mode)?;
             #[cfg(unix)]
             if self.apply_effects(&mut terminal)? {
                 self.suspend(&mut terminal, &mut continued).await?;
@@ -616,7 +618,7 @@ impl App {
     fn take_terminal_again(&mut self, terminal: &mut DefaultTerminal) -> Result<(), Error> {
         use crossterm::terminal::{Clear, ClearType};
 
-        terminal::take_over(self.mouse.capture)?;
+        terminal::take_over(self.mouse.capture, !self.pty_input_mode)?;
         // A new terminal forgets what was drawn; ratatui's own `clear` would ask the terminal
         // where its cursor is, an answer the input reader takes first.
         *terminal =
@@ -980,10 +982,16 @@ impl App {
     fn handle_key_press_pty_input_mode(&mut self, key: crossterm::event::KeyEvent) {
         use crossterm::event::{KeyCode, KeyModifiers};
 
+        // Ctrl+], telnet's escape key, arrives apart from every other key in every terminal:
+        // as `]` with Ctrl through the kitty protocol, and as the byte 0x1d, which crossterm
+        // reads as Ctrl+5, without it. Alt+Esc leaves too, where the terminal reports it apart.
+        let exit = match key.code {
+            KeyCode::Char(']' | '5') => key.modifiers == KeyModifiers::CONTROL,
+            KeyCode::Esc => key.modifiers.contains(KeyModifiers::ALT),
+            _ => false,
+        };
         match key.code {
-            KeyCode::Esc if key.modifiers.contains(KeyModifiers::ALT) => {
-                self.pty_input_mode = false;
-            }
+            _ if exit => self.pty_input_mode = false,
             _ => {
                 if let Some(bytes) = key_event_to_bytes(key.code, key.modifiers)
                     && let Some(service) = self.state.current_service()

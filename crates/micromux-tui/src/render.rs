@@ -1461,7 +1461,7 @@ const HELP_COLUMNS: [&[HelpSection]; 2] = [
                 },
                 HelpKey {
                     keys: "a",
-                    description: "PTY input (Alt+Esc exits)",
+                    description: "PTY input (Ctrl+] exits)",
                 },
                 HelpKey {
                     keys: "Ctrl-Z",
@@ -2057,7 +2057,7 @@ impl App {
         }
         if self.input.is_some() {
             if self.pty_input_mode {
-                hints.push(KeyHint::new("Alt+Esc", "Exit PTY input"));
+                hints.push(KeyHint::new("Ctrl+]", "Exit PTY input"));
             } else {
                 hints.push(KeyHint::new("a", "PTY input"));
             }
@@ -2571,7 +2571,7 @@ impl App {
     /// - The underlying event loop (`App::run`) fails.
     pub async fn render(self) -> Result<(), crate::Error> {
         crate::terminal::install_panic_hook();
-        if let Err(err) = crate::terminal::take_over(self.mouse.capture) {
+        if let Err(err) = crate::terminal::take_over(self.mouse.capture, !self.pty_input_mode) {
             // The failure to take the terminal over is the one to report.
             crate::terminal::give_back().ok();
             return Err(err.into());

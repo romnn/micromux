@@ -53,9 +53,9 @@ const MODIFY_OTHER_KEYS_ON: &[u8] = b"\x1b[>4;2m";
 const MODIFY_OTHER_KEYS_RESET: &[u8] = b"\x1b[>4m";
 
 /// What the TUI asks of the kitty keyboard protocol: Ctrl+Shift+C reported apart from Ctrl-C and
-/// Super+C reported at all, so the terminals' copy shortcuts arrive, Alt+Esc apart from Esc, so
-/// it leaves PTY input mode, and the shifted key with Shift, so a service in PTY input mode still
-/// gets the legacy bytes for Alt+Shift+1.
+/// Super+C reported at all, so the terminals' copy shortcuts arrive, and the shifted key with
+/// Shift, so keys reported just before PTY input mode turns the protocol off still fold into the
+/// legacy bytes for Alt+Shift+1.
 const KEYBOARD_FLAGS: KeyboardEnhancementFlags =
     KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
         .union(KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS);
@@ -128,7 +128,7 @@ impl crossterm::Command for EnableButtonMouseCapture {
 ///
 /// It also takes the terminal again after a suspend, setting every mode anew, since the shell
 /// may have put its own modes back meanwhile.
-pub(crate) fn take_over(mouse: bool) -> io::Result<()> {
+pub(crate) fn take_over(mouse: bool, keyboard_reporting: bool) -> io::Result<()> {
     let mut stdout = io::stdout();
     // crossterm counts raw mode as on even when a shell turned it off during a suspend.
     if RAW.swap(true, Ordering::SeqCst) {
@@ -139,12 +139,50 @@ pub(crate) fn take_over(mouse: bool) -> io::Result<()> {
     let keyboard = keyboard();
     SCREEN.store(true, Ordering::SeqCst);
     execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
-    ask_for_keyboard_on(&mut stdout, keyboard)?;
+    if keyboard_reporting {
+        ask_for_keyboard_on(&mut stdout, keyboard)?;
+    }
     if mouse {
         MOUSE.store(true, Ordering::SeqCst);
         execute!(stdout, EnableButtonMouseCapture)?;
     }
     Ok(())
+}
+
+/// Turns the keyboard reporting micromux asks for on or off while the TUI shows.
+///
+/// PTY input mode turns it off, so the terminal sends a service's keys as it would without
+/// micromux, Ctrl chords on any keyboard layout included; turning it on again while it is on
+/// sends nothing.
+pub(crate) fn set_keyboard_reporting(enabled: bool) -> io::Result<()> {
+    set_keyboard_reporting_on(&mut io::stdout(), enabled, keyboard())
+}
+
+fn set_keyboard_reporting_on(
+    out: &mut impl Write,
+    enabled: bool,
+    keyboard: Keyboard,
+) -> io::Result<()> {
+    if !enabled {
+        return reset_keyboard_on(out);
+    }
+    if KEYBOARD.load(Ordering::SeqCst) != Keyboard::Legacy as u8 {
+        return Ok(());
+    }
+    ask_for_keyboard_on(out, keyboard)
+}
+
+/// Takes back the keyboard reporting micromux asked for, once: pops the kitty flags or resets
+/// modifyOtherKeys.
+fn reset_keyboard_on(out: &mut impl Write) -> io::Result<()> {
+    match KEYBOARD.swap(Keyboard::Legacy as u8, Ordering::SeqCst) {
+        kitty if kitty == Keyboard::Kitty as u8 => write_ansi(out, PopKeyboardEnhancementFlags),
+        other if other == Keyboard::ModifyOtherKeys as u8 => {
+            out.write_all(MODIFY_OTHER_KEYS_RESET)?;
+            out.flush()
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Asks the terminal to report keys as `keyboard` says, so the single reset in [`give_back`]
@@ -315,22 +353,15 @@ fn give_back_on(
             first = result;
         }
     };
-    match KEYBOARD.swap(Keyboard::Legacy as u8, Ordering::SeqCst) {
-        kitty if kitty == Keyboard::Kitty as u8 => {
-            step(write_ansi(out, PopKeyboardEnhancementFlags));
-        }
-        other if other == Keyboard::ModifyOtherKeys as u8 => {
-            step(
-                out.write_all(MODIFY_OTHER_KEYS_RESET)
-                    .and_then(|()| out.flush()),
-            );
-        }
-        _ => {}
-    }
+    // Off the alternate screen first, as far as asking for keyboard reporting goes, so the event
+    // loop cannot ask for it again in between, as when a second interrupt gives the terminal back
+    // from another thread.
+    let screen = SCREEN.swap(false, Ordering::SeqCst);
+    step(reset_keyboard_on(out));
     if MOUSE.swap(false, Ordering::SeqCst) {
         step(execute!(out, DisableMouseCapture));
     }
-    if SCREEN.swap(false, Ordering::SeqCst) {
+    if screen {
         step(execute!(
             out,
             DisableBracketedPaste,
@@ -415,7 +446,7 @@ impl Continued {
 mod tests {
     use super::{
         KEYBOARD, Keyboard, MOUSE, RAW, SCREEN, ask_for_keyboard_on, give_back_on,
-        set_mouse_capture_on,
+        set_keyboard_reporting_on, set_mouse_capture_on,
     };
     use color_eyre::eyre;
     use similar_asserts::assert_eq;
@@ -524,6 +555,37 @@ mod tests {
         ask_for_keyboard_on(&mut out, Keyboard::Kitty)?;
         assert!(out.is_empty(), "{:?}", written(&out));
         assert_eq!(KEYBOARD.load(Ordering::SeqCst), Keyboard::Legacy as u8);
+
+        reporting_goes_off_and_on_with_pty_input_mode()
+    }
+
+    /// PTY input mode turns the keyboard reporting off and leaving it turns it on again, each once
+    /// however often the event loop asks; this needs no console, so it runs on Windows too.
+    fn reporting_goes_off_and_on_with_pty_input_mode() -> eyre::Result<()> {
+        for (keyboard, on, off) in [
+            (Keyboard::Kitty, KEYBOARD_PUSH, KEYBOARD_POP),
+            (
+                Keyboard::ModifyOtherKeys,
+                MODIFY_OTHER_KEYS_ON,
+                MODIFY_OTHER_KEYS_RESET,
+            ),
+        ] {
+            SCREEN.store(true, Ordering::SeqCst);
+            KEYBOARD.store(Keyboard::Legacy as u8, Ordering::SeqCst);
+            let mut out = Vec::new();
+            for enabled in [true, true, false, false, true, true] {
+                set_keyboard_reporting_on(&mut out, enabled, keyboard)?;
+            }
+            assert_eq!(written(&out), format!("{on}{off}{on}"), "{keyboard:?}");
+        }
+        // A terminal without either has nothing to turn off or on.
+        KEYBOARD.store(Keyboard::Legacy as u8, Ordering::SeqCst);
+        let mut out = Vec::new();
+        for enabled in [true, false, true] {
+            set_keyboard_reporting_on(&mut out, enabled, Keyboard::Legacy)?;
+        }
+        assert!(out.is_empty(), "{:?}", written(&out));
+        SCREEN.store(false, Ordering::SeqCst);
         Ok(())
     }
 
@@ -548,6 +610,6 @@ mod tests {
             written(&out),
             format!("{MODIFY_OTHER_KEYS_ON}{MODIFY_OTHER_KEYS_ON}")
         );
-        Ok(())
+        reporting_goes_off_and_on_with_pty_input_mode()
     }
 }

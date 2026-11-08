@@ -203,7 +203,7 @@ fn hint_key(keys: &str) -> Option<KeyEvent> {
     match keys {
         "q" => None,
         "Tab" => Some(key(KeyCode::Tab, KeyModifiers::NONE)),
-        "Alt+Esc" => Some(key(KeyCode::Esc, KeyModifiers::ALT)),
+        "Ctrl+]" => Some(key(KeyCode::Char(']'), KeyModifiers::CONTROL)),
         _ => {
             let mut chars = keys.chars();
             match (chars.next(), chars.next()) {
@@ -340,7 +340,7 @@ impl App {
                 };
                 // In PTY input mode keys go to the service, so only the hint that leaves the mode
                 // acts.
-                if self.pty_input_mode && keys != "Alt+Esc" {
+                if self.pty_input_mode && keys != "Ctrl+]" {
                     return;
                 }
                 self.handle_key_press(key);

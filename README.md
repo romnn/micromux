@@ -96,7 +96,7 @@ from the TUI or with the control plane.
  - **Navigate**: `j`/`k` (or arrows)
  - **Restart**: `r` (current), `R` (all)
  - **Disable/enable**: `d`
- - **PTY input mode (send input)**: `a` (exit input mode with `Alt+Esc`)
+ - **PTY input mode (send input)**: `a` (exit input mode with `Ctrl+]`)
  - **Toggle panes/focus**: `Tab`, healthchecks pane: `H`
  - **Logs**: wrap `w`, follow-tail `t`, level threshold `L`, timestamps `T`, hidden fields `F`
  - **Mouse**: click to select and focus, wheel to scroll, drag to select text inside a pane and `y` or a right-click to
