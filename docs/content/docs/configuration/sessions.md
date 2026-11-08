@@ -24,6 +24,8 @@ allocate_ports:
 
 Two live sessions cannot share a name. When a second session would, it fails to start and asks you to set `session.name`.
 
+One config runs one session at a time. A session claims its config before it waits for anything, such as a previous session's cleanups, so a second start for the same config fails at once with `a session for this config is already starting or running (pid N)`. Through MCP, `start_session` then waits for the session that is already starting and reports it, still starting if it is not reachable yet, instead of starting another. A session that stops gives up its claim as soon as it starts stopping. A session started while another still stops can claim the config, but it still fails to start, with `another micromux is already running`, until the stopping session has exited.
+
 ## Allocated ports
 
 Every name under `allocate_ports` becomes an environment variable holding a free TCP port:
@@ -126,7 +128,7 @@ On Linux, port 80 needs privileges unless you allow unprivileged low ports once 
 
 A session joins a proxy that is already running only if it listens on `port` or `fallback_port`. A session with path routes also needs a proxy that routes by path: one started by an older micromux would ignore the paths, so the session never registers with it.
 
-After an upgrade, the old proxy usually serves no session anymore and only waits out its idle minute, so a session that needs a newer proxy takes it over. A proxy from this version on is asked to stop right away. An older one cannot be stopped, so the session shows `waiting for the outdated proxy (pid N) to exit` and waits up to 75 seconds for it to exit on its own. Then it starts the new proxy and registers. The MCP `start_session` tool waits along with it, so a session it starts this way can take up to 90 seconds to become reachable. The session never signals the old proxy's process. If other sessions still use the old proxy, the session refuses it instead and names the proxy's process id and those sessions: stopping it would cut their routes, and an older micromux would start it again. Stop those sessions or restart them with the new micromux; the old proxy exits a minute after its last session stops. Once only sessions of the new micromux use it, `kill <pid>` moves them to a new proxy right away.
+After an upgrade, the old proxy usually serves no session anymore and only waits out its idle minute, so a session that needs a newer proxy takes it over. A proxy from this version on is asked to stop right away. An older one cannot be stopped, so the session shows `waiting for the outdated proxy (pid N) to exit` and waits up to 75 seconds for it to exit on its own. Then it starts the new proxy and registers. The MCP `start_session` tool waits along with it, so a session it starts this way can take up to 90 seconds longer to become reachable. The session never signals the old proxy's process. If other sessions still use the old proxy, the session refuses it instead and names the proxy's process id and those sessions: stopping it would cut their routes, and an older micromux would start it again. Stop those sessions or restart them with the new micromux; the old proxy exits a minute after its last session stops. Once only sessions of the new micromux use it, `kill <pid>` moves them to a new proxy right away.
 
 The port a session started with stays its port: if the proxy goes away, the session starts it again on the same port, because its services already hold URLs with that port.
 

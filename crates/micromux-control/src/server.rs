@@ -98,21 +98,74 @@ pub fn bind(endpoint: &ControlEndpoint) -> Result<Option<EndpointGuard>, Control
     platform::bind(endpoint)
 }
 
-/// Bind a session endpoint and acquire the config-wide owner lock.
+/// How the error a session reports when another session holds its config's owner lock begins,
+/// for a process that only sees the session's stderr, such as the one that started it.
+pub const SESSION_ALREADY_STARTING: &str =
+    "a session for this config is already starting or running";
+
+/// A config's owner lock, which makes the config's session unique.
 ///
-/// Unlike the endpoint-local lock, the owner lock lives in a fixed per-user directory under
-/// `/tmp`, so changing `XDG_RUNTIME_DIR` or `TMPDIR` cannot start another supervisor for the same
-/// config.
+/// A session claims it before it waits for anything, so a second start for the same config fails
+/// at once, and [`bind_project`] then serves the endpoint under it.
+/// Dropping it releases the lock.
+#[derive(Debug)]
+pub struct ProjectClaim {
+    // The OS releases the advisory lock when the last descriptor closes, also on a crash.
+    #[cfg_attr(
+        not(unix),
+        expect(
+            dead_code,
+            reason = "platforms without a control transport take no lock, so nothing reads it"
+        )
+    )]
+    lock: Option<std::fs::File>,
+}
+
+/// Why [`claim_project`] could not claim a config.
+#[derive(Debug, thiserror::Error)]
+pub enum ClaimError {
+    /// Another session holds the config's owner lock.
+    #[error(
+        "{SESSION_ALREADY_STARTING}{}; stop it first, or attach to it with `micromux attach`",
+        pid.map(|pid| format!(" (pid {pid})")).unwrap_or_default()
+    )]
+    Held {
+        /// The process id the holder recorded, when it could be read.
+        pid: Option<u32>,
+    },
+    /// The lock file could not be opened or locked.
+    #[error(transparent)]
+    Control(#[from] ControlError),
+}
+
+/// Claims the owner lock of `config_path` for this process, and records its process id there.
+///
+/// The lock lives in a fixed per-user directory under `/tmp`, so changing `XDG_RUNTIME_DIR` or
+/// `TMPDIR` cannot start another supervisor for the same config.
+/// On a platform without a control transport the claim holds no lock.
 ///
 /// # Errors
 ///
-/// Returns [`ControlError::Io`] if either lock or the socket cannot be created, or
+/// Returns [`ClaimError::Held`] when another process holds the lock, and
+/// [`ClaimError::Control`] when the lock file cannot be opened or locked.
+pub fn claim_project(config_path: &CanonicalConfigPath) -> Result<ProjectClaim, ClaimError> {
+    platform::claim_project(config_path)
+}
+
+/// Binds a session endpoint under the config's owner lock, which `claim` holds.
+///
+/// The returned guard shares the owner lock, which stays held until both the guard and `claim`
+/// are dropped.
+///
+/// # Errors
+///
+/// Returns [`ControlError::Io`] if the endpoint lock or the socket cannot be created, or
 /// [`ControlError::Unsupported`] when this platform has no control transport.
 pub fn bind_project(
     endpoint: &ControlEndpoint,
-    config_path: &CanonicalConfigPath,
+    claim: &ProjectClaim,
 ) -> Result<Option<EndpointGuard>, ControlError> {
-    platform::bind_project(endpoint, config_path)
+    platform::bind_project(endpoint, claim)
 }
 
 /// Return whether a live owner currently holds the endpoint's lifetime lock.

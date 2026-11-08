@@ -172,30 +172,87 @@ pub(crate) fn remove_captured_stderr(path: &Path) {
     let _ = std::fs::remove_file(path);
 }
 
-/// How long `start_session` gives a spawned session from the moment its captured stderr says it
-/// waits for an outdated proxy to exit, or `None` while it does not say so.
-///
-/// The session gives up on that proxy within [`micromux_proxy::OUTDATED_PROXY_WAIT`], and then
-/// starts like any other, so a start that is still progressing never runs out of time.
-#[cfg(unix)]
-pub(crate) fn outdated_proxy_start_budget(stderr_path: &Path) -> Option<Duration> {
-    use std::io::Read as _;
+/// What a spawned session's captured stderr says about its start.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct ReportedStart {
+    /// How long the session waits for a previous session's cleanups, each time it said so.
+    pub(crate) previous_cleanup_waits: Vec<Duration>,
+    /// Whether it waits for an outdated shared proxy to exit.
+    pub(crate) outdated_proxy_wait: bool,
+    /// The session's error when another session for its config is already starting or running.
+    pub(crate) already_starting: Option<String>,
+}
 
-    // The session reports the wait before it starts any service, so it is near the start.
-    const STDERR_HEAD: u64 = 64 * 1024;
-    let mut head = Vec::new();
-    std::fs::File::open(stderr_path)
-        .and_then(|file| file.take(STDERR_HEAD).read_to_end(&mut head))
-        .ok()?;
-    String::from_utf8_lossy(&head)
-        .contains(micromux_proxy::WAITING_FOR_OUTDATED_PROXY)
-        .then_some(micromux_proxy::OUTDATED_PROXY_WAIT.saturating_add(START_READY_TIMEOUT))
+impl ReportedStart {
+    /// Reads what the session reported in its captured stderr at `stderr_path`.
+    ///
+    /// A session reports these before it starts any service, so they are near the start.
+    pub(crate) fn read(stderr_path: &Path) -> Self {
+        use std::io::Read as _;
+
+        const STDERR_HEAD: u64 = 64 * 1024;
+        let mut head = Vec::new();
+        if std::fs::File::open(stderr_path)
+            .and_then(|file| file.take(STDERR_HEAD).read_to_end(&mut head))
+            .is_err()
+        {
+            return Self::default();
+        }
+        Self::parse(&strip_ansi_escapes::strip_str(String::from_utf8_lossy(
+            &head,
+        )))
+    }
+
+    fn parse(stderr: &str) -> Self {
+        Self {
+            previous_cleanup_waits: micromux::reported_previous_cleanup_waits(stderr),
+            outdated_proxy_wait: outdated_proxy_wait_reported(stderr),
+            already_starting: stderr
+                .lines()
+                .find(|line| line.contains(micromux_control::SESSION_ALREADY_STARTING))
+                .map(|line| line.trim().to_string()),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn outdated_proxy_wait_reported(stderr: &str) -> bool {
+    stderr.contains(micromux_proxy::WAITING_FOR_OUTDATED_PROXY)
 }
 
 /// Sessions only start on Unix, where the proxy exists.
 #[cfg(not(unix))]
-pub(crate) fn outdated_proxy_start_budget(_stderr_path: &Path) -> Option<Duration> {
-    None
+fn outdated_proxy_wait_reported(_stderr: &str) -> bool {
+    false
+}
+
+/// How long a session that waits for an outdated proxy to exit may take to start from then on.
+#[cfg(unix)]
+pub(crate) const OUTDATED_PROXY_START_BUDGET: Duration =
+    micromux_proxy::OUTDATED_PROXY_WAIT.saturating_add(START_READY_TIMEOUT);
+
+/// Sessions only start on Unix, where the proxy exists.
+#[cfg(not(unix))]
+pub(crate) const OUTDATED_PROXY_START_BUDGET: Duration = START_READY_TIMEOUT;
+
+/// Whether the session an "already starting" error names may still run: it names none, or its
+/// process exists.
+pub(crate) fn holder_may_run(pid: Option<u32>) -> bool {
+    #[cfg(unix)]
+    {
+        pid.is_none_or(process_alive)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        true
+    }
+}
+
+/// The process id an "already starting" error names, if it names one.
+pub(crate) fn already_starting_pid(error: &str) -> Option<u32> {
+    let (_, rest) = error.split_once("(pid ")?;
+    rest.split(')').next()?.parse().ok()
 }
 
 pub(crate) fn start_failure_message(base: &str, stderr_path: &Path) -> String {
@@ -344,37 +401,45 @@ mod tests {
     // execs `current_exe()`, which under `cargo test` is the test binary, not micromux. The
     // message shaping below is the unit-testable half; the spawn path is covered manually.
 
-    /// The line a spawned session prints while it waits for an outdated proxy earns it that wait
-    /// plus an ordinary start, while other output, or a stderr capture that is gone, earns
-    /// nothing.
+    /// The lines a spawned session prints while it waits, or when another session holds its
+    /// config, are read off its stderr, and nothing else is.
     #[cfg(unix)]
     #[test]
-    fn the_outdated_proxy_wait_line_earns_its_budget() -> std::io::Result<()> {
+    fn reads_what_a_starting_session_reports() {
         use similar_asserts::assert_eq;
 
-        let dir = tempfile::tempdir()?;
-        let path = dir.path().join("serve.stderr");
-        assert_eq!(outdated_proxy_start_budget(&path), None);
-
-        std::fs::write(
-            &path,
-            "waiting for the cleanup of infra from the previous session\n",
-        )?;
-        assert_eq!(outdated_proxy_start_budget(&path), None);
-
-        // The line the session prints while it waits
-        std::fs::write(
-            &path,
-            format!(
-                "{} (pid 4242) to exit\n",
-                micromux_proxy::WAITING_FOR_OUTDATED_PROXY
-            ),
-        )?;
         assert_eq!(
-            outdated_proxy_start_budget(&path),
-            Some(micromux_proxy::OUTDATED_PROXY_WAIT + START_READY_TIMEOUT)
+            ReportedStart::parse("listening\n"),
+            ReportedStart::default()
         );
-        Ok(())
+
+        let cleanup = micromux::PreviousCleanupWait {
+            services: vec!["infra".to_string()],
+            bound: Duration::from_secs(85),
+        };
+        let proxy = format!(
+            "{} (pid 4242) to exit",
+            micromux_proxy::WAITING_FOR_OUTDATED_PROXY
+        );
+        assert_eq!(
+            ReportedStart::parse(&format!("{cleanup}\n{proxy}\n")),
+            ReportedStart {
+                previous_cleanup_waits: vec![Duration::from_secs(85)],
+                outdated_proxy_wait: true,
+                already_starting: None,
+            }
+        );
+
+        let held = micromux_control::ClaimError::Held { pid: Some(31337) }.to_string();
+        let reported = ReportedStart::parse(&format!("Error: {held}\n"));
+        assert_eq!(reported.already_starting, Some(format!("Error: {held}")));
+        assert_eq!(
+            reported
+                .already_starting
+                .as_deref()
+                .and_then(already_starting_pid),
+            Some(31337)
+        );
     }
 
     #[test]

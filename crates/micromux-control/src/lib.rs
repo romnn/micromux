@@ -55,7 +55,8 @@ pub use select::{
     session_matches_config_path,
 };
 pub use server::{
-    ControlServer, EndpointGuard, SessionIdentity, bind, bind_project, endpoint_owner_lock_held,
+    ClaimError, ControlServer, EndpointGuard, ProjectClaim, SESSION_ALREADY_STARTING,
+    SessionIdentity, bind, bind_project, claim_project, endpoint_owner_lock_held,
 };
 
 /// Maximum size of a single protocol frame. Oversized frames are rejected, not buffered, so a
