@@ -436,7 +436,10 @@ mod tests {
         let alpha = boot(runtime_dir.path(), "alpha", &config_a)?;
 
         // A leaked, non-connectable socket file must be skipped, never resolved or pruned.
-        std::fs::write(runtime_dir.path().join("dead.sock"), b"")?;
+        std::fs::write(
+            runtime_dir.path().join(format!("{:016x}.sock", 0xdead)),
+            b"",
+        )?;
 
         let resolved = resolve_in(
             runtime_dir.path(),
@@ -536,7 +539,9 @@ mod tests {
             }
         });
 
-        let alias_endpoint = ControlEndpoint::Unix(runtime_dir.path().join("session-alias.sock"));
+        // Discovery only probes sockets named after an endpoint hash.
+        let alias_endpoint =
+            ControlEndpoint::Unix(runtime_dir.path().join(format!("{:016x}.sock", 1)));
         let session = boot_at_endpoint(&alias_endpoint, "live", &config_path)?;
         let runtime_dirs = vec![runtime_dir.path().to_path_buf()];
         let dir_statuses = runtime_dirs
@@ -575,7 +580,9 @@ mod tests {
         )?;
         let live_config = CanonicalConfigPath::new(project_dir.path().join("tools/micromux.yaml"))?;
 
-        let alias_endpoint = ControlEndpoint::Unix(runtime_dir.path().join("tools-session.sock"));
+        // Discovery only probes sockets named after an endpoint hash.
+        let alias_endpoint =
+            ControlEndpoint::Unix(runtime_dir.path().join(format!("{:016x}.sock", 1)));
         let session = boot_at_endpoint_with_working_dir(
             &alias_endpoint,
             "live",
@@ -645,7 +652,9 @@ mod tests {
             }
         });
 
-        let alias_endpoint = ControlEndpoint::Unix(runtime_dir.path().join("tools-session.sock"));
+        // Discovery only probes sockets named after an endpoint hash.
+        let alias_endpoint =
+            ControlEndpoint::Unix(runtime_dir.path().join(format!("{:016x}.sock", 1)));
         let session = boot_at_endpoint_with_working_dir(
             &alias_endpoint,
             "live",
@@ -719,7 +728,9 @@ mod tests {
             }
         });
 
-        let alias_endpoint = ControlEndpoint::Unix(runtime_dir.path().join("tools-session.sock"));
+        // Discovery only probes sockets named after an endpoint hash.
+        let alias_endpoint =
+            ControlEndpoint::Unix(runtime_dir.path().join(format!("{:016x}.sock", 1)));
         let session = boot_at_endpoint_with_working_dir(
             &alias_endpoint,
             "live",
@@ -779,7 +790,9 @@ mod tests {
             }
         });
 
-        let alias_endpoint = ControlEndpoint::Unix(runtime_dir.path().join("tools-session.sock"));
+        // Discovery only probes sockets named after an endpoint hash.
+        let alias_endpoint =
+            ControlEndpoint::Unix(runtime_dir.path().join(format!("{:016x}.sock", 1)));
         let session = boot_at_endpoint_with_working_dir(
             &alias_endpoint,
             "live",

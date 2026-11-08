@@ -237,8 +237,7 @@ pub fn runtime_dir_in(state_directory: &Path) -> PathBuf {
 /// The coordination directory of an isolated setup in `state_directory`, which holds its session
 /// locks and its shared proxy's socket and lock.
 ///
-/// It is separate from [`runtime_dir_in`], because discovery takes every socket in a runtime
-/// directory for a session's control socket.
+/// It is separate from [`runtime_dir_in`], so the runtime directory holds only control sockets.
 #[must_use]
 pub fn coordination_dir_in(state_directory: &Path) -> PathBuf {
     state_directory.join("coordination")
@@ -322,6 +321,28 @@ fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)
 }
 
+/// Length of an [`endpoint_hash`], in lowercase hex digits.
+const ENDPOINT_HASH_LEN: usize = 16;
+
+/// Whether `value` has the shape of an [`endpoint_hash`].
+pub(crate) fn is_endpoint_hash(value: &str) -> bool {
+    value.len() == ENDPOINT_HASH_LEN
+        && value
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// The endpoint hash a session's socket at `path` is named after, or `None` for any other file.
+///
+/// A runtime directory can hold other sockets, such as the shared proxy's when it doubles as the
+/// coordination directory, so discovery only takes files named `<endpoint hash>.sock` for
+/// sessions.
+#[cfg(unix)]
+pub(crate) fn session_socket_hash(path: &Path) -> Option<&str> {
+    let hash = path.file_name()?.to_str()?.strip_suffix(".sock")?;
+    is_endpoint_hash(hash).then_some(hash)
+}
+
 /// Build a control endpoint from a known endpoint hash within `runtime_dir`.
 #[must_use]
 pub fn endpoint_from_hash(runtime_dir: &Path, hash: &str) -> ControlEndpoint {
@@ -350,6 +371,35 @@ mod tests {
     use similar_asserts::assert_eq;
     #[cfg(all(unix, target_os = "linux"))]
     use std::io;
+
+    /// Only sockets named after an endpoint hash count as sessions, so the proxy's socket and any
+    /// other file sharing the directory are never probed.
+    #[cfg(unix)]
+    #[test]
+    fn only_endpoint_hash_sockets_are_session_sockets() -> eyre::Result<()> {
+        let directory = Path::new("/run/micromux");
+        let config = CanonicalConfigPath(PathBuf::from("/home/user/project/micromux.yaml"));
+        let ControlEndpoint::Unix(session) = endpoint_for(directory, &config) else {
+            eyre::bail!("expected a Unix socket endpoint");
+        };
+        assert_eq!(
+            session_socket_hash(&session),
+            Some(endpoint_hash(&config).as_str())
+        );
+
+        for other in [
+            "proxy.sock",
+            "garbage.sock",
+            "3F98F83E6E2C8D23.sock",
+            "3f98f83e6e2c8d2.sock",
+            "3f98f83e6e2c8d233.sock",
+            "3f98f83e6e2c8d23.lock",
+            "3f98f83e6e2c8d23.session.lock",
+        ] {
+            assert_eq!(session_socket_hash(&directory.join(other)), None, "{other}");
+        }
+        Ok(())
+    }
 
     #[test]
     fn endpoint_hash_is_deterministic_and_fixed_length() {
