@@ -1,20 +1,19 @@
-//! Read-only, connect-to-verify session selection.
+//! Connect-to-verify session selection, which never mutates a session.
 //!
 //! The control crate owns selector parsing and endpoint resolution. This layer applies the
-//! `MICROMUX_SESSION` fallback and enriches transport probe reports with agent-facing diagnostics;
-//! it never prunes endpoints or mutates sessions.
+//! `MICROMUX_SESSION` fallback and enriches transport probe reports with agent-facing diagnostics.
 
 use std::path::{Path, PathBuf};
 
 use micromux_control::{
     ControlError, EndpointProbe, EndpointProbeResult, ProbeReport, ResolvedSession,
     RuntimeDirDetail, RuntimeDirStatus, SelectError, SessionInfo, SessionSelector,
-    SocketProbeDetail, probe_detail, probe_runtime_dirs, resolve_selector_with_statuses,
+    SocketProbeDetail, SocketProbeDetails, probe_runtime_dirs, resolve_selector_with_statuses,
     runtime_dir_statuses, unique_answering_session_probes, usable_runtime_dirs,
 };
 #[cfg(all(test, unix))]
 use micromux_control::{
-    ProtocolVersion, SocketProbeStatus, resolve_selector_in_runtime_dirs,
+    ProtocolVersion, SocketProbeStatus, probe_detail, resolve_selector_in_runtime_dirs,
     session_config_path_is_under, session_matches_config_path,
 };
 use schemars::JsonSchema;
@@ -82,8 +81,11 @@ pub struct DiscoveryDiagnostics {
     pub xdg_runtime_dir: Option<String>,
     /// All candidate runtime directories and whether they were usable.
     pub runtime_dirs: Vec<RuntimeDirDetail>,
-    /// Probe result for each derived or discovered socket.
+    /// Every derived or discovered socket where something listened, then a few where nothing
+    /// live did.
     pub socket_probes: Vec<SocketProbeDetail>,
+    /// How many sockets had nothing live listening, including those listed in `socket_probes`.
+    pub absent_probe_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -126,6 +128,7 @@ fn diagnostics_from_report(cwd: &Path, report: ProbeReport) -> DiscoveryDiagnost
         xdg_runtime_dir: std::env::var("XDG_RUNTIME_DIR").ok(),
         runtime_dirs: report.runtime_dirs,
         socket_probes: report.socket_probes,
+        absent_probe_count: report.absent_probe_count,
     }
 }
 
@@ -200,8 +203,8 @@ impl Discovery {
 
     /// List every session that answers `Describe`.
     ///
-    /// Endpoints that refuse a connection are skipped; live-but-unusable ones are simply not
-    /// listed this scan (never pruned).
+    /// Endpoints that refuse a connection are skipped, and removed when no session owns them;
+    /// live-but-unusable ones are simply not listed this scan (never pruned).
     ///
     /// # Errors
     ///
@@ -219,16 +222,16 @@ impl Discovery {
                 "no runtime directory could be resolved".to_string(),
                 None,
                 &dir_statuses,
-                Vec::new(),
+                SocketProbeDetails::default(),
             ))));
         }
         let probes = probe_runtime_dirs(&runtime_dirs).await?;
         let sessions = session_infos_from_probes(&probes);
         let summary = session_list_summary(&sessions, &probes);
-        let socket_probes = probes.into_iter().map(probe_detail).collect();
+        let probes = SocketProbeDetails::from_probes(probes);
         Ok(SessionList {
             sessions,
-            diagnostics: discovery_diagnostics(&cwd, summary, None, &dir_statuses, socket_probes),
+            diagnostics: discovery_diagnostics(&cwd, summary, None, &dir_statuses, probes),
         })
     }
 
@@ -296,8 +299,12 @@ pub(crate) fn discovery_diagnostics(
     summary: String,
     config_path: Option<&Path>,
     dir_statuses: &[RuntimeDirStatus],
-    socket_probes: Vec<SocketProbeDetail>,
+    probes: SocketProbeDetails,
 ) -> DiscoveryDiagnostics {
+    let SocketProbeDetails {
+        socket_probes,
+        absent_probe_count,
+    } = probes;
     DiscoveryDiagnostics {
         summary,
         executable: std::env::current_exe()
@@ -316,6 +323,7 @@ pub(crate) fn discovery_diagnostics(
             })
             .collect(),
         socket_probes,
+        absent_probe_count,
     }
 }
 fn session_infos_from_probes(probes: &[EndpointProbe]) -> Vec<SessionInfo> {
@@ -492,7 +500,7 @@ mod tests {
         let config_a = write_config(&runtime_dir.path().join("proj-a/micromux.yaml"))?;
         let alpha = boot(runtime_dir.path(), "alpha", &config_a)?;
 
-        // A leaked, non-connectable socket file must be skipped, never resolved or pruned.
+        // A leaked, non-connectable socket file must be skipped, never resolved.
         std::fs::write(
             runtime_dir.path().join(format!("{:016x}.sock", 0xdead)),
             b"",
@@ -1238,6 +1246,81 @@ mod tests {
 
         first.shutdown.cancel();
         second.shutdown.cancel();
+        Ok(())
+    }
+
+    /// `list_sessions` reports a pile of dead endpoints as a count with a few examples, removes
+    /// them, and still lists the live session and the unusable endpoint in full.
+    #[tokio::test]
+    async fn list_sessions_bounds_and_prunes_dead_endpoints() -> eyre::Result<()> {
+        const DEAD_ENDPOINTS: usize = 20;
+
+        let runtime_dir = temp_dir("list-dead")?;
+        let config_path = write_config(&runtime_dir.path().join("proj/micromux.yaml"))?;
+        let session = boot(runtime_dir.path(), "live", &config_path)?;
+
+        // Leftovers of crashed sessions: socket files nothing listens on, with free locks.
+        let dead_paths = (0..DEAD_ENDPOINTS)
+            .map(|index| {
+                runtime_dir
+                    .path()
+                    .join(format!("{:016x}.sock", 0xdead_0000 + index))
+            })
+            .collect::<Vec<_>>();
+        for path in &dead_paths {
+            drop(std::os::unix::net::UnixListener::bind(path)?);
+        }
+
+        // A listener that answers garbage is unusable and must stay listed.
+        let garbage_path = runtime_dir.path().join(format!("{:016x}.sock", 0xbad));
+        let listener = tokio::net::UnixListener::bind(&garbage_path)?;
+        let garbage_task = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let _ = stream.write_all(b"not json\n").await;
+                let _ = stream.flush().await;
+            }
+        });
+
+        let discovery = Discovery::in_runtime_dirs(vec![runtime_dir.path().to_path_buf()]);
+        let list = discovery.list_sessions().await?;
+
+        // The live session and the unusable endpoint are listed, the dead ones only sampled.
+        let statuses = |list: &SessionList, wanted: SocketProbeStatus| {
+            list.diagnostics
+                .socket_probes
+                .iter()
+                .filter(|probe| probe.status == wanted)
+                .count()
+        };
+        assert_eq!(list.sessions.len(), 1);
+        assert_eq!(statuses(&list, SocketProbeStatus::Session), 1);
+        assert_eq!(statuses(&list, SocketProbeStatus::Unreachable), 1);
+        assert_eq!(
+            statuses(&list, SocketProbeStatus::Absent),
+            micromux_control::LISTED_ABSENT_PROBES
+        );
+        assert_eq!(list.diagnostics.absent_probe_count, DEAD_ENDPOINTS);
+
+        // The dead sockets are gone, their lock files stay, and the live endpoints are untouched.
+        for path in &dead_paths {
+            assert!(!path.exists(), "{} was not pruned", path.display());
+            assert!(path.with_extension("lock").exists());
+        }
+        assert!(garbage_path.exists());
+        let ControlEndpoint::Unix(live_path) = endpoint_for(runtime_dir.path(), &config_path)
+        else {
+            eyre::bail!("expected a Unix socket endpoint");
+        };
+        assert!(live_path.exists());
+
+        // A second scan finds nothing left to report.
+        let list = discovery.list_sessions().await?;
+        assert_eq!(list.diagnostics.absent_probe_count, 0);
+        assert_eq!(statuses(&list, SocketProbeStatus::Absent), 0);
+        assert_eq!(list.sessions.len(), 1);
+
+        garbage_task.abort();
+        session.shutdown.cancel();
         Ok(())
     }
 }

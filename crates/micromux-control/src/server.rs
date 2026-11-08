@@ -192,6 +192,16 @@ pub fn endpoint_owner_lock_held(endpoint: &ControlEndpoint) -> Result<bool, Cont
     platform::endpoint_owner_lock_held(endpoint)
 }
 
+/// Unlinks a dead endpoint's leftover socket when its ownership lock proves no session owns it,
+/// and returns whether it removed one.
+///
+/// A held lock, from a running or still starting session, keeps the socket.
+/// Named pipes vanish with their owner, so only Unix sockets can be left behind.
+#[cfg(unix)]
+pub(crate) fn prune_dead_socket(socket_path: &Path) -> std::io::Result<bool> {
+    platform::prune_dead_socket(socket_path)
+}
+
 /// The control server. Cheap to clone-share via `Arc`.
 #[cfg_attr(
     not(unix),

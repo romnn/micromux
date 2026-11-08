@@ -2,7 +2,8 @@
 //!
 //! The session binds a Unix domain socket (Unix/macOS) keyed by a hash of its canonical config
 //! path; clients — the `micromux ctl` CLI and the MCP proxy — connect, speak newline-delimited JSON
-//! ([`Request`]/[`Response`]), and probe local endpoint paths without pruning stale sockets.
+//! ([`Request`]/[`Response`]), and probe local endpoint paths, removing only the stale sockets no
+//! session owns.
 //! The core knows nothing about any of this; the server is driven by a
 //! [`micromux::SessionModelReader`] (reads) and a [`micromux::ServiceControl`] (mutations and the
 //! environment read), so it can observe and command but never mutate the model directly.
@@ -49,10 +50,10 @@ pub use protocol::{
     SessionInfo,
 };
 pub use select::{
-    AmbiguousSelection, ProbeReport, ResolvedSession, RuntimeDirDetail, SelectError,
-    SessionSelector, SocketProbeDetail, SocketProbeStatus, config_for_target, probe_detail,
-    resolve_selector, resolve_selector_in_runtime_dirs, resolve_selector_with_statuses,
-    session_config_path_is_under, session_matches_config_path,
+    AmbiguousSelection, LISTED_ABSENT_PROBES, ProbeReport, ResolvedSession, RuntimeDirDetail,
+    SelectError, SessionSelector, SocketProbeDetail, SocketProbeDetails, SocketProbeStatus,
+    config_for_target, probe_detail, resolve_selector, resolve_selector_in_runtime_dirs,
+    resolve_selector_with_statuses, session_config_path_is_under, session_matches_config_path,
 };
 #[cfg(unix)]
 pub use server::claim_project_at;

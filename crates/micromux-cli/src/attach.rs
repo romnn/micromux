@@ -96,6 +96,18 @@ fn format_no_session(report: &ProbeReport, client: &str) -> String {
             let _ = write!(message, "\n  {}", format_probe(probe));
         }
     }
+    let listed_absent = report
+        .socket_probes
+        .iter()
+        .filter(|probe| matches!(probe.status, SocketProbeStatus::Absent))
+        .count();
+    let unlisted_absent = report.absent_probe_count.saturating_sub(listed_absent);
+    if unlisted_absent > 0 {
+        let _ = write!(
+            message,
+            "\n  … and {unlisted_absent} more endpoint(s) with nothing listening"
+        );
+    }
     let _ = write!(
         message,
         "\nstart the session with `micromux serve` or the MCP `start_session` tool, then run `micromux {client}` again"

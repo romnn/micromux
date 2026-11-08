@@ -5,6 +5,9 @@
 - **The TUI draws with your terminal theme's colors instead of fixed ones,** so it stays
   readable in light and dark themes alike. A `▶` in the service's status color marks the selected
   service.
+- **Session discovery removes the sockets of crashed sessions, and diagnostics stay small.**
+  `list_sessions` and other `socket_probes` reports count dead endpoints in `absent_probe_count`
+  and list only a few.
 
 ## v0.4.0
 

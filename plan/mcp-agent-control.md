@@ -852,12 +852,16 @@ across `.await`" (see robustness).
   on crash. A successor cannot bind until the lock is released, so shutdown cleanup
   can unlink under the lock without an inode/start-token guard. The reclaim path
   never relies on connect-probing (which a wedged listener can fool).
-- **Read-only proxy:** the MCP proxy never writes or deletes on disk — it *skips*
-  dead endpoints/sentinel files, never prunes them. Only sessions mutate (each
-  writes its own Windows sentinel file), under its own lifetime lock, touching only
-  its own endpoint — single-writer-per-file.
+- **Discovery prunes only proven-dead sockets:** a probe that finds nothing
+  listening unlinks the socket only while it holds the ownership lock (shared, so
+  a starting session waits it out instead of reading it as an owner). A held lock,
+  from a running or starting session, keeps the socket. Lock files are never
+  unlinked: a session that opened one just before would lock an orphaned inode
+  while the next creates a new file, leaving two owners. Otherwise only sessions
+  mutate (each writes its own Windows sentinel file), under its own lifetime lock,
+  touching only its own endpoint.
 - **Cleanup:** unlink on graceful shutdown; no reaper task — a crash-leaked socket
-  is inert and reclaimed by the next same-project start's dance.
+  is removed by the next discovery probe or the next same-project start's dance.
 - **No locks across `.await`:** the model's `Inner` uses `parking_lot::RwLock` (sync).
   Adapters snapshot/clone (or copy the log tail) **under the lock, drop it, then
   serialize and write to the socket** — never hold the guard across an await or
