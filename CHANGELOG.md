@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- **The TUI draws with your terminal theme's colors instead of fixed ones,** so it stays
+  readable in light and dark themes alike. A `▶` in the service's status color marks the selected
+  service.
+
 ## v0.4.0
 
 - **Sessions get a name and stable, collision-free allocated ports.** Configure them with

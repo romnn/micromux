@@ -2862,11 +2862,7 @@ mod tests {
             service.snapshot.desired = micromux::Desired::Disabled;
         }
         let frozen = render(&mut app)?;
-        assert!(
-            matches!(frozen.fg, ratatui::style::Color::Rgb(red, green, blue) if red == green && green == blue),
-            "{:?}",
-            frozen.fg
-        );
+        assert_eq!(frozen.fg, ratatui::style::Color::DarkGray);
         assert!(frozen.modifier.contains(ratatui::style::Modifier::BOLD));
         Ok(())
     }

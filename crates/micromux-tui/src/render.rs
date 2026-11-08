@@ -6,7 +6,7 @@ use ratatui::{
     buffer::Buffer,
     layout::{Constraint, Direction, Layout, Rect},
     prelude::*,
-    style::{Color, Modifier, Style, Styled, palette::tailwind},
+    style::{Color, Modifier, Style, Styled},
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Widget},
 };
 
@@ -802,7 +802,7 @@ fn info_rows<V: Into<Line<'static>>>(label: &str, values: Vec<V>) -> Vec<Line<'s
     let mut values = values.into_iter().map(Into::into);
     let first = values
         .next()
-        .unwrap_or_else(|| Line::from("—".fg(tailwind::GRAY.c500)));
+        .unwrap_or_else(|| Line::from("—".fg(Color::DarkGray)));
     let indent = |label: Span<'static>, line: Line<'static>| {
         let mut spans = vec![label];
         spans.extend(line.spans);
@@ -870,14 +870,14 @@ fn service_info_rows(
             micromux::RetiredReason::Removed => "removed from the config",
             micromux::RetiredReason::Unknown => "unknown reason",
         };
-        state.push(format!("  {reason}").fg(tailwind::GRAY.c400));
+        state.push(format!("  {reason}").fg(Color::DarkGray));
     }
     if let Some(pid) = snapshot.pid {
-        state.push(format!("  pid {pid}").fg(tailwind::GRAY.c400));
+        state.push(format!("  pid {pid}").fg(Color::DarkGray));
     }
     let urls = service_urls(session, &snapshot.id)
         .into_iter()
-        .map(|url| url.fg(tailwind::CYAN.c400))
+        .map(|url| url.fg(Color::LightBlue))
         .collect();
     let depends_on = snapshot
         .depends_on
@@ -914,7 +914,7 @@ fn service_info_rows(
     if snapshot.config_stale {
         rows.extend(info_rows(
             "Config",
-            vec!["changed since this run started; restart to apply".fg(tailwind::YELLOW.c500)],
+            vec!["changed since this run started; restart to apply".fg(Color::Yellow)],
         ));
     }
     rows.extend(info_rows("URLs", urls));
@@ -935,7 +935,7 @@ fn service_info_rows(
     if let Some(failure) = &snapshot.dependency_failure {
         rows.extend(info_rows(
             "Blocked",
-            vec![failure.describe().fg(tailwind::RED.c400)],
+            vec![failure.describe().fg(Color::Red)],
         ));
     }
     rows.extend(info_rows("Restart", restart_rows(snapshot)));
@@ -1019,7 +1019,7 @@ fn restart_rows(snapshot: &micromux::ServiceSnapshot) -> Vec<Span<'static>> {
                 "backing off {}s before the next attempt{left}",
                 state.backoff_delay.as_secs()
             )
-            .fg(tailwind::GRAY.c400),
+            .fg(Color::DarkGray),
         );
     }
     rows
@@ -1032,7 +1032,7 @@ fn healthcheck_rows(
 ) -> Vec<Span<'static>> {
     match (&snapshot.healthcheck, last) {
         (None, _) => Vec::new(),
-        (Some(_), None) => vec!["no attempt yet".fg(tailwind::GRAY.c400)],
+        (Some(_), None) => vec!["no attempt yet".fg(Color::DarkGray)],
         (Some(_), Some(attempt)) => {
             let outcome = match attempt.result {
                 None => "running".to_string(),
@@ -1044,7 +1044,7 @@ fn healthcheck_rows(
             rows.extend(
                 command_rows(&format!("$ {}", attempt.command))
                     .into_iter()
-                    .map(|row| row.fg(tailwind::GRAY.c400)),
+                    .map(|row| row.fg(Color::DarkGray)),
             );
             rows
         }
@@ -1319,11 +1319,11 @@ fn pack_key_hints(hints: &[KeyHint], width: usize) -> Vec<HintRow> {
     } in hints
     {
         let mut hint = vec![
-            keys.fg(tailwind::YELLOW.c500).bold(),
-            format!(" {description}").fg(tailwind::GRAY.c500),
+            keys.fg(Color::Yellow).bold(),
+            format!(" {description}").fg(Color::DarkGray),
         ];
         if let Some(value) = value {
-            hint.push(value.clone().fg(tailwind::GRAY.c500).bold());
+            hint.push(value.clone().fg(Color::DarkGray).bold());
         }
         let hint_width = hint.iter().map(Span::width).sum::<usize>();
         match rows.last_mut() {
@@ -1489,8 +1489,8 @@ fn help_column_rows(sections: &[HelpSection]) -> Vec<Line<'static>> {
         rows.push(Line::from(section.title.bold().fg(App::HEADER_COLOR)));
         for HelpKey { keys, description } in section.keys {
             rows.push(Line::from(vec![
-                format!("  {keys:<9}").fg(tailwind::YELLOW.c500).bold(),
-                description.fg(tailwind::GRAY.c300),
+                format!("  {keys:<9}").fg(Color::Yellow).bold(),
+                description.fg(Color::DarkGray),
             ]));
         }
     }
@@ -1537,13 +1537,8 @@ fn logs_filters(format: &crate::json_log::LineFormat) -> Option<Line<'static>> {
         1 => filters.push("1 field hidden".to_string()),
         hidden => filters.push(format!("{hidden} fields hidden")),
     }
-    (!filters.is_empty()).then(|| {
-        border_facts(
-            filters
-                .into_iter()
-                .map(|filter| filter.fg(tailwind::GRAY.c500)),
-        )
-    })
+    (!filters.is_empty())
+        .then(|| border_facts(filters.into_iter().map(|filter| filter.fg(Color::DarkGray))))
 }
 
 /// Fewest border dashes kept between the Logs title and the filters on the right.
@@ -1554,8 +1549,8 @@ const LOGS_TITLE_GAP: usize = 2;
 ///
 /// Also returns each URL shown with the column it starts at in the title.
 fn logs_title(urls: &[String], width: usize) -> (Line<'static>, Vec<(usize, String)>) {
-    let separator = || " · ".fg(Color::White);
-    let more = |hidden: usize| format!("+{hidden} more").fg(tailwind::GRAY.c400);
+    let separator = || " · ".fg(Color::DarkGray);
+    let more = |hidden: usize| format!("+{hidden} more").fg(Color::DarkGray);
     let mut spans = vec![Span::raw("Logs")];
     // A trailing space keeps the border dashes out of the last URL, which terminals that detect
     // links would otherwise take as part of it.
@@ -1579,7 +1574,7 @@ fn logs_title(urls: &[String], width: usize) -> (Line<'static>, Vec<(usize, Stri
         }
         // The URL follows "Logs" and the separators so far, each three columns wide.
         let start = spans.iter().map(Span::width).sum::<usize>() + 3;
-        spans.extend([separator(), url.clone().fg(tailwind::CYAN.c400)]);
+        spans.extend([separator(), url.clone().fg(Color::LightBlue)]);
         columns.push((start, url.clone()));
         used += url_width;
     }
@@ -1606,20 +1601,20 @@ fn service_urls(session: Option<&micromux::SessionSummary>, service: &str) -> Ve
 /// Joins facts drawn into a border with white dots, padded by a space on either end.
 fn border_facts(facts: impl IntoIterator<Item = Span<'static>>) -> Line<'static> {
     let mut spans = vec![Span::raw(" ")];
-    spans.extend(intersperse(facts, " · ".fg(Color::White)));
+    spans.extend(intersperse(facts, " · ".fg(Color::DarkGray)));
     spans.push(Span::raw(" "));
     Line::from(spans)
 }
 
 fn level_color(min_level: Option<micromux::StructuredLogLevel>) -> Color {
     match min_level {
-        None => tailwind::GRAY.c200,
-        Some(micromux::StructuredLogLevel::Trace) => tailwind::GRAY.c500,
-        Some(micromux::StructuredLogLevel::Debug) => tailwind::CYAN.c400,
-        Some(micromux::StructuredLogLevel::Info) => tailwind::GREEN.c400,
-        Some(micromux::StructuredLogLevel::Warn) => tailwind::YELLOW.c400,
-        Some(micromux::StructuredLogLevel::Error) => tailwind::RED.c400,
-        Some(micromux::StructuredLogLevel::Fatal) => tailwind::FUCHSIA.c400,
+        None => Color::Reset,
+        Some(micromux::StructuredLogLevel::Trace) => Color::DarkGray,
+        Some(micromux::StructuredLogLevel::Debug) => Color::Cyan,
+        Some(micromux::StructuredLogLevel::Info) => Color::Green,
+        Some(micromux::StructuredLogLevel::Warn) => Color::Yellow,
+        Some(micromux::StructuredLogLevel::Error) => Color::Red,
+        Some(micromux::StructuredLogLevel::Fatal) => Color::Magenta,
     }
 }
 
@@ -1690,20 +1685,20 @@ fn pane_name(name: &str, focused: bool) -> Span<'static> {
     if focused {
         span.bold().fg(FOCUS_COLOR)
     } else {
-        span.fg(tailwind::GRAY.c400)
+        span.fg(Color::DarkGray)
     }
 }
 
 /// The accent of the focused pane's frame.
-pub(crate) const FOCUS_COLOR: Color = tailwind::SKY.c400;
+pub(crate) const FOCUS_COLOR: Color = Color::Cyan;
 
 /// The frame of a pane without the focus.
-const UNFOCUSED_COLOR: Color = tailwind::GRAY.c600;
+const UNFOCUSED_COLOR: Color = Color::DarkGray;
 
 /// Color of the command in the logs pane's bottom border.
-const BORDER_COMMAND_COLOR: Color = tailwind::GRAY.c400;
+const BORDER_COMMAND_COLOR: Color = Color::DarkGray;
 /// Color of the run facts in the logs pane's bottom border.
-const BORDER_RUN_FACTS_COLOR: Color = tailwind::FUCHSIA.c400;
+const BORDER_RUN_FACTS_COLOR: Color = Color::Magenta;
 
 /// Identity of the selected service for the logs pane frame.
 ///
@@ -1736,11 +1731,7 @@ fn service_detail(
                 dynamic_facts.push(format!("owner {owner}"));
             }
         }
-        facts.extend(
-            dynamic_facts
-                .into_iter()
-                .map(|fact| fact.fg(tailwind::YELLOW.c500)),
-        );
+        facts.extend(dynamic_facts.into_iter().map(|fact| fact.fg(Color::Yellow)));
     }
     if let Some(started) = snapshot.started_at_unix_ms.and_then(short_local_time) {
         facts.push(format!("started {started}").fg(BORDER_RUN_FACTS_COLOR));
@@ -1844,22 +1835,24 @@ fn hint_hits(rows: &[HintRow], area: Rect) -> Vec<crate::mouse::HintHit> {
 }
 
 impl App {
-    const HEADER_COLOR: Color = tailwind::YELLOW.c500;
-    const HIGHLIGHT_COLOR: Color = tailwind::GRAY.c900;
+    const HEADER_COLOR: Color = Color::Yellow;
+    /// A selected row is bold and set apart by its marker rather than a fill, because no palette
+    /// color makes a fill that reads well in both light and dark themes.
+    const HIGHLIGHT_STYLE: Style = Style::new().add_modifier(Modifier::BOLD);
 
     fn attachment_header(&self) -> Option<Line<'static>> {
         let status = self.source.attachment_status()?;
         let mut spans = if status.connected {
-            vec!["attached: ".fg(tailwind::GREEN.c400).bold()]
+            vec!["attached: ".fg(Color::Green).bold()]
         } else {
-            vec!["reconnecting… ".fg(tailwind::RED.c400).bold()]
+            vec!["reconnecting… ".fg(Color::Red).bold()]
         };
         spans.extend([
             status.session.name.bold(),
             format!(" ({})", status.session.config_path).into(),
         ]);
         if let Some(notice) = status.notice.as_deref().or_else(|| self.terminal_notice()) {
-            spans.extend([" — ".into(), notice.to_string().fg(tailwind::RED.c400)]);
+            spans.extend([" — ".into(), notice.to_string().fg(Color::Red)]);
         }
         Some(Line::from(spans))
     }
@@ -1873,8 +1866,8 @@ impl App {
             format!("micromux v{}", env!("CARGO_PKG_VERSION"))
                 .bold()
                 .fg(App::HEADER_COLOR),
-            " — WARNING: ".fg(tailwind::RED.c400).bold(),
-            notice.to_string().fg(tailwind::RED.c400),
+            " — WARNING: ".fg(Color::Red).bold(),
+            notice.to_string().fg(Color::Red),
         ]))
     }
 
@@ -1937,7 +1930,7 @@ impl App {
             return None;
         };
         Some(Line::from(
-            format!("routing unavailable: {reason}").fg(tailwind::RED.c400),
+            format!("routing unavailable: {reason}").fg(Color::Red),
         ))
     }
 
@@ -2099,7 +2092,8 @@ impl App {
             .state
             .services
             .iter()
-            .map(|service| {
+            .enumerate()
+            .map(|(index, service)| {
                 let status = format!("{: >10}", state_name(&service.snapshot))
                     .set_style(crate::style::service_style(&service.snapshot));
 
@@ -2111,8 +2105,12 @@ impl App {
                 let line = Line::from(vec![
                     status,
                     " ".into(),
-                    origin.fg(tailwind::GRAY.c400),
-                    service.snapshot.id.as_str().into(),
+                    origin.fg(Color::DarkGray),
+                    if index == self.state.selected_service {
+                        service.snapshot.id.as_str().fg(FOCUS_COLOR).bold()
+                    } else {
+                        service.snapshot.id.as_str().into()
+                    },
                 ]);
 
                 ListItem::new(line)
@@ -2136,12 +2134,15 @@ impl App {
             .with_selected(Some(self.state.selected_service));
         let sidebar = List::new(items)
             .block(block)
-            .highlight_style(
-                Style::default()
-                    .bg(Self::HIGHLIGHT_COLOR)
-                    .add_modifier(Modifier::BOLD),
-            )
-            .highlight_symbol(" > ");
+            .highlight_style(Self::HIGHLIGHT_STYLE)
+            // The marker takes the selected service's status color.
+            .highlight_symbol(selection_marker(
+                self.state
+                    .current_service()
+                    .map_or_else(Style::default, |service| {
+                        crate::style::service_style(&service.snapshot)
+                    }),
+            ));
         StatefulWidget::render(&sidebar, area, buf, &mut state);
         self.first_service = state.offset();
         (rows, state.offset())
@@ -2342,7 +2343,7 @@ impl App {
                 let label = crate::level::threshold_label(*choice);
                 let mut spans = vec![format!("{label:<6}").fg(level_color(*choice))];
                 if current == Some(*choice) {
-                    spans.push(" (current)".fg(tailwind::GRAY.c500));
+                    spans.push(" (current)".fg(Color::DarkGray));
                 }
                 ListItem::new(Line::from(spans))
             })
@@ -2363,16 +2364,12 @@ impl App {
             .borders(Borders::ALL)
             .padding(POPUP_PADDING)
             .title(title)
-            .title_bottom(hint.fg(tailwind::GRAY.c500));
+            .title_bottom(hint.fg(Color::DarkGray));
         let rows = block.inner(popup);
         let list = List::new(items)
             .block(block)
-            .highlight_style(
-                Style::default()
-                    .bg(Self::HIGHLIGHT_COLOR)
-                    .add_modifier(Modifier::BOLD),
-            )
-            .highlight_symbol(" > ");
+            .highlight_style(Self::HIGHLIGHT_STYLE)
+            .highlight_symbol(selection_marker(Style::default().fg(FOCUS_COLOR)));
         let mut state = ListState::default();
         state.select(Some(picker.cursor));
         Clear.render(popup, buf);
@@ -2446,7 +2443,7 @@ impl App {
             .borders(Borders::ALL)
             .padding(POPUP_PADDING)
             .title(title)
-            .title_bottom(format!(" {key} or Esc closes ").fg(tailwind::GRAY.c500));
+            .title_bottom(format!(" {key} or Esc closes ").fg(Color::DarkGray));
         if max_scroll > 0 {
             block = block.title_bottom(self.scroll_position(visible, rows.len()));
         }
@@ -2458,7 +2455,7 @@ impl App {
         let first = self.popup_scroll + 1;
         let last = (self.popup_scroll + visible).min(rows);
         format!(" ↑/↓ scroll · {first}-{last} of {rows} ")
-            .fg(tailwind::GRAY.c500)
+            .fg(Color::DarkGray)
             .into_right_aligned_line()
     }
 
@@ -2499,7 +2496,7 @@ impl App {
             .borders(Borders::ALL)
             .padding(POPUP_PADDING)
             .title(" Keys ")
-            .title_bottom(" Esc closes ".fg(tailwind::GRAY.c500));
+            .title_bottom(" Esc closes ".fg(Color::DarkGray));
         if max_scroll > 0 {
             block = block.title_bottom(self.scroll_position(visible, rows.len()));
         }
@@ -2518,9 +2515,9 @@ impl App {
             } else {
                 "quit"
             };
-            (Some(format!("press q to {action}")), tailwind::YELLOW.c400)
+            (Some(format!("press q to {action}")), Color::Yellow)
         } else {
-            (self.mouse.notice.clone(), tailwind::GREEN.c400)
+            (self.mouse.notice.clone(), Color::Green)
         };
         let (Some(notice), Some(last)) = (notice, footer.last()) else {
             return None;
@@ -2904,4 +2901,9 @@ pub mod log_view {
                 .collect(),
         }
     }
+}
+
+/// The marker in front of a selected row, drawn in `style`.
+fn selection_marker(style: Style) -> Line<'static> {
+    Line::from(vec![" ".into(), "▶".set_style(style), " ".into()])
 }
