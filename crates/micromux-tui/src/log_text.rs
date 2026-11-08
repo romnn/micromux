@@ -1,36 +1,44 @@
 //! The text a log pane draws from log records, and the keys that find a record's lines in it
-//! again after it is rebuilt.
+//! again after it changes.
 //!
 //! A selected service's pane and the pane of every service's logs both draw a [`LogText`], so
 //! scrolling, search and mouse selection work the same in either.
+
+use std::collections::HashMap;
 
 use ansi_to_tui::IntoText as _;
 use ratatui::text::{Line, Span, Text};
 
 use crate::render::log_view::RenderedLineIndex;
 
-/// A record's place in a log pane, which orders the records as the pane shows them and finds
-/// the record's lines again after older records are dropped.
-///
-/// A single service's pane leaves `timestamp_unix_ms` and `service` at zero, so its records
-/// order by sequence alone.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct RecordKey {
-    /// When micromux captured the record, in Unix milliseconds.
-    pub timestamp_unix_ms: u64,
-    /// The service's place in the roster, which orders records captured in the same
-    /// millisecond.
+/// Which record a line comes from, which stays the same however the records around it change.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub(crate) struct RecordId {
+    /// The service the record comes from: zero in a single service's pane, and a number that
+    /// stays with the service's ID while every service's logs show.
     pub service: u32,
     /// The record's sequence number in its service's log.
     pub seq: u64,
+}
+
+/// A record of a log pane: which one it is, and when micromux first captured it.
+///
+/// The capture time places a record that was dropped, so what pointed at it moves to the record
+/// now in its place.
+/// A single service's pane leaves it at zero, which orders its records by sequence alone.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct RecordKey {
+    pub id: RecordId,
+    /// When micromux first captured the record, in Unix milliseconds.
+    pub timestamp_unix_ms: u64,
 }
 
 impl RecordKey {
     /// The key of record `seq` in a single service's pane.
     pub(crate) fn of_seq(seq: u64) -> Self {
         Self {
-            seq,
-            ..Self::default()
+            id: RecordId { service: 0, seq },
+            timestamp_unix_ms: 0,
         }
     }
 }
@@ -43,7 +51,7 @@ struct RecordStart {
 }
 
 /// A line of the text by the record it comes from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RecordLine {
     pub record: RecordKey,
     /// The line within the record, which a live screen snapshot has several of.
@@ -66,6 +74,17 @@ pub(crate) struct TaggedRecord<'a> {
     pub tag: &'a [Span<'static>],
 }
 
+/// How the text changed in its last rebuild, when only lines at its ends did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Edit {
+    /// The generation the text had before.
+    pub from_generation: u64,
+    /// How many lines were dropped from the front.
+    pub dropped_lines: usize,
+    /// The first line appended after the lines that were kept, or the line count when none was.
+    pub first_new_line: usize,
+}
+
 /// How the rows of the text are laid out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RowLayout {
@@ -78,18 +97,24 @@ struct RowLayout {
 #[derive(Debug, Default)]
 pub(crate) struct LogText {
     pub text: Text<'static>,
-    /// Where each record starts, ordered by key and by line alike.
+    /// Where each record starts, in the order of the text.
     record_starts: Vec<RecordStart>,
+    /// The ordinal of each record, which counts up from the text's first full rebuild; the
+    /// record at index `i` of `record_starts` has ordinal `first_ordinal + i`.
+    ordinals: HashMap<RecordId, u64>,
+    first_ordinal: u64,
     pub line_index: RenderedLineIndex,
     /// The layout `line_index` describes, or `None` before the first build.
     layout: Option<RowLayout>,
-    /// Counts the rebuilds of the text and its layout, so what was computed from them, such as
+    /// Counts the changes to the text and its layout, so what was computed from them, such as
     /// search matches and scroll anchors, can tell when it is stale.
     pub generation: u64,
+    /// How the last change edited the text, or `None` when it rebuilt it whole.
+    pub last_edit: Option<Edit>,
 }
 
 impl LogText {
-    /// Replaces the text with `records`, ordered by key, laid out for `wrap` at `width` columns.
+    /// Replaces the text with `records`, laid out for `wrap` at `width` columns.
     ///
     /// The records are parsed as one text, so a color carries from one line to the next as it
     /// does in a terminal.
@@ -106,13 +131,10 @@ impl LogText {
             .collect::<Vec<_>>()
             .join("\n");
         self.text = parse_ansi(&joined);
-        self.record_starts.clear();
+        self.clear_records();
         let mut next = 0;
         for (key, text) in records {
-            self.record_starts.push(RecordStart {
-                key,
-                first_line: next,
-            });
+            self.push_record(key, next);
             next += 1 + text.matches('\n').count();
         }
         // Joining drops the line of a blank last record, which keeps a line of its own.
@@ -122,8 +144,8 @@ impl LogText {
         self.lay_out(wrap, width);
     }
 
-    /// Replaces the text with `records`, ordered by key, each line led by its record's tag, laid
-    /// out for `wrap` at `width` columns.
+    /// Replaces the text with `records`, each line led by its record's tag, laid out for `wrap`
+    /// at `width` columns.
     ///
     /// Each record is parsed on its own, so a color one record leaves set never bleeds into the
     /// next, which may come from another service.
@@ -134,12 +156,92 @@ impl LogText {
         width: u16,
     ) {
         self.text = Text::default();
+        self.clear_records();
+        self.append_tagged(records);
+        self.lay_out(wrap, width);
+    }
+
+    /// Drops the first `dropped_records` records and appends `records`, each line led by its
+    /// record's tag, laying out only the new lines.
+    ///
+    /// The text must be laid out already; the change is recorded in [`Self::last_edit`].
+    pub(crate) fn edit_tagged<'a>(
+        &mut self,
+        dropped_records: usize,
+        records: impl IntoIterator<Item = TaggedRecord<'a>>,
+    ) {
+        let Some(RowLayout { wrap, width }) = self.layout else {
+            return;
+        };
+        let dropped_records = dropped_records.min(self.record_starts.len());
+        let dropped_lines = self
+            .record_starts
+            .get(dropped_records)
+            .map_or(self.text.lines.len(), |start| start.first_line);
+        for start in self.record_starts.drain(..dropped_records) {
+            self.ordinals.remove(&start.key.id);
+        }
+        self.first_ordinal += u64::try_from(dropped_records).unwrap_or(u64::MAX);
+        for start in &mut self.record_starts {
+            start.first_line -= dropped_lines;
+        }
+        self.text.lines.drain(..dropped_lines);
+        self.line_index.drop_front(dropped_lines);
+
+        let first_new_line = self.text.lines.len();
+        self.append_tagged(records);
+        self.line_index.extend(
+            self.text.lines.get(first_new_line..).unwrap_or_default(),
+            wrap,
+            width,
+        );
+        let from_generation = self.generation;
+        self.generation = self.generation.wrapping_add(1);
+        self.last_edit = Some(Edit {
+            from_generation,
+            dropped_lines,
+            first_new_line,
+        });
+    }
+
+    /// Lays the text out for `wrap` at `width` columns, unless it is laid out so already.
+    pub(crate) fn relayout(&mut self, wrap: bool, width: u16) {
+        if self.layout == Some(RowLayout { wrap, width }) {
+            return;
+        }
+        let from_generation = self.generation;
+        self.lay_out(wrap, width);
+        // The lines themselves stay as they are.
+        self.last_edit = Some(Edit {
+            from_generation,
+            dropped_lines: 0,
+            first_new_line: self.text.lines.len(),
+        });
+    }
+
+    /// How many records from the front of the text `before` holds for, which must hold for a
+    /// leading run of records and for none after it.
+    pub(crate) fn leading_records(&self, before: impl Fn(RecordKey) -> bool) -> usize {
+        self.record_starts
+            .partition_point(|start| before(start.key))
+    }
+
+    fn clear_records(&mut self) {
         self.record_starts.clear();
+        self.ordinals.clear();
+        self.first_ordinal = 0;
+    }
+
+    fn push_record(&mut self, key: RecordKey, first_line: usize) {
+        let ordinal =
+            self.first_ordinal + u64::try_from(self.record_starts.len()).unwrap_or(u64::MAX);
+        self.ordinals.insert(key.id, ordinal);
+        self.record_starts.push(RecordStart { key, first_line });
+    }
+
+    fn append_tagged<'a>(&mut self, records: impl IntoIterator<Item = TaggedRecord<'a>>) {
         for TaggedRecord { key, text, tag } in records {
-            self.record_starts.push(RecordStart {
-                key,
-                first_line: self.text.lines.len(),
-            });
+            self.push_record(key, self.text.lines.len());
             let mut lines = parse_ansi(text).lines;
             if lines.is_empty() {
                 lines.push(Line::default());
@@ -149,20 +251,13 @@ impl LogText {
                 self.text.lines.push(line);
             }
         }
-        self.lay_out(wrap, width);
-    }
-
-    /// Lays the text out for `wrap` at `width` columns, unless it is laid out so already.
-    pub(crate) fn relayout(&mut self, wrap: bool, width: u16) {
-        if self.layout != Some(RowLayout { wrap, width }) {
-            self.lay_out(wrap, width);
-        }
     }
 
     fn lay_out(&mut self, wrap: bool, width: u16) {
         self.line_index.rebuild(&self.text, wrap, width);
         self.layout = Some(RowLayout { wrap, width });
         self.generation = self.generation.wrapping_add(1);
+        self.last_edit = None;
     }
 
     /// The width the text's lines wrap at, or `None` when they do not wrap.
@@ -187,20 +282,27 @@ impl LogText {
     }
 
     /// The line of the text that `key` names, or, when its record was dropped, `Err` with the
-    /// line now in its place.
+    /// line now in its place: the first line of the first record captured at the same time or
+    /// later.
     pub(crate) fn find_record_line(&self, key: RecordLine) -> Result<usize, usize> {
-        let start_of = |record: usize| {
-            self.record_starts
-                .get(record)
-                .map_or(self.text.lines.len(), |start| start.first_line)
-        };
-        match self
-            .record_starts
-            .binary_search_by_key(&key.record, |start| start.key)
-        {
-            Ok(record) => Ok(start_of(record) + key.line),
-            Err(record) => Err(start_of(record)),
+        let found = self
+            .ordinals
+            .get(&key.record.id)
+            .and_then(|ordinal| usize::try_from(ordinal - self.first_ordinal).ok())
+            .and_then(|index| self.record_starts.get(index));
+        if let Some(start) = found {
+            return Ok(start.first_line + key.line);
         }
+        // Records are ordered by capture time; a single service's pane, which leaves that at
+        // zero, by sequence.
+        let place = |key: RecordKey| (key.timestamp_unix_ms, key.id.seq);
+        let record = self
+            .record_starts
+            .partition_point(|start| place(start.key) < place(key.record));
+        Err(self
+            .record_starts
+            .get(record)
+            .map_or(self.text.lines.len(), |start| start.first_line))
     }
 
     /// What rendered `row` shows, by a key that stays with it while lines arrive and older ones

@@ -2819,10 +2819,15 @@ pub mod log_view {
         /// Rebuild the row index after the text or wrap configuration changes.
         pub(crate) fn rebuild(&mut self, text: &ratatui::text::Text<'_>, wrap: bool, width: u16) {
             self.starts.clear();
-            self.starts.reserve(text.lines.len());
-            let mut rendered = 0usize;
-            for line in &text.lines {
-                self.starts.push(rendered);
+            self.total_lines = 0;
+            self.extend(&text.lines, wrap, width);
+        }
+
+        /// Indexes `lines` appended to the text, under the configuration the index has.
+        pub(crate) fn extend(&mut self, lines: &[ratatui::text::Line<'_>], wrap: bool, width: u16) {
+            self.starts.reserve(lines.len());
+            for line in lines {
+                self.starts.push(self.total_lines);
                 let height = if wrap {
                     Paragraph::new(borrow_line(line))
                         .wrap(Wrap { trim: false })
@@ -2830,9 +2835,19 @@ pub mod log_view {
                 } else {
                     1
                 };
-                rendered = rendered.saturating_add(height);
+                self.total_lines = self.total_lines.saturating_add(height);
             }
-            self.total_lines = rendered;
+        }
+
+        /// Forgets the first `lines` lines, dropped from the front of the text.
+        pub(crate) fn drop_front(&mut self, lines: usize) {
+            let lines = lines.min(self.starts.len());
+            let rows = self.starts.get(lines).copied().unwrap_or(self.total_lines);
+            self.starts.drain(..lines);
+            for start in &mut self.starts {
+                *start -= rows;
+            }
+            self.total_lines -= rows;
         }
 
         /// Total rendered rows covered by this index.

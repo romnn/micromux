@@ -22,6 +22,11 @@ pub struct Service {
     pub healthcheck_dirty: bool,
     /// Highest log sequence read into `cached_lines`, including records the format filtered out.
     pub log_cursor: u64,
+    /// The model's oldest retained sequence as last read, or `None` while its log is empty.
+    pub first_retained_seq: Option<u64>,
+    /// Counts the changes to `cached_lines` other than appending lines and dropping the oldest,
+    /// so a view built from them can tell when it must be built again.
+    pub(crate) rewrites: u64,
     /// The format `cached_lines` was rendered with; a different format requires a full rebuild.
     pub cached_format: Option<LineFormat>,
     /// Level threshold picked in the viewer, taking precedence over the configured one.
@@ -37,7 +42,10 @@ pub struct Service {
 pub struct CachedLine {
     /// The record's sequence number.
     pub seq: u64,
-    /// When micromux captured the record, in Unix milliseconds.
+    /// When micromux first captured the record, in Unix milliseconds.
+    ///
+    /// A live screen snapshot the model replaces in place keeps the time of its first frame, so
+    /// it stays where it started among every service's logs.
     pub timestamp_unix_ms: u64,
     /// The record formatted for the pane, possibly several lines of a live screen snapshot.
     pub text: String,
@@ -56,6 +64,8 @@ impl Service {
             healthcheck_cached_wrap: None,
             healthcheck_dirty: true,
             log_cursor: 0,
+            first_retained_seq: None,
+            rewrites: 0,
             cached_format: None,
             level_override: None,
             timestamps_override: None,
@@ -70,6 +80,7 @@ impl Service {
         }
         // A new format changes which records show and how, so render the retained log again.
         self.cached_lines.clear();
+        self.rewrites += 1;
         self.log_cursor = 0;
         self.cached_format = Some(format.clone());
         self.logs_dirty = true;
@@ -107,8 +118,14 @@ impl Service {
         records: &[LogLine],
         format: &LineFormat,
     ) {
+        self.first_retained_seq = first_retained;
         match first_retained {
-            None => self.cached_lines.clear(),
+            None => {
+                if !self.cached_lines.is_empty() {
+                    self.cached_lines.clear();
+                    self.rewrites += 1;
+                }
+            }
             Some(first) => {
                 while self
                     .cached_lines
@@ -127,10 +144,13 @@ impl Service {
                 .back()
                 .is_some_and(|cached| cached.seq == record.seq);
             match (formatted, replaces_last) {
+                // Each read takes the newest record again, which mostly comes back unchanged.
                 (Some(text), true) => {
-                    if let Some(cached) = self.cached_lines.back_mut() {
-                        cached.timestamp_unix_ms = record.timestamp_unix_ms;
+                    if let Some(cached) = self.cached_lines.back_mut()
+                        && cached.text != text
+                    {
                         cached.text = text;
+                        self.rewrites += 1;
                     }
                 }
                 (Some(text), false) => self.cached_lines.push_back(CachedLine {
@@ -141,6 +161,7 @@ impl Service {
                 // The replacement now falls below the level threshold.
                 (None, true) => {
                     self.cached_lines.pop_back();
+                    self.rewrites += 1;
                 }
                 (None, false) => {}
             }

@@ -62,8 +62,9 @@ pub(crate) struct TextContext {
     pub(crate) pane: TextPane,
     /// The service whose text the pane shows, if any; none for every service's logs.
     service: Option<String>,
-    /// How the logs are formatted, which decides what their lines say.
-    format: Option<crate::json_log::LineFormat>,
+    /// How each service's logs the pane shows are formatted, by service ID, which decides what
+    /// their lines say.
+    formats: std::collections::BTreeMap<String, crate::json_log::LineFormat>,
     wrap: bool,
     width: u16,
 }
@@ -74,11 +75,18 @@ impl TextContext {
     ///
     /// Only wrapping makes rows depend on the width, so an unwrapped log keeps its selection
     /// through a resize.
+    /// Services that come or go leave every service's logs as they are for the others, so only
+    /// a service in both must keep its format.
     fn shows_same_text(&self, now: &Self) -> bool {
         let width_matters = self.wrap || matches!(self.pane, TextPane::Info(_));
+        let same_formats = self.formats.iter().all(|(service, format)| {
+            now.formats
+                .get(service)
+                .is_none_or(|now_format| now_format == format)
+        });
         self.pane == now.pane
             && self.service == now.service
-            && self.format == now.format
+            && same_formats
             && self.wrap == now.wrap
             && (!width_matters || self.width == now.width)
     }
@@ -225,23 +233,34 @@ impl App {
         let area = self.text_area(pane).filter(|area| !area.is_empty())?;
         let current = self.state.current_service();
         let service = current.map(|service| service.snapshot.id.clone());
-        let (service, format, wrap) = match pane {
+        let format_of = |service: &crate::state::Service| {
+            (
+                service.snapshot.id.clone(),
+                service.line_format(self.pretty_json_logs),
+            )
+        };
+        let no_formats = std::collections::BTreeMap::new;
+        let (service, formats, wrap) = match pane {
             // Every service's logs stay in the pane whichever service is selected, and so does a
             // selection in them.
-            TextPane::Logs if self.state.all_logs.is_some() => (None, None, self.log_view.wrap),
-            TextPane::Logs => (
-                Some(service?),
-                current.map(|service| service.line_format(self.pretty_json_logs)),
+            TextPane::Logs if self.state.all_logs.is_some() => (
+                None,
+                self.state.services.iter().map(format_of).collect(),
                 self.log_view.wrap,
             ),
-            TextPane::Healthcheck => (Some(service?), None, self.healthcheck_view.wrap),
-            TextPane::Info(InfoView::Service) => (service, None, false),
-            TextPane::Help | TextPane::Info(InfoView::Session) => (None, None, false),
+            TextPane::Logs => (
+                Some(service?),
+                current.map(format_of).into_iter().collect(),
+                self.log_view.wrap,
+            ),
+            TextPane::Healthcheck => (Some(service?), no_formats(), self.healthcheck_view.wrap),
+            TextPane::Info(InfoView::Service) => (service, no_formats(), false),
+            TextPane::Help | TextPane::Info(InfoView::Session) => (None, no_formats(), false),
         };
         Some(TextContext {
             pane,
             service,
-            format,
+            formats,
             wrap,
             width: area.width,
         })
@@ -320,7 +339,7 @@ impl App {
             LineKey::Record(record_line) => record_line,
         };
         let Some(shown) = self.state.shown_log().filter(|_| pane == TextPane::Logs) else {
-            return Ok(usize::try_from(record_line.record.seq).unwrap_or(usize::MAX));
+            return Ok(usize::try_from(record_line.record.id.seq).unwrap_or(usize::MAX));
         };
         shown.log.find_record_line(record_line)
     }

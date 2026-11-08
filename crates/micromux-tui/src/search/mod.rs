@@ -169,8 +169,19 @@ pub(crate) struct Match {
 
 /// Every match of `query` in `text`, ordered by line and then by position in the line.
 pub(crate) fn find_matches(text: &ratatui::text::Text<'_>, query: &Query) -> Vec<Match> {
+    find_matches_from(text, 0, query)
+}
+
+/// Every match of `query` in `text` from line `first_line` on, ordered by line and then by
+/// position in the line.
+fn find_matches_from(
+    text: &ratatui::text::Text<'_>,
+    first_line: usize,
+    query: &Query,
+) -> Vec<Match> {
     let mut matches = Vec::new();
-    for (line, content) in text.lines.iter().enumerate() {
+    let lines = text.lines.iter().enumerate().skip(first_line);
+    for (line, content) in lines {
         let haystack = match content.spans.as_slice() {
             [single] => std::borrow::Cow::Borrowed(single.content.as_ref()),
             spans => std::borrow::Cow::Owned(
@@ -298,7 +309,7 @@ struct CurrentMatch {
 }
 
 /// Where a match is, by a key that stays with its text while lines arrive and old ones go.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct MatchAnchor {
     record_line: RecordLine,
     start: usize,
@@ -349,6 +360,8 @@ impl LogSearch {
 
     /// Finds the matches again when `shown`'s text is not the one they were found in.
     ///
+    /// When the text only lost lines at its front and gained lines at its end since, the matches
+    /// on the lines it kept stay and only the new lines are searched.
     /// In the same logs the current match follows its text; when its text is gone, the nearest
     /// newer match becomes current, or the newest one when none is newer.
     /// In other logs, such as another service's, no match is current until `n` or `N` moves to
@@ -369,12 +382,38 @@ impl LogSearch {
             .found_in
             .as_ref()
             .is_some_and(|previous| previous.shows == found_in.shows);
-        active.matches = find_matches(&log.text, &active.query);
+        let edit = log.last_edit.filter(|edit| {
+            same_logs
+                && active
+                    .found_in
+                    .as_ref()
+                    .is_some_and(|previous| previous.text_generation == edit.from_generation)
+        });
+        match edit {
+            Some(edit) => {
+                active
+                    .matches
+                    .retain(|found| found.line >= edit.dropped_lines);
+                for found in &mut active.matches {
+                    found.line -= edit.dropped_lines;
+                }
+                active.matches.extend(find_matches_from(
+                    &log.text,
+                    edit.first_new_line,
+                    &active.query,
+                ));
+            }
+            None => active.matches = find_matches(&log.text, &active.query),
+        }
         active.current = active.current.filter(|_| same_logs).and_then(|current| {
-            // Matches are ordered by line, and so by anchor.
+            // A match whose record is gone gives way to the first one after where it was.
+            let place = match log.find_record_line(current.anchor.record_line) {
+                Ok(line) => (line, current.anchor.start),
+                Err(line) => (line, 0),
+            };
             let index = active
                 .matches
-                .partition_point(|found| MatchAnchor::of(found, log) < current.anchor)
+                .partition_point(|found| (found.line, found.bytes.start) < place)
                 .min(active.matches.len().checked_sub(1)?);
             let found = active.matches.get(index)?;
             Some(CurrentMatch {

@@ -63,15 +63,15 @@ The search stays while the log moves on: new lines are searched as they arrive, 
 
 ## All services' logs
 
-`A` shows the logs of every service in the log pane, interleaved in time order, so a request can be followed from one service to the next; `A` again shows the selected service's logs. Each line starts with the name of its service, in a color of its own and padded to the longest name, so the log text lines up; a name longer than 16 columns is cut short. The header shows `All:ON` while the pane shows them.
+`A` shows the logs of every service in the log pane, interleaved in time order, so a request can be followed from one service to the next; `A` again shows the selected service's logs. Each line starts with the name of its service, in a color of its own and padded to the longest name, so the log text lines up; a name longer than 16 columns is cut short in the middle, so `payments-service-api` and `payments-service-worker` stay apart. The header shows `All:ON` while the pane shows them.
 
-- **Order.** Lines are ordered by when micromux captured them, one clock for every service, even for lines that carry no timestamp of their own. Lines captured in the same millisecond go in the order of their services in the sidebar, and each service's lines keep their own order. The MCP tool `follow_all_logs` also keeps each service's order, but goes by a JSON record's own timestamp where it has one and breaks ties by service name.
+- **Order.** Lines are ordered by when micromux first captured them, one clock for every service, even for lines that carry no timestamp of their own. Lines captured in the same millisecond go in the order of their service names, and each service's lines keep their own order. The MCP tool `follow_all_logs` merges the same way, except that it goes by a JSON record's own timestamp where it has one.
 - **Filters.** Each service's lines look as they do in its own pane: its level threshold (`L`), timestamps (`T`) and hidden fields (`F`) apply here too. Those keys still act on the selected service.
-- **Live screens.** A program that redraws its screen in place, such as a progress bar or a full-screen dashboard, shows as one block of lines, each tagged, that moves to the time of its latest redraw.
+- **Live screens.** A program that redraws its screen in place, such as a progress bar or a full-screen dashboard, shows as one block of lines, each tagged, that redraws where its first frame appeared, so other services' newer lines keep coming below it.
 - **Everything else works as in a single service's pane:** scrolling and follow-tail, wrapping, search with `/`, `n` and `N`, which also matches the service names, and selecting and copying with the mouse, which copies the names too. A view off the tail stays on its lines while services drop their oldest ones. Switching between the views follows the newest lines.
 - **Input.** `a` still types into the selected service; the pane shows that service's logs while PTY input mode lasts, so you see what you type, and every service's logs again once `Ctrl+]` leaves it.
 
-Only the lines that the services still keep in memory show, as in their own panes, so memory stays within each service's [log retention]({{< relref "configuration/logs.md" >}}).
+Only the lines that the services still keep in memory show, as in their own panes, so memory stays within each service's [log retention]({{< relref "configuration/logs.md" >}}). Services keep different amounts, a busy one only its most recent lines, and an attached TUI fewer than the session's own. So that no stretch of the pane silently lacks a service's lines, the pane starts at the oldest line still kept by the service that dropped lines most recently, by its retention or because a restart cleared them; older lines of the other services show in their own panes.
 
 ## Mouse
 

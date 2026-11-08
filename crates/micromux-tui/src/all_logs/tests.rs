@@ -11,7 +11,8 @@ use ratatui::style::Color;
 use ratatui::widgets::Widget as _;
 use similar_asserts::assert_eq;
 
-use super::{AllLogs, merge, tag};
+use super::{AllLogs, fit_name, tag};
+use crate::log_text::{RecordId, RecordKey, RecordLine};
 use crate::state::{CachedLine, Service};
 use crate::{App, Effect, LocalSource, SessionSource, ViewOptions};
 
@@ -144,6 +145,48 @@ fn set_lines(
     Ok(())
 }
 
+/// Has the service at `index` log `records`, read from a model that retains its records from
+/// `first_retained` on, for the next frame to show.
+fn log_more(
+    app: &mut App,
+    index: usize,
+    first_retained: u64,
+    records: &[(u64, u64, String)],
+) -> eyre::Result<()> {
+    let records = records
+        .iter()
+        .map(|(seq, timestamp_unix_ms, text)| (*seq, *timestamp_unix_ms, text.as_str()))
+        .collect::<Vec<_>>();
+    apply(
+        app.state
+            .services
+            .get_mut(index)
+            .ok_or_eyre("no such service")?,
+        first_retained,
+        &records,
+    );
+    Ok(())
+}
+
+/// The text the log pane's row `y` shows, without the sidebar and the pane's borders.
+fn pane_row(app: &App, frame: &Buffer, y: u16) -> String {
+    let area = crate::render::log_view::text_area(app.hits.logs);
+    (area.x..area.right())
+        .filter_map(|x| frame.cell((x, y)).map(ratatui::buffer::Cell::symbol))
+        .collect()
+}
+
+/// Selects from the start of `from` to the end of `to`, which the frame shows, with a drag.
+fn select(app: &mut App, frame: &Buffer, from: &str, to: &str) -> eyre::Result<()> {
+    let start = find(frame, from)?;
+    let end = find(frame, to)?;
+    let last = Position::new(end.x + u16::try_from(to.chars().count())? - 1, end.y);
+    mouse(app, MouseEventKind::Down(MouseButton::Left), start);
+    mouse(app, MouseEventKind::Drag(MouseButton::Left), last);
+    mouse(app, MouseEventKind::Up(MouseButton::Left), last);
+    Ok(())
+}
+
 fn draw(app: &mut App) -> Buffer {
     let area = Rect::new(0, 0, WIDTH, HEIGHT);
     let mut buffer = Buffer::empty(area);
@@ -242,44 +285,59 @@ fn current_match_service(app: &App) -> eyre::Result<u32> {
         .log
         .record_line(found.line)
         .ok_or_eyre("the match has no record")?;
-    Ok(record_line.record.service)
+    Ok(record_line.record.id.service)
+}
+
+/// An [`AllLogs`] built from `services` in one go.
+fn built(services: &[Service]) -> AllLogs {
+    let mut all_logs = AllLogs::new();
+    all_logs.render_text(services, false, 80);
+    all_logs
+}
+
+/// Gives `service` the further log `records` of `(seq, timestamp_unix_ms, line)`, read from a
+/// model that retains them from `first_retained` on, as reading the model does.
+fn apply(service: &mut Service, first_retained: u64, records: &[(u64, u64, &str)]) {
+    let format = service
+        .cached_format
+        .clone()
+        .unwrap_or_else(|| service.line_format(false));
+    service.use_format(&format);
+    let records = records
+        .iter()
+        .map(|&(seq, timestamp_unix_ms, line)| micromux::LogLine {
+            seq,
+            run_generation: 1,
+            timestamp_unix_ms,
+            line: line.to_string(),
+        })
+        .collect::<Vec<_>>();
+    service.apply_log_records(Some(first_retained), &records, &format);
 }
 
 #[test]
-fn records_merge_by_capture_time_then_sidebar_order_and_keep_each_services_order() {
+fn records_merge_by_capture_time_then_service_id_and_keep_each_services_order() {
+    // The sidebar lists web first, but ties go by service ID, as follow_all_logs breaks them.
     let services = [
-        // The last record claims an earlier time than the one before it, as after the clock
-        // was set back, yet stays after it.
-        service("api", &[(1, 100, "a1"), (2, 300, "a2"), (3, 250, "a3")]),
         service("web", &[(1, 100, "w1"), (2, 200, "w2"), (3, 300, "w3")]),
+        service("api", &[(1, 100, "a1"), (2, 300, "a2"), (3, 300, "a3")]),
     ];
 
-    let merged = merge(&services)
-        .map(|record| (record.text, record.key.timestamp_unix_ms))
-        .collect::<Vec<_>>();
-
-    // Records of the same millisecond go in sidebar order, api before web.
-    // The record that went back in time is merged at the time of the one before it, so each
-    // service's records keep their order and the keys stay ordered for lookups.
     assert_eq!(
-        merged,
+        lines(&built(&services)),
         vec![
-            ("a1", 100),
-            ("w1", 100),
-            ("w2", 200),
-            ("a2", 300),
-            ("a3", 300),
-            ("w3", 300),
+            "api │ a1",
+            "web │ w1",
+            "web │ w2",
+            "api │ a2",
+            "api │ a3",
+            "web │ w3",
         ]
     );
-    let keys = merge(&services)
-        .map(|record| record.key)
-        .collect::<Vec<_>>();
-    assert!(keys.is_sorted());
 }
 
 #[test]
-fn tags_pad_names_to_one_width_and_cut_long_ones_short() {
+fn tags_pad_names_to_one_width_and_cut_long_ones_in_the_middle() {
     let text = |spans: Vec<ratatui::text::Span<'static>>| {
         spans
             .iter()
@@ -290,14 +348,22 @@ fn tags_pad_names_to_one_width_and_cut_long_ones_short() {
     // A short name is padded, so the log text lines up after every tag.
     assert_eq!(text(tag("api", 0, 6)), "api    │ ");
 
-    // A long name is cut to the width, an ellipsis taking the last column.
-    assert_eq!(text(tag("background-worker", 0, 6)), "backg… │ ");
+    // Long names that share a prefix keep the ends that tell them apart.
+    assert_eq!(fit_name("payments-service-api", 16), "payment…vice-api");
+    assert_eq!(fit_name("payments-service-worker", 16), "payment…e-worker");
+    assert_eq!(
+        text(tag("payments-service-api", 0, 16)),
+        "payment…vice-api │ "
+    );
 
-    // Services take the theme's colors in sidebar order, and the colors repeat after the last.
-    let color = |index| tag("api", index, 3).first().and_then(|span| span.style.fg);
+    // Services take the theme's colors by their number, and the colors repeat after the last.
+    let color = |number| tag("api", number, 3).first().and_then(|span| span.style.fg);
     assert_eq!(color(0), Some(Color::Cyan));
     assert_eq!(color(1), Some(Color::Magenta));
-    assert_eq!(color(super::TAG_COLORS.len()), Some(Color::Cyan));
+    assert_eq!(
+        color(u32::try_from(super::TAG_COLORS.len()).unwrap_or_default()),
+        Some(Color::Cyan)
+    );
 }
 
 #[test]
@@ -307,9 +373,7 @@ fn every_line_of_a_record_is_tagged_and_no_color_bleeds_into_the_next_record() {
         service("api", &[(1, 100, "first row\nsecond row\x1b[31m red")]),
         service("worker", &[(1, 200, "plain")]),
     ];
-    let mut all_logs = AllLogs::new();
-
-    all_logs.render_text(&services, false, 80);
+    let all_logs = built(&services);
 
     // Every line carries its service's tag, padded to the longest name.
     assert_eq!(
@@ -329,6 +393,183 @@ fn every_line_of_a_record_is_tagged_and_no_color_bleeds_into_the_next_record() {
         .and_then(|line| line.spans.last())
         .map(|span| span.style.fg);
     assert_eq!(plain, Some(None));
+}
+
+#[test]
+fn a_live_screen_redrawn_in_place_stays_at_the_time_of_its_first_frame() {
+    let mut services = [service("api", &[]), service("web", &[])];
+    let [api, web] = &mut services;
+    apply(api, 1, &[(1, 100, "frame one")]);
+    apply(web, 1, &[(1, 200, "web line")]);
+    let mut all_logs = built(&services);
+
+    // The model replaces the screen's record in place with a later frame.
+    let [api, _] = &mut services;
+    apply(api, 1, &[(1, 300, "frame two")]);
+    all_logs.render_text(&services, false, 80);
+
+    // The screen shows its new frame where its first one was, before the later web line.
+    assert_eq!(lines(&all_logs), vec!["api │ frame two", "web │ web line"]);
+    let [api, _] = &services;
+    assert_eq!(
+        api.cached_lines.front().map(|line| line.timestamp_unix_ms),
+        Some(100)
+    );
+}
+
+#[test]
+fn editing_at_the_ends_builds_the_same_text_as_building_it_whole() {
+    /// What the services log before one render.
+    struct Step {
+        api: &'static [(u64, u64, &'static str)],
+        web: &'static [(u64, u64, &'static str)],
+        /// The oldest record api's model retains.
+        api_first_retained: u64,
+    }
+
+    let mut services = [service("api", &[]), service("web", &[])];
+    let mut edited = AllLogs::new();
+    let steps = [
+        Step {
+            api: &[(1, 100, "a1"), (2, 300, "a2")],
+            web: &[(1, 200, "w1")],
+            api_first_retained: 1,
+        },
+        Step {
+            api: &[(3, 400, "a3")],
+            web: &[(2, 400, "w2"), (3, 500, "w3")],
+            api_first_retained: 1,
+        },
+        // api drops its first two lines, so the text starts at its oldest kept line.
+        Step {
+            api: &[(4, 600, "a4")],
+            web: &[(4, 600, "w4")],
+            api_first_retained: 3,
+        },
+        Step {
+            api: &[],
+            web: &[(5, 700, "w5\nsecond line")],
+            api_first_retained: 3,
+        },
+    ];
+    for (step, logged) in steps.iter().enumerate() {
+        let [api, web] = &mut services;
+        apply(api, logged.api_first_retained, logged.api);
+        apply(web, 1, logged.web);
+        edited.render_text(&services, false, 80);
+
+        // After the first build, each step edits the text at its ends.
+        assert_eq!(edited.log.last_edit.is_some(), step > 0, "step {step}");
+        let whole = built(&services);
+        assert_eq!(lines(&edited), lines(&whole), "step {step}");
+        assert_eq!(
+            edited.log.line_index.total_lines(),
+            whole.log.line_index.total_lines()
+        );
+        // Every line names the same record in both.
+        for line in 0..whole.log.text.lines.len() {
+            let record_line = whole.log.record_line(line);
+            assert_eq!(edited.log.record_line(line), record_line, "step {step}");
+            if let Some(record_line) = record_line {
+                assert_eq!(edited.log.find_record_line(record_line), Ok(line));
+            }
+        }
+    }
+    assert_eq!(
+        lines(&edited),
+        vec![
+            "api │ a3",
+            "web │ w2",
+            "web │ w3",
+            "api │ a4",
+            "web │ w4",
+            "web │ w5",
+            "web │ second line",
+        ]
+    );
+}
+
+#[test]
+fn a_replaced_record_or_a_new_line_out_of_order_builds_the_text_whole() {
+    let mut services = [service("api", &[]), service("web", &[])];
+    let [api, web] = &mut services;
+    apply(api, 1, &[(1, 100, "a1")]);
+    apply(web, 1, &[(1, 300, "w1")]);
+    let mut all_logs = built(&services);
+
+    // A line captured before the last one in the text must go before it.
+    let [api, _] = &mut services;
+    apply(api, 1, &[(2, 200, "a2")]);
+    all_logs.render_text(&services, false, 80);
+    assert_eq!(all_logs.log.last_edit, None);
+    assert_eq!(lines(&all_logs), vec!["api │ a1", "api │ a2", "web │ w1"]);
+
+    // A record replaced in place changes the middle of the text.
+    let [api, _] = &mut services;
+    apply(api, 1, &[(2, 200, "a2 redrawn")]);
+    all_logs.render_text(&services, false, 80);
+    assert_eq!(all_logs.log.last_edit, None);
+    assert_eq!(
+        lines(&all_logs),
+        vec!["api │ a1", "api │ a2 redrawn", "web │ w1"]
+    );
+}
+
+#[test]
+fn lines_older_than_the_oldest_line_a_service_kept_are_left_out() {
+    let mut services = [service("api", &[]), service("web", &[])];
+    let [api, web] = &mut services;
+    // api's model no longer has its first four records.
+    apply(
+        api,
+        5,
+        &[(5, 300, "api oldest kept"), (6, 500, "api newer")],
+    );
+    apply(
+        web,
+        1,
+        &[
+            (1, 100, "web old"),
+            (2, 200, "web older than api"),
+            (3, 400, "web"),
+        ],
+    );
+
+    // Before api's oldest kept line, its lines would be missing, so web's are left out too.
+    assert_eq!(
+        lines(&built(&services)),
+        vec!["api │ api oldest kept", "web │ web", "api │ api newer"]
+    );
+}
+
+#[test]
+fn a_record_is_found_by_its_service_and_sequence_however_the_roster_changes() {
+    let services = [
+        service("api", &[(1, 100, "a1")]),
+        service("web", &[(1, 100, "w1")]),
+    ];
+    let mut all_logs = built(&services);
+    let web_line = RecordLine {
+        record: RecordKey {
+            id: RecordId { service: 1, seq: 1 },
+            timestamp_unix_ms: 100,
+        },
+        line: 0,
+    };
+    assert_eq!(all_logs.log.find_record_line(web_line), Ok(1));
+
+    // A service that sorts first joins at the top of the sidebar.
+    let services = [
+        service("aaa", &[(1, 50, "x1")]),
+        service("api", &[(1, 100, "a1")]),
+        service("web", &[(1, 100, "w1")]),
+    ];
+    all_logs.dirty = true;
+    all_logs.render_text(&services, false, 80);
+
+    // web keeps its number, and its line is found where it moved.
+    assert_eq!(all_logs.log.find_record_line(web_line), Ok(2));
+    assert_eq!(lines(&all_logs), vec!["aaa │ x1", "api │ a1", "web │ w1"]);
 }
 
 #[tokio::test]
@@ -400,20 +641,116 @@ async fn the_view_stays_on_its_line_while_services_drop_old_lines() -> eyre::Res
     app.log_view.scroll_offset = 30;
     let frame = draw(&mut app);
     let text_area = crate::render::log_view::text_area(app.hits.logs);
-    let top = row_text(&frame, text_area.y);
+    let top = pane_row(&app, &frame, text_area.y);
     assert!(top.contains("line 16"), "{top}");
 
     // Each service drops its ten oldest lines while ten new ones arrive.
-    app.state
-        .services
-        .get_mut(0)
-        .ok_or_eyre("no api service")?
-        .cached_lines = cached(&numbered("api", 11..=50, 0));
-    set_lines(&mut app, 1, &numbered("web", 11..=50, 5))?;
+    log_more(&mut app, 0, 11, &numbered("api", 41..=50, 0))?;
+    log_more(&mut app, 1, 11, &numbered("web", 41..=50, 5))?;
+    draw(&mut app);
 
-    // The same line still tops the view, although twenty lines above it are gone.
+    // The text was edited at its ends, and the same line still tops the view, although the
+    // lines above it are gone.
+    let all_logs = app
+        .state
+        .all_logs
+        .as_ref()
+        .ok_or_eyre("all logs are hidden")?;
+    assert!(all_logs.log.last_edit.is_some());
     let frame = draw(&mut app);
-    assert_eq!(row_text(&frame, text_area.y), top);
+    assert_eq!(pane_row(&app, &frame, text_area.y), top);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_selection_and_a_scrolled_view_stay_while_a_service_joins() -> eyre::Result<()> {
+    let mut app = all_logs_app()?;
+    set_lines(&mut app, 0, &numbered("api", 1..=40, 0))?;
+    set_lines(&mut app, 1, &numbered("web", 1..=40, 5))?;
+    app.log_view.follow_tail = false;
+    app.log_view.scroll_offset = 30;
+    let frame = draw(&mut app);
+    let text_area = crate::render::log_view::text_area(app.hits.logs);
+    let top = pane_row(&app, &frame, text_area.y);
+    select(&mut app, &frame, "api │ api line 18", "web │ web line 18")?;
+    let selected = app.selected_text();
+    assert_eq!(
+        selected.as_deref(),
+        Some("api │ api line 18\nweb │ web line 18")
+    );
+
+    // A service that sorts first joins at the top of the sidebar, as a reconciled config or a
+    // dynamic service adds one, with lines among the others' though none inside the selection.
+    let mut joined = Service::new(micromux::ServiceSnapshot::initial(
+        "aaa".to_string(),
+        "aaa".to_string(),
+        Vec::new(),
+        None,
+        micromux::RestartPolicy::Never,
+        Vec::new(),
+        None,
+    ));
+    joined.cached_format = Some(joined.line_format(app.pretty_json_logs));
+    joined.logs_dirty = false;
+    joined.cached_lines = cached(&numbered("aaa", 1..=40, 7));
+    app.state.services.insert(0, joined);
+    if let Some(all_logs) = &mut app.state.all_logs {
+        all_logs.dirty = true;
+    }
+
+    // The view still starts at the same line, and the selection still holds the same text.
+    let frame = draw(&mut app);
+    assert_eq!(pane_row(&app, &frame, text_area.y), top);
+    assert_eq!(app.selected_text(), selected);
+    Ok(())
+}
+
+#[tokio::test]
+async fn changing_a_services_format_drops_a_selection_in_all_logs() -> eyre::Result<()> {
+    let mut app = all_logs_app()?;
+    set_lines(&mut app, 0, &[(1, 100, "api first")])?;
+    set_lines(&mut app, 1, &[(1, 200, "web second")])?;
+    let frame = draw(&mut app);
+    select(&mut app, &frame, "api │ api first", "web │ web second")?;
+    assert!(app.selected_text().is_some());
+
+    // Toggling the selected service's timestamps may change what its lines say.
+    press(&mut app, KeyCode::Char('T'));
+    draw(&mut app);
+    assert_eq!(app.selected_text(), None);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_search_takes_in_new_lines_and_keeps_its_current_match() -> eyre::Result<()> {
+    let mut app = all_logs_app()?;
+    set_lines(&mut app, 0, &[(1, 100, "api needle")])?;
+    set_lines(&mut app, 1, &[(1, 200, "web needle")])?;
+    search(&mut app, "needle");
+    assert!(screen(&draw(&mut app)).contains("/needle 2/2"));
+
+    // A new line is appended to the text, and only it is searched.
+    log_more(&mut app, 0, 1, &[(2, 300, "api needle again".to_string())])?;
+    draw(&mut app);
+    let frame = draw(&mut app);
+    let all_logs = app
+        .state
+        .all_logs
+        .as_ref()
+        .ok_or_eyre("all logs are hidden")?;
+    assert!(all_logs.log.last_edit.is_some());
+    assert_eq!(
+        app.search.highlights().matches,
+        crate::search::find_matches(
+            &all_logs.log.text,
+            &crate::search::Query::new("needle").ok_or_eyre("empty query")?
+        )
+        .as_slice()
+    );
+
+    // The current match stays on web's line, now the second of three.
+    assert!(screen(&frame).contains("/needle 2/3"));
+    assert_eq!(current_match_service(&app)?, 1);
     Ok(())
 }
 
