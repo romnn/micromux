@@ -90,7 +90,7 @@ Press `?` in the TUI for every key. The essentials:
 
 `kind: job` runs a command to completion, like a migration or a seed. A dependency on a job waits
 for it to complete. Add `run: manual` to run it only when you restart it.
-[Jobs →](https://romnn.github.io/micromux/docs/configuration/services/#jobs)
+See [Jobs](https://romnn.github.io/micromux/docs/configuration/services/#jobs).
 
 ### Ports and hostnames
 
@@ -111,13 +111,13 @@ routes:
 ```
 
 A shared `micromux proxy` serves the routes and starts on its own.
-[Sessions, ports, and hostnames →](https://romnn.github.io/micromux/docs/configuration/sessions/)
+See [Sessions, ports, and hostnames](https://romnn.github.io/micromux/docs/configuration/sessions/).
 
 ### Structured logs
 
 JSON logs render as compact, colored lines. Filter them by level (`L`), toggle timestamps (`T`), and
 hide noisy fields (`F`, or `logs.fields` in the config).
-[Logs →](https://romnn.github.io/micromux/docs/configuration/logs/)
+See [Logs](https://romnn.github.io/micromux/docs/configuration/logs/).
 
 <picture>
   <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/romnn/micromux/main/docs/static/images/structured-logs-light.png">
@@ -143,7 +143,7 @@ args = ["mcp"]
 
 Agents can then find services across sessions, read and follow logs, diagnose failures, restart a
 service and wait for its new run to become healthy.
-[Agent control →](https://romnn.github.io/micromux/docs/agent-control/)
+See [Agent control](https://romnn.github.io/micromux/docs/agent-control/).
 
 ### From the shell
 
@@ -154,7 +154,7 @@ micromux exec ./scripts/seed.sh           # with the session's ports and variabl
 micromux attach                           # TUI for a headless `micromux serve` session
 ```
 
-[The control plane →](https://romnn.github.io/micromux/docs/agent-control/control-plane/)
+See [the control plane](https://romnn.github.io/micromux/docs/agent-control/control-plane/).
 
 ## How it compares
 
@@ -164,4 +164,4 @@ micromux attach                           # TUI for a headless `micromux serve` 
   healthchecks and dependencies.
 
 Linux and macOS are fully supported. On Windows the TUI works, but the control plane and the proxy
-do not yet. [Comparisons →](https://romnn.github.io/micromux/docs/comparisons/)
+do not yet. See [Comparisons](https://romnn.github.io/micromux/docs/comparisons/).
