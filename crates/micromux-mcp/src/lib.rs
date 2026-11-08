@@ -58,9 +58,9 @@ use crate::tools::logs::{
     truncate_wait_matches,
 };
 use crate::tools::sessions::{
-    CHILD_EXIT_GRACE, START_READY_TIMEOUT, already_running_any, outdated_proxy_start_budget,
-    reachable_session_for_start, remove_captured_stderr, spawn_detached_serve,
-    start_failure_message, start_session_report,
+    CHILD_EXIT_GRACE, OUTDATED_PROXY_START_BUDGET, ReportedStart, START_READY_TIMEOUT,
+    already_running_any, already_starting_pid, holder_may_run, reachable_session_for_start,
+    remove_captured_stderr, spawn_detached_serve, start_failure_message, start_session_report,
 };
 #[cfg(unix)]
 use crate::tools::sessions::{ProcessExitWatch, STOP_CONFIRM_TIMEOUT};
@@ -655,7 +655,7 @@ struct StopSessionResult {
     note: Option<&'static str>,
 }
 
-#[derive(Serialize, JsonSchema)]
+#[derive(Debug, Serialize, JsonSchema)]
 struct StartSessionResult {
     started: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2296,10 +2296,12 @@ impl McpServer {
     #[tool(
         description = "Start a new headless micromux session for a project (brings its services \
         up). Spawns `micromux serve` detached for the project's config and returns once the session \
-        is reachable, which takes up to 90 seconds when the session first waits for an outdated \
-        shared proxy to exit; a no-op if one is already running for that config. `path` is a \
-        project directory or a config file — omit for the MCP server's directory. If another worktree's \
-        session binds the same ports, stop it first with stop_session."
+        is reachable, which takes longer while the session first waits for a previous session's \
+        cleanups or for an outdated shared proxy to exit; a no-op if one is already running for \
+        that config, and a session that is still starting is reported with reachable=false \
+        instead of being started twice. `path` is a project directory or a config file — omit \
+        for the MCP server's directory. If another worktree's session binds the same ports, stop \
+        it first with stop_session."
     )]
     async fn start_session(&self, args: Parameters<StartArgs>) -> ToolResult<StartSessionResult> {
         let Parameters(args) = args;
@@ -2918,6 +2920,12 @@ impl McpServer {
                     .as_deref()
                     .map_or_else(|| self.cwd.clone(), PathBuf::from);
                 let report = self.start_for_target(target).await?;
+                // A start already in progress for this config has no session to wait on yet.
+                if report.reachable == Some(false)
+                    && let Some(reason) = &report.reason
+                {
+                    return Err(ErrorData::internal_error(reason.clone(), None));
+                }
                 let id = report.id.clone().ok_or_else(|| {
                     ErrorData::internal_error(
                         "start_session did not identify the reachable session",
@@ -3266,8 +3274,11 @@ pub async fn serve_stdio(
 
 /// Waits for the session `spawned` to become reachable, and reports it, or why it did not.
 ///
-/// The child gets [`START_READY_TIMEOUT`], or more while it reports waiting for an outdated proxy
-/// to exit, and only a short grace once it exited.
+/// The child gets [`START_READY_TIMEOUT`], and more while it reports waiting for a previous
+/// session's cleanups or for an outdated proxy to exit, each for as long as that wait is bounded.
+/// A child that exits gets only a short grace for a concurrent start to come up, unless it exited
+/// because another session for the config is already starting: that session gets an ordinary
+/// start, and is reported as still starting rather than stopped when it takes longer.
 /// A child that is still running when the time is up is stopped, so it cannot hold the session's
 /// ports unseen.
 async fn await_spawned_session(
@@ -3280,7 +3291,9 @@ async fn await_spawned_session(
     let spawned_at = tokio::time::Instant::now();
     let mut deadline = spawned_at + START_READY_TIMEOUT;
     let mut child_exit: Option<std::process::ExitStatus> = None;
+    let mut previous_cleanup_waits = 0;
     let mut waits_for_outdated_proxy = false;
+    let mut already_starting: Option<String> = None;
     loop {
         // Observe early exit before deciding whether an answering session is ours; after the
         // child is reaped, its pid is no longer a trustworthy ownership signal.
@@ -3288,7 +3301,12 @@ async fn await_spawned_session(
             && let Ok(Some(status)) = child.try_wait()
         {
             child_exit = Some(status);
-            deadline = deadline.min(tokio::time::Instant::now() + CHILD_EXIT_GRACE);
+            already_starting = ReportedStart::read(&stderr_path).already_starting;
+            deadline = if already_starting.is_some() {
+                tokio::time::Instant::now() + START_READY_TIMEOUT
+            } else {
+                deadline.min(tokio::time::Instant::now() + CHILD_EXIT_GRACE)
+            };
         }
         let child_pid = child_exit.is_none().then(|| child.id()).flatten();
         match reachable_session_for_start(endpoints, config_path, child_pid).await {
@@ -3313,23 +3331,33 @@ async fn await_spawned_session(
                 return Err(error_data(err));
             }
         }
-        // A session that waits for an outdated proxy to exit is still starting, for as long as
-        // that wait is bounded.
+        // A session that waits for a previous session's cleanups or for an outdated proxy to
+        // exit is still starting, for as long as that wait is bounded.
         // Checking right before the deadline also catches a wait announced during the probe.
-        if !waits_for_outdated_proxy
-            && child_exit.is_none()
-            && let Some(budget) = outdated_proxy_start_budget(&stderr_path)
-        {
-            waits_for_outdated_proxy = true;
-            deadline = deadline.max(tokio::time::Instant::now() + budget);
+        if child_exit.is_none() {
+            let reported = ReportedStart::read(&stderr_path);
+            let now = tokio::time::Instant::now();
+            // A cleanup that starts later can move the end of that wait out, which the session
+            // reports again.
+            if reported.previous_cleanup_waits.len() > previous_cleanup_waits
+                && let Some(bound) = reported.previous_cleanup_waits.last()
+            {
+                previous_cleanup_waits = reported.previous_cleanup_waits.len();
+                deadline = deadline.max(now + *bound + START_READY_TIMEOUT);
+            }
+            if !waits_for_outdated_proxy && reported.outdated_proxy_wait {
+                waits_for_outdated_proxy = true;
+                deadline = deadline.max(now + OUTDATED_PROXY_START_BUDGET);
+            }
         }
-        // If our child exited, keep polling briefly. A concurrent start_session that won the
-        // lifetime-lock race makes our loser child exit too, and the winner may still be
-        // binding.
         if tokio::time::Instant::now() >= deadline {
             if child_exit.is_none() {
                 // Still running but never bound — don't leak a session that may hold the ports.
                 let _ = child.kill().await;
+            }
+            if let Some(error) = already_starting {
+                remove_captured_stderr(&stderr_path);
+                return still_starting(&error, config_path);
             }
             let base = match child_exit {
                 Some(status) => format!(
@@ -3349,6 +3377,37 @@ async fn await_spawned_session(
         }
         tokio::time::sleep(Duration::from_millis(150)).await;
     }
+}
+
+/// Reports the session that kept a spawned one from starting, as the spawned one's `error` names
+/// it, once it did not become reachable within an ordinary start.
+///
+/// Another start for this config is in progress; it is not ours to stop.
+fn still_starting(error: &str, config_path: &Path) -> Result<StartSessionResult, ErrorData> {
+    let pid = already_starting_pid(error);
+    if !holder_may_run(pid) {
+        return Err(ErrorData::internal_error(
+            format!("{error}; that session exited before it became reachable"),
+            None,
+        ));
+    }
+    Ok(StartSessionResult {
+        started: false,
+        already_running: Some(true),
+        reachable: Some(false),
+        config_path: config_path.display().to_string(),
+        session: None,
+        id: None,
+        pid,
+        endpoint: None,
+        reason: Some(format!(
+            "{error}; it has not become reachable within {}s: it is still starting, so call \
+             start_session again to check on it, or it runs without a control plane, such as a \
+             TUI started with `--no-control`",
+            START_READY_TIMEOUT.as_secs()
+        )),
+        urls: None,
+    })
 }
 
 #[cfg(test)]
@@ -5427,15 +5486,32 @@ mod start_tests {
     use std::time::Duration;
 
     use color_eyre::eyre;
+    use similar_asserts::assert_eq;
 
     use crate::tools::sessions::{START_READY_TIMEOUT, SpawnedServe};
 
-    /// Waits for a stand-in session that never becomes reachable, whose stderr gets the outdated
-    /// proxy wait after `announce_after`, if at all, and returns how long the wait lasted and the
-    /// error it ended with.
-    async fn wait_for_unreachable_session(
-        announce_after: Option<Duration>,
-    ) -> eyre::Result<(Duration, String)> {
+    /// A stand-in for a spawned session that never becomes reachable.
+    struct StandIn {
+        /// Whether it has exited, having written its reports at once, before the wait starts.
+        exited: bool,
+        /// What it writes to its stderr, and after how long.
+        reports: Vec<(Duration, String)>,
+    }
+
+    impl StandIn {
+        /// A stand-in that keeps running and writes `reports` as it goes.
+        fn running(reports: Vec<(Duration, String)>) -> Self {
+            Self {
+                exited: false,
+                reports,
+            }
+        }
+    }
+
+    /// Waits for `stand_in` and returns how long the wait lasted and how it ended.
+    async fn wait_for(
+        stand_in: StandIn,
+    ) -> eyre::Result<(Duration, Result<crate::StartSessionResult, String>)> {
         let directory = tempfile::tempdir()?;
         let config_path = directory.path().join("micromux.yaml");
         std::fs::write(&config_path, "version: 1\n")?;
@@ -5446,68 +5522,175 @@ mod start_tests {
         )];
         let stderr_path = directory.path().join("serve.stderr");
         std::fs::write(&stderr_path, "")?;
-        let child = tokio::process::Command::new("sleep")
-            .arg("600")
-            .kill_on_drop(true)
-            .spawn()?;
-        let announce = {
+        let mut child =
+            tokio::process::Command::new(if stand_in.exited { "true" } else { "sleep" })
+                .args(if stand_in.exited {
+                    &[][..]
+                } else {
+                    &["600"][..]
+                })
+                .kill_on_drop(true)
+                .spawn()?;
+        let mut reports = stand_in.reports;
+        if stand_in.exited {
+            // The paused clock runs ahead of a real process, so the stand-in has exited, and
+            // said why, before the wait starts; the exit stays observable once reaped.
+            let mut written = String::new();
+            for (_, line) in reports.drain(..) {
+                written.push_str(&line);
+                written.push('\n');
+            }
+            std::fs::write(&stderr_path, written)?;
+            child.wait().await?;
+        }
+        let report = {
             let stderr_path = stderr_path.clone();
             async move {
-                if let Some(after) = announce_after {
+                let mut written = String::new();
+                for (after, line) in reports {
                     tokio::time::sleep(after).await;
-                    std::fs::write(
-                        &stderr_path,
-                        format!(
-                            "{} (pid 4242) to exit\n",
-                            micromux_proxy::WAITING_FOR_OUTDATED_PROXY
-                        ),
-                    )?;
+                    written.push_str(&line);
+                    written.push('\n');
+                    std::fs::write(&stderr_path, &written)?;
                 }
                 Ok::<_, std::io::Error>(())
             }
         };
         let started = tokio::time::Instant::now();
-        let (result, announced) = tokio::join!(
+        let (result, reported) = tokio::join!(
             super::await_spawned_session(
                 SpawnedServe { child, stderr_path },
                 &endpoints,
                 &config_path,
             ),
-            announce
+            report
         );
-        announced?;
-        let Err(err) = result else {
-            eyre::bail!("a session that never came up was reported reachable");
-        };
-        Ok((started.elapsed(), err.message.to_string()))
+        reported?;
+        Ok((
+            started.elapsed(),
+            result.map_err(|err| err.message.to_string()),
+        ))
     }
 
-    /// A spawned session gets the ordinary start time, or, once it says it waits for an outdated
-    /// proxy to exit, that wait plus an ordinary start, even when it says so at the last moment.
+    /// The line a session prints while it waits for an outdated proxy to exit.
+    fn outdated_proxy() -> String {
+        format!(
+            "{} (pid 4242) to exit",
+            micromux_proxy::WAITING_FOR_OUTDATED_PROXY
+        )
+    }
+
+    /// The line a session prints while it waits for a previous session's cleanups.
+    fn previous_cleanup(bound: Duration) -> String {
+        micromux::PreviousCleanupWait {
+            services: vec!["infra".to_string()],
+            bound,
+        }
+        .to_string()
+    }
+
+    /// A spawned session gets the ordinary start time, and, once it says it waits for a previous
+    /// session's cleanups or for an outdated proxy to exit, that wait plus an ordinary start, even
+    /// when it says so at the last moment; a session that never comes up is stopped then.
     #[tokio::test(start_paused = true)]
-    async fn a_start_waiting_for_an_outdated_proxy_gets_the_time_that_wait_needs()
-    -> eyre::Result<()> {
-        let extended = micromux_proxy::OUTDATED_PROXY_WAIT + START_READY_TIMEOUT;
+    async fn a_waiting_start_gets_the_time_its_waits_need() -> eyre::Result<()> {
+        let proxy_budget = micromux_proxy::OUTDATED_PROXY_WAIT + START_READY_TIMEOUT;
+        let cleanup = Duration::from_secs(200);
         // Each check of the session takes a poll of 150 ms.
         let slack = Duration::from_secs(1);
         // Announced just before the ordinary start runs out
         let late = START_READY_TIMEOUT.saturating_sub(Duration::from_millis(100));
         let cases = [
-            (None, START_READY_TIMEOUT),
-            (Some(Duration::ZERO), extended),
-            (Some(late), late + extended),
+            ("no wait", vec![], START_READY_TIMEOUT),
+            (
+                "outdated proxy",
+                vec![(Duration::ZERO, outdated_proxy())],
+                proxy_budget,
+            ),
+            (
+                "late outdated proxy",
+                vec![(late, outdated_proxy())],
+                late + proxy_budget,
+            ),
+            (
+                "previous cleanup",
+                vec![(Duration::ZERO, previous_cleanup(cleanup))],
+                cleanup + START_READY_TIMEOUT,
+            ),
+            // The proxy wait starts once the cleanups are done, and extends from there.
+            (
+                "previous cleanup, then outdated proxy",
+                vec![
+                    (Duration::ZERO, previous_cleanup(cleanup)),
+                    (Duration::from_secs(150), outdated_proxy()),
+                ],
+                Duration::from_secs(150) + proxy_budget,
+            ),
         ];
-        for (announce_after, budget) in cases {
-            let (waited, message) = wait_for_unreachable_session(announce_after).await?;
+        for (case, reports, budget) in cases {
+            let (waited, result) = wait_for(StandIn::running(reports)).await?;
             assert!(
                 waited >= budget && waited < budget + slack,
-                "{announce_after:?}: waited {waited:?}, expected {budget:?}"
+                "{case}: waited {waited:?}, expected {budget:?}"
             );
             assert!(
-                message.contains("did not become reachable"),
-                "{announce_after:?}: {message}"
+                matches!(&result, Err(message) if message.contains("did not become reachable")),
+                "{case}: {result:?}"
             );
         }
+        Ok(())
+    }
+
+    /// A spawned session that finds another session of its config already starting exits, and the
+    /// tool then gives that other session an ordinary start and reports it as still starting,
+    /// rather than failing or stopping anything; one whose process is gone by then is reported
+    /// as failed.
+    #[tokio::test(start_paused = true)]
+    async fn a_start_in_progress_is_reported_as_still_starting() -> eyre::Result<()> {
+        // This test process stands in for the session that is starting.
+        let holder = std::process::id();
+        let held = micromux_control::ClaimError::Held { pid: Some(holder) }.to_string();
+        let (waited, result) = wait_for(StandIn {
+            exited: true,
+            reports: vec![(Duration::ZERO, format!("Error: {held}"))],
+        })
+        .await?;
+        let report = result.map_err(|message| eyre::eyre!(message))?;
+        assert!(!report.started);
+        assert_eq!(report.reachable, Some(false));
+        assert_eq!(report.pid, Some(holder));
+        assert!(
+            report
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains(micromux_control::SESSION_ALREADY_STARTING)),
+            "{:?}",
+            report.reason
+        );
+        assert!(
+            waited >= START_READY_TIMEOUT && waited < START_READY_TIMEOUT + Duration::from_secs(1),
+            "{waited:?}"
+        );
+
+        // A holder whose process has exited
+        let mut gone = tokio::process::Command::new("true").spawn()?;
+        let gone_pid = gone
+            .id()
+            .ok_or_else(|| eyre::eyre!("the process has no pid"))?;
+        gone.wait().await?;
+        let held = micromux_control::ClaimError::Held {
+            pid: Some(gone_pid),
+        }
+        .to_string();
+        let (_, result) = wait_for(StandIn {
+            exited: true,
+            reports: vec![(Duration::ZERO, format!("Error: {held}"))],
+        })
+        .await?;
+        assert!(
+            matches!(&result, Err(message) if message.contains("exited before it became reachable")),
+            "{result:?}"
+        );
         Ok(())
     }
 }

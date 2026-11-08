@@ -13,9 +13,19 @@ pub(super) fn bind(_endpoint: &ControlEndpoint) -> Result<Option<EndpointGuard>,
     Err(ControlError::Unsupported)
 }
 
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "keeps one signature with the Unix implementation, whose claim can fail"
+)]
+pub(super) fn claim_project(
+    _config_path: &crate::CanonicalConfigPath,
+) -> Result<super::ProjectClaim, super::ClaimError> {
+    Ok(super::ProjectClaim { lock: None })
+}
+
 pub(super) fn bind_project(
     _endpoint: &ControlEndpoint,
-    _config_path: &crate::CanonicalConfigPath,
+    _claim: &super::ProjectClaim,
 ) -> Result<Option<EndpointGuard>, ControlError> {
     Err(ControlError::Unsupported)
 }
