@@ -1,7 +1,7 @@
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
-    style::{Color, Style, palette::tailwind},
+    style::{Color, Style},
 };
 
 pub const INITIAL_SIDEBAR_WIDTH: u16 = 40;
@@ -10,10 +10,10 @@ pub const MIN_SIDEBAR_WIDTH: u16 = 20;
 #[must_use]
 pub fn health_style(health: Option<micromux::Health>) -> Style {
     match health {
-        Some(micromux::Health::Unhealthy) => Style::default().fg(tailwind::RED.c500),
-        Some(micromux::Health::Healthy) => Style::default().fg(tailwind::GREEN.c500),
-        Some(micromux::Health::Unknown) => Style::default().fg(tailwind::AMBER.c500),
-        None => Style::default().fg(tailwind::GREEN.c300),
+        Some(micromux::Health::Unhealthy) => Style::default().fg(Color::Red),
+        Some(micromux::Health::Healthy) => Style::default().fg(Color::Green),
+        Some(micromux::Health::Unknown) => Style::default().fg(Color::Yellow),
+        None => Style::default().fg(Color::LightGreen),
     }
 }
 
@@ -38,17 +38,17 @@ pub fn service_style(snapshot: &micromux::ServiceSnapshot) -> Style {
         // A blocked service is waiting to start, not failing — it shares the pre-start blue rather
         // than the red an `Exited` snapshot would otherwise have given it.
         micromux::Execution::Pending | micromux::Execution::Blocked => {
-            Style::default().fg(tailwind::BLUE.c500)
+            Style::default().fg(Color::Blue)
         }
         micromux::Execution::Starting | micromux::Execution::Running => {
             health_style(snapshot.health)
         }
         // Distinct from the green "running" styling so a stopped service is obvious at a glance.
         micromux::Execution::Stopping | micromux::Execution::Unknown => {
-            Style::default().fg(tailwind::AMBER.c500)
+            Style::default().fg(Color::Yellow)
         }
         micromux::Execution::Exited | micromux::Execution::Failed => {
-            Style::default().fg(tailwind::RED.c400)
+            Style::default().fg(Color::Red)
         }
         // Unreachable behind `is_frozen`, which grays a completed job out entirely.
         micromux::Execution::Completed => Style::default().fg(FROZEN_TEXT),
@@ -56,39 +56,42 @@ pub fn service_style(snapshot: &micromux::ServiceSnapshot) -> Style {
 }
 
 /// The gray of a frozen service's row and of its text that has no color of its own.
-const FROZEN_TEXT: Color = tailwind::GRAY.c500;
+const FROZEN_TEXT: Color = Color::DarkGray;
 
-/// The darkest gray a color turns into when frozen, kept visible on a dark background.
-const FROZEN_DARKEST: u8 = 64;
+/// The luma from which a color freezes to the theme's light gray rather than its dark one.
+const FROZEN_LIGHT_FROM: u16 = 128 * 256;
 
-/// How far the brightest color rises above [`FROZEN_DARKEST`], in sixteen steps of this size.
-const FROZEN_STEP: u8 = 8;
-
-/// Renders `area` the way a stopped service looks: every color becomes a gray of its own
-/// brightness, so bars and highlights keep their shape while nothing looks live.
+/// Renders `area` the way a stopped service looks: every color becomes one of the theme's two
+/// grays by its brightness, so bars and highlights keep their shape while nothing looks live.
 ///
 /// Bold, underline, reverse and the other modifiers stay as they are.
 /// Text without a color of its own takes the gray of a frozen sidebar row, and a cell without
 /// its own background keeps the terminal's.
+/// Text that would freeze to its background's gray takes the other gray, so it stays readable.
 pub fn freeze(buf: &mut Buffer, area: Rect) {
     for position in area.positions() {
         if let Some(cell) = buf.cell_mut(position) {
-            cell.fg = frozen(cell.fg, FROZEN_TEXT);
-            cell.bg = frozen(cell.bg, Color::Reset);
+            let bg = frozen(cell.bg).unwrap_or(Color::Reset);
+            let fg = frozen(cell.fg).unwrap_or(FROZEN_TEXT);
+            cell.fg = match (fg, bg) {
+                (Color::Gray, Color::Gray) => Color::DarkGray,
+                (Color::DarkGray, Color::DarkGray) => Color::Gray,
+                _ => fg,
+            };
+            cell.bg = bg;
         }
     }
 }
 
-/// The gray `color` freezes to, or `default` for the terminal's default color.
-fn frozen(color: Color, default: Color) -> Color {
-    let Some(luma) = luma(color) else {
-        return default;
-    };
-    // The top four bits of the luma pick one of sixteen grays, which keeps the arithmetic in `u8`
-    // and still separates the colors a bar or a highlight is made of.
-    let step = u8::try_from(luma >> 12).unwrap_or(15);
-    let level = FROZEN_DARKEST + step * FROZEN_STEP;
-    Color::Rgb(level, level, level)
+/// The theme gray `color` freezes to, or `None` for the terminal's default color.
+fn frozen(color: Color) -> Option<Color> {
+    luma(color).map(|luma| {
+        if luma >= FROZEN_LIGHT_FROM {
+            Color::Gray
+        } else {
+            Color::DarkGray
+        }
+    })
 }
 
 /// The brightness of `color` on a scale of 0 to 65280, or `None` for the terminal's default.
@@ -161,30 +164,17 @@ mod tests {
         assert_eq!(luma(Color::Indexed(255)), luma(Color::Rgb(238, 238, 238)));
     }
 
-    /// The gray level `color` freezes to.
-    fn level(color: Color) -> eyre::Result<u8> {
-        match frozen(color, Color::Reset) {
-            Color::Rgb(red, green, blue) if red == green && green == blue => Ok(red),
-            other => eyre::bail!("expected a gray, got {other:?}"),
-        }
-    }
-
-    /// Frozen grays keep the order of the colors' brightness inside a visible range.
+    /// Bright colors freeze to the theme's light gray and dark ones to its dark gray.
     #[test]
-    fn frozen_grays_keep_brightness_order() -> eyre::Result<()> {
-        assert_eq!(level(Color::Black)?, 64);
-        assert_eq!(level(Color::White)?, 184);
-        assert!(level(Color::Yellow)? > level(Color::Green)?);
-        assert!(level(Color::Green)? > level(Color::Red)?);
-        assert!(level(Color::Red)? > level(Color::Blue)?);
-        assert!(level(Color::Blue)? > level(Color::Black)?);
-        // The default color takes whatever the caller stands in for it.
-        assert_eq!(frozen(Color::Reset, Color::Reset), Color::Reset);
-        assert_eq!(
-            frozen(Color::Reset, Color::Rgb(1, 2, 3)),
-            Color::Rgb(1, 2, 3)
-        );
-        Ok(())
+    fn frozen_grays_follow_brightness() {
+        assert_eq!(frozen(Color::White), Some(Color::Gray));
+        assert_eq!(frozen(Color::Yellow), Some(Color::Gray));
+        assert_eq!(frozen(Color::Rgb(200, 200, 200)), Some(Color::Gray));
+        assert_eq!(frozen(Color::Red), Some(Color::DarkGray));
+        assert_eq!(frozen(Color::Blue), Some(Color::DarkGray));
+        assert_eq!(frozen(Color::Black), Some(Color::DarkGray));
+        // The terminal's default color has no brightness to go by.
+        assert_eq!(frozen(Color::Reset), None);
     }
 
     /// Freezing an area grays its colors, keeps its modifiers, and leaves the rest of the buffer
@@ -203,9 +193,9 @@ mod tests {
         freeze(&mut buf, Rect::new(0, 0, 6, 1));
 
         let frozen_cell = buf.cell((0, 0)).ok_or_eyre("missing frozen cell")?;
-        assert!(matches!(frozen_cell.fg, Color::Rgb(level, _, _) if level > 64));
-        assert!(matches!(frozen_cell.bg, Color::Rgb(..)));
-        assert_ne!(frozen_cell.fg, frozen_cell.bg);
+        // Red and blue are both dark, so the text takes the light gray to stay readable.
+        assert_eq!(frozen_cell.bg, Color::DarkGray);
+        assert_eq!(frozen_cell.fg, Color::Gray);
         assert!(frozen_cell.modifier.contains(Modifier::BOLD));
         // An empty cell has no color of its own: its text goes gray and its background stays.
         let empty_cell = buf.cell((5, 0)).ok_or_eyre("missing empty cell")?;

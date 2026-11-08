@@ -159,7 +159,7 @@ Some processes want input — a REPL, a prompt, a dev server waiting on a keypre
 
 ## Disabling on the fly
 
-Press `d` to disable the selected service: micromux stops it and its row turns gray, while its captured logs remain for inspection. The log pane turns gray with it: every color becomes a shade of gray of its own brightness, so a progress bar or a highlighted row keeps its shape while nothing looks live. Press `d` again to re-enable and start it.
+Press `d` to disable the selected service: micromux stops it and its row turns gray, while its captured logs remain for inspection. The log pane turns gray with it: every color becomes your theme's light or dark gray by its brightness, so a progress bar or a highlighted row keeps its shape while nothing looks live. Press `d` again to re-enable and start it.
 
 Those preserved logs would otherwise look frozen, so micromux marks each transition in the log with a blue rule — `=== service disable requested ===`, `=== service enable requested ===`, `=== waiting for postgres to become healthy ===`, `=== automatic restart scheduled after 250 ms ===`. Whatever the log is doing, the last line says why. The same rules appear in `micromux ctl logs` and in the retained run files; the MCP log tools strip their color along with the rest of the ANSI.
 
