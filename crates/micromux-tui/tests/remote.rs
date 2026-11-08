@@ -65,10 +65,13 @@ fn build_session(dir: &Path, yaml: &str) -> eyre::Result<Session> {
     config.config_path = Some(config_path.as_path().to_path_buf());
     // A port registry of the test's own, so the session never registers with the user's.
     let registry = micromux::PortRegistry::at(dir.join("registry"));
-    let mux = Arc::new(micromux::Micromux::with_session(
-        &config,
-        micromux::Session::establish(&config, &registry)?,
-    )?);
+    let mux = Arc::new(
+        micromux::Micromux::with_session(
+            &config,
+            micromux::Session::establish(&config, &registry)?,
+        )?
+        .with_cache_directory(dir.join("cache")),
+    );
 
     let shutdown = CancellationToken::new();
     let (runner, handles) = mux.start(shutdown.clone());

@@ -375,7 +375,10 @@ services:
         let registry = micromux::PortRegistry::at(directory.path().join("registry"));
         let mut session = micromux::Session::establish(&config_file, &registry)?;
         session.set_proxy_port(proxy_port);
-        let mux = Arc::new(micromux::Micromux::with_session(&config_file, session)?);
+        let mux = Arc::new(
+            micromux::Micromux::with_session(&config_file, session)?
+                .with_cache_directory(directory.path().join("cache")),
+        );
         let (runner, handles) = mux.clone().start(shutdown.clone());
         let runner = tokio::spawn(runner);
 

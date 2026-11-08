@@ -51,8 +51,8 @@ pub use protocol::{
 pub use select::{
     AmbiguousSelection, ProbeReport, ResolvedSession, RuntimeDirDetail, SelectError,
     SessionSelector, SocketProbeDetail, SocketProbeStatus, config_for_target, probe_detail,
-    resolve_selector, resolve_selector_in_runtime_dirs, session_config_path_is_under,
-    session_matches_config_path,
+    resolve_selector, resolve_selector_in_runtime_dirs, resolve_selector_with_statuses,
+    session_config_path_is_under, session_matches_config_path,
 };
 pub use server::{
     ControlServer, EndpointGuard, SessionIdentity, bind, bind_project, endpoint_owner_lock_held,

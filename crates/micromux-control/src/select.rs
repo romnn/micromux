@@ -169,17 +169,36 @@ pub async fn resolve_selector(
     if !crate::transport_supported() {
         return Err(SelectError::Unsupported);
     }
-    let dir_statuses = runtime_dir_statuses();
-    let runtime_dirs = usable_runtime_dirs(&dir_statuses);
+    resolve_selector_with_statuses(&runtime_dir_statuses(), cwd, selector, config_override).await
+}
+
+/// Resolve a selector across the usable directories among `dir_statuses`.
+///
+/// It is [`resolve_selector`] for a client that chooses its own runtime directories, such as a
+/// test that runs its sessions in a private one.
+///
+/// # Errors
+///
+/// Returns the same errors as [`resolve_selector`].
+pub async fn resolve_selector_with_statuses(
+    dir_statuses: &[RuntimeDirStatus],
+    cwd: &Path,
+    selector: Option<SessionSelector>,
+    config_override: Option<&Path>,
+) -> Result<ResolvedSession, SelectError> {
+    if !crate::transport_supported() {
+        return Err(SelectError::Unsupported);
+    }
+    let runtime_dirs = usable_runtime_dirs(dir_statuses);
     if runtime_dirs.is_empty() {
         return Err(SelectError::NoSession(Box::new(probe_report(
             "no runtime directory could be resolved".to_string(),
             None,
-            &dir_statuses,
+            dir_statuses,
             Vec::new(),
         ))));
     }
-    resolve_selector_in_runtime_dirs(&runtime_dirs, &dir_statuses, cwd, selector, config_override)
+    resolve_selector_in_runtime_dirs(&runtime_dirs, dir_statuses, cwd, selector, config_override)
         .await
 }
 
@@ -664,7 +683,9 @@ mod tests {
         let mut diagnostics = Vec::new();
         let config = micromux::from_str(yaml, working_dir, 0usize, None, &mut diagnostics)
             .map_err(|error| eyre::eyre!("parse: {error}"))?;
-        let mux = Arc::new(micromux::Micromux::new(&config)?);
+        let mux = Arc::new(
+            micromux::Micromux::new(&config)?.with_cache_directory(runtime_dir.join("cache")),
+        );
         let shutdown = CancellationToken::new();
         let (runner, handles) = mux.clone().start(shutdown.clone());
         let runner = tokio::spawn(runner);

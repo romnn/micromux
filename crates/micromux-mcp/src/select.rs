@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 use micromux_control::{
     ControlError, EndpointProbe, EndpointProbeResult, ProbeReport, ResolvedSession,
     RuntimeDirDetail, RuntimeDirStatus, SelectError, SessionInfo, SessionSelector,
-    SocketProbeDetail, probe_detail, probe_runtime_dirs, resolve_selector, runtime_dir_statuses,
-    unique_answering_session_probes, usable_runtime_dirs,
+    SocketProbeDetail, probe_detail, probe_runtime_dirs, resolve_selector_with_statuses,
+    runtime_dir_statuses, unique_answering_session_probes, usable_runtime_dirs,
 };
 #[cfg(all(test, unix))]
 use micromux_control::{
@@ -141,17 +141,121 @@ fn map_select_error(cwd: &Path, error: SelectError) -> ToolError {
     }
 }
 
-/// Resolve a selector to a single live session.
+/// Where discovery looks for sessions: the user's runtime directories, or fixed ones.
 ///
-/// # Errors
-///
-/// Returns [`ToolError::NoSession`] when nothing answers, [`ToolError::Ambiguous`] when a name
-/// matches more than one, or [`ToolError::Unsupported`] on a platform without a transport.
-pub async fn resolve(cwd: &Path, selector: Option<String>) -> Result<Resolved, ToolError> {
-    let selector = selector_with_environment_fallback(selector);
-    resolve_selector(cwd, selector, None)
-        .await
-        .map_err(|error| map_select_error(cwd, error))
+/// Every discovery path of the server reads its runtime directories from here.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Discovery {
+    /// Runtime directories to search instead of the user's.
+    runtime_dirs: Option<Vec<PathBuf>>,
+}
+
+impl Discovery {
+    /// Discovery that searches only `runtime_dirs`, for tests that run sessions of their own.
+    #[cfg(test)]
+    pub(crate) fn in_runtime_dirs(runtime_dirs: Vec<PathBuf>) -> Self {
+        Self {
+            runtime_dirs: Some(runtime_dirs),
+        }
+    }
+
+    /// The runtime directories to search, and whether each is usable.
+    pub(crate) fn runtime_dir_statuses(&self) -> Vec<RuntimeDirStatus> {
+        let Some(runtime_dirs) = &self.runtime_dirs else {
+            return runtime_dir_statuses();
+        };
+        runtime_dirs
+            .iter()
+            .map(|path| {
+                let usable = path.is_dir();
+                RuntimeDirStatus {
+                    path: path.clone(),
+                    usable,
+                    error: (!usable).then(|| "not a directory".to_string()),
+                }
+            })
+            .collect()
+    }
+
+    /// Resolve a selector to a single live session.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ToolError::NoSession`] when nothing answers, [`ToolError::Ambiguous`] when a
+    /// name matches more than one, or [`ToolError::Unsupported`] on a platform without a
+    /// transport.
+    pub(crate) async fn resolve(
+        &self,
+        cwd: &Path,
+        selector: Option<String>,
+    ) -> Result<Resolved, ToolError> {
+        if !micromux_control::transport_supported() {
+            return Err(ToolError::Unsupported);
+        }
+        let selector = selector_with_environment_fallback(selector);
+        resolve_selector_with_statuses(&self.runtime_dir_statuses(), cwd, selector, None)
+            .await
+            .map_err(|error| map_select_error(cwd, error))
+    }
+
+    /// List every session that answers `Describe`.
+    ///
+    /// Endpoints that refuse a connection are skipped; live-but-unusable ones are simply not
+    /// listed this scan (never pruned).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ToolError::Unsupported`] on a platform without a control transport.
+    pub(crate) async fn list_sessions(&self) -> Result<SessionList, ToolError> {
+        if !micromux_control::transport_supported() {
+            return Err(ToolError::Unsupported);
+        }
+        let dir_statuses = self.runtime_dir_statuses();
+        let runtime_dirs = usable_runtime_dirs(&dir_statuses);
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        if runtime_dirs.is_empty() {
+            return Err(ToolError::NoSession(Box::new(discovery_diagnostics(
+                &cwd,
+                "no runtime directory could be resolved".to_string(),
+                None,
+                &dir_statuses,
+                Vec::new(),
+            ))));
+        }
+        let probes = probe_runtime_dirs(&runtime_dirs).await?;
+        let sessions = session_infos_from_probes(&probes);
+        let summary = session_list_summary(&sessions, &probes);
+        let socket_probes = probes.into_iter().map(probe_detail).collect();
+        Ok(SessionList {
+            sessions,
+            diagnostics: discovery_diagnostics(&cwd, summary, None, &dir_statuses, socket_probes),
+        })
+    }
+
+    /// List every answering session together with the endpoint that drives it.
+    ///
+    /// Like [`Self::list_sessions`], but keeps the endpoint so a caller can query each session,
+    /// to locate a service across sibling sessions.
+    /// An empty vector means no runtime dir or no answering session, never an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ToolError::Unsupported`] on a platform without a control transport.
+    pub(crate) async fn answering_sessions(&self) -> Result<Vec<Resolved>, ToolError> {
+        if !micromux_control::transport_supported() {
+            return Err(ToolError::Unsupported);
+        }
+        let dir_statuses = self.runtime_dir_statuses();
+        let runtime_dirs = usable_runtime_dirs(&dir_statuses);
+        if runtime_dirs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let probes = probe_runtime_dirs(&runtime_dirs).await?;
+        Ok(unique_answering_session_probes(&probes)
+            .into_iter()
+            .map(|(endpoint, info)| ResolvedSession { endpoint, info })
+            .collect())
+    }
 }
 
 /// Resolve a selector against an explicit runtime directory (testable variant of [`resolve`]).
@@ -219,61 +323,6 @@ fn session_infos_from_probes(probes: &[EndpointProbe]) -> Vec<SessionInfo> {
         .into_iter()
         .map(|(_endpoint, info)| info)
         .collect()
-}
-
-/// List every session that answers `Describe`. Endpoints that refuse a connection are skipped;
-/// live-but-unusable ones are simply not listed this scan (never pruned).
-///
-/// # Errors
-///
-/// Returns [`ToolError::Unsupported`] on a platform without a control transport.
-pub async fn list_sessions() -> Result<SessionList, ToolError> {
-    if !micromux_control::transport_supported() {
-        return Err(ToolError::Unsupported);
-    }
-    let dir_statuses = runtime_dir_statuses();
-    let runtime_dirs = usable_runtime_dirs(&dir_statuses);
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    if runtime_dirs.is_empty() {
-        return Err(ToolError::NoSession(Box::new(discovery_diagnostics(
-            &cwd,
-            "no runtime directory could be resolved".to_string(),
-            None,
-            &dir_statuses,
-            Vec::new(),
-        ))));
-    }
-    let probes = probe_runtime_dirs(&runtime_dirs).await?;
-    let sessions = session_infos_from_probes(&probes);
-    let summary = session_list_summary(&sessions, &probes);
-    let socket_probes = probes.into_iter().map(probe_detail).collect();
-    Ok(SessionList {
-        sessions,
-        diagnostics: discovery_diagnostics(&cwd, summary, None, &dir_statuses, socket_probes),
-    })
-}
-
-/// List every answering session together with the endpoint that drives it. Like [`list_sessions`]
-/// but keeps the endpoint so a caller can query each session — used to locate a service across
-/// sibling sessions. An empty vector means no runtime dir or no answering session, never an error.
-///
-/// # Errors
-///
-/// Returns [`ToolError::Unsupported`] on a platform without a control transport.
-pub async fn answering_sessions() -> Result<Vec<Resolved>, ToolError> {
-    if !micromux_control::transport_supported() {
-        return Err(ToolError::Unsupported);
-    }
-    let dir_statuses = runtime_dir_statuses();
-    let runtime_dirs = usable_runtime_dirs(&dir_statuses);
-    if runtime_dirs.is_empty() {
-        return Ok(Vec::new());
-    }
-    let probes = probe_runtime_dirs(&runtime_dirs).await?;
-    Ok(unique_answering_session_probes(&probes)
-        .into_iter()
-        .map(|(endpoint, info)| ResolvedSession { endpoint, info })
-        .collect())
 }
 
 fn session_list_summary(sessions: &[SessionInfo], probes: &[EndpointProbe]) -> String {
@@ -404,7 +453,15 @@ mod tests {
         let mut diagnostics = vec![];
         let config = micromux::from_str(yaml, working_dir, 0usize, None, &mut diagnostics)
             .map_err(|err| eyre::eyre!("parse: {err}"))?;
-        let mux = Arc::new(micromux::Micromux::new(&config)?);
+        // The run-log spool goes next to the session's socket, in the test's runtime directory.
+        let ControlEndpoint::Unix(socket) = endpoint else {
+            eyre::bail!("expected a Unix socket endpoint");
+        };
+        let cache = socket
+            .parent()
+            .ok_or_else(|| eyre::eyre!("the socket has no directory"))?
+            .join("cache");
+        let mux = Arc::new(micromux::Micromux::new(&config)?.with_cache_directory(cache));
         let shutdown = CancellationToken::new();
         let (runner, handles) = mux.clone().start(shutdown.clone());
         let runner = tokio::spawn(runner);

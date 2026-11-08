@@ -52,7 +52,8 @@ fn build_session_yaml(dir: &Path, yaml: &str) -> eyre::Result<Session> {
         Ok(micromux::Micromux::with_session(
             config,
             micromux::Session::establish(config, &private_registry(dir))?,
-        )?)
+        )?
+        .with_cache_directory(dir.join("cache")))
     })
 }
 
@@ -62,7 +63,8 @@ fn build_routed_session(dir: &Path, yaml: &str) -> eyre::Result<Session> {
     build_session_with(dir, yaml, |config| {
         let mut session = micromux::Session::establish(config, &private_registry(dir))?;
         session.set_proxy_port(8080);
-        Ok(micromux::Micromux::with_session(config, session)?)
+        Ok(micromux::Micromux::with_session(config, session)?
+            .with_cache_directory(dir.join("cache")))
     })
 }
 

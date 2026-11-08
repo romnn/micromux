@@ -500,6 +500,8 @@ pub struct Micromux {
     dynamic_policy: DynamicServicesPolicy,
     default_log_retention: LogRetention,
     default_log_display: LogDisplay,
+    /// Where the session keeps its run-log spool; `None` keeps run logs in memory only.
+    cache_directory: Option<PathBuf>,
 }
 
 /// Capability handles returned by [`Micromux::start`].
@@ -632,7 +634,18 @@ impl Micromux {
             dynamic_policy,
             default_log_retention: config_file.config.log_retention,
             default_log_display: config_file.config.log_display.clone(),
+            cache_directory: cache_directory(),
         })
+    }
+
+    /// Keeps the session's run-log spool in `directory` instead of [`cache_directory`].
+    ///
+    /// It serves tests and embedders that keep micromux's files apart from the user's, without
+    /// setting [`STATE_DIR_VARIABLE`] for the whole process.
+    #[must_use]
+    pub fn with_cache_directory(mut self, directory: impl Into<PathBuf>) -> Self {
+        self.cache_directory = Some(directory.into());
+        self
     }
 
     /// The latched session's name and domain.
@@ -696,7 +709,10 @@ impl Micromux {
         self: Arc<Self>,
         shutdown: CancellationToken,
     ) -> (impl Future<Output = Result<(), Error>> + 'static, Handles) {
-        let (reader, writer) = model::new(initial_model_entries(&self.services));
+        let (reader, writer) = model::new_in(
+            initial_model_entries(&self.services),
+            self.cache_directory.as_deref(),
+        );
         let (commands_tx, commands_rx) = mpsc::channel(1024);
         let (terminal, pty_input_rx) = TerminalControl::channel(commands_tx.clone());
         let session_status = SessionStatus::new(self.session_summary());

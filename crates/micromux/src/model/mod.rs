@@ -1795,12 +1795,25 @@ pub(crate) fn new_with_retention(
     )
 }
 
-/// Build the model using a private, session-owned spool directory for disk run logs.
+/// Build the model with a private, session-owned spool directory for disk run logs in
+/// `cache_directory`, or with run logs in memory only when it is `None`.
+pub(crate) fn new_in(
+    initial: impl IntoIterator<Item = (ServiceSnapshot, LogRetention)>,
+    cache_directory: Option<&Path>,
+) -> (SessionModelReader, SessionModelWriter) {
+    if cache_directory.is_none() {
+        tracing::warn!("disk run logs disabled: no cache directory is available");
+    }
+    let (spool_dir, spool_lock) = cache_directory.and_then(create_spool_dir).unzip();
+    new_with_retention(initial, spool_dir, spool_lock)
+}
+
+/// Build the model with its spool in [`crate::cache_directory`].
+#[cfg(test)]
 pub(crate) fn new(
     initial: impl IntoIterator<Item = (ServiceSnapshot, LogRetention)>,
 ) -> (SessionModelReader, SessionModelWriter) {
-    let (spool_dir, spool_lock) = create_spool_dir().unzip();
-    new_with_retention(initial, spool_dir, spool_lock)
+    new_in(initial, crate::cache_directory().as_deref())
 }
 
 #[cfg(test)]
