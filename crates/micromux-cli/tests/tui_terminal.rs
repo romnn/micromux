@@ -293,6 +293,8 @@ impl Project {
         command.cwd(self.directory.path());
         command.env("TERM", "xterm-256color");
         command.env("HOME", self.home());
+        // State micromux shares per user, such as the port registry, stays in the project.
+        command.env("MICROMUX_STATE_DIR", self.directory.path().join("state"));
         command.env_remove("XDG_CONFIG_HOME");
         command.env_remove("MICROMUX_MOUSE");
         command.env_remove("MICROMUX_COPY_ON_SELECT");
