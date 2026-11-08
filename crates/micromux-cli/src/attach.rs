@@ -43,9 +43,10 @@ pub(crate) async fn run(options: &Options, raw_session: Option<&str>) -> Result<
 
     let shutdown = micromux::CancellationToken::new();
     crate::spawn_shutdown_handler(shutdown.clone());
+    let terminal = remote.terminal();
     let app = micromux_tui::App::new(
         micromux_tui::SessionSource::Remote(remote),
-        None,
+        terminal,
         shutdown,
         micromux_tui::ViewOptions {
             pretty_json: !options.no_pretty_json_logs,

@@ -177,7 +177,14 @@ micromux attach --session name:my-project
 
 A selector may be a bare session name or `name:`, `pid:`, or `hash:`. More than one attach client can observe and operate the same session at once.
 
-An attached TUI follows service status, logs, and healthchecks, and its lifecycle keys (`r`, `R`, `d`) still restart, enable, and disable services. In v1 it does **not** forward service PTY input or terminal-resize events.
+An attached TUI follows service status, logs, and healthchecks, and its lifecycle keys (`r`, `R`, `d`) still restart, enable, and disable services. `a` types into the selected service as it does locally, so an interactive service of a headless session can be driven from an attached TUI.
+
+With several clients on one session, the last active writer wins:
+
+- **Resizes.** Watching never resizes anything: an attached TUI resizes the service PTYs only while it is in PTY input mode, starting with its own size when you press `a`, and following its log pane while the mode lasts. The session's own TUI resizes them whenever its log pane changes size, and takes the size back when you press `a` there. Every PTY takes the size of the most recent resize the session receives. Detaching does not restore an earlier size.
+- **Input.** Keystrokes and pastes from every client reach the service in the order the session receives them, with no lock or turn-taking, like two terminals typing into one tmux pane. Each client's input stays in its own order, and one batch of keys or one paste is written whole, never split by another client's. Input typed while an attached TUI shows `reconnecting…` is discarded rather than sent later, and input for a service that is not running is refused with a notice.
+
+An attached paste is limited to 512 KiB, half the local limit, so it fits one control-protocol message. A session older than micromux's protocol 3.18 accepts no input or resizes; `a` is then unavailable.
 
 > [!NOTE]
 > Pressing `q` in an attached client only **detaches** it — it never stops the session or its services. To stop a headless session explicitly, use `micromux ctl stop` or the MCP `stop_session` tool.

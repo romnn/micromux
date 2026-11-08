@@ -64,7 +64,7 @@ The tools cover the full lifecycle:
 Manual restarts, enables, and due automatic restarts reload the latest `micromux.yaml` service definitions before spawning, so command, environment, port, restart-policy, healthcheck, and log-retention edits take effect without stopping the session.
 
 > [!NOTE]
-> MCP deliberately exposes **no service-PTY-input tool** — human observation of a headless session goes through [`micromux attach`]({{< relref "../tui.md" >}}#attach-to-a-running-session). For a lean, TUI-only binary with the MCP server compiled out, build with `cargo install --no-default-features micromux-cli`.
+> MCP deliberately exposes **no service-PTY-input tool** — a human watches or types into a headless session through [`micromux attach`]({{< relref "../tui.md" >}}#attach-to-a-running-session). For a lean, TUI-only binary with the MCP server compiled out, build with `cargo install --no-default-features micromux-cli`.
 
 > [!WARNING]
 > The same-user control interface is operator-trusted, not a redacted security boundary. Discovery

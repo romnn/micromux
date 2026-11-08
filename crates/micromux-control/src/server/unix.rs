@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use futures::{SinkExt, StreamExt};
 use micromux::{
-    ChangeKind, CommandRejection, SchedulerStopped, ServiceCommandResult, ServiceSnapshot,
-    SessionChange, SessionModelReader,
+    ChangeKind, CommandRejection, PtyInputSendError, SchedulerStopped, ServiceCommandResult,
+    ServiceSnapshot, SessionChange, SessionModelReader, TerminalSize,
 };
 use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -621,18 +621,7 @@ async fn dispatch(server: &ControlServer, request: Request) -> Response {
     match request {
         Request::Describe => Response::Description(describe(server)),
         Request::ListServices => Response::Services(server.reader.services()),
-        Request::GetService { service } => {
-            let snapshots = server.reader.services();
-            snapshots
-                .iter()
-                .find(|snapshot| snapshot.id == service)
-                .or_else(|| snapshots.iter().find(|snapshot| snapshot.name == service))
-                .cloned()
-                .map_or_else(
-                    || unknown_service(&service),
-                    |snapshot| Response::Service(Box::new(snapshot)),
-                )
-        }
+        Request::GetService { service } => get_service(&server.reader, &service),
         Request::GetLogs {
             service,
             run_generation,
@@ -707,6 +696,12 @@ async fn dispatch(server: &ControlServer, request: Request) -> Response {
         }
         Request::GetEnvironment { service } => environment(server, service.as_ref()).await,
         Request::ReconcileConfig { dry_run } => reconcile(server, dry_run).await,
+        Request::SendInput {
+            service,
+            data,
+            paste,
+        } => send_input(server, service, data.into_inner(), paste).await,
+        Request::ResizeTerminal { cols, rows } => resize_terminal(server, cols, rows).await,
         // Subscribe is intercepted before dispatch; reaching here is a protocol misuse.
         Request::Subscribe | Request::SubscribeWithVersion { .. } => Response::error(
             ErrorCode::BadRequest,
@@ -719,6 +714,86 @@ async fn dispatch(server: &ControlServer, request: Request) -> Response {
     }
 }
 
+/// Queues input for a running service's PTY behind any earlier input, from this or another
+/// client.
+///
+/// Nothing serializes clients beyond that: each request is written contiguously, so input from two
+/// clients interleaves only at request boundaries, like two terminals typing into one tmux pane.
+async fn send_input(
+    server: &ControlServer,
+    service: micromux::ServiceID,
+    data: Vec<u8>,
+    paste: bool,
+) -> Response {
+    let Some(terminal) = &server.terminal else {
+        return no_terminal();
+    };
+    let Some(snapshot) = server.reader.service(&service) else {
+        return unknown_service(&service);
+    };
+    // The scheduler would drop this input and record the drop only as a service event, which an
+    // attached TUI does not follow, so refuse it here, where the client sees why.
+    // The scheduler still drops input that loses a race with the process exiting.
+    if !matches!(
+        snapshot.execution,
+        micromux::Execution::Running | micromux::Execution::Stopping
+    ) {
+        let kind = if paste { "paste" } else { "input" };
+        return Response::error(
+            ErrorCode::InvalidState,
+            format!("terminal {kind} discarded: {service} is not running"),
+        );
+    }
+    let prepared = if paste {
+        terminal.prepare_paste(service, data)
+    } else {
+        terminal.prepare_input(service, data)
+    };
+    let prepared = match prepared {
+        Ok(prepared) => prepared,
+        Err(err) => return Response::error(ErrorCode::LimitExceeded, err.to_string()),
+    };
+    match terminal.send(prepared).await {
+        Ok(()) => Response::TerminalQueued,
+        // The session's own capability never reports `Full` from `send`, nor disconnects.
+        Err(
+            PtyInputSendError::Closed(_)
+            | PtyInputSendError::Full(_)
+            | PtyInputSendError::Disconnected(_),
+        ) => Response::error(ErrorCode::SchedulerStopped, "the scheduler has stopped"),
+        Err(PtyInputSendError::WrongSession(_)) => Response::error(
+            ErrorCode::Internal,
+            "terminal input was prepared for another session",
+        ),
+    }
+}
+
+/// Resizes every service PTY; the scheduler applies resizes in arrival order, so the last one
+/// received wins, whichever client sent it.
+async fn resize_terminal(server: &ControlServer, cols: u16, rows: u16) -> Response {
+    let Some(terminal) = &server.terminal else {
+        return no_terminal();
+    };
+    if cols == 0 || rows == 0 {
+        return Response::error(
+            ErrorCode::BadRequest,
+            "a terminal needs at least one column and one row",
+        );
+    }
+    if terminal.resize(TerminalSize { cols, rows }).await {
+        Response::TerminalQueued
+    } else {
+        Response::error(ErrorCode::SchedulerStopped, "the scheduler has stopped")
+    }
+}
+
+fn no_terminal() -> Response {
+    Response::error(
+        ErrorCode::PolicyDenied,
+        "this session does not accept terminal input",
+    )
+}
+
 async fn reconcile(server: &ControlServer, dry_run: bool) -> Response {
     acknowledge_reconcile(server.control.reconcile_config(dry_run).await)
 }
@@ -728,6 +803,20 @@ async fn environment(server: &ControlServer, service: Option<&micromux::ServiceI
         server.control.environment(service).await,
         Response::Environment,
     )
+}
+
+/// Exact ids take precedence over display names, as [`Request::GetService`] documents.
+fn get_service(reader: &SessionModelReader, service: &str) -> Response {
+    let snapshots = reader.services();
+    snapshots
+        .iter()
+        .find(|snapshot| snapshot.id == service)
+        .or_else(|| snapshots.iter().find(|snapshot| snapshot.name == service))
+        .cloned()
+        .map_or_else(
+            || unknown_service(service),
+            |snapshot| Response::Service(Box::new(snapshot)),
+        )
 }
 
 fn get_events(
@@ -1312,9 +1401,9 @@ mod tests {
         InboundFrameRate, MAX_LOG_TAIL, MAX_UNSOLICITED_SUBSCRIPTION_FRAMES_PER_WINDOW,
         RESPONSE_MAX_BYTES, SubscriptionPolicy, bind_project, bound_follow_response_lines,
         bound_follow_response_lines_page, bound_health_attempt, bound_health_history,
-        bound_tail_response_lines, claim_project_at, describe, encoded_len, lag_replay_changes,
-        log_read_error, logs_fit, open_endpoint_lock, prune_dead_socket, response_within_frame,
-        stream_changes,
+        bound_tail_response_lines, claim_project_at, describe, dispatch, encoded_len,
+        lag_replay_changes, log_read_error, logs_fit, open_endpoint_lock, prune_dead_socket,
+        response_within_frame, stream_changes,
     };
 
     fn line(seq: u64, len: usize) -> LogLine {
@@ -1696,6 +1785,124 @@ mod tests {
 
         // Every socket was unlinked by its own guard, so the pruner never found one to remove.
         assert_eq!(removed.load(Ordering::Relaxed), 0);
+        Ok(())
+    }
+
+    /// A session with one `svc` service whose scheduler never runs.
+    struct UnscheduledSession {
+        server: ControlServer,
+        terminal: micromux::TerminalControl,
+        /// The unpolled scheduler, which keeps its command and input queues open until dropped.
+        runner: std::pin::Pin<Box<dyn Future<Output = Result<(), micromux::Error>>>>,
+    }
+
+    fn unscheduled_session(directory: &std::path::Path) -> eyre::Result<UnscheduledSession> {
+        use std::sync::Arc;
+
+        let yaml = "version: 1\nservices:\n  svc:\n    command: [\"true\"]\n";
+        let config_path = directory.join("micromux.yaml");
+        std::fs::write(&config_path, yaml)?;
+        let config_path = CanonicalConfigPath::new(config_path)?;
+        let mut diagnostics = Vec::new();
+        let config = micromux::from_str(yaml, directory, 0usize, None, &mut diagnostics)?;
+        let mux = Arc::new(micromux::Micromux::new(&config)?);
+        let (runner, handles) = mux.start(micromux::CancellationToken::new());
+        let control = handles.service_control();
+        let server = ControlServer::new(
+            handles.reader,
+            control,
+            SessionIdentity::new("test".to_string(), directory, &config_path),
+            handles.dynamic_services,
+        );
+        Ok(UnscheduledSession {
+            server,
+            terminal: handles.terminal,
+            runner: Box::pin(runner),
+        })
+    }
+
+    /// Without a terminal capability the server refuses input and resizes as a policy decision,
+    /// so a client can tell the refusal from an unknown request.
+    #[tokio::test]
+    async fn terminal_requests_need_a_terminal_capability() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let UnscheduledSession { server, .. } = unscheduled_session(directory.path())?;
+
+        for request in [
+            Request::SendInput {
+                service: "svc".to_string(),
+                data: crate::InputBytes::from(b"x".to_vec()),
+                paste: false,
+            },
+            Request::ResizeTerminal { cols: 80, rows: 24 },
+        ] {
+            assert_matches!(
+                dispatch(&server, request).await,
+                Response::Error {
+                    code: ErrorCode::PolicyDenied,
+                    ..
+                }
+            );
+        }
+        Ok(())
+    }
+
+    /// Terminal requests are validated before they reach the scheduler: the target must be a
+    /// known service id with a running process, and a PTY needs a non-empty size.
+    #[tokio::test]
+    async fn terminal_requests_are_validated_before_queueing() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let UnscheduledSession {
+            server,
+            terminal,
+            runner,
+        } = unscheduled_session(directory.path())?;
+        let server = server.with_terminal(terminal);
+
+        let send = |service: &str| Request::SendInput {
+            service: service.to_string(),
+            data: crate::InputBytes::from(b"x".to_vec()),
+            paste: false,
+        };
+        assert_matches!(
+            dispatch(&server, send("missing")).await,
+            Response::Error {
+                code: ErrorCode::UnknownService,
+                ..
+            }
+        );
+        // The scheduler never ran, so `svc` has no process to type into, and the client hears so
+        // instead of its input vanishing.
+        assert_matches!(
+            dispatch(&server, send("svc")).await,
+            Response::Error {
+                code: ErrorCode::InvalidState,
+                message,
+            } if message == "terminal input discarded: svc is not running"
+        );
+        for (cols, rows) in [(0, 24), (80, 0)] {
+            assert_matches!(
+                dispatch(&server, Request::ResizeTerminal { cols, rows }).await,
+                Response::Error {
+                    code: ErrorCode::BadRequest,
+                    ..
+                }
+            );
+        }
+        assert_matches!(
+            dispatch(&server, Request::ResizeTerminal { cols: 80, rows: 24 }).await,
+            Response::TerminalQueued
+        );
+
+        // Once the scheduler is gone, nothing can deliver a resize.
+        drop(runner);
+        assert_matches!(
+            dispatch(&server, Request::ResizeTerminal { cols: 80, rows: 24 }).await,
+            Response::Error {
+                code: ErrorCode::SchedulerStopped,
+                ..
+            }
+        );
         Ok(())
     }
 
