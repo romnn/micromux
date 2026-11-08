@@ -37,9 +37,15 @@ impl ProcessExitWatch {
         let already_exited =
             matches!(&opened, Some(Err(error)) if *error == rustix::io::Errno::SRCH);
         #[cfg(target_os = "linux")]
-        let pidfd = opened
-            .and_then(Result::ok)
-            .and_then(|fd| tokio::io::unix::AsyncFd::new(fd).ok());
+        let pidfd = opened.and_then(Result::ok).and_then(|fd| {
+            #[expect(
+                unsafe_code,
+                reason = "an `OwnedFd` stays open and returns the same descriptor from \
+                          `as_raw_fd` until the `AsyncFd` that owns it is dropped"
+            )]
+            let registered = unsafe { tokio::io::unix::AsyncFd::register(fd) };
+            registered.ok()
+        });
         Self {
             pid,
             #[cfg(target_os = "linux")]

@@ -35,7 +35,7 @@ use rmcp::{
     },
     model::{
         CacheScope, Implementation, ListToolsResult, PaginatedRequestParams, ProtocolVersion,
-        ServerCapabilities, ServerInfo,
+        ServerCapabilities, ServerConfig,
     },
     service::{MaybeSendFuture, RequestContext},
     tool, tool_handler, tool_router,
@@ -3213,8 +3213,8 @@ impl ServerHandler for McpServer {
         std::future::ready(Ok(result))
     }
 
-    fn get_info(&self) -> ServerInfo {
-        let mut info = ServerInfo::new(ServerCapabilities::builder().enable_tools().build());
+    fn get_info(&self) -> ServerConfig {
+        let mut info = ServerConfig::new(ServerCapabilities::builder().enable_tools().build());
         info.server_info = Implementation::from_build_env();
         info.server_info.name = "micromux".to_string();
         info.server_info.version = env!("CARGO_PKG_VERSION").to_string();

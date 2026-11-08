@@ -10,6 +10,7 @@
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use std::fmt::Write as _;
 use std::io::{Read as _, Write};
+use std::num::NonZeroU16;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant};
@@ -67,20 +68,25 @@ struct Scenario {
     /// Output basename (writes `docs/<name>.png`).
     name: &'static str,
     /// Terminal width in columns.
-    cols: u16,
+    cols: NonZeroU16,
     /// Terminal height in rows.
-    rows: u16,
+    rows: NonZeroU16,
     /// Keystrokes to send (each chunk is settled before the next), e.g. `b"H"` to open the
     /// healthcheck pane. Empty captures the default frame the config settles into.
     keys: &'static [&'static [u8]],
 }
 
+/// Terminal width every scenario captures at.
+const COLS: NonZeroU16 = NonZeroU16::new(200).unwrap();
+/// Terminal height every scenario captures at.
+const ROWS: NonZeroU16 = NonZeroU16::new(44).unwrap();
+
 const SCENARIOS: &[Scenario] = &[
     // The dashboard: the default frame the config settles into, `api` selected with its logs.
     Scenario {
         name: "overview",
-        cols: 200,
-        rows: 44,
+        cols: COLS,
+        rows: ROWS,
         keys: &[],
     },
     // Healthcheck diagnostics: navigate down to the unhealthy `payments` service (6 rows below the
@@ -88,24 +94,24 @@ const SCENARIOS: &[Scenario] = &[
     // long probe command line is readable instead of truncated.
     Scenario {
         name: "healthcheck",
-        cols: 200,
-        rows: 44,
+        cols: COLS,
+        rows: ROWS,
         keys: &[b"jjjjjj" as &[u8], b"H", b"w"],
     },
     // Service management: select `web` (one row below `api`) and disable it with `d`. Its sidebar
     // row turns gray (DISABLED) and the process is stopped, while its captured logs remain.
     Scenario {
         name: "disable",
-        cols: 200,
-        rows: 44,
+        cols: COLS,
+        rows: ROWS,
         keys: &[b"j" as &[u8], b"d"],
     },
     // Structured logs: select `worker` (two rows below `api`), whose JSON records lead with their
     // timestamps while the fields its config hides stay out of the pane.
     Scenario {
         name: "structured-logs",
-        cols: 200,
-        rows: 44,
+        cols: COLS,
+        rows: ROWS,
         keys: &[b"jj" as &[u8]],
     },
     // Mouse selection: a drag over four of `api`'s request lines, sent as SGR mouse reports with
@@ -113,8 +119,8 @@ const SCENARIOS: &[Scenario] = &[
     // The logs' text starts in column 42, and the 12:00:02 POST line is drawn on row 12.
     Scenario {
         name: "mouse-selection",
-        cols: 200,
-        rows: 44,
+        cols: COLS,
+        rows: ROWS,
         keys: &[
             b"\x1b[<0;42;12M" as &[u8],
             b"\x1b[<32;81;15M",
@@ -125,8 +131,8 @@ const SCENARIOS: &[Scenario] = &[
     // Service details: `i` opens the popup that describes the selected `api` service in full.
     Scenario {
         name: "service-details",
-        cols: 200,
-        rows: 44,
+        cols: COLS,
+        rows: ROWS,
         keys: &[b"i" as &[u8]],
     },
 ];
@@ -245,8 +251,8 @@ fn capture(
     let pty = native_pty_system();
     let pair = pty
         .openpty(PtySize {
-            rows: scenario.rows,
-            cols: scenario.cols,
+            rows: scenario.rows.get(),
+            cols: scenario.cols.get(),
             pixel_width: 0,
             pixel_height: 0,
         })
@@ -325,7 +331,7 @@ fn capture(
         settle(&rx, &mut parser);
     }
 
-    let ansi = screen_to_ansi(parser.screen(), scenario.rows, scenario.cols);
+    let ansi = screen_to_ansi(parser.screen(), scenario.rows.get(), scenario.cols.get());
 
     // Quit micromux gracefully (`q`) so its scheduler tears down the demo service process groups
     // instead of leaving the long-lived `sleep` children orphaned.

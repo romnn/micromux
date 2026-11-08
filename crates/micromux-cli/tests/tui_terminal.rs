@@ -3,6 +3,7 @@
 #![cfg(unix)]
 
 use std::io::{Read as _, Write as _};
+use std::num::NonZeroU16;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
@@ -13,6 +14,11 @@ use similar_asserts::assert_eq;
 use vt100::MouseProtocolMode;
 
 const MICROMUX: &str = env!("CARGO_BIN_EXE_micromux");
+
+/// The terminal's height in rows.
+const ROWS: NonZeroU16 = NonZeroU16::new(30).unwrap();
+/// The terminal's width in columns.
+const COLS: NonZeroU16 = NonZeroU16::new(120).unwrap();
 
 /// How long the TUI may take to reach a state the test waits for.
 const WAIT: Duration = Duration::from_secs(30);
@@ -58,8 +64,8 @@ impl Terminal {
     fn spawn(command: CommandBuilder) -> eyre::Result<Self> {
         let pair = native_pty_system()
             .openpty(PtySize {
-                rows: 30,
-                cols: 120,
+                rows: ROWS.get(),
+                cols: COLS.get(),
                 pixel_width: 0,
                 pixel_height: 0,
             })
@@ -100,7 +106,7 @@ impl Terminal {
             child,
             writer,
             output,
-            parser: vt100::Parser::new(30, 120, 0),
+            parser: vt100::Parser::new(ROWS, COLS, 0),
             written: Vec::new(),
             answered: 0,
             keyboard_protocol: false,
@@ -352,7 +358,7 @@ impl Project {
 /// The zero-based column and row where `needle` is drawn on `screen`.
 fn find(screen: &vt100::Screen, needle: &str) -> eyre::Result<(u16, u16)> {
     let (_, columns) = screen.size();
-    for (row, text) in screen.rows(0, columns).enumerate() {
+    for (row, text) in screen.rows(0, columns.get()).enumerate() {
         if let Some(byte) = text.find(needle) {
             let column = text.get(..byte).unwrap_or_default().chars().count();
             return Ok((u16::try_from(column)?, u16::try_from(row)?));
