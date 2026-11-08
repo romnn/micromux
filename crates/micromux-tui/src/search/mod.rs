@@ -16,11 +16,22 @@
 
 use std::ops::Range;
 
+use ratatui::buffer::Buffer;
+use ratatui::layout::Rect;
+use ratatui::style::{Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Paragraph, Widget as _, Wrap};
+use unicode_segmentation::UnicodeSegmentation as _;
+
 use crate::App;
 use crate::state::{RecordLine, Service};
 
 #[cfg(test)]
 mod tests;
+
+/// Longest query the prompt takes, which keeps matching and drawing the prompt cheap whatever
+/// is pasted into it.
+const MAX_QUERY_CHARS: usize = 256;
 
 /// What a search looks for.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,8 +66,20 @@ impl Query {
         &self.text
     }
 
-    /// The byte ranges of `haystack` the query matches, from left to right and none overlapping.
+    /// The byte ranges of `haystack` the query matches, from left to right and none overlapping,
+    /// each widened to whole graphemes.
     pub(crate) fn find_in(&self, haystack: &str) -> Vec<Range<usize>> {
+        let found = self.find_chars_in(haystack);
+        // Every ASCII character but the CR of a CRLF, which a log line never ends in, is a
+        // grapheme of its own.
+        if found.is_empty() || haystack.is_ascii() {
+            return found;
+        }
+        snap_to_graphemes(haystack, found)
+    }
+
+    /// The byte ranges of `haystack` whose characters match the query.
+    fn find_chars_in(&self, haystack: &str) -> Vec<Range<usize>> {
         if self.case_sensitive {
             return haystack
                 .match_indices(self.text.as_str())
@@ -91,6 +114,37 @@ impl Query {
         }
         Some(end)
     }
+}
+
+/// Widens each of `found`, ordered and apart, to the graphemes it touches, and merges those that
+/// then overlap.
+///
+/// A highlight that split a grapheme, such as an `e` and its combining accent, would draw the
+/// two halves apart and change how the line wraps.
+fn snap_to_graphemes(haystack: &str, found: Vec<Range<usize>>) -> Vec<Range<usize>> {
+    let boundaries = haystack
+        .grapheme_indices(true)
+        .map(|(start, _)| start)
+        .chain(std::iter::once(haystack.len()))
+        .collect::<Vec<_>>();
+    let mut snapped: Vec<Range<usize>> = Vec::with_capacity(found.len());
+    for range in found {
+        let start = boundaries
+            .partition_point(|boundary| *boundary <= range.start)
+            .checked_sub(1)
+            .and_then(|index| boundaries.get(index))
+            .copied()
+            .unwrap_or(range.start);
+        let end = boundaries
+            .get(boundaries.partition_point(|boundary| *boundary < range.end))
+            .copied()
+            .unwrap_or(range.end);
+        match snapped.last_mut() {
+            Some(last) if start < last.end => last.end = last.end.max(end),
+            _ => snapped.push(start..end),
+        }
+    }
+    snapped
 }
 
 /// `ch` in lowercase where that is a single character, so a match covers as many characters as
@@ -133,6 +187,53 @@ pub(crate) fn find_matches(text: &ratatui::text::Text<'_>, query: &Query) -> Vec
         );
     }
     matches
+}
+
+/// The rendered row `found` starts on in `service`'s text, under the wrapping the text was
+/// last indexed for.
+fn match_row(service: &Service, found: &Match) -> Option<usize> {
+    let first_row = service.cached_line_index.line_start(found.line)?;
+    let Some((true, width)) = service.cached_wrap else {
+        return Some(first_row);
+    };
+    let line = service.cached_text.lines.get(found.line)?;
+    Some(first_row + row_in_wrapped_line(line, &found.bytes, width))
+}
+
+/// The row that byte `bytes.start` of `line` is drawn on when the line wraps at `width` columns
+/// as the log pane wraps it.
+///
+/// Wrapping depends on the text alone, so the line is drawn off screen with only the match
+/// styled, and the first styled cell gives the row.
+fn row_in_wrapped_line(line: &Line<'_>, bytes: &Range<usize>, width: u16) -> usize {
+    let content = line
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect::<String>();
+    let (Some(before), Some(matched), Some(after)) = (
+        content.get(..bytes.start),
+        content.get(bytes.clone()),
+        content.get(bytes.end..),
+    ) else {
+        return 0;
+    };
+    let marked = Line::from(vec![
+        Span::raw(before),
+        Span::styled(matched, Style::new().add_modifier(Modifier::REVERSED)),
+        Span::raw(after),
+    ]);
+    let paragraph = Paragraph::new(marked).wrap(Wrap { trim: false });
+    let height = u16::try_from(paragraph.line_count(width)).unwrap_or(u16::MAX);
+    let area = Rect::new(0, 0, width, height);
+    let mut buf = Buffer::empty(area);
+    paragraph.render(area, &mut buf);
+    area.positions()
+        .find(|position| {
+            buf.cell(*position)
+                .is_some_and(|cell| cell.modifier.contains(Modifier::REVERSED))
+        })
+        .map_or(0, |position| usize::from(position.y))
 }
 
 /// Which way a search moves through the log.
@@ -270,7 +371,8 @@ impl LogSearch {
         active.found_in = Some(found_in);
     }
 
-    /// Moves to the next match in `direction` and returns its line, or `None` without matches.
+    /// Moves to the next match in `direction` and returns the rendered row it starts on, or
+    /// `None` without matches.
     ///
     /// Without a current match, `Older` moves to the newest match at or above the bottom of
     /// `view` and `Newer` to the oldest at or below its top; past either end it wraps around.
@@ -284,7 +386,7 @@ impl LogSearch {
         let active = self.active.as_mut()?;
         let count = active.matches.len();
         let last = count.checked_sub(1)?;
-        let row_of = |found: &Match| service.cached_line_index.line_start(found.line);
+        let row_of = |found: &Match| match_row(service, found);
         let wrap_newer = |index: usize| if index < count { index } else { 0 };
         let index = match (active.current, direction) {
             (Some(current), Direction::Older) => current.index.checked_sub(1).unwrap_or(last),
@@ -305,7 +407,7 @@ impl LogSearch {
             index,
             anchor: MatchAnchor::of(found, service),
         });
-        Some(found.line)
+        match_row(service, found)
     }
 
     /// What the log pane's border says, while a query is confirmed.
@@ -345,7 +447,11 @@ impl App {
             return;
         };
         match code {
-            KeyCode::Char(ch) => prompt.push(ch),
+            KeyCode::Char(ch) => {
+                if prompt.chars().count() < MAX_QUERY_CHARS {
+                    prompt.push(ch);
+                }
+            }
             KeyCode::Backspace => {
                 if prompt.pop().is_none() {
                     self.search.prompt = None;
@@ -367,7 +473,8 @@ impl App {
     pub(crate) fn paste_into_search_prompt(&mut self, text: &str) {
         if let Some(prompt) = &mut self.search.prompt {
             let first_line = text.lines().next().unwrap_or_default();
-            prompt.extend(first_line.chars().filter(|ch| !ch.is_control()));
+            let room = MAX_QUERY_CHARS.saturating_sub(prompt.chars().count());
+            prompt.extend(first_line.chars().filter(|ch| !ch.is_control()).take(room));
         }
     }
 
@@ -392,13 +499,9 @@ impl App {
             top: offset,
             bottom: offset + viewport - 1,
         };
-        let Some(line) = self.search.step(direction, service, view) else {
+        let Some(row) = self.search.step(direction, service, view) else {
             return;
         };
-        let row = service
-            .cached_line_index
-            .line_start(line)
-            .unwrap_or_default();
         // A match on screen leaves the view where it is; one off screen comes to its middle.
         self.log_view.scroll_offset = if (view.top..=view.bottom).contains(&row) {
             offset

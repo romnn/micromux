@@ -2284,11 +2284,19 @@ impl App {
     }
 
     /// Draws the selected service's logs and returns where the URLs in its title landed.
-    fn render_logs(&mut self, area: Rect, buf: &mut Buffer) -> Vec<crate::mouse::LinkHit> {
-        let session = self.source.session_summary();
-        let Some(service) = self.state.current_service_mut() else {
-            return Vec::new();
+    /// Reads the selected service's new log records and renders its text for a pane `area`
+    /// wide, and returns the format it is rendered with.
+    ///
+    /// A view off the tail stays on the rows it shows while new lines arrive and the oldest are
+    /// dropped, which would otherwise shift the text up under it.
+    fn update_log_text(&mut self, area: Rect) -> Option<crate::json_log::LineFormat> {
+        let service = self.state.current_service_mut()?;
+        let top = if self.log_view.follow_tail {
+            None
+        } else {
+            service.row_anchor(self.log_view.scroll_offset)
         };
+        let generation = service.text_generation;
         let format = service.line_format(self.pretty_json_logs);
         service.use_format(&format);
         if service.logs_dirty {
@@ -2297,12 +2305,20 @@ impl App {
                 .logs_since(&service.snapshot.id, service.log_read_cursor());
             service.apply_log_records(first_retained, &records, &format);
         }
-
-        let wrap = self.log_view.wrap;
-        let wrap_width = area.width.saturating_sub(3);
-        if let Some(service) = self.state.current_service_mut() {
-            service.render_text(wrap, wrap_width);
+        service.render_text(self.log_view.wrap, area.width.saturating_sub(3));
+        if let Some(top) = top
+            && service.text_generation != generation
+        {
+            self.log_view.scroll_offset = service.anchored_row(top);
         }
+        Some(format)
+    }
+
+    fn render_logs(&mut self, area: Rect, buf: &mut Buffer) -> Vec<crate::mouse::LinkHit> {
+        let session = self.source.session_summary();
+        let Some(format) = self.update_log_text(area) else {
+            return Vec::new();
+        };
 
         let Some(current_service) = self.state.current_service() else {
             return Vec::new();
@@ -2679,20 +2695,25 @@ impl App {
             ..area
         };
         let width = usize::from(row.width);
-        let cursor = Span::styled(" ", Style::new().add_modifier(Modifier::REVERSED));
-        let mut shown = prompt;
-        let line = loop {
-            let line = Line::from(vec![
-                " /".fg(Color::Yellow).bold(),
-                Span::raw(shown),
-                cursor.clone(),
-            ]);
-            let mut rest = shown.chars();
-            if line.width() <= width || rest.next().is_none() {
-                break line;
+        // The query's end that fits beside the " /" before it and the cursor after it.
+        let room = width.saturating_sub(3);
+        let mut used = 0;
+        let mut shown_from = prompt.len();
+        for (start, ch) in prompt.char_indices().rev() {
+            let ch_width = prompt
+                .get(start..start + ch.len_utf8())
+                .map_or(0, |text| Span::raw(text).width());
+            if used + ch_width > room {
+                break;
             }
-            shown = rest.as_str();
-        };
+            used += ch_width;
+            shown_from = start;
+        }
+        let line = Line::from(vec![
+            " /".fg(Color::Yellow).bold(),
+            Span::raw(prompt.get(shown_from..).unwrap_or_default()),
+            Span::styled(" ", Style::new().add_modifier(Modifier::REVERSED)),
+        ]);
         let hint = " ↵ search · Esc cancel ".fg(Color::DarkGray);
         let gap = width.saturating_sub(line.width() + hint.width());
         let mut spans = line.spans;

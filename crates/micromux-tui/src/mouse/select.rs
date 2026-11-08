@@ -323,20 +323,10 @@ impl App {
         else {
             return Ok(index_key);
         };
-        let start_of = |record: usize| {
-            service
-                .record_starts
-                .get(record)
-                .copied()
-                .unwrap_or(service.cached_text.lines.len())
-        };
-        match service
-            .cached_lines
-            .binary_search_by_key(&key.record, |(seq, _)| *seq)
-        {
-            Ok(record) => Ok(start_of(record) + key.line),
-            Err(record) => Err(start_of(record)),
-        }
+        service.find_record_line(RecordLine {
+            seq: key.record,
+            line: key.line,
+        })
     }
 
     /// The anchor for `pos` in `pane`'s text.
@@ -699,8 +689,10 @@ impl App {
                 if covered.is_some_and(|popup| popup.contains(position)) {
                     continue;
                 }
+                // Reverse video flips, so a selection over text already reversed, such as a
+                // search match, still shows.
                 if let Some(cell) = buf.cell_mut(position) {
-                    cell.modifier.insert(Modifier::REVERSED);
+                    cell.modifier.toggle(Modifier::REVERSED);
                 }
             }
         }

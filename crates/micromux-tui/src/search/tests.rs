@@ -43,6 +43,18 @@ fn found<'a>(query: &str, haystack: &'a str) -> eyre::Result<Vec<&'a str>> {
 
 /// An app over `yaml`'s services that has drawn one frame.
 fn app(yaml: &str) -> eyre::Result<App> {
+    let (app, _) = app_and_runner(yaml)?;
+    Ok(app)
+}
+
+/// An app over `yaml`'s services that has drawn one frame, and the session's runner, which
+/// keeps the scheduler's input queue open while it is held, though it never runs.
+fn app_and_runner(
+    yaml: &str,
+) -> eyre::Result<(
+    App,
+    impl std::future::Future<Output = Result<(), micromux::Error>>,
+)> {
     let mut diagnostics = Vec::new();
     let parsed = micromux::from_str(yaml, Path::new("."), 0usize, None, &mut diagnostics)?;
     // The run-log spool goes to a directory of the test's own, never the user's cache.
@@ -50,7 +62,7 @@ fn app(yaml: &str) -> eyre::Result<App> {
     let cache = tempfile::tempdir()?;
     let mux =
         std::sync::Arc::new(micromux::Micromux::new(&parsed)?.with_cache_directory(cache.path()));
-    let (_runner, handles) = mux.start(micromux::CancellationToken::new());
+    let (runner, handles) = mux.start(micromux::CancellationToken::new());
     let mut app = App::new(
         SessionSource::Local(LocalSource::new(handles.reader, handles.commands.clone())),
         Some(handles.terminal),
@@ -60,7 +72,7 @@ fn app(yaml: &str) -> eyre::Result<App> {
     app.terminal_cols = WIDTH;
     app.terminal_rows = HEIGHT;
     draw(&mut app);
-    Ok(app)
+    Ok((app, runner))
 }
 
 /// Gives the selected service the records `(seq, line)` as its log, as if it had printed them,
@@ -84,7 +96,12 @@ fn set_records(
 /// A log of `lines` numbered records, with sequence numbers from 1, whose lines at `needles`
 /// mention a needle.
 fn log_with_needles(lines: u64, needles: &[u64]) -> Vec<(u64, String)> {
-    (0..lines)
+    log_range(0..lines, needles)
+}
+
+/// The records of [`log_with_needles`] numbered `indices`, as a log that dropped the ones before.
+fn log_range(indices: std::ops::Range<u64>, needles: &[u64]) -> Vec<(u64, String)> {
+    indices
         .map(|index| {
             let line = if needles.contains(&index) {
                 format!("needle at {index:03}")
@@ -219,6 +236,17 @@ fn matches_cover_whole_characters_and_never_overlap() -> eyre::Result<()> {
     // A character that lowercases to several characters matches only itself.
     assert_eq!(found("i̇", "İ")?, Vec::<&str>::new());
     assert_eq!(found("ab", "İab")?, vec!["ab"]);
+    Ok(())
+}
+
+#[test]
+fn matches_widen_to_whole_graphemes() -> eyre::Result<()> {
+    // A decomposed accent and an emoji presentation selector stay with their base character.
+    assert_eq!(found("e", "cafe\u{301} e")?, vec!["e\u{301}", "e"]);
+    assert_eq!(found("❤", "❤\u{fe0f} ok")?, vec!["❤\u{fe0f}"]);
+
+    // A combining mark alone highlights the whole grapheme it belongs to.
+    assert_eq!(found("\u{301}", "e\u{301}")?, vec!["e\u{301}"]);
     Ok(())
 }
 
@@ -382,6 +410,14 @@ async fn escape_clears_the_selection_before_the_search() -> eyre::Result<()> {
     mouse(&mut app, MouseEventKind::Up(MouseButton::Left), to);
     assert!(app.has_selection());
 
+    // The selection flips reverse video, so it shows over the matches it covers too.
+    let frame = draw(&mut app);
+    let (_, modifier) = style_at(&frame, "line 000")?;
+    assert!(modifier.contains(Modifier::REVERSED));
+    let (fg, modifier) = style_at(&frame, "needle at 001")?;
+    assert_eq!(fg, Color::Yellow);
+    assert!(!modifier.contains(Modifier::REVERSED));
+
     press(&mut app, KeyCode::Esc);
     assert!(!app.has_selection());
     assert!(app.search.is_active());
@@ -464,36 +500,180 @@ async fn switching_services_searches_the_new_log_for_the_same_query() -> eyre::R
 /// In PTY input mode `/`, `n` and `N` reach the service instead of searching.
 #[tokio::test]
 async fn pty_input_mode_types_search_keys_into_the_service() -> eyre::Result<()> {
-    let mut app = app(SERVICES)?;
+    let (mut app, _runner) = app_and_runner(SERVICES)?;
     set_records(&mut app, log_with_needles(5, &[1, 3]))?;
     search(&mut app, "needle");
     let offset = app.log_view.scroll_offset;
 
+    // With the scheduler's queue full, typed input waits in the TUI, where it can be read.
+    let terminal = app
+        .input
+        .clone()
+        .ok_or_else(|| eyre::eyre!("the app has no PTY input"))?;
+    while terminal
+        .try_send(terminal.prepare_input("api".to_string(), vec![b'x'])?)
+        .is_ok()
+    {}
+
     app.pty_input_mode = true;
     press(&mut app, KeyCode::Char('/'));
-    assert_eq!(app.search.prompt, None);
     press(&mut app, KeyCode::Char('n'));
+    press(&mut app, KeyCode::Char('N'));
+
+    // The keys went to the selected service as typed, and the search did not move.
+    let typed = app
+        .pending_pty_input
+        .iter()
+        .inspect(|input| assert_eq!(input.service_id(), "api"))
+        .flat_map(|input| input.data().to_vec())
+        .collect::<Vec<u8>>();
+    assert_eq!(typed, b"/nN".to_vec());
+    assert_eq!(app.search.prompt, None);
     assert_eq!(app.log_view.scroll_offset, offset);
     assert!(screen(&draw(&mut app)).contains("/needle 2/2"));
     Ok(())
 }
 
-/// A click while the prompt is open closes it rather than typing a hint's key into the query,
-/// and a paste adds its first line to the query.
+/// A click while the prompt is open only closes it, so neither a hint the prompt covers nor
+/// one beside it acts or types its key into the query.
 #[tokio::test]
-async fn clicks_close_the_prompt_and_pastes_extend_the_query() -> eyre::Result<()> {
+async fn clicks_on_hints_only_close_the_prompt() -> eyre::Result<()> {
     let mut app = app(SERVICES)?;
     set_records(&mut app, log_with_needles(5, &[1, 3]))?;
-    let frame = draw(&mut app);
+    let before = draw(&mut app);
+    let mouse_hint = find(&before, "m Mouse")?;
+    let help_hint = find(&before, "? Help")?;
+    assert_eq!(
+        mouse_hint.y,
+        HEIGHT - 1,
+        "the mouse hint must be on the covered row"
+    );
+    assert_ne!(
+        help_hint.y,
+        HEIGHT - 1,
+        "the help hint must be on an uncovered row"
+    );
 
+    for hint in [mouse_hint, help_hint] {
+        press(&mut app, KeyCode::Char('/'));
+        type_text(&mut app, "ne");
+        draw(&mut app);
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), hint);
+        mouse(&mut app, MouseEventKind::Up(MouseButton::Left), hint);
+
+        // The prompt closed without searching, and the hint's key did nothing.
+        assert_eq!(app.search.prompt, None);
+        assert!(!app.search.is_active());
+        assert!(app.mouse.capture);
+        assert_eq!(app.effects, Vec::new());
+        assert!(!app.show_help);
+    }
+    Ok(())
+}
+
+/// A paste adds its first line to the query, and the query stops growing at its limit while
+/// the prompt shows its end.
+#[tokio::test]
+async fn pastes_extend_the_query_up_to_its_limit() -> eyre::Result<()> {
+    let mut app = app(SERVICES)?;
     press(&mut app, KeyCode::Char('/'));
     app.handle_crossterm_event(&crossterm::event::Event::Paste("nee\ndle".to_string()));
     assert_eq!(app.search.prompt.as_deref(), Some("nee"));
 
-    let restart = find(&frame, "Restart all")?;
-    mouse(&mut app, MouseEventKind::Down(MouseButton::Left), restart);
-    mouse(&mut app, MouseEventKind::Up(MouseButton::Left), restart);
-    assert_eq!(app.search.prompt, None);
-    assert!(!app.search.is_active());
+    let long = format!("{}end", "x".repeat(1_000));
+    app.handle_crossterm_event(&crossterm::event::Event::Paste(long));
+    type_text(&mut app, "y");
+    let prompt = app.search.prompt.clone().unwrap_or_default();
+    assert_eq!(prompt.chars().count(), super::MAX_QUERY_CHARS);
+    assert!(prompt.starts_with("neexxx"));
+
+    // The row shows the query's end, right up to the cursor.
+    let last_row = row_text(&draw(&mut app), HEIGHT - 1);
+    assert!(last_row.starts_with(" /xxx"), "{last_row:?}");
+    assert_eq!(last_row.chars().count(), usize::from(WIDTH));
+    Ok(())
+}
+
+/// Characters typed with `AltGr`, which Windows reports as Ctrl+Alt, and with Alt go into the
+/// query; Ctrl chords do not.
+#[tokio::test]
+async fn the_prompt_takes_altgr_characters_but_not_ctrl_chords() -> eyre::Result<()> {
+    let mut app = app(SERVICES)?;
+    press(&mut app, KeyCode::Char('/'));
+    let altgr = KeyModifiers::CONTROL | KeyModifiers::ALT;
+    for (ch, modifiers) in [
+        ('@', altgr),
+        ('{', altgr),
+        ('\\', altgr),
+        ('~', KeyModifiers::ALT),
+        ('x', KeyModifiers::CONTROL),
+        ('X', KeyModifiers::CONTROL | KeyModifiers::SHIFT),
+    ] {
+        app.handle_key_press(KeyEvent {
+            code: KeyCode::Char(ch),
+            modifiers,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        });
+    }
+    assert_eq!(app.search.prompt.as_deref(), Some("@{\\~"));
+    Ok(())
+}
+
+/// A match of a long wrapped line is scrolled into view by the row it is on, not by the row its
+/// line starts on.
+#[tokio::test]
+async fn a_match_deep_in_a_wrapped_line_is_scrolled_into_view() -> eyre::Result<()> {
+    let mut app = app(SERVICES)?;
+    press(&mut app, KeyCode::Char('w'));
+    let mut records = vec![(1, format!("{}needle here", "filler ".repeat(500)))];
+    records.extend((2..40).map(|seq| (seq, format!("line {seq:03}"))));
+    set_records(&mut app, records)?;
+    let viewport = app.log_viewport_height();
+    let line_rows = app
+        .state
+        .current_service()
+        .map(|service| service.cached_line_index.total_lines())
+        .unwrap_or_default()
+        - 38;
+    assert!(
+        line_rows > usize::from(viewport),
+        "the line must wrap onto more rows than the pane shows"
+    );
+
+    search(&mut app, "needle");
+    let frame = draw(&mut app);
+    assert!(screen(&frame).contains("/needle 1/1"));
+    assert!(is_current(&frame, "needle here")?);
+    Ok(())
+}
+
+/// On a busy service the view stays on the current match while new lines arrive and the oldest
+/// are dropped, wrapped or not.
+#[tokio::test]
+async fn the_view_stays_on_the_match_while_old_lines_are_dropped() -> eyre::Result<()> {
+    let mut app = app(SERVICES)?;
+    set_records(&mut app, log_range(0..200, &[150]))?;
+    search(&mut app, "needle");
+    let row = find(&draw(&mut app), "needle at 150")?.y;
+
+    // Each round twenty lines arrive and as many of the oldest are dropped.
+    let mut first = 0;
+    for _ in 0..5 {
+        first += 20;
+        set_records(&mut app, log_range(first..first + 200, &[150]))?;
+        let frame = draw(&mut app);
+        assert_eq!(find(&frame, "needle at 150")?.y, row);
+        assert!(is_current(&frame, "needle at 150")?);
+    }
+
+    // Wrapping keeps the top line in place, and so does dropping lines while wrapped.
+    press(&mut app, KeyCode::Char('w'));
+    let row = find(&draw(&mut app), "needle at 150")?.y;
+    for _ in 0..3 {
+        first += 10;
+        set_records(&mut app, log_range(first..first + 200, &[150]))?;
+        assert_eq!(find(&draw(&mut app), "needle at 150")?.y, row);
+    }
     Ok(())
 }

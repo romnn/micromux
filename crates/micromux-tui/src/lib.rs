@@ -840,11 +840,18 @@ impl App {
             self.effects.push(Effect::Suspend);
             return;
         }
-        if key.modifiers != KeyModifiers::NONE && key.modifiers != KeyModifiers::SHIFT {
+        // The prompt takes characters typed with Alt and AltGr as well, which Windows reports as
+        // Ctrl+Alt, so `@`, `{` or `\` can be typed on layouts that put them there; only Ctrl
+        // chords stay out of the query.
+        if self.search.prompt.is_some() {
+            let control_chord = key.modifiers.contains(KeyModifiers::CONTROL)
+                && !key.modifiers.contains(KeyModifiers::ALT);
+            if !control_chord {
+                self.handle_key_press_search_prompt(key.code);
+            }
             return;
         }
-        if self.search.prompt.is_some() {
-            self.handle_key_press_search_prompt(key.code);
+        if key.modifiers != KeyModifiers::NONE && key.modifiers != KeyModifiers::SHIFT {
             return;
         }
         if self.show_help || self.info.is_some() {
