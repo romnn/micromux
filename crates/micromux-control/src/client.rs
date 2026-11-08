@@ -466,10 +466,9 @@ fn runtime_dir_endpoints(runtime_dir: &Path) -> Vec<ControlEndpoint> {
     let mut endpoints = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.extension().and_then(|ext| ext.to_str()) != Some("sock") {
-            continue;
+        if crate::endpoint::session_socket_hash(&path).is_some() {
+            endpoints.push(ControlEndpoint::Unix(path));
         }
-        endpoints.push(ControlEndpoint::Unix(path));
     }
     endpoints.sort();
     endpoints
@@ -531,8 +530,12 @@ mod tests {
     #[test]
     fn runtime_dir_endpoints_are_sorted() -> eyre::Result<()> {
         let dir = tempfile::tempdir()?;
-        std::fs::write(dir.path().join("z.sock"), b"")?;
-        std::fs::write(dir.path().join("a.sock"), b"")?;
+        let first = format!("{:016x}.sock", 0xa);
+        let last = format!("{:016x}.sock", 0xf);
+        std::fs::write(dir.path().join(&last), b"")?;
+        std::fs::write(dir.path().join(&first), b"")?;
+        // Files not named after an endpoint hash, such as the proxy's socket, are never sessions.
+        std::fs::write(dir.path().join("proxy.sock"), b"")?;
         std::fs::write(dir.path().join("ignore.txt"), b"")?;
 
         let endpoints = runtime_dir_endpoints(dir.path());
@@ -540,8 +543,8 @@ mod tests {
         assert_eq!(
             endpoints,
             vec![
-                ControlEndpoint::Unix(dir.path().join("a.sock")),
-                ControlEndpoint::Unix(dir.path().join("z.sock")),
+                ControlEndpoint::Unix(dir.path().join(first)),
+                ControlEndpoint::Unix(dir.path().join(last)),
             ],
         );
         Ok(())

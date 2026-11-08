@@ -376,6 +376,16 @@ async fn resolve_hash(
     dir_statuses: &[RuntimeDirStatus],
     hash: &str,
 ) -> Result<ResolvedSession, SelectError> {
+    // Any other value names no session's socket, and may even point outside the runtime
+    // directories, so nothing is probed for it.
+    if !crate::endpoint::is_endpoint_hash(hash) {
+        return Err(SelectError::NoSession(Box::new(probe_report(
+            format!("no session with hash {hash}"),
+            None,
+            dir_statuses,
+            Vec::new(),
+        ))));
+    }
     let endpoints = runtime_dirs
         .iter()
         .map(|runtime_dir| endpoint_from_hash(runtime_dir, hash))
@@ -734,6 +744,38 @@ mod tests {
             SessionSelector::parse("hash:abc"),
             SessionSelector::ConfigHash("abc".to_string())
         );
+    }
+
+    /// A `hash:` selector that is not an endpoint hash names no session, so it is never turned
+    /// into a socket path, not even one of another live socket in the runtime directory.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_hash_selector_that_is_not_an_endpoint_hash_probes_nothing() -> eyre::Result<()> {
+        let runtime_dir = tempfile::tempdir()?;
+        let _proxy = std::os::unix::net::UnixListener::bind(runtime_dir.path().join("proxy.sock"))?;
+        let runtime_dirs = vec![runtime_dir.path().to_path_buf()];
+        let dir_statuses = vec![RuntimeDirStatus {
+            path: runtime_dir.path().to_path_buf(),
+            usable: true,
+            error: None,
+        }];
+
+        for hash in ["proxy", "../proxy", "3F98F83E6E2C8D23"] {
+            let result = resolve_selector_in_runtime_dirs(
+                &runtime_dirs,
+                &dir_statuses,
+                runtime_dir.path(),
+                Some(SessionSelector::ConfigHash(hash.to_string())),
+                None,
+            )
+            .await;
+
+            let Err(SelectError::NoSession(report)) = result else {
+                eyre::bail!("expected no session for hash {hash}");
+            };
+            assert_eq!(report.socket_probes.len(), 0, "{hash}");
+        }
+        Ok(())
     }
 
     #[tokio::test]
