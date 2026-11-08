@@ -166,7 +166,7 @@ fn ask_for_keyboard_on(out: &mut impl Write, keyboard: Keyboard) -> io::Result<(
     match keyboard {
         Keyboard::Kitty => {
             log_keyboard(&format!("pushed kitty keyboard flags {KEYBOARD_FLAGS:?}"));
-            execute!(out, PushKeyboardEnhancementFlags(KEYBOARD_FLAGS))
+            write_ansi(out, PushKeyboardEnhancementFlags(KEYBOARD_FLAGS))
         }
         Keyboard::ModifyOtherKeys => {
             if !asked {
@@ -177,6 +177,18 @@ fn ask_for_keyboard_on(out: &mut impl Write, keyboard: Keyboard) -> io::Result<(
         }
         Keyboard::Legacy => Ok(()),
     }
+}
+
+/// Writes `command`'s escape sequence to `out`.
+///
+/// crossterm would hand the kitty flags to the Windows console API, which has no such thing, on a
+/// console without escape sequences; micromux only pushes them where the terminal answered that
+/// it has the protocol, so the sequence is what it needs.
+fn write_ansi(out: &mut impl Write, command: impl crossterm::Command) -> io::Result<()> {
+    let mut ansi = String::new();
+    command.write_ansi(&mut ansi).map_err(io::Error::other)?;
+    out.write_all(ansi.as_bytes())?;
+    out.flush()
 }
 
 /// Which keyboard reporting to ask the terminal for, decided once: the kitty protocol where the
@@ -304,7 +316,9 @@ fn give_back_on(
         }
     };
     match KEYBOARD.swap(Keyboard::Legacy as u8, Ordering::SeqCst) {
-        kitty if kitty == Keyboard::Kitty as u8 => step(execute!(out, PopKeyboardEnhancementFlags)),
+        kitty if kitty == Keyboard::Kitty as u8 => {
+            step(write_ansi(out, PopKeyboardEnhancementFlags));
+        }
         other if other == Keyboard::ModifyOtherKeys as u8 => {
             step(
                 out.write_all(MODIFY_OTHER_KEYS_RESET)

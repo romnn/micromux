@@ -50,7 +50,7 @@ pub fn user_config_path() -> Option<PathBuf> {
 
 /// The user config's path under `xdg_config_home`, or under `home`'s `.config` when that is
 /// unset, empty or relative, as the XDG base directory specification says.
-#[cfg(any(not(windows), test))]
+#[cfg(not(windows))]
 fn xdg_user_config_path(
     xdg_config_home: Option<std::ffi::OsString>,
     home: Option<PathBuf>,
@@ -105,14 +105,18 @@ pub fn parse_user_config<F: Copy>(
 
 #[cfg(test)]
 mod tests {
-    use super::{UserConfig, parse_user_config, xdg_user_config_path};
+    use super::{UserConfig, parse_user_config};
     use color_eyre::eyre;
     use indoc::indoc;
     use similar_asserts::assert_eq;
     use std::path::PathBuf;
 
+    /// Windows has no XDG directories; its user config is in the roaming application data.
+    #[cfg(not(windows))]
     #[test]
     fn the_user_config_lives_under_the_xdg_config_home() {
+        use super::xdg_user_config_path;
+
         let home = Some(PathBuf::from("/home/me"));
 
         // `$XDG_CONFIG_HOME` decides when it is an absolute path.
@@ -131,6 +135,21 @@ mod tests {
 
         // Without a home directory there is nowhere to look.
         assert_eq!(xdg_user_config_path(None, None), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_user_config_lives_in_the_roaming_application_data() {
+        let Some(path) = super::user_config_path() else {
+            return;
+        };
+        let appdata = std::env::var_os("APPDATA").map(PathBuf::from);
+        assert!(
+            appdata.is_some_and(|appdata| path.starts_with(appdata)),
+            "{}",
+            path.display()
+        );
+        assert!(path.ends_with("config.yaml"), "{}", path.display());
     }
 
     #[test]
