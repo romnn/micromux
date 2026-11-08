@@ -31,7 +31,12 @@ const ATTRIBUTES_QUERY: &[u8] = b"\x1b[c";
 /// The OSC 52 copy of `hello` to the clipboard.
 const HELLO_COPIED: &[u8] = b"\x1b]52;c;aGVsbG8=";
 
-const CONFIG: &str = "version: 1\nservices:\n  app:\n    command: [\"sh\", \"-c\", \"echo hello world; sleep 30\"]\n";
+/// A service that prints `hello world` once, a moment after it starts.
+///
+/// The logs pane's border shows the command, so the command never spells the output out:
+/// otherwise the output would seem to be on screen, and be found on the border, before the
+/// service printed it, as on a slow machine. The pause makes every run that slow machine.
+const CONFIG: &str = "version: 1\nservices:\n  app:\n    command: [\"sh\", \"-c\", \"sleep 0.3; w=world; echo hello $$w; sleep 30\"]\n";
 
 /// A program running in a pseudo-terminal, with the screen it drew and everything it wrote.
 struct Terminal {

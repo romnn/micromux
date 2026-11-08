@@ -602,11 +602,9 @@ mod shim {
             if supervisor_gone || hung_up() {
                 // Claim the cleanup's lock before the teardown, so a restarted session waits for
                 // all of it, not just for the cleanup command.
-                let lock = args
-                    .cleanup
-                    .as_ref()
-                    .and_then(|cleanup| cleanup.lock.as_deref())
-                    .and_then(crate::cleanup::try_lock);
+                let lock = args.cleanup.as_ref().and_then(|cleanup| {
+                    crate::cleanup::try_lock(cleanup.lock.as_deref()?, args.grace + cleanup.timeout)
+                });
                 clean_up(
                     args.stop_signal,
                     args.grace,
@@ -647,12 +645,16 @@ mod shim {
                 return EXIT_CANNOT_RUN;
             }
         };
-        let lock = args.cleanup.lock.as_deref().and_then(lock_or_report);
+        let lock = lock_or_report(&args.cleanup);
         let mut go = [0u8; 1];
         while let Err(err) = std::io::stdin().read(&mut go) {
             if err.kind() != std::io::ErrorKind::Interrupted {
                 break;
             }
+        }
+        // The cleanup's timeout runs from now, which can be long after the lock was taken.
+        if let Some(lock) = &lock {
+            crate::cleanup::record_deadline(lock, args.cleanup.timeout);
         }
         let status = run_cleanup(&args.cleanup, args.stop_signal, &args.carriers, false, lock);
         drop(signals);
@@ -676,9 +678,11 @@ mod shim {
         }
     }
 
-    /// Takes the cleanup lock at `path`, waiting for its holder, or reports why it cannot.
-    fn lock_or_report(path: &std::path::Path) -> Option<File> {
-        crate::cleanup::lock(path)
+    /// Takes the lock of `cleanup`, if it has one, waiting for its holder, or reports why it
+    /// cannot.
+    fn lock_or_report(cleanup: &Cleanup) -> Option<File> {
+        let path = cleanup.lock.as_deref()?;
+        crate::cleanup::lock(path, cleanup.timeout)
             .inspect_err(|err| {
                 eprintln!(
                     "micromux shim: cannot lock {}: {err}; running the cleanup unlocked",
@@ -706,7 +710,7 @@ mod shim {
         fresh: bool,
         lock: Option<File>,
     ) -> i32 {
-        let lock = lock.or_else(|| cleanup.lock.as_deref().and_then(lock_or_report));
+        let lock = lock.or_else(|| lock_or_report(cleanup));
         let mut log = cleanup.log.as_deref().and_then(|path| {
             crate::cleanup::open_log(path, fresh)
                 .inspect_err(|err| {
