@@ -56,10 +56,11 @@ pub use tokio_util::sync::CancellationToken;
 pub use cleanup::{
     CleanupWaitCancelled, cleanup_directory_in, cleanup_state_directory, wait_for_previous_cleanups,
 };
+pub use config::user::{UserConfig, parse_user_config, user_config_path};
 pub use config::{
     ConfigError, ConfigFile, ControlConfig, DependencyCondition, DynamicServicesPolicy,
-    MAX_CONFIG_FILE_BYTES, config_file_names, find_config_file, from_str, read_config_file,
-    read_config_file_async,
+    MAX_CONFIG_FILE_BYTES, UiConfig, config_file_names, find_config_file, from_str,
+    parse_ui_section, read_config_file, read_config_file_async,
 };
 pub use diagnostics::{Printer, ToDiagnostics, render_to_string};
 pub use env::{Error as EnvironmentError, InterpolationError};

@@ -14,6 +14,7 @@ mod mcp;
 mod options;
 mod proxy;
 mod session_env;
+mod ui_settings;
 
 use clap::Parser;
 use codespan_reporting::diagnostic::Diagnostic;
@@ -122,6 +123,8 @@ fn spawn_second_interrupt_handler(shutdown: micromux::CancellationToken) {
     tokio::spawn(async move {
         shutdown.cancelled().await;
         if tokio::signal::ctrl_c().await.is_ok() {
+            // The TUI may not have given the terminal back yet, and exiting skips its teardown.
+            micromux_tui::release_terminal();
             eprintln!("exiting; service shims finish the remaining stops and cleanups");
             std::process::exit(EXIT_INTERRUPTED);
         }
@@ -436,9 +439,9 @@ async fn run_command(command: options::Command, options: options::Options) -> Re
     }
 }
 
-async fn run() -> Result<(), Error> {
-    let mut options = options::Options::parse();
-    // Every micromux of an isolated setup must agree on its directory, wherever it starts.
+/// Refuses a relative `MICROMUX_STATE_DIR`: every micromux of an isolated setup must agree on its
+/// directory, wherever it starts.
+fn check_state_dir() -> Result<(), Error> {
     if let Some(state) = std::env::var_os(micromux::STATE_DIR_VARIABLE)
         && !state.is_empty()
         && !std::path::Path::new(&state).is_absolute()
@@ -449,6 +452,12 @@ async fn run() -> Result<(), Error> {
             std::path::Path::new(&state).display()
         )));
     }
+    Ok(())
+}
+
+async fn run() -> Result<(), Error> {
+    let mut options = options::Options::parse();
+    check_state_dir()?;
     // `exec` replaces this process, and the command it runs keeps the caller's open-file limit.
     if !matches!(options.command, Some(options::Command::Exec { .. })) {
         raise_file_descriptor_limit();
@@ -467,6 +476,13 @@ async fn run() -> Result<(), Error> {
     let _log_guard = setup_logging(&options)?;
 
     let LoadedConfig { config, printer } = load_config(&options, color_choice).await?;
+    // Settle the TUI's settings before any service starts, so a broken user config stops nothing.
+    let mouse = ui_settings::mouse_options(
+        options.ui_setting_flags(),
+        Some(&config.config.ui_config),
+        &printer,
+    )
+    .await?;
 
     let Supervisor { mux, routes } = start_supervisor(&config, &printer, &shutdown).await?;
     let (runner, handles) = mux.clone().start(shutdown.clone());
@@ -522,8 +538,9 @@ async fn run() -> Result<(), Error> {
         micromux_tui::SessionSource::Local(source),
         Some(input),
         shutdown.clone(),
-        micromux_tui::LogViewOptions {
+        micromux_tui::ViewOptions {
             pretty_json: config.config.ui_config.pretty_json_logs && !options.no_pretty_json_logs,
+            mouse,
         },
     );
 

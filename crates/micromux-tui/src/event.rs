@@ -11,8 +11,15 @@ const INPUT_QUEUE_CAPACITY: usize = 1024;
 /// periodic tick — nothing in the view is time-animated, and live output arrives as model changes.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Hash)]
 pub enum Input {
-    /// Crossterm events emitted by the terminal.
+    /// Crossterm events emitted by the terminal, other than the mouse's.
     Event(CrosstermEvent),
+    /// A mouse event, and when it arrived, which tells the burst of events some terminals send
+    /// for one notch of the wheel from separate notches however long the TUI takes to handle
+    /// them.
+    Mouse {
+        event: MouseEvent,
+        at: std::time::Instant,
+    },
     /// The terminal input stream reached EOF.
     Closed,
 }
@@ -28,9 +35,12 @@ impl std::fmt::Display for Input {
             Self::Event(CrosstermEvent::Resize(cols, rows)) => {
                 write!(f, "Resize(cols={cols}, rows={rows})")
             }
-            Self::Event(CrosstermEvent::Mouse(MouseEvent {
-                column, row, kind, ..
-            })) => {
+            Self::Mouse {
+                event: MouseEvent {
+                    column, row, kind, ..
+                },
+                ..
+            } => {
                 write!(f, "Mouse({kind:?}, col={column}, row={row})")
             }
             other @ Self::Event(_) => std::fmt::Debug::fmt(other, f),
@@ -112,7 +122,14 @@ impl EventTask {
               () = self.sender.closed() => break,
               event = reader.next() => match event {
                 Some(Ok(event)) => {
-                    if !self.send(Input::Event(event)).await {
+                    let input = match event {
+                        CrosstermEvent::Mouse(event) => Input::Mouse {
+                            event,
+                            at: std::time::Instant::now(),
+                        },
+                        event => Input::Event(event),
+                    };
+                    if !self.send(input).await {
                         break;
                     }
                 }

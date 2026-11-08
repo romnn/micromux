@@ -7,6 +7,7 @@
 //! - A set of configuration types (e.g. [`Service`], [`HealthCheck`]) and diagnostics-friendly
 //!   errors ([`ConfigError`]).
 
+pub mod user;
 pub mod v1;
 
 use crate::diagnostics::{DiagnosticExt, Span, ToDiagnostics};
@@ -179,6 +180,23 @@ pub enum Version {
     Latest,
 }
 
+/// Only the `ui` section of the project config `raw`, as a TUI attached to a running session
+/// reads it.
+///
+/// The rest of the file does not matter there: it may have changed since the session loaded it,
+/// or depend on the session's environment, and either would hide the `ui` settings.
+///
+/// # Errors
+///
+/// Returns an error when the file is not YAML or its `ui` section is malformed.
+pub fn parse_ui_section(raw: &str) -> Result<UiConfig, ConfigError> {
+    let root = yaml_spanned::from_str(raw).map_err(ConfigError::Yaml)?;
+    if matches!(root.inner, Value::Null) {
+        return Ok(UiConfig::default());
+    }
+    v1::parse_ui_config(&root, 0usize, false, &mut Vec::new())
+}
+
 /// User-interface related configuration.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct UiConfig {
@@ -186,6 +204,11 @@ pub struct UiConfig {
     pub width: Option<Spanned<usize>>,
     /// Render structured JSON logs as compact colored log lines in the TUI.
     pub pretty_json_logs: bool,
+    /// Whether the TUI captures the mouse, or `None` to leave the choice to the user config.
+    pub mouse: Option<bool>,
+    /// Whether finishing a mouse selection copies it, or `None` to leave the choice to the user
+    /// config.
+    pub copy_on_select: Option<bool>,
 }
 
 /// Agent-control configuration latched for the lifetime of a session.
@@ -232,6 +255,8 @@ impl Default for UiConfig {
         Self {
             width: None,
             pretty_json_logs: true,
+            mouse: None,
+            copy_on_select: None,
         }
     }
 }
@@ -895,6 +920,27 @@ mod tests {
             .build(schema)?)
     }
 
+    /// An attached TUI reads the project's `ui` settings even where the rest of the file would
+    /// not load, as with a key the session predates under `strict` or a broken service.
+    #[test]
+    fn the_ui_section_reads_without_the_rest_of_the_config() -> eyre::Result<()> {
+        let yaml = indoc! {r"
+            version: 1
+            strict: true
+            added_later: true
+            ui:
+              mouse: false
+              copy_on_select: true
+            services:
+              broken: 5
+        "};
+        let ui = super::parse_ui_section(yaml)?;
+        assert_eq!((ui.mouse, ui.copy_on_select), (Some(false), Some(true)));
+        assert_eq!(super::parse_ui_section("")?, super::UiConfig::default());
+        assert!(super::parse_ui_section("ui: [1]").is_err());
+        Ok(())
+    }
+
     #[test]
     fn parse_config_basic_and_special_cases() -> eyre::Result<()> {
         let yaml = indoc! {r#"
@@ -1016,6 +1062,8 @@ mod tests {
             ui:
               width: 80
               pretty_json_logs: false
+              mouse: false
+              copy_on_select: true
             services:
               app:
                 command: "true"
@@ -1027,6 +1075,8 @@ mod tests {
         assert_eq!(diagnostics, Vec::new());
         assert_eq!(parsed.config.ui_config.width.as_deref().copied(), Some(80));
         assert!(!parsed.config.ui_config.pretty_json_logs);
+        assert_eq!(parsed.config.ui_config.mouse, Some(false));
+        assert_eq!(parsed.config.ui_config.copy_on_select, Some(true));
         Ok(())
     }
 
@@ -1105,6 +1155,8 @@ mod tests {
             ui:
               width: 120
               pretty_json_logs: false
+              mouse: false
+              copy_on_select: false
             control:
               enabled: true
               dynamic_services:

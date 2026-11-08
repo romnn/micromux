@@ -56,6 +56,10 @@ Add the `$schema` comment at the top and an editor with the YAML language server
 ui:
   width: 40              # initial sidebar width, in columns
   pretty_json_logs: true # render structured JSON logs as compact colored lines (default)
+  mouse: true            # capture the mouse in the TUI; omit to use the user config's setting
+  copy_on_select: false  # copy a mouse selection when the drag ends, not on y (default off)
 ```
+
+`ui.mouse` and `ui.copy_on_select` can also be set for every project in your [user config]({{< relref "../tui.md#user-config" >}}), and per run with `--mouse on|off` and `--copy-on-select on|off`.
 
 Services that emit JSON logs are, by default, rendered in the TUI as compact colored log lines. Opt out per run with `--no-pretty-json-logs`, or for everyone with `ui: { pretty_json_logs: false }`. The raw JSON is always preserved for the control plane and MCP tools.
