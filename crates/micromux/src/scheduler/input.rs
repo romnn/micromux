@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use parking_lot::Mutex;
 use tokio::sync::{mpsc, watch};
@@ -330,6 +331,10 @@ pub enum PtyInputSendError {
     /// The payload was prepared for another session.
     #[error("PTY input belongs to another session")]
     WrongSession(PreparedPtyInput),
+    /// The forwarder is not connected to its session, so the input must be discarded rather
+    /// than kept for later.
+    #[error("terminal input is not accepted while disconnected")]
+    Disconnected(PreparedPtyInput),
 }
 
 /// The size every service PTY in a session takes.
@@ -354,6 +359,18 @@ pub struct TerminalForwarding {
     ///
     /// A resize replaces one not yet forwarded, because only the latest size matters.
     pub size: watch::Receiver<Option<TerminalSize>>,
+    accepting: Arc<AtomicBool>,
+}
+
+impl TerminalForwarding {
+    /// Sets whether the capability accepts input, such as while its session is reachable.
+    ///
+    /// While it does not, sending fails with [`PtyInputSendError::Disconnected`], so the sender
+    /// discards input instead of queueing it for a later connection.
+    /// Input queued before the switch stays in [`Self::input`] for the holder to drain.
+    pub fn set_accepting(&self, accepting: bool) {
+        self.accepting.store(accepting, Ordering::Release);
+    }
 }
 
 /// Where [`TerminalControl`] sends resizes.
@@ -374,6 +391,8 @@ enum ResizeTarget {
 pub struct TerminalControl {
     resize: ResizeTarget,
     input: mpsc::Sender<PreparedPtyInput>,
+    /// Cleared only by a [`TerminalForwarding`] holder; the scheduler always accepts input.
+    accepting: Arc<AtomicBool>,
     budget: Arc<InputBudget>,
 }
 
@@ -386,6 +405,7 @@ impl TerminalControl {
             Self {
                 resize: ResizeTarget::Scheduler(commands),
                 input,
+                accepting: Arc::new(AtomicBool::new(true)),
                 budget: InputBudget::shared(MAX_PTY_PASTE_BYTES),
             },
             receiver,
@@ -402,15 +422,18 @@ impl TerminalControl {
     pub fn forwarding(max_paste_bytes: usize) -> (Self, TerminalForwarding) {
         let (input, input_receiver) = mpsc::channel(PTY_INPUT_CHANNEL_CAPACITY);
         let (size, size_receiver) = watch::channel(None);
+        let accepting = Arc::new(AtomicBool::new(true));
         (
             Self {
                 resize: ResizeTarget::Forwarded(size),
                 input,
+                accepting: Arc::clone(&accepting),
                 budget: InputBudget::shared(max_paste_bytes),
             },
             TerminalForwarding {
                 input: input_receiver,
                 size: size_receiver,
+                accepting,
             },
         )
     }
@@ -426,6 +449,7 @@ impl TerminalControl {
             Self {
                 resize: ResizeTarget::Scheduler(commands),
                 input,
+                accepting: Arc::new(AtomicBool::new(true)),
                 budget: InputBudget::shared_with_limit(max_bytes),
             },
             receiver,
@@ -465,10 +489,14 @@ impl TerminalControl {
     /// # Errors
     ///
     /// Returns the prepared payload when the input queue is full or closed, preserving the
-    /// reservation so a caller can retry without an atomicity gap.
+    /// reservation so a caller can retry without an atomicity gap, and
+    /// [`PtyInputSendError::Disconnected`] while a forwarding capability does not accept input.
     pub fn try_send(&self, input: PreparedPtyInput) -> Result<(), PtyInputSendError> {
         if !Arc::ptr_eq(&self.budget, &input.permit.budget) {
             return Err(PtyInputSendError::WrongSession(input));
+        }
+        if !self.accepting.load(Ordering::Acquire) {
+            return Err(PtyInputSendError::Disconnected(input));
         }
         match self.input.try_send(input) {
             Ok(()) => Ok(()),
@@ -481,11 +509,15 @@ impl TerminalControl {
     ///
     /// # Errors
     ///
-    /// Returns the prepared payload when the queue is closed or the payload was prepared by
-    /// another session's capability; never [`PtyInputSendError::Full`].
+    /// Returns the prepared payload when the queue is closed, the payload was prepared by
+    /// another session's capability, or a forwarding capability does not accept input; never
+    /// [`PtyInputSendError::Full`].
     pub async fn send(&self, input: PreparedPtyInput) -> Result<(), PtyInputSendError> {
         if !Arc::ptr_eq(&self.budget, &input.permit.budget) {
             return Err(PtyInputSendError::WrongSession(input));
+        }
+        if !self.accepting.load(Ordering::Acquire) {
+            return Err(PtyInputSendError::Disconnected(input));
         }
         self.input
             .send(input)
@@ -729,6 +761,36 @@ mod tests {
             commands_rx.recv().await,
             Some(Command::ResizeAll { cols: 90, rows: 20 })
         );
+        Ok(())
+    }
+
+    /// A disconnected forwarder refuses input outright, so nothing typed meanwhile can reach a
+    /// later connection, while input queued before the switch stays for the holder to drain.
+    #[tokio::test]
+    async fn disconnected_forwarding_refuses_input() -> eyre::Result<()> {
+        let (control, mut forwarding) = TerminalControl::forwarding(MAX_PTY_PASTE_BYTES);
+        control.try_send(control.prepare_input("svc".to_string(), b"before".to_vec())?)?;
+
+        forwarding.set_accepting(false);
+        let typed = control.prepare_input("svc".to_string(), b"during".to_vec())?;
+        assert_matches!(
+            control.try_send(typed),
+            Err(PtyInputSendError::Disconnected(_))
+        );
+        let pasted = control.prepare_paste("svc".to_string(), b"during".to_vec())?;
+        assert_matches!(
+            control.send(pasted).await,
+            Err(PtyInputSendError::Disconnected(_))
+        );
+        assert_eq!(forwarding.input.try_recv()?.data(), b"before");
+        assert_matches!(
+            forwarding.input.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        );
+
+        forwarding.set_accepting(true);
+        control.try_send(control.prepare_input("svc".to_string(), b"after".to_vec())?)?;
+        assert_eq!(forwarding.input.try_recv()?.data(), b"after");
         Ok(())
     }
 }

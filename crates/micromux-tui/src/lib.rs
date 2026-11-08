@@ -35,6 +35,7 @@ const PENDING_PTY_INPUT_RETRY: Duration = Duration::from_millis(5);
 /// How long the footer says how to quit after a Ctrl-C.
 const QUIT_HINT_DURATION: Duration = Duration::from_secs(2);
 const TERMINAL_INPUT_CLOSED_NOTICE: &str = "terminal input closed; send SIGINT or SIGTERM to exit";
+const DISCONNECTED_INPUT_NOTICE: &str = "input discarded while reconnecting";
 
 fn format_byte_limit(bytes: usize) -> String {
     const KIB: usize = 1024;
@@ -151,6 +152,9 @@ pub struct App {
     /// Terminal work queued for the event loop.
     effects: Vec<Effect>,
     pty_input_mode: bool,
+    /// Whether the PTYs follow this TUI's pane only while it types into a service, as an attached
+    /// TUI's do.
+    resizes_only_in_pty_input_mode: bool,
     focus: Focus,
     terminal_cols: u16,
     terminal_rows: u16,
@@ -188,6 +192,7 @@ impl App {
     ) -> Self {
         let changes = source.subscribe();
         let summary_changes = source.summary_changes();
+        let resizes_only_in_pty_input_mode = matches!(source, SessionSource::Remote(_));
         let snapshots = source.services();
         let event_cursors = snapshots
             .iter()
@@ -230,6 +235,7 @@ impl App {
             hits: mouse::Hits::default(),
             effects: Vec::new(),
             pty_input_mode: false,
+            resizes_only_in_pty_input_mode,
             focus: Focus::Services,
             terminal_cols: 80,
             terminal_rows: 24,
@@ -248,10 +254,18 @@ impl App {
         (text.width.max(1), text.height.max(1))
     }
 
+    /// Sends the pane size to the service PTYs when it changed since the last resize sent.
+    ///
+    /// The last active writer wins: an attached TUI resizes only while it types into a service,
+    /// so watching a session never changes its PTYs, while the session's own TUI follows its pane
+    /// whenever it changes.
     fn maybe_resize_pty(&mut self) {
         let Some(input) = &self.input else {
             return;
         };
+        if self.resizes_only_in_pty_input_mode && !self.pty_input_mode {
+            return;
+        }
         let (cols, rows) = self.desired_pty_size();
         if cols == self.last_pty_cols && rows == self.last_pty_rows {
             return;
@@ -293,6 +307,7 @@ impl App {
                 Err(PtyInputSendError::WrongSession(_)) => {
                     tracing::error!("PTY input reservation belongs to another session");
                 }
+                Err(PtyInputSendError::Disconnected(_)) => self.discard_disconnected_input(),
             }
         } else {
             self.push_pending_pty_input(prepared);
@@ -326,6 +341,10 @@ impl App {
                 }
                 Err(PtyInputSendError::WrongSession(_)) => {
                     tracing::error!("PTY paste reservation belongs to another session");
+                    return;
+                }
+                Err(PtyInputSendError::Disconnected(_)) => {
+                    self.discard_disconnected_input();
                     return;
                 }
                 Err(PtyInputSendError::Full(prepared)) => {
@@ -413,8 +432,19 @@ impl App {
                     self.pending_pty_input.clear();
                     break;
                 }
+                Err(PtyInputSendError::Disconnected(_)) => {
+                    self.discard_disconnected_input();
+                    break;
+                }
             }
         }
+    }
+
+    /// Drops input that an attached session cannot take while it reconnects, together with
+    /// everything queued behind it, so none of it reaches the session once it is back.
+    fn discard_disconnected_input(&mut self) {
+        self.pending_pty_input.clear();
+        self.input_notice = Some(DISCONNECTED_INPUT_NOTICE.to_string());
     }
 
     /// Run the TUI event loop.
@@ -830,10 +860,8 @@ impl App {
             // Toggle mouse capture
             KeyCode::Char('m') => self.toggle_mouse_capture(),
 
-            // Toggle PTY input mode
-            KeyCode::Char('a') if self.input.is_some() => {
-                self.pty_input_mode = !self.pty_input_mode;
-            }
+            // Enter PTY input mode
+            KeyCode::Char('a') if self.input.is_some() => self.enter_pty_input_mode(),
             KeyCode::Char('H') => self.toggle_healthcheck_pane(),
 
             // Disable current service
@@ -974,6 +1002,15 @@ impl App {
             _ => {}
         }
         self.level_picker = Some(picker);
+    }
+
+    /// Starts typing into the selected service, and takes the PTY size back for this TUI's pane
+    /// even when another client resized the PTYs since, because the client typing wins.
+    fn enter_pty_input_mode(&mut self) {
+        self.pty_input_mode = true;
+        self.last_pty_cols = 0;
+        self.last_pty_rows = 0;
+        self.maybe_resize_pty();
     }
 
     fn handle_key_press_pty_input_mode(&mut self, key: crossterm::event::KeyEvent) {
@@ -1364,7 +1401,7 @@ mod tests {
     use color_eyre::eyre;
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
     use indoc::indoc;
-    use micromux::Command;
+    use micromux::{Command, TerminalSize};
     use ratatui::widgets::Widget as _;
     use similar_asserts::assert_eq;
     use tokio::sync::mpsc;
@@ -1399,6 +1436,9 @@ mod tests {
                 }
                 Err(PtyInputSendError::WrongSession(_)) => {
                     eyre::bail!("test input reservation belonged to another session")
+                }
+                Err(PtyInputSendError::Disconnected(_)) => {
+                    eyre::bail!("test terminal refused input as disconnected")
                 }
             }
         }
@@ -2773,6 +2813,127 @@ mod tests {
             .collect::<String>();
         assert!(!rendered.contains("PTY input"));
         assert!(!rendered.contains("Exit PTY input"));
+        Ok(())
+    }
+
+    fn pane_size(app: &App) -> TerminalSize {
+        let (cols, rows) = app.desired_pty_size();
+        TerminalSize { cols, rows }
+    }
+
+    fn press(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent {
+            code,
+            modifiers,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        }
+    }
+
+    /// Watching a session never resizes its PTYs: an attached TUI resizes them only while it
+    /// types into a service, starting with its current size when it enters PTY input mode.
+    #[tokio::test]
+    async fn an_attached_tui_resizes_only_in_pty_input_mode() -> eyre::Result<()> {
+        let (source, mut forwarding) = RemoteSource::offline();
+        let terminal = source.terminal();
+        let mut app = App::new(
+            SessionSource::Remote(source),
+            terminal,
+            micromux::CancellationToken::new(),
+            ViewOptions::default(),
+        );
+
+        // Attaching and resizing the terminal leave the session's PTYs alone.
+        app.maybe_resize_pty();
+        app.handle_crossterm_event(&crossterm::event::Event::Resize(120, 40));
+        assert!(!forwarding.size.has_changed()?);
+
+        // Entering PTY input mode claims the PTYs for this pane, and pane changes follow.
+        app.handle_key_press(press(KeyCode::Char('a'), KeyModifiers::NONE));
+        assert!(app.pty_input_mode);
+        assert_eq!(*forwarding.size.borrow_and_update(), Some(pane_size(&app)));
+        app.handle_crossterm_event(&crossterm::event::Event::Resize(100, 30));
+        assert_eq!(*forwarding.size.borrow_and_update(), Some(pane_size(&app)));
+
+        // Leaving it stops forwarding resizes again.
+        app.handle_key_press(press(KeyCode::Char(']'), KeyModifiers::CONTROL));
+        assert!(!app.pty_input_mode);
+        app.handle_crossterm_event(&crossterm::event::Event::Resize(140, 50));
+        assert!(!forwarding.size.has_changed()?);
+        Ok(())
+    }
+
+    /// The session's own TUI follows its pane as before, and takes the PTY size back when it
+    /// enters PTY input mode, even when its pane did not change since an attached TUI resized.
+    #[tokio::test]
+    async fn the_local_tui_reasserts_its_size_in_pty_input_mode() -> eyre::Result<()> {
+        let mut diagnostics = Vec::new();
+        let parsed = micromux::from_str(
+            "version: 1\nservices: {}\n",
+            Path::new("."),
+            0usize,
+            None,
+            &mut diagnostics,
+        )?;
+        let cache = tempfile::tempdir()?;
+        let mux = std::sync::Arc::new(test_micromux(&parsed, &cache)?);
+        let shutdown = micromux::CancellationToken::new();
+        let (_runner, handles) = mux.start(shutdown.clone());
+        // A forwarding capability stands in for the scheduler, so the test sees each resize.
+        let (terminal, mut forwarding) = TerminalControl::forwarding(micromux::MAX_PTY_PASTE_BYTES);
+        let mut app = App::new(
+            SessionSource::Local(LocalSource::new(handles.reader, handles.commands.clone())),
+            Some(terminal),
+            shutdown,
+            ViewOptions::default(),
+        );
+
+        app.handle_crossterm_event(&crossterm::event::Event::Resize(120, 40));
+        let size = *forwarding.size.borrow_and_update();
+        assert_eq!(size, Some(pane_size(&app)));
+
+        app.handle_key_press(press(KeyCode::Char('a'), KeyModifiers::NONE));
+        assert!(forwarding.size.has_changed()?);
+        assert_eq!(*forwarding.size.borrow_and_update(), size);
+        Ok(())
+    }
+
+    /// Input an attached session cannot take while it reconnects is discarded with a notice,
+    /// together with input already waiting behind a full queue, instead of being sent later.
+    #[tokio::test]
+    async fn input_refused_while_reconnecting_is_discarded() -> eyre::Result<()> {
+        let (source, mut forwarding) = RemoteSource::offline();
+        let terminal = source
+            .terminal()
+            .ok_or_else(|| eyre::eyre!("the offline session accepts terminal input"))?;
+        let mut app = App::new(
+            SessionSource::Remote(source),
+            Some(terminal.clone()),
+            micromux::CancellationToken::new(),
+            ViewOptions::default(),
+        );
+
+        // A full queue makes the TUI keep further input pending.
+        let queued = fill_terminal_queue(&terminal)?;
+        app.enqueue_pty_input("svc".to_string(), b"pending".to_vec());
+        assert_eq!(app.pending_pty_input.len(), 1);
+
+        // The connection breaks: pending input is dropped on the next retry, and new input at
+        // once, both without reaching the queue.
+        forwarding.set_accepting(false);
+        app.flush_pending_pty_input();
+        assert!(app.pending_pty_input.is_empty());
+        app.enqueue_pty_input("svc".to_string(), b"typed".to_vec());
+        app.enqueue_pty_paste("svc", b"pasted");
+        assert!(app.pending_pty_input.is_empty());
+        assert_eq!(app.input_notice.as_deref(), Some(DISCONNECTED_INPUT_NOTICE));
+
+        let mut forwarded = 0;
+        while let Ok(input) = forwarding.input.try_recv() {
+            assert_eq!(input.data(), b"x");
+            forwarded += 1;
+        }
+        assert_eq!(forwarded, queued);
         Ok(())
     }
 

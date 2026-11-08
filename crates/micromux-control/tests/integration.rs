@@ -9,7 +9,7 @@ use std::time::Duration;
 use color_eyre::eyre;
 use micromux::CancellationToken;
 use micromux_control::{
-    Client, ControlEndpoint, ControlServer, EndpointProbeResult, Request, Response,
+    Client, ControlEndpoint, ControlServer, EndpointProbeResult, ErrorCode, Request, Response,
     SessionIdentity, bind, endpoint_owner_lock_held, probe_runtime_dir,
 };
 use similar_asserts::assert_eq;
@@ -392,11 +392,15 @@ async fn send_until_logged(
 ) -> eyre::Result<()> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
-        let response = client.request(request.clone()).await?;
-        assert!(
-            matches!(response, Response::TerminalQueued),
-            "unexpected response: {response:?}"
-        );
+        // A service that has not started yet refuses input; anything else is a failure.
+        match client.request(request.clone()).await? {
+            Response::TerminalQueued
+            | Response::Error {
+                code: ErrorCode::InvalidState,
+                ..
+            } => {}
+            other => eyre::bail!("unexpected response: {other:?}"),
+        }
         let poll_until = tokio::time::Instant::now() + Duration::from_millis(200);
         while tokio::time::Instant::now() < poll_until {
             if has_log_line(reader, expected) {
@@ -457,6 +461,28 @@ async fn input_and_resizes_reach_the_service_pty_over_the_socket() -> eyre::Resu
     assert!(session.terminal.try_resize(100, 25));
     send_until_logged(&mut first, &session.reader, enter("b", false), "25 100").await?;
 
+    // A key batch keeps its size limit over the socket.
+    let oversized = first
+        .request(Request::SendInput {
+            service: "svc".to_string(),
+            data: micromux_control::InputBytes::from(vec![
+                b'x';
+                micromux::MAX_PTY_INPUT_BATCH_BYTES + 1
+            ]),
+            paste: false,
+        })
+        .await?;
+    assert!(
+        matches!(
+            oversized,
+            Response::Error {
+                code: ErrorCode::LimitExceeded,
+                ..
+            }
+        ),
+        "{oversized:?}"
+    );
+
     // And another attached client resizing after that wins again.
     let resized = second
         .request(Request::ResizeTerminal { cols: 90, rows: 21 })
@@ -464,6 +490,47 @@ async fn input_and_resizes_reach_the_service_pty_over_the_socket() -> eyre::Resu
     assert!(matches!(resized, Response::TerminalQueued), "{resized:?}");
     send_until_logged(&mut first, &session.reader, enter("c", false), "21 90").await?;
 
+    session.shutdown.cancel();
+    Ok(())
+}
+
+/// Input for a service that has exited is refused with a reason, rather than queued and dropped
+/// where an attached client cannot see it.
+#[tokio::test]
+async fn input_for_an_exited_service_is_refused() -> eyre::Result<()> {
+    let dir = unique_dir("terminal-exited")?;
+    let session = build_session(dir.path(), "exit 0")?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !session
+        .reader
+        .service("svc")
+        .is_some_and(|snapshot| snapshot.execution.has_exited())
+    {
+        if tokio::time::Instant::now() >= deadline {
+            eyre::bail!("the service never exited");
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let mut client = Client::connect(&session.endpoint).await?;
+    let response = client
+        .request(Request::SendInput {
+            service: "svc".to_string(),
+            data: micromux_control::InputBytes::from(b"lost\r".to_vec()),
+            paste: true,
+        })
+        .await?;
+
+    assert!(
+        matches!(
+            &response,
+            Response::Error {
+                code: ErrorCode::InvalidState,
+                message,
+            } if message == "terminal paste discarded: svc is not running"
+        ),
+        "{response:?}"
+    );
     session.shutdown.cancel();
     Ok(())
 }

@@ -714,7 +714,8 @@ async fn dispatch(server: &ControlServer, request: Request) -> Response {
     }
 }
 
-/// Queues input for a service's PTY behind any earlier input, from this or another client.
+/// Queues input for a running service's PTY behind any earlier input, from this or another
+/// client.
 ///
 /// Nothing serializes clients beyond that: each request is written contiguously, so input from two
 /// clients interleaves only at request boundaries, like two terminals typing into one tmux pane.
@@ -727,8 +728,21 @@ async fn send_input(
     let Some(terminal) = &server.terminal else {
         return no_terminal();
     };
-    if server.reader.service(&service).is_none() {
+    let Some(snapshot) = server.reader.service(&service) else {
         return unknown_service(&service);
+    };
+    // The scheduler would drop this input and record the drop only as a service event, which an
+    // attached TUI does not follow, so refuse it here, where the client sees why.
+    // The scheduler still drops input that loses a race with the process exiting.
+    if !matches!(
+        snapshot.execution,
+        micromux::Execution::Running | micromux::Execution::Stopping
+    ) {
+        let kind = if paste { "paste" } else { "input" };
+        return Response::error(
+            ErrorCode::InvalidState,
+            format!("terminal {kind} discarded: {service} is not running"),
+        );
     }
     let prepared = if paste {
         terminal.prepare_paste(service, data)
@@ -741,9 +755,12 @@ async fn send_input(
     };
     match terminal.send(prepared).await {
         Ok(()) => Response::TerminalQueued,
-        Err(PtyInputSendError::Closed(_) | PtyInputSendError::Full(_)) => {
-            Response::error(ErrorCode::SchedulerStopped, "the scheduler has stopped")
-        }
+        // The session's own capability never reports `Full` from `send`, nor disconnects.
+        Err(
+            PtyInputSendError::Closed(_)
+            | PtyInputSendError::Full(_)
+            | PtyInputSendError::Disconnected(_),
+        ) => Response::error(ErrorCode::SchedulerStopped, "the scheduler has stopped"),
         Err(PtyInputSendError::WrongSession(_)) => Response::error(
             ErrorCode::Internal,
             "terminal input was prepared for another session",
@@ -1771,8 +1788,6 @@ mod tests {
         Ok(())
     }
 
-    /// Pruning removes a crash-leaked socket and leaves the lock file, but keeps a socket whose
-    /// lock a starting session holds.
     /// A session with one `svc` service whose scheduler never runs.
     struct UnscheduledSession {
         server: ControlServer,
@@ -1833,7 +1848,7 @@ mod tests {
     }
 
     /// Terminal requests are validated before they reach the scheduler: the target must be a
-    /// known service id, a key batch keeps its size limit, and a PTY needs a non-empty size.
+    /// known service id with a running process, and a PTY needs a non-empty size.
     #[tokio::test]
     async fn terminal_requests_are_validated_before_queueing() -> eyre::Result<()> {
         let directory = tempfile::tempdir()?;
@@ -1844,37 +1859,26 @@ mod tests {
         } = unscheduled_session(directory.path())?;
         let server = server.with_terminal(terminal);
 
-        let send = |service: &str, bytes: usize, paste: bool| Request::SendInput {
+        let send = |service: &str| Request::SendInput {
             service: service.to_string(),
-            data: crate::InputBytes::from(vec![b'x'; bytes]),
-            paste,
+            data: crate::InputBytes::from(b"x".to_vec()),
+            paste: false,
         };
         assert_matches!(
-            dispatch(&server, send("missing", 1, false)).await,
+            dispatch(&server, send("missing")).await,
             Response::Error {
                 code: ErrorCode::UnknownService,
                 ..
             }
         );
+        // The scheduler never ran, so `svc` has no process to type into, and the client hears so
+        // instead of its input vanishing.
         assert_matches!(
-            dispatch(
-                &server,
-                send("svc", micromux::MAX_PTY_INPUT_BATCH_BYTES + 1, false)
-            )
-            .await,
+            dispatch(&server, send("svc")).await,
             Response::Error {
-                code: ErrorCode::LimitExceeded,
-                ..
-            }
-        );
-        // The same bytes are a valid paste.
-        assert_matches!(
-            dispatch(
-                &server,
-                send("svc", micromux::MAX_PTY_INPUT_BATCH_BYTES + 1, true)
-            )
-            .await,
-            Response::TerminalQueued
+                code: ErrorCode::InvalidState,
+                message,
+            } if message == "terminal input discarded: svc is not running"
         );
         for (cols, rows) in [(0, 24), (80, 0)] {
             assert_matches!(
@@ -1890,15 +1894,8 @@ mod tests {
             Response::TerminalQueued
         );
 
-        // Once the scheduler is gone, nothing can deliver input or resizes.
+        // Once the scheduler is gone, nothing can deliver a resize.
         drop(runner);
-        assert_matches!(
-            dispatch(&server, send("svc", 1, false)).await,
-            Response::Error {
-                code: ErrorCode::SchedulerStopped,
-                ..
-            }
-        );
         assert_matches!(
             dispatch(&server, Request::ResizeTerminal { cols: 80, rows: 24 }).await,
             Response::Error {
@@ -1909,6 +1906,8 @@ mod tests {
         Ok(())
     }
 
+    /// Pruning removes a crash-leaked socket and leaves the lock file, but keeps a socket whose
+    /// lock a starting session holds.
     #[test]
     fn pruning_removes_only_sockets_without_an_owner() -> eyre::Result<()> {
         let directory = tempfile::tempdir()?;

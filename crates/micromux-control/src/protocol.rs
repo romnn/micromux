@@ -573,7 +573,8 @@ pub enum Response {
     /// Reply to [`Request::SendInput`] and [`Request::ResizeTerminal`]: the session queued the input
     /// or resize for its PTYs.
     ///
-    /// Input for a service without a running PTY is dropped later, and recorded as an
+    /// A service that is not running refuses input with [`ErrorCode::InvalidState`] instead.
+    /// Input that races with the process exiting is still dropped later, and recorded as an
     /// `InputDropped` service event.
     TerminalQueued,
     /// Acknowledgement of [`Request::Shutdown`], written just before the session begins exiting.
