@@ -12,7 +12,7 @@ Running `micromux` with no subcommand opens the TUI for the current project. It'
 ## Layout
 
 - **Sidebar** — every service, one row each, showing its lifecycle state: pending, blocked, starting, running, healthy, unhealthy, exited, or disabled. A [job]({{< relref "configuration/services.md" >}}#jobs) shows **COMPLETED** once it exited with status 0, grayed out like a disabled service, **FAILED** with its exit code in red, **RETRYING** between attempts, and **IDLE** while a manual job waits to be run. The selected row drives the panes on the right.
-- **Log pane** — the selected service's live output, annotated with the lifecycle transitions that stall it. ANSI color and interactive/redrawing output are supported.
+- **Log pane** — the selected service's live output, annotated with the lifecycle transitions that stall it. ANSI color and interactive/redrawing output are supported. `A` switches it to [every service's logs](#all-services-logs) in time order.
 - **Healthcheck pane** — toggled with `H`, it shows the selected service's latest probe: the command, its exit status, and its output.
 
 The pane with the focus, which the movement keys act on, has a thick frame in an accent color; `Tab` or a click moves it. The thickness tells it apart even where the terminal shows no color.
@@ -30,9 +30,10 @@ The header's right side lists the view keys, which change only what the panes sh
 | `a` | Enter PTY **input mode** — send keystrokes to the service (exit with `Ctrl+]`) |
 | `Tab` | Move focus between panes |
 | `H` | Toggle the healthcheck pane |
+| `A` | Toggle every service's logs in one pane, in time order (see [All services' logs](#all-services-logs)) |
 | `w` | Toggle log wrapping |
 | `t` | Toggle follow-tail (stick to the newest logs) |
-| `/` | Search the selected service's logs (see [Searching logs](#searching-logs)) |
+| `/` | Search the logs the log pane shows (see [Searching logs](#searching-logs)) |
 | `n` / `N` | Move to the next older / newer search match |
 | `L` | Pick the selected service's log level threshold (`ALL`, `DEBUG`, `INFO`, `WARN`, `ERROR`) |
 | `T` | Toggle timestamps on the selected service's structured JSON log lines |
@@ -54,11 +55,23 @@ Restart, disable, and enable all go through the [control plane]({{< relref "agen
 
 ## Searching logs
 
-`/` opens a prompt over the footer's last row: type a query and press `Enter` to search the selected service's logs, or `Esc` to cancel; `Backspace` edits it. The query matches literal text, the way the pane shows it, and ignores case unless it has an uppercase letter, as vim's smartcase does: `error` finds `ERROR` too, `Error` finds only `Error`.
+`/` opens a prompt over the footer's last row: type a query and press `Enter` to search the logs the log pane shows, the selected service's or [every service's](#all-services-logs), or `Esc` to cancel; `Backspace` edits it. The query matches literal text, the way the pane shows it, and ignores case unless it has an uppercase letter, as vim's smartcase does: `error` finds `ERROR` too, `Error` finds only `Error`.
 
 The newest lines are at the bottom, so a search goes back in time, like vim's `?`: `Enter` moves to the newest match at or above the bottom of the view, `n` to the next older match and `N` to the next newer one, wrapping around at either end. A match off screen scrolls to the middle of the pane, and follow-tail stops, so the match stays put while new lines arrive; `t` follows the tail again. Every match on screen is highlighted, the current one in the focus color, and the Logs pane's top-right corner shows the query with the current match's place, such as `/error 3/17`, or `no match`.
 
 The search stays while the log moves on: new lines are searched as they arrive, and the current match stays on its line until that line is dropped from the log. Selecting another service searches its logs for the same query, with no match current until `n` or `N` moves to one. `Esc` ends the search and its highlighting, once any mouse selection is cleared. In PTY input mode `/`, `n` and `N` go to the service like any other key. Without wrapping (`w`), a match past the pane's right edge is not visible.
+
+## All services' logs
+
+`A` shows the logs of every service in the log pane, interleaved in time order, so a request can be followed from one service to the next; `A` again shows the selected service's logs. Each line starts with the name of its service, in a color of its own and padded to the longest name, so the log text lines up; a name longer than 16 columns is cut short. The header shows `All:ON` while the pane shows them.
+
+- **Order.** Lines are ordered by when micromux captured them, one clock for every service, even for lines that carry no timestamp of their own. Lines captured in the same millisecond go in the order of their services in the sidebar, and each service's lines keep their own order. The MCP tool `follow_all_logs` also keeps each service's order, but goes by a JSON record's own timestamp where it has one and breaks ties by service name.
+- **Filters.** Each service's lines look as they do in its own pane: its level threshold (`L`), timestamps (`T`) and hidden fields (`F`) apply here too. Those keys still act on the selected service.
+- **Live screens.** A program that redraws its screen in place, such as a progress bar or a full-screen dashboard, shows as one block of lines, each tagged, that moves to the time of its latest redraw.
+- **Everything else works as in a single service's pane:** scrolling and follow-tail, wrapping, search with `/`, `n` and `N`, which also matches the service names, and selecting and copying with the mouse, which copies the names too. A view off the tail stays on its lines while services drop their oldest ones. Switching between the views follows the newest lines.
+- **Input.** `a` still types into the selected service; the pane shows that service's logs while PTY input mode lasts, so you see what you type, and every service's logs again once `Ctrl+]` leaves it.
+
+Only the lines that the services still keep in memory show, as in their own panes, so memory stays within each service's [log retention]({{< relref "configuration/logs.md" >}}).
 
 ## Mouse
 

@@ -1,27 +1,20 @@
-use ansi_to_tui::IntoText as _;
 use micromux::LogLine;
 
 use crate::json_log::LineFormat;
+use crate::log_text::{LogText, RecordKey};
 
 /// View state for one service. Domain state (execution, health, logs, healthchecks) lives in the
 /// [`crate::SessionSource`]; this is the per-service render cache the TUI keeps.
 #[derive(Debug)]
 pub struct Service {
     pub snapshot: micromux::ServiceSnapshot,
-    pub cached_lines: std::collections::VecDeque<(u64, String)>,
-    /// Where each record rendered into `cached_text` starts; a record of a live screen snapshot
-    /// spans several lines.
+    pub cached_lines: std::collections::VecDeque<CachedLine>,
+    /// The log pane's text for this service.
     ///
     /// It describes the text as rendered, so it stays right while records read since then wait
     /// in `cached_lines` for the next rebuild.
-    pub record_starts: Vec<RecordStart>,
-    pub cached_text: ratatui::text::Text<'static>,
+    pub(crate) log: LogText,
     pub text_dirty: bool,
-    /// Counts the rebuilds of `cached_text`, so what was computed from it, such as search
-    /// matches, can tell when it is stale.
-    pub text_generation: u64,
-    pub cached_line_index: crate::render::log_view::RenderedLineIndex,
-    pub cached_wrap: Option<(bool, u16)>,
     pub logs_dirty: bool,
     pub healthcheck_cached_text: ratatui::text::Text<'static>,
     pub healthcheck_cached_line_index: crate::render::log_view::RenderedLineIndex,
@@ -39,17 +32,24 @@ pub struct Service {
     pub filter_fields_override: Option<bool>,
 }
 
+/// A log record as the log pane renders it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CachedLine {
+    /// The record's sequence number.
+    pub seq: u64,
+    /// When micromux captured the record, in Unix milliseconds.
+    pub timestamp_unix_ms: u64,
+    /// The record formatted for the pane, possibly several lines of a live screen snapshot.
+    pub text: String,
+}
+
 impl Service {
     pub(crate) fn new(snapshot: micromux::ServiceSnapshot) -> Self {
         Self {
             snapshot,
             cached_lines: std::collections::VecDeque::new(),
-            record_starts: Vec::new(),
-            cached_text: ratatui::text::Text::default(),
+            log: LogText::default(),
             text_dirty: true,
-            text_generation: 0,
-            cached_line_index: crate::render::log_view::RenderedLineIndex::default(),
-            cached_wrap: None,
             logs_dirty: true,
             healthcheck_cached_text: ratatui::text::Text::default(),
             healthcheck_cached_line_index: crate::render::log_view::RenderedLineIndex::default(),
@@ -83,6 +83,20 @@ impl Service {
         self.log_cursor.saturating_sub(1)
     }
 
+    /// Brings `cached_lines` up to date with `source` under the format the settings in effect
+    /// pick, and returns whether they changed.
+    pub(crate) fn read_logs(&mut self, source: &crate::SessionSource, pretty_json: bool) -> bool {
+        let format = self.line_format(pretty_json);
+        self.use_format(&format);
+        if !self.logs_dirty {
+            return false;
+        }
+        let (first_retained, records) =
+            source.logs_since(&self.snapshot.id, self.log_read_cursor());
+        self.apply_log_records(first_retained, &records, &format);
+        true
+    }
+
     /// Merges records read after [`Self::log_read_cursor`] into the rendered lines.
     ///
     /// `first_retained` is the model's oldest retained sequence, or `None` once the log is empty;
@@ -99,7 +113,7 @@ impl Service {
                 while self
                     .cached_lines
                     .front()
-                    .is_some_and(|(seq, _)| *seq < first)
+                    .is_some_and(|cached| cached.seq < first)
                 {
                     self.cached_lines.pop_front();
                 }
@@ -111,14 +125,19 @@ impl Service {
             let replaces_last = self
                 .cached_lines
                 .back()
-                .is_some_and(|(seq, _)| *seq == record.seq);
+                .is_some_and(|cached| cached.seq == record.seq);
             match (formatted, replaces_last) {
-                (Some(formatted), true) => {
-                    if let Some((_, cached)) = self.cached_lines.back_mut() {
-                        *cached = formatted;
+                (Some(text), true) => {
+                    if let Some(cached) = self.cached_lines.back_mut() {
+                        cached.timestamp_unix_ms = record.timestamp_unix_ms;
+                        cached.text = text;
                     }
                 }
-                (Some(formatted), false) => self.cached_lines.push_back((record.seq, formatted)),
+                (Some(text), false) => self.cached_lines.push_back(CachedLine {
+                    seq: record.seq,
+                    timestamp_unix_ms: record.timestamp_unix_ms,
+                    text,
+                }),
                 // The replacement now falls below the level threshold.
                 (None, true) => {
                     self.cached_lines.pop_back();
@@ -130,107 +149,21 @@ impl Service {
         self.logs_dirty = false;
     }
 
-    /// Renders `cached_lines` into `cached_text` and indexes its rows for `wrap` at `wrap_width`
-    /// columns, unless that is done already.
+    /// Renders `cached_lines` into the pane's text and indexes its rows for `wrap` at
+    /// `wrap_width` columns, unless that is done already.
     pub(crate) fn render_text(&mut self, wrap: bool, wrap_width: u16) {
-        if !self.text_dirty && self.cached_wrap == Some((wrap, wrap_width)) {
+        if !self.text_dirty {
+            self.log.relayout(wrap, wrap_width);
             return;
         }
-        let joined = self
-            .cached_lines
-            .iter()
-            .map(|(_, line)| line.as_str())
-            .collect::<Vec<_>>()
-            .join("\n");
-        self.cached_text = joined.as_str().into_text().unwrap_or_else(|err| {
-            let escaped = strip_ansi_escapes::strip_str(&joined);
-            tracing::error!(
-                ?err,
-                input_bytes = joined.len(),
-                "failed to sanitize log buffer"
-            );
-            escaped.into()
-        });
-        // A selection finds its lines by the records they came from.
-        self.record_starts.clear();
-        let mut next = 0;
-        for (seq, line) in &self.cached_lines {
-            self.record_starts.push(RecordStart {
-                seq: *seq,
-                first_line: next,
-            });
-            next += 1 + line.matches('\n').count();
-        }
-        // Joining drops the line of a blank last record, which keeps a line of its own.
-        if self.cached_text.lines.len() < next {
-            self.cached_text
-                .lines
-                .resize(next, ratatui::text::Line::default());
-        }
-        self.cached_line_index
-            .rebuild(&self.cached_text, wrap, wrap_width);
-        self.cached_wrap = Some((wrap, wrap_width));
+        self.log.rebuild(
+            self.cached_lines
+                .iter()
+                .map(|cached| (RecordKey::of_seq(cached.seq), cached.text.as_str())),
+            wrap,
+            wrap_width,
+        );
         self.text_dirty = false;
-        self.text_generation = self.text_generation.wrapping_add(1);
-    }
-
-    /// The record line `line` of `cached_text` comes from, which stays with the line while older
-    /// records are dropped, or `None` before any record was rendered.
-    pub(crate) fn record_line(&self, line: usize) -> Option<RecordLine> {
-        let record = self
-            .record_starts
-            .partition_point(|start| start.first_line <= line)
-            .checked_sub(1)?;
-        let start = self.record_starts.get(record)?;
-        Some(RecordLine {
-            seq: start.seq,
-            line: line - start.first_line,
-        })
-    }
-
-    /// The line of `cached_text` that `key` names, or, when its record was dropped, `Err` with
-    /// the line now in its place.
-    pub(crate) fn find_record_line(&self, key: RecordLine) -> Result<usize, usize> {
-        let start_of = |record: usize| {
-            self.record_starts
-                .get(record)
-                .map_or(self.cached_text.lines.len(), |start| start.first_line)
-        };
-        match self
-            .record_starts
-            .binary_search_by_key(&key.seq, |start| start.seq)
-        {
-            Ok(record) => Ok(start_of(record) + key.line),
-            Err(record) => Err(start_of(record)),
-        }
-    }
-
-    /// What rendered `row` of the log pane shows, by a key that stays with it while lines
-    /// arrive and older ones are dropped, or `None` before any record was rendered.
-    pub(crate) fn row_anchor(&self, row: usize) -> Option<RowAnchor> {
-        let (line, first_row) = self.cached_line_index.line_of_row(row)?;
-        Some(RowAnchor {
-            record_line: self.record_line(line)?,
-            row_in_line: row - first_row,
-        })
-    }
-
-    /// The rendered row `anchor` names in the current text: the same row of the same line,
-    /// capped at the line's last row when it now wraps onto fewer, or the first row of the line
-    /// in its place when its record was dropped.
-    pub(crate) fn anchored_row(&self, anchor: RowAnchor) -> usize {
-        let index = &self.cached_line_index;
-        match self.find_record_line(anchor.record_line) {
-            Ok(line) => {
-                let Some(first_row) = index.line_start(line) else {
-                    return index.total_lines();
-                };
-                let next_row = index.line_start(line + 1).unwrap_or(index.total_lines());
-                let last_row = next_row.saturating_sub(1).max(first_row);
-                (first_row + anchor.row_in_line).min(last_row)
-            }
-            Err(line) => index.line_start(line).unwrap_or(index.total_lines()),
-        }
     }
 
     /// Whether structured records lead with their timestamp: the viewer's toggle, else the config.
@@ -268,36 +201,39 @@ impl Service {
     }
 }
 
-/// Where a record starts in the log pane's text.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RecordStart {
-    /// The record's sequence number.
-    pub seq: u64,
-    pub first_line: usize,
-}
-
-/// A line of the log pane's text by the record it comes from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct RecordLine {
-    /// The record's sequence number.
-    pub seq: u64,
-    /// The line within the record, which a live screen snapshot has several of.
-    pub line: usize,
-}
-
-/// A rendered row of the log pane by the line it belongs to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct RowAnchor {
-    pub record_line: RecordLine,
-    /// The row within the line, which wrapping spreads over several.
-    pub row_in_line: usize,
-}
-
 #[derive(Debug)]
 pub struct State {
     pub services: Vec<Service>,
     pub services_sidebar_width: u16,
     pub selected_service: usize,
+    /// Every service's logs interleaved, while the log pane shows them instead of the selected
+    /// service's.
+    pub(crate) all_logs: Option<crate::all_logs::AllLogs>,
+}
+
+/// Whose logs the log pane shows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ShownLogs {
+    /// The service with this ID.
+    Service(String),
+    /// Every service, interleaved.
+    All,
+}
+
+/// The logs the log pane shows and their text.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ShownLog<'a> {
+    pub service: Option<&'a Service>,
+    pub log: &'a LogText,
+}
+
+impl ShownLog<'_> {
+    /// Whose logs these are.
+    pub(crate) fn shows(&self) -> ShownLogs {
+        self.service.map_or(ShownLogs::All, |service| {
+            ShownLogs::Service(service.snapshot.id.clone())
+        })
+    }
 }
 
 impl Default for State {
@@ -306,6 +242,7 @@ impl Default for State {
             services: Vec::new(),
             services_sidebar_width: crate::style::INITIAL_SIDEBAR_WIDTH,
             selected_service: 0,
+            all_logs: None,
         }
     }
 }
@@ -327,6 +264,48 @@ impl State {
     #[must_use]
     pub fn current_service_mut(&mut self) -> Option<&mut Service> {
         self.services.get_mut(self.selected_service)
+    }
+
+    /// The logs the log pane shows: every service's while they are shown, else the selected
+    /// service's, or `None` without a service to show.
+    pub(crate) fn shown_log(&self) -> Option<ShownLog<'_>> {
+        match &self.all_logs {
+            Some(all_logs) => Some(ShownLog {
+                service: None,
+                log: &all_logs.log,
+            }),
+            None => self.current_service().map(|service| ShownLog {
+                service: Some(service),
+                log: &service.log,
+            }),
+        }
+    }
+
+    /// Reads new log records and renders the text the log pane shows for `wrap` at `wrap_width`
+    /// columns.
+    pub(crate) fn update_shown_log(
+        &mut self,
+        source: &crate::SessionSource,
+        pretty_json: bool,
+        wrap: bool,
+        wrap_width: u16,
+    ) {
+        match &mut self.all_logs {
+            Some(all_logs) => {
+                for service in &mut self.services {
+                    if service.read_logs(source, pretty_json) {
+                        all_logs.dirty = true;
+                    }
+                }
+                all_logs.render_text(&self.services, wrap, wrap_width);
+            }
+            None => {
+                if let Some(service) = self.services.get_mut(self.selected_service) {
+                    service.read_logs(source, pretty_json);
+                    service.render_text(wrap, wrap_width);
+                }
+            }
+        }
     }
 
     /// Update the selection index.
@@ -402,7 +381,7 @@ mod tests {
         service
             .cached_lines
             .iter()
-            .map(|(seq, line)| (*seq, line.as_str()))
+            .map(|cached| (cached.seq, cached.text.as_str()))
             .collect()
     }
 

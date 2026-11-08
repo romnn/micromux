@@ -13,6 +13,7 @@ use ratatui::widgets::Widget as _;
 use similar_asserts::assert_eq;
 
 use super::{Match, Query, find_matches};
+use crate::state::CachedLine;
 use crate::{App, LocalSource, SessionSource, ViewOptions};
 
 const WIDTH: u16 = 120;
@@ -87,7 +88,14 @@ fn set_records(
         .ok_or_else(|| eyre::eyre!("no service is selected"))?;
     // The first frame read the model's log already, so these lines are not overwritten.
     service.logs_dirty = false;
-    service.cached_lines = records.into_iter().collect();
+    service.cached_lines = records
+        .into_iter()
+        .map(|(seq, text)| CachedLine {
+            seq,
+            timestamp_unix_ms: 0,
+            text,
+        })
+        .collect();
     service.text_dirty = true;
     draw(app);
     Ok(())
@@ -653,7 +661,7 @@ async fn a_match_deep_in_a_wrapped_line_is_scrolled_into_view() -> eyre::Result<
     let line_rows = app
         .state
         .current_service()
-        .map(|service| service.cached_line_index.total_lines())
+        .map(|service| service.log.line_index.total_lines())
         .unwrap_or_default()
         - 38;
     assert!(

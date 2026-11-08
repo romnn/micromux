@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **`A` in the TUI shows every service's logs in one pane, interleaved in time order.** Each line is
+  tagged with its service, and search, scrolling and copying work as in a service's own pane.
 - **`micromux attach` types into services and resizes their PTYs.** Press `a` in an attached TUI;
   it resizes the PTYs only while in PTY input mode, so watching never changes them.
 - **`/` searches the selected service's logs in the TUI, and `n` / `N` move between the

@@ -1481,6 +1481,10 @@ const HELP_COLUMNS: [&[HelpSection]; 2] = [
                     keys: "H",
                     description: "Healthcheck pane",
                 },
+                HelpKey {
+                    keys: "A",
+                    description: "All services' logs",
+                },
             ],
         },
         HelpSection {
@@ -1618,20 +1622,20 @@ fn help_rows() -> Vec<Line<'static>> {
         .collect()
 }
 
-/// The logs pane's top-right corner: the active filters and the search, or `None` when nothing
-/// is hidden or searched for.
+/// The logs pane's top-right corner: the filters of `format`, if any, and the search, or `None`
+/// when nothing is hidden or searched for.
 fn logs_status(
-    format: &crate::json_log::LineFormat,
+    format: Option<&crate::json_log::LineFormat>,
     search: Option<crate::search::SearchStatus<'_>>,
 ) -> Option<Line<'static>> {
     let mut filters = Vec::new();
-    if format.min_level.is_some() {
+    if let Some(min_level) = format.and_then(|format| format.min_level) {
         filters.push(format!(
             "level ≥ {}",
-            crate::level::threshold_label(format.min_level)
+            crate::level::threshold_label(Some(min_level))
         ));
     }
-    match format.hidden_fields.len() {
+    match format.map_or(0, |format| format.hidden_fields.len()) {
         0 => {}
         1 => filters.push("1 field hidden".to_string()),
         hidden => filters.push(format!("{hidden} fields hidden")),
@@ -2143,6 +2147,7 @@ impl App {
             KeyHint::toggle("w", "Wrap", on_off(self.log_view.wrap)),
             KeyHint::toggle("t", "Tail", on_off(self.log_view.follow_tail)),
             KeyHint::toggle("H", "Health", on_off(self.show_healthcheck_pane)),
+            KeyHint::toggle("A", "All", on_off(self.state.all_logs.is_some())),
         ]
     }
 
@@ -2283,50 +2288,59 @@ impl App {
         (rows, state.offset())
     }
 
-    /// Draws the selected service's logs and returns where the URLs in its title landed.
-    /// Reads the selected service's new log records and renders its text for a pane `area`
-    /// wide, and returns the format it is rendered with.
+    /// Reads new log records and renders the text the log pane shows for a pane `area` wide.
     ///
     /// A view off the tail stays on the rows it shows while new lines arrive and the oldest are
     /// dropped, which would otherwise shift the text up under it.
-    fn update_log_text(&mut self, area: Rect) -> Option<crate::json_log::LineFormat> {
-        let service = self.state.current_service_mut()?;
-        let top = if self.log_view.follow_tail {
-            None
-        } else {
-            service.row_anchor(self.log_view.scroll_offset)
-        };
-        let generation = service.text_generation;
-        let format = service.line_format(self.pretty_json_logs);
-        service.use_format(&format);
-        if service.logs_dirty {
-            let (first_retained, records) = self
-                .source
-                .logs_since(&service.snapshot.id, service.log_read_cursor());
-            service.apply_log_records(first_retained, &records, &format);
-        }
-        service.render_text(self.log_view.wrap, area.width.saturating_sub(3));
+    fn update_log_text(&mut self, area: Rect) {
+        let shown = self.state.shown_log();
+        let top = shown
+            .filter(|_| !self.log_view.follow_tail)
+            .and_then(|shown| shown.log.row_anchor(self.log_view.scroll_offset));
+        let generation = shown.map(|shown| shown.log.generation);
+        self.state.update_shown_log(
+            &self.source,
+            self.pretty_json_logs,
+            self.log_view.wrap,
+            area.width.saturating_sub(3),
+        );
         if let Some(top) = top
-            && service.text_generation != generation
+            && let Some(shown) = self.state.shown_log()
+            && Some(shown.log.generation) != generation
         {
-            self.log_view.scroll_offset = service.anchored_row(top);
+            self.log_view.scroll_offset = shown.log.anchored_row(top);
         }
-        Some(format)
     }
 
+    /// Draws the logs the log pane shows and returns where the URLs in its title landed.
     fn render_logs(&mut self, area: Rect, buf: &mut Buffer) -> Vec<crate::mouse::LinkHit> {
         let session = self.source.session_summary();
-        let Some(format) = self.update_log_text(area) else {
+        self.update_log_text(area);
+        let Some(shown) = self.state.shown_log() else {
             return Vec::new();
         };
-
-        let Some(current_service) = self.state.current_service() else {
+        self.search.refresh(shown);
+        let focused = self.focus == crate::Focus::Logs;
+        let Some(current_service) = shown.service else {
+            // Every service's logs, whose own filters each service's pane names.
+            self.log_view.render(
+                area,
+                &shown.log.line_index,
+                &shown.log.text,
+                log_view::PaneBorders {
+                    title: Line::from(pane_name("All logs", focused)),
+                    status: logs_status(None, self.search.status()),
+                    detail: None,
+                    focused,
+                },
+                self.search.highlights(),
+                buf,
+            );
             return Vec::new();
         };
-        self.search.refresh(current_service);
-        let text = &current_service.cached_text;
+        let format = current_service.line_format(self.pretty_json_logs);
         let detail = service_detail(&current_service.snapshot, now_unix_ms());
-        let status = logs_status(&format, self.search.status());
+        let status = logs_status(Some(&format), self.search.status());
         // The pane's border spans its width less the scrollbar column and both corners.
         let title_width = usize::from(area.width)
             .saturating_sub(3)
@@ -2338,7 +2352,7 @@ impl App {
         );
         let mut title = title;
         if let Some(name) = title.spans.first_mut() {
-            *name = pane_name("Logs", self.focus == crate::Focus::Logs);
+            *name = pane_name("Logs", focused);
         }
         // The title starts right after the pane's top-left corner.
         let links = url_columns
@@ -2355,19 +2369,19 @@ impl App {
             .collect();
         tracing::trace!(
             service_id = current_service.snapshot.id,
-            num_lines = current_service.cached_line_index.total_lines(),
+            num_lines = shown.log.line_index.total_lines(),
             "collected logs"
         );
 
         self.log_view.render(
             area,
-            &current_service.cached_line_index,
-            text,
+            &shown.log.line_index,
+            &shown.log.text,
             log_view::PaneBorders {
                 title,
                 status,
                 detail: Some(detail),
-                focused: self.focus == crate::Focus::Logs,
+                focused,
             },
             self.search.highlights(),
             buf,

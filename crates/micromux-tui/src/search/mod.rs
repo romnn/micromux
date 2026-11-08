@@ -1,5 +1,5 @@
-//! Searching the selected service's logs with `/` and moving between the matches with `n` and
-//! `N`.
+//! Searching the log pane, which shows the selected service's logs or every service's, with `/`
+//! and moving between the matches with `n` and `N`.
 //!
 //! The search runs over the text the log pane draws, after ANSI colors are parsed and JSON
 //! records are formatted, so it finds what the pane shows, for a local session and an attached
@@ -24,7 +24,8 @@ use ratatui::widgets::{Paragraph, Widget as _, Wrap};
 use unicode_segmentation::UnicodeSegmentation as _;
 
 use crate::App;
-use crate::state::{RecordLine, Service};
+use crate::log_text::{LogText, RecordKey, RecordLine};
+use crate::state::{ShownLog, ShownLogs};
 
 #[cfg(test)]
 mod tests;
@@ -189,14 +190,13 @@ pub(crate) fn find_matches(text: &ratatui::text::Text<'_>, query: &Query) -> Vec
     matches
 }
 
-/// The rendered row `found` starts on in `service`'s text, under the wrapping the text was
-/// last indexed for.
-fn match_row(service: &Service, found: &Match) -> Option<usize> {
-    let first_row = service.cached_line_index.line_start(found.line)?;
-    let Some((true, width)) = service.cached_wrap else {
+/// The rendered row `found` starts on in `log`, under the wrapping it was last laid out for.
+fn match_row(log: &LogText, found: &Match) -> Option<usize> {
+    let first_row = log.line_index.line_start(found.line)?;
+    let Some(width) = log.wrap_width() else {
         return Some(first_row);
     };
-    let line = service.cached_text.lines.get(found.line)?;
+    let line = log.text.lines.get(found.line)?;
     Some(first_row + row_in_wrapped_line(line, &found.bytes, width))
 }
 
@@ -283,10 +283,10 @@ struct ActiveSearch {
     current: Option<CurrentMatch>,
 }
 
-/// Which service's text, at which rebuild, matches were found in.
+/// Whose logs, at which rebuild of their text, matches were found in.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FoundIn {
-    service_id: String,
+    shows: ShownLogs,
     text_generation: u64,
 }
 
@@ -305,11 +305,11 @@ struct MatchAnchor {
 }
 
 impl MatchAnchor {
-    fn of(found: &Match, service: &Service) -> Self {
+    fn of(found: &Match, log: &LogText) -> Self {
         Self {
             // Every line of a rendered text belongs to a record, so the fallback is never taken.
-            record_line: service.record_line(found.line).unwrap_or(RecordLine {
-                seq: 0,
+            record_line: log.record_line(found.line).unwrap_or(RecordLine {
+                record: RecordKey::default(),
                 line: found.line,
             }),
             start: found.bytes.start,
@@ -347,37 +347,39 @@ impl LogSearch {
         self.active = None;
     }
 
-    /// Finds the matches again when `service`'s text is not the one they were found in.
+    /// Finds the matches again when `shown`'s text is not the one they were found in.
     ///
-    /// In the same service the current match follows its text; when its text is gone, the
-    /// nearest newer match becomes current, or the newest one when none is newer.
-    /// In another service no match is current until `n` or `N` moves to one.
-    pub(crate) fn refresh(&mut self, service: &Service) {
+    /// In the same logs the current match follows its text; when its text is gone, the nearest
+    /// newer match becomes current, or the newest one when none is newer.
+    /// In other logs, such as another service's, no match is current until `n` or `N` moves to
+    /// one.
+    pub(crate) fn refresh(&mut self, shown: ShownLog<'_>) {
         let Some(active) = &mut self.active else {
             return;
         };
+        let log = shown.log;
         let found_in = FoundIn {
-            service_id: service.snapshot.id.clone(),
-            text_generation: service.text_generation,
+            shows: shown.shows(),
+            text_generation: log.generation,
         };
         if active.found_in.as_ref() == Some(&found_in) {
             return;
         }
-        let same_service = active
+        let same_logs = active
             .found_in
             .as_ref()
-            .is_some_and(|previous| previous.service_id == found_in.service_id);
-        active.matches = find_matches(&service.cached_text, &active.query);
-        active.current = active.current.filter(|_| same_service).and_then(|current| {
+            .is_some_and(|previous| previous.shows == found_in.shows);
+        active.matches = find_matches(&log.text, &active.query);
+        active.current = active.current.filter(|_| same_logs).and_then(|current| {
             // Matches are ordered by line, and so by anchor.
             let index = active
                 .matches
-                .partition_point(|found| MatchAnchor::of(found, service) < current.anchor)
+                .partition_point(|found| MatchAnchor::of(found, log) < current.anchor)
                 .min(active.matches.len().checked_sub(1)?);
             let found = active.matches.get(index)?;
             Some(CurrentMatch {
                 index,
-                anchor: MatchAnchor::of(found, service),
+                anchor: MatchAnchor::of(found, log),
             })
         });
         active.found_in = Some(found_in);
@@ -388,11 +390,11 @@ impl LogSearch {
     ///
     /// Without a current match, `Older` moves to the newest match at or above the bottom of
     /// `view` and `Newer` to the oldest at or below its top; past either end it wraps around.
-    /// `service` must be the one the matches were refreshed for.
+    /// `log` must be the text the matches were refreshed for.
     pub(crate) fn step(
         &mut self,
         direction: Direction,
-        service: &Service,
+        log: &LogText,
         view: ViewRows,
     ) -> Option<usize> {
         let active = self.active.as_mut()?;
@@ -400,7 +402,7 @@ impl LogSearch {
         let last = count.checked_sub(1)?;
         // Choosing compares the rows lines start on, which needs no drawing; only the chosen
         // match is placed within its wrapped line.
-        let row_of = |found: &Match| service.cached_line_index.line_start(found.line);
+        let row_of = |found: &Match| log.line_index.line_start(found.line);
         let wrap_newer = |index: usize| if index < count { index } else { 0 };
         let index = match (active.current, direction) {
             (Some(current), Direction::Older) => current.index.checked_sub(1).unwrap_or(last),
@@ -419,9 +421,9 @@ impl LogSearch {
         let found = active.matches.get(index)?;
         active.current = Some(CurrentMatch {
             index,
-            anchor: MatchAnchor::of(found, service),
+            anchor: MatchAnchor::of(found, log),
         });
-        match_row(service, found)
+        match_row(log, found)
     }
 
     /// What the log pane's border says, while a query is confirmed.
@@ -498,11 +500,11 @@ impl App {
     /// arrive.
     pub(crate) fn jump_to_match(&mut self, direction: Direction) {
         let viewport = usize::from(self.log_viewport_height()).max(1);
-        let Some(service) = self.state.current_service() else {
+        let Some(shown) = self.state.shown_log() else {
             return;
         };
-        self.search.refresh(service);
-        let total = service.cached_line_index.total_lines();
+        self.search.refresh(shown);
+        let total = shown.log.line_index.total_lines();
         let max_offset = total.saturating_sub(viewport);
         let offset = if self.log_view.follow_tail {
             max_offset
@@ -513,7 +515,7 @@ impl App {
             top: offset,
             bottom: offset + viewport - 1,
         };
-        let Some(row) = self.search.step(direction, service, view) else {
+        let Some(row) = self.search.step(direction, shown.log, view) else {
             return;
         };
         // A match on screen leaves the view where it is; one off screen comes to its middle.

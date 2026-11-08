@@ -4,10 +4,12 @@
 //! sender, a shutdown token, and display options; call [`App::render`] to run it. The TUI holds only
 //! view state and re-reads its synchronous source on each [`micromux::SessionChange`].
 
+mod all_logs;
 mod clipboard;
 mod event;
 mod json_log;
 mod level;
+mod log_text;
 mod mouse;
 mod platform;
 mod remote;
@@ -155,6 +157,9 @@ pub struct App {
     /// Terminal work queued for the event loop.
     effects: Vec<Effect>,
     pty_input_mode: bool,
+    /// Whether the log pane goes back to every service's logs when PTY input mode ends, which
+    /// shows the selected service's logs while it lasts.
+    all_logs_after_input: bool,
     /// Whether the PTYs follow this TUI's pane only while it types into a service, as an attached
     /// TUI's do.
     resizes_only_in_pty_input_mode: bool,
@@ -239,6 +244,7 @@ impl App {
             hits: mouse::Hits::default(),
             effects: Vec::new(),
             pty_input_mode: false,
+            all_logs_after_input: false,
             resizes_only_in_pty_input_mode,
             focus: Focus::Services,
             terminal_cols: 80,
@@ -749,6 +755,10 @@ impl App {
                     .position(|service| service.snapshot.id == selected_id)
             })
             .unwrap_or_else(|| previous_index.min(self.state.services.len().saturating_sub(1)));
+        // Services may have come, gone or moved, which changes the order and tags of all logs.
+        if let Some(all_logs) = &mut self.state.all_logs {
+            all_logs.dirty = true;
+        }
     }
 
     fn service_mut(&mut self, id: &str) -> Option<&mut state::Service> {
@@ -884,6 +894,9 @@ impl App {
             // Enter PTY input mode
             KeyCode::Char('a') if self.input.is_some() => self.enter_pty_input_mode(),
             KeyCode::Char('H') => self.toggle_healthcheck_pane(),
+
+            // Show every service's logs, or the selected service's again
+            KeyCode::Char('A') => self.show_all_logs(self.state.all_logs.is_none()),
 
             // Disable current service
             KeyCode::Char('d') => self.disable_current_service(),
@@ -1034,9 +1047,24 @@ impl App {
         self.level_picker = Some(picker);
     }
 
+    /// Shows every service's logs in the log pane when `all` holds, else the selected service's,
+    /// following the newest lines either way.
+    fn show_all_logs(&mut self, all: bool) {
+        if all == self.state.all_logs.is_some() {
+            return;
+        }
+        self.state.all_logs = all.then(all_logs::AllLogs::new);
+        self.log_view.follow_tail = true;
+    }
+
     /// Starts typing into the selected service, and takes the PTY size back for this TUI's pane
     /// even when another client resized the PTYs since, because the client typing wins.
+    ///
+    /// The log pane shows the selected service while the mode lasts, so what is typed shows
+    /// where it goes.
     fn enter_pty_input_mode(&mut self) {
+        self.all_logs_after_input = self.state.all_logs.is_some();
+        self.show_all_logs(false);
         self.pty_input_mode = true;
         self.last_pty_cols = 0;
         self.last_pty_rows = 0;
@@ -1047,6 +1075,9 @@ impl App {
     /// reconnect to a replacement session cannot resize that session's PTYs while it only watches.
     fn leave_pty_input_mode(&mut self) {
         self.pty_input_mode = false;
+        if std::mem::take(&mut self.all_logs_after_input) {
+            self.show_all_logs(true);
+        }
         if self.resizes_only_in_pty_input_mode
             && let Some(input) = &self.input
         {
@@ -1180,12 +1211,12 @@ impl App {
     /// Scrolls the logs by `rows`, up when negative, as [`render::log_view::LogView::scroll_by`]
     /// does.
     fn scroll_logs(&mut self, rows: isize) {
-        let Some(service) = self.state.current_service() else {
+        let Some(shown) = self.state.shown_log() else {
             return;
         };
         // Wrap-aware count persisted by the renderer, so scrolling reaches the true bottom
         // even when wrapping is enabled (the raw entry count would stop short).
-        let total = service.cached_line_index.total_lines();
+        let total = shown.log.line_index.total_lines();
         let viewport = usize::from(self.log_viewport_height());
         self.log_view.scroll_by(rows, total, viewport);
     }
@@ -3230,7 +3261,7 @@ mod tests {
         );
         app.state.selected_service = 1;
         if let Some(service) = app.state.current_service_mut() {
-            service.cached_text = ratatui::text::Text::from("preserved");
+            service.log.text = ratatui::text::Text::from("preserved");
         }
 
         let updated = handles_for(indoc! {r#"
@@ -3254,7 +3285,7 @@ mod tests {
         assert_eq!(
             app.state
                 .current_service()
-                .map(|service| service.cached_text.clone()),
+                .map(|service| service.log.text.clone()),
             Some(ratatui::text::Text::from("preserved"))
         );
         Ok(())

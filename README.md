@@ -76,6 +76,7 @@ Press `?` in the TUI for every key. The essentials:
 | `d` | Disable or enable the service |
 | `a` | Type into the service's terminal (`Ctrl+]` leaves) |
 | `H` | Show the healthcheck pane |
+| `A` | Show every service's logs, interleaved in time order |
 | `/` | Search the service's logs; `n` / `N` move between matches |
 | `i` / `u` | Describe the service / the session's URLs and ports |
 | `q` | Quit |
