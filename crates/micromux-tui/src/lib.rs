@@ -1013,6 +1013,17 @@ impl App {
         self.maybe_resize_pty();
     }
 
+    /// Stops typing into the selected service; an attached TUI also withdraws its size, so a
+    /// reconnect to a replacement session cannot resize that session's PTYs while it only watches.
+    fn leave_pty_input_mode(&mut self) {
+        self.pty_input_mode = false;
+        if self.resizes_only_in_pty_input_mode
+            && let Some(input) = &self.input
+        {
+            input.withdraw_size();
+        }
+    }
+
     fn handle_key_press_pty_input_mode(&mut self, key: crossterm::event::KeyEvent) {
         use crossterm::event::{KeyCode, KeyModifiers};
 
@@ -1025,7 +1036,7 @@ impl App {
             _ => false,
         };
         match key.code {
-            _ if exit => self.pty_input_mode = false,
+            _ if exit => self.leave_pty_input_mode(),
             _ => {
                 if let Some(bytes) = key_event_to_bytes(key.code, key.modifiers)
                     && let Some(service) = self.state.current_service()
@@ -2855,11 +2866,19 @@ mod tests {
         app.handle_crossterm_event(&crossterm::event::Event::Resize(100, 30));
         assert_eq!(*forwarding.size.borrow_and_update(), Some(pane_size(&app)));
 
-        // Leaving it stops forwarding resizes again.
+        // Leaving it withdraws the size, so a reconnect to a replacement session, which marks
+        // the size changed to re-send it, finds nothing to send, and pane changes send nothing.
         app.handle_key_press(press(KeyCode::Char(']'), KeyModifiers::CONTROL));
         assert!(!app.pty_input_mode);
+        assert_eq!(*forwarding.size.borrow_and_update(), None);
+        forwarding.size.mark_changed();
+        assert_eq!(*forwarding.size.borrow_and_update(), None);
         app.handle_crossterm_event(&crossterm::event::Event::Resize(140, 50));
         assert!(!forwarding.size.has_changed()?);
+
+        // Entering the mode again sends the current size once more.
+        app.handle_key_press(press(KeyCode::Char('a'), KeyModifiers::NONE));
+        assert_eq!(*forwarding.size.borrow_and_update(), Some(pane_size(&app)));
         Ok(())
     }
 

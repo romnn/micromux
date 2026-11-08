@@ -409,7 +409,8 @@ async fn run_remote(
                 "input typed before the connection broke was discarded".to_string(),
             );
         }
-        // A replacement session starts its PTYs at its own default size, so assert ours again.
+        // A replacement session starts its PTYs at its own default size, so assert ours again,
+        // if the TUI still holds one: it withdraws its size when it leaves PTY input mode.
         // The same session still holds the last size it received, which may be another client's.
         if !store.read().session.is_same_instance(&previous_session) {
             inbox.terminal.size.mark_changed();
@@ -1609,6 +1610,11 @@ mod tests {
         let mut request = ScriptedConnection::new([Response::TerminalQueued]);
         forward_latest_size(&mut request, &store, &changes, &mut forwarding.size).await?;
         assert!(!forwarding.size.has_changed()?);
+
+        // A withdrawn size is not re-sent, even when a reconnect marks it changed.
+        terminal.withdraw_size();
+        forwarding.size.mark_changed();
+        forward_latest_size(&mut request, &store, &changes, &mut forwarding.size).await?;
         assert_matches!(
             request.requests.as_slice(),
             [Request::ResizeTerminal {

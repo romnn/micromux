@@ -540,6 +540,16 @@ impl TerminalControl {
         }
     }
 
+    /// Withdraws the size a forwarding capability holds, so its holder sends no resize from it,
+    /// not even after reconnecting to a replacement session.
+    ///
+    /// A resize already sent stays in effect; the scheduler's own capability ignores this.
+    pub fn withdraw_size(&self) {
+        if let ResizeTarget::Forwarded(size) = &self.resize {
+            size.send_replace(None);
+        }
+    }
+
     /// Queue a terminal resize, waiting for scheduler capacity.
     ///
     /// Returns `false` when the scheduler, or the [`TerminalForwarding`] holder, has stopped.
@@ -723,6 +733,11 @@ mod tests {
             })
         );
         assert!(!forwarding.size.has_changed()?);
+
+        // A withdrawn size leaves nothing to forward.
+        assert!(control.try_resize(90, 20));
+        control.withdraw_size();
+        assert_eq!(*forwarding.size.borrow_and_update(), None);
 
         // Without a receiver the resize has nowhere to go.
         drop(forwarding);
