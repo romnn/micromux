@@ -1342,7 +1342,7 @@ async fn a_single_cell_can_be_selected() -> eyre::Result<()> {
 
 /// Ctrl+] leaves PTY input mode as every terminal sends it, the byte 0x1d that crossterm reads as
 /// Ctrl+5, and as the kitty protocol reports it; so does Alt+Esc where it arrives apart, while a
-/// plain Esc goes to the service.
+/// plain Esc stays in the mode.
 #[tokio::test]
 async fn ctrl_close_bracket_leaves_pty_input_mode() -> eyre::Result<()> {
     let mut app = app(SERVICES)?;
