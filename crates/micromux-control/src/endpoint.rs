@@ -159,6 +159,10 @@ pub fn runtime_dir_statuses() -> Vec<RuntimeDirStatus> {
 }
 
 fn runtime_dir_candidates() -> Vec<PathBuf> {
+    // An isolated setup finds only its own sessions.
+    if let Some(state) = micromux::state_directory_override() {
+        return vec![runtime_dir_in(&state)];
+    }
     let mut candidates = Vec::new();
 
     if let Some(directory) = micromux::project_dir()
@@ -200,6 +204,8 @@ fn per_user_fallback_dir() -> PathBuf {
 ///
 /// It deliberately ignores `$TMPDIR` and `$XDG_RUNTIME_DIR`, which differ between shells, agents,
 /// and services of the same user, and stays short enough for socket paths on macOS.
+/// [`micromux::STATE_DIR_VARIABLE`] replaces it explicitly (see [`coordination_dir_in`]), so a
+/// test or an isolated setup never joins the user's real sessions or shared proxy.
 ///
 /// # Errors
 ///
@@ -207,10 +213,35 @@ fn per_user_fallback_dir() -> PathBuf {
 /// another user.
 #[cfg(unix)]
 pub fn coordination_dir() -> std::io::Result<PathBuf> {
-    let uid = nix::unistd::Uid::current();
-    let directory = Path::new("/tmp").join(format!("micromux-{uid}"));
+    let directory = micromux::state_directory_override().map_or_else(
+        || {
+            let uid = nix::unistd::Uid::current();
+            Path::new("/tmp").join(format!("micromux-{uid}"))
+        },
+        |state| coordination_dir_in(&state),
+    );
     ensure_private_dir(&directory)?;
     Ok(directory)
+}
+
+/// The runtime directory of an isolated setup in `state_directory`, which holds its sessions'
+/// control sockets.
+///
+/// micromux creates it and makes it private, which leaves the permissions of the state directory
+/// itself alone.
+#[must_use]
+pub fn runtime_dir_in(state_directory: &Path) -> PathBuf {
+    state_directory.join("run")
+}
+
+/// The coordination directory of an isolated setup in `state_directory`, which holds its session
+/// locks and its shared proxy's socket and lock.
+///
+/// It is separate from [`runtime_dir_in`], because discovery takes every socket in a runtime
+/// directory for a session's control socket.
+#[must_use]
+pub fn coordination_dir_in(state_directory: &Path) -> PathBuf {
+    state_directory.join("coordination")
 }
 
 #[cfg(unix)]

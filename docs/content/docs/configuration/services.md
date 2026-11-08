@@ -197,7 +197,7 @@ services:
 
 **Timeout.** A cleanup still running after its `timeout` gets the service's `stop_signal`, and `SIGKILL` 5 seconds later, together with everything it started. Whatever a cleanup leaves running when it exits is stopped at once, so a cleanup cannot start a lasting background process.
 
-**Output.** Each line the cleanup prints appears in the run's log as `[cleanup] <line>`. The output of the latest cleanup is also kept in a file, framed by a line saying when it started and a line saying how it ended: `~/.local/state/micromux/cleanup/<config-key>/<service>.log` on Linux and `~/Library/Application Support/com.romnn.micromux/cleanup/<config-key>/<service>.log` on macOS, where `<config-key>` is a digest of the config file's path.
+**Output.** Each line the cleanup prints appears in the run's log as `[cleanup] <line>`. The output of the latest cleanup is also kept in a file, framed by a line saying when it started and a line saying how it ended: `~/.local/state/micromux/cleanup/<config-key>/<service>.log` on Linux and `~/Library/Application Support/com.romnn.micromux/cleanup/<config-key>/<service>.log` on macOS, where `<config-key>` is a digest of the config file's path. With [`MICROMUX_STATE_DIR`]({{< relref "sessions.md" >}}#isolated-state) set, it is `cleanup/<config-key>/<service>.log` in that directory.
 
 **Status.** The service's timeline records `CleanupStarted`, then `CleanupFinished` or `CleanupFailed` with the exit code or the timeout, and its status carries `last_cleanup`: the run it followed, whether it succeeded, its exit code, and whether it timed out. The MCP `diagnose` tool reports every service whose last cleanup failed. A failure is only reported: it never blocks a restart or the session.
 

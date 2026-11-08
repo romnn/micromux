@@ -215,9 +215,9 @@ pub(crate) fn start_failure_message(base: &str, stderr_path: &Path) -> String {
         .unwrap_or_default();
     let stderr = String::from_utf8_lossy(&stderr);
     let stderr = strip_ansi_escapes::strip_str(&stderr);
-    let log_hint = micromux::project_dir().map_or_else(
+    let log_hint = micromux::cache_directory().map_or_else(
         || "session log directory could not be resolved".to_string(),
-        |dirs| format!("session logs directory: {}", dirs.cache_dir().display()),
+        |directory| format!("session logs directory: {}", directory.display()),
     );
     let mut message = format!(
         "{base}\ncaptured stderr file: {}\n{log_hint}",

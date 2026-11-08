@@ -158,8 +158,7 @@ fn service_log_dir_name(value: &str) -> String {
 }
 
 pub(super) fn create_spool_dir() -> Option<(PathBuf, File)> {
-    let Some(base) = crate::project_dir().map(|dirs| dirs.cache_dir().join("session-run-logs"))
-    else {
+    let Some(base) = crate::cache_directory().map(|cache| cache.join("session-run-logs")) else {
         tracing::warn!("disk run logs disabled: no project cache directory is available");
         return None;
     };

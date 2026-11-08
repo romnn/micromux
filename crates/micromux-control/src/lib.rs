@@ -36,8 +36,9 @@ pub use client::{
 #[cfg(unix)]
 pub use endpoint::coordination_dir;
 pub use endpoint::{
-    CanonicalConfigPath, ControlEndpoint, RuntimeDirStatus, endpoint_for, endpoint_from_hash,
-    endpoint_hash, runtime_dir, runtime_dir_statuses, transport_supported, usable_runtime_dirs,
+    CanonicalConfigPath, ControlEndpoint, RuntimeDirStatus, coordination_dir_in, endpoint_for,
+    endpoint_from_hash, endpoint_hash, runtime_dir, runtime_dir_in, runtime_dir_statuses,
+    transport_supported, usable_runtime_dirs,
 };
 pub use micromux::{
     DynamicServiceAck, ReconcileAction, ReconcileActionKind, ReconcileReceipt, ResolvedEnvironment,

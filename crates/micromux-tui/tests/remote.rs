@@ -63,7 +63,12 @@ fn build_session(dir: &Path, yaml: &str) -> eyre::Result<Session> {
     // `CanonicalConfigPath` signatures below make any other input a compile error.
     let config_path = micromux_control::CanonicalConfigPath::new(&config_path)?;
     config.config_path = Some(config_path.as_path().to_path_buf());
-    let mux = Arc::new(micromux::Micromux::new(&config)?);
+    // A port registry of the test's own, so the session never registers with the user's.
+    let registry = micromux::PortRegistry::at(dir.join("registry"));
+    let mux = Arc::new(micromux::Micromux::with_session(
+        &config,
+        micromux::Session::establish(&config, &registry)?,
+    )?);
 
     let shutdown = CancellationToken::new();
     let (runner, handles) = mux.start(shutdown.clone());

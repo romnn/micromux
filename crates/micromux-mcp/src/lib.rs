@@ -3510,7 +3510,12 @@ services:
             .map_err(|err| eyre::eyre!("parse config: {err}"))?;
         config.config_path = Some(config_path.as_path().to_path_buf());
 
-        let mux = Arc::new(micromux::Micromux::new(&config)?);
+        // A port registry of the test's own, so the session never registers with the user's.
+        let registry = micromux::PortRegistry::at(project_dir.join("registry"));
+        let mux = Arc::new(micromux::Micromux::with_session(
+            &config,
+            micromux::Session::establish(&config, &registry)?,
+        )?);
         let shutdown = micromux::CancellationToken::new();
         let (runner, handles) = mux.clone().start(shutdown.clone());
         let runner = tokio::spawn(runner);

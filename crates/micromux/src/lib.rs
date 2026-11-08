@@ -53,7 +53,9 @@ use tokio::sync::mpsc;
 
 pub use tokio_util::sync::CancellationToken;
 
-pub use cleanup::{CleanupWaitCancelled, cleanup_state_directory, wait_for_previous_cleanups};
+pub use cleanup::{
+    CleanupWaitCancelled, cleanup_directory_in, cleanup_state_directory, wait_for_previous_cleanups,
+};
 pub use config::{
     ConfigError, ConfigFile, ControlConfig, DependencyCondition, DynamicServicesPolicy,
     MAX_CONFIG_FILE_BYTES, config_file_names, find_config_file, from_str, read_config_file,
@@ -82,8 +84,9 @@ pub use service::{
     SkippedEnvFile, WorkingDirectoryError,
 };
 pub use session::{
-    PortRegistry, Route, RouteError, RoutingStatus, Session, SessionEnvironment, SessionError,
-    SessionIdentity, SessionStatus, SessionSummary,
+    PortRegistry, Route, RouteError, RoutingStatus, STATE_DIR_VARIABLE, Session,
+    SessionEnvironment, SessionError, SessionIdentity, SessionStatus, SessionSummary,
+    state_directory_override,
 };
 pub use shell::shell_join;
 pub use spec::{
@@ -537,6 +540,19 @@ pub fn project_dir() -> Option<directories::ProjectDirs> {
     directories::ProjectDirs::from("com", "romnn", "micromux")
 }
 
+/// The directory for micromux's own log files and the session run-log spools.
+///
+/// It is `cache` in the directory [`STATE_DIR_VARIABLE`] names when that is set, and the user's
+/// cache directory otherwise.
+/// Returns `None` when neither can be determined.
+#[must_use]
+pub fn cache_directory() -> Option<PathBuf> {
+    match state_directory_override() {
+        Some(state) => Some(state.join("cache")),
+        None => project_dir().map(|directories| directories.cache_dir().to_path_buf()),
+    }
+}
+
 fn memory_retention_is_unbounded(retention: LogRetention) -> bool {
     retention.memory.max_lines == LogLimit::Unbounded
         || retention.memory.max_bytes == LogLimit::Unbounded
@@ -784,7 +800,11 @@ mod tests {
         let mut diagnostics = Vec::new();
         let mut config = from_str(raw, &link, 0usize, None, &mut diagnostics)?;
         config.config_path = Some(real.join("micromux.yaml").canonicalize()?);
-        let mux = Arc::new(Micromux::new(&config)?);
+        let registry = PortRegistry::at(directory.path().join("registry"));
+        let mux = Arc::new(Micromux::with_session(
+            &config,
+            Session::establish(&config, &registry)?,
+        )?);
         let shutdown = CancellationToken::new();
         let (runner, handles) = mux.start(shutdown.clone());
         let runner = tokio::spawn(runner);

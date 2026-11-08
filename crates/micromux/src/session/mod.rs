@@ -16,8 +16,8 @@ use indexmap::IndexMap;
 
 use crate::config::{ConfigFile, SessionConfig};
 
-pub use registry::PortRegistry;
 pub(crate) use registry::{DEFAULT_PORT_RANGE, Lease, create_private_dir, user_state_directory};
+pub use registry::{PortRegistry, STATE_DIR_VARIABLE, state_directory_override};
 pub use routes::{CATCH_ALL_HOST, Route, RouteError, route_path_problem};
 pub(crate) use routes::{owner as route_owner, resolve as resolve_routes};
 pub use status::{RoutingStatus, SessionStatus, SessionSummary};
@@ -63,6 +63,22 @@ pub enum SessionError {
         /// Underlying filesystem error.
         #[source]
         source: std::io::Error,
+    },
+    /// One process held the port registry lock for longer than a session waits.
+    #[error(
+        "the port registry lock {} is still held after {}s{}; another micromux is stuck while \
+         allocating ports, so stop it and start the session again",
+        path.display(),
+        waited.as_secs(),
+        holder.map(|pid| format!(" by pid {pid}")).unwrap_or_default()
+    )]
+    RegistryLocked {
+        /// Path of the registry lock file.
+        path: PathBuf,
+        /// How long the session waited without the lock changing hands.
+        waited: std::time::Duration,
+        /// Pid the holder recorded in the lock file, when it could be read.
+        holder: Option<u32>,
     },
     /// No per-user state directory could be determined for the port registry.
     #[error("cannot determine a per-user state directory for the port registry")]

@@ -17,7 +17,9 @@ use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 use similar_asserts::assert_eq;
 
-const MICROMUX: &str = env!("CARGO_BIN_EXE_micromux");
+mod common;
+
+use common::MICROMUX;
 
 /// A session with one allocated port and a service whose environment mixes an env file, an
 /// interpolated inline entry that needs quoting, and a key no shell can assign.
@@ -40,7 +42,7 @@ const STALE_NOTE: &str =
     "svc's config changed since it started; showing the environment of its running process";
 
 fn micromux(directory: &Path, args: &[&str]) -> Command {
-    let mut command = Command::new(MICROMUX);
+    let mut command = common::micromux(directory);
     command
         .args(args)
         .current_dir(directory)
@@ -84,7 +86,7 @@ impl Session {
 
     /// Serves the config already written to `directory`.
     fn serve(directory: tempfile::TempDir) -> eyre::Result<Self> {
-        let supervisor = Command::new(MICROMUX)
+        let supervisor = common::micromux(directory.path())
             .arg("serve")
             .current_dir(directory.path())
             .stdin(Stdio::null())
@@ -210,7 +212,7 @@ fn env_prints_the_session_and_the_service_environment() -> eyre::Result<()> {
     assert_eq!(json.get("NOT-SHELL").map(String::as_str), Some("x"));
 
     // `--export` output loads into a shell.
-    let output = Command::new("sh")
+    let output = common::isolated("sh", session.path())
         .args([
             "-c",
             r#"eval "$("$MICROMUX" env --export --service svc)" && printf '%s|%s' "$INLINE" "$EXEC_TEST_PORT""#,
@@ -244,20 +246,22 @@ fn env_prints_the_session_and_the_service_environment() -> eyre::Result<()> {
         );
     }
 
-    // `--session` reaches the session from a directory without a config.
+    // `--session` reaches the session from a directory without a config, as long as it shares
+    // the session's state.
     let elsewhere = tempfile::tempdir()?;
     let name = pins
         .get("MICROMUX_SESSION")
         .ok_or_else(|| eyre::eyre!("MICROMUX_SESSION is missing"))?;
-    let output = run(
-        elsewhere.path(),
-        &[
+    let output = common::micromux(session.path())
+        .args([
             "env",
             "--session",
             &format!("name:{name}"),
             "EXEC_TEST_PORT",
-        ],
-    )?;
+        ])
+        .current_dir(elsewhere.path())
+        .stdin(Stdio::null())
+        .output()?;
     assert!(output.status.success(), "{}", stderr(&output));
     assert_eq!(stdout(&output), format!("{port}\n"));
     Ok(())
@@ -521,11 +525,16 @@ struct OldSession {
 impl OldSession {
     fn bind(directory: &Path) -> eyre::Result<Self> {
         let config = micromux_control::CanonicalConfigPath::new(directory.join("micromux.yaml"))?;
-        let runtime_dir =
-            micromux_control::usable_runtime_dirs(&micromux_control::runtime_dir_statuses())
-                .into_iter()
-                .next()
-                .ok_or_else(|| eyre::eyre!("no usable runtime directory"))?;
+        // Where the isolated micromux the test runs looks for sessions.
+        let runtime_dir = micromux_control::runtime_dir_in(&common::state_directory(directory));
+        {
+            use std::os::unix::fs::DirBuilderExt as _;
+
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&runtime_dir)?;
+        }
         let micromux_control::ControlEndpoint::Unix(socket) =
             micromux_control::endpoint_for(&runtime_dir, &config)
         else {

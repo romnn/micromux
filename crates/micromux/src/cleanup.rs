@@ -62,11 +62,16 @@ const GO: u8 = b'\n';
 /// Returns `None` when the user has no state directory.
 #[must_use]
 pub fn cleanup_state_directory(config_path: &Path) -> Option<PathBuf> {
-    crate::session::user_state_directory().map(|state| {
-        state
-            .join("cleanup")
-            .join(crate::session::config_path_key(config_path))
-    })
+    crate::session::user_state_directory().map(|state| cleanup_directory_in(&state, config_path))
+}
+
+/// Where the cleanup files of a session's services live inside `state_directory`, the directory
+/// [`crate::STATE_DIR_VARIABLE`] names for an isolated session.
+#[must_use]
+pub fn cleanup_directory_in(state_directory: &Path, config_path: &Path) -> PathBuf {
+    state_directory
+        .join("cleanup")
+        .join(crate::session::config_path_key(config_path))
 }
 
 /// The path that keys a config's cleanup files.

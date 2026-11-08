@@ -14,6 +14,9 @@ pub struct ProxyPaths {
 impl ProxyPaths {
     /// The current user's paths, in micromux's fixed per-user coordination directory.
     ///
+    /// `MICROMUX_STATE_DIR` relocates them along with the rest of micromux's state (see
+    /// [`micromux_control::coordination_dir`]).
+    ///
     /// # Errors
     ///
     /// Returns an error when the coordination directory cannot be prepared.
