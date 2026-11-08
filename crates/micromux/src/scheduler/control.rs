@@ -4,8 +4,11 @@
 //! method carries a oneshot reply, so the *scheduler* validates the command and latches the
 //! generation at the exact moment it processes it — there is no pre-queue snapshot race. The type
 //! has no `send_input`/`resize_all` method and cannot construct those `Command` variants, so raw
-//! input forwarding is *unreachable* for adapters; the trusted in-process TUI keeps the full
+//! input forwarding is *unreachable* through it; the trusted in-process TUI keeps the full
 //! `mpsc::Sender<Command>` instead.
+//! PTY input and resizes travel only through the separate, bounded [`crate::TerminalControl`],
+//! which the in-process TUI and the control server (for attached TUIs) hold.
+//! The MCP server never sends them.
 
 use super::types::{Command, ServiceID};
 use crate::{DynamicServiceParams, Lease, RestartPolicy, ServiceSpec};

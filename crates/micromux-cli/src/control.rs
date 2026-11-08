@@ -3,7 +3,10 @@
 //! This is the untrusted boundary.
 //! The server is constructed with two model capabilities — a `SessionModelReader` (queries +
 //! subscribe) and a narrow `ServiceControl` (mutations and the environment read) — so it can
-//! observe and command but can neither mutate the model directly nor forward raw input.
+//! observe and command but never mutate the model directly.
+//! It also holds the session's bounded `TerminalControl`, so attached TUIs can type into services
+//! and resize their PTYs; the MCP server, the other client of this endpoint, never sends those
+//! requests.
 //! The accept loop additionally holds the session's shutdown token, its one lifecycle
 //! capability: a `Request::Shutdown` cancels it to stop the whole session (the same path as
 //! Ctrl-C).
@@ -116,7 +119,8 @@ pub fn spawn(
             identity,
             handles.dynamic_services.clone(),
         )
-        .with_session_status(handles.session.clone()),
+        .with_session_status(handles.session.clone())
+        .with_terminal(handles.terminal.clone()),
     );
     tracing::info!(endpoint = ?endpoint, "control plane listening");
 

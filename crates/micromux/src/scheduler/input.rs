@@ -1,8 +1,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use parking_lot::Mutex;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use super::{Command, MAX_PTY_INPUT_BATCH_BYTES, MAX_PTY_PASTE_BYTES, ServiceID};
 
@@ -24,11 +25,17 @@ pub(super) struct InputBudget {
     state: Mutex<InputBudgetState>,
     max_bytes: usize,
     per_service_max_bytes: usize,
+    max_paste_bytes: usize,
 }
 
 impl InputBudget {
-    fn shared() -> Arc<Self> {
-        Self::shared_with_limits(PTY_INPUT_GLOBAL_MAX_BYTES, PTY_INPUT_PER_SERVICE_MAX_BYTES)
+    /// Session-wide budgets whose pastes may be at most `max_paste_bytes`, capped at
+    /// [`MAX_PTY_PASTE_BYTES`].
+    fn shared(max_paste_bytes: usize) -> Arc<Self> {
+        Arc::new(Self {
+            max_paste_bytes: max_paste_bytes.min(MAX_PTY_PASTE_BYTES),
+            ..Self::with_limits(PTY_INPUT_GLOBAL_MAX_BYTES, PTY_INPUT_PER_SERVICE_MAX_BYTES)
+        })
     }
 
     #[cfg(test)]
@@ -36,12 +43,25 @@ impl InputBudget {
         Self::shared_with_limits(max_bytes, max_bytes)
     }
 
+    #[cfg(test)]
     fn shared_with_limits(max_bytes: usize, per_service_max_bytes: usize) -> Arc<Self> {
-        Arc::new(Self {
+        Arc::new(Self::with_limits(max_bytes, per_service_max_bytes))
+    }
+
+    fn with_limits(max_bytes: usize, per_service_max_bytes: usize) -> Self {
+        Self {
             state: Mutex::new(InputBudgetState::default()),
             max_bytes,
             per_service_max_bytes,
-        })
+            max_paste_bytes: MAX_PTY_PASTE_BYTES,
+        }
+    }
+
+    const fn max_payload_bytes(&self, kind: PtyInputKind) -> usize {
+        match kind {
+            PtyInputKind::Input => MAX_PTY_INPUT_BATCH_BYTES,
+            PtyInputKind::Paste => self.max_paste_bytes,
+        }
     }
 
     fn try_reserve(
@@ -149,13 +169,6 @@ impl PtyInputKind {
             Self::Paste => "paste",
         }
     }
-
-    const fn max_bytes(self) -> usize {
-        match self {
-            Self::Input => MAX_PTY_INPUT_BATCH_BYTES,
-            Self::Paste => MAX_PTY_PASTE_BYTES,
-        }
-    }
 }
 
 /// PTY input that already owns space in the session-wide and per-service byte budgets.
@@ -178,7 +191,7 @@ impl PreparedPtyInput {
         kind: PtyInputKind,
     ) -> Result<Self, PtyInputPrepareError> {
         let bytes = data.len();
-        let max_bytes = kind.max_bytes();
+        let max_bytes = budget.max_payload_bytes(kind);
         if bytes > max_bytes {
             return Err(PtyInputPrepareError::TooLarge {
                 kind,
@@ -309,15 +322,64 @@ pub enum PtyInputPrepareError {
 /// Failure to enqueue prepared PTY input.
 #[derive(Debug, thiserror::Error)]
 pub enum PtyInputSendError {
-    /// The scheduler input queue is currently full.
-    #[error("scheduler input queue is full")]
+    /// The input queue is currently full.
+    #[error("terminal input queue is full")]
     Full(PreparedPtyInput),
-    /// The scheduler has stopped.
-    #[error("scheduler input queue is closed")]
+    /// The scheduler, or whatever forwards the input, has stopped.
+    #[error("terminal input queue is closed")]
     Closed(PreparedPtyInput),
     /// The payload was prepared for another session.
     #[error("PTY input belongs to another session")]
     WrongSession(PreparedPtyInput),
+    /// The forwarder is not connected to its session, so the input must be discarded rather
+    /// than kept for later.
+    #[error("terminal input is not accepted while disconnected")]
+    Disconnected(PreparedPtyInput),
+}
+
+/// The size every service PTY in a session takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TerminalSize {
+    /// Columns.
+    pub cols: u16,
+    /// Rows.
+    pub rows: u16,
+}
+
+/// The receiving ends of a [`TerminalControl`] made by [`TerminalControl::forwarding`].
+///
+/// The holder delivers both to a session itself, such as over its control endpoint.
+pub struct TerminalForwarding {
+    /// Prepared input in the order it was sent.
+    ///
+    /// Each payload keeps its byte reservation until the holder drops it, so the forwarder's
+    /// budgets also cover input still in flight to the session.
+    pub input: mpsc::Receiver<PreparedPtyInput>,
+    /// The latest requested size, or `None` before the first resize.
+    ///
+    /// A resize replaces one not yet forwarded, because only the latest size matters.
+    pub size: watch::Receiver<Option<TerminalSize>>,
+    accepting: Arc<AtomicBool>,
+}
+
+impl TerminalForwarding {
+    /// Sets whether the capability accepts input, such as while its session is reachable.
+    ///
+    /// While it does not, sending fails with [`PtyInputSendError::Disconnected`], so the sender
+    /// discards input instead of queueing it for a later connection.
+    /// Input queued before the switch stays in [`Self::input`] for the holder to drain.
+    pub fn set_accepting(&self, accepting: bool) {
+        self.accepting.store(accepting, Ordering::Release);
+    }
+}
+
+/// Where [`TerminalControl`] sends resizes.
+#[derive(Clone)]
+enum ResizeTarget {
+    /// The session's scheduler, which resizes every running PTY.
+    Scheduler(mpsc::Sender<Command>),
+    /// A [`TerminalForwarding`] holder, which delivers the latest size elsewhere.
+    Forwarded(watch::Sender<Option<TerminalSize>>),
 }
 
 /// Trusted terminal capability for bounded PTY input and resize requests.
@@ -327,8 +389,10 @@ pub enum PtyInputSendError {
 /// the active PTY write.
 #[derive(Clone)]
 pub struct TerminalControl {
-    commands: mpsc::Sender<Command>,
+    resize: ResizeTarget,
     input: mpsc::Sender<PreparedPtyInput>,
+    /// Cleared only by a [`TerminalForwarding`] holder; the scheduler always accepts input.
+    accepting: Arc<AtomicBool>,
     budget: Arc<InputBudget>,
 }
 
@@ -339,11 +403,38 @@ impl TerminalControl {
         let (input, receiver) = mpsc::channel(PTY_INPUT_CHANNEL_CAPACITY);
         (
             Self {
-                commands,
+                resize: ResizeTarget::Scheduler(commands),
                 input,
-                budget: InputBudget::shared(),
+                accepting: Arc::new(AtomicBool::new(true)),
+                budget: InputBudget::shared(MAX_PTY_PASTE_BYTES),
             },
             receiver,
+        )
+    }
+
+    /// Creates a capability whose input and resizes the caller forwards to a session itself.
+    ///
+    /// The attach client uses it to drive a remote session's PTYs with the same bounded queues
+    /// and byte budgets as the in-process TUI.
+    /// Pastes larger than `max_paste_bytes` are rejected when prepared; the limit is capped at
+    /// [`MAX_PTY_PASTE_BYTES`].
+    #[must_use]
+    pub fn forwarding(max_paste_bytes: usize) -> (Self, TerminalForwarding) {
+        let (input, input_receiver) = mpsc::channel(PTY_INPUT_CHANNEL_CAPACITY);
+        let (size, size_receiver) = watch::channel(None);
+        let accepting = Arc::new(AtomicBool::new(true));
+        (
+            Self {
+                resize: ResizeTarget::Forwarded(size),
+                input,
+                accepting: Arc::clone(&accepting),
+                budget: InputBudget::shared(max_paste_bytes),
+            },
+            TerminalForwarding {
+                input: input_receiver,
+                size: size_receiver,
+                accepting,
+            },
         )
     }
 
@@ -356,8 +447,9 @@ impl TerminalControl {
         let (input, receiver) = mpsc::channel(capacity);
         (
             Self {
-                commands,
+                resize: ResizeTarget::Scheduler(commands),
                 input,
+                accepting: Arc::new(AtomicBool::new(true)),
                 budget: InputBudget::shared_with_limit(max_bytes),
             },
             receiver,
@@ -397,10 +489,14 @@ impl TerminalControl {
     /// # Errors
     ///
     /// Returns the prepared payload when the input queue is full or closed, preserving the
-    /// reservation so a caller can retry without an atomicity gap.
+    /// reservation so a caller can retry without an atomicity gap, and
+    /// [`PtyInputSendError::Disconnected`] while a forwarding capability does not accept input.
     pub fn try_send(&self, input: PreparedPtyInput) -> Result<(), PtyInputSendError> {
         if !Arc::ptr_eq(&self.budget, &input.permit.budget) {
             return Err(PtyInputSendError::WrongSession(input));
+        }
+        if !self.accepting.load(Ordering::Acquire) {
+            return Err(PtyInputSendError::Disconnected(input));
         }
         match self.input.try_send(input) {
             Ok(()) => Ok(()),
@@ -409,14 +505,63 @@ impl TerminalControl {
         }
     }
 
+    /// Enqueue prepared input, waiting for queue capacity.
+    ///
+    /// # Errors
+    ///
+    /// Returns the prepared payload when the queue is closed, the payload was prepared by
+    /// another session's capability, or a forwarding capability does not accept input; never
+    /// [`PtyInputSendError::Full`].
+    pub async fn send(&self, input: PreparedPtyInput) -> Result<(), PtyInputSendError> {
+        if !Arc::ptr_eq(&self.budget, &input.permit.budget) {
+            return Err(PtyInputSendError::WrongSession(input));
+        }
+        if !self.accepting.load(Ordering::Acquire) {
+            return Err(PtyInputSendError::Disconnected(input));
+        }
+        self.input
+            .send(input)
+            .await
+            .map_err(|mpsc::error::SendError(input)| PtyInputSendError::Closed(input))
+    }
+
     /// Queue a terminal resize without waiting for scheduler capacity.
     ///
     /// Returns `false` when the command queue is full or the scheduler has stopped.
+    /// A forwarding capability replaces any size not yet forwarded and returns `false` only once
+    /// its [`TerminalForwarding`] is gone.
     #[must_use]
     pub fn try_resize(&self, cols: u16, rows: u16) -> bool {
-        self.commands
-            .try_send(Command::ResizeAll { cols, rows })
-            .is_ok()
+        match &self.resize {
+            ResizeTarget::Scheduler(commands) => {
+                commands.try_send(Command::ResizeAll { cols, rows }).is_ok()
+            }
+            ResizeTarget::Forwarded(size) => size.send(Some(TerminalSize { cols, rows })).is_ok(),
+        }
+    }
+
+    /// Withdraws the size a forwarding capability holds, so its holder sends no resize from it,
+    /// not even after reconnecting to a replacement session.
+    ///
+    /// A resize already sent stays in effect; the scheduler's own capability ignores this.
+    pub fn withdraw_size(&self) {
+        if let ResizeTarget::Forwarded(size) = &self.resize {
+            size.send_replace(None);
+        }
+    }
+
+    /// Queue a terminal resize, waiting for scheduler capacity.
+    ///
+    /// Returns `false` when the scheduler, or the [`TerminalForwarding`] holder, has stopped.
+    pub async fn resize(&self, size: TerminalSize) -> bool {
+        let TerminalSize { cols, rows } = size;
+        match &self.resize {
+            ResizeTarget::Scheduler(commands) => commands
+                .send(Command::ResizeAll { cols, rows })
+                .await
+                .is_ok(),
+            ResizeTarget::Forwarded(_) => self.try_resize(cols, rows),
+        }
     }
 }
 
@@ -532,6 +677,135 @@ mod tests {
             b"abcd".to_vec(),
             PtyInputKind::Input,
         )?;
+        Ok(())
+    }
+
+    /// A forwarding capability enforces its own paste limit, capped at the scheduler's, so an
+    /// attach client rejects a paste its transport cannot carry before queueing it.
+    #[test]
+    fn forwarding_control_caps_pastes_at_its_own_limit() -> eyre::Result<()> {
+        let (control, mut forwarding) = TerminalControl::forwarding(16);
+
+        assert_matches!(
+            control.prepare_paste("svc".to_string(), vec![b'x'; 17]),
+            Err(PtyInputPrepareError::TooLarge { max_bytes: 16, .. })
+        );
+        let paste = control.prepare_paste("svc".to_string(), vec![b'x'; 16])?;
+        control.try_send(paste)?;
+        assert_eq!(forwarding.input.try_recv()?.data(), [b'x'; 16]);
+
+        // Key input keeps the scheduler's batch limit whatever the paste limit is.
+        control.prepare_input("svc".to_string(), vec![b'k'; 32])?;
+
+        let (uncapped, _forwarding) = TerminalControl::forwarding(usize::MAX);
+        assert_matches!(
+            uncapped.prepare_paste("svc".to_string(), vec![b'x'; MAX_PTY_PASTE_BYTES + 1]),
+            Err(PtyInputPrepareError::TooLarge {
+                max_bytes: MAX_PTY_PASTE_BYTES,
+                ..
+            })
+        );
+        Ok(())
+    }
+
+    /// Resizes not yet forwarded collapse into the latest one, which is all a PTY needs.
+    #[tokio::test]
+    async fn forwarding_control_keeps_only_the_latest_size() -> eyre::Result<()> {
+        let (control, mut forwarding) = TerminalControl::forwarding(MAX_PTY_PASTE_BYTES);
+        assert_eq!(*forwarding.size.borrow(), None);
+
+        assert!(control.try_resize(80, 24));
+        assert!(
+            control
+                .resize(TerminalSize {
+                    cols: 120,
+                    rows: 40
+                })
+                .await
+        );
+
+        assert!(forwarding.size.has_changed()?);
+        assert_eq!(
+            *forwarding.size.borrow_and_update(),
+            Some(TerminalSize {
+                cols: 120,
+                rows: 40
+            })
+        );
+        assert!(!forwarding.size.has_changed()?);
+
+        // A withdrawn size leaves nothing to forward.
+        assert!(control.try_resize(90, 20));
+        control.withdraw_size();
+        assert_eq!(*forwarding.size.borrow_and_update(), None);
+
+        // Without a receiver the resize has nowhere to go.
+        drop(forwarding);
+        assert!(!control.try_resize(100, 30));
+        Ok(())
+    }
+
+    /// The control server waits for queue room instead of refusing input a burst filled it with.
+    #[tokio::test]
+    async fn send_waits_for_queue_capacity() -> eyre::Result<()> {
+        let (commands, mut commands_rx) = mpsc::channel(1);
+        let (control, mut input) = TerminalControl::with_byte_limit(commands, 1, 8);
+        control.try_send(control.prepare_input("svc".to_string(), b"a".to_vec())?)?;
+
+        let second = control.prepare_input("svc".to_string(), b"b".to_vec())?;
+        let send = tokio::spawn({
+            let control = control.clone();
+            async move { control.send(second).await.map_err(|err| err.to_string()) }
+        });
+        tokio::task::yield_now().await;
+        assert!(!send.is_finished());
+
+        assert_eq!(
+            input.recv().await.map(|input| input.data().to_vec()),
+            Some(b"a".to_vec())
+        );
+        send.await?.map_err(|err| eyre::eyre!(err))?;
+        assert_eq!(
+            input.recv().await.map(|input| input.data().to_vec()),
+            Some(b"b".to_vec())
+        );
+
+        // An awaited resize reaches the scheduler as a regular resize command.
+        assert!(control.resize(TerminalSize { cols: 90, rows: 20 }).await);
+        assert_matches!(
+            commands_rx.recv().await,
+            Some(Command::ResizeAll { cols: 90, rows: 20 })
+        );
+        Ok(())
+    }
+
+    /// A disconnected forwarder refuses input outright, so nothing typed meanwhile can reach a
+    /// later connection, while input queued before the switch stays for the holder to drain.
+    #[tokio::test]
+    async fn disconnected_forwarding_refuses_input() -> eyre::Result<()> {
+        let (control, mut forwarding) = TerminalControl::forwarding(MAX_PTY_PASTE_BYTES);
+        control.try_send(control.prepare_input("svc".to_string(), b"before".to_vec())?)?;
+
+        forwarding.set_accepting(false);
+        let typed = control.prepare_input("svc".to_string(), b"during".to_vec())?;
+        assert_matches!(
+            control.try_send(typed),
+            Err(PtyInputSendError::Disconnected(_))
+        );
+        let pasted = control.prepare_paste("svc".to_string(), b"during".to_vec())?;
+        assert_matches!(
+            control.send(pasted).await,
+            Err(PtyInputSendError::Disconnected(_))
+        );
+        assert_eq!(forwarding.input.try_recv()?.data(), b"before");
+        assert_matches!(
+            forwarding.input.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        );
+
+        forwarding.set_accepting(true);
+        control.try_send(control.prepare_input("svc".to_string(), b"after".to_vec())?)?;
+        assert_eq!(forwarding.input.try_recv()?.data(), b"after");
         Ok(())
     }
 }

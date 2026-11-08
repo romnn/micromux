@@ -4026,6 +4026,38 @@ services:
         Ok(())
     }
 
+    /// Agents never type into a service: the control protocol carries PTY input and resizes for
+    /// attached TUIs, but no MCP code may send them.
+    #[test]
+    fn mcp_never_sends_terminal_requests() -> eyre::Result<()> {
+        // Spelled in halves so this test does not match itself.
+        let forbidden = [concat!("Send", "Input"), concat!("Resize", "Terminal")];
+        let mut pending = vec![std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src")];
+        let mut scanned = 0;
+        while let Some(path) = pending.pop() {
+            if path.is_dir() {
+                for entry in std::fs::read_dir(&path)? {
+                    pending.push(entry?.path());
+                }
+                continue;
+            }
+            if path.extension().is_none_or(|extension| extension != "rs") {
+                continue;
+            }
+            let source = std::fs::read_to_string(&path)?;
+            scanned += 1;
+            for name in forbidden {
+                assert!(
+                    !source.contains(name),
+                    "{} references the terminal request {name}",
+                    path.display()
+                );
+            }
+        }
+        assert!(scanned > 1, "found no MCP sources to scan");
+        Ok(())
+    }
+
     #[test]
     fn server_builds_typed_tool_schemas() -> eyre::Result<()> {
         let server = McpServer::new();
