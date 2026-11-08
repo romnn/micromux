@@ -151,17 +151,8 @@
     "allocate_ports": {
       "type": "array",
       "uniqueItems": true,
-      "items": {
-        "type": "string",
-        "pattern": "^[A-Za-z_][A-Za-z0-9_]*$",
-        "not": {
-          "anyOf": [
-            { "pattern": "^[Mm][Ii][Cc][Rr][Oo][Mm][Uu][Xx]_" },
-            { "enum": ["TERM", "CLICOLOR", "CLICOLOR_FORCE", "FORCE_COLOR"] }
-          ]
-        }
-      },
-      "description": "Environment variable names that each receive a free TCP port, stable across restarts of this session and never shared with another live session. The values override env_file and environment definitions of the same names. Changes require a session restart."
+      "items": { "$ref": "#/definitions/allocated_port" },
+      "description": "Environment variables that each receive a free TCP port, stable across restarts of this session and never shared with another live session. An entry is a variable name, or { name, prefer } to take a well-known port whenever it is available. The values override env_file and environment definitions of the same names. Changes require a session restart."
     },
     "routes": {
       "type": "array",
@@ -226,6 +217,35 @@
     }
   },
   "definitions": {
+    "allocated_port_name": {
+      "type": "string",
+      "pattern": "^[A-Za-z_][A-Za-z0-9_]*$",
+      "not": {
+        "anyOf": [
+          { "pattern": "^[Mm][Ii][Cc][Rr][Oo][Mm][Uu][Xx]_" },
+          { "enum": ["TERM", "CLICOLOR", "CLICOLOR_FORCE", "FORCE_COLOR"] }
+        ]
+      }
+    },
+    "allocated_port": {
+      "oneOf": [
+        { "$ref": "#/definitions/allocated_port_name" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["name"],
+          "properties": {
+            "name": { "$ref": "#/definitions/allocated_port_name" },
+            "prefer": {
+              "type": "integer",
+              "minimum": 1024,
+              "maximum": 65535,
+              "description": "Port the variable takes when no other session, running or stopped, has it assigned and nothing else listens on it, otherwise keeping its previous port or falling back to session.port_range. May lie outside the range, but not on a proxy port or another entry's preferred port."
+            }
+          }
+        }
+      ]
+    },
     "scalar": {
       "anyOf": [
         {

@@ -16,7 +16,9 @@ use indexmap::IndexMap;
 
 use crate::config::{ConfigFile, SessionConfig};
 
-pub(crate) use registry::{DEFAULT_PORT_RANGE, Lease, create_private_dir, user_state_directory};
+pub(crate) use registry::{
+    DEFAULT_PORT_RANGE, Lease, PortRequest, create_private_dir, user_state_directory,
+};
 pub use registry::{PortRegistry, STATE_DIR_VARIABLE, state_directory_override};
 pub use routes::{CATCH_ALL_HOST, Route, RouteError, route_path_problem};
 pub(crate) use routes::{owner as route_owner, resolve as resolve_routes};
@@ -307,18 +309,14 @@ impl Session {
                 lease: None,
             });
         };
-        let names = settings
-            .allocate_ports
-            .iter()
-            .map(|name| name.inner.clone())
-            .collect::<Vec<_>>();
+        let requests = port_requests(&settings);
         let excluded = std::iter::once(proxy_port)
             .chain(settings.proxy.fallback_port())
             .collect::<Vec<_>>();
         let (ports, lease) = registry.acquire(
             config_path,
             &identity.name,
-            &names,
+            &requests,
             &excluded,
             &settings.port_range(),
         )?;
@@ -334,9 +332,12 @@ impl Session {
 
     /// Resolves the session for validation without reserving anything.
     ///
-    /// Names with a persisted assignment in the port range use it; every other name gets a
+    /// Names with a persisted assignment the config still allows use it; every other name gets a
     /// distinct provisional port, listed by [`Self::provisional_ports`], since the next start
     /// assigns it anew.
+    /// A name whose persisted port is not its preferred one is provisional too, showing the
+    /// preferred port the next start tries first; other sessions' records are not consulted.
+    /// Every other provisional port comes from the port range.
     /// Crate-private because a preview holds no reservation and must never run services.
     pub(crate) fn preview<F>(config: &ConfigFile<F>, registry: &PortRegistry) -> Self {
         let settings = config.config.session.clone();
@@ -346,23 +347,52 @@ impl Session {
             .as_deref()
             .and_then(|path| registry.persisted(path))
             .unwrap_or_default();
+        let range = settings.port_range();
+        let requests = port_requests(&settings);
+        let kept = |request: &PortRequest| {
+            persisted
+                .get(&request.name)
+                .copied()
+                .filter(|port| request.allows(*port, &range))
+        };
+        let kept_ports = requests
+            .iter()
+            .filter_map(kept)
+            .collect::<std::collections::HashSet<_>>();
+        // Provisional range ports skip every port another name keeps or prefers.
+        let reserved = requests
+            .iter()
+            .filter_map(|request| request.prefer)
+            .chain(kept_ports.iter().copied())
+            .collect::<std::collections::HashSet<_>>();
         let mut ports = IndexMap::new();
         let mut provisional = Vec::new();
-        let range = settings.port_range();
         let mut next = *range.start();
-        for name in &settings.allocate_ports {
-            let port = if let Some(port) = persisted
-                .get(&name.inner)
-                .filter(|port| range.contains(port))
-            {
-                *port
-            } else {
-                provisional.push(name.inner.clone());
-                let port = next;
-                next = next.saturating_add(1);
-                port
+        for request in &requests {
+            let kept_port = kept(request);
+            // Mirrors the registry: a preferred port another name keeps is out of reach.
+            let preferred = request
+                .prefer
+                .filter(|prefer| kept_port != Some(*prefer) && !kept_ports.contains(prefer));
+            let port = match (preferred, kept_port) {
+                (Some(prefer), _) => {
+                    provisional.push(request.name.clone());
+                    prefer
+                }
+                (None, Some(port)) => port,
+                (None, None) => {
+                    provisional.push(request.name.clone());
+                    let port = (next..=u16::MAX)
+                        .find(|candidate| {
+                            !reserved.contains(candidate)
+                                && !ports.values().any(|assigned| assigned == candidate)
+                        })
+                        .unwrap_or(next);
+                    next = port.saturating_add(1);
+                    port
+                }
             };
-            ports.insert(name.inner.clone(), port);
+            ports.insert(request.name.clone(), port);
         }
         Self {
             identity,
@@ -477,6 +507,18 @@ impl SessionContext {
             lease: None,
         }
     }
+}
+
+/// The port each `allocate_ports` entry asks the registry for, in config order.
+fn port_requests(settings: &SessionConfig) -> Vec<PortRequest> {
+    settings
+        .allocate_ports
+        .iter()
+        .map(|allocation| PortRequest {
+            name: allocation.name.inner.clone(),
+            prefer: allocation.prefer.as_ref().map(|prefer| prefer.inner),
+        })
+        .collect()
 }
 
 /// What follows `<route>.` in a browser URL: the session domain, plus the proxy port unless it is
@@ -657,6 +699,49 @@ mod tests {
             !default.config.session.same_settings(&ranged.config.session),
             "a changed range must not pass as the latched settings"
         );
+        Ok(())
+    }
+
+    /// Validation shows a preferred port as the provisional value of a name the session has no
+    /// port for yet, and gives the other names distinct ports from the range.
+    #[test]
+    fn previews_show_preferred_ports_as_provisional() -> color_eyre::eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let registry = PortRegistry::at(directory.path());
+        // WEB prefers the first port of the range, which API would otherwise get.
+        let config = session_config(
+            "session: { port_range: { start: 40000, end: 40999 } }\n\
+             allocate_ports: [API, { name: WEB, prefer: 40000 }]",
+        )?;
+
+        let preview = Session::preview(&config, &registry);
+
+        assert_eq!(
+            preview.provisional_ports(),
+            ["API".to_string(), "WEB".to_string()]
+        );
+        assert_eq!(preview.ports().get("WEB"), Some(&40000));
+        assert_eq!(preview.ports().get("API"), Some(&40001));
+        Ok(())
+    }
+
+    /// Validation shows a persisted port as provisional when the name now prefers another one,
+    /// since the next start tries the preferred port first, and keeps the other names' ports.
+    #[test]
+    fn previews_show_persisted_fallbacks_as_provisional() -> color_eyre::eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let registry = PortRegistry::at(directory.path());
+        let plain = session_config("allocate_ports: [WEB, API]")?;
+        let preferring = session_config("allocate_ports: [{ name: WEB, prefer: 3000 }, API]")?;
+        let established = Session::establish(&plain, &registry)?;
+        let api = established.ports().get("API").copied();
+        drop(established);
+
+        let preview = Session::preview(&preferring, &registry);
+
+        assert_eq!(preview.provisional_ports(), ["WEB".to_string()]);
+        assert_eq!(preview.ports().get("WEB"), Some(&3000));
+        assert_eq!(preview.ports().get("API").copied(), api);
         Ok(())
     }
 

@@ -302,14 +302,27 @@ pub struct SessionConfig {
     pub name: Option<Spanned<String>>,
     /// Explicit parent domain, already validated as a hostname.
     pub domain: Option<Spanned<String>>,
-    /// Environment variable names that each receive a session-allocated TCP port.
-    pub allocate_ports: Vec<Spanned<String>>,
+    /// Environment variables that each receive a session-allocated TCP port, in config order.
+    pub allocate_ports: Vec<AllocatedPortConfig>,
     /// Hostname routes registered with the shared proxy while the session runs.
     pub routes: Vec<RouteConfig>,
     /// Port preference for the shared proxy.
     pub proxy: ProxyConfig,
     /// Ports `allocate_ports` draws from, when not the default range.
     pub port_range: Option<PortRangeConfig>,
+}
+
+/// One `allocate_ports` entry: an environment variable that receives a session-allocated TCP port.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AllocatedPortConfig {
+    /// Environment variable name, already validated as an allocation name.
+    pub name: Spanned<String>,
+    /// Port the variable takes whenever it is available, before falling back to
+    /// `session.port_range`.
+    ///
+    /// It may lie outside the range, is at least 1024, and is never a proxy port or the preferred
+    /// port of another entry.
+    pub prefer: Option<Spanned<u16>>,
 }
 
 /// The `session.port_range` mapping: the inclusive range `allocate_ports` draws from.
@@ -375,10 +388,15 @@ impl SessionConfig {
     pub fn same_settings(&self, other: &Self) -> bool {
         let inner =
             |value: &Option<Spanned<String>>| value.as_ref().map(|value| value.inner.clone());
-        let names = |names: &[Spanned<String>]| {
-            names
+        let allocations = |allocations: &[AllocatedPortConfig]| {
+            allocations
                 .iter()
-                .map(|name| name.inner.clone())
+                .map(|allocation| {
+                    (
+                        allocation.name.inner.clone(),
+                        allocation.prefer.as_ref().map(|prefer| prefer.inner),
+                    )
+                })
                 .collect::<Vec<_>>()
         };
         let routes = |routes: &[RouteConfig]| {
@@ -396,7 +414,7 @@ impl SessionConfig {
         };
         inner(&self.name) == inner(&other.name)
             && inner(&self.domain) == inner(&other.domain)
-            && names(&self.allocate_ports) == names(&other.allocate_ports)
+            && allocations(&self.allocate_ports) == allocations(&other.allocate_ports)
             && routes(&self.routes) == routes(&other.routes)
             && self.proxy.port() == other.proxy.port()
             && self.proxy.fallback_port() == other.proxy.fallback_port()

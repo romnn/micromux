@@ -25,7 +25,7 @@ Every key in `micromux.yaml`. The machine-readable source of truth is [`micromux
 | `ui` | object | — | Terminal-UI options. |
 | `control` | object | — | [Control plane]({{< relref "../agent-control/_index.md" >}}) and dynamic-service policy. |
 | `session` | object | — | [Session]({{< relref "sessions.md" >}}) `name` (default: the config directory's name, slugified) and `domain` (default `localhost`). |
-| `allocate_ports` | array | — | Environment variable names that each receive a [session-allocated port]({{< relref "sessions.md" >}}#allocated-ports). |
+| `allocate_ports` | array | — | Environment variable names that each receive a [session-allocated port]({{< relref "sessions.md" >}}#allocated-ports), or `{ name, prefer }` to take a [preferred port]({{< relref "sessions.md" >}}#preferred-ports) whenever it is free. |
 | `routes` | array | — | [Hostnames]({{< relref "sessions.md" >}}#hostnames) `{ host, path, strip_prefix, port }` served by the shared proxy, optionally split by [path prefix]({{< relref "sessions.md" >}}#path-routes). Not supported on Windows. |
 | `proxy` | object | — | [Proxy]({{< relref "sessions.md" >}}#the-proxy) `port` (default `80`) and optional `fallback_port`. |
 

@@ -16,6 +16,7 @@ session:
 allocate_ports:
   - API_PORT
   - POSTGRES_PORT
+  - { name: WEB_PORT, prefer: 3000 }         # 3000 whenever it is free
 ```
 
 ## Session name
@@ -32,10 +33,24 @@ Every name under `allocate_ports` becomes an environment variable holding a free
 
 - The port **stays the same across restarts** of the session. Assignments are stored per config file in micromux's state directory (`~/.local/state/micromux/ports` on Linux, `~/Library/Application Support/com.romnn.micromux/ports` on macOS, or [`MICROMUX_STATE_DIR`](#isolated-state)).
 - **No two live sessions of the same user share a port.** A session holds its assignment while it runs; a stopped session's ports are only handed to another session when no other port is left.
-- Ports come from `session.port_range`, by default `20000`–`32767`, below the ephemeral port ranges of Linux (`32768`+) and macOS (`49152`+), so outgoing connections never take one. See [choosing a port range](#choosing-a-port-range).
+- Unless an entry [prefers a port](#preferred-ports), ports come from `session.port_range`, by default `20000`–`32767`, below the ephemeral port ranges of Linux (`32768`+) and macOS (`49152`+), so outgoing connections never take one. See [choosing a port range](#choosing-a-port-range).
 - A port a session is assigned for the first time is checked to be free. If a port the session had before is now held by some other process, the session **fails to start** and names the variable and the port, rather than pointing your services at a stranger. Stop that process (often a leftover of an earlier run) and start again.
 
 Only one micromux can run a given config file at a time; a second one fails to start.
+
+### Preferred ports
+
+An entry can name a well-known port to take instead of one from the range, so the main checkout keeps the port it used before micromux, and docs and screenshots show the same port on every machine:
+
+```yaml
+allocate_ports:
+  - API_PORT
+  - { name: WEB_PORT, prefer: 3000 }
+```
+
+A session takes the preferred port when no other session, running or stopped, has it assigned and no other process listens on it. Otherwise it keeps the port it had, or gets a new one from `session.port_range`, so a second checkout falls back to the range instead of failing. Once a session has its preferred port, it keeps it like any assigned port, also while it is stopped: a checkout started in the meantime falls back, and if another process holds the port at the next start, the session fails to start. A session that had to fall back moves to its preferred port once no other session claims it, because that session's project was deleted or its config dropped the preference.
+
+The preferred port may lie outside `session.port_range`, but it must be at least `1024`, and two entries cannot prefer the same port, nor a [proxy](#the-proxy) port. Removing `prefer` from an entry keeps its port only if it lies inside the range.
 
 ### Choosing a port range
 
@@ -136,7 +151,7 @@ The port a session started with stays its port: if the proxy goes away, the sess
 
 `session` (including `port_range`), `allocate_ports`, `routes`, and `proxy` are read once, when the session starts. A config reload — [`reconcile_config`]({{< relref "../agent-control/control-plane.md" >}}), or a restart that re-reads the config — that changes any of them is rejected; restart the session to apply the change.
 
-`validate_config` never reserves anything. It uses the assignment a session already has, or provisional values for names that were never assigned, and says so in a note.
+`validate_config` never reserves anything. It uses the assignment a session already has, or provisional values for names that were never assigned or may move to their preferred port, and says so in a note.
 
 ## Isolated state
 

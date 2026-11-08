@@ -1562,40 +1562,28 @@ fn parse_session<F: Copy>(
         session.port_range =
             parse_port_range(mapping.get("port_range"), file_id, strict, diagnostics)?;
     }
-    if let Some(names) = value.get("allocate_ports") {
-        let names = expect_sequence(
-            names,
-            Some("allocate_ports must be a list of environment variable names"),
-        )?;
-        if names.len() > MAX_SESSION_ENTRIES {
-            return Err(ConfigError::InvalidValue {
-                message: format!("allocate_ports lists more than {MAX_SESSION_ENTRIES} names"),
-                span: value.span().into(),
-            });
-        }
-        for name in names {
-            let name = parse::<String>(name)?;
-            if let Some(problem) = crate::session::allocation_name_problem(&name) {
-                return Err(ConfigError::InvalidValue {
-                    message: format!("allocate_ports entry `{}` {problem}", name.inner),
-                    span: name.span.into(),
-                });
-            }
-            if session
-                .allocate_ports
-                .iter()
-                .any(|existing| existing.inner.eq_ignore_ascii_case(&name.inner))
-            {
-                return Err(ConfigError::InvalidValue {
-                    message: format!("allocate_ports lists `{}` more than once", name.inner),
-                    span: name.span.into(),
-                });
-            }
-            session.allocate_ports.push(name);
-        }
-    }
+    session.allocate_ports = parse_allocate_ports(value, file_id, strict, diagnostics)?;
     session.routes = parse_routes(value, file_id, strict, diagnostics)?;
     session.proxy = parse_proxy(value, file_id, strict, diagnostics)?;
+    // A proxy port is never allocated, so no entry may prefer one.
+    if let Some((allocation, prefer)) = session.allocate_ports.iter().find_map(|allocation| {
+        allocation
+            .prefer
+            .as_ref()
+            .filter(|prefer| {
+                prefer.inner == session.proxy.port()
+                    || Some(prefer.inner) == session.proxy.fallback_port()
+            })
+            .map(|prefer| (allocation, prefer))
+    }) {
+        return Err(ConfigError::InvalidValue {
+            message: format!(
+                "allocate_ports entry `{}` prefers port {}, which the proxy listens on",
+                allocation.name.inner, prefer.inner
+            ),
+            span: prefer.span.into(),
+        });
+    }
     if let Some(range) = &session.port_range {
         // The proxy's ports are never allocated, so they take no room.
         let proxy_ports = [Some(session.proxy.port()), session.proxy.fallback_port()]
@@ -1624,7 +1612,112 @@ fn parse_session<F: Copy>(
     Ok(session)
 }
 
-/// Lowest port `session.port_range` may include: lower ports need privileges on most systems.
+/// Parse the top-level `allocate_ports` list of variable names or `{name, prefer}` mappings.
+fn parse_allocate_ports<F: Copy>(
+    value: &yaml_spanned::Spanned<Value>,
+    file_id: F,
+    strict: bool,
+    diagnostics: &mut Vec<Diagnostic<F>>,
+) -> Result<Vec<super::AllocatedPortConfig>, ConfigError> {
+    let Some(entries_value) = value.get("allocate_ports") else {
+        return Ok(Vec::new());
+    };
+    let entries = expect_sequence(
+        entries_value,
+        Some("allocate_ports must be a list of environment variable names or {name, prefer}"),
+    )?;
+    if entries.len() > MAX_SESSION_ENTRIES {
+        return Err(ConfigError::InvalidValue {
+            message: format!("allocate_ports lists more than {MAX_SESSION_ENTRIES} names"),
+            span: value.span().into(),
+        });
+    }
+    let mut allocations: Vec<super::AllocatedPortConfig> = Vec::new();
+    for entry in entries {
+        let allocation = match &entry.inner {
+            Value::String(_) => super::AllocatedPortConfig {
+                name: parse::<String>(entry)?,
+                prefer: None,
+            },
+            Value::Mapping(mapping) => {
+                warn_unknown_keys(
+                    mapping,
+                    &["name", "prefer"],
+                    "allocate_ports entry",
+                    file_id,
+                    strict,
+                    diagnostics,
+                );
+                let name = parse::<String>(mapping.get("name").ok_or_else(|| {
+                    ConfigError::MissingKey {
+                        key: "name".to_string(),
+                        message: "allocate_ports entry is missing `name`".to_string(),
+                        span: entry.span().into(),
+                    }
+                })?)?;
+                let prefer = parse_optional::<u16>(mapping.get("prefer"))?;
+                super::AllocatedPortConfig { name, prefer }
+            }
+            _ => {
+                return Err(ConfigError::UnexpectedType {
+                    message: "allocate_ports entries must be a variable name or {name, prefer}"
+                        .to_string(),
+                    expected: vec![Kind::String, Kind::Mapping],
+                    found: entry.kind(),
+                    span: entry.span().into(),
+                });
+            }
+        };
+        let name = &allocation.name;
+        if let Some(problem) = crate::session::allocation_name_problem(name) {
+            return Err(ConfigError::InvalidValue {
+                message: format!("allocate_ports entry `{}` {problem}", name.inner),
+                span: name.span.into(),
+            });
+        }
+        if allocations
+            .iter()
+            .any(|existing| existing.name.inner.eq_ignore_ascii_case(&name.inner))
+        {
+            return Err(ConfigError::InvalidValue {
+                message: format!("allocate_ports lists `{}` more than once", name.inner),
+                span: name.span.into(),
+            });
+        }
+        if let Some(prefer) = &allocation.prefer {
+            if prefer.inner < MIN_ALLOCATED_PORT {
+                return Err(ConfigError::InvalidValue {
+                    message: format!(
+                        "allocate_ports entry `{}` must prefer a port of at least \
+                         {MIN_ALLOCATED_PORT}, below which ports need privileges",
+                        name.inner
+                    ),
+                    span: prefer.span.into(),
+                });
+            }
+            // Only one name can ever have the port, so a shared preference is a mistake.
+            if let Some(other) = allocations.iter().find(|existing| {
+                existing
+                    .prefer
+                    .as_ref()
+                    .is_some_and(|other| other.inner == prefer.inner)
+            }) {
+                return Err(ConfigError::InvalidValue {
+                    message: format!(
+                        "allocate_ports entries `{}` and `{}` both prefer port {}",
+                        other.name.inner, name.inner, prefer.inner
+                    ),
+                    span: prefer.span.into(),
+                });
+            }
+        }
+        allocations.push(allocation);
+    }
+    Ok(allocations)
+}
+
+/// Lowest port `session.port_range` or a preferred port may be: lower ports need privileges on
+/// most systems.
 const MIN_ALLOCATED_PORT: u16 = 1024;
 
 /// Parse `session.port_range`, an inclusive `{start, end}` mapping.
@@ -2466,6 +2559,43 @@ mod tests {
         Ok(())
     }
 
+    /// The published schema accepts the `allocate_ports` shapes the parser accepts and rejects
+    /// the ones it rejects.
+    #[test]
+    fn allocate_ports_shapes_match_the_published_schema() -> eyre::Result<()> {
+        let schema: serde_json::Value =
+            serde_json::from_str(include_str!("../../../../micromux.schema.json"))?;
+        let schema = jsonschema::options()
+            .with_draft(jsonschema::Draft::Draft7)
+            .build(&schema)?;
+        let check = |allocate_ports: &str, accepted: bool| -> eyre::Result<()> {
+            let yaml = format!(
+                "version: 1\nallocate_ports: {allocate_ports}\nservices:\n  app:\n    command: \"true\"\n"
+            );
+            let mut diagnostics: Vec<Diagnostic<usize>> = Vec::new();
+            let parsed = config::from_str(&yaml, Path::new("."), 0, None, &mut diagnostics);
+            let document: serde_json::Value = serde_yaml::from_str(&yaml)?;
+            eyre::ensure!(
+                parsed.is_ok() == accepted,
+                "the parser disagrees about `{allocate_ports}`"
+            );
+            eyre::ensure!(
+                schema.validate(&document).is_ok() == accepted,
+                "the schema disagrees about `{allocate_ports}`"
+            );
+            Ok(())
+        };
+        check("[API_PORT, WEB_PORT]", true)?;
+        check("[API_PORT, { name: WEB_PORT, prefer: 3000 }]", true)?;
+        check("[{ name: WEB_PORT }]", true)?;
+        check("[{ prefer: 3000 }]", false)?;
+        check("[{ name: WEB_PORT, prefer: 80 }]", false)?;
+        check("[{ name: WEB_PORT, prefer: \"3000\" }]", false)?;
+        check("[{ name: MICROMUX_PORT, prefer: 3000 }]", false)?;
+        check("[3000]", false)?;
+        Ok(())
+    }
+
     /// The published schema accepts the `cleanup` shapes the parser accepts and rejects the ones
     /// it rejects.
     #[test]
@@ -3162,7 +3292,7 @@ mod tests {
               name: luup2
               domain: dev.localhost
               port_range: { start: 30000, end: 32767 }
-            allocate_ports: [API_PORT, db_port]
+            allocate_ports: [API_PORT, db_port, { name: WEB_PORT, prefer: 3000 }]
             services:
               app:
                 command: ["true"]
@@ -3183,9 +3313,22 @@ mod tests {
         let names = session
             .allocate_ports
             .iter()
-            .map(|name| name.inner.as_str())
+            .map(|allocation| {
+                (
+                    allocation.name.inner.as_str(),
+                    allocation.prefer.as_ref().map(|prefer| prefer.inner),
+                )
+            })
             .collect::<Vec<_>>();
-        assert_eq!(names, vec!["API_PORT", "db_port"]);
+        // A preferred port may lie outside the port range.
+        assert_eq!(
+            names,
+            vec![
+                ("API_PORT", None),
+                ("db_port", None),
+                ("WEB_PORT", Some(3000))
+            ]
+        );
         assert_eq!(session.port_range(), 30000..=32767);
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
         Ok(())
@@ -3320,6 +3463,33 @@ mod tests {
                 "sets this variable on every service",
             ),
             ("allocate_ports: [PORT, port]", "more than once"),
+            (
+                "allocate_ports: [A, { name: a, prefer: 3000 }]",
+                "more than once",
+            ),
+            ("allocate_ports: [{ prefer: 3000 }]", "missing `name`"),
+            (
+                "allocate_ports: [[A]]",
+                "must be a variable name or {name, prefer}",
+            ),
+            (
+                "allocate_ports: [{ name: TERM, prefer: 3000 }]",
+                "sets this variable on every service",
+            ),
+            (
+                "allocate_ports: [{ name: A, prefer: 80 }]",
+                "must prefer a port of at least 1024",
+            ),
+            ("allocate_ports: [{ name: A, prefer: 70000 }]", ""),
+            (
+                "allocate_ports: [{ name: A, prefer: 3000 }, { name: B, prefer: 3000 }]",
+                "`A` and `B` both prefer port 3000",
+            ),
+            (
+                "proxy: { port: 8081, fallback_port: 8080 }\n\
+                 allocate_ports: [{ name: A, prefer: 8080 }]",
+                "prefers port 8080, which the proxy listens on",
+            ),
             (&long_name, "longer than 128 characters"),
             (
                 "session: { port_range: { start: 1000, end: 2000 } }",
