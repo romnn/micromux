@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.4.1
+
 - **`E` in the TUI shows the selected service's lifecycle events, the timeline agents read with
   `get_service_events`.** It takes the healthcheck pane's place and works in attached TUIs too.
 - **`A` in the TUI shows every service's logs in one pane, interleaved in time order.** Each line is
