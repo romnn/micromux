@@ -50,10 +50,12 @@ pub(crate) struct TextAnchor {
 }
 
 /// A line of a pane's text by a key that stays with it: a log's line by the record it comes
-/// from, and a line of a pane that never drops lines by its index.
+/// from, an events pane line by the sequence number of its event, and a line of a pane that never
+/// drops lines by its index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LineKey {
     Record(RecordLine),
+    Event(u64),
     Index(usize),
 }
 
@@ -338,13 +340,22 @@ impl App {
 
     /// The key of line `index` of `pane`: for a log, the sequence number of the record it comes
     /// from, which stays with it when older records are dropped, and its line within the record;
-    /// for other panes, the index itself.
+    /// for the events pane, the sequence number of its event, for the same reason; for other
+    /// panes, the index itself.
     fn line_key(&self, pane: TextPane, index: usize) -> LineKey {
-        self.state
-            .shown_log()
-            .filter(|_| pane == TextPane::Logs)
-            .and_then(|shown| shown.log.record_line(index))
-            .map_or(LineKey::Index(index), LineKey::Record)
+        match pane {
+            TextPane::Logs => self
+                .state
+                .shown_log()
+                .and_then(|shown| shown.log.record_line(index))
+                .map_or(LineKey::Index(index), LineKey::Record),
+            TextPane::Events => self
+                .state
+                .current_service()
+                .and_then(|service| service.event_seqs.get(index))
+                .map_or(LineKey::Index(index), |seq| LineKey::Event(*seq)),
+            TextPane::Healthcheck | TextPane::Help | TextPane::Info(_) => LineKey::Index(index),
+        }
     }
 
     /// The index of the line `key` names in `pane`, or, when its record was dropped, `Err` with
@@ -352,6 +363,14 @@ impl App {
     fn line_index(&self, pane: TextPane, key: LineKey) -> Result<usize, usize> {
         let record_line = match key {
             LineKey::Index(index) => return Ok(index),
+            // Events stay in sequence order, so a dropped event's place is where it would sort.
+            LineKey::Event(seq) => {
+                return self
+                    .state
+                    .current_service()
+                    .filter(|_| pane == TextPane::Events)
+                    .map_or(Err(0), |service| service.event_seqs.binary_search(&seq));
+            }
             LineKey::Record(record_line) => record_line,
         };
         let Some(shown) = self.state.shown_log().filter(|_| pane == TextPane::Logs) else {

@@ -440,7 +440,7 @@ async fn hints_run_their_key_but_never_quit() -> eyre::Result<()> {
     let frame = draw(&mut app);
 
     // Header and footer hints act like their keys.
-    click(&mut app, find(&frame, "H Health")?);
+    click(&mut app, find(&frame, "H/E Pane")?);
     assert_eq!(app.side_pane, Some(SidePane::Health));
     click(&mut app, find(&frame, "Tab Focus")?);
     assert_eq!(app.focus, Focus::Logs);
@@ -467,6 +467,27 @@ async fn hints_run_their_key_but_never_quit() -> eyre::Result<()> {
     let selected = app.state.selected_service;
     click(&mut app, find(&frame, "↑/↓ Move")?);
     assert_eq!(app.state.selected_service, selected);
+    Ok(())
+}
+
+/// The side panes share one header hint, which names the pane on screen; a click on it shows
+/// them in turn, the healthcheck pane, the events pane, then neither.
+#[tokio::test]
+async fn the_side_pane_hint_cycles_through_the_side_panes() -> eyre::Result<()> {
+    let mut app = app(SERVICES)?;
+    let mut expected = [
+        (Some(SidePane::Health), "H/E Pane:HEALTH"),
+        (Some(SidePane::Events), "H/E Pane:EVENTS"),
+        (None, "H/E Pane:OFF"),
+    ]
+    .into_iter();
+    assert!(row_text(&draw(&mut app), 0).contains("H/E Pane:OFF"));
+    for (pane, hint) in expected.by_ref() {
+        let frame = draw(&mut app);
+        click(&mut app, find(&frame, "H/E Pane")?);
+        assert_eq!(app.side_pane, pane);
+        assert!(row_text(&draw(&mut app), 0).contains(hint), "{hint}");
+    }
     Ok(())
 }
 
@@ -693,7 +714,7 @@ async fn in_pty_input_mode_the_mouse_never_changes_the_service_typed_into() -> e
 async fn a_hint_acts_only_when_the_button_comes_up_on_it() -> eyre::Result<()> {
     let mut app = app(SERVICES)?;
     let frame = draw(&mut app);
-    let health = find(&frame, "H Health")?;
+    let health = find(&frame, "H/E Pane")?;
 
     // Pressing does nothing yet, and releasing elsewhere cancels the click.
     mouse(&mut app, MouseEventKind::Down(MouseButton::Left), health);
@@ -1104,7 +1125,7 @@ async fn the_wheel_leaves_a_pane_with_nothing_to_scroll_following() -> eyre::Res
         };
         mouse(&mut app, kind, inside);
         assert!(app.log_view.follow_tail);
-        assert!(find(&draw(&mut app), "Tail:ON").is_ok());
+        assert!(row_text(&draw(&mut app), 0).contains("Tail:ON"));
     }
     Ok(())
 }

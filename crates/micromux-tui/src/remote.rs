@@ -267,12 +267,11 @@ impl RemoteSource {
             .map_or_else(Vec::new, |entry| entry.health.clone())
     }
 
-    /// Return mirrored lifecycle events with a sequence greater than `after`, or every retained one
-    /// without a cursor, oldest first.
+    /// Return the mirrored lifecycle events of one service, oldest first.
     ///
     /// It is `None` when the session predates [`EVENTS_PROTOCOL_VERSION`] and reports no events.
     #[must_use]
-    pub fn events(&self, id: &str, after: Option<u64>) -> Option<Vec<micromux::ServiceEvent>> {
+    pub fn events(&self, id: &str) -> Option<Vec<micromux::ServiceEvent>> {
         let store = self.store.read();
         if !accepts_events(&store.session) {
             return None;
@@ -281,7 +280,7 @@ impl RemoteSource {
             store
                 .services
                 .get(id)
-                .map_or_else(Vec::new, |entry| entry.events.since(after)),
+                .map_or_else(Vec::new, |entry| entry.events.events()),
         )
     }
 
@@ -364,6 +363,21 @@ impl RemoteSource {
             shutdown: CancellationToken::new(),
         };
         (source, forwarding)
+    }
+
+    /// Replaces the mirrored lifecycle events of service `id` with `events`, as a refresh after an
+    /// events change would, and tells the TUI with that change alone.
+    pub(crate) fn record_events(&self, id: &str, events: Vec<micromux::ServiceEvent>) {
+        if let Some(entry) = self.store.write().services.get_mut(id) {
+            entry.events.replace(events);
+        }
+        publish(
+            &self.changes,
+            SessionChange {
+                service_id: id.to_string(),
+                kind: ChangeKind::Events,
+            },
+        );
     }
 
     /// Mirrors `snapshot` with `events` as its retained lifecycle events, as a refresh would, and
@@ -1890,7 +1904,7 @@ mod tests {
 
     fn mirrored_event_seqs(store: &Arc<RwLock<MirrorStore>>) -> Vec<u64> {
         source_for(Arc::clone(store))
-            .events("svc", None)
+            .events("svc")
             .unwrap_or_default()
             .iter()
             .map(|event| event.seq)
@@ -1930,37 +1944,63 @@ mod tests {
 
         assert_eq!(mirrored_event_seqs(&store), vec![1, 2, 3, 4]);
         assert_eq!(events_cursors(&request.requests)?, vec![None, Some(1)]);
-        assert_eq!(
-            source_for(Arc::clone(&store))
-                .events("svc", Some(3))
-                .map(|events| events.len()),
-            Some(1)
-        );
         Ok(())
     }
 
-    /// A history that no longer starts with the newest event held, because retention dropped
-    /// events in between or the service was recreated, replaces the copy with the retained tail.
+    /// A history that no longer starts with the newest event held replaces the copy with the
+    /// retained tail: the service was recreated under its id and numbers its events from one
+    /// again, or retention dropped events the mirror never read.
     #[tokio::test]
     async fn events_refresh_retails_after_a_discontinuity() -> eyre::Result<()> {
+        // The recreated service recorded six events of its own; the session answers the cursor
+        // after event 4 with its events 5 and 6, which differ from the old run's event 5.
+        let recreated = |seqs: std::ops::RangeInclusive<u64>| {
+            seqs.map(|seq| micromux::ServiceEvent {
+                at_unix_ms: 1_000 + seq,
+                detail: format!("recreated {seq}"),
+                ..lifecycle_event(seq)
+            })
+            .collect::<Vec<_>>()
+        };
         let store = store_with(entry_with_log(1, "line"));
         if let Some(entry) = store.write().services.get_mut("svc") {
             entry.events.replace(lifecycle_events(1..=5));
         }
         let mut request = ScriptedConnection::new([
             Response::Events {
-                events: lifecycle_events(1..=2),
+                events: recreated(5..=6),
                 truncated: false,
             },
             Response::Events {
-                events: lifecycle_events(1..=2),
+                events: recreated(1..=6),
                 truncated: false,
             },
         ]);
-
         refresh_events(&mut request, &store, "svc").await?;
+        assert_eq!(
+            source_for(Arc::clone(&store)).events("svc"),
+            Some(recreated(1..=6))
+        );
+        assert_eq!(events_cursors(&request.requests)?, vec![Some(4), None]);
 
-        assert_eq!(mirrored_event_seqs(&store), vec![1, 2]);
+        // Retention moved past event 5 before this refresh, so the oldest event left is 9, and
+        // the session flags both pages as missing older events.
+        let store = store_with(entry_with_log(1, "line"));
+        if let Some(entry) = store.write().services.get_mut("svc") {
+            entry.events.replace(lifecycle_events(1..=5));
+        }
+        let mut request = ScriptedConnection::new([
+            Response::Events {
+                events: lifecycle_events(9..=10),
+                truncated: true,
+            },
+            Response::Events {
+                events: lifecycle_events(9..=10),
+                truncated: true,
+            },
+        ]);
+        refresh_events(&mut request, &store, "svc").await?;
+        assert_eq!(mirrored_event_seqs(&store), vec![9, 10]);
         assert_eq!(events_cursors(&request.requests)?, vec![Some(4), None]);
         Ok(())
     }
@@ -2036,7 +2076,7 @@ mod tests {
         refresh_events(&mut request, &store, "svc").await?;
 
         assert!(request.requests.is_empty());
-        assert_eq!(source_for(store).events("svc", None), None);
+        assert_eq!(source_for(store).events("svc"), None);
         Ok(())
     }
 

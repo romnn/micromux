@@ -1858,7 +1858,7 @@ mod tests {
         for hint in [
             "micromux v",
             "Level:ALL",
-            "Health:OFF",
+            "Pane:OFF",
             "? Help",
             "d Disable",
             "PTY input",

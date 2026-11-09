@@ -1350,6 +1350,10 @@ fn centered_popup(area: Rect, content_width: usize, content_rows: usize) -> Rect
     }
 }
 
+/// The keys of the one hint for both side panes, which take turns beside the logs and so share
+/// the header's room.
+pub(crate) const SIDE_PANE_KEYS: &str = "H/E";
+
 /// Where each part of the screen goes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ScreenLayout {
@@ -2172,14 +2176,13 @@ impl App {
             KeyHint::toggle("w", "Wrap", on_off(self.log_view.wrap)),
             KeyHint::toggle("t", "Tail", on_off(self.log_view.follow_tail)),
             KeyHint::toggle(
-                "H",
-                "Health",
-                on_off(self.side_pane == Some(crate::SidePane::Health)),
-            ),
-            KeyHint::toggle(
-                "E",
-                "Events",
-                on_off(self.side_pane == Some(crate::SidePane::Events)),
+                SIDE_PANE_KEYS,
+                "Pane",
+                match self.side_pane {
+                    None => "OFF",
+                    Some(crate::SidePane::Health) => "HEALTH",
+                    Some(crate::SidePane::Events) => "EVENTS",
+                },
             ),
             KeyHint::toggle("A", "All", on_off(self.state.all_logs.is_some())),
         ]

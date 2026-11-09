@@ -215,6 +215,21 @@ fn hint_key(keys: &str) -> Option<KeyEvent> {
 }
 
 impl App {
+    /// The key a click on the side pane hint presses, which shows the side panes in turn: the
+    /// healthcheck pane, then the events pane, then neither.
+    fn next_side_pane_key(&self) -> KeyEvent {
+        let ch = match self.side_pane {
+            None => 'H',
+            Some(crate::SidePane::Health | crate::SidePane::Events) => 'E',
+        };
+        KeyEvent {
+            code: KeyCode::Char(ch),
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        }
+    }
+
     /// Turns mouse capture on or off, as the `m` key does.
     pub(crate) fn toggle_mouse_capture(&mut self) {
         let capture = !self.mouse.capture;
@@ -343,7 +358,12 @@ impl App {
     fn click(&mut self, clickable: Clickable) {
         match clickable {
             Clickable::Hint(keys) => {
-                let Some(key) = hint_key(keys) else {
+                let key = if keys == crate::render::SIDE_PANE_KEYS {
+                    Some(self.next_side_pane_key())
+                } else {
+                    hint_key(keys)
+                };
+                let Some(key) = key else {
                     return;
                 };
                 // In PTY input mode keys go to the service, so only the hint that leaves the mode

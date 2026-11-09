@@ -97,15 +97,16 @@ impl SessionSource {
         }
     }
 
-    /// Retained lifecycle events with a sequence greater than `after`, or every one without a
-    /// cursor, oldest first; empty for an unknown service.
+    /// A service's retained lifecycle events, oldest first; empty for an unknown service.
     ///
+    /// Both sources read an in-process store of at most [`micromux::EVENT_HISTORY`] events: the
+    /// session model, or the attached TUI's mirror of it.
     /// It is `None` when the session reports no lifecycle events, as an attached session older
     /// than [`micromux_control::EVENTS_PROTOCOL_VERSION`].
-    pub(crate) fn events(&self, id: &str, after: Option<u64>) -> Option<Vec<ServiceEvent>> {
+    pub(crate) fn events(&self, id: &str) -> Option<Vec<ServiceEvent>> {
         match self {
-            Self::Local(source) => Some(source.reader.events(id, after, None).0),
-            Self::Remote(source) => source.events(id, after),
+            Self::Local(source) => Some(source.reader.events(id, None, None).0),
+            Self::Remote(source) => source.events(id),
         }
     }
 

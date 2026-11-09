@@ -19,11 +19,12 @@ pub struct Service {
     /// The healthcheck pane's text for this service.
     pub(crate) health_pane: PaneText,
     pub healthcheck_dirty: bool,
-    /// This service's lifecycle events, read forward as the session records them.
-    pub(crate) timeline: crate::timeline::Timeline,
     /// The events pane's text for this service.
     pub(crate) events_pane: PaneText,
-    /// Whether the session recorded lifecycle events that `timeline` has not read yet.
+    /// The sequence number of the event on each line of `events_pane`, ascending, so a selection
+    /// stays on its event while older ones drop out.
+    pub(crate) event_seqs: Vec<u64>,
+    /// Whether the session recorded lifecycle events since `events_pane` was built.
     pub(crate) events_dirty: bool,
     /// Highest log sequence read into `cached_lines`, including records the format filtered out.
     pub log_cursor: u64,
@@ -89,8 +90,8 @@ impl Service {
             logs_dirty: true,
             health_pane: PaneText::default(),
             healthcheck_dirty: true,
-            timeline: crate::timeline::Timeline::default(),
             events_pane: PaneText::default(),
+            event_seqs: Vec::new(),
             events_dirty: true,
             log_cursor: 0,
             rewrites: 0,
@@ -109,24 +110,20 @@ impl Service {
         }
     }
 
-    /// Brings the events pane's text up to date with the lifecycle events `source` recorded since
-    /// the last read, unless none were recorded.
+    /// Rebuilds the events pane's text from `source`'s lifecycle events, unless none were
+    /// recorded since it was built.
     pub(crate) fn refresh_events(&mut self, source: &crate::SessionSource) {
         if !std::mem::take(&mut self.events_dirty) {
             return;
         }
-        let id = &self.snapshot.id;
-        let Some(page) = source.events(id, self.timeline.read_after()) else {
-            self.timeline.replace(Vec::new());
+        let Some(events) = source.events(&self.snapshot.id) else {
+            self.event_seqs.clear();
             self.events_pane
                 .set_text(crate::timeline::unsupported_text());
             return;
         };
-        if !self.timeline.extend(page) {
-            self.timeline
-                .replace(source.events(id, None).unwrap_or_default());
-        }
-        self.events_pane.set_text(self.timeline.text());
+        self.event_seqs = events.iter().map(|event| event.seq).collect();
+        self.events_pane.set_text(crate::timeline::text(&events));
     }
 
     /// Drops the rendered lines when `format` differs from the one they were built with.

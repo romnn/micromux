@@ -1,14 +1,17 @@
 use color_eyre::eyre;
+use std::time::Instant;
+
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use micromux::{EVENT_HISTORY, ServiceEvent, ServiceEventKind};
 use ratatui::buffer::Buffer;
-use ratatui::layout::Rect;
+use ratatui::layout::{Position, Rect};
 use ratatui::style::Color;
 use ratatui::text::Line;
 use ratatui::widgets::Widget as _;
 use similar_asserts::assert_eq;
 
-use super::{Timeline, clock_time, event_line};
+use super::{Timeline, clock_time, event_line, text};
 use crate::{App, Focus, RemoteSource, SessionSource, SidePane, ViewOptions};
 
 fn event(seq: u64, kind: ServiceEventKind, detail: &str) -> ServiceEvent {
@@ -30,7 +33,7 @@ fn spawned(seq: u64) -> ServiceEvent {
 }
 
 fn seqs(timeline: &Timeline) -> Vec<u64> {
-    timeline.since(None).iter().map(|event| event.seq).collect()
+    timeline.events().iter().map(|event| event.seq).collect()
 }
 
 fn plain(line: &Line<'_>) -> String {
@@ -62,7 +65,6 @@ fn reads_forward_from_the_newest_event_held() {
     // A page with only the newest event held means nothing happened since.
     assert!(timeline.extend(vec![spawned(3)]));
     assert_eq!(seqs(&timeline), vec![1, 2, 3]);
-    assert_eq!(timeline.since(Some(2)), vec![spawned(3)]);
 }
 
 #[test]
@@ -192,28 +194,25 @@ fn each_event_shows_its_time_kind_and_detail() {
 
 #[test]
 fn the_text_lists_events_oldest_first_or_says_there_are_none() {
-    let mut timeline = Timeline::default();
     assert_eq!(
-        timeline.text().lines.iter().map(plain).collect::<Vec<_>>(),
+        text(&[]).lines.iter().map(plain).collect::<Vec<_>>(),
         vec!["no lifecycle events yet".to_string()]
     );
 
-    timeline.replace(vec![
+    let details = text(&[
         event(1, ServiceEventKind::RestartRequested, "first"),
         event(2, ServiceEventKind::Spawned, "second"),
-    ]);
-    let details = timeline
-        .text()
-        .lines
-        .iter()
-        .map(|line| {
-            plain(line)
-                .rsplit(' ')
-                .next()
-                .unwrap_or_default()
-                .to_string()
-        })
-        .collect::<Vec<_>>();
+    ])
+    .lines
+    .iter()
+    .map(|line| {
+        plain(line)
+            .rsplit(' ')
+            .next()
+            .unwrap_or_default()
+            .to_string()
+    })
+    .collect::<Vec<_>>();
     assert_eq!(details, vec!["first", "second"]);
 }
 
@@ -242,18 +241,35 @@ fn attached_app(source: RemoteSource) -> App {
     app
 }
 
-/// Mirrors `id` with `events`, then applies the changes that announce it, as the event loop does.
+fn remote(app: &App) -> eyre::Result<&RemoteSource> {
+    match &app.source {
+        SessionSource::Remote(source) => Ok(source),
+        SessionSource::Local(_) => eyre::bail!("the app is not attached"),
+    }
+}
+
+/// Adds service `id` with `events` to the mirror, then applies the roster change that
+/// announces it, as the event loop does.
 fn mirror(app: &mut App, id: &str, events: Vec<ServiceEvent>) -> eyre::Result<()> {
-    let SessionSource::Remote(source) = &app.source else {
-        eyre::bail!("the app is not attached");
-    };
-    source.mirror_service(snapshot(id), events);
+    remote(app)?.mirror_service(snapshot(id), events);
     let mut resync = false;
     while let Ok(change) = app.changes.try_recv() {
         resync |= app.apply_change(&change);
     }
     if resync {
         app.resync();
+    }
+    Ok(())
+}
+
+/// Replaces the mirrored events of `id` with `events` and applies the events change alone that
+/// announces them, which never asks for a roster resync.
+fn record(app: &mut App, id: &str, events: Vec<ServiceEvent>) -> eyre::Result<()> {
+    remote(app)?.record_events(id, events);
+    while let Ok(change) = app.changes.try_recv() {
+        if app.apply_change(&change) {
+            eyre::bail!("an events change asked for a roster resync");
+        }
     }
     Ok(())
 }
@@ -285,6 +301,37 @@ fn shows(rows: &[String], text: &str) -> bool {
     rows.iter().any(|row| row.contains(text))
 }
 
+/// Where `text` starts on screen, counting one column per cell.
+fn position_of(rows: &[String], text: &str) -> eyre::Result<Position> {
+    for (y, row) in rows.iter().enumerate() {
+        if let Some(byte) = row.find(text) {
+            let x = row.get(..byte).unwrap_or_default().chars().count();
+            return Ok(Position::new(u16::try_from(x)?, u16::try_from(y)?));
+        }
+    }
+    eyre::bail!("{text:?} is not on screen")
+}
+
+/// A triple click at `position`, which selects its whole line.
+fn select_line(app: &mut App, position: Position) {
+    for _ in 0..3 {
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            app.handle_mouse(
+                MouseEvent {
+                    kind,
+                    column: position.x,
+                    row: position.y,
+                    modifiers: KeyModifiers::NONE,
+                },
+                Instant::now(),
+            );
+        }
+    }
+}
+
 /// `E` shows the events pane in the place of the healthcheck pane, which `H` takes back, and the
 /// pane's own key hides it; the focus leaves a pane that hides.
 #[tokio::test]
@@ -298,8 +345,7 @@ async fn e_toggles_the_events_pane_in_place_of_the_healthcheck_pane() -> eyre::R
     assert_eq!(app.side_pane, Some(SidePane::Events));
     let rows = frame(&mut app);
     assert!(shows(&rows, "Events"));
-    assert!(shows(&rows, "E Events:ON"));
-    assert!(shows(&rows, "H Health:OFF"));
+    assert!(shows(&rows, "H/E Pane:EVENTS"));
 
     // Both side panes leave the logs the same width, so the service PTYs fit either.
     let beside_events = app.desired_pty_size();
@@ -307,7 +353,9 @@ async fn e_toggles_the_events_pane_in_place_of_the_healthcheck_pane() -> eyre::R
     press(&mut app, 'H');
     assert_eq!(app.side_pane, Some(SidePane::Health));
     assert_eq!(app.desired_pty_size(), beside_events);
-    assert!(shows(&frame(&mut app), "Healthcheck"));
+    let rows = frame(&mut app);
+    assert!(shows(&rows, "Healthcheck"));
+    assert!(shows(&rows, "H/E Pane:HEALTH"));
 
     // Tab reaches the side pane, whose kind the footer names.
     press(&mut app, 'E');
@@ -317,6 +365,7 @@ async fn e_toggles_the_events_pane_in_place_of_the_healthcheck_pane() -> eyre::R
     assert_eq!(app.side_pane, None);
     assert_eq!(app.focus, Focus::Logs);
     assert_eq!(app.desired_pty_size(), logs_alone);
+    assert!(shows(&frame(&mut app), "H/E Pane:OFF"));
     Ok(())
 }
 
@@ -335,24 +384,19 @@ async fn the_events_pane_never_resizes_an_attached_sessions_ptys() -> eyre::Resu
     Ok(())
 }
 
-/// The pane shows the selected service's events as they arrive, reading only the new ones, and
-/// starts over when the service's history no longer continues what it read.
+/// An events change alone, with no roster change, brings the selected service's new events into
+/// the pane.
 #[tokio::test]
-async fn the_events_pane_follows_the_selected_services_timeline() -> eyre::Result<()> {
+async fn an_events_change_updates_the_events_pane() -> eyre::Result<()> {
     let (source, _forwarding) = RemoteSource::offline();
     let mut app = attached_app(source);
-    mirror(
-        &mut app,
-        "svc",
-        vec![
-            event(1, ServiceEventKind::DependencyBlocked, "waiting for db"),
-            event(
-                2,
-                ServiceEventKind::Spawned,
-                "spawned service process with pid 7",
-            ),
-        ],
-    )?;
+    let blocked = event(1, ServiceEventKind::DependencyBlocked, "waiting for db");
+    let spawned = event(
+        2,
+        ServiceEventKind::Spawned,
+        "spawned service process with pid 7",
+    );
+    mirror(&mut app, "svc", vec![blocked.clone(), spawned.clone()])?;
     press(&mut app, 'E');
     let rows = frame(&mut app);
     assert!(shows(&rows, "blocked     waiting for db"));
@@ -361,26 +405,18 @@ async fn the_events_pane_follows_the_selected_services_timeline() -> eyre::Resul
         "spawned     spawned service process with pid 7"
     ));
 
-    // A new event extends the copy the pane read; it does not re-read what it holds.
     let mut exited = event(
         3,
         ServiceEventKind::Exited,
         "service process exited with code 1",
     );
     exited.exit_code = Some(1);
-    mirror(
-        &mut app,
-        "svc",
-        vec![
-            event(1, ServiceEventKind::DependencyBlocked, "waiting for db"),
-            event(
-                2,
-                ServiceEventKind::Spawned,
-                "spawned service process with pid 7",
-            ),
-            exited,
-        ],
-    )?;
+    record(&mut app, "svc", vec![blocked, spawned, exited])?;
+    assert!(
+        app.state
+            .current_service()
+            .is_some_and(|service| service.events_dirty)
+    );
     let rows = frame(&mut app);
     assert!(shows(
         &rows,
@@ -390,22 +426,42 @@ async fn the_events_pane_follows_the_selected_services_timeline() -> eyre::Resul
         .state
         .current_service()
         .ok_or_else(|| eyre::eyre!("no service"))?;
-    assert_eq!(service.timeline.read_after(), Some(2));
     assert!(!service.events_dirty);
+    assert_eq!(service.event_seqs, vec![1, 2, 3]);
+    Ok(())
+}
 
-    // The service was recreated under its id, so its events count from one again.
-    mirror(
-        &mut app,
-        "svc",
-        vec![event(
-            1,
-            ServiceEventKind::Created,
-            "configured service revived",
-        )],
-    )?;
+/// A selected event stays selected while older events drop out of the session's retention, so
+/// copying takes the event that was selected rather than whichever line moved into its place.
+#[tokio::test]
+async fn a_selection_in_the_events_pane_stays_on_its_event() -> eyre::Result<()> {
+    let (source, _forwarding) = RemoteSource::offline();
+    let mut app = attached_app(source);
+    let numbered = |seqs: std::ops::RangeInclusive<u64>| {
+        seqs.map(|seq| event(seq, ServiceEventKind::Exited, &format!("exit number {seq}")))
+            .collect::<Vec<_>>()
+    };
+    mirror(&mut app, "svc", numbered(1..=5))?;
+    press(&mut app, 'E');
     let rows = frame(&mut app);
-    assert!(shows(&rows, "configured service revived"));
-    assert!(!shows(&rows, "waiting for db"));
+    select_line(&mut app, position_of(&rows, "exit number 3")?);
+    assert!(
+        app.selected_text()
+            .is_some_and(|text| text.ends_with("exit number 3")),
+        "{:?}",
+        app.selected_text()
+    );
+
+    // A crash loop pushes the two oldest events out; the selected one moved up two lines.
+    record(&mut app, "svc", numbered(3..=7))?;
+    frame(&mut app);
+    let copied = app.selected_text().unwrap_or_default();
+    assert!(copied.ends_with("exit number 3"), "{copied:?}");
+
+    // Once the selected event itself drops out, nothing of it is left to copy.
+    record(&mut app, "svc", numbered(5..=9))?;
+    frame(&mut app);
+    assert_eq!(app.selected_text(), None);
     Ok(())
 }
 

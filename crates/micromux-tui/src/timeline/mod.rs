@@ -1,4 +1,5 @@
-//! A service's lifecycle events timeline, as the events pane shows it.
+//! A service's lifecycle events timeline: the attached TUI's copy of it, and the events pane's
+//! text.
 //!
 //! The session already explains each transition in the event's own `detail` line, the same line
 //! the MCP `get_service_events` tool returns, so the pane adds only the time and a colored kind.
@@ -12,10 +13,11 @@ use ratatui::text::{Line, Span, Text};
 /// Width the kind column pads its labels to, the longest label's.
 const KIND_WIDTH: usize = 11;
 
-/// A copy of a service's retained lifecycle events, oldest first.
+/// An attached TUI's copy of a service's retained lifecycle events, oldest first.
 ///
 /// It holds at most [`EVENT_HISTORY`] events, as many as the session retains per service, and is
-/// read forward from the newest event it holds, so a refresh reads only what is new.
+/// read forward from the newest event it holds, so a refresh fetches only what is new over the
+/// connection.
 #[derive(Debug, Default)]
 pub(crate) struct Timeline {
     events: VecDeque<ServiceEvent>,
@@ -66,24 +68,19 @@ impl Timeline {
         }
     }
 
-    /// Events with a sequence greater than `after`, or all of them without a cursor, as
-    /// [`micromux::SessionModelReader::events`] returns them.
-    pub(crate) fn since(&self, after: Option<u64>) -> Vec<ServiceEvent> {
-        self.events
-            .iter()
-            .filter(|event| after.is_none_or(|after| event.seq > after))
-            .cloned()
-            .collect()
+    /// Every event held, oldest first.
+    pub(crate) fn events(&self) -> Vec<ServiceEvent> {
+        self.events.iter().cloned().collect()
     }
+}
 
-    /// The pane's text: one line per event, oldest first, so the newest sits at the bottom where
-    /// follow-tail keeps it in view.
-    pub(crate) fn text(&self) -> Text<'static> {
-        if self.events.is_empty() {
-            return Text::from("no lifecycle events yet".fg(Color::DarkGray));
-        }
-        self.events.iter().map(event_line).collect()
+/// The events pane's text for `events`: one line per event, oldest first, so the newest sits at
+/// the bottom where follow-tail keeps it in view.
+pub(crate) fn text(events: &[ServiceEvent]) -> Text<'static> {
+    if events.is_empty() {
+        return Text::from("no lifecycle events yet".fg(Color::DarkGray));
     }
+    events.iter().map(event_line).collect()
 }
 
 /// The pane's text for a session that cannot report lifecycle events.
