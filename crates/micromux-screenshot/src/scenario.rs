@@ -17,7 +17,7 @@ pub(crate) struct Scenario {
 
 /// Terminal width every scenario captures at: the narrowest that keeps the footer's key hints on
 /// one row, so the text renders as large as it can in the README.
-const COLS: NonZeroU16 = NonZeroU16::new(136).unwrap();
+const COLS: NonZeroU16 = NonZeroU16::new(146).unwrap();
 /// Terminal height every scenario captures at.
 const ROWS: NonZeroU16 = NonZeroU16::new(22).unwrap();
 
