@@ -27,6 +27,7 @@ pub(crate) const END_OF_LINE: u16 = u16::MAX;
 pub(crate) enum TextPane {
     Logs,
     Healthcheck,
+    Events,
     Help,
     Info(InfoView),
 }
@@ -210,11 +211,23 @@ fn column(col: u16) -> usize {
 }
 
 impl App {
+    /// The text pane the side pane shows, if any.
+    pub(crate) fn side_text_pane(&self) -> Option<TextPane> {
+        self.side_pane.map(|pane| match pane {
+            crate::SidePane::Health => TextPane::Healthcheck,
+            crate::SidePane::Events => TextPane::Events,
+        })
+    }
+
     /// Where `pane`'s text was drawn in the last frame.
     pub(crate) fn text_area(&self, pane: TextPane) -> Option<Rect> {
         match pane {
             TextPane::Logs => Some(crate::render::log_view::text_area(self.hits.logs)),
-            TextPane::Healthcheck => Some(crate::render::log_view::text_area(self.hits.health)),
+            // Both side panes draw in one place, so only the one showing has text there.
+            TextPane::Healthcheck | TextPane::Events if self.side_text_pane() == Some(pane) => {
+                Some(crate::render::log_view::text_area(self.hits.side))
+            }
+            TextPane::Healthcheck | TextPane::Events => None,
             TextPane::Help | TextPane::Info(_) => match &self.hits.popup {
                 Some(PopupHit {
                     content:
@@ -253,7 +266,9 @@ impl App {
                 current.map(format_of).into_iter().collect(),
                 self.log_view.wrap,
             ),
-            TextPane::Healthcheck => (Some(service?), no_formats(), self.healthcheck_view.wrap),
+            TextPane::Healthcheck | TextPane::Events => {
+                (Some(service?), no_formats(), self.side_view.wrap)
+            }
             TextPane::Info(InfoView::Service) => (service, no_formats(), false),
             TextPane::Help | TextPane::Info(InfoView::Session) => (None, no_formats(), false),
         };
@@ -270,7 +285,7 @@ impl App {
     pub(crate) fn first_row(&self, pane: TextPane) -> usize {
         match pane {
             TextPane::Logs => self.log_view.scroll_offset,
-            TextPane::Healthcheck => self.healthcheck_view.scroll_offset,
+            TextPane::Healthcheck | TextPane::Events => self.side_view.scroll_offset,
             TextPane::Help | TextPane::Info(_) => self.popup_scroll,
         }
     }
@@ -290,11 +305,12 @@ impl App {
                 Some((&log.text, &log.line_index))
             }
             TextPane::Healthcheck => {
-                let service = self.state.current_service()?;
-                Some((
-                    &service.healthcheck_cached_text,
-                    &service.healthcheck_cached_line_index,
-                ))
+                let pane = &self.state.current_service()?.health_pane;
+                Some((&pane.text, &pane.line_index))
+            }
+            TextPane::Events => {
+                let pane = &self.state.current_service()?.events_pane;
+                Some((&pane.text, &pane.line_index))
             }
             TextPane::Help | TextPane::Info(_) => None,
         }
@@ -682,7 +698,12 @@ impl App {
             .hits
             .popup
             .as_ref()
-            .filter(|_| matches!(context.pane, TextPane::Logs | TextPane::Healthcheck))
+            .filter(|_| {
+                matches!(
+                    context.pane,
+                    TextPane::Logs | TextPane::Healthcheck | TextPane::Events
+                )
+            })
             .map(|popup| popup.area);
         let first = self.first_row(context.pane);
         // Rows end where their text does, as terminals highlight a selection, rather than at the

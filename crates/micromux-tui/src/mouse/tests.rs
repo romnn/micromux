@@ -14,7 +14,7 @@ use similar_asserts::assert_eq;
 
 use super::MouseState;
 use crate::state::CachedLine;
-use crate::{App, Effect, Focus, LocalSource, SessionSource, ViewOptions};
+use crate::{App, Effect, Focus, LocalSource, SessionSource, SidePane, ViewOptions};
 
 const WIDTH: u16 = 120;
 const HEIGHT: u16 = 30;
@@ -179,7 +179,7 @@ async fn clicks_select_services_and_focus_the_pane_under_them() -> eyre::Result<
     assert_eq!(app.focus, Focus::Logs);
     let health = find(&frame, "Healthcheck")?;
     click(&mut app, Position::new(health.x + 2, health.y + 3));
-    assert_eq!(app.focus, Focus::Healthcheck);
+    assert_eq!(app.focus, Focus::Side);
     assert_eq!(app.state.selected_service, 2);
 
     // A click below the last service focuses the list but selects nothing new.
@@ -441,7 +441,7 @@ async fn hints_run_their_key_but_never_quit() -> eyre::Result<()> {
 
     // Header and footer hints act like their keys.
     click(&mut app, find(&frame, "H Health")?);
-    assert!(app.show_healthcheck_pane);
+    assert_eq!(app.side_pane, Some(SidePane::Health));
     click(&mut app, find(&frame, "Tab Focus")?);
     assert_eq!(app.focus, Focus::Logs);
     click(&mut app, find(&frame, "? Help")?);
@@ -697,7 +697,7 @@ async fn a_hint_acts_only_when_the_button_comes_up_on_it() -> eyre::Result<()> {
 
     // Pressing does nothing yet, and releasing elsewhere cancels the click.
     mouse(&mut app, MouseEventKind::Down(MouseButton::Left), health);
-    assert!(!app.show_healthcheck_pane);
+    assert_eq!(app.side_pane, None);
     mouse(
         &mut app,
         MouseEventKind::Drag(MouseButton::Left),
@@ -708,12 +708,12 @@ async fn a_hint_acts_only_when_the_button_comes_up_on_it() -> eyre::Result<()> {
         MouseEventKind::Up(MouseButton::Left),
         Position::new(1, HEIGHT / 2),
     );
-    assert!(!app.show_healthcheck_pane);
+    assert_eq!(app.side_pane, None);
 
     // Releasing on the hint it went down on runs its key.
     mouse(&mut app, MouseEventKind::Down(MouseButton::Left), health);
     mouse(&mut app, MouseEventKind::Up(MouseButton::Left), health);
-    assert!(app.show_healthcheck_pane);
+    assert_eq!(app.side_pane, Some(SidePane::Health));
     Ok(())
 }
 
@@ -1104,7 +1104,7 @@ async fn the_wheel_leaves_a_pane_with_nothing_to_scroll_following() -> eyre::Res
         };
         mouse(&mut app, kind, inside);
         assert!(app.log_view.follow_tail);
-        assert!(row_text(&draw(&mut app), 0).contains("Tail:ON"));
+        assert!(find(&draw(&mut app), "Tail:ON").is_ok());
     }
     Ok(())
 }

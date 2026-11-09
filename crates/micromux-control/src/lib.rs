@@ -46,9 +46,9 @@ pub use micromux::{
     DynamicServiceAck, ReconcileAction, ReconcileActionKind, ReconcileReceipt, ResolvedEnvironment,
 };
 pub use protocol::{
-    DiskLogReadHealth, DynamicServicesCaps, ENVIRONMENT_PROTOCOL_VERSION, ErrorCode, InputBytes,
-    MAX_REMOTE_PASTE_BYTES, PROTOCOL_VERSION, ProtocolVersion, Request, Response, ServiceBrief,
-    SessionCapabilities, SessionInfo, TERMINAL_PROTOCOL_VERSION,
+    DiskLogReadHealth, DynamicServicesCaps, ENVIRONMENT_PROTOCOL_VERSION, EVENTS_PROTOCOL_VERSION,
+    ErrorCode, InputBytes, MAX_REMOTE_PASTE_BYTES, PROTOCOL_VERSION, ProtocolVersion, Request,
+    Response, ServiceBrief, SessionCapabilities, SessionInfo, TERMINAL_PROTOCOL_VERSION,
 };
 pub use select::{
     AmbiguousSelection, LISTED_ABSENT_PROBES, ProbeReport, ResolvedSession, RuntimeDirDetail,

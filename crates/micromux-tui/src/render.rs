@@ -820,6 +820,27 @@ mod tests {
     }
 }
 
+/// Brings the healthcheck pane's text up to date with `source`, unless the attempts did not
+/// change.
+fn refresh_health_text(service: &mut crate::state::Service, source: &crate::SessionSource) {
+    if !service.healthcheck_dirty {
+        return;
+    }
+    let attempts = source.healthchecks(&service.snapshot.id);
+    let out = build_healthcheck_text(service.snapshot.healthcheck_configured, &attempts);
+    let text = out.as_str().into_text().unwrap_or_else(|err| {
+        let escaped = strip_ansi_escapes::strip_str(&out);
+        tracing::error!(
+            ?err,
+            input_bytes = out.len(),
+            "failed to sanitize healthcheck output"
+        );
+        escaped.into()
+    });
+    service.health_pane.set_text(text);
+    service.healthcheck_dirty = false;
+}
+
 /// Build the healthcheck pane text from the model's bounded attempt history.
 fn build_healthcheck_text(configured: bool, attempts: &[micromux::HealthAttempt]) -> String {
     let mut out = String::new();
@@ -1338,8 +1359,8 @@ pub(crate) struct ScreenLayout {
     pub services: Rect,
     /// The logs pane, borders and scrollbar included.
     pub logs: Rect,
-    /// The healthcheck pane, or an empty area while it is hidden.
-    pub health: Rect,
+    /// The side pane, or an empty area while it is hidden.
+    pub side: Rect,
     pub footer: Rect,
 }
 
@@ -1528,6 +1549,10 @@ const HELP_COLUMNS: [&[HelpSection]; 2] = [
                 HelpKey {
                     keys: "u",
                     description: "Session URLs and ports",
+                },
+                HelpKey {
+                    keys: "E",
+                    description: "Lifecycle events pane",
                 },
                 HelpKey {
                     keys: "/",
@@ -1910,8 +1935,8 @@ impl Widget for &mut App {
         .render(layout.header, buf);
         let (service_rows, first_service) = self.render_services(layout.services, buf);
         let links = self.render_logs(layout.logs, buf);
-        if self.show_healthcheck_pane {
-            self.render_healthchecks(layout.health, buf);
+        if let Some(pane) = self.side_pane {
+            self.render_side_pane(pane, layout.side, buf);
         }
         Paragraph::new(
             footer
@@ -1929,7 +1954,7 @@ impl Widget for &mut App {
             service_rows,
             first_service,
             logs: layout.logs,
-            health: layout.health,
+            side: layout.side,
             // The hints the quit hint covers cannot be clicked, since they do not show.
             hints: [(&header, layout.header), (&footer, layout.footer)]
                 .into_iter()
@@ -2108,7 +2133,7 @@ impl App {
             ])
             .spacing(0)
             .areas(main);
-        let [logs, health] = if self.show_healthcheck_pane {
+        let [logs, side] = if self.side_pane.is_some() {
             Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
@@ -2122,7 +2147,7 @@ impl App {
             main,
             services,
             logs,
-            health,
+            side,
             footer,
         }
     }
@@ -2146,7 +2171,16 @@ impl App {
             KeyHint::toggle("F", "Fields", fields),
             KeyHint::toggle("w", "Wrap", on_off(self.log_view.wrap)),
             KeyHint::toggle("t", "Tail", on_off(self.log_view.follow_tail)),
-            KeyHint::toggle("H", "Health", on_off(self.show_healthcheck_pane)),
+            KeyHint::toggle(
+                "H",
+                "Health",
+                on_off(self.side_pane == Some(crate::SidePane::Health)),
+            ),
+            KeyHint::toggle(
+                "E",
+                "Events",
+                on_off(self.side_pane == Some(crate::SidePane::Events)),
+            ),
             KeyHint::toggle("A", "All", on_off(self.state.all_logs.is_some())),
         ]
     }
@@ -2156,7 +2190,10 @@ impl App {
         let focus = match self.focus {
             crate::Focus::Services => "SERVICES",
             crate::Focus::Logs => "LOGS",
-            crate::Focus::Healthcheck => "HEALTH",
+            crate::Focus::Side => match self.side_pane {
+                Some(crate::SidePane::Events) => "EVENTS",
+                Some(crate::SidePane::Health) | None => "HEALTH",
+            },
         };
         let selected = self
             .state
@@ -2394,69 +2431,33 @@ impl App {
         links
     }
 
-    fn render_healthchecks(&mut self, area: Rect, buf: &mut Buffer) {
-        let Some(current_id) = self
-            .state
-            .current_service()
-            .map(|service| service.snapshot.id.clone())
-        else {
+    /// Draws `pane` for the selected service, reading what changed in the session since the
+    /// last frame.
+    fn render_side_pane(&mut self, pane: crate::SidePane, area: Rect, buf: &mut Buffer) {
+        let focused = self.focus == crate::Focus::Side;
+        let Some(service) = self.state.services.get_mut(self.state.selected_service) else {
             return;
         };
-        let (dirty, configured) = self
-            .state
-            .current_service()
-            .map_or((false, false), |service| {
-                (
-                    service.healthcheck_dirty,
-                    service.snapshot.healthcheck_configured,
-                )
-            });
-        if dirty {
-            let attempts = self.source.healthchecks(&current_id);
-            let out = build_healthcheck_text(configured, &attempts);
-            if let Some(service) = self.state.current_service_mut() {
-                service.healthcheck_cached_text = out.as_str().into_text().unwrap_or_else(|err| {
-                    let escaped = strip_ansi_escapes::strip_str(&out);
-                    tracing::error!(
-                        ?err,
-                        input_bytes = out.len(),
-                        "failed to sanitize healthcheck output"
-                    );
-                    escaped.into()
-                });
-                service.healthcheck_cached_wrap = None;
-                service.healthcheck_dirty = false;
+        let (title, text) = match pane {
+            crate::SidePane::Health => {
+                refresh_health_text(service, &self.source);
+                ("Healthcheck", &mut service.health_pane)
             }
-        }
-
-        let wrap = self.healthcheck_view.wrap;
-        let wrap_width = area.width.saturating_sub(3);
-        if let Some(service) = self.state.current_service_mut()
-            && service.healthcheck_cached_wrap != Some((wrap, wrap_width))
-        {
-            service.healthcheck_cached_line_index.rebuild(
-                &service.healthcheck_cached_text,
-                wrap,
-                wrap_width,
-            );
-            service.healthcheck_cached_wrap = Some((wrap, wrap_width));
-        }
-
-        let Some(service) = self.state.current_service() else {
-            return;
+            crate::SidePane::Events => {
+                service.refresh_events(&self.source);
+                ("Events", &mut service.events_pane)
+            }
         };
-        self.healthcheck_view.render(
+        text.lay_out(self.side_view.wrap, area.width.saturating_sub(3));
+        self.side_view.render(
             area,
-            &service.healthcheck_cached_line_index,
-            &service.healthcheck_cached_text,
+            &text.line_index,
+            &text.text,
             log_view::PaneBorders {
-                title: Line::from(pane_name(
-                    "Healthcheck",
-                    self.focus == crate::Focus::Healthcheck,
-                )),
+                title: Line::from(pane_name(title, focused)),
                 status: None,
                 detail: None,
-                focused: self.focus == crate::Focus::Healthcheck,
+                focused,
             },
             log_view::Highlights::default(),
             buf,

@@ -12,13 +12,15 @@ use micromux::{
     TerminalForwarding, TerminalSize,
 };
 use micromux_control::{
-    Client, ControlEndpoint, ControlError, ErrorCode, InputBytes, MAX_REMOTE_PASTE_BYTES, Request,
-    Response, SessionInfo, Subscription, TERMINAL_PROTOCOL_VERSION,
+    Client, ControlEndpoint, ControlError, EVENTS_PROTOCOL_VERSION, ErrorCode, InputBytes,
+    MAX_REMOTE_PASTE_BYTES, Request, Response, SessionInfo, Subscription,
+    TERMINAL_PROTOCOL_VERSION,
 };
 use parking_lot::RwLock;
 use tokio::sync::{broadcast, mpsc};
 
 use crate::source::AttachmentStatus;
+use crate::timeline::Timeline;
 
 const CHANGE_CHANNEL_CAPACITY: usize = 1024;
 const REMOTE_LOG_TAIL: usize = 200;
@@ -53,6 +55,7 @@ struct MirrorEntry {
     next_log_seq: u64,
     first_retained_seq: Option<u64>,
     health: Vec<HealthAttempt>,
+    events: Timeline,
     // Manual restarts clear visible logs without resetting their sequence. The acknowledged
     // generation distinguishes that clear from an automatic restart, which retains logs.
     clear_logs_after_generation: Option<u64>,
@@ -264,6 +267,24 @@ impl RemoteSource {
             .map_or_else(Vec::new, |entry| entry.health.clone())
     }
 
+    /// Return mirrored lifecycle events with a sequence greater than `after`, or every retained one
+    /// without a cursor, oldest first.
+    ///
+    /// It is `None` when the session predates [`EVENTS_PROTOCOL_VERSION`] and reports no events.
+    #[must_use]
+    pub fn events(&self, id: &str, after: Option<u64>) -> Option<Vec<micromux::ServiceEvent>> {
+        let store = self.store.read();
+        if !accepts_events(&store.session) {
+            return None;
+        }
+        Some(
+            store
+                .services
+                .get(id)
+                .map_or_else(Vec::new, |entry| entry.events.since(after)),
+        )
+    }
+
     /// Subscribe to mirror invalidations.
     #[must_use]
     pub fn subscribe(&self) -> broadcast::Receiver<SessionChange> {
@@ -306,9 +327,16 @@ impl RemoteSource {
     /// A mirror of an empty current-protocol session with no background task, for tests that
     /// drive the TUI over it; the forwarding ends show what its terminal sends.
     pub(crate) fn offline() -> (Self, TerminalForwarding) {
+        Self::offline_at(micromux_control::PROTOCOL_VERSION)
+    }
+
+    /// A mirror of an empty session speaking `protocol_version`, as [`Self::offline`] is.
+    pub(crate) fn offline_at(
+        protocol_version: micromux_control::ProtocolVersion,
+    ) -> (Self, TerminalForwarding) {
         let session = SessionInfo {
             session: None,
-            protocol_version: micromux_control::PROTOCOL_VERSION,
+            protocol_version,
             id: "offline".to_string(),
             pid: 1,
             start_time: 1,
@@ -336,6 +364,44 @@ impl RemoteSource {
             shutdown: CancellationToken::new(),
         };
         (source, forwarding)
+    }
+
+    /// Mirrors `snapshot` with `events` as its retained lifecycle events, as a refresh would, and
+    /// tells the TUI so.
+    pub(crate) fn mirror_service(
+        &self,
+        snapshot: ServiceSnapshot,
+        events: Vec<micromux::ServiceEvent>,
+    ) {
+        let id = snapshot.id.clone();
+        let mut timeline = Timeline::default();
+        timeline.replace(events);
+        self.store.write().services.insert(
+            id.clone(),
+            MirrorEntry {
+                snapshot,
+                logs: VecDeque::new(),
+                next_log_seq: 0,
+                first_retained_seq: None,
+                health: Vec::new(),
+                events: timeline,
+                clear_logs_after_generation: None,
+            },
+        );
+        publish(
+            &self.changes,
+            SessionChange {
+                service_id: SessionChange::SESSION_WIDE.to_string(),
+                kind: ChangeKind::Roster,
+            },
+        );
+        publish(
+            &self.changes,
+            SessionChange {
+                service_id: id,
+                kind: ChangeKind::Events,
+            },
+        );
     }
 }
 
@@ -600,6 +666,7 @@ async fn full_sync<C: RequestConnection>(
     for service_id in &service_ids {
         refresh_logs(request, store, service_id).await?;
         refresh_health(request, store, service_id).await?;
+        refresh_events(request, store, service_id).await?;
     }
     Ok(store.read().services.keys().cloned().collect())
 }
@@ -638,10 +705,10 @@ async fn refresh_and_forward_batch<C: RequestConnection>(
         match change.kind {
             ChangeKind::Logs => refresh_logs(request, store, &change.service_id).await?,
             ChangeKind::Health => refresh_health(request, store, &change.service_id).await?,
+            ChangeKind::Events => refresh_events(request, store, &change.service_id).await?,
             ChangeKind::Status
             | ChangeKind::Roster
             | ChangeKind::Unknown
-            | ChangeKind::Events
             | ChangeKind::Heartbeat => {}
         }
     }
@@ -664,6 +731,7 @@ async fn refresh_roster<C: RequestConnection>(
     for service_id in needs_hydration {
         refresh_logs(request, store, &service_id).await?;
         refresh_health(request, store, &service_id).await?;
+        refresh_events(request, store, &service_id).await?;
     }
     Ok(())
 }
@@ -706,6 +774,7 @@ fn reconcile_services(
                 next_log_seq: 0,
                 first_retained_seq: None,
                 health: Vec::new(),
+                events: Timeline::default(),
                 clear_logs_after_generation: None,
             }
         };
@@ -863,6 +932,105 @@ async fn refresh_health<C: RequestConnection>(
     Ok(())
 }
 
+/// Brings the mirror's copy of a service's lifecycle events up to date, reading only events newer
+/// than the newest one it holds.
+async fn refresh_events<C: RequestConnection>(
+    request: &mut C,
+    store: &Arc<RwLock<MirrorStore>>,
+    service_id: &str,
+) -> Result<(), ControlError> {
+    if !accepts_events(&store.read().session) {
+        return Ok(());
+    }
+    loop {
+        let Some(after) = store
+            .read()
+            .services
+            .get(service_id)
+            .map(|entry| entry.events.read_after())
+        else {
+            return Ok(());
+        };
+        // An empty copy takes the retained tail in one page; it needs no continuation.
+        let Some(after) = after else {
+            return replace_events(request, store, service_id).await;
+        };
+        let Some(EventPage { events, truncated }) =
+            request_events(request, service_id, Some(after)).await?
+        else {
+            store.write().services.shift_remove(service_id);
+            return Ok(());
+        };
+        let extended = store.write().services.get_mut(service_id).map(|entry| {
+            entry
+                .events
+                .extend(events)
+                .then(|| entry.events.read_after())
+        });
+        let next = match extended {
+            None => return Ok(()),
+            Some(None) => return replace_events(request, store, service_id).await,
+            Some(Some(next)) => next,
+        };
+        // A page the response size bound cut short continues from its own newest event.
+        if !truncated {
+            return Ok(());
+        }
+        if next <= Some(after) {
+            return Err(ControlError::Unexpected(
+                "truncated GetEvents response did not advance its cursor".to_string(),
+            ));
+        }
+    }
+}
+
+/// Replaces the mirror's copy of a service's lifecycle events with the session's retained tail.
+async fn replace_events<C: RequestConnection>(
+    request: &mut C,
+    store: &Arc<RwLock<MirrorStore>>,
+    service_id: &str,
+) -> Result<(), ControlError> {
+    let Some(EventPage { events, .. }) = request_events(request, service_id, None).await? else {
+        store.write().services.shift_remove(service_id);
+        return Ok(());
+    };
+    if let Some(entry) = store.write().services.get_mut(service_id) {
+        entry.events.replace(events);
+    }
+    Ok(())
+}
+
+/// One `GetEvents` reply.
+struct EventPage {
+    events: Vec<micromux::ServiceEvent>,
+    /// Whether retention or the response size bound left out matching events.
+    truncated: bool,
+}
+
+/// Reads one page of a service's lifecycle events, or `None` once the session no longer knows
+/// the service.
+async fn request_events<C: RequestConnection>(
+    request: &mut C,
+    service_id: &str,
+    after: Option<u64>,
+) -> Result<Option<EventPage>, ControlError> {
+    match request
+        .request(Request::GetEvents {
+            service: service_id.to_string(),
+            after,
+            tail: Some(micromux::EVENT_HISTORY),
+        })
+        .await?
+    {
+        Response::Events { events, truncated } => Ok(Some(EventPage { events, truncated })),
+        Response::Error {
+            code: ErrorCode::UnknownService,
+            ..
+        } => Ok(None),
+        other => Err(unexpected_response(&other)),
+    }
+}
+
 async fn execute_command(
     request: &mut Client,
     store: &Arc<RwLock<MirrorStore>>,
@@ -911,6 +1079,10 @@ async fn execute_command(
         },
     );
     Ok(())
+}
+
+fn accepts_events(session: &SessionInfo) -> bool {
+    session.protocol_version.supports(EVENTS_PROTOCOL_VERSION)
 }
 
 fn accepts_terminal(session: &SessionInfo) -> bool {
@@ -1083,7 +1255,12 @@ fn publish_full_refresh(changes: &broadcast::Sender<SessionChange>, service_ids:
         },
     );
     for service_id in service_ids {
-        for kind in [ChangeKind::Status, ChangeKind::Logs, ChangeKind::Health] {
+        for kind in [
+            ChangeKind::Status,
+            ChangeKind::Logs,
+            ChangeKind::Health,
+            ChangeKind::Events,
+        ] {
             publish(
                 changes,
                 SessionChange {
@@ -1253,6 +1430,7 @@ mod tests {
             next_log_seq: seq,
             first_retained_seq: Some(seq),
             health: Vec::new(),
+            events: Timeline::default(),
             clear_logs_after_generation: None,
         }
     }
@@ -1689,6 +1867,176 @@ mod tests {
         .await?;
 
         assert!(store.read().services.is_empty());
+        Ok(())
+    }
+
+    fn lifecycle_event(seq: u64) -> micromux::ServiceEvent {
+        micromux::ServiceEvent {
+            seq,
+            at_unix_ms: seq,
+            run_generation: 1,
+            kind: micromux::ServiceEventKind::Spawned,
+            detail: format!("event {seq}"),
+            exit_code: None,
+            pid: None,
+            delay_ms: None,
+            blocked_on: None,
+        }
+    }
+
+    fn lifecycle_events(seqs: std::ops::RangeInclusive<u64>) -> Vec<micromux::ServiceEvent> {
+        seqs.map(lifecycle_event).collect()
+    }
+
+    fn mirrored_event_seqs(store: &Arc<RwLock<MirrorStore>>) -> Vec<u64> {
+        source_for(Arc::clone(store))
+            .events("svc", None)
+            .unwrap_or_default()
+            .iter()
+            .map(|event| event.seq)
+            .collect()
+    }
+
+    /// The cursor of each request, all of which must be `GetEvents`.
+    fn events_cursors(requests: &[Request]) -> eyre::Result<Vec<Option<u64>>> {
+        requests
+            .iter()
+            .map(|request| match request {
+                Request::GetEvents { after, .. } => Ok(*after),
+                other => Err(eyre::eyre!("expected GetEvents, got {other:?}")),
+            })
+            .collect()
+    }
+
+    /// The mirror reads a service's events forward from the newest it holds, re-reading that
+    /// one to prove the session's history still continues its copy.
+    #[tokio::test]
+    async fn events_refresh_reads_forward_from_the_newest_event_held() -> eyre::Result<()> {
+        let store = store_with(entry_with_log(1, "line"));
+        let mut request = ScriptedConnection::new([
+            Response::Events {
+                events: lifecycle_events(1..=2),
+                truncated: false,
+            },
+            Response::Events {
+                events: lifecycle_events(2..=4),
+                truncated: false,
+            },
+        ]);
+
+        // An empty copy takes the retained tail; the next refresh only what follows it.
+        refresh_events(&mut request, &store, "svc").await?;
+        refresh_events(&mut request, &store, "svc").await?;
+
+        assert_eq!(mirrored_event_seqs(&store), vec![1, 2, 3, 4]);
+        assert_eq!(events_cursors(&request.requests)?, vec![None, Some(1)]);
+        assert_eq!(
+            source_for(Arc::clone(&store))
+                .events("svc", Some(3))
+                .map(|events| events.len()),
+            Some(1)
+        );
+        Ok(())
+    }
+
+    /// A history that no longer starts with the newest event held, because retention dropped
+    /// events in between or the service was recreated, replaces the copy with the retained tail.
+    #[tokio::test]
+    async fn events_refresh_retails_after_a_discontinuity() -> eyre::Result<()> {
+        let store = store_with(entry_with_log(1, "line"));
+        if let Some(entry) = store.write().services.get_mut("svc") {
+            entry.events.replace(lifecycle_events(1..=5));
+        }
+        let mut request = ScriptedConnection::new([
+            Response::Events {
+                events: lifecycle_events(1..=2),
+                truncated: false,
+            },
+            Response::Events {
+                events: lifecycle_events(1..=2),
+                truncated: false,
+            },
+        ]);
+
+        refresh_events(&mut request, &store, "svc").await?;
+
+        assert_eq!(mirrored_event_seqs(&store), vec![1, 2]);
+        assert_eq!(events_cursors(&request.requests)?, vec![Some(4), None]);
+        Ok(())
+    }
+
+    /// A page the response size bound cut short is followed by the next one, from its own newest
+    /// event, and a page that cannot advance is an error rather than a loop.
+    #[tokio::test]
+    async fn events_refresh_follows_truncated_pages() -> eyre::Result<()> {
+        let store = store_with(entry_with_log(1, "line"));
+        if let Some(entry) = store.write().services.get_mut("svc") {
+            entry.events.replace(lifecycle_events(1..=1));
+        }
+        let mut request = ScriptedConnection::new([
+            Response::Events {
+                events: lifecycle_events(1..=3),
+                truncated: true,
+            },
+            Response::Events {
+                events: lifecycle_events(3..=4),
+                truncated: false,
+            },
+        ]);
+        refresh_events(&mut request, &store, "svc").await?;
+        assert_eq!(mirrored_event_seqs(&store), vec![1, 2, 3, 4]);
+        assert_eq!(events_cursors(&request.requests)?, vec![Some(0), Some(2)]);
+
+        let mut stuck = ScriptedConnection::new([Response::Events {
+            events: lifecycle_events(4..=4),
+            truncated: true,
+        }]);
+        assert_matches!(
+            refresh_events(&mut stuck, &store, "svc").await,
+            Err(ControlError::Unexpected(_))
+        );
+        Ok(())
+    }
+
+    /// An events change refreshes only the events of the service it names.
+    #[tokio::test]
+    async fn an_events_change_refreshes_the_mirrored_events() -> eyre::Result<()> {
+        let store = store_with(entry_with_log(1, "line"));
+        let mut request = ScriptedConnection::new([Response::Events {
+            events: lifecycle_events(1..=1),
+            truncated: false,
+        }]);
+        let (changes, mut received) = broadcast::channel(8);
+
+        refresh_and_forward(
+            &mut request,
+            &store,
+            &changes,
+            SessionChange {
+                service_id: "svc".to_string(),
+                kind: ChangeKind::Events,
+            },
+        )
+        .await?;
+
+        assert_matches!(request.requests.as_slice(), [Request::GetEvents { .. }]);
+        assert_eq!(mirrored_event_seqs(&store), vec![1]);
+        assert_eq!(received.try_recv()?.kind, ChangeKind::Events);
+        Ok(())
+    }
+
+    /// A session older than the events protocol is never asked for events, and the mirror says
+    /// it has none to report rather than that there are none.
+    #[tokio::test]
+    async fn older_sessions_never_receive_events_requests() -> eyre::Result<()> {
+        let store = store_with(entry_with_log(1, "line"));
+        store.write().session.protocol_version = micromux_control::ProtocolVersion::new(3, 2);
+        let mut request = ScriptedConnection::new([]);
+
+        refresh_events(&mut request, &store, "svc").await?;
+
+        assert!(request.requests.is_empty());
+        assert_eq!(source_for(store).events("svc", None), None);
         Ok(())
     }
 

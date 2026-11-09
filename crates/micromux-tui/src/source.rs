@@ -1,8 +1,8 @@
 //! Synchronous session data and lifecycle commands consumed by the TUI.
 
 use micromux::{
-    Command, HealthAttempt, LogLine, ServiceID, ServiceSnapshot, SessionChange, SessionModelReader,
-    SessionStatus, SessionSummary,
+    Command, HealthAttempt, LogLine, ServiceEvent, ServiceID, ServiceSnapshot, SessionChange,
+    SessionModelReader, SessionStatus, SessionSummary,
 };
 use tokio::sync::{broadcast, mpsc};
 
@@ -94,6 +94,18 @@ impl SessionSource {
         match self {
             Self::Local(source) => source.reader.healthchecks(id),
             Self::Remote(source) => source.healthchecks(id),
+        }
+    }
+
+    /// Retained lifecycle events with a sequence greater than `after`, or every one without a
+    /// cursor, oldest first; empty for an unknown service.
+    ///
+    /// It is `None` when the session reports no lifecycle events, as an attached session older
+    /// than [`micromux_control::EVENTS_PROTOCOL_VERSION`].
+    pub(crate) fn events(&self, id: &str, after: Option<u64>) -> Option<Vec<ServiceEvent>> {
+        match self {
+            Self::Local(source) => Some(source.reader.events(id, after, None).0),
+            Self::Remote(source) => source.events(id, after),
         }
     }
 

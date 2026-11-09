@@ -16,10 +16,15 @@ pub struct Service {
     pub(crate) log: LogText,
     pub text_dirty: bool,
     pub logs_dirty: bool,
-    pub healthcheck_cached_text: ratatui::text::Text<'static>,
-    pub healthcheck_cached_line_index: crate::render::log_view::RenderedLineIndex,
-    pub healthcheck_cached_wrap: Option<(bool, u16)>,
+    /// The healthcheck pane's text for this service.
+    pub(crate) health_pane: PaneText,
     pub healthcheck_dirty: bool,
+    /// This service's lifecycle events, read forward as the session records them.
+    pub(crate) timeline: crate::timeline::Timeline,
+    /// The events pane's text for this service.
+    pub(crate) events_pane: PaneText,
+    /// Whether the session recorded lifecycle events that `timeline` has not read yet.
+    pub(crate) events_dirty: bool,
     /// Highest log sequence read into `cached_lines`, including records the format filtered out.
     pub log_cursor: u64,
     /// Counts the changes to `cached_lines` other than appending lines and dropping the oldest,
@@ -33,6 +38,31 @@ pub struct Service {
     pub timestamps_override: Option<bool>,
     /// Field filtering toggled in the viewer, taking precedence over the configured one.
     pub filter_fields_override: Option<bool>,
+}
+
+/// A side pane's text and the rows it is laid out on.
+#[derive(Debug, Default)]
+pub(crate) struct PaneText {
+    pub text: ratatui::text::Text<'static>,
+    pub line_index: crate::render::log_view::RenderedLineIndex,
+    /// The wrapping and width `line_index` was built for, or `None` once `text` changed.
+    pub wrap: Option<(bool, u16)>,
+}
+
+impl PaneText {
+    /// Replaces the text, which the next [`Self::lay_out`] indexes anew.
+    pub(crate) fn set_text(&mut self, text: ratatui::text::Text<'static>) {
+        self.text = text;
+        self.wrap = None;
+    }
+
+    /// Indexes the text's rows for `wrap` at `width` columns, unless that is done already.
+    pub(crate) fn lay_out(&mut self, wrap: bool, width: u16) {
+        if self.wrap != Some((wrap, width)) {
+            self.line_index.rebuild(&self.text, wrap, width);
+            self.wrap = Some((wrap, width));
+        }
+    }
 }
 
 /// A log record as the log pane renders it.
@@ -57,10 +87,11 @@ impl Service {
             log: LogText::default(),
             text_dirty: true,
             logs_dirty: true,
-            healthcheck_cached_text: ratatui::text::Text::default(),
-            healthcheck_cached_line_index: crate::render::log_view::RenderedLineIndex::default(),
-            healthcheck_cached_wrap: None,
+            health_pane: PaneText::default(),
             healthcheck_dirty: true,
+            timeline: crate::timeline::Timeline::default(),
+            events_pane: PaneText::default(),
+            events_dirty: true,
             log_cursor: 0,
             rewrites: 0,
             cached_format: None,
@@ -68,6 +99,34 @@ impl Service {
             timestamps_override: None,
             filter_fields_override: None,
         }
+    }
+
+    /// The text `pane` shows for this service.
+    pub(crate) fn side_text(&self, pane: crate::SidePane) -> &PaneText {
+        match pane {
+            crate::SidePane::Health => &self.health_pane,
+            crate::SidePane::Events => &self.events_pane,
+        }
+    }
+
+    /// Brings the events pane's text up to date with the lifecycle events `source` recorded since
+    /// the last read, unless none were recorded.
+    pub(crate) fn refresh_events(&mut self, source: &crate::SessionSource) {
+        if !std::mem::take(&mut self.events_dirty) {
+            return;
+        }
+        let id = &self.snapshot.id;
+        let Some(page) = source.events(id, self.timeline.read_after()) else {
+            self.timeline.replace(Vec::new());
+            self.events_pane
+                .set_text(crate::timeline::unsupported_text());
+            return;
+        };
+        if !self.timeline.extend(page) {
+            self.timeline
+                .replace(source.events(id, None).unwrap_or_default());
+        }
+        self.events_pane.set_text(self.timeline.text());
     }
 
     /// Drops the rendered lines when `format` differs from the one they were built with.
