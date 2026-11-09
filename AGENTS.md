@@ -45,3 +45,11 @@ sentence naming the config key, command or flag. CI, tooling, tests, refactors
 and dependency bumps get no entry. A release moves the Unreleased entries under
 the new `## vX.Y.Z` heading before the bump, which commits `CHANGELOG.md`
 through `.bumpversion.toml`.
+
+## TUI screenshots
+
+Any visual change to the TUI regenerates the documentation screenshots with
+`task docs:screenshots` and checks every image in `docs/static/images`: the
+header and the footer must each stay on one row. When the footer wraps, raise
+`COLS` in `crates/micromux-screenshot/src/scenario.rs` to the narrowest width
+that keeps it on one row, plus one column of margin.
