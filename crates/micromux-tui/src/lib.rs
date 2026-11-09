@@ -19,6 +19,7 @@ mod source;
 mod state;
 mod style;
 mod terminal;
+mod timeline;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Duration;
@@ -136,8 +137,10 @@ pub struct App {
     state: state::State,
     /// Log viewer
     log_view: crate::render::log_view::LogView,
-    healthcheck_view: crate::render::log_view::LogView,
-    show_healthcheck_pane: bool,
+    /// Scrolling of the side pane, whichever one shows.
+    side_view: crate::render::log_view::LogView,
+    /// The pane beside the logs, if any.
+    side_pane: Option<SidePane>,
     pretty_json_logs: bool,
     level_picker: Option<level::LevelPicker>,
     /// The search of the log pane.
@@ -185,8 +188,17 @@ enum Focus {
     Services,
     /// Log pane is focused.
     Logs,
-    /// Healthcheck pane is focused.
-    Healthcheck,
+    /// The side pane is focused.
+    Side,
+}
+
+/// What the pane beside the logs shows; one at a time, so the logs keep half the width.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SidePane {
+    /// The selected service's healthcheck attempts.
+    Health,
+    /// The selected service's lifecycle events.
+    Events,
 }
 
 impl App {
@@ -214,7 +226,7 @@ impl App {
         let services = snapshots.into_iter().map(state::Service::new).collect();
 
         let log_view = render::log_view::LogView::default();
-        let healthcheck_view = render::log_view::LogView::default();
+        let side_view = render::log_view::LogView::default();
 
         Self {
             running: true,
@@ -230,8 +242,8 @@ impl App {
             input_event_handler: event::InputHandler::new(),
             state: state::State::new(services),
             log_view,
-            healthcheck_view,
-            show_healthcheck_pane: false,
+            side_view,
+            side_pane: None,
             pretty_json_logs: view_options.pretty_json,
             level_picker: None,
             search: search::LogSearch::default(),
@@ -690,7 +702,12 @@ impl App {
                 }
             }
             ChangeKind::Roster | ChangeKind::Unknown => return true,
-            ChangeKind::Events => self.observe_input_events(&change.service_id),
+            ChangeKind::Events => {
+                self.observe_input_events(&change.service_id);
+                if let Some(service) = self.service_mut(&change.service_id) {
+                    service.events_dirty = true;
+                }
+            }
             ChangeKind::Heartbeat => {}
         }
         false
@@ -729,6 +746,7 @@ impl App {
                     service.snapshot = snapshot;
                     service.logs_dirty = true;
                     service.healthcheck_dirty = true;
+                    service.events_dirty = true;
                     service
                 } else {
                     state::Service::new(snapshot)
@@ -893,7 +911,10 @@ impl App {
 
             // Enter PTY input mode
             KeyCode::Char('a') if self.input.is_some() => self.enter_pty_input_mode(),
-            KeyCode::Char('H') => self.toggle_healthcheck_pane(),
+
+            // Show a side pane, or hide it
+            KeyCode::Char('H') => self.toggle_side_pane(SidePane::Health),
+            KeyCode::Char('E') => self.toggle_side_pane(SidePane::Events),
 
             // Show every service's logs, or the selected service's again
             KeyCode::Char('A') => self.show_all_logs(self.state.all_logs.is_none()),
@@ -1110,24 +1131,33 @@ impl App {
     }
 
     fn toggle_focus(&mut self) {
-        self.focus = if self.show_healthcheck_pane {
+        self.focus = if self.side_pane.is_some() {
             match self.focus {
                 Focus::Services => Focus::Logs,
-                Focus::Logs => Focus::Healthcheck,
-                Focus::Healthcheck => Focus::Services,
+                Focus::Logs => Focus::Side,
+                Focus::Side => Focus::Services,
             }
         } else {
             match self.focus {
                 Focus::Services => Focus::Logs,
-                Focus::Logs | Focus::Healthcheck => Focus::Services,
+                Focus::Logs | Focus::Side => Focus::Services,
             }
         };
     }
 
-    fn toggle_healthcheck_pane(&mut self) {
-        self.show_healthcheck_pane = !self.show_healthcheck_pane;
-        if !self.show_healthcheck_pane && self.focus == Focus::Healthcheck {
-            self.focus = Focus::Logs;
+    /// Hides `pane` when it shows, and shows it otherwise, in place of the other side pane if that
+    /// one shows, following its newest lines.
+    ///
+    /// The log pane, which the service PTYs match, is as wide with either side pane.
+    fn toggle_side_pane(&mut self, pane: SidePane) {
+        if self.side_pane == Some(pane) {
+            self.side_pane = None;
+            if self.focus == Focus::Side {
+                self.focus = Focus::Logs;
+            }
+        } else {
+            self.side_pane = Some(pane);
+            self.side_view.follow_tail = true;
         }
         self.maybe_resize_pty();
     }
@@ -1136,7 +1166,7 @@ impl App {
         match self.focus {
             Focus::Services => self.state.service_up(),
             Focus::Logs => self.scroll_logs_up(1),
-            Focus::Healthcheck => self.scroll_healthchecks_up(1),
+            Focus::Side => self.scroll_side_pane_up(1),
         }
     }
 
@@ -1144,7 +1174,7 @@ impl App {
         match self.focus {
             Focus::Services => self.state.service_down(),
             Focus::Logs => self.scroll_logs_down(1),
-            Focus::Healthcheck => self.scroll_healthchecks_down(1),
+            Focus::Side => self.scroll_side_pane_down(1),
         }
     }
 
@@ -1154,9 +1184,9 @@ impl App {
                 self.log_view.follow_tail = false;
                 self.log_view.scroll_offset = 0;
             }
-            Focus::Healthcheck => {
-                self.healthcheck_view.follow_tail = false;
-                self.healthcheck_view.scroll_offset = 0;
+            Focus::Side => {
+                self.side_view.follow_tail = false;
+                self.side_view.scroll_offset = 0;
             }
             Focus::Services => {}
         }
@@ -1167,8 +1197,8 @@ impl App {
             Focus::Logs => {
                 self.log_view.follow_tail = true;
             }
-            Focus::Healthcheck => {
-                self.healthcheck_view.follow_tail = true;
+            Focus::Side => {
+                self.side_view.follow_tail = true;
             }
             Focus::Services => {}
         }
@@ -1177,7 +1207,7 @@ impl App {
     fn toggle_wrap(&mut self) {
         let wrap = !self.log_view.wrap;
         self.log_view.wrap = wrap;
-        self.healthcheck_view.wrap = wrap;
+        self.side_view.wrap = wrap;
     }
 
     fn toggle_tail(&mut self) {
@@ -1185,8 +1215,8 @@ impl App {
             Focus::Logs | Focus::Services => {
                 self.log_view.follow_tail = !self.log_view.follow_tail;
             }
-            Focus::Healthcheck => {
-                self.healthcheck_view.follow_tail = !self.healthcheck_view.follow_tail;
+            Focus::Side => {
+                self.side_view.follow_tail = !self.side_view.follow_tail;
             }
         }
     }
@@ -1221,22 +1251,22 @@ impl App {
         self.log_view.scroll_by(rows, total, viewport);
     }
 
-    fn scroll_healthchecks_up(&mut self, lines: u16) {
-        self.scroll_healthchecks(-isize::from(lines.cast_signed()));
+    fn scroll_side_pane_up(&mut self, lines: u16) {
+        self.scroll_side_pane(-isize::from(lines.cast_signed()));
     }
 
-    fn scroll_healthchecks_down(&mut self, lines: u16) {
-        self.scroll_healthchecks(isize::from(lines.cast_signed()));
+    fn scroll_side_pane_down(&mut self, lines: u16) {
+        self.scroll_side_pane(isize::from(lines.cast_signed()));
     }
 
-    /// Scrolls the healthcheck pane by `rows`, up when negative.
-    fn scroll_healthchecks(&mut self, rows: isize) {
-        let Some(service) = self.state.current_service() else {
+    /// Scrolls the side pane by `rows`, up when negative.
+    fn scroll_side_pane(&mut self, rows: isize) {
+        let (Some(service), Some(pane)) = (self.state.current_service(), self.side_pane) else {
             return;
         };
-        let total = service.healthcheck_cached_line_index.total_lines();
+        let total = service.side_text(pane).line_index.total_lines();
         let viewport = usize::from(self.log_viewport_height());
-        self.healthcheck_view.scroll_by(rows, total, viewport);
+        self.side_view.scroll_by(rows, total, viewport);
     }
 
     fn is_running(&self) -> bool {
@@ -1588,7 +1618,7 @@ mod tests {
         assert!(!shutdown.is_cancelled());
 
         app.handle_key_press(key(KeyCode::Char('H'), KeyModifiers::SHIFT));
-        assert!(app.show_healthcheck_pane);
+        assert_eq!(app.side_pane, Some(SidePane::Health));
 
         // Ctrl-C never quits, however often it comes; plain `q` does.
         for _ in 0..3 {
@@ -1828,7 +1858,7 @@ mod tests {
         for hint in [
             "micromux v",
             "Level:ALL",
-            "Health:OFF",
+            "Pane:OFF",
             "? Help",
             "d Disable",
             "PTY input",
@@ -2335,7 +2365,7 @@ mod tests {
             micromux::CancellationToken::new(),
             ViewOptions::default(),
         );
-        app.show_healthcheck_pane = true;
+        app.side_pane = Some(SidePane::Health);
         let area = ratatui::layout::Rect::new(0, 0, 120, 30);
         let mut buffer = ratatui::buffer::Buffer::empty(area);
 
@@ -2343,7 +2373,7 @@ mod tests {
         let cached_pointer = app
             .state
             .current_service()
-            .and_then(|service| service.healthcheck_cached_text.lines.first())
+            .and_then(|service| service.health_pane.text.lines.first())
             .and_then(|line| line.spans.first())
             .map(|span| span.content.as_ptr())
             .ok_or_else(|| eyre::eyre!("healthcheck cache was empty"))?;
@@ -2351,7 +2381,7 @@ mod tests {
         let reused_pointer = app
             .state
             .current_service()
-            .and_then(|service| service.healthcheck_cached_text.lines.first())
+            .and_then(|service| service.health_pane.text.lines.first())
             .and_then(|line| line.spans.first())
             .map(|span| span.content.as_ptr())
             .ok_or_else(|| eyre::eyre!("healthcheck cache was empty"))?;
@@ -2815,19 +2845,19 @@ mod tests {
             ViewOptions::default(),
         );
         app.focus = Focus::Services;
-        app.show_healthcheck_pane = false;
+        app.side_pane = None;
 
         app.handle_input_event(tab_press());
         assert_eq!(app.focus, Focus::Logs);
         app.handle_input_event(tab_press());
         assert_eq!(app.focus, Focus::Services);
 
-        app.show_healthcheck_pane = true;
+        app.side_pane = Some(SidePane::Health);
         app.focus = Focus::Services;
         app.handle_input_event(tab_press());
         assert_eq!(app.focus, Focus::Logs);
         app.handle_input_event(tab_press());
-        assert_eq!(app.focus, Focus::Healthcheck);
+        assert_eq!(app.focus, Focus::Side);
         app.handle_input_event(tab_press());
         assert_eq!(app.focus, Focus::Services);
 

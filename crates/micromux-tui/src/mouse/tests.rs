@@ -14,7 +14,7 @@ use similar_asserts::assert_eq;
 
 use super::MouseState;
 use crate::state::CachedLine;
-use crate::{App, Effect, Focus, LocalSource, SessionSource, ViewOptions};
+use crate::{App, Effect, Focus, LocalSource, SessionSource, SidePane, ViewOptions};
 
 const WIDTH: u16 = 120;
 const HEIGHT: u16 = 30;
@@ -179,7 +179,7 @@ async fn clicks_select_services_and_focus_the_pane_under_them() -> eyre::Result<
     assert_eq!(app.focus, Focus::Logs);
     let health = find(&frame, "Healthcheck")?;
     click(&mut app, Position::new(health.x + 2, health.y + 3));
-    assert_eq!(app.focus, Focus::Healthcheck);
+    assert_eq!(app.focus, Focus::Side);
     assert_eq!(app.state.selected_service, 2);
 
     // A click below the last service focuses the list but selects nothing new.
@@ -440,8 +440,8 @@ async fn hints_run_their_key_but_never_quit() -> eyre::Result<()> {
     let frame = draw(&mut app);
 
     // Header and footer hints act like their keys.
-    click(&mut app, find(&frame, "H Health")?);
-    assert!(app.show_healthcheck_pane);
+    click(&mut app, find(&frame, "H/E Pane")?);
+    assert_eq!(app.side_pane, Some(SidePane::Health));
     click(&mut app, find(&frame, "Tab Focus")?);
     assert_eq!(app.focus, Focus::Logs);
     click(&mut app, find(&frame, "? Help")?);
@@ -467,6 +467,27 @@ async fn hints_run_their_key_but_never_quit() -> eyre::Result<()> {
     let selected = app.state.selected_service;
     click(&mut app, find(&frame, "↑/↓ Move")?);
     assert_eq!(app.state.selected_service, selected);
+    Ok(())
+}
+
+/// The side panes share one header hint, which names the pane on screen; a click on it shows
+/// them in turn, the healthcheck pane, the events pane, then neither.
+#[tokio::test]
+async fn the_side_pane_hint_cycles_through_the_side_panes() -> eyre::Result<()> {
+    let mut app = app(SERVICES)?;
+    let mut expected = [
+        (Some(SidePane::Health), "H/E Pane:HEALTH"),
+        (Some(SidePane::Events), "H/E Pane:EVENTS"),
+        (None, "H/E Pane:OFF"),
+    ]
+    .into_iter();
+    assert!(row_text(&draw(&mut app), 0).contains("H/E Pane:OFF"));
+    for (pane, hint) in expected.by_ref() {
+        let frame = draw(&mut app);
+        click(&mut app, find(&frame, "H/E Pane")?);
+        assert_eq!(app.side_pane, pane);
+        assert!(row_text(&draw(&mut app), 0).contains(hint), "{hint}");
+    }
     Ok(())
 }
 
@@ -693,11 +714,11 @@ async fn in_pty_input_mode_the_mouse_never_changes_the_service_typed_into() -> e
 async fn a_hint_acts_only_when_the_button_comes_up_on_it() -> eyre::Result<()> {
     let mut app = app(SERVICES)?;
     let frame = draw(&mut app);
-    let health = find(&frame, "H Health")?;
+    let health = find(&frame, "H/E Pane")?;
 
     // Pressing does nothing yet, and releasing elsewhere cancels the click.
     mouse(&mut app, MouseEventKind::Down(MouseButton::Left), health);
-    assert!(!app.show_healthcheck_pane);
+    assert_eq!(app.side_pane, None);
     mouse(
         &mut app,
         MouseEventKind::Drag(MouseButton::Left),
@@ -708,12 +729,12 @@ async fn a_hint_acts_only_when_the_button_comes_up_on_it() -> eyre::Result<()> {
         MouseEventKind::Up(MouseButton::Left),
         Position::new(1, HEIGHT / 2),
     );
-    assert!(!app.show_healthcheck_pane);
+    assert_eq!(app.side_pane, None);
 
     // Releasing on the hint it went down on runs its key.
     mouse(&mut app, MouseEventKind::Down(MouseButton::Left), health);
     mouse(&mut app, MouseEventKind::Up(MouseButton::Left), health);
-    assert!(app.show_healthcheck_pane);
+    assert_eq!(app.side_pane, Some(SidePane::Health));
     Ok(())
 }
 

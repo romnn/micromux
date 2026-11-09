@@ -14,6 +14,7 @@ Running `micromux` with no subcommand opens the TUI for the current project. It'
 - **Sidebar** — every service, one row each, showing its lifecycle state: pending, blocked, starting, running, healthy, unhealthy, exited, or disabled. A [job]({{< relref "configuration/services.md" >}}#jobs) shows **COMPLETED** once it exited with status 0, grayed out like a disabled service, **FAILED** with its exit code in red, **RETRYING** between attempts, and **IDLE** while a manual job waits to be run. The selected row drives the panes on the right.
 - **Log pane** — the selected service's live output, annotated with the lifecycle transitions that stall it. ANSI color and interactive/redrawing output are supported. `A` switches it to [every service's logs](#all-services-logs) in time order.
 - **Healthcheck pane** — toggled with `H`, it shows the selected service's latest probe: the command, its exit status, and its output.
+- **Events pane** — toggled with `E` in the healthcheck pane's place, it shows the selected service's [lifecycle events](#lifecycle-events): why it is blocked, restarting, or gone.
 
 The pane with the focus, which the movement keys act on, has a thick frame in an accent color; `Tab` or a click moves it. The thickness tells it apart even where the terminal shows no color.
 
@@ -30,6 +31,7 @@ The header's right side lists the view keys, which change only what the panes sh
 | `a` | Enter PTY **input mode** — send keystrokes to the service (exit with `Ctrl+]`) |
 | `Tab` | Move focus between panes |
 | `H` | Toggle the healthcheck pane |
+| `E` | Toggle the lifecycle events pane (see [Lifecycle events](#lifecycle-events)) |
 | `A` | Toggle every service's logs in one pane, in time order (see [All services' logs](#all-services-logs)) |
 | `w` | Toggle log wrapping |
 | `t` | Toggle follow-tail (stick to the newest logs) |
@@ -73,17 +75,25 @@ The search stays while the log moves on: new lines are searched as they arrive, 
 
 Only the lines that the services still keep in memory show, as in their own panes, so memory stays within each service's [log retention]({{< relref "configuration/logs.md" >}}). A busy service drops its oldest lines sooner than a quiet one, so far back in the pane its lines may be missing.
 
+## Lifecycle events
+
+`E` shows the selected service's lifecycle events beside the logs, the timeline agents read with the MCP tool `get_service_events`: restart, enable and disable requests, config reloads, spawns and exits, healthcheck changes, restart backoff, dependency waits and failures, cleanups, discarded terminal input, and the creation, replacement, lease renewal and retirement of dynamic services. Each line shows the local time, the kind of event and what happened, such as `12:04:31 backoff     automatic restart scheduled after 2000 ms`. The kind is red for a failure, yellow while the service waits or when input was lost, green for progress, and blue for a request or a configuration change.
+
+The newest event is at the bottom, and the pane follows it as the log pane follows its tail; scrolling, wrapping and copying work as in the other panes, and a selection stays on its events while older ones drop out. It shows the events the session keeps, the latest 256 per service. An attached TUI keeps a copy of every service's events, as it does of their logs and healthchecks, and fetches only the new ones over the connection.
+
+The events pane and the healthcheck pane take turns beside the logs, so the logs and the service terminals keep the same width with either: `E` replaces the healthcheck pane, `H` brings it back, and the key of the pane on screen hides it. The header's `H/E Pane` hint names the pane on screen, `HEALTH` or `EVENTS`, or says `OFF`. The pane follows the selected service, also while `A` shows every service's logs. An attached TUI shows the session's events too; a session too old to report them says so.
+
 ## Mouse
 
 With mouse capture on, which is the default, the mouse works as in most terminal apps:
 
 - **Click** a service to select it, or any pane to focus it, as `Tab` would.
-- **Wheel** scrolls the pane under the pointer, without moving the focus: each notch moves the service list's selection by one service, and the log and healthcheck panes by three rows, also where the terminal sends a burst of events for one notch. A high-resolution wheel or a touchpad moves at most a step every 15 milliseconds. Scrolling up leaves follow-tail, as the keys do, but only when the view moves; a pane whose text fits, such as a full-screen program's live screen, keeps following. Scrolling back to the bottom follows the tail again. While a popup is open, the wheel scrolls the popup.
+- **Wheel** scrolls the pane under the pointer, without moving the focus: each notch moves the service list's selection by one service, and the log, healthcheck and events panes by three rows, also where the terminal sends a burst of events for one notch. A high-resolution wheel or a touchpad moves at most a step every 15 milliseconds. Scrolling up leaves follow-tail, as the keys do, but only when the view moves; a pane whose text fits, such as a full-screen program's live screen, keeps following. Scrolling back to the bottom follows the tail again. While a popup is open, the wheel scrolls the popup.
 - **Drag** selects text inside the pane where the drag started, never across panes, so a selection in the logs never picks up the sidebar. Dragging past the top or bottom of the pane scrolls it, and past its right edge selects to the end of the line, even where a line runs on beyond the pane. A double click selects a word, a triple click the whole line, even when it wraps over several rows or runs past the pane. `Esc` clears the selection.
 - **The selection stays on its text** until you clear it or start another: while new lines arrive and the pane scrolls, while a busy log drops its oldest lines, and while a live screen or a popup redraws. A resize keeps it too, unless wrapping lays the text out anew.
 - **Selecting only highlights.** Press `y` or `Enter`, right-click anywhere, or click `y Copy` in the footer, which takes the mouse toggle's place while text is selected, to copy the selection to the clipboard. The terminal's own copy shortcut can copy too, as [Copying](#copying) describes. A right-click copies when the button comes up and changes nothing else: not the selection, the focus or the selected service; without a selection it does nothing. To copy as soon as a drag ends instead, turn on [`ui.copy_on_select`](#settings).
 - **Copying** goes to the clipboard, and to the primary selection where there is one, through the terminal's OSC 52 support, which also works over ssh. The footer says what was copied. Some terminals ignore OSC 52, such as macOS Terminal and GNOME Terminal and other VTE-based terminals, so outside ssh micromux also hands the text to `pbcopy` on macOS, or to `wl-copy`, `xclip` or `xsel` on Linux, whichever is installed. Where neither works, use the terminal's own selection, described below.
-- **Click** a key hint in the header or footer to run its key, such as `H` to show the healthcheck pane or `?` for help. It acts when the button comes up on the hint it went down on, so sliding off cancels it. The `q` hint does nothing, so a stray click never ends the session, and neither do hints that name two keys, like `↑/↓`.
+- **Click** a key hint in the header or footer to run its key, such as `?` for help. It acts when the button comes up on the hint it went down on, so sliding off cancels it. The `q` hint does nothing, so a stray click never ends the session, and neither do hints that name two keys, like `↑/↓`, except `H/E`, which shows the healthcheck pane, then the events pane, then neither.
 - **Click** a URL in the Logs pane's title to open it in your browser.
 - **Click** outside an open popup to close it, as `Esc` does. In the level picker, click the threshold you want.
 

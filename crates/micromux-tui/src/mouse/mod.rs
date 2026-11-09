@@ -52,8 +52,8 @@ pub(crate) struct Hits {
     pub(crate) first_service: usize,
     /// The logs pane, borders and scrollbar included.
     pub(crate) logs: Rect,
-    /// The healthcheck pane, or an empty area while it is hidden.
-    pub(crate) health: Rect,
+    /// The side pane, or an empty area while it is hidden.
+    pub(crate) side: Rect,
     /// Key hints in the header and footer that a click runs.
     pub(crate) hints: Vec<HintHit>,
     /// URLs a click opens in the browser.
@@ -215,6 +215,21 @@ fn hint_key(keys: &str) -> Option<KeyEvent> {
 }
 
 impl App {
+    /// The key a click on the side pane hint presses, which shows the side panes in turn: the
+    /// healthcheck pane, then the events pane, then neither.
+    fn next_side_pane_key(&self) -> KeyEvent {
+        let ch = match self.side_pane {
+            None => 'H',
+            Some(crate::SidePane::Health | crate::SidePane::Events) => 'E',
+        };
+        KeyEvent {
+            code: KeyCode::Char(ch),
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        }
+    }
+
     /// Turns mouse capture on or off, as the `m` key does.
     pub(crate) fn toggle_mouse_capture(&mut self) {
         let capture = !self.mouse.capture;
@@ -331,9 +346,11 @@ impl App {
         } else if self.hits.logs.contains(position) {
             self.focus = Focus::Logs;
             self.start_selection(TextPane::Logs, position, count);
-        } else if self.hits.health.contains(position) {
-            self.focus = Focus::Healthcheck;
-            self.start_selection(TextPane::Healthcheck, position, count);
+        } else if self.hits.side.contains(position) {
+            self.focus = Focus::Side;
+            if let Some(pane) = self.side_text_pane() {
+                self.start_selection(pane, position, count);
+            }
         }
     }
 
@@ -341,7 +358,12 @@ impl App {
     fn click(&mut self, clickable: Clickable) {
         match clickable {
             Clickable::Hint(keys) => {
-                let Some(key) = hint_key(keys) else {
+                let key = if keys == crate::render::SIDE_PANE_KEYS {
+                    Some(self.next_side_pane_key())
+                } else {
+                    hint_key(keys)
+                };
+                let Some(key) = key else {
                     return;
                 };
                 // In PTY input mode keys go to the service, so only the hint that leaves the mode
@@ -527,8 +549,10 @@ impl App {
             }
         } else if self.hits.logs.contains(position) {
             self.scroll_pane(TextPane::Logs, down, WHEEL_ROWS);
-        } else if self.hits.health.contains(position) {
-            self.scroll_pane(TextPane::Healthcheck, down, WHEEL_ROWS);
+        } else if self.hits.side.contains(position)
+            && let Some(pane) = self.side_text_pane()
+        {
+            self.scroll_pane(pane, down, WHEEL_ROWS);
         }
     }
 
@@ -537,8 +561,8 @@ impl App {
         match (pane, down) {
             (TextPane::Logs, false) => self.scroll_logs_up(rows),
             (TextPane::Logs, true) => self.scroll_logs_down(rows),
-            (TextPane::Healthcheck, false) => self.scroll_healthchecks_up(rows),
-            (TextPane::Healthcheck, true) => self.scroll_healthchecks_down(rows),
+            (TextPane::Healthcheck | TextPane::Events, false) => self.scroll_side_pane_up(rows),
+            (TextPane::Healthcheck | TextPane::Events, true) => self.scroll_side_pane_down(rows),
             (TextPane::Help | TextPane::Info(_), false) => {
                 self.popup_scroll = self.popup_scroll.saturating_sub(usize::from(rows));
             }

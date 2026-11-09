@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **`E` in the TUI shows the selected service's lifecycle events, the timeline agents read with
+  `get_service_events`.** It takes the healthcheck pane's place and works in attached TUIs too.
 - **`A` in the TUI shows every service's logs in one pane, interleaved in time order.** Each line is
   tagged with its service, and search, scrolling and copying work as in a service's own pane.
 - **`micromux attach` types into services and resizes their PTYs.** Press `a` in an attached TUI;

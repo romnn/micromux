@@ -22,6 +22,9 @@ use serde::{Deserialize, Serialize};
 /// existing requests), and bump the major for incompatible request/response semantics.
 pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(3, 18);
 
+/// The first protocol revision whose sessions answer [`Request::GetEvents`].
+pub const EVENTS_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(3, 3);
+
 /// The first protocol revision whose sessions answer [`Request::GetEnvironment`].
 pub const ENVIRONMENT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(3, 15);
 
@@ -148,6 +151,8 @@ pub enum Request {
         service: ServiceID,
     },
     /// Return retained scheduler lifecycle events for a service.
+    ///
+    /// Sessions answer it from protocol [`EVENTS_PROTOCOL_VERSION`] on.
     GetEvents {
         /// Target service.
         service: ServiceID,
@@ -651,6 +656,15 @@ mod tests {
             3, 6
         )));
         assert!(supports_versioned_subscriptions(ProtocolVersion::new(3, 7)));
+    }
+
+    /// A session answers `GetEvents` only from 3.3 on, and never across a major line.
+    #[test]
+    fn events_require_protocol_3_3_on_the_same_major_line() {
+        assert!(ProtocolVersion::new(3, 3).supports(EVENTS_PROTOCOL_VERSION));
+        assert!(!ProtocolVersion::new(3, 2).supports(EVENTS_PROTOCOL_VERSION));
+        assert!(!ProtocolVersion::new(4, 3).supports(EVENTS_PROTOCOL_VERSION));
+        assert!(PROTOCOL_VERSION.supports(EVENTS_PROTOCOL_VERSION));
     }
 
     /// A session answers `GetEnvironment` only from 3.15 on, and never across a major line.

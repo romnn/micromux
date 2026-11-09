@@ -27,6 +27,7 @@ pub(crate) const END_OF_LINE: u16 = u16::MAX;
 pub(crate) enum TextPane {
     Logs,
     Healthcheck,
+    Events,
     Help,
     Info(InfoView),
 }
@@ -49,10 +50,12 @@ pub(crate) struct TextAnchor {
 }
 
 /// A line of a pane's text by a key that stays with it: a log's line by the record it comes
-/// from, and a line of a pane that never drops lines by its index.
+/// from, an events pane line by the sequence number of its event, and a line of a pane that never
+/// drops lines by its index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LineKey {
     Record(RecordLine),
+    Event(u64),
     Index(usize),
 }
 
@@ -210,11 +213,23 @@ fn column(col: u16) -> usize {
 }
 
 impl App {
+    /// The text pane the side pane shows, if any.
+    pub(crate) fn side_text_pane(&self) -> Option<TextPane> {
+        self.side_pane.map(|pane| match pane {
+            crate::SidePane::Health => TextPane::Healthcheck,
+            crate::SidePane::Events => TextPane::Events,
+        })
+    }
+
     /// Where `pane`'s text was drawn in the last frame.
     pub(crate) fn text_area(&self, pane: TextPane) -> Option<Rect> {
         match pane {
             TextPane::Logs => Some(crate::render::log_view::text_area(self.hits.logs)),
-            TextPane::Healthcheck => Some(crate::render::log_view::text_area(self.hits.health)),
+            // Both side panes draw in one place, so only the one showing has text there.
+            TextPane::Healthcheck | TextPane::Events if self.side_text_pane() == Some(pane) => {
+                Some(crate::render::log_view::text_area(self.hits.side))
+            }
+            TextPane::Healthcheck | TextPane::Events => None,
             TextPane::Help | TextPane::Info(_) => match &self.hits.popup {
                 Some(PopupHit {
                     content:
@@ -253,7 +268,9 @@ impl App {
                 current.map(format_of).into_iter().collect(),
                 self.log_view.wrap,
             ),
-            TextPane::Healthcheck => (Some(service?), no_formats(), self.healthcheck_view.wrap),
+            TextPane::Healthcheck | TextPane::Events => {
+                (Some(service?), no_formats(), self.side_view.wrap)
+            }
             TextPane::Info(InfoView::Service) => (service, no_formats(), false),
             TextPane::Help | TextPane::Info(InfoView::Session) => (None, no_formats(), false),
         };
@@ -270,7 +287,7 @@ impl App {
     pub(crate) fn first_row(&self, pane: TextPane) -> usize {
         match pane {
             TextPane::Logs => self.log_view.scroll_offset,
-            TextPane::Healthcheck => self.healthcheck_view.scroll_offset,
+            TextPane::Healthcheck | TextPane::Events => self.side_view.scroll_offset,
             TextPane::Help | TextPane::Info(_) => self.popup_scroll,
         }
     }
@@ -290,11 +307,12 @@ impl App {
                 Some((&log.text, &log.line_index))
             }
             TextPane::Healthcheck => {
-                let service = self.state.current_service()?;
-                Some((
-                    &service.healthcheck_cached_text,
-                    &service.healthcheck_cached_line_index,
-                ))
+                let pane = &self.state.current_service()?.health_pane;
+                Some((&pane.text, &pane.line_index))
+            }
+            TextPane::Events => {
+                let pane = &self.state.current_service()?.events_pane;
+                Some((&pane.text, &pane.line_index))
             }
             TextPane::Help | TextPane::Info(_) => None,
         }
@@ -322,13 +340,22 @@ impl App {
 
     /// The key of line `index` of `pane`: for a log, the sequence number of the record it comes
     /// from, which stays with it when older records are dropped, and its line within the record;
-    /// for other panes, the index itself.
+    /// for the events pane, the sequence number of its event, for the same reason; for other
+    /// panes, the index itself.
     fn line_key(&self, pane: TextPane, index: usize) -> LineKey {
-        self.state
-            .shown_log()
-            .filter(|_| pane == TextPane::Logs)
-            .and_then(|shown| shown.log.record_line(index))
-            .map_or(LineKey::Index(index), LineKey::Record)
+        match pane {
+            TextPane::Logs => self
+                .state
+                .shown_log()
+                .and_then(|shown| shown.log.record_line(index))
+                .map_or(LineKey::Index(index), LineKey::Record),
+            TextPane::Events => self
+                .state
+                .current_service()
+                .and_then(|service| service.event_seqs.get(index))
+                .map_or(LineKey::Index(index), |seq| LineKey::Event(*seq)),
+            TextPane::Healthcheck | TextPane::Help | TextPane::Info(_) => LineKey::Index(index),
+        }
     }
 
     /// The index of the line `key` names in `pane`, or, when its record was dropped, `Err` with
@@ -336,6 +363,14 @@ impl App {
     fn line_index(&self, pane: TextPane, key: LineKey) -> Result<usize, usize> {
         let record_line = match key {
             LineKey::Index(index) => return Ok(index),
+            // Events stay in sequence order, so a dropped event's place is where it would sort.
+            LineKey::Event(seq) => {
+                return self
+                    .state
+                    .current_service()
+                    .filter(|_| pane == TextPane::Events)
+                    .map_or(Err(0), |service| service.event_seqs.binary_search(&seq));
+            }
             LineKey::Record(record_line) => record_line,
         };
         let Some(shown) = self.state.shown_log().filter(|_| pane == TextPane::Logs) else {
@@ -682,7 +717,12 @@ impl App {
             .hits
             .popup
             .as_ref()
-            .filter(|_| matches!(context.pane, TextPane::Logs | TextPane::Healthcheck))
+            .filter(|_| {
+                matches!(
+                    context.pane,
+                    TextPane::Logs | TextPane::Healthcheck | TextPane::Events
+                )
+            })
             .map(|popup| popup.area);
         let first = self.first_row(context.pane);
         // Rows end where their text does, as terminals highlight a selection, rather than at the

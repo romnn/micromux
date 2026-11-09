@@ -399,7 +399,7 @@ fn select_hello(tui: &mut Terminal) -> eyre::Result<()> {
     // Input is handled in order, so once `H` shows, the release before it was handled too.
     tui.send(b"H")?;
     tui.wait_until("the release and the copy key in the footer", |screen, _| {
-        screen.contents().contains("y Copy") && screen.contents().contains("Health:ON")
+        screen.contents().contains("y Copy") && screen.contents().contains("Pane:HEALTH")
     })?;
     assert!(!contains(&tui.written, b"\x1b]52;"));
     Ok(())
