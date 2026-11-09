@@ -11,8 +11,8 @@ use ratatui::style::Modifier;
 use ratatui::widgets::{Paragraph, Widget as _};
 
 use super::{PopupContent, PopupHit};
+use crate::log_text::RecordLine;
 use crate::render::rows_u16;
-use crate::state::RecordLine;
 use crate::{App, InfoView};
 
 /// Fills the cells of an off-screen render that no text was drawn into, so copying tells
@@ -48,23 +48,23 @@ pub(crate) struct TextAnchor {
     col: u16,
 }
 
-/// A line of a pane's text by a key that stays with it.
+/// A line of a pane's text by a key that stays with it: a log's line by the record it comes
+/// from, and a line of a pane that never drops lines by its index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct LineKey {
-    /// A log record's sequence number, or the line's index in a pane that never drops lines.
-    record: u64,
-    /// The line within the record, which a live screen snapshot has several of.
-    line: usize,
+enum LineKey {
+    Record(RecordLine),
+    Index(usize),
 }
 
 /// What a pane's rows belong to; a selection made under one context means nothing under another.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TextContext {
     pub(crate) pane: TextPane,
-    /// The service whose text the pane shows, if any.
+    /// The service whose text the pane shows, if any; none for every service's logs.
     service: Option<String>,
-    /// How the logs are formatted, which decides what their lines say.
-    format: Option<crate::json_log::LineFormat>,
+    /// How each service's logs the pane shows are formatted, by service ID, which decides what
+    /// their lines say.
+    formats: std::collections::BTreeMap<String, crate::json_log::LineFormat>,
     wrap: bool,
     width: u16,
 }
@@ -75,11 +75,18 @@ impl TextContext {
     ///
     /// Only wrapping makes rows depend on the width, so an unwrapped log keeps its selection
     /// through a resize.
+    /// Services that come or go leave every service's logs as they are for the others, so only
+    /// a service in both must keep its format.
     fn shows_same_text(&self, now: &Self) -> bool {
         let width_matters = self.wrap || matches!(self.pane, TextPane::Info(_));
+        let same_formats = self.formats.iter().all(|(service, format)| {
+            now.formats
+                .get(service)
+                .is_none_or(|now_format| now_format == format)
+        });
         self.pane == now.pane
             && self.service == now.service
-            && self.format == now.format
+            && same_formats
             && self.wrap == now.wrap
             && (!width_matters || self.width == now.width)
     }
@@ -226,20 +233,34 @@ impl App {
         let area = self.text_area(pane).filter(|area| !area.is_empty())?;
         let current = self.state.current_service();
         let service = current.map(|service| service.snapshot.id.clone());
-        let (service, format, wrap) = match pane {
-            TextPane::Logs => (
-                Some(service?),
-                current.map(|service| service.line_format(self.pretty_json_logs)),
+        let format_of = |service: &crate::state::Service| {
+            (
+                service.snapshot.id.clone(),
+                service.line_format(self.pretty_json_logs),
+            )
+        };
+        let no_formats = std::collections::BTreeMap::new;
+        let (service, formats, wrap) = match pane {
+            // Every service's logs stay in the pane whichever service is selected, and so does a
+            // selection in them.
+            TextPane::Logs if self.state.all_logs.is_some() => (
+                None,
+                self.state.services.iter().map(format_of).collect(),
                 self.log_view.wrap,
             ),
-            TextPane::Healthcheck => (Some(service?), None, self.healthcheck_view.wrap),
-            TextPane::Info(InfoView::Service) => (service, None, false),
-            TextPane::Help | TextPane::Info(InfoView::Session) => (None, None, false),
+            TextPane::Logs => (
+                Some(service?),
+                current.map(format_of).into_iter().collect(),
+                self.log_view.wrap,
+            ),
+            TextPane::Healthcheck => (Some(service?), no_formats(), self.healthcheck_view.wrap),
+            TextPane::Info(InfoView::Service) => (service, no_formats(), false),
+            TextPane::Help | TextPane::Info(InfoView::Session) => (None, no_formats(), false),
         };
         Some(TextContext {
             pane,
             service,
-            format,
+            formats,
             wrap,
             width: area.width,
         })
@@ -263,13 +284,18 @@ impl App {
         &ratatui::text::Text<'static>,
         &crate::render::log_view::RenderedLineIndex,
     )> {
-        let service = self.state.current_service()?;
         match pane {
-            TextPane::Logs => Some((&service.cached_text, &service.cached_line_index)),
-            TextPane::Healthcheck => Some((
-                &service.healthcheck_cached_text,
-                &service.healthcheck_cached_line_index,
-            )),
+            TextPane::Logs => {
+                let log = self.state.shown_log()?.log;
+                Some((&log.text, &log.line_index))
+            }
+            TextPane::Healthcheck => {
+                let service = self.state.current_service()?;
+                Some((
+                    &service.healthcheck_cached_text,
+                    &service.healthcheck_cached_line_index,
+                ))
+            }
             TextPane::Help | TextPane::Info(_) => None,
         }
     }
@@ -298,35 +324,24 @@ impl App {
     /// from, which stays with it when older records are dropped, and its line within the record;
     /// for other panes, the index itself.
     fn line_key(&self, pane: TextPane, index: usize) -> LineKey {
-        let index_key = LineKey {
-            record: u64::try_from(index).unwrap_or(u64::MAX),
-            line: 0,
-        };
         self.state
-            .current_service()
+            .shown_log()
             .filter(|_| pane == TextPane::Logs)
-            .and_then(|service| service.record_line(index))
-            .map_or(index_key, |RecordLine { seq, line }| LineKey {
-                record: seq,
-                line,
-            })
+            .and_then(|shown| shown.log.record_line(index))
+            .map_or(LineKey::Index(index), LineKey::Record)
     }
 
     /// The index of the line `key` names in `pane`, or, when its record was dropped, `Err` with
     /// the index of the line now in its place.
     fn line_index(&self, pane: TextPane, key: LineKey) -> Result<usize, usize> {
-        let index_key = usize::try_from(key.record).unwrap_or(usize::MAX);
-        let Some(service) = self
-            .state
-            .current_service()
-            .filter(|_| pane == TextPane::Logs)
-        else {
-            return Ok(index_key);
+        let record_line = match key {
+            LineKey::Index(index) => return Ok(index),
+            LineKey::Record(record_line) => record_line,
         };
-        service.find_record_line(RecordLine {
-            seq: key.record,
-            line: key.line,
-        })
+        let Some(shown) = self.state.shown_log().filter(|_| pane == TextPane::Logs) else {
+            return Ok(usize::try_from(record_line.record.id.seq).unwrap_or(usize::MAX));
+        };
+        shown.log.find_record_line(record_line)
     }
 
     /// The anchor for `pos` in `pane`'s text.

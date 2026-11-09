@@ -13,6 +13,7 @@ use ratatui::widgets::Widget as _;
 use similar_asserts::assert_eq;
 
 use super::MouseState;
+use crate::state::CachedLine;
 use crate::{App, Effect, Focus, LocalSource, SessionSource, ViewOptions};
 
 const WIDTH: u16 = 120;
@@ -63,7 +64,11 @@ fn set_logs(app: &mut App, lines: impl IntoIterator<Item = String>) -> eyre::Res
         .into_iter()
         .enumerate()
         // Sequence numbers start at 1, apart from the line indices.
-        .map(|(index, line)| (u64::try_from(index).unwrap_or(u64::MAX) + 1, line))
+        .map(|(index, text)| CachedLine {
+            seq: u64::try_from(index).unwrap_or(u64::MAX) + 1,
+            timestamp_unix_ms: 0,
+            text,
+        })
         .collect();
     service.text_dirty = true;
     draw(app);
@@ -579,9 +584,11 @@ async fn a_selection_stays_on_its_text_while_a_full_log_drops_its_oldest_lines()
         .ok_or_else(|| eyre::eyre!("no service is selected"))?;
     for seq in 21..26u64 {
         service.cached_lines.pop_front();
-        service
-            .cached_lines
-            .push_back((seq, format!("line {seq} of the log")));
+        service.cached_lines.push_back(CachedLine {
+            seq,
+            timestamp_unix_ms: 0,
+            text: format!("line {seq} of the log"),
+        });
     }
     service.text_dirty = true;
     let frame = draw(&mut app);
@@ -726,9 +733,16 @@ async fn a_blank_last_line_keeps_the_selection_on_its_text() -> eyre::Result<()>
             .state
             .current_service_mut()
             .ok_or_else(|| eyre::eyre!("no service is selected"))?;
-        let seq = service.cached_lines.back().map_or(1, |(seq, _)| seq + 1);
+        let seq = service
+            .cached_lines
+            .back()
+            .map_or(1, |cached| cached.seq + 1);
         service.cached_lines.pop_front();
-        service.cached_lines.push_back((seq, text.to_string()));
+        service.cached_lines.push_back(CachedLine {
+            seq,
+            timestamp_unix_ms: 0,
+            text: text.to_string(),
+        });
         service.text_dirty = true;
         draw(&mut app);
         assert_eq!(
@@ -813,9 +827,16 @@ async fn a_selection_stays_on_its_text_next_to_a_screen_snapshot_record() -> eyr
         .state
         .current_service_mut()
         .ok_or_else(|| eyre::eyre!("no service is selected"))?;
-    let seq = service.cached_lines.back().map_or(1, |(seq, _)| seq + 1);
+    let seq = service
+        .cached_lines
+        .back()
+        .map_or(1, |cached| cached.seq + 1);
     service.cached_lines.pop_front();
-    service.cached_lines.push_back((seq, "next".to_string()));
+    service.cached_lines.push_back(CachedLine {
+        seq,
+        timestamp_unix_ms: 0,
+        text: "next".to_string(),
+    });
     service.text_dirty = true;
     draw(&mut app);
     assert_eq!(app.selected_text().as_deref(), Some("line 5"));
@@ -940,11 +961,16 @@ async fn a_selection_holds_while_its_text_moves_and_copies_later() -> eyre::Resu
             .state
             .current_service_mut()
             .ok_or_else(|| eyre::eyre!("no service is selected"))?;
-        let seq = service.cached_lines.back().map_or(1, |(seq, _)| seq + 1);
-        service.cached_lines.pop_front();
-        service
+        let seq = service
             .cached_lines
-            .push_back((seq, format!("arrived in round {round}")));
+            .back()
+            .map_or(1, |cached| cached.seq + 1);
+        service.cached_lines.pop_front();
+        service.cached_lines.push_back(CachedLine {
+            seq,
+            timestamp_unix_ms: 0,
+            text: format!("arrived in round {round}"),
+        });
         service.text_dirty = true;
         draw(&mut app);
     }
