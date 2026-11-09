@@ -46,6 +46,16 @@ and dependency bumps get no entry. A release moves the Unreleased entries under
 the new `## vX.Y.Z` heading before the bump, which commits `CHANGELOG.md`
 through `.bumpversion.toml`.
 
+## Versioning
+
+The Rust library API is not considered stable, so a version bump follows only
+what users see: the CLI, the config format and the control protocol. A release
+that keeps all three compatible is a patch release, such as 0.4.0 to 0.4.1,
+even when it adds features or changes library types; breaking any of them bumps
+the minor version. The control protocol stays backward compatible: additions
+bump its minor version, and clients send new requests only to sessions that
+report it.
+
 ## TUI screenshots
 
 Any visual change to the TUI regenerates the documentation screenshots with
