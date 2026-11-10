@@ -24,7 +24,8 @@
 //! A session learns its port from [`ClientMessage::Listen`] before its services start, and its
 //! registration names that port in [`Registration::proxy_port`].
 //! The proxy routes a request only to the sessions registered on the port it arrived on, and
-//! stops listening on a port once no session has used it for [`IDLE_TIMEOUT`].
+//! stops listening on a port once no session has used it for [`IDLE_TIMEOUT`], except the one it
+//! started on, which it keeps for its whole life.
 //! A proxy older than revision 4 listens on the one port it started with.
 
 use std::time::Duration;
@@ -112,8 +113,8 @@ pub enum ProxyMessage {
     Info {
         /// The HTTP port the proxy started with.
         ///
-        /// From revision 4 on, the proxy may listen on other ports as well, and may have stopped
-        /// listening on this one while no session used it.
+        /// From revision 4 on, the proxy may listen on other ports as well, and it keeps listening
+        /// on this one until it exits.
         port: u16,
         /// Process id of the proxy.
         pid: u32,

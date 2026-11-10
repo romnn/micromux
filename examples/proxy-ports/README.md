@@ -27,8 +27,9 @@ as <http://www.blog.localhost:8482>. One process listens on both ports:
 lsof -nP -iTCP:8481 -iTCP:8482 -sTCP:LISTEN
 ```
 
-Stop the shop, and the proxy stops listening on 8482 a minute later. Stop both, and the proxy exits
-a minute after the last session is gone.
+Stop the shop, and the proxy stops listening on 8482 a minute later. It keeps 8481, the port the
+blog started it on, until it exits. Stop both, and the proxy exits a minute after the last session
+is gone.
 
 Port 80 gives URLs without a port, but on Linux it needs privileges. To use it where it is allowed
 and fall back elsewhere, write:

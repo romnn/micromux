@@ -1383,6 +1383,46 @@ async fn a_port_closes_once_no_session_uses_it() -> eyre::Result<()> {
     Ok(())
 }
 
+/// The port the proxy started on stays open after its last session is gone, because `Hello`
+/// keeps advertising it and a protocol 3 client registers on the advertised port without asking
+/// the proxy to listen there first.
+#[tokio::test(start_paused = true)]
+async fn the_port_the_proxy_started_on_stays_open() -> eyre::Result<()> {
+    const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+    let proxy = start_proxy(IDLE_TIMEOUT).await?;
+    let other = test_ports::hold_port()?;
+    let (_closed, upstream_port) = refusing_port()?;
+    let one = Registrar::start(
+        proxy.paths.clone(),
+        registration("one", &[("app", upstream_port, None)]),
+        proxy.port,
+        None,
+        &CancellationToken::new(),
+        |_| {},
+    )
+    .await?;
+    // A session on another port keeps the proxy itself running.
+    let _two = Registrar::start(
+        proxy.paths.clone(),
+        registration("two", &[("app", upstream_port, None)]),
+        other.port,
+        None,
+        &CancellationToken::new(),
+        |_| {},
+    )
+    .await?;
+
+    // Long after the start port's only session is gone, the proxy still answers on it.
+    drop(one);
+    tokio::time::sleep(IDLE_TIMEOUT * 2).await;
+    let response = get(proxy.port, "app.one.localhost").await?;
+    assert!(response.starts_with("HTTP/1.1 404"), "{response}");
+
+    proxy.shutdown.cancel();
+    proxy.task.await??;
+    Ok(())
+}
+
 /// A registration for a port the proxy does not listen on opens it, as a session needs when it
 /// registers without asking for the port first, such as one started by an older micromux.
 #[tokio::test]

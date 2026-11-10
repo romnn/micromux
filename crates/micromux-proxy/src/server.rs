@@ -425,7 +425,12 @@ impl Shared {
             .collect::<HashSet<_>>();
         let now = tokio::time::Instant::now();
         let mut idle = Vec::new();
-        for (port, listener) in ports.iter_mut() {
+        // The port the proxy started on stays open for its whole life: `Hello` advertises it, and a
+        // protocol 3 client latches the advertised port without asking the proxy to listen there.
+        for (port, listener) in ports
+            .iter_mut()
+            .filter(|(port, _)| **port != self.started_port)
+        {
             if used.contains(port) {
                 listener.last_used = now;
             } else if now.duration_since(listener.last_used) >= idle_timeout {
