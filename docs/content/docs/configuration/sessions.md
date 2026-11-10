@@ -75,7 +75,7 @@ These variables are available to every [interpolation]({{< relref "services.md" 
 |---|---|
 | `MICROMUX_SESSION` | The session name, such as `luup2`. |
 | `MICROMUX_SESSION_DOMAIN` | `<name>.<domain>`, such as `luup2.localhost`. |
-| `MICROMUX_PROXY_PORT` | The port the shared proxy listens on, such as `80`. |
+| `MICROMUX_PROXY_PORT` | The port the shared proxy serves the session's routes on: its `proxy.port`, or `proxy.fallback_port` when that port could not be bound, such as `80`. |
 | `MICROMUX_HOST_SUFFIX` | What follows `<route>.` in a browser URL: `luup2.localhost` when the proxy listens on port 80, `luup2.localhost:8080` otherwise. For example `VITE_APP_URL=http://app.${MICROMUX_HOST_SUFFIX}`. |
 | every `allocate_ports` name | Its allocated port. |
 
@@ -141,7 +141,33 @@ proxy:
 
 On Linux, port 80 needs privileges unless you allow unprivileged low ports once with `sudo sysctl -w net.ipv4.ip_unprivileged_port_start=80` (persist it in `/etc/sysctl.d/`) or grant the binary `cap_net_bind_service` with `setcap`. Without either, set `fallback_port`, or the session fails to start and says so. macOS lets unprivileged processes bind port 80 only on the wildcard address, so there the proxy listens on all interfaces and drops every connection that does not come from the local machine.
 
-A session joins a proxy that is already running only if it listens on `port` or `fallback_port`. A session with path routes also needs a proxy that routes by path: one started by an older micromux would ignore the paths, so the session never registers with it.
+One proxy serves every session, whatever port each one asks for. A session whose `port` or `fallback_port` the running proxy does not listen on yet has it listen there too, so projects with different ports share it, and each session's routes answer only on its own port. The proxy stops listening on a port a minute after the last session using it is gone, except the port it started on, which it keeps until it exits.
+
+For example, a blog and a shop that each pick their own port:
+
+```yaml
+# blog/micromux.yaml
+session:
+  name: blog
+proxy:
+  port: 8481
+routes:
+  - host: www
+    port: ${WEB_PORT}
+```
+
+```yaml
+# shop/micromux.yaml
+session:
+  name: shop
+proxy:
+  port: 8482
+routes:
+  - host: www
+    port: ${WEB_PORT}
+```
+
+With both running, one `micromux proxy` process listens on `8481` and `8482`. `http://www.blog.localhost:8481` and `http://www.shop.localhost:8482` reach their sites, while `http://www.blog.localhost:8482` gets the 404 page listing both sessions. Services build their own URLs from [`MICROMUX_HOST_SUFFIX`](#injected-variables), which carries the port: `blog.localhost:8481`. The runnable version lives in [`examples/proxy-ports`](https://github.com/romnn/micromux/tree/main/examples/proxy-ports). A proxy started by an older micromux listens on one port only: a session that wants another port has it stop when no session uses it and starts a current one, and otherwise refuses it until that proxy exits, a minute after its last session stops. A session with path routes also needs a proxy that routes by path: one started by an older micromux would ignore the paths, so the session never registers with it.
 
 After an upgrade, the old proxy usually serves no session anymore and only waits out its idle minute, so a session that needs a newer proxy takes it over. A proxy from this version on is asked to stop right away. An older one cannot be stopped, so the session shows `waiting for the outdated proxy (pid N) to exit` and waits up to 75 seconds for it to exit on its own. Then it starts the new proxy and registers. The MCP `start_session` tool waits along with it, so a session it starts this way can take up to 90 seconds longer to become reachable. The session never signals the old proxy's process. If other sessions still use the old proxy, the session refuses it instead and names the proxy's process id and those sessions: stopping it would cut their routes, and an older micromux would start it again. Stop those sessions or restart them with the new micromux; the old proxy exits a minute after its last session stops. Once only sessions of the new micromux use it, `kill <pid>` moves them to a new proxy right away.
 

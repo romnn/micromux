@@ -1211,8 +1211,8 @@ async fn routes_end_with_the_registration_and_the_proxy_exits_when_idle() -> eyr
     Ok(())
 }
 
-/// A second session for the same session domain is refused, and only an acceptable running proxy
-/// is joined.
+/// A second session for the same session domain is refused, and a session whose ports are all
+/// taken by another program is refused, while one whose fallback the proxy serves joins it.
 #[tokio::test]
 async fn conflicting_sessions_and_ports_are_refused() -> eyre::Result<()> {
     let proxy = start_proxy(Duration::from_secs(60)).await?;
@@ -1242,35 +1242,313 @@ async fn conflicting_sessions_and_ports_are_refused() -> eyre::Result<()> {
         "{conflict:?}"
     );
 
+    // Another program holds the preferred port.
+    let taken = TcpListener::bind(("127.0.0.1", 0)).await?;
+    let taken_port = taken.local_addr()?.port();
     let joined = ensure_proxy(
         &proxy.paths,
         PortPreference {
-            port: 1,
+            port: taken_port,
             fallback_port: Some(proxy.port),
         },
         None,
     )
     .await?;
     assert_eq!(joined, proxy.port);
-    let mismatch = ensure_proxy(
+    let refused = ensure_proxy(
         &proxy.paths,
         PortPreference {
-            port: 1,
+            port: taken_port,
             fallback_port: None,
         },
         None,
     )
     .await;
     assert!(
-        matches!(
-            mismatch,
-            Err(micromux_proxy::ClientError::PortMismatch { .. })
-        ),
-        "{mismatch:?}"
+        matches!(refused, Err(micromux_proxy::ClientError::CannotListen(_))),
+        "{refused:?}"
     );
 
     proxy.shutdown.cancel();
     proxy.task.await??;
+    Ok(())
+}
+
+/// Sessions that want different ports share one proxy, which serves each session only on its own
+/// port and lists it with that port on the not-found page.
+#[tokio::test]
+async fn sessions_on_different_ports_share_one_proxy() -> eyre::Result<()> {
+    let proxy = start_proxy(Duration::from_secs(60)).await?;
+    let other = test_ports::hold_port()?;
+    let other_port = ensure_proxy(
+        &proxy.paths,
+        PortPreference {
+            port: other.port,
+            fallback_port: None,
+        },
+        None,
+    )
+    .await?;
+    assert_eq!(other_port, other.port);
+
+    let one_upstream = TcpListener::bind(("127.0.0.1", 0)).await?;
+    let two_upstream = TcpListener::bind(("127.0.0.1", 0)).await?;
+    let _one = Registrar::start(
+        proxy.paths.clone(),
+        registration("one", &[("app", one_upstream.local_addr()?.port(), None)]),
+        proxy.port,
+        None,
+        &CancellationToken::new(),
+        |_| {},
+    )
+    .await?;
+    let _two = Registrar::start(
+        proxy.paths.clone(),
+        registration("two", &[("app", two_upstream.local_addr()?.port(), None)]),
+        other.port,
+        None,
+        &CancellationToken::new(),
+        |_| {},
+    )
+    .await?;
+    let one = answer_once(one_upstream, "one");
+    let two = answer_once(two_upstream, "two");
+
+    // Each session answers on its own port.
+    let response = get(proxy.port, "app.one.localhost").await?;
+    assert!(response.ends_with("one"), "{response}");
+    let response = get(other.port, "app.two.localhost").await?;
+    assert!(response.ends_with("two"), "{response}");
+    one.await??;
+    two.await??;
+
+    // Neither answers on the other's port, whose not-found page points at the right URL.
+    let wrong = get(proxy.port, "app.two.localhost").await?;
+    assert!(wrong.starts_with("HTTP/1.1 404"), "{wrong}");
+    assert!(
+        wrong.contains(&format!("http://app.two.localhost:{}/", other.port)),
+        "{wrong}"
+    );
+    let wrong = get(other.port, "app.one.localhost").await?;
+    assert!(wrong.starts_with("HTTP/1.1 404"), "{wrong}");
+
+    proxy.shutdown.cancel();
+    proxy.task.await??;
+    // Stopping the proxy frees every port it listened on.
+    assert!(std::net::TcpListener::bind(("127.0.0.1", other.port)).is_ok());
+    Ok(())
+}
+
+/// The proxy stops listening on a port once no session has been registered on it for the idle
+/// timeout, while it keeps serving the others.
+#[tokio::test(start_paused = true)]
+async fn a_port_closes_once_no_session_uses_it() -> eyre::Result<()> {
+    const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+    let proxy = start_proxy(IDLE_TIMEOUT).await?;
+    let other = test_ports::hold_port()?;
+    let (_closed, upstream_port) = refusing_port()?;
+    let _one = Registrar::start(
+        proxy.paths.clone(),
+        registration("one", &[("app", upstream_port, None)]),
+        proxy.port,
+        None,
+        &CancellationToken::new(),
+        |_| {},
+    )
+    .await?;
+    let two = Registrar::start(
+        proxy.paths.clone(),
+        registration("two", &[("app", upstream_port, None)]),
+        other.port,
+        None,
+        &CancellationToken::new(),
+        |_| {},
+    )
+    .await?;
+
+    // A registered session keeps its port open past the idle timeout.
+    tokio::time::sleep(IDLE_TIMEOUT * 2).await;
+    let response = get(other.port, "app.two.localhost").await?;
+    assert!(response.starts_with("HTTP/1.1 502"), "{response}");
+
+    // Once its last session is gone, the port closes and the rest keep running.
+    drop(two);
+    tokio::time::sleep(IDLE_TIMEOUT * 2).await;
+    assert!(TcpStream::connect(("127.0.0.1", other.port)).await.is_err());
+    let response = get(proxy.port, "app.one.localhost").await?;
+    assert!(response.starts_with("HTTP/1.1 502"), "{response}");
+
+    proxy.shutdown.cancel();
+    proxy.task.await??;
+    Ok(())
+}
+
+/// The port the proxy started on stays open after its last session is gone, because `Hello`
+/// keeps advertising it and a protocol 3 client registers on the advertised port without asking
+/// the proxy to listen there first.
+#[tokio::test(start_paused = true)]
+async fn the_port_the_proxy_started_on_stays_open() -> eyre::Result<()> {
+    const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+    let proxy = start_proxy(IDLE_TIMEOUT).await?;
+    let other = test_ports::hold_port()?;
+    let (_closed, upstream_port) = refusing_port()?;
+    let one = Registrar::start(
+        proxy.paths.clone(),
+        registration("one", &[("app", upstream_port, None)]),
+        proxy.port,
+        None,
+        &CancellationToken::new(),
+        |_| {},
+    )
+    .await?;
+    // A session on another port keeps the proxy itself running.
+    let _two = Registrar::start(
+        proxy.paths.clone(),
+        registration("two", &[("app", upstream_port, None)]),
+        other.port,
+        None,
+        &CancellationToken::new(),
+        |_| {},
+    )
+    .await?;
+
+    // Long after the start port's only session is gone, the proxy still answers on it.
+    drop(one);
+    tokio::time::sleep(IDLE_TIMEOUT * 2).await;
+    let response = get(proxy.port, "app.one.localhost").await?;
+    assert!(response.starts_with("HTTP/1.1 404"), "{response}");
+
+    proxy.shutdown.cancel();
+    proxy.task.await??;
+    Ok(())
+}
+
+/// A registration for a port the proxy does not listen on opens it, as a session needs when it
+/// registers without asking for the port first, such as one started by an older micromux.
+#[tokio::test]
+async fn a_registration_opens_the_port_it_names() -> eyre::Result<()> {
+    use micromux_proxy::protocol::{ClientMessage, ProxyMessage};
+
+    let proxy = start_proxy(Duration::from_secs(60)).await?;
+    let other = test_ports::hold_port()?;
+    let (_closed, upstream_port) = refusing_port()?;
+    let mut two = registration("two", &[("app", upstream_port, None)]);
+    two.proxy_port = other.port;
+
+    // The registration lives as long as this connection.
+    let stream = tokio::net::UnixStream::connect(&proxy.paths.socket).await?;
+    let (reader, mut writer) = stream.into_split();
+    writer
+        .write_all(
+            format!(
+                "{}\n",
+                serde_json::to_string(&ClientMessage::Register(two))?
+            )
+            .as_bytes(),
+        )
+        .await?;
+    let mut line = String::new();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::io::AsyncBufReadExt::read_line(&mut tokio::io::BufReader::new(reader), &mut line),
+    )
+    .await??;
+    assert_eq!(
+        serde_json::from_str::<ProxyMessage>(&line)?,
+        ProxyMessage::Registered
+    );
+
+    // The route answers on the newly opened port, with its upstream down.
+    let response = get(other.port, "app.two.localhost").await?;
+    assert!(response.starts_with("HTTP/1.1 502"), "{response}");
+
+    drop(writer);
+    proxy.shutdown.cancel();
+    proxy.task.await??;
+    Ok(())
+}
+
+/// A proxy older than the multi-port protocol serves a session only on its own port: it is
+/// joined there without being asked to listen, refused on another port while sessions use it,
+/// and asked to stop on another port when none does, so a current proxy can take its place.
+#[tokio::test]
+async fn an_older_proxy_serves_only_its_own_port() -> eyre::Result<()> {
+    use micromux_proxy::protocol::ClientMessage;
+
+    let other = |port: u16| PortPreference {
+        port: port + 1,
+        fallback_port: None,
+    };
+
+    // In use by a session
+    let directory = tempfile::tempdir()?;
+    let paths = ProxyPaths::in_dir(directory.path());
+    let port = 18_500;
+    let (busy, mut received) = spawn_old_proxy(
+        &paths,
+        format!(
+            r#"{{"type":"info","port":{port},"pid":{},"protocol":3,"sessions":[{{"session":"one","config_path":"/one"}}]}}"#,
+            bystander_pid()
+        ),
+        UNKNOWN_REQUEST.to_string(),
+    )?;
+    let joined = ensure_proxy(
+        &paths,
+        PortPreference {
+            port,
+            fallback_port: None,
+        },
+        None,
+    )
+    .await?;
+    assert_eq!(joined, port);
+    let refused = ensure_proxy(&paths, other(port), None).await;
+    assert!(
+        matches!(
+            refused,
+            Err(micromux_proxy::ClientError::PortMismatch { running, .. }) if running == port
+        ),
+        "{refused:?}"
+    );
+    busy.abort();
+    received.close();
+    let mut messages = Vec::new();
+    while let Some(message) = received.recv().await {
+        messages.push(message);
+    }
+    assert!(
+        messages
+            .iter()
+            .all(|message| matches!(message, ClientMessage::Hello)),
+        "{messages:?}"
+    );
+
+    // Used by no session
+    let directory = tempfile::tempdir()?;
+    let paths = ProxyPaths::in_dir(directory.path());
+    let (idle, mut received) = spawn_old_proxy(
+        &paths,
+        format!(
+            r#"{{"type":"info","port":{port},"pid":{},"protocol":3,"sessions":[]}}"#,
+            bystander_pid()
+        ),
+        r#"{"type":"stopping"}"#.to_string(),
+    )?;
+    let stopped = ensure_proxy(&paths, other(port), None).await;
+    assert!(
+        matches!(stopped, Err(micromux_proxy::ClientError::Unavailable(_))),
+        "{stopped:?}"
+    );
+    idle.abort();
+    received.close();
+    let mut messages = Vec::new();
+    while let Some(message) = received.recv().await {
+        messages.push(message);
+    }
+    assert!(
+        messages.contains(&ClientMessage::StopIfIdle),
+        "{messages:?}"
+    );
     Ok(())
 }
 

@@ -19,6 +19,14 @@
 //! when [`ProxyMessage::Info`] lists the registered sessions, and otherwise waits for it to exit.
 //! A proxy older than revision 3 lists its sessions only on the HTML page it answers a host no
 //! session serves with, which the session reads instead.
+//!
+//! One proxy serves every port its sessions ask for.
+//! A session learns its port from [`ClientMessage::Listen`] before its services start, and its
+//! registration names that port in [`Registration::proxy_port`].
+//! The proxy routes a request only to the sessions registered on the port it arrived on, and
+//! stops listening on a port once no session has used it for [`IDLE_TIMEOUT`], except the one it
+//! started on, which it keeps for its whole life.
+//! A proxy older than revision 4 listens on the one port it started with.
 
 use std::time::Duration;
 
@@ -48,10 +56,14 @@ pub const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 /// - 2: path routes, with [`RouteTarget::path`] and [`RouteTarget::strip_prefix`].
 /// - 3: [`ProxyMessage::Info`] lists the registered sessions, and [`ClientMessage::StopIfIdle`]
 ///   stops a proxy that no session uses.
-pub const PROTOCOL_VERSION: u32 = 3;
+/// - 4: [`ClientMessage::Listen`] opens another port, and a registration opens the port it names.
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// The first protocol revision that routes by path.
 pub const PATH_ROUTES_PROTOCOL: u32 = 2;
+
+/// The first protocol revision that listens on more than one port.
+pub const PORTS_PROTOCOL: u32 = 4;
 
 fn first_protocol() -> u32 {
     1
@@ -61,8 +73,22 @@ fn first_protocol() -> u32 {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMessage {
-    /// Asks which port the proxy listens on.
+    /// Asks which port the proxy started with, and which protocol it speaks.
     Hello,
+    /// Asks the proxy to listen on `port`, or on `fallback_port` when `port` is privileged or
+    /// taken, answered with [`ProxyMessage::Listening`].
+    ///
+    /// A port the proxy already listens on is answered right away.
+    /// A port it opens stays open for at least [`IDLE_TIMEOUT`], which leaves the session time to
+    /// register on it; it closes after no session has been registered on it for that long.
+    /// A proxy older than revision 4 rejects it as an invalid message.
+    Listen {
+        /// Preferred port.
+        port: u16,
+        /// Port used when `port` is privileged or taken.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fallback_port: Option<u16>,
+    },
     /// Registers (or replaces) the routes of one session for the lifetime of this connection.
     ///
     /// Sent again on the same connection for the same session, it swaps the routes in place and
@@ -85,7 +111,10 @@ pub enum ClientMessage {
 pub enum ProxyMessage {
     /// Reply to [`ClientMessage::Hello`].
     Info {
-        /// The HTTP port the proxy listens on.
+        /// The HTTP port the proxy started with.
+        ///
+        /// From revision 4 on, the proxy may listen on other ports as well, and it keeps listening
+        /// on this one until it exits.
         port: u16,
         /// Process id of the proxy.
         pid: u32,
@@ -96,6 +125,11 @@ pub enum ProxyMessage {
         /// not tell.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         sessions: Option<Vec<RegisteredSession>>,
+    },
+    /// Reply to [`ClientMessage::Listen`]: the proxy listens on `port`.
+    Listening {
+        /// The port the session's routes are served on.
+        port: u16,
     },
     /// The registration is active.
     Registered,
@@ -147,8 +181,12 @@ pub struct Registration {
     pub config_path: String,
     /// Process id of the session.
     pub pid: u32,
-    /// The proxy port the session's services were told about; a proxy on another port refuses
-    /// the registration.
+    /// The proxy port the session's services were told about, the only port its routes are
+    /// served on.
+    ///
+    /// A proxy that does not listen on it yet opens it, without any fallback, and refuses the
+    /// registration as retryable when it cannot; a proxy older than revision 4 refuses every
+    /// port but its own that way.
     pub proxy_port: u16,
     /// The session's routes.
     pub routes: Vec<RouteTarget>,

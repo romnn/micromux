@@ -26,12 +26,12 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 type Body = BoxBody<Bytes, hyper::Error>;
 
-/// Serves one downstream connection until the client closes it.
-pub(crate) async fn serve_connection(stream: TcpStream, shared: Arc<Shared>) {
+/// Serves one downstream connection, accepted on proxy port `port`, until the client closes it.
+pub(crate) async fn serve_connection(stream: TcpStream, port: u16, shared: Arc<Shared>) {
     let _ = stream.set_nodelay(true);
     let service = hyper::service::service_fn(move |request| {
         let shared = shared.clone();
-        async move { Ok::<_, Infallible>(handle(request, &shared).await) }
+        async move { Ok::<_, Infallible>(handle(request, port, &shared).await) }
     });
     if let Err(err) = hyper::server::conn::http1::Builder::new()
         .serve_connection(TokioIo::new(stream), service)
@@ -42,11 +42,11 @@ pub(crate) async fn serve_connection(stream: TcpStream, shared: Arc<Shared>) {
     }
 }
 
-async fn handle(mut request: Request<Incoming>, shared: &Shared) -> Response<Body> {
+async fn handle(mut request: Request<Incoming>, port: u16, shared: &Shared) -> Response<Body> {
     let Some(host) = request_host(&request) else {
         return text(StatusCode::BAD_REQUEST, "the request names no host");
     };
-    let Some(target) = shared.lookup(&host, request.uri().path()) else {
+    let Some(target) = shared.lookup(port, &host, request.uri().path()) else {
         return html(
             StatusCode::NOT_FOUND,
             pages::not_found(&host, request.uri().path(), &shared.listed_sessions()),

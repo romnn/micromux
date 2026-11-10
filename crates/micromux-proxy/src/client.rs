@@ -15,8 +15,8 @@ use tokio_util::sync::CancellationToken;
 use crate::listen::PortPreference;
 use crate::paths::ProxyPaths;
 use crate::protocol::{
-    ClientMessage, IDLE_TIMEOUT, LEASE_TIMEOUT, MAX_MESSAGE_BYTES, PING_INTERVAL, ProxyMessage,
-    RegisteredSession, Registration, RouteTarget,
+    ClientMessage, IDLE_TIMEOUT, LEASE_TIMEOUT, MAX_MESSAGE_BYTES, PING_INTERVAL, PORTS_PROTOCOL,
+    ProxyMessage, RegisteredSession, Registration, RouteTarget,
 };
 
 /// How long a session waits for a proxy it started to come up.
@@ -68,10 +68,15 @@ pub enum ClientError {
     /// A proxy was started but did not come up.
     #[error("the micromux proxy did not start: {0}")]
     StartFailed(String),
-    /// The running proxy listens on a port this session does not accept.
+    /// The running proxy cannot listen on any port this session accepts.
+    #[error("the micromux proxy cannot serve this session's port: {0}")]
+    CannotListen(String),
+    /// The running proxy is too old to listen on more than one port, and its port is not one
+    /// this session accepts.
     #[error(
-        "the running micromux proxy listens on port {running}, but this session wants {wanted}; \
-         stop the other sessions or align `proxy.port` / `proxy.fallback_port`"
+        "the running micromux proxy was started by an older micromux and listens only on port \
+         {running}, but this session wants {wanted}; it exits a minute after the sessions using \
+         it stop, or align `proxy.port` / `proxy.fallback_port` with it"
     )]
     PortMismatch {
         /// The running proxy's port.
@@ -193,13 +198,20 @@ impl ProxyLauncher {
     }
 }
 
-/// Finds the running proxy, or starts one, and returns the port it listens on.
+/// Finds the running proxy, or starts one, has it listen as `preference` asks, and returns the
+/// port it serves the session on.
 ///
-/// A running proxy is only accepted when its port is one `preference` allows.
+/// A running proxy listens on the preferred port, or on the fallback when the preferred one is
+/// privileged or taken, alongside the ports it serves other sessions on.
+/// A proxy older than [`PORTS_PROTOCOL`] listens on one port only, and is accepted only when
+/// that port is one `preference` allows.
+/// When it is not and the proxy says no session uses it, it is asked to stop, and a current
+/// proxy takes its place.
 ///
 /// # Errors
 ///
-/// Returns [`ClientError::PortMismatch`] when the running proxy uses another port,
+/// Returns [`ClientError::CannotListen`] when the proxy cannot bind an acceptable port,
+/// [`ClientError::PortMismatch`] when an older proxy that sessions use listens on another port,
 /// [`ClientError::StartFailed`] with the proxy's own explanation when a started proxy exits, and
 /// [`ClientError::Unreachable`] when no proxy runs and `launcher` is `None`.
 pub async fn ensure_proxy(
@@ -207,22 +219,9 @@ pub async fn ensure_proxy(
     preference: PortPreference,
     launcher: Option<&ProxyLauncher>,
 ) -> Result<u16, ClientError> {
-    let accept = |port: u16| {
-        if preference.accepts(port) {
-            Ok(port)
-        } else {
-            Err(ClientError::PortMismatch {
-                running: port,
-                wanted: match preference.fallback_port {
-                    Some(fallback) => format!("{} or {fallback}", preference.port),
-                    None => preference.port.to_string(),
-                },
-            })
-        }
-    };
-    let first = match hello(&paths.socket).await {
-        Ok(port) => return accept(port),
-        Err(err) => err,
+    let first = match listen(&paths.socket, preference).await {
+        Err(err) if err.is_transient() => err,
+        result => return result,
     };
     let Some(launcher) = launcher else {
         return Err(first);
@@ -232,13 +231,15 @@ pub async fn ensure_proxy(
         .map_err(|err| ClientError::StartFailed(format!("cannot run the proxy: {err}")))?;
     let deadline = Instant::now() + START_TIMEOUT;
     loop {
-        if let Ok(port) = hello(&paths.socket).await {
-            return accept(port);
+        match listen(&paths.socket, preference).await {
+            Err(err) if err.is_transient() => {}
+            result => return result,
         }
         if let Ok(Some(status)) = child.try_wait() {
             // It may have lost a start race to another proxy that is up by now.
-            if let Ok(port) = hello(&paths.socket).await {
-                return accept(port);
+            match listen(&paths.socket, preference).await {
+                Err(err) if err.is_transient() => {}
+                result => return result,
             }
             let mut output = String::new();
             if let Some(stderr) = child.stderr.take() {
@@ -300,10 +301,56 @@ async fn request(
     }
 }
 
-async fn hello(socket: &Path) -> Result<u16, ClientError> {
+/// Has the proxy answering on `socket` listen as `preference` asks, and returns the port.
+async fn listen(socket: &Path, preference: PortPreference) -> Result<u16, ClientError> {
     let mut connection = connect(socket).await?;
-    match request(&mut connection, &ClientMessage::Hello).await? {
-        ProxyMessage::Info { port, .. } => Ok(port),
+    let (port, pid, protocol, sessions) =
+        match request(&mut connection, &ClientMessage::Hello).await? {
+            ProxyMessage::Info {
+                port,
+                pid,
+                protocol,
+                sessions,
+            } => (port, pid, protocol, sessions),
+            other => return Err(ClientError::Protocol(format!("{other:?}"))),
+        };
+    if protocol < PORTS_PROTOCOL {
+        if preference.accepts(port) {
+            return Ok(port);
+        }
+        // An older proxy that no session uses only waits out its idle timeout, so it makes way
+        // for a current one, which the caller then starts.
+        if sessions.is_some_and(|sessions| sessions.is_empty())
+            && let Ok(ProxyMessage::Stopping) =
+                request(&mut connection, &ClientMessage::StopIfIdle).await
+        {
+            tracing::info!(pid, protocol, port, "stopped an idle proxy on another port");
+            return Err(ClientError::Unavailable(format!(
+                "stopped the idle older proxy (pid {pid}) that listened only on port {port}"
+            )));
+        }
+        return Err(ClientError::PortMismatch {
+            running: port,
+            wanted: match preference.fallback_port {
+                Some(fallback) => format!("{} or {fallback}", preference.port),
+                None => preference.port.to_string(),
+            },
+        });
+    }
+    let listen = ClientMessage::Listen {
+        port: preference.port,
+        fallback_port: preference.fallback_port,
+    };
+    match request(&mut connection, &listen).await? {
+        ProxyMessage::Listening { port } => Ok(port),
+        ProxyMessage::Rejected {
+            reason,
+            transient: true,
+        } => Err(ClientError::Unavailable(reason)),
+        ProxyMessage::Rejected {
+            reason,
+            transient: false,
+        } => Err(ClientError::CannotListen(reason)),
         other => Err(ClientError::Protocol(format!("{other:?}"))),
     }
 }
@@ -336,7 +383,14 @@ async fn register(
     };
     let required = registration.required_protocol();
     loop {
-        ensure_proxy(paths, exact, launcher.as_ref()).await?;
+        // A port that cannot be bound right now may come free again, while the session cannot
+        // move to another one, so the registration keeps retrying rather than failing.
+        ensure_proxy(paths, exact, launcher.as_ref())
+            .await
+            .map_err(|err| match err {
+                ClientError::CannotListen(reason) => ClientError::Unavailable(reason),
+                err => err,
+            })?;
         let mut connection = connect(&paths.socket).await?;
         // Ask on the registration connection itself, so the answer describes the very proxy that
         // takes the routes even if another one replaced it since `ensure_proxy`.
@@ -550,7 +604,9 @@ impl Registrar {
     /// Registers `registration` with the proxy listening on `port`, then keeps it alive until
     /// `shutdown` fires or the registrar is dropped.
     ///
-    /// The registration's `proxy_port` is set to `port`, so a proxy on any other port refuses it.
+    /// The registration's `proxy_port` is set to `port`, the only port the proxy serves its
+    /// routes on; a proxy that does not listen on it opens it, or refuses the registration as
+    /// retryable while it cannot.
     ///
     /// A running proxy that speaks too old a protocol for the routes but serves no session is
     /// taken over: the registrar has it stop, or waits for it to exit by itself, and then starts

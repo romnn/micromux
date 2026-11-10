@@ -197,7 +197,7 @@ pub enum Command {
     /// Run the shared HTTP proxy serving every session's `routes`. Sessions with routes start it
     /// automatically; it exits once no session has been registered for the idle timeout.
     Proxy {
-        /// Port to listen on.
+        /// Port to listen on first; sessions have the proxy listen on their own ports as well.
         #[arg(long, default_value_t = 80)]
         port: u16,
         /// Port to use instead when `--port` needs privileges or is taken.

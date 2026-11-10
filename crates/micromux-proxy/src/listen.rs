@@ -84,21 +84,57 @@ pub(crate) struct Bound {
     pub(crate) wildcard: bool,
 }
 
+/// A port that serves a [`PortPreference`].
+#[derive(Debug)]
+pub(crate) enum Acquired {
+    /// The proxy already listens on this port.
+    Listening(u16),
+    /// Newly bound listeners.
+    Bound(Bound),
+}
+
 /// Binds the preferred port, or the fallback when the preferred one is privileged or taken.
 pub(crate) fn bind(preference: PortPreference) -> Result<Bound, BindError> {
-    match bind_port(preference.port) {
+    with_fallback(preference, bind_port)
+}
+
+/// Takes the preferred port, or the fallback when the preferred one is privileged or taken.
+///
+/// A port for which `listening` holds is the proxy's own and is used as it is, so the fallback
+/// is only taken when the preferred port belongs to another program.
+pub(crate) fn acquire(
+    preference: PortPreference,
+    listening: impl Fn(u16) -> bool,
+) -> Result<Acquired, BindError> {
+    with_fallback(preference, |port| {
+        if listening(port) {
+            Ok(Acquired::Listening(port))
+        } else {
+            bind_port(port).map(Acquired::Bound)
+        }
+    })
+}
+
+/// Takes `preference.port` with `take`, and the fallback port when that one is privileged or
+/// taken.
+fn with_fallback<T>(
+    preference: PortPreference,
+    take: impl Fn(u16) -> Result<T, BindError>,
+) -> Result<T, BindError> {
+    match take(preference.port) {
         Err(err @ (BindError::PermissionDenied { .. } | BindError::InUse { .. })) => {
             let Some(fallback) = preference.fallback_port else {
                 return Err(err);
             };
             tracing::warn!(%err, fallback, "using the configured fallback port");
-            bind_port(fallback)
+            take(fallback)
         }
         result => result,
     }
 }
 
-fn bind_port(port: u16) -> Result<Bound, BindError> {
+/// Binds exactly `port`.
+pub(crate) fn bind_port(port: u16) -> Result<Bound, BindError> {
     match bind_set(port, false) {
         // macOS lets unprivileged processes bind low ports only on the wildcard address.
         Err(BindError::PermissionDenied { .. }) if cfg!(target_os = "macos") => {
@@ -314,6 +350,34 @@ mod tests {
         });
 
         assert!(matches!(result, Err(BindError::InUse { .. })), "{result:?}");
+        Ok(())
+    }
+
+    /// A preferred port the proxy already listens on is used as it is, and a taken preferred port
+    /// moves to a fallback the proxy already listens on without binding anything.
+    #[test]
+    fn ports_the_proxy_listens_on_are_reused() -> eyre::Result<()> {
+        let taken = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+        let taken_port = taken.local_addr()?.port();
+        let own = crate::test_ports::hold_port()?;
+
+        let preferred = acquire(
+            PortPreference {
+                port: own.port,
+                fallback_port: None,
+            },
+            |port| port == own.port,
+        )?;
+        assert!(matches!(preferred, Acquired::Listening(port) if port == own.port));
+
+        let fallback = acquire(
+            PortPreference {
+                port: taken_port,
+                fallback_port: Some(own.port),
+            },
+            |port| port == own.port,
+        )?;
+        assert!(matches!(fallback, Acquired::Listening(port) if port == own.port));
         Ok(())
     }
 
