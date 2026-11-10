@@ -42,7 +42,7 @@ pub const SESSION_VARIABLE: &str = "MICROMUX_SESSION";
 /// Environment variable carrying `<session>.<domain>`.
 pub const SESSION_DOMAIN_VARIABLE: &str = "MICROMUX_SESSION_DOMAIN";
 
-/// Environment variable carrying the port the shared proxy listens on.
+/// Environment variable carrying the port the shared proxy serves the session's routes on.
 pub const PROXY_PORT_VARIABLE: &str = "MICROMUX_PROXY_PORT";
 
 /// Environment variable carrying what follows `<route>.` in a browser URL.

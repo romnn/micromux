@@ -1,0 +1,24 @@
+# yaml-language-server: $schema=https://github.com/romnn/micromux/raw/main/micromux.schema.json
+#
+# One of two projects that share the micromux proxy on different ports; see ../README.md.
+version: "1"
+
+session:
+  name: shop
+
+allocate_ports:
+  - WEB_PORT
+
+# http://www.shop.localhost:8482, served by the same proxy process as the blog on 8481.
+proxy:
+  port: 8482
+
+routes:
+  - host: www
+    port: ${WEB_PORT}
+
+services:
+  web:
+    command: ["python3", "-m", "http.server", "${WEB_PORT}", "--bind", "127.0.0.1", "--directory", "public"]
+    ports:
+      - ${WEB_PORT}

@@ -1,6 +1,6 @@
 //! The proxy process: registration socket, route table, HTTP listeners, and idle exit.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
@@ -10,7 +10,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio_util::codec::{Framed, LinesCodec};
 use tokio_util::sync::CancellationToken;
 
-use crate::listen::{self, BindError, PortPreference};
+use crate::listen::{self, Acquired, BindError, Bound, PortPreference};
 use crate::pages::ListedSession;
 use crate::paths::ProxyPaths;
 use crate::protocol::{
@@ -26,7 +26,7 @@ const LOCK_WAIT: Duration = Duration::from_secs(5);
 pub struct ServeOptions {
     /// Lock and socket locations.
     pub paths: ProxyPaths,
-    /// Which port to listen on.
+    /// Which port to listen on first; sessions can open more.
     pub preference: PortPreference,
     /// How long the proxy keeps running without any registered session.
     pub idle_timeout: Duration,
@@ -58,6 +58,8 @@ pub enum ServeError {
 /// Runs the proxy until it has had no registered session for `idle_timeout`, or `shutdown` fires.
 ///
 /// `on_ready` receives the effective port once the listeners and the registration socket are up.
+/// The proxy also listens on every port its sessions ask for, and stops listening on a port once
+/// no session has been registered on it for `idle_timeout`.
 ///
 /// # Errors
 ///
@@ -92,31 +94,14 @@ pub async fn serve(
     }
     let registrations = UnixListener::bind(&paths.socket).map_err(io(&paths.socket))?;
 
-    let shared = Arc::new(Shared {
-        port,
-        state: Mutex::new(State {
-            sessions: HashMap::new(),
-            next_generation: 0,
-            shutting_down: false,
-            idle_since: Some(tokio::time::Instant::now()),
-        }),
-    });
     let stop = shutdown.child_token();
-    let mut acceptors = Vec::new();
-    for listener in bound.listeners {
-        let listener = tokio::net::TcpListener::from_std(listener).map_err(io(&paths.socket))?;
-        acceptors.push(tokio::spawn(accept_http(
-            listener,
-            bound.wildcard,
-            shared.clone(),
-            stop.clone(),
-        )));
-    }
-    acceptors.push(tokio::spawn(accept_registrations(
+    let shared = Arc::new(Shared::new(port, stop.clone()));
+    shared.open(&mut *shared.ports.lock().await, bound)?;
+    let registration_acceptor = tokio::spawn(accept_registrations(
         registrations,
         shared.clone(),
         stop.clone(),
-    )));
+    ));
     tracing::info!(port, "micromux proxy listening");
     on_ready(port);
 
@@ -130,6 +115,7 @@ pub async fn serve(
                     tracing::info!("no session registered; exiting");
                     break;
                 }
+                shared.close_idle_ports(idle_timeout).await;
             }
         }
     }
@@ -139,9 +125,13 @@ pub async fn serve(
     stop.cancel();
     shared.end_all_registrations();
     let _ = std::fs::remove_file(&paths.socket);
-    // The acceptors own the listeners; the port is only free for a successor once they are gone.
-    for acceptor in acceptors {
-        let _ = acceptor.await;
+    // The acceptors own the listeners; a port is only free for a successor once they are gone.
+    let ports = std::mem::take(&mut *shared.ports.lock().await);
+    for (_, port) in ports {
+        port.close().await;
+    }
+    if let Err(err) = registration_acceptor.await {
+        tracing::warn!(%err, "the registration acceptor failed");
     }
     drop(lock);
     Ok(())
@@ -179,11 +169,42 @@ async fn acquire_lock(path: &PathBuf) -> Result<std::fs::File, ServeError> {
     }
 }
 
-/// The route table and lifecycle state shared by every connection.
+/// The route table, the listeners, and the lifecycle state shared by every connection.
 pub(crate) struct Shared {
-    /// The port the HTTP listeners use.
-    pub(crate) port: u16,
+    /// The port the proxy started with, which [`ProxyMessage::Info`] reports.
+    started_port: u16,
     state: Mutex<State>,
+    /// The HTTP listeners by port.
+    ///
+    /// Opening a port for a registration holds this lock until the registration is in `state`,
+    /// and closing an idle port holds it while it checks `state`, so a port never closes under a
+    /// registration that just opened it.
+    /// Whoever takes both locks takes this one first.
+    ports: tokio::sync::Mutex<HashMap<u16, Port>>,
+    /// Cancelled when the proxy stops, which stops every port's acceptors.
+    stop: CancellationToken,
+}
+
+/// The listeners of one port.
+struct Port {
+    /// When a session last was registered on the port, or asked for it.
+    last_used: tokio::time::Instant,
+    /// Stops this port's acceptors.
+    stop: CancellationToken,
+    /// The tasks that own the port's listeners.
+    acceptors: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl Port {
+    /// Stops listening; the port is free once this returns.
+    async fn close(self) {
+        self.stop.cancel();
+        for acceptor in self.acceptors {
+            if let Err(err) = acceptor.await {
+                tracing::warn!(%err, "a listener task failed");
+            }
+        }
+    }
 }
 
 struct State {
@@ -260,11 +281,166 @@ fn best_route<'a>(
 }
 
 impl Shared {
+    fn new(started_port: u16, stop: CancellationToken) -> Self {
+        Self {
+            started_port,
+            state: Mutex::new(State {
+                sessions: HashMap::new(),
+                next_generation: 0,
+                shutting_down: false,
+                idle_since: Some(tokio::time::Instant::now()),
+            }),
+            ports: tokio::sync::Mutex::new(HashMap::new()),
+            stop,
+        }
+    }
+
     fn state(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Finds the route serving `path` on `host`.
+    /// Starts accepting connections on `bound`'s listeners and records them in `ports`.
+    fn open(
+        self: &Arc<Self>,
+        ports: &mut HashMap<u16, Port>,
+        bound: Bound,
+    ) -> Result<(), BindError> {
+        let Bound {
+            port,
+            listeners,
+            wildcard,
+        } = bound;
+        let stop = self.stop.child_token();
+        let mut acceptors = Vec::new();
+        for listener in listeners {
+            let listener = match tokio::net::TcpListener::from_std(listener) {
+                Ok(listener) => listener,
+                Err(source) => {
+                    stop.cancel();
+                    return Err(BindError::Io {
+                        address: std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port)),
+                        source,
+                    });
+                }
+            };
+            acceptors.push(tokio::spawn(accept_http(
+                listener,
+                port,
+                wildcard,
+                self.clone(),
+                stop.clone(),
+            )));
+        }
+        ports.insert(
+            port,
+            Port {
+                last_used: tokio::time::Instant::now(),
+                stop,
+                acceptors,
+            },
+        );
+        Ok(())
+    }
+
+    /// Listens as `preference` asks, unless the proxy already listens on a port it accepts, and
+    /// returns the port.
+    async fn listen(self: &Arc<Self>, preference: PortPreference) -> Result<u16, Refusal> {
+        let mut ports = self.ports.lock().await;
+        self.listen_locked(&mut ports, preference).await
+    }
+
+    /// [`Self::listen`] with the `ports` lock already held.
+    ///
+    /// A failed bind is refused as final, since the session's preference cannot change.
+    async fn listen_locked(
+        self: &Arc<Self>,
+        ports: &mut HashMap<u16, Port>,
+        preference: PortPreference,
+    ) -> Result<u16, Refusal> {
+        if self.state().shutting_down {
+            return Err(Refusal::transient("the proxy is shutting down"));
+        }
+        let listening = ports.keys().copied().collect::<HashSet<_>>();
+        // Binding probes the port first, which can block for a moment.
+        let acquired = tokio::task::spawn_blocking(move || {
+            listen::acquire(preference, |port| listening.contains(&port))
+        })
+        .await
+        .map_err(|err| Refusal::transient(format!("binding the port failed: {err}")))?
+        .map_err(|err| Refusal {
+            reason: err.to_string(),
+            transient: false,
+        })?;
+        let port = match acquired {
+            Acquired::Listening(port) => port,
+            Acquired::Bound(bound) => {
+                let port = bound.port;
+                self.open(ports, bound).map_err(|err| Refusal {
+                    reason: err.to_string(),
+                    transient: false,
+                })?;
+                tracing::info!(port, "listening on another port");
+                port
+            }
+        };
+        if let Some(listener) = ports.get_mut(&port) {
+            listener.last_used = tokio::time::Instant::now();
+        }
+        Ok(port)
+    }
+
+    /// Registers a session, listening on its port first.
+    ///
+    /// A port that cannot be bound is refused as retryable: the session's services already carry
+    /// URLs with that port, so only the port becoming free again can help.
+    async fn register_listening(
+        self: &Arc<Self>,
+        registration: Registration,
+        previous: Option<&Owned>,
+    ) -> Result<Owned, Refusal> {
+        let mut ports = self.ports.lock().await;
+        if registration.proxy_port != 0 {
+            let exact = PortPreference {
+                port: registration.proxy_port,
+                fallback_port: None,
+            };
+            self.listen_locked(&mut ports, exact)
+                .await
+                .map_err(|refusal| Refusal {
+                    transient: true,
+                    ..refusal
+                })?;
+        }
+        self.register(registration, previous)
+    }
+
+    /// Stops listening on every port that no session has been registered on for `idle_timeout`.
+    async fn close_idle_ports(&self, idle_timeout: Duration) {
+        let mut ports = self.ports.lock().await;
+        let used = self
+            .state()
+            .sessions
+            .values()
+            .map(|entry| entry.registration.proxy_port)
+            .collect::<HashSet<_>>();
+        let now = tokio::time::Instant::now();
+        let mut idle = Vec::new();
+        for (port, listener) in ports.iter_mut() {
+            if used.contains(port) {
+                listener.last_used = now;
+            } else if now.duration_since(listener.last_used) >= idle_timeout {
+                idle.push(*port);
+            }
+        }
+        for port in idle {
+            if let Some(listener) = ports.remove(&port) {
+                listener.close().await;
+                tracing::info!(port, "no session uses the port; stopped listening");
+            }
+        }
+    }
+
+    /// Finds the route serving `path` on `host`, among the sessions registered on `port`.
     ///
     /// The host decides first, then the path.
     /// A hostname that any route names is served by those routes alone, and every other hostname
@@ -272,7 +448,7 @@ impl Shared {
     /// Among the chosen routes, the longest path prefix wins, and a route without a path matches
     /// every path; when none matches, nothing serves the request, rather than another host's
     /// routes answering for a mistyped path.
-    pub(crate) fn lookup(&self, host: &str, path: &str) -> Option<Target> {
+    pub(crate) fn lookup(&self, port: u16, host: &str, path: &str) -> Option<Target> {
         let state = self.state();
         let target = |entry: &Entry, route: &RouteTarget| Target {
             session: entry.registration.session.clone(),
@@ -286,11 +462,12 @@ impl Shared {
         let (domain, entry) = state
             .sessions
             .iter()
-            .filter(|(domain, _)| {
-                host == domain.as_str()
-                    || host
-                        .strip_suffix(domain.as_str())
-                        .is_some_and(|prefix| prefix.ends_with('.'))
+            .filter(|(domain, entry)| {
+                entry.registration.proxy_port == port
+                    && (host == domain.as_str()
+                        || host
+                            .strip_suffix(domain.as_str())
+                            .is_some_and(|prefix| prefix.ends_with('.')))
             })
             .max_by_key(|(domain, _)| domain.len())?;
         let labels = host
@@ -308,13 +485,8 @@ impl Shared {
         best_route(host_routes.into_iter(), path).map(|route| target(entry, route))
     }
 
-    /// The live sessions and their URLs, for the not-found page.
+    /// The live sessions and their URLs, each with its own port, for the not-found page.
     pub(crate) fn listed_sessions(&self) -> Vec<ListedSession> {
-        let suffix = if self.port == 80 {
-            String::new()
-        } else {
-            format!(":{}", self.port)
-        };
         let state = self.state();
         let mut sessions = state
             .sessions
@@ -327,6 +499,10 @@ impl Shared {
                     .routes
                     .iter()
                     .map(|route| {
+                        let suffix = match entry.registration.proxy_port {
+                            80 => String::new(),
+                            port => format!(":{port}"),
+                        };
                         let path = route.path.as_deref().unwrap_or("/");
                         if route.host == "*" {
                             format!("http://{domain}{suffix}{path}")
@@ -350,12 +526,14 @@ impl Shared {
         if state.shutting_down {
             return Err(Refusal::transient("the proxy is shutting down"));
         }
-        if registration.proxy_port != self.port {
-            return Err(Refusal::transient(format!(
-                "this proxy listens on port {}, not {}",
-                self.port, registration.proxy_port
-            )));
+        if registration.proxy_port == 0 {
+            return Err(Refusal {
+                reason: "a registration must name the port its routes are served on".to_string(),
+                transient: false,
+            });
         }
+        // Session domains are unique across ports, so a hostname means the same session whatever
+        // port a request names.
         // Session domains must not nest either: `api.two` under `one.localhost` and `api` under
         // `two.one.localhost` would both claim `api.two.one.localhost`.
         let domain = registration.session_domain.as_str();
@@ -476,7 +654,7 @@ impl Shared {
     /// Answers [`ClientMessage::Hello`].
     fn info(&self) -> ProxyMessage {
         ProxyMessage::Info {
-            port: self.port,
+            port: self.started_port,
             pid: std::process::id(),
             protocol: PROTOCOL_VERSION,
             sessions: Some(Self::registered_sessions(&self.state())),
@@ -524,6 +702,7 @@ impl Shared {
 
 async fn accept_http(
     listener: tokio::net::TcpListener,
+    port: u16,
     wildcard: bool,
     shared: Arc<Shared>,
     stop: CancellationToken,
@@ -547,7 +726,7 @@ async fn accept_http(
             continue;
         }
         let stop = stop.clone();
-        let connection = crate::forward::serve_connection(stream, shared.clone());
+        let connection = crate::forward::serve_connection(stream, port, shared.clone());
         tokio::spawn(async move {
             tokio::select! {
                 () = stop.cancelled() => {}
@@ -603,6 +782,23 @@ async fn serve_registration(stream: UnixStream, shared: Arc<Shared>, stop: Cance
         };
         let reply = match serde_json::from_str::<ClientMessage>(&line) {
             Ok(ClientMessage::Hello) => shared.info(),
+            Ok(ClientMessage::Listen {
+                port,
+                fallback_port,
+            }) => {
+                let preference = PortPreference {
+                    port,
+                    fallback_port,
+                };
+                match shared.listen(preference).await {
+                    Ok(port) => ProxyMessage::Listening { port },
+                    Err(Refusal { reason, transient }) => {
+                        let rejected = ProxyMessage::Rejected { reason, transient };
+                        let _ = send(&mut framed, &rejected).await;
+                        break;
+                    }
+                }
+            }
             Ok(ClientMessage::Ping) => ProxyMessage::Pong,
             Ok(ClientMessage::StopIfIdle) => match shared.try_stop_if_idle() {
                 Ok(()) => {
@@ -616,7 +812,10 @@ async fn serve_registration(stream: UnixStream, shared: Arc<Shared>, stop: Cance
                 Err(sessions) => ProxyMessage::Busy { sessions },
             },
             Ok(ClientMessage::Register(registration)) => {
-                match shared.register(registration, owned.as_ref()) {
+                match shared
+                    .register_listening(registration, owned.as_ref())
+                    .await
+                {
                     Ok(registered) => {
                         owned = Some(registered);
                         ProxyMessage::Registered
@@ -685,15 +884,7 @@ pub(crate) mod tests {
     }
 
     fn shared() -> Shared {
-        Shared {
-            port: 80,
-            state: Mutex::new(State {
-                sessions: HashMap::new(),
-                next_generation: 0,
-                shutting_down: false,
-                idle_since: Some(tokio::time::Instant::now()),
-            }),
-        }
+        Shared::new(80, CancellationToken::new())
     }
 
     /// Exact routes win over the catch-all route, which serves the bare domain and every
@@ -711,7 +902,7 @@ pub(crate) mod tests {
         )?;
         shared.register(registration("two", "/two", &[("app", 2001)]), None)?;
 
-        let port = |host: &str| shared.lookup(host, "/").map(|target| target.port);
+        let port = |host: &str| shared.lookup(80, host, "/").map(|target| target.port);
         assert_eq!(port("app.one.localhost"), Some(1001));
         assert_eq!(port("email.internal.one.localhost"), Some(1002));
         assert_eq!(port("app.two.localhost"), Some(2001));
@@ -754,7 +945,7 @@ pub(crate) mod tests {
         }
         shared.register(one, None)?;
 
-        let port = |host: &str, path: &str| shared.lookup(host, path).map(|target| target.port);
+        let port = |host: &str, path: &str| shared.lookup(80, host, path).map(|target| target.port);
 
         // Longest prefix within the host, then the host's route without a path
         assert_eq!(port("api.one.localhost", "/rest/admin/users"), Some(1003));
@@ -787,13 +978,17 @@ pub(crate) mod tests {
         }
         shared.register(one, None)?;
 
-        let target = shared.lookup("auth.one.localhost", "/auth/v1/token");
+        let target = shared.lookup(80, "auth.one.localhost", "/auth/v1/token");
         assert_eq!(
             target.map(|target| (target.port, target.path, target.strip_prefix)),
             Some((1001, Some("/auth/v1/".to_string()), true))
         );
-        assert!(shared.lookup("auth.one.localhost", "/auth/v1").is_none());
-        assert!(shared.lookup("auth.one.localhost", "/").is_none());
+        assert!(
+            shared
+                .lookup(80, "auth.one.localhost", "/auth/v1")
+                .is_none()
+        );
+        assert!(shared.lookup(80, "auth.one.localhost", "/").is_none());
         Ok(())
     }
 
@@ -811,12 +1006,12 @@ pub(crate) mod tests {
         assert!(first.cancel.is_cancelled());
         shared.unregister(&first);
         assert_eq!(
-            shared.lookup("app.one.localhost", "/").map(|t| t.port),
+            shared.lookup(80, "app.one.localhost", "/").map(|t| t.port),
             Some(1002)
         );
 
         shared.unregister(&second);
-        assert!(shared.lookup("app.one.localhost", "/").is_none());
+        assert!(shared.lookup(80, "app.one.localhost", "/").is_none());
         assert!(second.cancel.is_cancelled());
         Ok(())
     }
@@ -829,7 +1024,7 @@ pub(crate) mod tests {
         let shared = shared();
         let first = shared.register(registration("one", "/one", &[("app", 1001)]), None)?;
         let target = shared
-            .lookup("app.one.localhost", "/")
+            .lookup(80, "app.one.localhost", "/")
             .ok_or_else(|| Refusal::transient("app is not routed"))?;
 
         // Same connection
@@ -840,11 +1035,11 @@ pub(crate) mod tests {
         assert_eq!(replaced.generation, first.generation);
         assert!(!target.cancel.is_cancelled());
         assert_eq!(
-            shared.lookup("app.one.localhost", "/").map(|t| t.port),
+            shared.lookup(80, "app.one.localhost", "/").map(|t| t.port),
             Some(1002)
         );
         assert_eq!(
-            shared.lookup("api.one.localhost", "/").map(|t| t.port),
+            shared.lookup(80, "api.one.localhost", "/").map(|t| t.port),
             Some(1003)
         );
 
@@ -853,7 +1048,7 @@ pub(crate) mod tests {
         assert!(target.cancel.is_cancelled());
         shared.unregister(&replaced);
         assert_eq!(
-            shared.lookup("app.one.localhost", "/").map(|t| t.port),
+            shared.lookup(80, "app.one.localhost", "/").map(|t| t.port),
             Some(1004)
         );
         shared.unregister(&takeover);
@@ -861,9 +1056,9 @@ pub(crate) mod tests {
     }
 
     /// Session domains that nest inside each other could claim the same hostname, so the second
-    /// is refused; a registration for another proxy port is refused as retryable.
+    /// is refused, even on another port; a registration that names no port is refused too.
     #[test]
-    fn overlapping_domains_and_wrong_ports_are_refused() -> Result<(), Refusal> {
+    fn overlapping_domains_and_portless_registrations_are_refused() -> Result<(), Refusal> {
         let shared = shared();
         let mut outer = registration("one", "/one", &[("api.two", 1)]);
         outer.session_domain = "one.localhost".to_string();
@@ -871,6 +1066,7 @@ pub(crate) mod tests {
 
         let mut inner = registration("two", "/two", &[("api", 2)]);
         inner.session_domain = "two.one.localhost".to_string();
+        inner.proxy_port = 8080;
         let refused = shared.register(inner, None);
         assert!(matches!(
             refused,
@@ -880,16 +1076,51 @@ pub(crate) mod tests {
             })
         ));
 
-        let mut elsewhere = registration("three", "/three", &[("app", 3)]);
-        elsewhere.proxy_port = 8080;
-        let refused = shared.register(elsewhere, None);
+        let mut portless = registration("three", "/three", &[("app", 3)]);
+        portless.proxy_port = 0;
+        let refused = shared.register(portless, None);
         assert!(matches!(
             refused,
             Err(Refusal {
-                transient: true,
+                transient: false,
                 ..
             })
         ));
+        Ok(())
+    }
+
+    /// A request reaches only the sessions registered on the port it arrived on, and the
+    /// not-found page lists every session with its own port.
+    #[test]
+    fn lookup_serves_each_session_on_its_own_port() -> Result<(), Refusal> {
+        let shared = shared();
+        shared.register(registration("one", "/one", &[("app", 1001)]), None)?;
+        let mut two = registration("two", "/two", &[("app", 2001)]);
+        two.proxy_port = 8080;
+        shared.register(two, None)?;
+
+        let port = |proxy_port: u16, host: &str| {
+            shared
+                .lookup(proxy_port, host, "/")
+                .map(|target| target.port)
+        };
+        assert_eq!(port(80, "app.one.localhost"), Some(1001));
+        assert_eq!(port(8080, "app.two.localhost"), Some(2001));
+        assert_eq!(port(8080, "app.one.localhost"), None);
+        assert_eq!(port(80, "app.two.localhost"), None);
+
+        let urls = shared
+            .listed_sessions()
+            .into_iter()
+            .flat_map(|session| session.urls)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            urls,
+            [
+                "http://app.one.localhost/",
+                "http://app.two.localhost:8080/"
+            ]
+        );
         Ok(())
     }
 

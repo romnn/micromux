@@ -115,7 +115,9 @@ routes:
     port: ${API_PORT}
 ```
 
-A shared `micromux proxy` serves the routes and starts on its own.
+A shared `micromux proxy` serves the routes and starts on its own, on port 80 unless `proxy.port`
+names another. Projects with different ports share it; see
+[examples/proxy-ports](examples/proxy-ports).
 See [Sessions, ports, and hostnames](https://romnn.github.io/micromux/docs/configuration/sessions/).
 
 ### Structured logs

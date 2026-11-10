@@ -1,0 +1,26 @@
+# yaml-language-server: $schema=https://github.com/romnn/micromux/raw/main/micromux.schema.json
+#
+# One of two projects that share the micromux proxy on different ports; see ../README.md.
+version: "1"
+
+session:
+  name: blog
+
+allocate_ports:
+  - WEB_PORT
+
+# http://www.blog.localhost:8481, served by the shared proxy, which also serves the shop on 8482.
+# Ports above 1024 need no privileges, so the example runs without any setup.
+proxy:
+  port: 8481
+
+routes:
+  - host: www
+    port: ${WEB_PORT}
+
+services:
+  web:
+    command: ["python3", "-m", "http.server", "${WEB_PORT}", "--bind", "127.0.0.1", "--directory", "public"]
+    # Listing the route's port ties the route to this service, which error pages and the TUI name.
+    ports:
+      - ${WEB_PORT}
