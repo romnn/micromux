@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.4.2
+
 - **Sessions that want different proxy ports share one proxy.** A session no longer fails when
   another project's proxy runs on another port; the proxy listens on each session's `proxy.port`
   and serves its routes only there. `examples/proxy-ports` runs two such projects side by side.
