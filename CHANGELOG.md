@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.4.3
+
 - **Config reconciliation applies service ordering without restarting processes.** Dry runs
   report reordered services, and the TUI and control API follow the config's order.
 
