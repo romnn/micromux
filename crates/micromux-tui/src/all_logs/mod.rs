@@ -128,14 +128,14 @@ impl AllLogs {
         let names = &self.names;
         let name_width = services
             .iter()
-            .map(|service| Span::raw(service.snapshot.id.as_str()).width())
+            .map(|service| Span::raw(service.snapshot.name.as_str()).width())
             .max()
             .unwrap_or_default()
             .min(MAX_TAG_NAME_WIDTH);
         self.tags = services
             .iter()
             .zip(numbers)
-            .map(|(service, number)| (*number, tag(&service.snapshot.id, *number, name_width)))
+            .map(|(service, number)| (*number, tag(&service.snapshot.name, *number, name_width)))
             .collect();
         let records = merge(sources(services, numbers, |_| 0)).collect::<Vec<_>>();
         self.ordered = records.windows(2).all(|pair| match pair {
@@ -283,15 +283,15 @@ fn order(names: &[String], key: RecordKey) -> Order<'_> {
     }
 }
 
-/// The spans that lead each line of the service `id` with `number`: its name in its color,
+/// The spans that lead each line of service `number`: its display name in its color,
 /// padded or cut to `name_width` columns, and a separator.
-fn tag(id: &str, number: u32, name_width: usize) -> Vec<Span<'static>> {
+fn tag(name: &str, number: u32, name_width: usize) -> Vec<Span<'static>> {
     let color = usize::try_from(number)
         .ok()
         .and_then(|number| TAG_COLORS.get(number % TAG_COLORS.len()))
         .copied()
         .unwrap_or(Color::Cyan);
-    let name = fit_name(id, name_width);
+    let name = fit_name(name, name_width);
     let padding = " ".repeat(name_width.saturating_sub(Span::raw(name.as_str()).width()));
     vec![
         format!("{name}{padding}").fg(color).bold(),

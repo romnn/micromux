@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- **The TUI shows configured service display names.** The sidebar, combined-log tags, and popups
+  use `name`; the service details retain the ID used by commands and the control API.
+
 - **Override a session's proxy port without editing the project config.** Use `--proxy-port` on
   `micromux` or `micromux serve`, or set `MICROMUX_PROXY_PORT`.
 

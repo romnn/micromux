@@ -25,6 +25,7 @@ routes:
 
 services:
   api:
+    name: API server
     command: ["./bin/api.sh"]
     ports:
       - 8080
