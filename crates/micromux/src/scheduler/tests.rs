@@ -48,6 +48,7 @@ async fn run_test_scheduler(
 /// The live summary of a session without routes, which no reload ever changes.
 fn unrouted_session_status() -> crate::SessionStatus {
     crate::SessionStatus::new(crate::SessionSummary {
+        git: None,
         name: "test".to_string(),
         domain: "test.localhost".to_string(),
         host_suffix: "test.localhost".to_string(),

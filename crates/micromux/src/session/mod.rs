@@ -6,6 +6,7 @@
 //! Both reach services through pinned environment variables that override every `env_file` and
 //! inline `environment` definition of the same name.
 
+mod git;
 mod registry;
 mod routes;
 mod status;
@@ -16,6 +17,7 @@ use indexmap::IndexMap;
 
 use crate::config::{ConfigFile, SessionConfig};
 
+pub use git::GitContext;
 pub(crate) use registry::{
     DEFAULT_PORT_RANGE, Lease, PortRequest, create_private_dir, user_state_directory,
 };

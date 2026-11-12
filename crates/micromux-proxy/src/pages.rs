@@ -4,9 +4,12 @@ use std::fmt::Write as _;
 
 /// A live session as listed on the not-found page.
 pub(crate) struct ListedSession {
+    pub(crate) git_metadata: bool,
     pub(crate) name: String,
     pub(crate) config_path: String,
     pub(crate) urls: Vec<String>,
+    pub(crate) working_dir: Option<String>,
+    pub(crate) git: Option<micromux::session::GitContext>,
 }
 
 /// The page for a hostname and path no route serves.
@@ -23,10 +26,17 @@ pub(crate) fn not_found(host: &str, path: &str, sessions: &[ListedSession]) -> S
         for session in sessions {
             let _ = write!(
                 body,
-                "<li><strong>{}</strong> <small>({})</small><ul>",
+                "<li><strong>{}</strong> <small>({})</small>",
                 escape(&session.name),
                 escape(&session.config_path)
             );
+            if let Some(git) = &session.git {
+                let _ = write!(body, " <code>{}</code>", escape(&git.branch));
+                if let Some(number) = git.pull_request {
+                    let _ = write!(body, " <span>PR #{number}</span>");
+                }
+            }
+            body.push_str("<ul>");
             for url in &session.urls {
                 let url = escape(url);
                 let _ = write!(body, "<li><a href=\"{url}\">{url}</a></li>");
@@ -115,5 +125,26 @@ mod tests {
         assert!(page.contains("<strong>api</strong>"));
         assert!(page.contains("<strong>luup2</strong>"));
         assert!(page.contains("127.0.0.1:20001"));
+    }
+
+    #[test]
+    fn session_context_is_optional_and_escaped() {
+        let session = ListedSession {
+            git_metadata: true,
+            name: "loop1".to_string(),
+            config_path: "/project/micromux.yaml".to_string(),
+            urls: vec!["http://app.loop1.localhost/".to_string()],
+            working_dir: None,
+            git: Some(micromux::session::GitContext {
+                branch: "feature/<script>&\"".to_string(),
+                pull_request: Some(77),
+            }),
+        };
+        let page = not_found("localhost", "/", &[session]);
+        assert!(page.contains("<strong>loop1</strong>"));
+        assert!(page.contains("feature/&lt;script&gt;&amp;&quot;"));
+        assert!(!page.contains("<script>"));
+        assert!(page.contains("PR #77"));
+        assert!(page.contains("href=\"http://app.loop1.localhost/\""));
     }
 }

@@ -173,12 +173,18 @@ impl std::fmt::Display for RegisteredSession {
 /// The routes of one session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Registration {
+    /// Whether the proxy may fetch Git metadata; older sessions enable it implicitly.
+    #[serde(default = "git_metadata_default")]
+    pub git_metadata: bool,
     /// Session name, such as `luup2`.
     pub session: String,
     /// Session domain every route lives under, such as `luup2.localhost`.
     pub session_domain: String,
     /// Canonical config path, which identifies the session across reconnects.
     pub config_path: String,
+    /// Directory the session was launched in; older sessions omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_dir: Option<String>,
     /// Process id of the session.
     pub pid: u32,
     /// The proxy port the session's services were told about, the only port its routes are
@@ -190,6 +196,10 @@ pub struct Registration {
     pub proxy_port: u16,
     /// The session's routes.
     pub routes: Vec<RouteTarget>,
+}
+
+const fn git_metadata_default() -> bool {
+    true
 }
 
 impl Registration {

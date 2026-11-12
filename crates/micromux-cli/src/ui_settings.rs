@@ -78,42 +78,13 @@ pub(crate) async fn mouse_options(
     let user = if flags.or(project).is_complete() {
         Layers::default()
     } else {
-        let user = load_user_config(printer).await?;
+        let user = crate::user_config::load(printer).await?;
         Layers {
             mouse: user.mouse,
             copy_on_select: user.copy_on_select,
         }
     };
     Ok(resolve(flags, project, user))
-}
-
-/// Reads the user config, printing its diagnostics; a missing file is an empty config.
-async fn load_user_config(printer: &DiagnosticsPrinter) -> Result<micromux::UserConfig, Error> {
-    let Some(path) = micromux::user_config_path() else {
-        return Ok(micromux::UserConfig::default());
-    };
-    let raw = match micromux::read_config_file_async(&path).await {
-        Ok(raw) => raw,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(micromux::UserConfig::default());
-        }
-        Err(err) => {
-            return Err(Error::Message(format!(
-                "cannot read the user config {}: {err}",
-                path.display()
-            )));
-        }
-    };
-    let file_id = printer.add_source_file(&path, raw.clone());
-    let mut diagnostics = Vec::new();
-    let parsed = micromux::parse_user_config(&raw, file_id, &mut diagnostics);
-    if let Err(err) = &parsed {
-        diagnostics.extend(micromux::ToDiagnostics::to_diagnostics(err, file_id));
-    }
-    for diagnostic in &diagnostics {
-        printer.emit(diagnostic)?;
-    }
-    parsed.map_err(|_| Error::DiagnosticsEmitted)
 }
 
 /// The `ui` section of the project config at `config_path`, or `None` when it cannot be read.

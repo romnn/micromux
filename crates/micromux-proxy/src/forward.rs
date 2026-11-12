@@ -49,7 +49,11 @@ async fn handle(mut request: Request<Incoming>, port: u16, shared: &Shared) -> R
     let Some(target) = shared.lookup(port, &host, request.uri().path()) else {
         return html(
             StatusCode::NOT_FOUND,
-            pages::not_found(&host, request.uri().path(), &shared.listed_sessions()),
+            pages::not_found(
+                &host,
+                request.uri().path(),
+                &shared.listed_sessions_with_git().await,
+            ),
         );
     };
     let route = format!("{host}{}", target.path.as_deref().unwrap_or_default());

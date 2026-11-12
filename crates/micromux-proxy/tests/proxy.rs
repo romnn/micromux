@@ -68,10 +68,12 @@ async fn start_proxy(idle_timeout: Duration) -> eyre::Result<Proxy> {
 
 fn registration(session: &str, routes: &[(&str, u16, Option<&str>)]) -> Registration {
     Registration {
+        git_metadata: true,
         proxy_port: 0,
         session: session.to_string(),
         session_domain: format!("{session}.localhost"),
         config_path: format!("/projects/{session}/micromux.yaml"),
+        working_dir: None,
         pid: std::process::id(),
         routes: routes
             .iter()
@@ -1038,6 +1040,43 @@ async fn error_pages_name_sessions_and_services() -> eyre::Result<()> {
     assert!(down.contains("<strong>api-service</strong>"), "{down}");
     assert!(down.contains("<strong>one</strong>"), "{down}");
 
+    proxy.shutdown.cancel();
+    proxy.task.await??;
+    Ok(())
+}
+
+/// The overview follows the launch directory's branch even when the config is elsewhere.
+#[tokio::test]
+async fn overview_reads_the_current_branch_without_reregistering() -> eyre::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let initialized = tokio::process::Command::new("git")
+        .args(["init", "--quiet", "--initial-branch=feature/first"])
+        .arg(directory.path())
+        .status()
+        .await?;
+    assert!(initialized.success());
+    let proxy = start_proxy(Duration::from_secs(60)).await?;
+    let mut entry = registration("loop1", &[("api", 12345, None)]);
+    entry.working_dir = Some(directory.path().display().to_string());
+    let _registrar = Registrar::start(
+        proxy.paths.clone(),
+        entry,
+        proxy.port,
+        None,
+        &CancellationToken::new(),
+        |_| {},
+    )
+    .await?;
+    let first = get(proxy.port, "localhost").await?;
+    assert!(first.contains("<strong>loop1</strong>"), "{first}");
+    assert!(first.contains("<code>feature/first</code>"), "{first}");
+    std::fs::write(
+        directory.path().join(".git/HEAD"),
+        "ref: refs/heads/feature/second\n",
+    )?;
+    let second = get(proxy.port, "localhost").await?;
+    assert!(second.contains("<code>feature/second</code>"), "{second}");
+    assert!(!second.contains("feature/first"), "{second}");
     proxy.shutdown.cancel();
     proxy.task.await??;
     Ok(())

@@ -104,6 +104,7 @@ pub(crate) async fn latch_port(_session: &mut Session) -> Result<(), Error> {
 pub(crate) async fn register(
     mux: &Micromux,
     config_path: &std::path::Path,
+    working_dir: Option<&std::path::Path>,
     shutdown: &CancellationToken,
 ) -> Result<Option<RouteRegistration>, Error> {
     use micromux_proxy::protocol::Registration;
@@ -113,9 +114,11 @@ pub(crate) async fn register(
     }
     let identity = mux.session_identity();
     let registration = Registration {
+        git_metadata: mux.git_metadata_enabled(),
         session: identity.name.clone(),
         session_domain: identity.session_domain(),
         config_path: config_path.display().to_string(),
+        working_dir: working_dir.map(|directory| directory.display().to_string()),
         pid: std::process::id(),
         proxy_port: mux.proxy_port(),
         routes: route_targets(mux.routes()),
@@ -188,6 +191,7 @@ fn route_targets(routes: &[micromux::Route]) -> Vec<micromux_proxy::protocol::Ro
 pub(crate) async fn register(
     _mux: &Micromux,
     _config_path: &std::path::Path,
+    _working_dir: Option<&std::path::Path>,
     _shutdown: &CancellationToken,
 ) -> Result<Option<RouteRegistration>, Error> {
     Ok(None)
@@ -387,9 +391,11 @@ services:
             registrar: micromux_proxy::Registrar::start(
                 paths,
                 micromux_proxy::protocol::Registration {
+                    git_metadata: mux.git_metadata_enabled(),
                     session: mux.session_identity().name.clone(),
                     session_domain: mux.session_identity().session_domain(),
                     config_path: config_path.display().to_string(),
+                    working_dir: None,
                     pid: std::process::id(),
                     proxy_port,
                     routes: super::route_targets(mux.routes()),

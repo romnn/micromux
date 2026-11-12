@@ -535,6 +535,55 @@ async fn input_for_an_exited_service_is_refused() -> eyre::Result<()> {
     Ok(())
 }
 
+/// Descriptions used by MCP follow branch changes without restarting the supervisor.
+#[tokio::test]
+async fn descriptions_include_live_git_context() -> eyre::Result<()> {
+    let directory = unique_dir("git")?;
+    let initialized = tokio::process::Command::new("git")
+        .args(["init", "--quiet", "--initial-branch=feature/first"])
+        .arg(directory.path())
+        .status()
+        .await?;
+    assert!(initialized.success());
+    let session = build_session_yaml(directory.path(), "version: 1\nservices: {}\n")?;
+    let mut client = Client::connect(&session.endpoint).await?;
+    let git = client
+        .describe()
+        .await?
+        .session
+        .and_then(|session| session.git)
+        .ok_or_else(|| eyre::eyre!("missing git context"))?;
+    assert_eq!(git.branch, "feature/first");
+    assert_eq!(git.pull_request, None);
+
+    std::fs::write(
+        directory.path().join(".git/HEAD"),
+        "ref: refs/heads/feature/second\n",
+    )?;
+    let git = client
+        .describe()
+        .await?
+        .session
+        .and_then(|session| session.git)
+        .ok_or_else(|| eyre::eyre!("missing updated git context"))?;
+    assert_eq!(git.branch, "feature/second");
+
+    std::fs::write(
+        directory.path().join(".git/HEAD"),
+        "0000000000000000000000000000000000000001\n",
+    )?;
+    assert_eq!(
+        client
+            .describe()
+            .await?
+            .session
+            .and_then(|session| session.git),
+        None
+    );
+    session.shutdown.cancel();
+    Ok(())
+}
+
 #[tokio::test]
 async fn describe_list_logs_and_restart_over_the_socket() -> eyre::Result<()> {
     let dir = unique_dir("e2e")?;

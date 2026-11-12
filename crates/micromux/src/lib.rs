@@ -496,6 +496,7 @@ pub(crate) fn initial_model_entries(services: &ServiceMap) -> Vec<(ServiceSnapsh
 
 /// Main entry point to run a micromux session.
 pub struct Micromux {
+    git_metadata_enabled: bool,
     services: ServiceMap,
     session: Arc<session::SessionContext>,
     routes: Vec<Route>,
@@ -632,6 +633,7 @@ impl Micromux {
 
         Ok(Self {
             services,
+            git_metadata_enabled: config_file.config.git_metadata.unwrap_or(true),
             session,
             routes,
             reload_config,
@@ -676,6 +678,7 @@ impl Micromux {
     #[must_use]
     pub fn session_summary(&self) -> SessionSummary {
         SessionSummary {
+            git: None,
             name: self.session.identity.name.clone(),
             domain: self.session.identity.session_domain(),
             host_suffix: self.host_suffix(),
@@ -720,7 +723,8 @@ impl Micromux {
         );
         let (commands_tx, commands_rx) = mpsc::channel(1024);
         let (terminal, pty_input_rx) = TerminalControl::channel(commands_tx.clone());
-        let session_status = SessionStatus::new(self.session_summary());
+        let session_status =
+            SessionStatus::new(self.session_summary()).with_git_metadata(self.git_metadata_enabled);
         let handles = Handles {
             reader,
             commands: commands_tx,

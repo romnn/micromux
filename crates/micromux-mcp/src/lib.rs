@@ -1460,7 +1460,7 @@ impl McpServer {
         description = "List all micromux sessions currently running for this user, with their \
         name, pid, config path, working directory, advertised capabilities, discovery \
         diagnostics, and under `session` their browser URLs (`routes[].url`), allocated ports, \
-        and routing status."
+        routing status, and optional Git branch and cached open PR number (`session.git`)."
     )]
     async fn list_sessions(&self) -> ToolResult<SessionListResult> {
         let list = self.discovery.list_sessions().await.map_err(error_data)?;
@@ -1472,7 +1472,8 @@ impl McpServer {
 
     #[tool(
         description = "Show a session's browser URLs, allocated ports, and whether the shared \
-        proxy serves its routes right now. Open the URLs (such as http://app.<session>.localhost) \
+        proxy serves its routes right now, plus optional Git branch and cached open PR context. \
+        Open the URLs (such as http://app.<session>.localhost) \
         in a browser or Playwright; services reach each other on 127.0.0.1:<port> instead, since \
         only browsers resolve *.localhost everywhere. Read URLs from here instead of guessing them."
     )]

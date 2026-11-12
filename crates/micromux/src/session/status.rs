@@ -13,6 +13,9 @@ use crate::scheduler::ServiceID;
 /// A session's name, browser URLs, and allocated ports.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SessionSummary {
+    /// Best-effort branch and cached open PR context; absent outside a named Git branch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git: Option<super::GitContext>,
     /// Session name, such as `luup2`.
     pub name: String,
     /// Domain every route lives under, such as `luup2.localhost`.
@@ -53,12 +56,14 @@ pub enum RoutingStatus {
 /// Cloning it is cheap; every clone observes and updates the same summary.
 #[derive(Debug, Clone)]
 pub struct SessionStatus {
+    pub(super) git_metadata_enabled: bool,
     summary: Arc<watch::Sender<SessionSummary>>,
 }
 
 impl SessionStatus {
     pub(crate) fn new(summary: SessionSummary) -> Self {
         Self {
+            git_metadata_enabled: true,
             summary: Arc::new(watch::Sender::new(summary)),
         }
     }
@@ -108,10 +113,12 @@ impl SessionStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use color_eyre::eyre;
     use similar_asserts::assert_eq;
 
     fn summary(routes: Vec<Route>) -> SessionSummary {
         SessionSummary {
+            git: None,
             name: "one".to_string(),
             domain: "one.localhost".to_string(),
             host_suffix: "one.localhost".to_string(),
@@ -120,6 +127,17 @@ mod tests {
             routes,
             allocated_ports: IndexMap::new(),
         }
+    }
+
+    #[test]
+    fn summaries_from_older_sessions_have_no_git_context() -> eyre::Result<()> {
+        let mut value = serde_json::to_value(summary(Vec::new()))?;
+        if let Some(fields) = value.as_object_mut() {
+            fields.remove("git");
+        }
+        let decoded: SessionSummary = serde_json::from_value(value)?;
+        assert_eq!(decoded.git, None);
+        Ok(())
     }
 
     /// Routing updates reach subscribers, and a session without routes never reports any.

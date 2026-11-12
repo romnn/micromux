@@ -270,6 +270,8 @@ impl Default for UiConfig {
     reason = "the public field name predates this lint and renaming it would churn the config API"
 )]
 pub struct Config {
+    /// Whether to fetch Git context, or `None` to inherit the user setting (enabled by default).
+    pub git_metadata: Option<bool>,
     /// Optional session name, surfaced as the session identity to agents. Falls back to
     /// `basename(working_dir)` when unset.
     pub name: Option<String>,
@@ -936,6 +938,44 @@ mod tests {
         Ok(jsonschema::options()
             .with_draft(Draft::Draft7)
             .build(schema)?)
+    }
+
+    #[test]
+    fn git_metadata_settings_agree_in_project_user_and_schema() -> eyre::Result<()> {
+        let validator = compiled_schema()?;
+        for enabled in [false, true] {
+            let yaml = format!(
+                indoc! {"
+                version: 1
+                git:
+                  metadata: {enabled}
+                services:
+                  app:
+                    command: 'true'
+            "},
+                enabled = enabled
+            );
+            let mut diagnostics = Vec::new();
+            let project = super::from_str(&yaml, Path::new("."), 0usize, None, &mut diagnostics)?;
+            let user = super::user::parse_user_config(
+                &format!("git:\n  metadata: {enabled}\n"),
+                0usize,
+                &mut diagnostics,
+            )?;
+            assert_eq!(project.config.git_metadata, Some(enabled));
+            assert_eq!(user.git_metadata, Some(enabled));
+            assert_eq!(diagnostics, Vec::new());
+            assert!(validator.is_valid(&serde_yaml::from_str::<serde_json::Value>(&yaml)?));
+        }
+        for invalid in ["git: false\n", "git:\n  metadata: sometimes\n"] {
+            let mut diagnostics = Vec::new();
+            assert!(
+                super::from_str(invalid, Path::new("."), 0usize, None, &mut diagnostics).is_err()
+            );
+            assert!(super::user::parse_user_config(invalid, 0usize, &mut diagnostics).is_err());
+            assert!(!validator.is_valid(&serde_yaml::from_str::<serde_json::Value>(invalid)?));
+        }
+        Ok(())
     }
 
     /// An attached TUI reads the project's `ui` settings even where the rest of the file would

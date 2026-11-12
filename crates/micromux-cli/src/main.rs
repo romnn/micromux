@@ -15,6 +15,7 @@ mod options;
 mod proxy;
 mod session_env;
 mod ui_settings;
+mod user_config;
 
 use clap::Parser;
 use codespan_reporting::diagnostic::Diagnostic;
@@ -305,6 +306,7 @@ async fn start_supervisor(
     claim_policy: ClaimPolicy,
     proxy_port: Option<std::num::NonZeroU16>,
 ) -> Result<Supervisor, Error> {
+    let git_metadata = user_config::git_metadata(config.config.git_metadata, printer).await?;
     // Every service and healthcheck runs under the containment shim, so their process trees die
     // with this supervisor even when it is SIGKILLed.
     micromux::containment::enable(shim_executable()?);
@@ -340,9 +342,12 @@ async fn start_supervisor(
         proxy_port,
     )?;
     proxy::latch_port(&mut session).await?;
-    let mux = build_supervisor(config, printer, session)?;
+    let mux = build_supervisor(config, printer, session)?.with_git_metadata(git_metadata);
     let routes = match config.config_path.as_deref() {
-        Some(config_path) => proxy::register(&mux, config_path, shutdown).await?,
+        Some(config_path) => {
+            let working_dir = std::env::current_dir().ok();
+            proxy::register(&mux, config_path, working_dir.as_deref(), shutdown).await?
+        }
         None => None,
     };
     Ok(Supervisor {
