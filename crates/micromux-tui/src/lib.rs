@@ -688,7 +688,11 @@ impl App {
                 if let Some(snapshot) = self.source.service(&change.service_id)
                     && let Some(service) = self.service_mut(&change.service_id)
                 {
+                    let renamed = service.snapshot.name != snapshot.name;
                     service.snapshot = snapshot;
+                    if renamed && let Some(all_logs) = &mut self.state.all_logs {
+                        all_logs.dirty = true;
+                    }
                 }
             }
             ChangeKind::Logs => {

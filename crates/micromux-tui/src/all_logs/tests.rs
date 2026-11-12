@@ -367,6 +367,99 @@ fn tags_pad_names_to_one_width_and_cut_long_ones_in_the_middle() {
 }
 
 #[test]
+fn display_names_change_tags_without_changing_service_identity_or_merge_order() {
+    let mut services = [
+        service("api", &[(1, 100, "api line")]),
+        service("web", &[(1, 100, "web line")]),
+    ];
+    let [api, web] = &mut services;
+    api.snapshot.name = "Zulu (API)".to_string();
+    web.snapshot.name = "Alpha".to_string();
+    let all_logs = built(&services);
+
+    // Equal timestamps still sort by ID, and display-name widths determine the padding.
+    assert_eq!(
+        lines(&all_logs),
+        ["Zulu (API) │ api line", "Alpha      │ web line"]
+    );
+    assert_eq!(all_logs.names, ["api", "web"]);
+
+    // Identical display names do not merge two services into one identity.
+    let [api, web] = &mut services;
+    api.snapshot.name = "Worker".to_string();
+    web.snapshot.name = "Worker".to_string();
+    assert_eq!(
+        lines(&built(&services)),
+        ["Worker │ api line", "Worker │ web line"]
+    );
+}
+
+#[tokio::test]
+async fn service_rows_and_popups_show_display_names_and_keep_ids_available() -> eyre::Result<()> {
+    let yaml = SERVICES.replace("api:\n", "api:\n    name: API (local)\n");
+    let (mut app, _runner) = app_and_runner(&yaml)?;
+    let shown = screen(&draw(&mut app));
+    assert!(
+        row_text(&draw(&mut app), 2).contains("API (local)"),
+        "{shown}"
+    );
+    assert!(row_text(&draw(&mut app), 3).contains("web"), "{shown}");
+
+    press(&mut app, KeyCode::Char('j'));
+    let frame = draw(&mut app);
+    assert!(row_text(&frame, 2).contains("API (local)"));
+    assert!(row_text(&frame, 3).contains("web"));
+    press(&mut app, KeyCode::Char('k'));
+    press(&mut app, KeyCode::Char('i'));
+    let shown = screen(&draw(&mut app));
+    assert!(shown.contains("Service · API (local)"), "{shown}");
+    assert!(
+        shown
+            .lines()
+            .any(|line| line.contains("ID") && line.contains("api")),
+        "{shown}"
+    );
+    press(&mut app, KeyCode::Esc);
+    press(&mut app, KeyCode::Char('L'));
+    let shown = screen(&draw(&mut app));
+    assert!(shown.contains("Level · API (local)"), "{shown}");
+    assert_eq!(
+        app.state
+            .current_service()
+            .map(|service| service.snapshot.id.as_str()),
+        Some("api")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn status_rename_refreshes_retained_combined_log_tags() -> eyre::Result<()> {
+    let (mut app, _runner) = app_and_runner(SERVICES)?;
+    press(&mut app, KeyCode::Char('A'));
+    set_lines(&mut app, 0, &[(1, 100, "retained line")])?;
+    assert!(screen(&draw(&mut app)).contains("api │ retained line"));
+
+    let yaml = SERVICES.replace("api:\n", "api:\n    name: API (renamed)\n");
+    let (renamed, _renamed_runner) = app_and_runner(&yaml)?;
+    app.source = renamed.source;
+    app.apply_change(&micromux::SessionChange {
+        service_id: "api".to_string(),
+        kind: micromux::ChangeKind::Status,
+    });
+
+    let shown = screen(&draw(&mut app));
+    assert!(shown.contains("API (renamed) │ retained line"), "{shown}");
+    assert!(!shown.contains("api │ retained line"), "{shown}");
+    assert_eq!(
+        app.state
+            .current_service()
+            .map(|service| service.snapshot.id.as_str()),
+        Some("api")
+    );
+    Ok(())
+}
+
+#[test]
 fn every_line_of_a_record_is_tagged_and_no_color_bleeds_into_the_next_record() {
     let services = [
         // A live screen is one record of several lines, and this one leaves red set.

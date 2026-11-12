@@ -22,6 +22,8 @@ The pane with the focus, which the movement keys act on, has a thick frame in an
 
 The header's right side lists the view keys, which change only what the panes show, with their current state. With [routes]({{< relref "configuration/sessions.md" >}}#hostnames), the Logs pane's title lists the browser URLs of the selected service, the routes whose port is in its `ports` list, as many as fit, then a count of the rest; the header says so in red when the shared proxy does not serve them right now. The footer lists the keys that move around and act on services. Both wrap onto extra rows when the terminal is too narrow.
 
+The services list, combined-log tags, and service popups show each service's configured `name`, or its ID when no name is set. The `i` popup also shows the ID when it differs from the display name; commands and control requests always use that ID.
+
 | Key | Action |
 |---|---|
 | `j` / `k`, `↓` / `↑` | Move the selection |

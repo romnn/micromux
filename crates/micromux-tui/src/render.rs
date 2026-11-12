@@ -1019,6 +1019,9 @@ fn service_info_rows(
     );
 
     let mut rows = info_rows("State", vec![Line::from(state)]);
+    if snapshot.name != snapshot.id {
+        rows.extend(info_rows("ID", vec![snapshot.id.clone()]));
+    }
     if snapshot.config_stale {
         rows.extend(info_rows(
             "Config",
@@ -2287,9 +2290,9 @@ impl App {
                     " ".into(),
                     origin.fg(Color::DarkGray),
                     if index == self.state.selected_service {
-                        service.snapshot.id.as_str().fg(FOCUS_COLOR).bold()
+                        service.snapshot.name.as_str().fg(FOCUS_COLOR).bold()
                     } else {
-                        service.snapshot.id.as_str().into()
+                        service.snapshot.name.as_str().into()
                     },
                 ]);
 
@@ -2471,12 +2474,12 @@ impl App {
         let Some(picker) = &self.level_picker else {
             return;
         };
-        let current = self
+        let service = self
             .state
             .services
             .iter()
-            .find(|service| service.snapshot.id == picker.service_id)
-            .map(crate::state::Service::min_level);
+            .find(|service| service.snapshot.id == picker.service_id);
+        let current = service.map(crate::state::Service::min_level);
         let items = crate::level::LEVEL_CHOICES
             .iter()
             .map(|choice| {
@@ -2489,7 +2492,10 @@ impl App {
             })
             .collect::<Vec<_>>();
 
-        let title = format!(" Level · {} ", picker.service_id);
+        let name = service.map_or(picker.service_id.as_str(), |service| {
+            service.snapshot.name.as_str()
+        });
+        let title = format!(" Level · {name} ");
         let hint = " ↵ select · Esc cancel ";
         let widest_item = items.iter().map(ListItem::width).max().unwrap_or_default();
         let content_width = title
@@ -2535,7 +2541,7 @@ impl App {
                 };
                 let attempts = self.source.healthchecks(&service.snapshot.id);
                 (
-                    format!(" Service · {} ", service.snapshot.id),
+                    format!(" Service · {} ", service.snapshot.name),
                     service_info_rows(
                         &service.snapshot,
                         &|id| {
