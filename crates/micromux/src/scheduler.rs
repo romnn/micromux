@@ -2154,6 +2154,7 @@ impl SchedulerRuntime {
         }
         *services = merged;
         self.sync_all(services);
+        self.writer.reorder_services(services.keys());
         self.publish_route_owners(services);
         if !changed.is_empty() {
             let detail = format!("reloaded changed service specs: {}", changed.join(", "));
@@ -2170,6 +2171,18 @@ impl SchedulerRuntime {
         updated: &ServiceMap,
     ) -> Vec<ReconcileAction> {
         let mut actions = Vec::new();
+        // Additions and removals shift indices without changing the relative order of survivors.
+        let current_order = services
+            .iter()
+            .filter(|(id, service)| {
+                updated.contains_key(*id)
+                    && roster_entry_state(&self.services, id, service)
+                        == Some(RosterEntryState::LiveConfigured)
+            })
+            .enumerate()
+            .map(|(position, (id, _))| (id, position))
+            .collect::<HashMap<_, _>>();
+        let mut position = 0;
         for (service_id, updated_service) in updated {
             let current = services.get(service_id).filter(|service| {
                 roster_entry_state(&self.services, service_id, service)
@@ -2185,6 +2198,10 @@ impl SchedulerRuntime {
             };
 
             let mut changed = Vec::new();
+            if current_order.get(service_id) != Some(&position) {
+                changed.push("service order");
+            }
+            position += 1;
             if current.spec != updated_service.spec {
                 changed.push("service spec");
             }
@@ -2376,6 +2393,10 @@ impl SchedulerRuntime {
                 "configured service retired because it was removed by config reconciliation",
             );
         }
+        // Configured services lead in file order; dynamic services and tombstones keep their
+        // relative order after them, with their runtime and retained model entries intact.
+        services.sort_by_cached_key(|id, _| updated.get_index_of(id).unwrap_or(usize::MAX));
+        self.writer.reorder_services(services.keys());
     }
 
     async fn reconcile_config(

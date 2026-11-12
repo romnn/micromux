@@ -700,6 +700,77 @@ services:
     Ok(())
 }
 
+#[tokio::test]
+async fn reconcile_order_is_visible_over_the_socket_without_new_runs() -> eyre::Result<()> {
+    let dir = unique_dir("reconcile-order")?;
+    let yaml = r#"version: 1
+services:
+  api: {command: ["sh", "-c", "sleep 60"]}
+  worker: {command: ["sh", "-c", "sleep 60"]}
+  query: {command: ["sh", "-c", "sleep 60"]}
+"#;
+    let session = build_session_yaml(dir.path(), yaml)?;
+    let Response::Services(before) = request_until(&session.endpoint, Request::ListServices, |response| {
+        matches!(response, Response::Services(services) if services.iter().all(|service| service.execution == micromux::Execution::Running))
+    }).await? else {
+        eyre::bail!("expected services");
+    };
+    std::fs::write(
+        dir.path().join("micromux.yaml"),
+        r#"version: 1
+services:
+  api: {command: ["sh", "-c", "sleep 60"]}
+  query: {command: ["sh", "-c", "sleep 60"]}
+  worker: {command: ["sh", "-c", "sleep 60"]}
+"#,
+    )?;
+    let mut client = Client::connect(&session.endpoint).await?;
+    let Response::Reconcile(preview) = client
+        .request(Request::ReconcileConfig { dry_run: true })
+        .await?
+    else {
+        eyre::bail!("expected reconciliation preview");
+    };
+    assert_eq!(preview.actions.len(), 2);
+    let Response::Services(unchanged) = client.request(Request::ListServices).await? else {
+        eyre::bail!("expected services");
+    };
+    assert_eq!(
+        unchanged
+            .iter()
+            .map(|service| service.id.as_str())
+            .collect::<Vec<_>>(),
+        ["api", "worker", "query"]
+    );
+    let Response::Reconcile(applied) = client
+        .request(Request::ReconcileConfig { dry_run: false })
+        .await?
+    else {
+        eyre::bail!("expected reconciliation receipt");
+    };
+    assert_eq!(applied.actions, preview.actions);
+    let Response::Services(after) = client.request(Request::ListServices).await? else {
+        eyre::bail!("expected services");
+    };
+    assert_eq!(
+        after
+            .iter()
+            .map(|service| service.id.as_str())
+            .collect::<Vec<_>>(),
+        ["api", "query", "worker"]
+    );
+    for current in after {
+        let previous = before
+            .iter()
+            .find(|service| service.id == current.id)
+            .ok_or_else(|| eyre::eyre!("missing {}", current.id))?;
+        assert_eq!(current.pid, previous.pid);
+        assert_eq!(current.run_generation, previous.run_generation);
+    }
+    session.shutdown.cancel();
+    Ok(())
+}
+
 /// Each route's host, port and owning service, in config order.
 fn routed_owners(routes: &[micromux::Route]) -> Vec<(&str, u16, Option<&str>)> {
     routes

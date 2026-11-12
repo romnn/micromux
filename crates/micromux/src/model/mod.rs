@@ -12,7 +12,7 @@
 //! `Inner` is behind a synchronous [`parking_lot::RwLock`]; readers snapshot/clone under the lock,
 //! drop it, and only then serialize — never holding the guard across an `.await`.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -1565,6 +1565,30 @@ impl RunSink {
 }
 
 impl SessionModelWriter {
+    /// Reorders existing entries by `ids`, preserving unlisted entries at the end.
+    ///
+    /// Entry state stays intact, and an actual order change publishes one roster notification.
+    pub(crate) fn reorder_services<'a>(&self, ids: impl IntoIterator<Item = &'a ServiceID>) {
+        let positions = ids
+            .into_iter()
+            .enumerate()
+            .map(|(position, id)| (id.as_str(), position))
+            .collect::<HashMap<_, _>>();
+        let first = {
+            let mut services = self.inner.services.write();
+            let position =
+                |id: &ServiceID| positions.get(id.as_str()).copied().unwrap_or(usize::MAX);
+            if services.keys().map(position).is_sorted() {
+                return;
+            }
+            services.sort_by_cached_key(|id, _| position(id));
+            services.first().map(|(id, _)| id.clone())
+        };
+        if let Some(id) = first {
+            self.inner.publish(&id, ChangeKind::Roster);
+        }
+    }
+
     /// Add a service to the end of the roster.
     pub(crate) fn insert_service(&self, snapshot: ServiceSnapshot, retention: LogRetention) {
         let service_id = snapshot.id.clone();
@@ -2922,6 +2946,43 @@ mod tests {
         assert_eq!(removed.service_id, "dynamic");
         assert_eq!(removed.kind, ChangeKind::Roster);
         assert!(reader.service("dynamic").is_none());
+    }
+
+    #[test]
+    fn roster_reorder_preserves_entries_and_only_notifies_when_order_changes() -> eyre::Result<()> {
+        let (reader, writer) = new([
+            entry("api"),
+            entry("worker"),
+            entry("query"),
+            entry("dynamic"),
+            entry("removed"),
+        ]);
+        let original = reader.inner.services.read().clone();
+        let mut changes = reader.subscribe();
+        let order = ["api", "query", "worker"].map(str::to_string);
+        writer.reorder_services(&order);
+
+        assert_eq!(
+            reader
+                .services()
+                .iter()
+                .map(|snapshot| snapshot.id.as_str())
+                .collect::<Vec<_>>(),
+            ["api", "query", "worker", "dynamic", "removed"]
+        );
+        // The exact entries survive, including their logs, health history, and active run sinks.
+        for (id, before) in original {
+            let after = reader
+                .inner
+                .service_entry(&id)
+                .ok_or_else(|| eyre::eyre!("missing {id}"))?;
+            assert!(Arc::ptr_eq(&before, &after), "{id}");
+        }
+        assert_eq!(changes.try_recv()?.kind, ChangeKind::Roster);
+        assert!(changes.try_recv().is_err());
+        writer.reorder_services(&order);
+        assert!(changes.try_recv().is_err());
+        Ok(())
     }
 
     #[test]
