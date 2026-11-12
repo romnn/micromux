@@ -1814,6 +1814,195 @@ services:
     Ok(())
 }
 
+fn ordered_service_yaml(ids: &[&str]) -> String {
+    let mut yaml = String::from("version: 1\nservices:\n");
+    for id in ids {
+        let definition = format!(
+            indoc! {r#"
+            {id}:
+              command: ["sh", "-c", "echo {id}-ready; sleep 60"]
+              healthcheck:
+                test: ["CMD", "true"]
+                interval: 1h
+        "#},
+            id = id
+        );
+        for line in definition.lines() {
+            yaml.push_str("  ");
+            yaml.push_str(line);
+            yaml.push('\n');
+        }
+    }
+    yaml
+}
+
+fn roster_ids(reader: &crate::SessionModelReader) -> Vec<String> {
+    reader
+        .services()
+        .into_iter()
+        .map(|snapshot| snapshot.id)
+        .collect()
+}
+
+#[tokio::test]
+async fn reconcile_reorders_running_services_without_replacing_their_state() -> eyre::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let config_path = dir.path().join("micromux.yaml");
+    fs::write(
+        &config_path,
+        ordered_service_yaml(&["api", "worker", "query"]),
+    )?;
+    let harness = spawn_harness(
+        services_from_config_path(&config_path)?,
+        Some(reload_config(&config_path)?),
+    );
+    for id in ["api", "worker", "query"] {
+        wait_for_log(&harness.reader, id, &format!("{id}-ready")).await?;
+        wait_until(&harness.reader, id, |snapshot| {
+            snapshot.health == Some(crate::Health::Healthy)
+        })
+        .await?;
+    }
+    let before = harness.reader.services();
+    let mut changes = harness.reader.subscribe();
+    fs::write(
+        &config_path,
+        ordered_service_yaml(&["api", "query", "worker"]),
+    )?;
+
+    let dry_run = reconcile_accepted(harness.control.reconcile_config(true).await)?;
+    assert_eq!(
+        dry_run
+            .actions
+            .iter()
+            .map(|action| action.service.as_str())
+            .collect::<Vec<_>>(),
+        ["query", "worker"]
+    );
+    assert!(
+        dry_run
+            .actions
+            .iter()
+            .all(|action| action.action == ReconcileActionKind::Changed
+                && action.detail == "changed service order")
+    );
+    assert_eq!(roster_ids(&harness.reader), ["api", "worker", "query"]);
+    let applied = reconcile_accepted(harness.control.reconcile_config(false).await)?;
+    assert_eq!(applied.actions, dry_run.actions);
+    assert_eq!(roster_ids(&harness.reader), ["api", "query", "worker"]);
+
+    // A roster notification makes local and attached TUIs re-read the ordered model.
+    let mut roster_changed = false;
+    while let Ok(change) = changes.try_recv() {
+        roster_changed |= change.kind == crate::ChangeKind::Roster;
+    }
+    assert!(roster_changed);
+    for before in before {
+        let after = harness
+            .reader
+            .service(&before.id)
+            .ok_or_else(|| eyre::eyre!("missing {}", before.id))?;
+        assert_eq!(after.run_generation, before.run_generation);
+        assert_eq!(after.pid, before.pid);
+        assert_eq!(after.desired, before.desired);
+        assert_eq!(after.execution, before.execution);
+        assert_eq!(after.health, before.health);
+        assert!(!after.config_stale);
+        assert!(!harness.reader.healthchecks(&before.id).is_empty());
+        assert!(
+            harness
+                .reader
+                .logs(&before.id, None)
+                .iter()
+                .any(|line| line.line.contains(&format!("{}-ready", before.id)))
+        );
+    }
+    assert_eq!(
+        reconcile_accepted(harness.control.reconcile_config(false).await)?.actions,
+        Vec::<ReconcileAction>::new()
+    );
+
+    // The ordinary restart/reload path must publish file order too.
+    fs::write(
+        &config_path,
+        ordered_service_yaml(&["query", "worker", "api"]),
+    )?;
+    accepted(harness.control.restart(&"api".to_string()).await)?;
+    assert_eq!(roster_ids(&harness.reader), ["query", "worker", "api"]);
+    harness.shutdown.cancel();
+    harness.handle.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn reconcile_places_additions_and_revivals_before_dynamic_services_and_tombstones()
+-> eyre::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let config_path = dir.path().join("micromux.yaml");
+    fs::write(
+        &config_path,
+        ordered_service_yaml(&["api", "worker", "query"]),
+    )?;
+    let harness = spawn_harness_with_policy(
+        services_from_config_path(&config_path)?,
+        Some(reload_config(&config_path)?),
+        dir.path().to_path_buf(),
+        enabled_dynamic_policy(dir.path())?,
+    );
+    dynamic_accepted(
+        harness
+            .control
+            .start_dynamic(dynamic_params("debug", &["sh", "-c", "sleep 60"]))
+            .await,
+    )?;
+    fs::write(
+        &config_path,
+        ordered_service_yaml(&["query", "added", "api"]),
+    )?;
+    reconcile_accepted(harness.control.reconcile_config(false).await)?;
+    assert_eq!(
+        roster_ids(&harness.reader),
+        ["query", "added", "api", "worker", "debug"]
+    );
+    assert_eq!(
+        harness
+            .reader
+            .service("worker")
+            .and_then(|snapshot| snapshot.retired),
+        Some(RetiredReason::Removed)
+    );
+    assert_eq!(
+        harness
+            .reader
+            .service("debug")
+            .map(|snapshot| snapshot.origin),
+        Some(OriginKind::Dynamic)
+    );
+
+    fs::write(
+        &config_path,
+        ordered_service_yaml(&["worker", "api", "query", "added"]),
+    )?;
+    reconcile_accepted(harness.control.reconcile_config(false).await)?;
+    assert_eq!(
+        roster_ids(&harness.reader),
+        ["worker", "api", "query", "added", "debug"]
+    );
+    assert!(
+        harness
+            .reader
+            .service("worker")
+            .is_some_and(|snapshot| snapshot.retired.is_none())
+    );
+    assert_eq!(
+        reconcile_accepted(harness.control.reconcile_config(true).await)?.actions,
+        Vec::<ReconcileAction>::new()
+    );
+    harness.shutdown.cancel();
+    harness.handle.await??;
+    Ok(())
+}
+
 async fn assert_reconcile_dry_run(
     harness: &Harness,
     before_x: &crate::model::ServiceSnapshot,

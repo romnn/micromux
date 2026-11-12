@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- **Config reconciliation applies service ordering without restarting processes.** Dry runs
+  report reordered services, and the TUI and control API follow the config's order.
+
 - **The TUI shows configured service display names.** The sidebar, combined-log tags, and popups
   use `name`; the service details retain the ID used by commands and the control API.
 

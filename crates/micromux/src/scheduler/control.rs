@@ -165,7 +165,7 @@ pub enum ReconcileActionKind {
     Added,
     /// A configured service will be retired.
     Removed,
-    /// A configured service definition changed in place.
+    /// A configured service definition or its relative position changed in place.
     Changed,
 }
 
@@ -176,7 +176,7 @@ pub struct ReconcileAction {
     pub service: ServiceID,
     /// Semantic change kind.
     pub action: ReconcileActionKind,
-    /// Human-readable summary of the changed definition components.
+    /// Human-readable summary of the changed definition components or service order.
     pub detail: String,
 }
 
