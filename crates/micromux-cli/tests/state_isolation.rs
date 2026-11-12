@@ -217,37 +217,7 @@ fn assert_session_state(source: ProxyPortSource) -> eyre::Result<()> {
         std::thread::sleep(Duration::from_millis(50));
     }
 
-    // The registry in the state directory holds the session's port, and its lock names no holder
-    // once the session finished allocating.
-    let output = run(directory, &["env", "ISOLATED_PORT", "MICROMUX_PROXY_PORT"])?;
-    eyre::ensure!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let printed = String::from_utf8(output.stdout)?;
-    let variable = |name: &str| {
-        printed
-            .lines()
-            .find_map(|line| line.strip_prefix(&format!("{name}=")))
-            .ok_or_else(|| eyre::eyre!("`env` printed no {name}: {printed}"))
-    };
-    let port = variable("ISOLATED_PORT")?;
-    let session_proxy_port = variable("MICROMUX_PROXY_PORT")?;
-    let record: serde_json::Value = serde_json::from_slice(&std::fs::read(
-        state.join("ports").join(format!("{key}.json")),
-    )?)?;
-    assert_eq!(
-        record
-            .pointer("/ports/ISOLATED_PORT")
-            .ok_or_else(|| eyre::eyre!("missing port record"))?
-            .to_string(),
-        port
-    );
-    assert_eq!(
-        std::fs::read_to_string(state.join("ports").join("registry.lock"))?,
-        ""
-    );
+    assert_port_registry(directory, proxy_port)?;
 
     // The control socket and the session lock live in the state directory too, and so does the
     // session's run-log spool.
@@ -271,7 +241,6 @@ fn assert_session_state(source: ProxyPortSource) -> eyre::Result<()> {
 
     // The session started a proxy of its own on the configured port and registered with it,
     // rather than joining the developer's proxy.
-    assert_eq!(session_proxy_port, proxy_port.to_string());
     let info = ask_proxy(&coordination_dir.join("proxy.sock"), r#"{"type":"hello"}"#)?;
     assert_eq!(info.get("port"), Some(&serde_json::json!(proxy_port)));
     assert_eq!(
@@ -308,6 +277,44 @@ fn assert_session_state(source: ProxyPortSource) -> eyre::Result<()> {
         })
         .count();
     assert!(logs > 0, "the session wrote no log in the state directory");
+    Ok(())
+}
+
+fn assert_port_registry(directory: &Path, proxy_port: u16) -> eyre::Result<()> {
+    let state = common::state_directory(directory);
+    let key = micromux::session::config_path_key(&directory.join("micromux.yaml").canonicalize()?);
+    // The registry in the state directory holds the session's port, and its lock names no holder
+    // once the session finished allocating.
+    let output = run(directory, &["env", "ISOLATED_PORT", "MICROMUX_PROXY_PORT"])?;
+    eyre::ensure!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let printed = String::from_utf8(output.stdout)?;
+    let variable = |name: &str| {
+        printed
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("{name}=")))
+            .ok_or_else(|| eyre::eyre!("`env` printed no {name}: {printed}"))
+    };
+    let port = variable("ISOLATED_PORT")?;
+    assert_eq!(variable("MICROMUX_PROXY_PORT")?, proxy_port.to_string());
+    let record: serde_json::Value = serde_json::from_slice(&std::fs::read(
+        state.join("ports").join(format!("{key}.json")),
+    )?)?;
+    assert_eq!(
+        record
+            .pointer("/ports/ISOLATED_PORT")
+            .ok_or_else(|| eyre::eyre!("missing port record"))?
+            .to_string(),
+        port
+    );
+    assert_eq!(
+        std::fs::read_to_string(state.join("ports").join("registry.lock"))?,
+        ""
+    );
+
     Ok(())
 }
 
