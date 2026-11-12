@@ -1565,6 +1565,7 @@ mod tests {
         let store = store_with(entry_with_log(1, "line"));
         let (changes, mut received) = broadcast::channel(8);
         let summary = |routing| micromux::SessionSummary {
+            git: None,
             name: "one".to_string(),
             domain: "one.localhost".to_string(),
             host_suffix: "one.localhost".to_string(),

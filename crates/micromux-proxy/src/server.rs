@@ -490,6 +490,26 @@ impl Shared {
         best_route(host_routes.into_iter(), path).map(|route| target(entry, route))
     }
 
+    pub(crate) async fn listed_sessions_with_git(&self) -> Vec<ListedSession> {
+        // Snapshot before I/O to keep the routing table available during Git lookups.
+        let mut sessions = self.listed_sessions();
+        futures::future::join_all(sessions.iter_mut().map(|session| async move {
+            if !session.git_metadata {
+                return;
+            }
+            let directory = session
+                .working_dir
+                .as_deref()
+                .map(std::path::Path::new)
+                .or_else(|| std::path::Path::new(&session.config_path).parent());
+            if let Some(directory) = directory {
+                session.git = micromux::session::GitContext::discover(directory).await;
+            }
+        }))
+        .await;
+        sessions
+    }
+
     /// The live sessions and their URLs, each with its own port, for the not-found page.
     pub(crate) fn listed_sessions(&self) -> Vec<ListedSession> {
         let state = self.state();
@@ -497,6 +517,9 @@ impl Shared {
             .sessions
             .iter()
             .map(|(domain, entry)| ListedSession {
+                git_metadata: entry.registration.git_metadata,
+                working_dir: entry.registration.working_dir.clone(),
+                git: None,
                 name: entry.registration.session.clone(),
                 config_path: entry.registration.config_path.clone(),
                 urls: entry
@@ -862,6 +885,7 @@ async fn send(
 pub(crate) mod tests {
     use super::*;
     use crate::protocol::RouteTarget;
+    use color_eyre::eyre;
     use similar_asserts::assert_eq;
 
     pub(crate) fn registration(
@@ -870,9 +894,11 @@ pub(crate) mod tests {
         routes: &[(&str, u16)],
     ) -> Registration {
         Registration {
+            git_metadata: true,
             session: session.to_string(),
             session_domain: format!("{session}.localhost"),
             config_path: config_path.to_string(),
+            working_dir: None,
             pid: 1,
             proxy_port: 80,
             routes: routes
@@ -890,6 +916,40 @@ pub(crate) mod tests {
 
     fn shared() -> Shared {
         Shared::new(80, CancellationToken::new())
+    }
+
+    #[tokio::test]
+    async fn disabled_metadata_is_omitted_from_session_listings() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let initialized = tokio::process::Command::new("git")
+            .args(["init", "--quiet", "--initial-branch=feature/metadata"])
+            .arg(directory.path())
+            .status()
+            .await?;
+        assert!(initialized.success());
+        let shared = shared();
+        for (name, enabled) in [("enabled", true), ("disabled", false)] {
+            let mut entry = registration(name, &format!("/{name}/micromux.yaml"), &[("app", 1001)]);
+            entry.working_dir = Some(directory.path().display().to_string());
+            entry.git_metadata = enabled;
+            shared
+                .register(entry, None)
+                .map_err(|err| eyre::eyre!("{err:?}"))?;
+        }
+        // Both sessions point at the same repository; the disabled one must ignore its context.
+        let sessions = shared.listed_sessions_with_git().await;
+        let enabled = sessions
+            .iter()
+            .find(|session| session.name == "enabled")
+            .and_then(|session| session.git.as_ref())
+            .map(|git| git.branch.as_str());
+        assert_eq!(enabled, Some("feature/metadata"));
+        let disabled = sessions
+            .iter()
+            .find(|session| session.name == "disabled")
+            .ok_or_else(|| eyre::eyre!("missing disabled session"))?;
+        assert_eq!(disabled.git, None);
+        Ok(())
     }
 
     /// Exact routes win over the catch-all route, which serves the bare domain and every

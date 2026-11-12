@@ -619,7 +619,7 @@ fn lag_replay_changes(snapshots: &[ServiceSnapshot]) -> impl Iterator<Item = Ses
 
 async fn dispatch(server: &ControlServer, request: Request) -> Response {
     match request {
-        Request::Describe => Response::Description(describe(server)),
+        Request::Describe => Response::Description(describe_with_git(server).await),
         Request::ListServices => Response::Services(server.reader.services()),
         Request::GetService { service } => get_service(&server.reader, &service),
         Request::GetLogs {
@@ -948,6 +948,16 @@ fn bound_follow_response_lines_page(
     lines.truncate(MAX_LOG_TAIL);
     let truncated = capped || bound_follow_response_lines(&mut lines, first_retained_seq);
     (lines, truncated)
+}
+
+async fn describe_with_git(server: &ControlServer) -> SessionInfo {
+    let mut info = describe(server);
+    if let (Some(session), Some(status)) = (&mut info.session, &server.session) {
+        session.git = status
+            .git_context(std::path::Path::new(&info.working_dir))
+            .await;
+    }
+    info
 }
 
 fn describe(server: &ControlServer) -> SessionInfo {

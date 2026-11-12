@@ -18,6 +18,7 @@ Every key in `micromux.yaml`. The machine-readable source of truth is [`micromux
 | `version` | string / number | — | Config format version. Use `"1"`. |
 | `name` | string | directory name | Session name surfaced to agents via the control plane. |
 | `strict` | bool | `false` | Treat config warnings as errors. |
+| `git` | object | — | `metadata` (bool, default `true`) controls Git branch and GitHub PR fetching for [session listings]({{< relref "sessions.md" >}}#the-proxy). Overrides the user config; changes require a session restart. |
 | `services` | map | — | Service definitions, keyed by id. |
 | `restart` | string | — | Default [restart policy]({{< relref "restart-policies.md" >}}). |
 | `healthcheck` | object | — | Default [healthcheck timing]({{< relref "healthchecks.md" >}}) (no `test`). |

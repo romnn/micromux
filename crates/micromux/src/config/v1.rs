@@ -57,6 +57,7 @@ const KNOWN_HEALTHCHECK_KEYS: &[&str] = &[
 ];
 
 const KNOWN_CONFIG_KEYS: &[&str] = &[
+    "git",
     "version",
     "name",
     "strict",
@@ -1504,6 +1505,7 @@ pub fn parse_config<F: Copy + PartialEq>(
         diagnostics,
     )?;
     Ok(Config {
+        git_metadata: parse_git_metadata(value, file_id, strict, diagnostics)?,
         name,
         ui_config,
         control,
@@ -1514,6 +1516,20 @@ pub fn parse_config<F: Copy + PartialEq>(
         session,
         services,
     })
+}
+
+pub(super) fn parse_git_metadata<F: Copy>(
+    value: &Spanned<Value>,
+    file_id: F,
+    strict: bool,
+    diagnostics: &mut Vec<Diagnostic<F>>,
+) -> Result<Option<bool>, ConfigError> {
+    let Some(git) = value.get("git") else {
+        return Ok(None);
+    };
+    let (_, mapping) = expect_mapping(git, Some("git config must be a mapping"))?;
+    warn_unknown_keys(mapping, &["metadata"], "git", file_id, strict, diagnostics);
+    Ok(parse_optional::<bool>(mapping.get("metadata"))?.map(Spanned::into_inner))
 }
 
 /// Parse the top-level `session` mapping and `allocate_ports` list.

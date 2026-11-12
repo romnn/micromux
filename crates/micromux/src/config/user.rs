@@ -18,6 +18,8 @@ pub const USER_CONFIG_FILE_NAME: &str = "config.yaml";
 /// Settings from the user config.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct UserConfig {
+    /// `git.metadata`: whether sessions fetch Git context, or `None` for the enabled default.
+    pub git_metadata: Option<bool>,
     /// `ui.mouse`: whether the TUI captures the mouse, or `None` when the file does not say.
     pub mouse: Option<bool>,
     /// `ui.copy_on_select`: whether finishing a mouse selection copies it, or `None` when the
@@ -70,8 +72,8 @@ fn xdg_user_config_path(
 ///
 /// # Errors
 ///
-/// Returns an error when the text is not YAML, when its root or `ui` is not a mapping, or when
-/// a known key has a value of the wrong type.
+/// Returns an error when the text is not YAML, when its root, `ui`, or `git` is not a mapping,
+/// or when a known key has a value of the wrong type.
 pub fn parse_user_config<F: Copy>(
     raw: &str,
     file_id: F,
@@ -82,22 +84,34 @@ pub fn parse_user_config<F: Copy>(
         return Ok(UserConfig::default());
     }
     let (_span, mapping) = expect_mapping(&root, Some("the user config must be a mapping"))?;
-    super::v1::warn_unknown_keys(mapping, &["ui"], "user config", file_id, false, diagnostics);
-    let Some(ui) = mapping.get("ui") else {
-        return Ok(UserConfig::default());
-    };
-    let (_span, ui) = expect_mapping(ui, Some("ui config must be a mapping"))?;
     super::v1::warn_unknown_keys(
-        ui,
-        &["mouse", "copy_on_select"],
-        "ui",
+        mapping,
+        &["ui", "git"],
+        "user config",
         file_id,
         false,
         diagnostics,
     );
-    let mouse = parse_optional::<bool>(ui.get("mouse"))?.map(Spanned::into_inner);
-    let copy_on_select = parse_optional::<bool>(ui.get("copy_on_select"))?.map(Spanned::into_inner);
+    let ui = mapping
+        .get("ui")
+        .map(|ui| expect_mapping(ui, Some("ui config must be a mapping")))
+        .transpose()?
+        .map(|(_, ui)| ui);
+    if let Some(ui) = ui {
+        super::v1::warn_unknown_keys(
+            ui,
+            &["mouse", "copy_on_select"],
+            "ui",
+            file_id,
+            false,
+            diagnostics,
+        );
+    }
+    let mouse = parse_optional::<bool>(ui.and_then(|ui| ui.get("mouse")))?.map(Spanned::into_inner);
+    let copy_on_select = parse_optional::<bool>(ui.and_then(|ui| ui.get("copy_on_select")))?
+        .map(Spanned::into_inner);
     Ok(UserConfig {
+        git_metadata: super::v1::parse_git_metadata(&root, file_id, false, diagnostics)?,
         mouse,
         copy_on_select,
     })
@@ -163,6 +177,7 @@ mod tests {
         assert_eq!(
             config,
             UserConfig {
+                git_metadata: None,
                 mouse: Some(false),
                 copy_on_select: Some(true),
             }
@@ -174,7 +189,7 @@ mod tests {
     #[test]
     fn empty_files_and_sections_leave_every_setting_unset() -> eyre::Result<()> {
         let mut diagnostics = Vec::new();
-        for raw in ["", "# nothing yet\n", "ui: {}\n"] {
+        for raw in ["", "# nothing yet\n", "ui: {}\n", "git: {}\n"] {
             assert_eq!(
                 parse_user_config(raw, 0usize, &mut diagnostics)?,
                 UserConfig::default(),
@@ -200,6 +215,7 @@ mod tests {
         assert_eq!(
             config,
             UserConfig {
+                git_metadata: None,
                 mouse: Some(true),
                 copy_on_select: None,
             }

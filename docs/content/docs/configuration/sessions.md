@@ -129,6 +129,19 @@ routes:
 
 ### The proxy
 
+Visit `http://localhost` (including your proxy port when it is not 80) to see the registered sessions and their endpoints. Each session also shows its current Git branch and, when available, an open GitHub PR number. Session names stay the same.
+
+To disable both Git and GitHub metadata fetching, set this in your [user config]({{< relref "../tui.md" >}}#user-config) for all projects, or in a project's `micromux.yaml`:
+
+```yaml
+git:
+  metadata: false
+```
+
+The project's `git.metadata` takes precedence over the user's setting; it defaults to `true` when neither file sets it. A project can use `metadata: true` to override a user-level default of `false`. Disabling it also hides previously cached metadata. The setting is read at session startup, so restart running sessions after changing it.
+
+Git context comes from the directory where the session was launched. The branch is checked on each overview request or MCP session description, so switching branches does not need a restart. PR lookups use `gh` in the background: the first response may show only the branch, with the PR appearing on a later request. Each process caches found PRs for an hour and retries missing PRs or failures after five minutes, keyed by directory and branch. Concurrent requests share a lookup. Missing Git or `gh`, detached HEAD, non-repositories, authentication failures, and network timeouts simply leave the corresponding metadata absent. MCP exposes the same context under `session.git` in `list_sessions` and in the session returned by `get_session_urls`.
+
 The first session with routes starts the proxy (`micromux proxy`) in the background. Sessions keep their routes registered over a local socket for as long as they run; a session that crashes loses its routes within seconds, and the proxy exits on its own a minute after the last session is gone.
 
 The proxy listens on `127.0.0.1` and `[::1]` (Linux resolves `*.localhost` to `::1` first). It uses **port 80** unless configured otherwise, and it never quietly moves to another port:

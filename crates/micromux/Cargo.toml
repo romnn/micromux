@@ -74,6 +74,7 @@ tempfile.workspace = true
 chrono.workspace = true
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 color-eyre.workspace = true
 indoc.workspace = true
 jsonschema = { version = "0", default-features = false }

@@ -73,6 +73,7 @@ color-eyre.workspace = true
 tempfile.workspace = true
 
 [target.'cfg(unix)'.dev-dependencies]
+indoc.workspace = true
 nix = { workspace = true, features = ["signal"] }
 # Drive the TUI in a pseudo-terminal and read back the terminal modes it leaves.
 portable-pty.workspace = true
