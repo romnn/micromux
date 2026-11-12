@@ -30,6 +30,8 @@ pub(crate) fn capture(
     let mut cmd = CommandBuilder::new(micromux);
     cmd.cwd(example_dir);
     cmd.env("TERM", "xterm-256color");
+    // Documentation captures need the palette even when the caller disables terminal colors.
+    cmd.env_remove("NO_COLOR");
     // The TUI shows log timestamps in local time, so pin the zone to render the demo records'
     // fixed timestamps identically on every machine.
     cmd.env("TZ", "UTC");

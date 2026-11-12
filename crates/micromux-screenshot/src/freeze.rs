@@ -24,6 +24,7 @@ pub(crate) fn ensure_freeze() -> Result<(), Error> {
 pub(crate) fn run_freeze(input: &Path, output: &Path, theme: &Theme) -> Result<(), Error> {
     let (r, g, b) = theme.background;
     let status = std::process::Command::new("freeze")
+        .env_remove("NO_COLOR")
         .arg("--language")
         .arg("text")
         .arg("--output")
