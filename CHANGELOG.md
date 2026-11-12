@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- **Override a session's proxy port without editing the project config.** Use `--proxy-port` on
+  `micromux` or `micromux serve`, or set `MICROMUX_PROXY_PORT`.
+
 ## v0.4.2
 
 - **Sessions that want different proxy ports share one proxy.** A session no longer fails when

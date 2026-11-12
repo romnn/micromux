@@ -116,19 +116,88 @@ impl Drop for Session {
 /// share with every session the developer runs.
 #[test]
 fn a_session_keeps_all_its_state_in_the_state_directory() -> eyre::Result<()> {
+    assert_session_state(ProxyPortSource::Config)
+}
+
+#[test]
+fn proxy_port_environment_overrides_config() -> eyre::Result<()> {
+    assert_session_state(ProxyPortSource::Environment)
+}
+
+#[test]
+fn proxy_port_flag_overrides_environment_and_config() -> eyre::Result<()> {
+    assert_session_state(ProxyPortSource::Flag)
+}
+
+#[test]
+fn proxy_port_override_keeps_configured_fallback() -> eyre::Result<()> {
+    assert_session_state(ProxyPortSource::Fallback)
+}
+
+#[derive(Clone, Copy)]
+enum ProxyPortSource {
+    Config,
+    Environment,
+    Flag,
+    Fallback,
+}
+
+impl ProxyPortSource {
+    fn prepare(
+        self,
+        command: &mut std::process::Command,
+        proxy_port: u16,
+        occupied_port: u16,
+    ) -> String {
+        let configured_port = if matches!(self, ProxyPortSource::Config) {
+            proxy_port
+        } else {
+            occupied_port
+        };
+        let mut yaml = config(configured_port);
+        if matches!(self, ProxyPortSource::Fallback) {
+            yaml = yaml.replace(
+                &format!("port: {configured_port}"),
+                &format!("port: {configured_port}\n  fallback_port: {proxy_port}"),
+            );
+        }
+
+        command.arg("serve").env_remove("MICROMUX_PROXY_PORT");
+        match self {
+            ProxyPortSource::Config => {}
+            ProxyPortSource::Environment => {
+                command.env("MICROMUX_PROXY_PORT", proxy_port.to_string());
+            }
+            ProxyPortSource::Flag => {
+                command
+                    .env("MICROMUX_PROXY_PORT", occupied_port.to_string())
+                    .args(["--proxy-port", &proxy_port.to_string()]);
+            }
+            ProxyPortSource::Fallback => {
+                command.args(["--proxy-port", &occupied_port.to_string()]);
+            }
+        }
+        yaml
+    }
+}
+
+fn assert_session_state(source: ProxyPortSource) -> eyre::Result<()> {
     let project = tempfile::tempdir()?;
     let directory = project.path();
     let state = common::state_directory(directory);
     let proxy_port = free_port()?;
-    std::fs::write(directory.join("micromux.yaml"), config(proxy_port))?;
+    let occupied = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let occupied_port = occupied.local_addr()?.port();
+    let mut command = common::micromux(directory);
+    let yaml = source.prepare(&mut command, proxy_port, occupied_port);
+    std::fs::write(directory.join("micromux.yaml"), &yaml)?;
     let config_path = directory.join("micromux.yaml").canonicalize()?;
     let key = micromux::session::config_path_key(&config_path);
     let runtime_dir = micromux_control::runtime_dir_in(&state);
     let coordination_dir = micromux_control::coordination_dir_in(&state);
 
     let _proxy = StopProxy(coordination_dir.join("proxy.sock"));
-    let supervisor = common::micromux(directory)
-        .arg("serve")
+    let supervisor = command
         .current_dir(directory)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -168,7 +237,13 @@ fn a_session_keeps_all_its_state_in_the_state_directory() -> eyre::Result<()> {
     let record: serde_json::Value = serde_json::from_slice(&std::fs::read(
         state.join("ports").join(format!("{key}.json")),
     )?)?;
-    assert_eq!(record["ports"]["ISOLATED_PORT"].to_string(), port);
+    assert_eq!(
+        record
+            .pointer("/ports/ISOLATED_PORT")
+            .ok_or_else(|| eyre::eyre!("missing port record"))?
+            .to_string(),
+        port
+    );
     assert_eq!(
         std::fs::read_to_string(state.join("ports").join("registry.lock"))?,
         ""
@@ -198,11 +273,24 @@ fn a_session_keeps_all_its_state_in_the_state_directory() -> eyre::Result<()> {
     // rather than joining the developer's proxy.
     assert_eq!(session_proxy_port, proxy_port.to_string());
     let info = ask_proxy(&coordination_dir.join("proxy.sock"), r#"{"type":"hello"}"#)?;
-    assert_eq!(info["port"], proxy_port);
+    assert_eq!(info.get("port"), Some(&serde_json::json!(proxy_port)));
     assert_eq!(
-        info["sessions"][0]["config_path"],
-        config_path.display().to_string()
+        info.pointer("/sessions/0/config_path")
+            .and_then(serde_json::Value::as_str),
+        config_path.to_str()
     );
+
+    assert_service_proxy_environment(directory, proxy_port)?;
+
+    // A run-local override must not make unchanged YAML look like changed session settings.
+    for arguments in [
+        vec!["ctl", "reconcile", "--dry-run"],
+        vec!["ctl", "reconcile"],
+    ] {
+        let output = run(directory, &arguments)?;
+        assert!(output.status.success(), "{output:?}");
+    }
+    assert_eq!(std::fs::read_to_string(&config_path)?, yaml);
 
     // Stopping the session runs the cleanup, whose log lands in the state directory, and the
     // session logged there as well.
@@ -220,6 +308,26 @@ fn a_session_keeps_all_its_state_in_the_state_directory() -> eyre::Result<()> {
         })
         .count();
     assert!(logs > 0, "the session wrote no log in the state directory");
+    Ok(())
+}
+
+fn assert_service_proxy_environment(directory: &Path, proxy_port: u16) -> eyre::Result<()> {
+    // Services and URLs use the effective port, including a fallback after an override.
+    let output = run(directory, &["env", "--service", "svc", "--format", "json"])?;
+    assert!(output.status.success(), "{output:?}");
+    let environment: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(
+        environment
+            .get("MICROMUX_PROXY_PORT")
+            .and_then(serde_json::Value::as_str),
+        Some(proxy_port.to_string().as_str())
+    );
+    let suffix = environment
+        .get("MICROMUX_HOST_SUFFIX")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| eyre::eyre!("missing host suffix"))?;
+    assert!(suffix.ends_with(&format!(":{proxy_port}")), "{suffix}");
+
     Ok(())
 }
 

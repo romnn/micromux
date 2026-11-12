@@ -303,6 +303,7 @@ async fn start_supervisor(
     printer: &DiagnosticsPrinter,
     shutdown: &micromux::CancellationToken,
     claim_policy: ClaimPolicy,
+    proxy_port: Option<std::num::NonZeroU16>,
 ) -> Result<Supervisor, Error> {
     // Every service and healthcheck runs under the containment shim, so their process trees die
     // with this supervisor even when it is SIGKILLed.
@@ -333,7 +334,11 @@ async fn start_supervisor(
     // The MCP `start_session` tool reads this line from a headless session's stderr to give the
     // session the time the wait needs.
     micromux::wait_for_previous_cleanups(config, shutdown, |wait| eprintln!("{wait}")).await?;
-    let mut session = micromux::Session::establish(config, &micromux::PortRegistry::user())?;
+    let mut session = micromux::Session::establish_with_proxy_port(
+        config,
+        &micromux::PortRegistry::user(),
+        proxy_port,
+    )?;
     proxy::latch_port(&mut session).await?;
     let mux = build_supervisor(config, printer, session)?;
     let routes = match config.config_path.as_deref() {
@@ -565,8 +570,14 @@ async fn run() -> Result<(), Error> {
     )
     .await?;
 
-    let Supervisor { mux, routes, claim } =
-        start_supervisor(&config, &printer, &shutdown, ClaimPolicy::BestEffort).await?;
+    let Supervisor { mux, routes, claim } = start_supervisor(
+        &config,
+        &printer,
+        &shutdown,
+        ClaimPolicy::BestEffort,
+        options.proxy_port,
+    )
+    .await?;
     let (runner, handles) = mux.clone().start(shutdown.clone());
     if let Some(routes) = &routes {
         routes.report_to(handles.session.clone(), shutdown.clone());
@@ -632,8 +643,14 @@ async fn run_headless(options: options::Options) -> Result<(), Error> {
     let color_choice = options.color_choice.unwrap_or(termcolor::ColorChoice::Auto);
     let LoadedConfig { config, printer } = load_config(&options, color_choice).await?;
 
-    let Supervisor { mux, routes, claim } =
-        start_supervisor(&config, &printer, &shutdown, ClaimPolicy::Required).await?;
+    let Supervisor { mux, routes, claim } = start_supervisor(
+        &config,
+        &printer,
+        &shutdown,
+        ClaimPolicy::Required,
+        options.proxy_port,
+    )
+    .await?;
     let (runner, handles) = mux.clone().start(shutdown.clone());
     if let Some(routes) = &routes {
         routes.report_to(handles.session.clone(), shutdown.clone());

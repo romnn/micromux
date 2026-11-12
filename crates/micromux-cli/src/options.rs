@@ -107,6 +107,10 @@ pub struct Options {
     )]
     pub no_control: bool,
 
+    /// Preferred session proxy port; leaves the configured fallback port in effect.
+    #[arg(long, env = "MICROMUX_PROXY_PORT", global = true)]
+    pub proxy_port: Option<std::num::NonZeroU16>,
+
     #[command(subcommand)]
     pub command: Option<Command>,
 }
@@ -225,6 +229,27 @@ mod tests {
     use super::{Command, EnvFormat, Options};
     use clap::{CommandFactory as _, Parser};
     use similar_asserts::assert_eq;
+
+    #[test]
+    fn proxy_port_accepts_tui_and_serve_flags_and_rejects_invalid_ports() -> Result<(), clap::Error>
+    {
+        for arguments in [
+            vec!["micromux", "--proxy-port", "8181"],
+            vec!["micromux", "serve", "--proxy-port", "8181"],
+            vec!["micromux", "--proxy-port", "8181", "serve"],
+        ] {
+            assert_eq!(
+                Options::try_parse_from(arguments)?
+                    .proxy_port
+                    .map(std::num::NonZeroU16::get),
+                Some(8181)
+            );
+        }
+        for port in ["0", "65536", "-1", "http"] {
+            assert!(Options::try_parse_from(["micromux", "--proxy-port", port]).is_err());
+        }
+        Ok(())
+    }
 
     /// `--version` names the control protocol next to the release, so a mismatch between a
     /// session and a client can be read off both binaries.

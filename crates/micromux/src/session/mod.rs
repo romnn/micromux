@@ -268,6 +268,7 @@ pub struct Session {
     ports: IndexMap<String, u16>,
     provisional: Vec<String>,
     proxy_port: u16,
+    preferred_proxy_port: u16,
     lease: Option<Lease>,
 }
 
@@ -293,9 +294,26 @@ impl Session {
         config: &ConfigFile<F>,
         registry: &PortRegistry,
     ) -> Result<Self, SessionError> {
+        Self::establish_with_proxy_port(config, registry, None)
+    }
+
+    /// Establishes a session with an optional preferred proxy port override.
+    ///
+    /// The override replaces `proxy.port` for port allocation and proxy startup.
+    /// The configured fallback still applies, and reloads compare the original config settings.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::establish`], with the override excluded from allocation.
+    pub fn establish_with_proxy_port<F>(
+        config: &ConfigFile<F>,
+        registry: &PortRegistry,
+        proxy_port: Option<std::num::NonZeroU16>,
+    ) -> Result<Self, SessionError> {
         let settings = config.config.session.clone();
         let identity = SessionIdentity::resolve(&settings, &config.config_dir);
-        let proxy_port = settings.proxy.port();
+        let proxy_port =
+            proxy_port.map_or_else(|| settings.proxy.port(), std::num::NonZeroU16::get);
         let Some(config_path) = config.config_path.as_deref() else {
             if settings.needs_config_path() {
                 return Err(SessionError::NoConfigPath);
@@ -306,6 +324,7 @@ impl Session {
                 ports: IndexMap::new(),
                 provisional: Vec::new(),
                 proxy_port,
+                preferred_proxy_port: proxy_port,
                 lease: None,
             });
         };
@@ -326,6 +345,7 @@ impl Session {
             ports,
             provisional: Vec::new(),
             proxy_port,
+            preferred_proxy_port: proxy_port,
             lease: Some(lease),
         })
     }
@@ -397,6 +417,7 @@ impl Session {
         Self {
             identity,
             proxy_port: settings.proxy.port(),
+            preferred_proxy_port: settings.proxy.port(),
             settings,
             ports,
             provisional,
@@ -422,11 +443,11 @@ impl Session {
         !self.settings.routes.is_empty()
     }
 
-    /// The configured proxy port preference: the preferred port and the optional fallback.
+    /// The effective proxy port preference, including an override, and the configured fallback.
     #[must_use]
     pub fn proxy_preference(&self) -> (u16, Option<u16>) {
         (
-            self.settings.proxy.port(),
+            self.preferred_proxy_port,
             self.settings.proxy.fallback_port(),
         )
     }
@@ -624,6 +645,7 @@ fn path_bytes(path: &Path) -> std::borrow::Cow<'_, [u8]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use color_eyre::eyre;
     use similar_asserts::assert_eq;
 
     #[test]
@@ -670,6 +692,33 @@ mod tests {
         )?;
         config.config_path = Some(PathBuf::from("/projects/one/micromux.yaml"));
         Ok(config)
+    }
+
+    #[test]
+    fn proxy_override_is_excluded_from_allocations_and_keeps_source_settings() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let registry = PortRegistry::at(directory.path());
+        let config = session_config(
+            "session: { port_range: { start: 40000, end: 40999 } }\nallocate_ports: [WEB]",
+        )?;
+        let mut session = Session::establish_with_proxy_port(
+            &config,
+            &registry,
+            std::num::NonZeroU16::new(40000),
+        )?;
+
+        assert!(session.ports().values().all(|port| *port != 40000));
+        assert_eq!(session.proxy_preference(), (40000, None));
+        assert!(session.settings.same_settings(&config.config.session));
+
+        // Latching an actual listener port does not change the startup preference.
+        session.set_proxy_port(8181);
+        assert_eq!(session.proxy_preference(), (40000, None));
+        assert_eq!(
+            session.environment().variables.get(PROXY_PORT_VARIABLE),
+            Some(&"8181".to_string())
+        );
+        Ok(())
     }
 
     /// A port range change reassigns ports at the next start, and validation shows the ports it
