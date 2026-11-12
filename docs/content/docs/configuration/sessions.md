@@ -141,6 +141,8 @@ proxy:
 
 On Linux, port 80 needs privileges unless you allow unprivileged low ports once with `sudo sysctl -w net.ipv4.ip_unprivileged_port_start=80` (persist it in `/etc/sysctl.d/`) or grant the binary `cap_net_bind_service` with `setcap`. Without either, set `fallback_port`, or the session fails to start and says so. macOS lets unprivileged processes bind port 80 only on the wildcard address, so there the proxy listens on all interfaces and drops every connection that does not come from the local machine.
 
+For a local override, use `micromux --proxy-port 8181` or `micromux serve --proxy-port 8181`, or set `MICROMUX_PROXY_PORT=8181`. The flag takes precedence over the environment variable, which takes precedence over `proxy.port`. Ports must be between 1 and 65535. The configured `proxy.fallback_port` still applies when the preferred port cannot be bound. Services receive the actual listening port in `MICROMUX_PROXY_PORT` and `MICROMUX_HOST_SUFFIX`, so URLs built from those variables follow the override automatically. The override lasts for the session and does not edit the YAML file.
+
 One proxy serves every session, whatever port each one asks for. A session whose `port` or `fallback_port` the running proxy does not listen on yet has it listen there too, so projects with different ports share it, and each session's routes answer only on its own port. The proxy stops listening on a port a minute after the last session using it is gone, except the port it started on, which it keeps until it exits.
 
 For example, a blog and a shop that each pick their own port:
