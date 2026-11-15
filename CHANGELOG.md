@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.4.4
+
 - **Session listings show the current Git branch and an optional GitHub PR number.** The proxy
   overview and MCP session details discover this context on demand and cache GitHub lookups;
   disable fetching with `git.metadata: false` in the user or project config.
