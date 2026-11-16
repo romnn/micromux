@@ -256,6 +256,42 @@ services:
     Ok(())
 }
 
+/// Only `GetSessionEnvironment` adds the session-wide `env_file`, whose values may be secrets,
+/// to the session's variables; `GetEnvironment` without a service keeps returning them alone,
+/// because older clients show those values unasked.
+#[tokio::test]
+async fn only_the_session_environment_carries_the_session_env_file() -> eyre::Result<()> {
+    let dir = unique_dir("session-environment")?;
+    std::fs::write(dir.path().join("session.env"), "SESSION_SECRET=s3cr3t\n")?;
+    let session = build_session_yaml(
+        dir.path(),
+        "version: 1\nenv_file: session.env\nservices:\n  svc:\n    command: [\"sh\", \"-c\", \
+         \"sleep 60\"]\n",
+    )?;
+    let mut client = Client::connect(&session.endpoint).await?;
+
+    let Response::Environment(variables) = client
+        .request(Request::GetEnvironment { service: None })
+        .await?
+    else {
+        eyre::bail!("expected the session's variables");
+    };
+    assert!(!variables.variables.contains_key("SESSION_SECRET"));
+
+    let Response::Environment(own) = client.request(Request::GetSessionEnvironment).await? else {
+        eyre::bail!("expected the session's own environment");
+    };
+    let mut without_the_file = own.variables.clone();
+    assert_eq!(
+        without_the_file.remove("SESSION_SECRET").as_deref(),
+        Some("s3cr3t")
+    );
+    assert_eq!(without_the_file, variables.variables);
+
+    session.shutdown.cancel();
+    Ok(())
+}
+
 #[tokio::test]
 async fn health_history_is_oldest_first_and_unknown_services_are_typed() -> eyre::Result<()> {
     let dir = unique_dir("health-history")?;

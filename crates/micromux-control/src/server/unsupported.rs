@@ -34,6 +34,12 @@ pub(super) fn endpoint_owner_lock_held(_endpoint: &ControlEndpoint) -> Result<bo
     Err(ControlError::Unsupported)
 }
 
+pub(super) fn hold_unclaimed_project(
+    _config_path: &crate::CanonicalConfigPath,
+) -> Result<Option<super::UnclaimedProject>, ControlError> {
+    Err(ControlError::Unsupported)
+}
+
 #[expect(
     clippy::unused_async,
     reason = "the platform serve function is async on Unix and awaited by the shared server API"

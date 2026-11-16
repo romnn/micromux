@@ -16,9 +16,10 @@ use std::sync::Arc;
 
 /// Errors from materializing a runnable service definition.
 ///
-/// Every variant names its service and carries the span of the configured value, so the CLI
-/// and `validate_config` can point at the source while the config-reload path, which reports
-/// through a single rendered line, still gets a self-contained message.
+/// Every variant names its service, or the session-wide `env_file` that every service loads,
+/// and carries the span of the configured value, so the CLI and `validate_config` can point at
+/// the source while the config-reload path, which reports through a single rendered line, still
+/// gets a self-contained message.
 /// Messages include their cause for that same reason.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -62,6 +63,29 @@ pub enum Error {
         /// Underlying integer parse error.
         #[source]
         source: std::num::ParseIntError,
+    },
+    /// A path or value of the session-wide `env_file` references a variable that cannot be
+    /// substituted.
+    #[error("cannot resolve {site}: {source}")]
+    SessionInterpolation {
+        /// Which value failed.
+        site: SessionSite,
+        /// Span of the entry's path in the config file.
+        span: Span,
+        /// The failing reference.
+        #[source]
+        source: env::InterpolationError,
+    },
+    /// A file of the session-wide `env_file` could not be read or parsed.
+    #[error("cannot load top-level env_file[{index}]: {source}")]
+    SessionEnvFile {
+        /// Position of the entry in the top-level `env_file` list.
+        index: usize,
+        /// Span of the entry's path in the config file.
+        span: Span,
+        /// Underlying read or parse error, which names the resolved path.
+        #[source]
+        source: env::Error,
     },
     /// The configured working directory could not be opened or is not a directory.
     #[error("cannot use working_dir of service `{service}`: {source}")]
@@ -123,6 +147,7 @@ pub enum Site {
         /// Dotenv key whose value failed.
         key: String,
     },
+
     /// The `environment` entry for `key`.
     Environment {
         /// Environment key.
@@ -164,11 +189,46 @@ impl std::fmt::Display for Site {
             Self::EnvFileValue { index, path, key } => {
                 write!(f, "key `{key}` in env_file[{index}] ({})", path.display())
             }
+
             Self::Environment { key } => write!(f, "environment.{key}"),
             Self::Port { index } => write!(f, "ports[{index}]"),
             Self::Command { index, .. } => write!(f, "command[{index}]"),
             Self::HealthcheckTest { index, .. } => write!(f, "healthcheck.test[{index}]"),
             Self::CleanupCommand { index, .. } => write!(f, "cleanup.command[{index}]"),
+        }
+    }
+}
+
+/// The value of the session-wide `env_file` an interpolation error refers to.
+///
+/// Displays like a [`Site`], under the top-level list's name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionSite {
+    /// The path of the top-level `env_file` entry at `index`.
+    EnvFilePath {
+        /// Position in the top-level `env_file` list.
+        index: usize,
+    },
+    /// The value of `key` inside the loaded top-level `env_file` entry at `index`.
+    EnvFileValue {
+        /// Position in the top-level `env_file` list.
+        index: usize,
+        /// Resolved path of the file.
+        path: Box<Path>,
+        /// Dotenv key whose value failed.
+        key: String,
+    },
+}
+
+impl std::fmt::Display for SessionSite {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EnvFilePath { index } => write!(f, "top-level env_file[{index}].path"),
+            Self::EnvFileValue { index, path, key } => write!(
+                f,
+                "key `{key}` in top-level env_file[{index}] ({})",
+                path.display()
+            ),
         }
     }
 }
@@ -179,9 +239,9 @@ impl std::fmt::Display for Site {
 /// never took part.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SkippedEnvFile {
-    /// Service the entry belongs to.
-    pub service: ServiceID,
-    /// Position of the entry in the `env_file` list.
+    /// Service the entry belongs to, or `None` for the session-wide `env_file`.
+    pub service: Option<ServiceID>,
+    /// Position of the entry in its `env_file` list.
     pub index: usize,
     /// Span of the entry's path in the config file.
     pub span: Span,
@@ -221,10 +281,13 @@ impl std::fmt::Display for SkippedEnvFile {
             reason,
             ..
         } = self;
-        write!(
-            f,
-            "optional env_file[{index}] of service `{service}` skipped: {reason}"
-        )
+        match service {
+            Some(service) => write!(
+                f,
+                "optional env_file[{index}] of service `{service}` skipped: {reason}"
+            ),
+            None => write!(f, "optional top-level env_file[{index}] skipped: {reason}"),
+        }
     }
 }
 
@@ -253,11 +316,44 @@ fn is_shell_program(program: &str) -> bool {
         .any(|shell| shell.eq_ignore_ascii_case(name))
 }
 
+/// The reference forms, for an author whose reference is malformed.
+const REFERENCE_SYNTAX: &str = "supported references are `$VAR`, `${VAR}`, `${VAR:-default}`, \
+                                and `${VAR-default}`; write `$$VAR` or `$${VAR}` to keep one \
+                                literal";
+
+/// What the author can do about an `env_file` path that references the unset `variable`.
+fn env_file_path_help(variable: &str) -> String {
+    format!(
+        "set `{variable}` in the environment micromux runs in, write `${{{variable}:-<path>}}` \
+         to fall back to a default, or add `optional: true` to skip this file on machines where \
+         `{variable}` is unset"
+    )
+}
+
+/// What the author can do about an `env_file` value that references the unset `variable`.
+fn env_file_value_help(variable: &str) -> String {
+    format!(
+        "define `{variable}` on an earlier line, in an earlier env_file, or in the environment \
+         micromux runs in; write `${{{variable}:-<default>}}`, or single-quote the value to keep \
+         it literal"
+    )
+}
+
 impl Error {
+    /// What the author can do about an interpolation failure in the session-wide `env_file`.
+    fn session_interpolation_help(site: &SessionSite, source: &env::InterpolationError) -> String {
+        let env::InterpolationError::Unset { variable } = source else {
+            return REFERENCE_SYNTAX.to_string();
+        };
+        match site {
+            SessionSite::EnvFilePath { .. } => env_file_path_help(variable),
+            SessionSite::EnvFileValue { .. } => env_file_value_help(variable),
+        }
+    }
+
     /// What the author can do about an interpolation failure at `site`.
     fn interpolation_help(site: &Site, source: &env::InterpolationError) -> String {
-        let syntax = "supported references are `$VAR`, `${VAR}`, `${VAR:-default}`, and \
-                      `${VAR-default}`; write `$$VAR` or `$${VAR}` to keep one literal";
+        let syntax = REFERENCE_SYNTAX;
         let env::InterpolationError::Unset { variable } = source else {
             return match site {
                 Site::Command { .. }
@@ -275,16 +371,8 @@ impl Error {
                  `${{{variable}:-<path>}}` to fall back to a default; paths only see that \
                  environment because they are resolved before any env_file is loaded"
             ),
-            Site::EnvFilePath { .. } => format!(
-                "set `{variable}` in the environment micromux runs in, write \
-                 `${{{variable}:-<path>}}` to fall back to a default, or add `optional: true` to \
-                 skip this file on machines where `{variable}` is unset"
-            ),
-            Site::EnvFileValue { .. } => format!(
-                "define `{variable}` on an earlier line, in an earlier env_file, or in the \
-                 environment micromux runs in; write `${{{variable}:-<default>}}`, or \
-                 single-quote the value to keep it literal"
-            ),
+            Site::EnvFilePath { .. } => env_file_path_help(variable),
+            Site::EnvFileValue { .. } => env_file_value_help(variable),
             Site::Environment { .. } => format!(
                 "set `{variable}` in the environment micromux runs in, in an `env_file`, or \
                  above this entry under `environment:` (entries resolve top to bottom), or \
@@ -334,7 +422,15 @@ impl ToDiagnostics for Error {
                 site.to_string(),
                 vec![Self::interpolation_help(site, source)],
             ),
+            Self::SessionInterpolation { site, span, source } => (
+                span,
+                site.to_string(),
+                vec![Self::session_interpolation_help(site, source)],
+            ),
             Self::EnvFile { index, span, .. } => (span, format!("env_file[{index}].path"), vec![]),
+            Self::SessionEnvFile { index, span, .. } => {
+                (span, format!("top-level env_file[{index}].path"), vec![])
+            }
             Self::InvalidPort {
                 index, span, port, ..
             } => (
@@ -484,6 +580,7 @@ mod tests {
             config,
             supervisor_environment,
             &SessionEnvironment::default(),
+            &env::EnvMap::new(),
             &mut Vec::new(),
         )
     }
@@ -640,6 +737,7 @@ mod tests {
             cfg,
             &base_environment(&[("API_PORT", "1")]),
             &pinned,
+            &env::EnvMap::new(),
             &mut Vec::new(),
         )?;
 
@@ -658,6 +756,139 @@ mod tests {
         );
         assert_eq!(svc.spec.command, vec!["echo", "20001", "luup2"]);
         assert_eq!(svc.spec.ports, vec![20001]);
+        Ok(())
+    }
+
+    /// The session-wide files lie beneath the service's own files and inline entries, which see
+    /// their values, and the session's pinned variables win in every layer, also inside the
+    /// session-wide files' own references.
+    #[test]
+    fn session_env_files_lie_beneath_the_service_and_pins_win() -> eyre::Result<()> {
+        let dir = unique_tmp_dir("session-env-files");
+        fs::create_dir_all(&dir)?;
+        fs::write(
+            dir.join("session.env"),
+            "SHARED=session\nFROM_SESSION=session\nAPI_PORT=9540\n\
+             DATABASE_URL=postgres://127.0.0.1:${API_PORT}/app\nINLINE=session\n",
+        )?;
+        fs::write(
+            dir.join("svc.env"),
+            "SHARED=service\nFROM_SERVICE=${FROM_SESSION}+service\n",
+        )?;
+        let pinned = SessionEnvironment::from_pairs(&[("API_PORT", "20001")]);
+        let supervisor = base_environment(&[("API_PORT", "1")]);
+        let mut skipped = Vec::new();
+        let session_files = load_session_env_files(
+            &dir,
+            &[config::EnvFile {
+                path: spanned_string("session.env"),
+                optional: false,
+            }],
+            &supervisor,
+            &pinned,
+            &mut skipped,
+        )?;
+
+        let mut cfg = service_config("svc", ("echo", &["${SHARED}", "${DATABASE_URL}"]));
+        cfg.env_file = vec![config::EnvFile {
+            path: spanned_string("svc.env"),
+            optional: false,
+        }];
+        cfg.environment
+            .insert(spanned_string("INLINE"), spanned_string("inline"));
+        let svc = Service::from_config(
+            "svc",
+            &dir,
+            cfg,
+            &supervisor,
+            &pinned,
+            &session_files,
+            &mut skipped,
+        )?;
+
+        let environment = svc
+            .spec
+            .environment
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(
+            environment,
+            std::collections::BTreeMap::from([
+                ("API_PORT", "20001"),
+                ("DATABASE_URL", "postgres://127.0.0.1:20001/app"),
+                ("FROM_SERVICE", "session+service"),
+                ("FROM_SESSION", "session"),
+                ("INLINE", "inline"),
+                ("SHARED", "service"),
+            ])
+        );
+        assert_eq!(
+            svc.spec.command,
+            vec!["echo", "service", "postgres://127.0.0.1:20001/app"]
+        );
+        assert_eq!(skipped, Vec::new());
+        Ok(())
+    }
+
+    /// A session-wide file's failures and skips name the top-level entry, not a service.
+    #[test]
+    fn session_env_file_failures_name_the_top_level_entry() -> eyre::Result<()> {
+        let dir = unique_tmp_dir("session-env-file-failures");
+        fs::create_dir_all(&dir)?;
+        let entry = |path: &str, optional: bool| config::EnvFile {
+            path: spanned_string(path),
+            optional,
+        };
+        let load = |entries: &[config::EnvFile], skipped: &mut Vec<SkippedEnvFile>| {
+            load_session_env_files(
+                &dir,
+                entries,
+                &base_environment(&[]),
+                &SessionEnvironment::default(),
+                skipped,
+            )
+        };
+
+        let mut skipped = Vec::new();
+        let error = load(
+            &[
+                entry("${MICROMUX_TEST_UNSET_DIR}/.env", true),
+                entry("missing.env", false),
+            ],
+            &mut skipped,
+        )
+        .err()
+        .ok_or_else(|| eyre::eyre!("a missing required file must fail"))?;
+        assert!(
+            matches!(error, Error::SessionEnvFile { index: 1, .. }),
+            "{error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .starts_with("cannot load top-level env_file[1]: "),
+            "{error}"
+        );
+        assert_eq!(
+            skipped.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            [
+                "optional top-level env_file[0] skipped: variable `MICROMUX_TEST_UNSET_DIR` is \
+                 not set"
+            ]
+        );
+
+        let error = load(
+            &[entry("${MICROMUX_TEST_UNSET_DIR}/.env", false)],
+            &mut Vec::new(),
+        )
+        .err()
+        .ok_or_else(|| eyre::eyre!("an unset path variable must fail"))?;
+        assert_eq!(
+            error.to_string(),
+            "cannot resolve top-level env_file[0].path: variable `MICROMUX_TEST_UNSET_DIR` is \
+             not set"
+        );
         Ok(())
     }
 
@@ -1131,6 +1362,7 @@ mod tests {
             cfg,
             &base_environment(&[]),
             &SessionEnvironment::default(),
+            &env::EnvMap::new(),
             &mut skipped,
         );
 
@@ -1356,6 +1588,7 @@ impl Service {
             config,
             &std::env::vars().collect(),
             &SessionEnvironment::default(),
+            &env::EnvMap::new(),
             &mut Vec::new(),
         )
     }
@@ -1367,8 +1600,10 @@ impl Service {
     ///
     /// - `working_dir` and every `env_file` path see only `supervisor_environment`, because the
     ///   files have to be located before anything can be loaded from them.
-    /// - Each env file sees `supervisor_environment`, the files before it, and its own earlier
-    ///   lines.
+    /// - `session_files`, the session-wide `env_file` that [`load_session_env_files`] loaded,
+    ///   lie beneath everything the service defines itself.
+    /// - Each of the service's env files sees `supervisor_environment`, `session_files`, the
+    ///   files before it, and its own earlier lines.
     /// - `environment` entries additionally see every loaded env file and their earlier siblings.
     /// - `ports`, `command`, and `healthcheck.test` see the complete environment the service
     ///   process receives.
@@ -1394,6 +1629,7 @@ impl Service {
         config: config::Service,
         supervisor_environment: &HashMap<String, String>,
         pinned: &SessionEnvironment,
+        session_files: &env::EnvMap,
         skipped_env_files: &mut Vec<SkippedEnvFile>,
     ) -> Result<Self, Error> {
         let id: ServiceID = id.into();
@@ -1414,26 +1650,15 @@ impl Service {
             None => resolver.config_directory(&config.name)?,
         };
 
-        // Env files, then inline entries, each layered over everything resolved before it
-        let mut environment: indexmap::IndexMap<String, String> = resolver
-            .load_env_files(&config.env_file, supervisor_environment, skipped_env_files)?
-            .into_iter()
-            .collect();
-        let mut service_environment = supervisor_environment.clone();
-        service_environment.extend(environment.clone());
-        for (key, value) in &config.environment {
-            if pinned.pins(key.as_ref()) {
-                continue;
-            }
-            let site = Site::Environment {
-                key: key.as_ref().clone(),
-            };
-            let expanded = resolver.interpolate(site, value, &service_environment)?;
-            environment.insert(key.as_ref().clone(), expanded.clone());
-            service_environment.insert(key.as_ref().clone(), expanded);
-        }
-
-        pinned.apply_to(&mut environment);
+        let ServiceEnvironment {
+            process: environment,
+            references: service_environment,
+        } = resolver.environment(
+            &config,
+            supervisor_environment,
+            session_files,
+            skipped_env_files,
+        )?;
 
         // Everything else: the environment the process receives
         let ports = config
@@ -1657,6 +1882,14 @@ impl WorkingDirectory {
     }
 }
 
+/// A service's resolved environment.
+struct ServiceEnvironment {
+    /// What the service's process receives, with the session's variables applied.
+    process: indexmap::IndexMap<String, String>,
+    /// What its other values resolve against: the supervisor environment beneath `process`.
+    references: HashMap<String, String>,
+}
+
 /// Labels every failure of one service's configured values with its site and span.
 struct Resolver<'a> {
     service: &'a ServiceID,
@@ -1768,79 +2001,245 @@ impl Resolver<'_> {
             .collect()
     }
 
-    /// Load the configured env files in order, each expanded over `supervisor_environment` and
-    /// the files before it.
+    /// The service's environment: the session-wide env files, then its own, then its inline
+    /// entries, each layered over everything resolved before it, with the session's variables
+    /// over all of them.
     ///
-    /// An `optional` entry whose path references an unset variable, or that does not point at
-    /// a file, is recorded in `skipped` instead of loaded.
-    /// A present optional file participates fully, including parse errors.
+    /// `supervisor_environment` already holds the session's variables, and is all that the
+    /// service's env file paths see.
+    fn environment(
+        &self,
+        config: &config::Service,
+        supervisor_environment: &HashMap<String, String>,
+        session_files: &env::EnvMap,
+        skipped: &mut Vec<SkippedEnvFile>,
+    ) -> Result<ServiceEnvironment, Error> {
+        let mut process: indexmap::IndexMap<String, String> = session_files
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        let mut beneath = supervisor_environment.clone();
+        beneath.extend(process.clone());
+        process.extend(self.load_env_files(
+            &config.env_file,
+            supervisor_environment,
+            &beneath,
+            skipped,
+        )?);
+        let mut references = supervisor_environment.clone();
+        references.extend(process.clone());
+        for (key, value) in &config.environment {
+            if self.pinned.pins(key.as_ref()) {
+                continue;
+            }
+            let site = Site::Environment {
+                key: key.as_ref().clone(),
+            };
+            let expanded = self.interpolate(site, value, &references)?;
+            process.insert(key.as_ref().clone(), expanded.clone());
+            references.insert(key.as_ref().clone(), expanded);
+        }
+        self.pinned.apply_to(&mut process);
+        Ok(ServiceEnvironment {
+            process,
+            references,
+        })
+    }
+
+    /// Load the service's own env files in order, each expanded over `base` and the files
+    /// before it, with their paths resolved against `paths`.
+    ///
+    /// An `optional` entry that is skipped is recorded in `skipped`.
     fn load_env_files(
         &self,
         entries: &[config::EnvFile],
-        supervisor_environment: &HashMap<String, String>,
+        paths: &HashMap<String, String>,
+        base: &HashMap<String, String>,
         skipped: &mut Vec<SkippedEnvFile>,
     ) -> Result<env::EnvMap, Error> {
-        let mut loaded = env::EnvMap::new();
-        let mut current = supervisor_environment.clone();
-        for (index, entry) in entries.iter().enumerate() {
-            let mut skip = |reason: SkipReason| {
-                tracing::info!(
-                    service_id = %self.service,
-                    index,
-                    %reason,
-                    "skipping optional env file"
-                );
-                skipped.push(SkippedEnvFile {
+        let skip = |index: usize, entry: &config::EnvFile, reason: SkipReason| {
+            tracing::info!(
+                service_id = %self.service,
+                index,
+                %reason,
+                "skipping optional env file"
+            );
+            skipped.push(SkippedEnvFile {
+                service: Some(self.service.clone()),
+                index,
+                span: entry.path.span.into(),
+                reason,
+            });
+        };
+        load_env_files(self.config_dir, entries, paths, base, self.pinned, skip).map_err(
+            |EnvFileFailure {
+                 index,
+                 entry,
+                 cause,
+             }| match cause {
+                EnvFileCause::Path(source) => {
+                    self.interpolation_error(Site::EnvFilePath { index }, &entry.path, source)
+                }
+                EnvFileCause::Load(source) => Error::EnvFile {
                     service: self.service.clone(),
                     index,
                     span: entry.path.span.into(),
-                    reason,
-                });
-            };
-            let path = match env::resolve_path(
-                self.config_dir,
-                entry.path.as_ref(),
-                supervisor_environment,
-            ) {
-                Ok(path) => path,
-                Err(env::InterpolationError::Unset { variable }) if entry.optional => {
-                    skip(SkipReason::UnsetVariable { variable });
-                    continue;
-                }
-                Err(source) => {
-                    return Err(self.interpolation_error(
-                        Site::EnvFilePath { index },
-                        &entry.path,
-                        source,
-                    ));
-                }
-            };
-            if entry.optional && !path.is_file() {
-                skip(SkipReason::NotAFile { path });
-                continue;
-            }
-            let parsed =
-                env::load_env_files_sync(std::slice::from_ref(&path)).map_err(|source| {
-                    Error::EnvFile {
-                        service: self.service.clone(),
-                        index,
-                        span: entry.path.span.into(),
-                        source,
-                    }
-                })?;
-            let expanded = env::expand_env_values(&parsed, &current, &|key| self.pinned.pins(key))
-                .map_err(|err| {
-                    let env::ValueError { key, source } = err;
+                    source,
+                },
+                EnvFileCause::Value { path, key, source } => {
                     let site = Site::EnvFileValue {
                         index,
-                        path: path.clone().into_boxed_path(),
+                        path: path.into_boxed_path(),
                         key,
                     };
                     self.interpolation_error(site, &entry.path, source)
-                })?;
-            current.extend(expanded.clone());
-            loaded.extend(expanded);
-        }
-        Ok(loaded)
+                }
+            },
+        )
     }
+}
+
+/// The session-wide `env_file`, loaded the way every service loads its own and layered beneath
+/// each service's.
+///
+/// Paths and values see `supervisor_environment` with the session's `pinned` variables on top,
+/// and each file also sees the files before it and its own earlier lines.
+/// A line `pinned` names is dropped, so the pinned value is what later lines see.
+/// Every `optional` entry that was not loaded is appended to `skipped`.
+///
+/// # Errors
+///
+/// Returns [`Error::SessionInterpolation`] when a path or value references a variable that
+/// cannot be substituted, and [`Error::SessionEnvFile`] when a file cannot be loaded.
+pub(crate) fn load_session_env_files(
+    config_dir: &Path,
+    entries: &[config::EnvFile],
+    supervisor_environment: &HashMap<String, String>,
+    pinned: &SessionEnvironment,
+    skipped: &mut Vec<SkippedEnvFile>,
+) -> Result<env::EnvMap, Error> {
+    let environment = pinned.layered_over(supervisor_environment);
+    let skip = |index: usize, entry: &config::EnvFile, reason: SkipReason| {
+        tracing::info!(index, %reason, "skipping optional top-level env file");
+        skipped.push(SkippedEnvFile {
+            service: None,
+            index,
+            span: entry.path.span.into(),
+            reason,
+        });
+    };
+    load_env_files(
+        config_dir,
+        entries,
+        &environment,
+        &environment,
+        pinned,
+        skip,
+    )
+    .map_err(
+        |EnvFileFailure {
+             index,
+             entry,
+             cause,
+         }| {
+            let span = entry.path.span.into();
+            match cause {
+                EnvFileCause::Path(source) => Error::SessionInterpolation {
+                    site: SessionSite::EnvFilePath { index },
+                    span,
+                    source,
+                },
+                EnvFileCause::Load(source) => Error::SessionEnvFile {
+                    index,
+                    span,
+                    source,
+                },
+                EnvFileCause::Value { path, key, source } => Error::SessionInterpolation {
+                    site: SessionSite::EnvFileValue {
+                        index,
+                        path: path.into_boxed_path(),
+                        key,
+                    },
+                    span,
+                    source,
+                },
+            }
+        },
+    )
+}
+
+/// Why the `env_file` entry at `index` could not be loaded, before the caller says whose list
+/// it belongs to.
+struct EnvFileFailure<'a> {
+    index: usize,
+    entry: &'a config::EnvFile,
+    cause: EnvFileCause,
+}
+
+/// What went wrong with one `env_file` entry.
+enum EnvFileCause {
+    /// The path references a variable that cannot be substituted.
+    Path(env::InterpolationError),
+    /// The file could not be read or parsed.
+    Load(env::Error),
+    /// The value of `key` in the file at `path` references a variable that cannot be substituted.
+    Value {
+        path: PathBuf,
+        key: String,
+        source: env::InterpolationError,
+    },
+}
+
+/// Load one `env_file` list in order, the way every list loads: the session-wide one and each
+/// service's own.
+///
+/// Each path resolves against `paths`.
+/// Each file's values expand over `base`, the files before it, and its own earlier lines.
+/// A line `pinned` names is dropped, so the pinned value `base` holds is what later lines see.
+/// An `optional` entry whose path references an unset variable, or that does not point at a
+/// file, goes to `skip` instead of being loaded; a present optional file participates fully,
+/// including parse errors.
+fn load_env_files<'a>(
+    config_dir: &Path,
+    entries: &'a [config::EnvFile],
+    paths: &HashMap<String, String>,
+    base: &HashMap<String, String>,
+    pinned: &SessionEnvironment,
+    mut skip: impl FnMut(usize, &config::EnvFile, SkipReason),
+) -> Result<env::EnvMap, EnvFileFailure<'a>> {
+    let mut loaded = env::EnvMap::new();
+    let mut current = base.clone();
+    for (index, entry) in entries.iter().enumerate() {
+        let failure = |cause| EnvFileFailure {
+            index,
+            entry,
+            cause,
+        };
+        let path = match env::resolve_path(config_dir, entry.path.as_ref(), paths) {
+            Ok(path) => path,
+            Err(env::InterpolationError::Unset { variable }) if entry.optional => {
+                skip(index, entry, SkipReason::UnsetVariable { variable });
+                continue;
+            }
+            Err(source) => return Err(failure(EnvFileCause::Path(source))),
+        };
+        if entry.optional && !path.is_file() {
+            skip(index, entry, SkipReason::NotAFile { path });
+            continue;
+        }
+        let parsed = env::load_env_files_sync(std::slice::from_ref(&path))
+            .map_err(|source| failure(EnvFileCause::Load(source)))?;
+        let expanded = env::expand_env_values(&parsed, &current, &|key| pinned.pins(key)).map_err(
+            |env::ValueError { key, source }| {
+                failure(EnvFileCause::Value {
+                    path: path.clone(),
+                    key,
+                    source,
+                })
+            },
+        )?;
+        current.extend(expanded.clone());
+        loaded.extend(expanded);
+    }
+    Ok(loaded)
 }

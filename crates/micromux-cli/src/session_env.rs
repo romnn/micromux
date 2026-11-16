@@ -1,9 +1,10 @@
-//! `micromux env` and `micromux exec`: a running session's environment, printed or run with.
+//! `micromux env` and `micromux exec`: a running session's environment, printed, written to a
+//! dotenv file, or run with.
 //!
-//! Both read the environment from the live session over the control plane, so they show exactly
-//! what its services got and can never disagree with each other.
-//! Values may hold secrets from env files: they go to stdout or the command, and never into a log
-//! or a diagnostic.
+//! All of them read the environment from the live session over the control plane, so they show
+//! exactly what the session resolves and can never disagree with each other.
+//! Values may hold secrets from env files: they go to stdout, the session's own file, or the
+//! command, and never into a log or a diagnostic.
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -12,8 +13,8 @@ use std::io::Write as _;
 use std::path::Path;
 
 use micromux_control::{
-    Client, ENVIRONMENT_PROTOCOL_VERSION, ErrorCode, PROTOCOL_VERSION, Request,
-    ResolvedEnvironment, Response, SessionInfo, SessionSelector,
+    Client, ENVIRONMENT_PROTOCOL_VERSION, ErrorCode, PROTOCOL_VERSION, ProtocolVersion, Request,
+    ResolvedEnvironment, Response, SESSION_ENV_FILE_PROTOCOL_VERSION, SessionInfo, SessionSelector,
 };
 
 use crate::options::EnvFormat;
@@ -25,15 +26,20 @@ const ENV_FAILED: i32 = 1;
 /// `timeout(1)` use.
 const EXEC_FAILED: i32 = 125;
 
-/// Which environment to read: the session's variables, or one service's.
+/// Which environment to read: the session's own, or one service's.
 pub(crate) struct Target<'a> {
     /// Session selector; `None` selects the session for the config resolved from the current
     /// directory.
     pub(crate) session: Option<&'a str>,
-    /// Service id; `None` selects the session's own variables.
+    /// Service id; `None` selects the session's own environment.
     pub(crate) service: Option<&'a str>,
     /// Explicit config file, used when no selector names the session.
     pub(crate) config: Option<&'a Path>,
+    /// Whether a project no session claims has no environment to read rather than failing.
+    ///
+    /// It is only set without a session selector, so the session it asks about is always the
+    /// project's.
+    pub(crate) if_running: bool,
 }
 
 /// What `micromux env` prints.
@@ -49,7 +55,9 @@ pub(crate) struct Output<'a> {
 /// Returns [`crate::Error::Exit`] with code 1 once the failure is reported on stderr.
 pub(crate) async fn print(target: &Target<'_>, output: &Output<'_>) -> Result<(), crate::Error> {
     let result = async {
-        let (session, environment) = fetch(target, "env").await?;
+        let Some((session, environment)) = fetch(target, "env").await? else {
+            return Ok(());
+        };
         let selected = select(&environment.variables, output.names)
             .map_err(|missing| missing_message(&missing, &session, target.service))?;
         let bare = output.format == EnvFormat::Env && output.names.len() == 1;
@@ -76,7 +84,36 @@ pub(crate) async fn print(target: &Target<'_>, output: &Output<'_>) -> Result<()
     result.map_err(|err| report(err, ENV_FAILED))
 }
 
-/// Replaces this process with `command`, run with the target's environment over the caller's.
+/// Has the session write the target's environment to its dotenv file, and prints the file's
+/// path.
+///
+/// # Errors
+///
+/// Returns [`crate::Error::Exit`] with code 1 once the failure is reported on stderr.
+pub(crate) async fn write_file(target: &Target<'_>) -> Result<(), crate::Error> {
+    let command = "env --file";
+    let result = async {
+        let Some((mut client, session)) = connect(target, command).await? else {
+            return Ok(());
+        };
+        require(&session, SESSION_ENV_FILE_PROTOCOL_VERSION, command)?;
+        let response = client
+            .request(Request::WriteEnvironmentFile {
+                service: target.service.map(str::to_string),
+            })
+            .await?;
+        let Response::EnvironmentFile { path, stale } = response else {
+            return Err(request_error(response, &session, target.service));
+        };
+        note_stale(stale, target.service);
+        write_stdout(&format!("{path}\n"))
+    }
+    .await;
+    result.map_err(|err| report(err, ENV_FAILED))
+}
+
+/// Replaces this process with `command`, run with the target's environment over the caller's,
+/// or with the caller's alone when `--if-running` finds no session.
 ///
 /// # Errors
 ///
@@ -84,10 +121,12 @@ pub(crate) async fn print(target: &Target<'_>, output: &Output<'_>) -> Result<()
 /// environment cannot be read, 126 when the command cannot run, and 127 when it is not found.
 /// On success it does not return.
 pub(crate) async fn exec(target: &Target<'_>, command: &[OsString]) -> Result<(), crate::Error> {
-    let (_, environment) = fetch(target, "exec")
+    let variables = fetch(target, "exec")
         .await
-        .map_err(|err| report(err, EXEC_FAILED))?;
-    Err(replace_process(command, environment.variables))
+        .map_err(|err| report(err, EXEC_FAILED))?
+        .map(|(_, environment)| environment.variables)
+        .unwrap_or_default();
+    Err(replace_process(command, variables))
 }
 
 /// Prints `err` unless it was already reported, and exits with `code`.
@@ -101,75 +140,104 @@ fn report(err: crate::Error, code: i32) -> crate::Error {
     }
 }
 
-/// Reads the target's environment from its live session.
+/// Reads the target's environment from its live session, or `None` when `--if-running` finds
+/// no session.
 async fn fetch(
     target: &Target<'_>,
     command: &str,
-) -> Result<(SessionInfo, ResolvedEnvironment), crate::Error> {
-    let (mut client, session) = connect(target, command).await?;
-    if !session
-        .protocol_version
-        .supports(ENVIRONMENT_PROTOCOL_VERSION)
+) -> Result<Option<(SessionInfo, ResolvedEnvironment)>, crate::Error> {
+    let Some((mut client, session)) = connect(target, command).await? else {
+        return Ok(None);
+    };
+    require(&session, ENVIRONMENT_PROTOCOL_VERSION, command)?;
+    // A session too old for a session-wide env file has its variables alone for its own
+    // environment.
+    let request = if target.service.is_none()
+        && session
+            .protocol_version
+            .supports(SESSION_ENV_FILE_PROTOCOL_VERSION)
     {
-        return Err(crate::Error::Message(format!(
-            "the running session `{}` (protocol {}) is too old for `micromux {command}`; restart \
-             it with this micromux (protocol {PROTOCOL_VERSION})",
-            session.name, session.protocol_version
-        )));
-    }
-    let response = client
-        .request(Request::GetEnvironment {
+        Request::GetSessionEnvironment
+    } else {
+        Request::GetEnvironment {
             service: target.service.map(str::to_string),
-        })
-        .await?;
-    let environment = match response {
-        Response::Environment(environment) => environment,
+        }
+    };
+    let response = client.request(request).await?;
+    let Response::Environment(environment) = response else {
+        return Err(request_error(response, &session, target.service));
+    };
+    note_stale(environment.stale, target.service);
+    Ok(Some((session, environment)))
+}
+
+/// Refuses a session older than the protocol `revision` that `micromux <command>` needs.
+fn require(
+    session: &SessionInfo,
+    revision: ProtocolVersion,
+    command: &str,
+) -> Result<(), crate::Error> {
+    if session.protocol_version.supports(revision) {
+        return Ok(());
+    }
+    Err(crate::Error::Message(format!(
+        "the running session `{}` (protocol {}) is too old for `micromux {command}`; restart it \
+         with this micromux (protocol {PROTOCOL_VERSION})",
+        session.name, session.protocol_version
+    )))
+}
+
+/// The failure an environment request reports when the session answers with `response`.
+fn request_error(response: Response, session: &SessionInfo, service: Option<&str>) -> crate::Error {
+    match response {
         Response::Error {
             code: ErrorCode::UnknownService,
             ..
-        } => {
-            return Err(crate::Error::Message(format!(
-                "session `{}` has no service with id `{}`; `--service` takes an id as `micromux \
-                 ctl ls` lists it",
-                session.name,
-                target.service.unwrap_or_default()
-            )));
-        }
-        Response::Error { code, message } => {
-            return Err(crate::Error::Message(format!("{code:?}: {message}")));
-        }
-        // The environment response is the only one that carries values, so printing any other
-        // response cannot disclose one.
-        other => {
-            return Err(crate::Error::Message(format!(
-                "unexpected response to an environment query: {other:?}"
-            )));
-        }
-    };
-    if environment.stale
-        && let Some(service) = target.service
-    {
+        } => crate::Error::Message(format!(
+            "session `{}` has no service with id `{}`; `--service` takes an id as `micromux ctl \
+             ls` lists it",
+            session.name,
+            service.unwrap_or_default()
+        )),
+        Response::Error { code, message } => crate::Error::Message(format!("{code:?}: {message}")),
+        // The environment response is the only one that carries values, and its `Debug` output
+        // names only the keys, so printing a response never discloses a value.
+        other => crate::Error::Message(format!(
+            "unexpected response to an environment request: {other:?}"
+        )),
+    }
+}
+
+/// Notes on stderr that a service's environment is its running process's, which its config no
+/// longer describes.
+fn note_stale(stale: bool, service: Option<&str>) {
+    if stale && let Some(service) = service {
         eprintln!(
             "micromux: {service}'s config changed since it started; showing the environment of \
              its running process"
         );
     }
-    Ok((session, environment))
 }
 
 /// Connects to the selected session, or, without a selector, to the one for the project's
 /// config exactly as `micromux ctl` does.
+///
+/// With `--if-running`, it returns `None` when that fails because no session claims the
+/// project.
 async fn connect(
     target: &Target<'_>,
     command: &str,
-) -> Result<(Client, SessionInfo), crate::Error> {
+) -> Result<Option<(Client, SessionInfo)>, crate::Error> {
     let selector = target
         .session
         .map(SessionSelector::parse)
         .filter(|selector| *selector != SessionSelector::Current);
     let Some(selector) = selector else {
-        let session = crate::ctl::connect_project(target.config).await?;
-        return Ok((session.client, session.info));
+        return match crate::ctl::connect_project(target.config).await {
+            Ok(session) => Ok(Some((session.client, session.info))),
+            Err(err) if target.if_running => not_running_or(err, target.config).await,
+            Err(err) => Err(err),
+        };
     };
     let cwd = std::env::current_dir()?;
     let resolved = micromux_control::resolve_selector(&cwd, Some(selector), target.config)
@@ -178,7 +246,37 @@ async fn connect(
     let client = Client::connect(&resolved.endpoint)
         .await
         .map_err(|err| crate::Error::Message(crate::attach::format_control_error(err, command)))?;
-    Ok((client, resolved.info))
+    Ok(Some((client, resolved.info)))
+}
+
+/// `None` when no session runs for the project, which `--if-running` treats as nothing to read,
+/// and otherwise `err`, why the session that runs for it did not answer.
+///
+/// Locks decide, not the failed connection: a session that is starting, or runs without a
+/// control plane, holds its config's owner lock but answers nothing, and one that is stopping
+/// has released that lock and its endpoint while its services still drain, but keeps its
+/// registry lock until they are gone.
+/// Neither must pass for a project without a session.
+async fn not_running_or(
+    err: crate::Error,
+    config: Option<&Path>,
+) -> Result<Option<(Client, SessionInfo)>, crate::Error> {
+    let working_dir = std::env::current_dir()?;
+    let config_path = crate::control::resolve_config_path(config, &working_dir).await?;
+    // The registry is asked while the hold keeps a successor from claiming the config, so a
+    // stopping session that exits meanwhile cannot hand over unseen to one that is starting.
+    if let Some(unclaimed) = micromux_control::hold_unclaimed_project(&config_path)? {
+        let live = micromux::PortRegistry::user().is_live(&config_path)?;
+        drop(unclaimed);
+        if !live {
+            return Ok(None);
+        }
+    }
+    Err(crate::Error::Message(format!(
+        "{err}\nnote: a session runs for {}, so --if-running does not skip it; it is starting, \
+         stopping, or runs without a control plane",
+        config_path.display()
+    )))
 }
 
 fn missing_message(missing: &[&str], session: &SessionInfo, service: Option<&str>) -> crate::Error {
@@ -264,7 +362,7 @@ fn render(
         }
     };
     for (key, value) in selected {
-        if is_shell_name(key) {
+        if micromux::is_shell_name(key) {
             rendered.text.push_str(prefix);
             rendered.text.push_str(key);
             rendered.text.push('=');
@@ -275,15 +373,6 @@ fn render(
         }
     }
     Ok(rendered)
-}
-
-/// Whether a POSIX shell can assign `key`: `[A-Za-z_][A-Za-z0-9_]*`.
-fn is_shell_name(key: &str) -> bool {
-    let mut bytes = key.bytes();
-    bytes
-        .next()
-        .is_some_and(|first| first == b'_' || first.is_ascii_alphabetic())
-        && bytes.all(|byte| byte == b'_' || byte.is_ascii_alphanumeric())
 }
 
 /// Quotes `value` for a POSIX shell, leaving values made only of unambiguous characters bare.
@@ -342,7 +431,7 @@ fn replace_process(_command: &[OsString], _variables: BTreeMap<String, String>) 
 
 #[cfg(test)]
 mod tests {
-    use super::{EnvFormat, Rendered, is_shell_name, render, select, shell_quote};
+    use super::{EnvFormat, Rendered, render, select, shell_quote};
     use color_eyre::eyre;
     use similar_asserts::assert_eq;
     use std::collections::BTreeMap;
@@ -418,16 +507,6 @@ mod tests {
             assert_eq!(String::from_utf8_lossy(&output.stdout), value);
         }
         Ok(())
-    }
-
-    #[test]
-    fn shell_names_follow_the_posix_identifier_rule() {
-        for valid in ["A", "_", "_A1", "api_port", "X9"] {
-            assert!(is_shell_name(valid), "{valid}");
-        }
-        for invalid in ["", "1A", "A-B", "A.B", "A B", "Ä"] {
-            assert!(!is_shell_name(invalid), "{invalid}");
-        }
     }
 
     #[test]

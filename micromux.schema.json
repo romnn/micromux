@@ -220,6 +220,14 @@
         }
       }
     },
+    "env_file": {
+      "description": "Session-wide dotenv files, loaded beneath every service's own env_file and environment, dynamic services included. `micromux env` and `micromux exec` without --service read them from disk on every call, so their edits apply there without a restart.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/env_file"
+        }
+      ]
+    },
     "services": {
       "type": "object",
       "additionalProperties": {

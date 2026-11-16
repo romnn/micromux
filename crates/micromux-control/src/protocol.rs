@@ -20,13 +20,20 @@ use serde::{Deserialize, Serialize};
 ///
 /// Bump the minor for additive changes (new optional/defaulted fields, new tools that reuse
 /// existing requests), and bump the major for incompatible request/response semantics.
-pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(3, 19);
+pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(3, 20);
 
 /// The first protocol revision whose sessions answer [`Request::GetEvents`].
 pub const EVENTS_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(3, 3);
 
 /// The first protocol revision whose sessions answer [`Request::GetEnvironment`].
 pub const ENVIRONMENT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(3, 15);
+
+/// The first protocol revision whose sessions answer [`Request::GetSessionEnvironment`] and
+/// [`Request::WriteEnvironmentFile`], and load a session-wide `env_file`.
+///
+/// An older session has no session-wide `env_file`, so its variables alone, which
+/// [`Request::GetEnvironment`] returns without a service, are its whole environment.
+pub const SESSION_ENV_FILE_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(3, 20);
 
 /// The first protocol revision whose sessions answer [`Request::SendInput`] and
 /// [`Request::ResizeTerminal`].
@@ -210,9 +217,32 @@ pub enum Request {
     ///
     /// Sessions answer it from protocol [`ENVIRONMENT_PROTOCOL_VERSION`] on; older ones reject it
     /// as a bad request.
+    /// Without a service it never includes the session-wide `env_file`, whose values may be
+    /// secrets, because clients predating [`Request::GetSessionEnvironment`] show these values
+    /// unasked.
     /// See [`micromux::ServiceControl::environment`] for what the variables are.
     GetEnvironment {
-        /// Service id, matched exactly, or `None` for the session's own variables.
+        /// Service id, matched exactly, or `None` for the session's variables.
+        service: Option<ServiceID>,
+    },
+    /// Return the session's own environment, with its values: the session-wide `env_file`, read
+    /// from disk for this request, and the session's variables over it.
+    ///
+    /// Sessions answer it from protocol [`SESSION_ENV_FILE_PROTOCOL_VERSION`] on; older ones
+    /// reject it as a bad request.
+    GetSessionEnvironment,
+    /// Write the environment [`Request::GetEnvironment`] returns for a service, or
+    /// [`Request::GetSessionEnvironment`] without one, to a dotenv file the session owns, and
+    /// return its path.
+    ///
+    /// Sessions answer it from protocol [`SESSION_ENV_FILE_PROTOCOL_VERSION`] on.
+    /// An environment the file cannot carry literally fails the request, see
+    /// [`micromux::to_dotenv`], and leaves an earlier file as it was.
+    /// Each request rewrites the file at the same path, in a private directory next to the
+    /// session's control socket, and the session removes the directory when it stops.
+    /// The format is [`micromux::to_dotenv`]'s.
+    WriteEnvironmentFile {
+        /// Service id, matched exactly, or `None` for the session's own environment.
         service: Option<ServiceID>,
     },
     /// Reconcile configured services against the session's on-disk config.
@@ -283,6 +313,8 @@ impl Request {
                 | Self::GetHealthHistory { .. }
                 | Self::GetEvents { .. }
                 | Self::GetEnvironment { .. }
+                | Self::GetSessionEnvironment
+                | Self::WriteEnvironmentFile { .. }
                 | Self::ReconcileConfig { dry_run: true }
         )
     }
@@ -571,8 +603,15 @@ pub enum Response {
     DynamicService(DynamicServiceAck),
     /// Reply to a config reconciliation.
     Reconcile(ReconcileReceipt),
-    /// Reply to [`Request::GetEnvironment`].
+    /// Reply to [`Request::GetEnvironment`] and [`Request::GetSessionEnvironment`].
     Environment(ResolvedEnvironment),
+    /// Reply to [`Request::WriteEnvironmentFile`].
+    EnvironmentFile {
+        /// Absolute path of the written file.
+        path: String,
+        /// As [`ResolvedEnvironment::stale`].
+        stale: bool,
+    },
     /// A streamed change notification (only after [`Request::Subscribe`]).
     Change(SessionChange),
     /// Reply to [`Request::SendInput`] and [`Request::ResizeTerminal`]: the session queued the input
@@ -643,14 +682,14 @@ mod tests {
     fn protocol_version_uses_major_minor_shape_and_accepts_same_major() {
         assert_eq!(
             serde_json::to_value(PROTOCOL_VERSION).unwrap(),
-            json!({ "major": 3, "minor": 19 })
+            json!({ "major": 3, "minor": 20 })
         );
         assert_eq!(
             serde_json::from_value::<ProtocolVersion>(json!({ "major": 1, "minor": 0 })).unwrap(),
             ProtocolVersion::new(1, 0)
         );
 
-        assert!(PROTOCOL_VERSION.is_compatible_with(ProtocolVersion::new(3, 18)));
+        assert!(PROTOCOL_VERSION.is_compatible_with(ProtocolVersion::new(3, 19)));
         assert!(!PROTOCOL_VERSION.is_compatible_with(ProtocolVersion::new(2, 9)));
         assert!(!supports_versioned_subscriptions(ProtocolVersion::new(
             3, 6
@@ -675,6 +714,56 @@ mod tests {
         assert!(!ProtocolVersion::new(3, 14).supports(ENVIRONMENT_PROTOCOL_VERSION));
         assert!(!ProtocolVersion::new(4, 15).supports(ENVIRONMENT_PROTOCOL_VERSION));
         assert!(PROTOCOL_VERSION.supports(ENVIRONMENT_PROTOCOL_VERSION));
+    }
+
+    /// A session answers the requests for its own environment and its env files only from 3.20
+    /// on, and never across a major line.
+    #[test]
+    fn session_env_files_require_protocol_3_20_on_the_same_major_line() {
+        assert!(ProtocolVersion::new(3, 20).supports(SESSION_ENV_FILE_PROTOCOL_VERSION));
+        assert!(!ProtocolVersion::new(3, 19).supports(SESSION_ENV_FILE_PROTOCOL_VERSION));
+        assert!(!ProtocolVersion::new(4, 20).supports(SESSION_ENV_FILE_PROTOCOL_VERSION));
+        assert!(PROTOCOL_VERSION.supports(SESSION_ENV_FILE_PROTOCOL_VERSION));
+    }
+
+    #[test]
+    fn environment_file_request_and_response_round_trip() -> serde_json::Result<()> {
+        for service in [None, Some("api".to_string())] {
+            let encoded = serde_json::to_value(Request::WriteEnvironmentFile {
+                service: service.clone(),
+            })?;
+            assert_matches!(
+                serde_json::from_value::<Request>(encoded)?,
+                Request::WriteEnvironmentFile { service: decoded } if decoded == service
+            );
+        }
+        assert!(Request::WriteEnvironmentFile { service: None }.is_retry_safe());
+        let encoded = serde_json::to_value(Request::GetSessionEnvironment)?;
+        assert_eq!(encoded, json!("GetSessionEnvironment"));
+        assert_matches!(
+            serde_json::from_value::<Request>(encoded)?,
+            Request::GetSessionEnvironment
+        );
+        assert!(Request::GetSessionEnvironment.is_retry_safe());
+
+        let encoded = serde_json::to_value(Response::EnvironmentFile {
+            path: "/run/micromux/0123456789abcdef.env.d/session.env".to_string(),
+            stale: false,
+        })?;
+        assert_eq!(
+            encoded,
+            json!({
+                "EnvironmentFile": {
+                    "path": "/run/micromux/0123456789abcdef.env.d/session.env",
+                    "stale": false
+                }
+            })
+        );
+        assert_matches!(
+            serde_json::from_value::<Response>(encoded)?,
+            Response::EnvironmentFile { path, stale: false } if path.ends_with("session.env")
+        );
+        Ok(())
     }
 
     /// A session answers terminal requests only from 3.18 on, and never across a major line.
@@ -1027,7 +1116,7 @@ mod tests {
     fn protocol_version_ignores_additive_fields() {
         let version = serde_json::from_value::<ProtocolVersion>(json!({
             "major": 3,
-            "minor": 19,
+            "minor": 20,
             "future_capability": true
         }))
         .unwrap();

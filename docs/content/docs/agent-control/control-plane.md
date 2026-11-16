@@ -71,22 +71,23 @@ The MCP `wait_for_healthy` and `wait_for_exit` tools follow the same rules; a de
 A task you run yourself, such as a migration, a seed script, or a one-off `psql`, needs the ports and variables the session's services get. `micromux exec` runs it with them, and `micromux env` prints them:
 
 ```bash
-micromux exec task migrations:reset                   # run with the session's variables
+micromux exec task migrations:reset                   # run with the session's environment
 micromux exec --service api -- cargo run --bin seed   # run with what the `api` service gets
 micromux env                                          # KEY=value lines, quoted for a shell
 psql -p "$(micromux env POSTGRES_PORT)"               # one name prints just its value
 eval "$(micromux env --export)"                       # load them into the current shell
 micromux env --service api --format json
+micromux env --file                                   # the path of a dotenv file with them
 ```
 
-Both read the environment from the running session over the control plane, so they match what its services got, and `exec` and `env` never disagree. Without a running session they fail instead of falling back to `.env` files. On success they print nothing besides the requested output.
+Both read the environment from the running session over the control plane, so they match what its services got, and `exec` and `env` never disagree. Without a running session they fail instead of falling back to `.env` files, unless you pass [`--if-running`](#without-a-session). On success they print nothing besides the requested output.
 
 **Which session.** Like `ctl`, they use the session for the config found at or above the current directory, or for `--config <path>`. A session for any other config does not count, not even one in a subdirectory. `--session` selects a session by `name:`, `pid:`, or `hash:`, as [`micromux attach`]({{< relref "../tui.md" >}}#attach-to-a-running-session) does.
 
 **Which variables.**
 
-- Without `--service`, the variables the session injects into every service: `MICROMUX_SESSION`, `MICROMUX_SESSION_DOMAIN`, `MICROMUX_PROXY_PORT`, `MICROMUX_HOST_SUFFIX`, and every [allocated port]({{< relref "../configuration/sessions.md" >}}#allocated-ports).
-- With `--service <id>`, that service's `env_file` and `environment` entries, interpolated, with the session's variables applied. It takes the service id, not its display name. While the service runs, these are the values its process started with; when its config changed since, for example through `ctl reconcile`, a note on stderr says so. The variables micromux sets on every service process itself (`TERM`, `CLICOLOR`, `CLICOLOR_FORCE`, `FORCE_COLOR`) are not included.
+- Without `--service`, the session's own environment: the [session-wide `env_file`]({{< relref "../configuration/services.md" >}}#session-wide-env-files), with the variables the session injects into every service over it: `MICROMUX_SESSION`, `MICROMUX_SESSION_DOMAIN`, `MICROMUX_PROXY_PORT`, `MICROMUX_HOST_SUFFIX`, and every [allocated port]({{< relref "../configuration/sessions.md" >}}#allocated-ports). The session reads the files from disk for every call, resolved exactly as for its services, so an edit or a new key shows at once, without a restart or a reconcile. Which files the list names follows the config the session last loaded. A session that predates protocol 3.20 has no session-wide `env_file`, so its variables are its whole environment.
+- With `--service <id>`, that service's resolved session-wide `env_file`, own `env_file`, and `environment` entries, interpolated, with the session's variables applied. It takes the service id, not its display name. While the service runs, these are the values its process started with; when its config changed since, for example through `ctl reconcile`, a note on stderr says so. The variables micromux sets on every service process itself (`TERM`, `CLICOLOR`, `CLICOLOR_FORCE`, `FORCE_COLOR`) are not included.
 - Variables your shell already has, such as `PATH`, `AWS_PROFILE`, or a `DATABASE_URL` from direnv, come from your shell. `exec` keeps them, and only the session's configured variables override variables of the same name. The environment micromux itself was started with, which its services also inherit, is not part of it.
 
 ### `micromux exec`
@@ -95,7 +96,7 @@ The command replaces the micromux process: it runs in your terminal with your st
 
 | Code | Meaning |
 |---|---|
-| `125` | micromux failed before running the command: no session, a session too old for it, an unknown service, or a control-plane error. |
+| `125` | micromux failed before running the command: no session (unless `--if-running`), a session too old for it, an unknown service, or a control-plane error. |
 | `126` | The command was found but cannot run. |
 | `127` | The command was not found. |
 | any other | The command's own exit status. |
@@ -107,12 +108,40 @@ The command replaces the micromux process: it runs in your terminal with your st
 - `--format json` prints one JSON object.
 - Names after the options print only those variables, and a single name in the default format prints its bare value. A name that is not set fails the command, and nothing goes to stdout, so a script never runs with an empty port.
 - A key a shell cannot assign, anything but `[A-Za-z_][A-Za-z0-9_]*`, is left out of the line formats with a warning on stderr that names it. JSON keeps every key.
+- `--file` has the session write the environment, or a service's with `--service`, to a dotenv file and prints the file's absolute path; see below.
 - It exits 1 on any failure.
+
+### Dotenv files for other tools
+
+Some tools load dotenv files themselves and expand `${VAR}` from the file alone, ignoring the environment they run in. go-task's `dotenv:` is one: even under `micromux exec task …`, it rebuilds `DATABASE_URL=postgres://…:${POSTGRES_PORT}/app` with the file's default port. `micromux env --file` gives such a tool a file with the session's resolved values:
+
+```yaml
+# taskfile.yaml
+vars:
+  MICROMUX_ENV_FILE:
+    sh: if command -v micromux >/dev/null 2>&1; then micromux env --file --if-running; fi
+dotenv:
+  - "{{.MICROMUX_ENV_FILE}}" # the session's resolved environment wins
+  - .env.local
+  - .env
+```
+
+- The session owns the file. It lives in a private directory next to the session's control socket, readable by your user only, and goes away when the session stops.
+- Every call rewrites the same path with the environment as it is now, replacing the file in one step, so a reader never sees half of it.
+- Each value is double-quoted, with quotes, backslashes, newlines, and `$` written as `\"`, `\\`, `\n`, and `\$`, so godotenv (go-task), Docker Compose, and dotenvy all read it back literally and expand nothing. godotenv misreads a double-quoted value that ends in `"`, so such a value is single-quoted instead.
+- An environment the file cannot carry exactly fails the command, which names the variables but never their values, and leaves the file as it was: a key that is not a shell variable name, or a value no quoting carries through all three readers, one that ends in a backslash, or ends in `"` and contains `'` or a carriage return before a line feed. Leaving such a variable out would let the tool take its value from the next file it loads instead.
+- It needs a session started by this micromux or a later one, protocol 3.20.
+
+### Without a session
+
+With `--if-running`, a project no session runs for is not an error: `micromux env` prints nothing and exits 0, and `micromux exec` runs the command with your environment unchanged. A script can then fall back to its own defaults when no session runs, and only then.
+
+Every other failure still fails: a session that is starting, stopping, or runs without a control plane, a control plane that does not answer, a session too old for the command, an unknown service. micromux decides by two locks: the config's owner lock, which a session takes before anything else and releases as it starts stopping, and its port-registry lock, which it holds until its services have stopped. It asks about the second while it keeps a new session from claiming the config, so a session that cannot answer is never mistaken for none, not even while its services drain after `ctl stop` or a new session takes over. `--if-running` asks about the project's session, so it does not combine with `--session`.
 
 > [!WARNING]
 > Values can be secrets from env files. They reach stdout or the command only when you run one of these commands, and micromux never logs them, unless you replace its log filter with a `RUST_LOG` that turns on debug logging for the MCP library (`rmcp`), which records tool results. The control socket is reachable by your user only.
 
-Agents read the same environment with the MCP `get_session_env` tool. For a service, it returns only the variable names unless the agent asks for `names`.
+Agents read the same environment with the MCP `get_session_env` tool. It returns only the variable names unless the agent asks for `names`, since env files can hold secrets.
 
 ## Headless sessions: `micromux serve`
 
@@ -143,4 +172,4 @@ Reconciliation also applies the config's service order immediately, without rest
 
 ## Protocol compatibility
 
-Protocol 3 peers accept additive fields from newer minor revisions. Revision 3.8 changed transient disk-log rotation and reader saturation failures from `LimitExceeded` to the retryable `Busy` code. Revision 3.9 distinguishes an uninitialized disk-reader pool and reports reads that still occupy workers after their callers leave. Revision 3.11 adds `session` to the session description: its name, [browser URLs and allocated ports]({{< relref "../configuration/sessions.md" >}}), and whether the shared proxy serves its routes. Revision 3.12 adds `last_cleanup` to service snapshots and the `CleanupStarted`, `CleanupFinished`, and `CleanupFailed` event kinds for [cleanup commands]({{< relref "../configuration/services.md" >}}#cleanup); older peers read the new kinds as `Unknown`. Revision 3.13 adds `dependency_failure` to service snapshots, naming the dependency that keeps a blocked service from ever starting on its own, and the `DependencyFailed` event kind. Revision 3.14 adds `depends_on` to service snapshots. Revision 3.15 adds the `GetEnvironment` request, which returns the session's variables or one service's resolved environment with their values; `micromux env`, `micromux exec`, and `get_session_env` refuse a session older than 3.15 and ask you to restart it. Revision 3.16 adds [jobs]({{< relref "../configuration/services.md" >}}#jobs): `kind` and `manual` on service snapshots and dynamic-service definitions, the `Completed` and `Failed` execution states, and an optional dependency `condition` whose absence means the target's natural condition. Older peers read the new states as `Unknown`, so restart an attached TUI or a running `micromux mcp` after upgrading; an older session ignores `kind` and creates a dynamic job as a service. Revision 3.17 adds `path` and `strip_prefix` to the session's routes for [path routes]({{< relref "../configuration/sessions.md" >}}#path-routes); a route's `url` already ends in its path. Revision 3.18 adds the `SendInput` and `ResizeTerminal` requests, which an [attached TUI]({{< relref "../tui.md" >}}#attach-to-a-running-session) uses to type into services and resize their PTYs; it sends neither to an older session, and MCP never sends them. Revision 3.19 adds optional `session.git` context to session descriptions: the current Git branch and a cached open GitHub PR number. GitHub lookups run in the background and may be absent on the first response; no Git or GitHub tooling is required.
+Protocol 3 peers accept additive fields from newer minor revisions. Revision 3.8 changed transient disk-log rotation and reader saturation failures from `LimitExceeded` to the retryable `Busy` code. Revision 3.9 distinguishes an uninitialized disk-reader pool and reports reads that still occupy workers after their callers leave. Revision 3.11 adds `session` to the session description: its name, [browser URLs and allocated ports]({{< relref "../configuration/sessions.md" >}}), and whether the shared proxy serves its routes. Revision 3.12 adds `last_cleanup` to service snapshots and the `CleanupStarted`, `CleanupFinished`, and `CleanupFailed` event kinds for [cleanup commands]({{< relref "../configuration/services.md" >}}#cleanup); older peers read the new kinds as `Unknown`. Revision 3.13 adds `dependency_failure` to service snapshots, naming the dependency that keeps a blocked service from ever starting on its own, and the `DependencyFailed` event kind. Revision 3.14 adds `depends_on` to service snapshots. Revision 3.15 adds the `GetEnvironment` request, which returns the session's variables or one service's resolved environment with their values; `micromux env`, `micromux exec`, and `get_session_env` refuse a session older than 3.15 and ask you to restart it. Revision 3.16 adds [jobs]({{< relref "../configuration/services.md" >}}#jobs): `kind` and `manual` on service snapshots and dynamic-service definitions, the `Completed` and `Failed` execution states, and an optional dependency `condition` whose absence means the target's natural condition. Older peers read the new states as `Unknown`, so restart an attached TUI or a running `micromux mcp` after upgrading; an older session ignores `kind` and creates a dynamic job as a service. Revision 3.17 adds `path` and `strip_prefix` to the session's routes for [path routes]({{< relref "../configuration/sessions.md" >}}#path-routes); a route's `url` already ends in its path. Revision 3.18 adds the `SendInput` and `ResizeTerminal` requests, which an [attached TUI]({{< relref "../tui.md" >}}#attach-to-a-running-session) uses to type into services and resize their PTYs; it sends neither to an older session, and MCP never sends them. Revision 3.19 adds optional `session.git` context to session descriptions: the current Git branch and a cached open GitHub PR number. GitHub lookups run in the background and may be absent on the first response; no Git or GitHub tooling is required. Revision 3.20 adds the `GetSessionEnvironment` request, which returns the session's own environment, its session-wide `env_file` included, and the `WriteEnvironmentFile` request behind `micromux env --file`. `GetEnvironment` without a service still returns the session's variables alone, so an older client that shows those values unasked never shows an env file's. `micromux env`, `micromux exec`, and `get_session_env` without a service send the new request to a 3.20 session and the old one to an older session, which has no session-wide `env_file`; `micromux env --file` refuses a session older than 3.20 and asks you to restart it.

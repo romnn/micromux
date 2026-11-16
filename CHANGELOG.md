@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- **Share env files across services, and hand the session's resolved environment to tools that
+  only read dotenv files.** Use the top-level `env_file`, `micromux env --file`, and
+  `--if-running` on `env` and `exec`.
+
 ## v0.4.4
 
 - **Session listings show the current Git branch and an optional GitHub PR number.** The proxy

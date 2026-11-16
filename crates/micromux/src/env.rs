@@ -130,6 +130,11 @@ impl EnvMap {
     pub fn extend(&mut self, other: EnvMap) {
         self.inner.extend(other.inner);
     }
+
+    /// The entries in order.
+    pub fn iter(&self) -> indexmap::map::Iter<'_, String, String> {
+        self.inner.iter()
+    }
 }
 
 impl IntoIterator for EnvMap {
@@ -391,6 +396,118 @@ pub fn expand_env_values(
     }
 
     Ok(out)
+}
+
+/// Variables [`to_dotenv`] cannot write so that every reader reads them back literally.
+///
+/// It names the variables, never a value, because values may be secrets.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{}", describe_unrepresentable(names, values))]
+pub struct UnrepresentableVariables {
+    /// Keys that are not POSIX shell names, in the order given.
+    pub names: Vec<String>,
+    /// Keys whose value no quoting carries through every reader, in the order given.
+    pub values: Vec<String>,
+}
+
+fn describe_unrepresentable(names: &[String], values: &[String]) -> String {
+    let mut problems = Vec::new();
+    if !names.is_empty() {
+        problems.push(format!("not shell variable names: {}", names.join(", ")));
+    }
+    if !values.is_empty() {
+        problems.push(format!(
+            "values no dotenv quoting carries literally: {}",
+            values.join(", ")
+        ));
+    }
+    format!(
+        "cannot write a dotenv file that every reader takes literally ({})",
+        problems.join("; ")
+    )
+}
+
+/// Render `variables` as a dotenv file that godotenv (go-task's `dotenv:`), Docker Compose's
+/// `env_file`, and dotenvy all read back literally, expanding nothing.
+///
+/// A value is double-quoted with the `\\`, `\"`, `\$`, and `\n` escapes, which all three undo
+/// and none of them expands; every other character, a carriage return or tab included, is
+/// written as it is.
+/// godotenv misreads a double-quoted value that ends in `"` or `\`: it trims the escaped closing
+/// quote, and takes the quote after an escaped backslash for an escaped quote.
+/// A value that ends in `"` is single-quoted instead, which all three read verbatim, as long as
+/// it contains no `'`, and no carriage return before a line feed, which godotenv turns into a
+/// line feed before it parses.
+///
+/// # Errors
+///
+/// Returns [`UnrepresentableVariables`] naming every key that is not a POSIX shell name, which
+/// godotenv may reject, and every key whose value no quoting carries through all three readers.
+/// Such a variable fails the whole file rather than going missing from it, because a reader
+/// would then take its value from the next file it loads.
+pub fn to_dotenv<'a>(
+    variables: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> Result<String, UnrepresentableVariables> {
+    let mut text = String::new();
+    let mut unrepresentable = UnrepresentableVariables {
+        names: Vec::new(),
+        values: Vec::new(),
+    };
+    for (key, value) in variables {
+        if !is_shell_name(key) {
+            unrepresentable.names.push(key.to_string());
+            continue;
+        }
+        let Some(quoted) = dotenv_value(value) else {
+            unrepresentable.values.push(key.to_string());
+            continue;
+        };
+        text.push_str(key);
+        text.push('=');
+        text.push_str(&quoted);
+        text.push('\n');
+    }
+    if unrepresentable.names.is_empty() && unrepresentable.values.is_empty() {
+        Ok(text)
+    } else {
+        Err(unrepresentable)
+    }
+}
+
+/// `value` quoted for [`to_dotenv`], or `None` when no quoting reads back literally in every
+/// supported reader.
+fn dotenv_value(value: &str) -> Option<String> {
+    if value.ends_with('\\') {
+        return None;
+    }
+    if value.ends_with('"') {
+        // Single quotes carry every character as written, so godotenv's line-ending
+        // normalization would reach a carriage return before a line feed.
+        return (!value.contains('\'') && !value.contains("\r\n")).then(|| format!("'{value}'"));
+    }
+    let mut quoted = String::with_capacity(value.len() + 2);
+    quoted.push('"');
+    for ch in value.chars() {
+        match ch {
+            '\\' => quoted.push_str(r"\\"),
+            '"' => quoted.push_str(r#"\""#),
+            '$' => quoted.push_str(r"\$"),
+            '\n' => quoted.push_str(r"\n"),
+            other => quoted.push(other),
+        }
+    }
+    quoted.push('"');
+    Some(quoted)
+}
+
+/// Whether a POSIX shell can assign `key`: `[A-Za-z_][A-Za-z0-9_]*`.
+#[must_use]
+pub fn is_shell_name(key: &str) -> bool {
+    let mut bytes = key.bytes();
+    bytes
+        .next()
+        .is_some_and(|first| first == b'_' || first.is_ascii_alphabetic())
+        && bytes.all(|byte| byte == b'_' || byte.is_ascii_alphanumeric())
 }
 
 /// Resolve a configured path: expand `~`, substitute variables from `env`, and anchor a relative
@@ -851,5 +968,394 @@ mod tests {
 
         assert!(matches!(error, Error::FileTooLarge { path: actual } if actual == path));
         Ok(())
+    }
+
+    /// Values a dotenv file has to carry through every reader unchanged: quotes, dollar
+    /// signs, backslashes, newlines, and comment markers.
+    const AWKWARD_VALUES: &[&str] = &[
+        "",
+        "plain",
+        " padded ",
+        "it's",
+        "say \"hi\" now",
+        "\"quoted\"",
+        "ends in a quote\"",
+        "\\\"",
+        "$HOME",
+        "${HOME}",
+        "${HOME:-default}",
+        "$$",
+        "\\$HOME",
+        "cost: 5$",
+        "$(date)",
+        "C:\\new\\table",
+        "\\\\ in the middle",
+        "line\nbreak",
+        "crlf\r\nbreak",
+        "trailing newline\n",
+        "newline\nthen a quote\"",
+        "\\n is no newline",
+        "tab\there",
+        "carriage\rreturn",
+        "# not a comment",
+        "a # b",
+        "=",
+        "postgres://user:p@ss@127.0.0.1:5432/db?sslmode=disable",
+        "ünïcödé ✓",
+        "'single'",
+        "{\"json\": \"value\"}",
+    ];
+
+    #[test]
+    fn shell_names_follow_the_posix_identifier_rule() {
+        for valid in ["A", "_", "_A1", "api_port", "X9"] {
+            assert!(is_shell_name(valid), "{valid}");
+        }
+        for invalid in ["", "1A", "A-B", "A.B", "A B", "Ä"] {
+            assert!(!is_shell_name(invalid), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn dotenv_quotes_every_value_and_escapes_what_readers_unescape() -> eyre::Result<()> {
+        let text = to_dotenv([
+            ("PLAIN", "20001"),
+            ("EMPTY", ""),
+            ("URL", "postgres://u:p@127.0.0.1:${PORT}/db"),
+            ("ESCAPED", "a\"b\\c\nd$e"),
+            ("RAW", "tab\tand\rcarriage"),
+            ("ENDS_IN_QUOTE", "--flag=\"x\""),
+        ])?;
+
+        assert_eq!(
+            text,
+            concat!(
+                "PLAIN=\"20001\"\n",
+                "EMPTY=\"\"\n",
+                "URL=\"postgres://u:p@127.0.0.1:\\${PORT}/db\"\n",
+                "ESCAPED=\"a\\\"b\\\\c\\nd\\$e\"\n",
+                "RAW=\"tab\tand\rcarriage\"\n",
+                "ENDS_IN_QUOTE='--flag=\"x\"'\n",
+            )
+        );
+        Ok(())
+    }
+
+    /// Names a reader may reject, and values no quoting carries through every reader, fail the
+    /// whole file, which names each such variable but none of their values.
+    #[test]
+    fn dotenv_refuses_what_a_reader_would_misread() -> eyre::Result<()> {
+        let result = to_dotenv([
+            ("NOT-SHELL", "x"),
+            ("1A", "x"),
+            ("ENDS_IN_BACKSLASH", "secret\\"),
+            ("BOTH_QUOTES", "secret's \"x\""),
+            // godotenv would turn the single-quoted CRLF into a bare LF.
+            ("CRLF_ENDS_IN_QUOTE", "secret\r\nbreak\""),
+            ("KEPT", "x"),
+        ]);
+
+        let Err(error) = result else {
+            eyre::bail!("an unrepresentable environment was written: {result:?}");
+        };
+        assert_eq!(
+            error,
+            UnrepresentableVariables {
+                names: vec!["NOT-SHELL".to_string(), "1A".to_string()],
+                values: vec![
+                    "ENDS_IN_BACKSLASH".to_string(),
+                    "BOTH_QUOTES".to_string(),
+                    "CRLF_ENDS_IN_QUOTE".to_string(),
+                ],
+            }
+        );
+        let message = error.to_string();
+        assert!(message.contains("NOT-SHELL, 1A"), "{message}");
+        assert!(message.contains("CRLF_ENDS_IN_QUOTE"), "{message}");
+        assert!(!message.contains("secret"), "{message}");
+        Ok(())
+    }
+
+    /// Every value reads back unchanged through godotenv's and Compose's grammars and through
+    /// dotenvy, so none of them expands or unescapes anything micromux did not escape.
+    #[test]
+    fn dotenv_reads_back_literally_in_every_reader() -> eyre::Result<()> {
+        let keys = (0..AWKWARD_VALUES.len())
+            .map(|index| format!("VALUE_{index}"))
+            .collect::<Vec<_>>();
+        let expected = keys
+            .iter()
+            .map(String::as_str)
+            .zip(AWKWARD_VALUES.iter().copied())
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect::<Vec<_>>();
+        let text = to_dotenv(
+            keys.iter()
+                .map(String::as_str)
+                .zip(AWKWARD_VALUES.iter().copied()),
+        )?;
+
+        assert_eq!(
+            readers::godotenv(&text).map_err(eyre::Report::msg)?,
+            expected,
+            "godotenv"
+        );
+        assert_eq!(
+            readers::compose(&text).map_err(eyre::Report::msg)?,
+            expected,
+            "compose"
+        );
+        let dotenvy = dotenvy::from_read_iter(text.as_bytes()).collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(dotenvy, expected, "dotenvy");
+        Ok(())
+    }
+
+    /// The readers that only exist in Go, ported from their parsers as far as the lines
+    /// [`to_dotenv`] writes need, so a test can read a written file back the way they do.
+    ///
+    /// Expansion looks nothing up: it substitutes a marker, so a value either reader would
+    /// expand reads back changed.
+    mod readers {
+        /// One `KEY=<quoted value>` statement after another, with blank lines and comments
+        /// between them, the shape both Go parsers share.
+        fn statements(
+            text: &str,
+            value: impl Fn(&str) -> Result<(String, &str), String>,
+        ) -> Result<Vec<(String, String)>, String> {
+            let text = text.replace("\r\n", "\n");
+            let mut rest = text.as_str();
+            let mut parsed = Vec::new();
+            loop {
+                rest = rest.trim_start();
+                if rest.is_empty() {
+                    return Ok(parsed);
+                }
+                if rest.starts_with('#') {
+                    match rest.find('\n') {
+                        Some(end) => rest = rest.get(end..).unwrap_or_default(),
+                        None => return Ok(parsed),
+                    }
+                    continue;
+                }
+                let separator = rest
+                    .find(['=', ':'])
+                    .ok_or_else(|| format!("no separator in {rest:?}"))?;
+                let key = rest.get(..separator).unwrap_or_default().trim_end();
+                if !key
+                    .chars()
+                    .all(|ch| ch.is_alphanumeric() || ch == '_' || ch == '.')
+                {
+                    return Err(format!("unexpected character in variable name {key:?}"));
+                }
+                let after = rest
+                    .get(separator + 1..)
+                    .unwrap_or_default()
+                    .trim_start_matches([' ', '\t']);
+                let (value, left) = value(after)?;
+                parsed.push((key.to_string(), value));
+                rest = left;
+            }
+        }
+
+        fn quote_of(src: &str) -> Result<char, String> {
+            match src.chars().next() {
+                Some(quote @ ('"' | '\'')) => Ok(quote),
+                _ => Err(format!("unquoted value {src:?}")),
+            }
+        }
+
+        /// godotenv v1.5.1 (`parser.go`), which go-task's `dotenv:` uses.
+        pub(super) fn godotenv(text: &str) -> Result<Vec<(String, String)>, String> {
+            statements(text, |src| {
+                let quote = quote_of(src)?;
+                let bytes = src.as_bytes();
+                // The first quote not preceded by a backslash closes the value.
+                let close = (1..bytes.len())
+                    .find(|&index| {
+                        bytes.get(index) == Some(&(quote as u8))
+                            && bytes.get(index - 1) != Some(&b'\\')
+                    })
+                    .ok_or_else(|| format!("unterminated quoted value {src:?}"))?;
+                // Every quote character at either end is trimmed, escaped or not.
+                let value = src
+                    .get(..close)
+                    .unwrap_or_default()
+                    .trim_end_matches(quote)
+                    .trim_start_matches(quote);
+                let value = if quote == '"' {
+                    godotenv_expand_variables(&godotenv_expand_escapes(value))
+                } else {
+                    value.to_string()
+                };
+                Ok((value, src.get(close + 1..).unwrap_or_default()))
+            })
+        }
+
+        /// `expandEscapes`: `\n` and `\r` become control characters, and then `\x` becomes `x`
+        /// for every `x` but `$`.
+        fn godotenv_expand_escapes(value: &str) -> String {
+            // `\\.`, where `.` matches anything but a newline
+            let mut escaped = String::new();
+            let mut chars = value.chars().peekable();
+            while let Some(ch) = chars.next() {
+                match (ch, chars.peek().copied()) {
+                    ('\\', Some(next)) if next != '\n' => {
+                        chars.next();
+                        match next {
+                            'n' => escaped.push('\n'),
+                            'r' => escaped.push('\r'),
+                            other => {
+                                escaped.push('\\');
+                                escaped.push(other);
+                            }
+                        }
+                    }
+                    _ => escaped.push(ch),
+                }
+            }
+            // `\\([^$])` becomes `$1`.
+            let mut unescaped = String::new();
+            let mut chars = escaped.chars().peekable();
+            while let Some(ch) = chars.next() {
+                match (ch, chars.peek().copied()) {
+                    ('\\', Some(next)) if next != '$' => {
+                        chars.next();
+                        unescaped.push(next);
+                    }
+                    _ => unescaped.push(ch),
+                }
+            }
+            unescaped
+        }
+
+        /// `expandVariables`: every match of `(\\)?(\$)(\()?\{?([A-Z0-9_]+)?\}?` loses its
+        /// leading backslash when it has one, and is otherwise expanded when it names a
+        /// variable.
+        fn godotenv_expand_variables(value: &str) -> String {
+            let bytes = value.as_bytes();
+            let mut expanded = String::new();
+            let mut copied = 0;
+            let mut index = 0;
+            while index < bytes.len() {
+                let (escaped, dollar) = match (bytes.get(index), bytes.get(index + 1)) {
+                    (Some(b'\\'), Some(b'$')) => (true, index + 1),
+                    (Some(b'$'), _) => (false, index),
+                    _ => {
+                        index += 1;
+                        continue;
+                    }
+                };
+                let mut end = dollar + 1;
+                for optional in *b"({" {
+                    if bytes.get(end) == Some(&optional) {
+                        end += 1;
+                    }
+                }
+                let name_start = end;
+                while bytes.get(end).is_some_and(|byte| {
+                    byte.is_ascii_uppercase() || byte.is_ascii_digit() || *byte == b'_'
+                }) {
+                    end += 1;
+                }
+                let name = value.get(name_start..end).unwrap_or_default().to_string();
+                if bytes.get(end) == Some(&b'}') {
+                    end += 1;
+                }
+                expanded.push_str(value.get(copied..index).unwrap_or_default());
+                let matched = value.get(index..end).unwrap_or_default();
+                if escaped {
+                    expanded.push_str(matched.get(1..).unwrap_or_default());
+                } else if !name.is_empty() {
+                    expanded.push_str("<expanded ");
+                    expanded.push_str(&name);
+                    expanded.push('>');
+                } else {
+                    expanded.push_str(matched);
+                }
+                copied = end;
+                index = end;
+            }
+            expanded.push_str(value.get(copied..).unwrap_or_default());
+            expanded
+        }
+
+        /// compose-go v2 (`dotenv/parser.go`), which Docker Compose's `env_file` uses.
+        pub(super) fn compose(text: &str) -> Result<Vec<(String, String)>, String> {
+            statements(text, |src| {
+                let quote = quote_of(src)?;
+                let mut chars = String::new();
+                let mut previous_is_escape = false;
+                for (index, ch) in src.char_indices().skip(1) {
+                    if ch != quote {
+                        if !previous_is_escape && ch == '\\' {
+                            previous_is_escape = true;
+                            continue;
+                        }
+                        if previous_is_escape {
+                            previous_is_escape = false;
+                            chars.push('\\');
+                        }
+                        chars.push(ch);
+                        continue;
+                    }
+                    // An escaped quote is part of the value, without its backslash.
+                    if previous_is_escape {
+                        previous_is_escape = false;
+                        chars.push(ch);
+                        continue;
+                    }
+                    let value = if quote == '"' {
+                        compose_expand_variables(&compose_expand_escapes(&chars))
+                    } else {
+                        chars
+                    };
+                    return Ok((value, src.get(index + 1..).unwrap_or_default()));
+                }
+                Err(format!("unterminated quoted value {src:?}"))
+            })
+        }
+
+        /// `expandEscapes`: the escapes of `\\(?:[abcfnrtv$"\\]|0\d{0,3})` are unquoted the way
+        /// Go unquotes them, except that `\$` becomes `$$` for the interpolation that follows.
+        fn compose_expand_escapes(value: &str) -> String {
+            let mut unescaped = String::new();
+            let mut chars = value.chars().peekable();
+            while let Some(ch) = chars.next() {
+                let replacement = match (ch, chars.peek().copied()) {
+                    ('\\', Some('$')) => "$$",
+                    ('\\', Some('"')) => "\"",
+                    ('\\', Some('\\')) => "\\",
+                    ('\\', Some('n')) => "\n",
+                    ('\\', Some('r')) => "\r",
+                    ('\\', Some('t')) => "\t",
+                    _ => {
+                        unescaped.push(ch);
+                        continue;
+                    }
+                };
+                chars.next();
+                unescaped.push_str(replacement);
+            }
+            unescaped
+        }
+
+        /// The interpolation: `$$` is one literal `$`, and `$NAME` or `${…}` is expanded.
+        fn compose_expand_variables(value: &str) -> String {
+            let mut expanded = String::new();
+            let mut chars = value.chars().peekable();
+            while let Some(ch) = chars.next() {
+                match (ch, chars.peek().copied()) {
+                    ('$', Some('$')) => {
+                        chars.next();
+                        expanded.push('$');
+                    }
+                    ('$', Some(next)) if next == '{' || next == '_' || next.is_alphabetic() => {
+                        expanded.push_str("<expanded>");
+                    }
+                    _ => expanded.push(ch),
+                }
+            }
+            expanded
+        }
     }
 }

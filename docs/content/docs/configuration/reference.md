@@ -29,6 +29,7 @@ Every key in `micromux.yaml`. The machine-readable source of truth is [`micromux
 | `allocate_ports` | array | — | Environment variable names that each receive a [session-allocated port]({{< relref "sessions.md" >}}#allocated-ports), or `{ name, prefer }` to take a [preferred port]({{< relref "sessions.md" >}}#preferred-ports) whenever it is free. |
 | `routes` | array | — | [Hostnames]({{< relref "sessions.md" >}}#hostnames) `{ host, path, strip_prefix, port }` served by the shared proxy, optionally split by [path prefix]({{< relref "sessions.md" >}}#path-routes). Not supported on Windows. |
 | `proxy` | object | — | The [proxy]({{< relref "sessions.md" >}}#the-proxy) `port` the session's routes are served on (default `80`), and an optional `fallback_port` for when that port cannot be bound. Sessions with different ports share one proxy. |
+| `env_file` | string / object / array | — | [Session-wide]({{< relref "services.md" >}}#session-wide-env-files) `.env` file(s), loaded beneath every service's own `env_file` and `environment` and read from disk for every `micromux env` and `micromux exec` without `--service`. Same entries as [`env_file[]`](#env_file). |
 
 ## `services.<id>`
 

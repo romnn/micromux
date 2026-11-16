@@ -1,7 +1,7 @@
 use crate::cleanup::CleanupOutcome;
 use crate::{
-    DynamicOrigin, DynamicServiceParams, DynamicServicesPolicy, Lease, LogDisplay, ReloadConfig,
-    ServiceMap, ServiceOrigin, ServiceSpec,
+    DynamicOrigin, DynamicServiceParams, DynamicServicesPolicy, Lease, LoadedServices, LogDisplay,
+    ReloadConfig, ServiceMap, ServiceOrigin, ServiceSpec,
     graph::ServiceGraph,
     health_check::Health,
     model::{
@@ -15,7 +15,7 @@ use codespan_reporting::diagnostic::Severity;
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::hash::{Hash, Hasher};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -903,7 +903,7 @@ fn project_execution(running: bool, state: &State, ran_before: bool, blocked: bo
     }
 }
 
-fn load_services_from_disk(reload: &ReloadConfig) -> Result<ServiceMap, String> {
+fn load_services_from_disk(reload: &ReloadConfig) -> Result<LoadedServices, String> {
     let raw = crate::config::read_config_file(&reload.config_path)
         .map_err(|err| format!("read {}: {err}", reload.config_path.display()))?;
     let mut diagnostics = Vec::new();
@@ -942,14 +942,14 @@ fn load_services_from_disk(reload: &ReloadConfig) -> Result<ServiceMap, String> 
             reload.config_path.display()
         ));
     }
-    let services = crate::service_map_from_config(&config, &reload.session.environment)
+    let loaded = crate::load_services(&config, &reload.session.environment)
         .map_err(|err| format!("normalize {}: {err}", reload.config_path.display()))?;
-    ServiceGraph::new(&services)
+    ServiceGraph::new(&loaded.services)
         .map_err(|err| format!("validate {}: {err}", reload.config_path.display()))?;
-    Ok(services)
+    Ok(loaded)
 }
 
-async fn load_services_from_disk_async(reload: ReloadConfig) -> Result<ServiceMap, String> {
+async fn load_services_from_disk_async(reload: ReloadConfig) -> Result<LoadedServices, String> {
     tokio::task::spawn_blocking(move || load_services_from_disk(&reload))
         .await
         .map_err(|err| format!("config reload task failed: {err}"))?
@@ -1039,6 +1039,34 @@ fn sorted_variables(
         .collect()
 }
 
+/// The session's own environment: the session-wide `env_file`, read from disk now with the
+/// resolver every configured service uses, and the session's variables over it.
+///
+/// It blocks on the filesystem, so the scheduler runs it on a blocking thread.
+fn session_environment(
+    config_dir: &Path,
+    entries: &[crate::config::EnvFile],
+    session: &crate::SessionEnvironment,
+) -> EnvironmentResult {
+    let supervisor_environment = std::env::vars().collect();
+    let files = crate::service::load_session_env_files(
+        config_dir,
+        entries,
+        &supervisor_environment,
+        session,
+        &mut Vec::new(),
+    )
+    .map_err(|err| {
+        CommandRejection::ConfigReload(format!("cannot resolve the session environment: {err}"))
+    })?;
+    let mut variables = files.into_iter().collect();
+    session.apply_to(&mut variables);
+    Ok(ResolvedEnvironment {
+        variables: sorted_variables(&variables),
+        stale: false,
+    })
+}
+
 /// A command's acknowledgement, held back until the scheduling pass the command triggers has run.
 enum Reply {
     Service(Option<CommandAck>, ServiceCommandResult),
@@ -1066,6 +1094,8 @@ struct SchedulerRuntime {
     writer: SessionModelWriter,
     shutdown: CancellationToken,
     config_dir: PathBuf,
+    /// The session-wide `env_file` of the config last loaded, which follows config reloads.
+    session_env_files: crate::SessionEnvFiles,
     dynamic_policy: DynamicServicesPolicy,
     /// The latched session; holding it keeps the session registered until the scheduler has
     /// drained every service.
@@ -1085,6 +1115,7 @@ struct SchedulerResources {
     writer: SessionModelWriter,
     shutdown: CancellationToken,
     config_dir: PathBuf,
+    session_env_files: crate::SessionEnvFiles,
     dynamic_policy: DynamicServicesPolicy,
     /// The latched session; holding it keeps the session registered until the scheduler has
     /// drained every service.
@@ -1130,6 +1161,7 @@ impl SchedulerRuntime {
             writer,
             shutdown,
             config_dir,
+            session_env_files,
             dynamic_policy,
             session,
             session_status,
@@ -1152,6 +1184,7 @@ impl SchedulerRuntime {
             writer,
             shutdown,
             config_dir,
+            session_env_files,
             dynamic_policy,
             session,
             session_status,
@@ -1559,7 +1592,12 @@ impl SchedulerRuntime {
         spec.normalize()
             .map_err(|err| CommandRejection::InvalidSpec(err.to_string()))?;
         spec.command.extend(params.extra_args.clone());
-        // Dynamic services see the session variables too, and cannot shadow them.
+        // Like a configured service, a dynamic one sits on the session-wide env files as the
+        // last config load resolved them, and sees the session variables too, which it cannot
+        // shadow.
+        let mut environment = self.session_env_files.values.clone();
+        environment.extend(std::mem::take(&mut spec.environment));
+        spec.environment = environment;
         self.session.environment.apply_to(&mut spec.environment);
 
         let working_dir = spec
@@ -2065,14 +2103,14 @@ impl SchedulerRuntime {
         }
     }
 
-    async fn await_loaded_services<F>(
+    async fn await_loaded_services<F, T>(
         &mut self,
         services: &ServiceMap,
         events_rx: &mut mpsc::Receiver<ProcessEvent>,
         load: F,
-    ) -> Result<ServiceMap, String>
+    ) -> Result<T, String>
     where
-        F: Future<Output = Result<ServiceMap, String>>,
+        F: Future<Output = Result<T, String>>,
     {
         // Process exits must keep freeing event-channel capacity during a slow reload, while
         // shutdown must stop waiting so service termination is not coupled to filesystem liveness.
@@ -2105,7 +2143,10 @@ impl SchedulerRuntime {
         let Some(reload) = self.reload_config.clone() else {
             return Ok(());
         };
-        let updated = self
+        let LoadedServices {
+            services: updated,
+            session_env_files,
+        } = self
             .await_loaded_services(services, events_rx, load_services_from_disk_async(reload))
             .await
             .map_err(CommandRejection::ConfigReload)?;
@@ -2153,6 +2194,7 @@ impl SchedulerRuntime {
             }
         }
         *services = merged;
+        self.session_env_files = session_env_files;
         self.sync_all(services);
         self.writer.reorder_services(services.keys());
         self.publish_route_owners(services);
@@ -2411,7 +2453,10 @@ impl SchedulerRuntime {
             )
         })?;
         let config_path = reload.config_path.display().to_string();
-        let updated = self
+        let LoadedServices {
+            services: updated,
+            session_env_files,
+        } = self
             .await_loaded_services(services, events_rx, load_services_from_disk_async(reload))
             .await
             .map_err(CommandRejection::ConfigReload)?;
@@ -2421,6 +2466,7 @@ impl SchedulerRuntime {
         self.validate_reconcile_candidate(services, &updated, &actions)?;
         if !dry_run {
             self.apply_reconcile(services, &updated, &actions);
+            self.session_env_files = session_env_files;
             self.publish_route_owners(services);
         }
         Ok(ReconcileReceipt {
@@ -2681,8 +2727,6 @@ impl SchedulerRuntime {
     }
 
     /// The session's variables, or a service's environment as its live run got it.
-    ///
-    /// Without a live run, a service reports its current definition, which its next run gets.
     fn environment(&self, services: &ServiceMap, service: Option<&ServiceID>) -> EnvironmentResult {
         let Some(service_id) = service else {
             return Ok(ResolvedEnvironment {
@@ -2690,6 +2734,32 @@ impl SchedulerRuntime {
                 stale: false,
             });
         };
+        self.service_environment(services, service_id)
+    }
+
+    /// Answers `ack` with the session's own environment, which reads the session-wide `env_file`
+    /// from disk, on a blocking thread so a slow filesystem never stalls the scheduler.
+    fn session_environment(&self, ack: control::EnvironmentCommandAck) {
+        let config_dir = self.config_dir.clone();
+        let entries = self.session_env_files.entries.clone();
+        let session = std::sync::Arc::clone(&self.session);
+        tokio::task::spawn_blocking(move || {
+            ack.send(session_environment(
+                &config_dir,
+                &entries,
+                &session.environment,
+            ));
+        });
+    }
+
+    /// A service's environment as its live run got it.
+    ///
+    /// Without a live run, a service reports its current definition, which its next run gets.
+    fn service_environment(
+        &self,
+        services: &ServiceMap,
+        service_id: &ServiceID,
+    ) -> EnvironmentResult {
         let service = services
             .get(service_id)
             .ok_or(CommandRejection::UnknownService)?;
@@ -2765,6 +2835,10 @@ impl SchedulerRuntime {
             // A read changes nothing, so it skips the scheduling pass a reply waits for.
             Command::Environment { service, ack } => {
                 ack.send(self.environment(services, service.as_ref()));
+                return None;
+            }
+            Command::SessionEnvironment { ack } => {
+                self.session_environment(ack);
                 return None;
             }
             Command::ResizeAll { cols, rows } => {
@@ -3095,6 +3169,7 @@ pub(crate) struct SchedulerInput {
     pub(crate) writer: SessionModelWriter,
     pub(crate) shutdown: CancellationToken,
     pub(crate) config_dir: PathBuf,
+    pub(crate) session_env_files: crate::SessionEnvFiles,
     pub(crate) dynamic_policy: DynamicServicesPolicy,
     pub(crate) session: std::sync::Arc<crate::session::SessionContext>,
     pub(crate) session_status: crate::SessionStatus,
@@ -3115,6 +3190,7 @@ pub(crate) async fn scheduler(input: SchedulerInput) -> Result<(), crate::graph:
         writer,
         shutdown,
         config_dir,
+        session_env_files,
         dynamic_policy,
         session,
         session_status,
@@ -3140,6 +3216,7 @@ pub(crate) async fn scheduler(input: SchedulerInput) -> Result<(), crate::graph:
             writer,
             shutdown: shutdown.clone(),
             config_dir,
+            session_env_files,
             dynamic_policy,
             session,
             session_status,

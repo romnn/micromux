@@ -218,6 +218,25 @@ fn print_health_attempt(attempt: &micromux::HealthAttempt) {
     }
 }
 
+fn print_reconcile(receipt: &micromux::ReconcileReceipt) {
+    println!(
+        "reconcile {}{}",
+        receipt.config_path,
+        if receipt.dry_run { " (dry run)" } else { "" }
+    );
+    if receipt.actions.is_empty() {
+        println!("  no changes");
+    }
+    for action in &receipt.actions {
+        let action_name = match action.action {
+            micromux::ReconcileActionKind::Added => "added",
+            micromux::ReconcileActionKind::Removed => "removed",
+            micromux::ReconcileActionKind::Changed => "changed",
+        };
+        println!("  {action_name:<7} {}: {}", action.service, action.detail);
+    }
+}
+
 fn print_response(response: &Response) -> Result<(), crate::Error> {
     match response {
         Response::Services(services) => print_services(services),
@@ -290,24 +309,7 @@ fn print_response(response: &Response) -> Result<(), crate::Error> {
         Response::DynamicService(receipt) => {
             println!("{}", dynamic_receipt_line(receipt));
         }
-        Response::Reconcile(receipt) => {
-            println!(
-                "reconcile {}{}",
-                receipt.config_path,
-                if receipt.dry_run { " (dry run)" } else { "" }
-            );
-            if receipt.actions.is_empty() {
-                println!("  no changes");
-            }
-            for action in &receipt.actions {
-                let action_name = match action.action {
-                    micromux::ReconcileActionKind::Added => "added",
-                    micromux::ReconcileActionKind::Removed => "removed",
-                    micromux::ReconcileActionKind::Changed => "changed",
-                };
-                println!("  {action_name:<7} {}: {}", action.service, action.detail);
-            }
-        }
+        Response::Reconcile(receipt) => print_reconcile(receipt),
         Response::Error { code, message } => {
             return Err(crate::Error::Message(format!("{code:?}: {message}")));
         }
@@ -315,7 +317,10 @@ fn print_response(response: &Response) -> Result<(), crate::Error> {
             println!("session is shutting down");
         }
         // `ctl` never subscribes, asks for environment values, or drives service terminals.
-        Response::Change(_) | Response::Environment(_) | Response::TerminalQueued => {}
+        Response::Change(_)
+        | Response::Environment(_)
+        | Response::EnvironmentFile { .. }
+        | Response::TerminalQueued => {}
     }
     Ok(())
 }

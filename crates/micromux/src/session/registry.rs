@@ -165,6 +165,26 @@ impl PortRegistry {
         Ok(directory)
     }
 
+    /// Whether a session for `config_path` is live: it holds the instance lock it takes when it
+    /// establishes its ports until it has stopped every service and exits.
+    ///
+    /// A stopping session still counts while its services drain, unlike its config's owner
+    /// lock, which it releases as it starts stopping.
+    /// The probe runs under the registry lock, as every liveness probe does, so it can never make
+    /// a starting session look like a duplicate.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError::NoStateDirectory`] when the registry cannot be located,
+    /// [`SessionError::RegistryLocked`] when the registry lock stays held, and
+    /// [`SessionError::Io`] when the instance lock cannot be probed.
+    pub fn is_live(&self, config_path: &Path) -> Result<bool, SessionError> {
+        let directory = self.directory()?;
+        let _registry_lock = lock_registry(&directory.join(REGISTRY_LOCK), self.lock_timeout)?;
+        let path = directory.join(format!("{}.lock", config_path_key(config_path)));
+        owner_is_live(&path).map_err(|source| SessionError::Io { path, source })
+    }
+
     /// The assignment persisted for `config_path`, read without locking or reserving anything.
     ///
     /// Records are replaced atomically, so an unlocked read sees either the old or the new one.
@@ -1179,6 +1199,28 @@ mod tests {
         )?;
 
         assert!(!record.exists());
+        Ok(())
+    }
+
+    /// A session is live from establishing its ports until its lease goes, which it keeps while
+    /// its services drain, and a session for another config never counts.
+    #[test]
+    fn a_session_is_live_while_it_holds_its_lease() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let registry = PortRegistry::ignoring_host_listeners(directory.path().join("registry"));
+        let config = Path::new("/projects/live/micromux.yaml");
+        let other = Path::new("/projects/other/micromux.yaml");
+
+        // Never started
+        assert!(!registry.is_live(config)?);
+
+        let (_ports, lease) = registry.acquire(config, "live", &[], &[], &DEFAULT_PORT_RANGE)?;
+        assert!(registry.is_live(config)?);
+        assert!(!registry.is_live(other)?);
+
+        // Stopped
+        drop(lease);
+        assert!(!registry.is_live(config)?);
         Ok(())
     }
 

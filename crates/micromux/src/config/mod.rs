@@ -289,6 +289,9 @@ pub struct Config {
     pub healthcheck_defaults: HealthCheckDefaults,
     /// Session identity and allocated ports, latched when a session starts.
     pub session: SessionConfig,
+    /// The session-wide `env_file`, which every service loads beneath its own `env_file` and
+    /// `environment`, and which the session's own environment includes.
+    pub env_file: Vec<EnvFile>,
     /// Service definitions keyed by service name.
     pub services: IndexMap<Spanned<String>, Service>,
 }

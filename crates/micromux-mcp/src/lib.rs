@@ -24,8 +24,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use micromux::{DependencyFailure, Desired, Execution, Health, HealthAttempt, ServiceSnapshot};
 use micromux_control::{
     Client, ControlEndpoint, ControlError, ENVIRONMENT_PROTOCOL_VERSION, ErrorCode, Request,
-    Response, SessionInfo, SocketProbeDetails, endpoint_for, transport_supported,
-    usable_runtime_dirs,
+    Response, SESSION_ENV_FILE_PROTOCOL_VERSION, SessionInfo, SocketProbeDetails, endpoint_for,
+    transport_supported, usable_runtime_dirs,
 };
 use regex::{Regex, RegexBuilder};
 use rmcp::{
@@ -101,8 +101,8 @@ given, tools target the current project's session. Use `find_service` to locate 
 sessions; service-scoped errors also point at matching sibling sessions. Read a session's browser \
 URLs and allocated ports from `get_session_urls` instead of guessing them. When you run a dev task \
 yourself, such as a migration or a seed against the session's database, read the session's \
-variables or a service's resolved environment with `get_session_env`; a service's values come back \
-only for the `names` you ask for. `start_dynamic_service` remains the way to run a command under \
+environment or a service's resolved environment with `get_session_env`; values come back only for \
+the `names` you ask for. `start_dynamic_service` remains the way to run a command under \
 the session. Validate a candidate file with `validate_config`; for an active session's on-disk \
 edits, call `reconcile_config` with \
 `dry_run=true` before applying it. Reconciliation adds, retires, and updates configured services but \
@@ -154,12 +154,12 @@ struct SessionEnvArgs {
     #[serde(default)]
     session: Option<String>,
     /// The id of a service whose resolved environment to read; omit for the session's own
-    /// variables.
+    /// environment.
     #[serde(default)]
     service: Option<String>,
     /// Variables to read.
     ///
-    /// Without them, a service's environment returns only the names.
+    /// Without them, only the names come back, because values may hold secrets from env files.
     #[serde(default)]
     names: Option<Vec<String>>,
 }
@@ -692,7 +692,7 @@ struct SessionUrlsResult {
 struct SessionEnvResult {
     #[serde(flatten)]
     session_ref: SessionRef,
-    /// The service whose environment this is; absent for the session's own variables.
+    /// The service whose environment this is; absent for the session's own environment.
     #[serde(skip_serializing_if = "Option::is_none")]
     service: Option<String>,
     /// For a service, whether its definition changed since its running process started; the
@@ -1496,13 +1496,14 @@ impl McpServer {
     #[tool(
         description = "Read a running session's environment, to run a dev task yourself with \
         exactly what its services get, such as a migration or seed against the session's \
-        database. Without `service`, returns the session's own variables with their values: \
-        MICROMUX_SESSION, MICROMUX_SESSION_DOMAIN, MICROMUX_PROXY_PORT, MICROMUX_HOST_SUFFIX, \
-        and every allocated port. With `service` (its id), returns that service's resolved \
-        env_file and environment entries with the session variables applied, as its running \
-        process got them; `stale` says whether its config changed since. A service's values may \
-        hold secrets, so it returns only names unless you pass `names`. Requested names that are \
-        not set are listed in `missing`. The result names the session and config it read from."
+        database. Without `service`, returns the session's own environment: the top-level \
+        env_file, read from disk now, with the session variables over it (MICROMUX_SESSION, \
+        MICROMUX_SESSION_DOMAIN, MICROMUX_PROXY_PORT, MICROMUX_HOST_SUFFIX, and every allocated \
+        port). With `service` (its id), returns that service's resolved env_file and \
+        environment entries with the session variables applied, as its running process got \
+        them; `stale` says whether its config changed since. Values may hold secrets from env \
+        files, so it returns only names unless you pass `names`. Requested names that are not \
+        set are listed in `missing`. The result names the session and config it read from."
     )]
     async fn get_session_env(
         &self,
@@ -1526,14 +1527,19 @@ impl McpServer {
                 None,
             ));
         }
-        let response = send_request(
-            &resolved.endpoint,
-            Request::GetEnvironment {
-                service: args.service.clone(),
-            },
-        )
-        .await
-        .map_err(error_data)?;
+        // A session too old for a session-wide env file has its variables alone for its own
+        // environment.
+        let request =
+            if args.service.is_none() && version.supports(SESSION_ENV_FILE_PROTOCOL_VERSION) {
+                Request::GetSessionEnvironment
+            } else {
+                Request::GetEnvironment {
+                    service: args.service.clone(),
+                }
+            };
+        let response = send_request(&resolved.endpoint, request)
+            .await
+            .map_err(error_data)?;
         let environment = match &args.service {
             Some(service) => {
                 service_result(&self.discovery, service, convert::environment(response)).await?
@@ -1553,21 +1559,17 @@ impl McpServer {
             missing: Vec::new(),
             hint: None,
         };
-        match args.names {
-            Some(names) => {
-                result.missing = names
-                    .iter()
-                    .filter(|name| !variables.contains_key(*name))
-                    .cloned()
-                    .collect();
-                variables.retain(|key, _| names.contains(key));
-                result.variables = Some(variables);
-            }
-            None if result.service.is_some() => {
-                result.names = Some(variables.into_keys().collect());
-                result.hint = Some("pass `names` to read values");
-            }
-            None => result.variables = Some(variables),
+        if let Some(names) = args.names {
+            result.missing = names
+                .iter()
+                .filter(|name| !variables.contains_key(*name))
+                .cloned()
+                .collect();
+            variables.retain(|key, _| names.contains(key));
+            result.variables = Some(variables);
+        } else {
+            result.names = Some(variables.into_keys().collect());
+            result.hint = Some("pass `names` to read values");
         }
         Ok(Json(result))
     }
@@ -4204,15 +4206,15 @@ services:
         session.finish().await
     }
 
-    /// The session's variables come back with values, a service's only by name unless the
-    /// caller asks for names, and every result says which session answered.
+    /// Boots a session whose session-wide and service env files hold secrets, and returns it
+    /// with its selector.
     #[cfg(unix)]
-    #[tokio::test]
-    async fn get_session_env_discloses_service_values_only_when_asked() -> eyre::Result<()> {
-        let project = tempfile::tempdir()?;
-        std::fs::write(project.path().join("svc.env"), "FROM_ENV_FILE=from-file\n")?;
+    fn boot_env_session(project: &std::path::Path) -> eyre::Result<(RunningMcpSession, String)> {
+        std::fs::write(project.join("svc.env"), "FROM_ENV_FILE=from-file\n")?;
+        std::fs::write(project.join("session.env"), "SESSION_SECRET=s3ss10n\n")?;
         let yaml = r#"version: 1
 allocate_ports: [MCP_ENV_TEST_PORT]
+env_file: session.env
 services:
   svc:
     command: ["sh", "-c", "sleep 60"]
@@ -4220,42 +4222,91 @@ services:
     environment:
       SECRET: "s3cr3t"
 "#;
-        let (session, selector) = boot_mcp_session_with_yaml(project.path(), "mcp-env-test", yaml)?;
-        let mut server = session.server();
-        server.cwd = project.path().to_path_buf();
-        let env = |service: Option<&str>, names: Option<&[&str]>| SessionEnvArgs {
-            session: Some(selector.clone()),
+        boot_mcp_session_with_yaml(project, "mcp-env-test", yaml)
+    }
+
+    /// `get_session_env` arguments for the session `selector` names.
+    #[cfg(unix)]
+    fn env_args(selector: &str, service: Option<&str>, names: Option<&[&str]>) -> SessionEnvArgs {
+        SessionEnvArgs {
+            session: Some(selector.to_string()),
             service: service.map(str::to_string),
             names: names.map(|names| names.iter().map(ToString::to_string).collect()),
-        };
+        }
+    }
 
-        // Session variables, with values
-        let Json(pins) = server
-            .get_session_env(Parameters(env(None, None)))
+    /// The session's own environment, its env file included, comes back by name only unless
+    /// the caller asks for names, and every result says which session answered.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn get_session_env_discloses_session_values_only_when_asked() -> eyre::Result<()> {
+        let project = tempfile::tempdir()?;
+        let (session, selector) = boot_env_session(project.path())?;
+        let mut server = session.server();
+        server.cwd = project.path().to_path_buf();
+
+        // Names only, so the env file's secret stays out of the transcript
+        let Json(names_only) = server
+            .get_session_env(Parameters(env_args(&selector, None, None)))
             .await
             .map_err(|err| eyre::eyre!(err.message))?;
-        assert_eq!(pins.session_ref.session, "mcp-env-test");
+        assert_eq!(names_only.session_ref.session, "mcp-env-test");
         assert_eq!(
-            pins.session_ref.config_path,
+            names_only.session_ref.config_path,
             project
                 .path()
                 .canonicalize()?
                 .join("micromux.yaml")
                 .to_string_lossy()
         );
-        let variables = pins
+        assert!(!serde_json::to_string(&names_only)?.contains("s3ss10n"));
+        assert_eq!(
+            (names_only.service, names_only.stale, names_only.variables),
+            (None, None, None)
+        );
+        let names = names_only
+            .names
+            .ok_or_else(|| eyre::eyre!("session names are missing"))?;
+        for name in ["MCP_ENV_TEST_PORT", "MICROMUX_SESSION", "SESSION_SECRET"] {
+            assert!(names.iter().any(|listed| listed == name), "{name}");
+        }
+
+        // Values for the requested names
+        let Json(values) = server
+            .get_session_env(Parameters(env_args(
+                &selector,
+                None,
+                Some(&["MCP_ENV_TEST_PORT", "SESSION_SECRET"]),
+            )))
+            .await
+            .map_err(|err| eyre::eyre!(err.message))?;
+        let variables = values
             .variables
             .ok_or_else(|| eyre::eyre!("session values are missing"))?;
         let port = variables
             .get("MCP_ENV_TEST_PORT")
             .ok_or_else(|| eyre::eyre!("the allocated port is missing"))?;
         assert!(port.parse::<u16>().is_ok(), "{port}");
-        assert!(variables.contains_key("MICROMUX_SESSION"));
-        assert_eq!((pins.service, pins.stale, pins.names), (None, None, None));
+        assert_eq!(
+            variables.get("SESSION_SECRET").map(String::as_str),
+            Some("s3ss10n")
+        );
 
-        // A service's names only, so its secrets stay out of the transcript
+        session.finish().await
+    }
+
+    /// A service's environment comes back by name only unless the caller asks for names.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn get_session_env_discloses_service_values_only_when_asked() -> eyre::Result<()> {
+        let project = tempfile::tempdir()?;
+        let (session, selector) = boot_env_session(project.path())?;
+        let mut server = session.server();
+        server.cwd = project.path().to_path_buf();
+
+        // Names only, so its secrets stay out of the transcript
         let Json(names_only) = server
-            .get_session_env(Parameters(env(Some("svc"), None)))
+            .get_session_env(Parameters(env_args(&selector, Some("svc"), None)))
             .await
             .map_err(|err| eyre::eyre!(err.message))?;
         assert!(!serde_json::to_string(&names_only)?.contains("s3cr3t"));
@@ -4264,13 +4315,22 @@ services:
         let names = names_only
             .names
             .ok_or_else(|| eyre::eyre!("service names are missing"))?;
-        for name in ["FROM_ENV_FILE", "MCP_ENV_TEST_PORT", "SECRET"] {
+        for name in [
+            "FROM_ENV_FILE",
+            "MCP_ENV_TEST_PORT",
+            "SECRET",
+            "SESSION_SECRET",
+        ] {
             assert!(names.iter().any(|listed| listed == name), "{name}");
         }
 
         // Values for the requested names, and the ones that are not set
         let Json(values) = server
-            .get_session_env(Parameters(env(Some("svc"), Some(&["SECRET", "NOT_SET"]))))
+            .get_session_env(Parameters(env_args(
+                &selector,
+                Some("svc"),
+                Some(&["SECRET", "NOT_SET"]),
+            )))
             .await
             .map_err(|err| eyre::eyre!(err.message))?;
         assert_eq!(
@@ -4285,7 +4345,7 @@ services:
 
         // An unknown service is a typed error.
         let unknown = server
-            .get_session_env(Parameters(env(Some("nope"), None)))
+            .get_session_env(Parameters(env_args(&selector, Some("nope"), None)))
             .await;
         assert!(
             unknown
