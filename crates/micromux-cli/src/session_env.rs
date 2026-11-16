@@ -263,10 +263,14 @@ async fn not_running_or(
 ) -> Result<Option<(Client, SessionInfo)>, crate::Error> {
     let working_dir = std::env::current_dir()?;
     let config_path = crate::control::resolve_config_path(config, &working_dir).await?;
-    if !micromux_control::project_claimed(&config_path)?
-        && !micromux::PortRegistry::user().is_live(&config_path)?
-    {
-        return Ok(None);
+    // The registry is asked while the hold keeps a successor from claiming the config, so a
+    // stopping session that exits meanwhile cannot hand over unseen to one that is starting.
+    if let Some(unclaimed) = micromux_control::hold_unclaimed_project(&config_path)? {
+        let live = micromux::PortRegistry::user().is_live(&config_path)?;
+        drop(unclaimed);
+        if !live {
+            return Ok(None);
+        }
     }
     Err(crate::Error::Message(format!(
         "{err}\nnote: a session runs for {}, so --if-running does not skip it; it is starting, \

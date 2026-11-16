@@ -229,8 +229,33 @@ pub(super) fn endpoint_owner_lock_held(endpoint: &ControlEndpoint) -> Result<boo
     }
 }
 
-pub(super) fn project_claimed(config_path: &CanonicalConfigPath) -> Result<bool, ControlError> {
-    lock_held(&project_lock_path(config_path)?)
+pub(super) fn hold_unclaimed_project(
+    config_path: &CanonicalConfigPath,
+) -> Result<Option<super::UnclaimedProject>, ControlError> {
+    hold_unclaimed_project_at(&project_lock_path(config_path)?)
+}
+
+/// Takes the owner lock at `lock_path` shared unless a session holds it.
+///
+/// A missing lock file is created as a claim creates it, so a claim made while the hold lasts
+/// locks the same file and waits the hold out in [`try_lock_owner`].
+pub(super) fn hold_unclaimed_project_at(
+    lock_path: &Path,
+) -> Result<Option<super::UnclaimedProject>, ControlError> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(lock_path)?;
+    match fs2::FileExt::try_lock_shared(&lock) {
+        Ok(()) => Ok(Some(super::UnclaimedProject { lock })),
+        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+        Err(err) => Err(err.into()),
+    }
 }
 
 /// Opens the endpoint's ownership lock file, creating it when missing.
@@ -1524,8 +1549,8 @@ mod tests {
         RESPONSE_MAX_BYTES, SubscriptionPolicy, bind_project, bound_follow_response_lines,
         bound_follow_response_lines_page, bound_health_attempt, bound_health_history,
         bound_tail_response_lines, claim_project_at, describe, dispatch, encoded_len,
-        lag_replay_changes, log_read_error, logs_fit, open_endpoint_lock, prune_dead_socket,
-        response_within_frame, stream_changes,
+        hold_unclaimed_project_at, lag_replay_changes, log_read_error, logs_fit,
+        open_endpoint_lock, prune_dead_socket, response_within_frame, stream_changes,
     };
 
     fn line(seq: u64, len: usize) -> LogLine {
@@ -1809,6 +1834,33 @@ mod tests {
         assert!(bound_follow_response_lines(&mut lines, None));
         assert!(logs_fit(&lines, true, None));
         assert_eq!(lines.first().map(|line| line.seq), Some(1));
+    }
+
+    /// A hold on an unclaimed config keeps a starting session from claiming it until the hold
+    /// ends, so what the holder checks meanwhile cannot be overtaken by a successor, and a
+    /// claimed config gives no hold.
+    #[test]
+    fn a_hold_on_an_unclaimed_project_holds_off_claims() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let lock = directory.path().join("project.session.lock");
+
+        let hold = hold_unclaimed_project_at(&lock)?
+            .ok_or_else(|| eyre::eyre!("an unclaimed config gave no hold"))?;
+        let claim = std::thread::scope(|scope| -> eyre::Result<_> {
+            let claiming = scope.spawn(|| claim_project_at(&lock));
+            // A claim that did not wait for the hold would be done long before this.
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            eyre::ensure!(!claiming.is_finished(), "a claim overtook the hold");
+            drop(hold);
+            Ok(claiming
+                .join()
+                .map_err(|_| eyre::eyre!("claiming panicked"))??)
+        })?;
+
+        assert!(hold_unclaimed_project_at(&lock)?.is_none());
+        drop(claim);
+        assert!(hold_unclaimed_project_at(&lock)?.is_some());
+        Ok(())
     }
 
     /// The owner lock is claimed before any endpoint exists, a second claim names its holder,

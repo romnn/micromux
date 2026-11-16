@@ -1,7 +1,7 @@
 use crate::cleanup::CleanupOutcome;
 use crate::{
-    DynamicOrigin, DynamicServiceParams, DynamicServicesPolicy, Lease, LogDisplay, ReloadConfig,
-    ServiceMap, ServiceOrigin, ServiceSpec,
+    DynamicOrigin, DynamicServiceParams, DynamicServicesPolicy, Lease, LoadedServices, LogDisplay,
+    ReloadConfig, ServiceMap, ServiceOrigin, ServiceSpec,
     graph::ServiceGraph,
     health_check::Health,
     model::{
@@ -903,15 +903,7 @@ fn project_execution(running: bool, state: &State, ran_before: bool, blocked: bo
     }
 }
 
-/// What a config reload yields for a running session.
-#[derive(Debug)]
-pub(crate) struct LoadedConfig {
-    services: ServiceMap,
-    /// The session-wide `env_file` entries, which the session's own environment reads.
-    session_env_files: Vec<crate::config::EnvFile>,
-}
-
-fn load_services_from_disk(reload: &ReloadConfig) -> Result<LoadedConfig, String> {
+fn load_services_from_disk(reload: &ReloadConfig) -> Result<LoadedServices, String> {
     let raw = crate::config::read_config_file(&reload.config_path)
         .map_err(|err| format!("read {}: {err}", reload.config_path.display()))?;
     let mut diagnostics = Vec::new();
@@ -950,17 +942,14 @@ fn load_services_from_disk(reload: &ReloadConfig) -> Result<LoadedConfig, String
             reload.config_path.display()
         ));
     }
-    let services = crate::service_map_from_config(&config, &reload.session.environment)
+    let loaded = crate::load_services(&config, &reload.session.environment)
         .map_err(|err| format!("normalize {}: {err}", reload.config_path.display()))?;
-    ServiceGraph::new(&services)
+    ServiceGraph::new(&loaded.services)
         .map_err(|err| format!("validate {}: {err}", reload.config_path.display()))?;
-    Ok(LoadedConfig {
-        services,
-        session_env_files: config.config.env_file,
-    })
+    Ok(loaded)
 }
 
-async fn load_services_from_disk_async(reload: ReloadConfig) -> Result<LoadedConfig, String> {
+async fn load_services_from_disk_async(reload: ReloadConfig) -> Result<LoadedServices, String> {
     tokio::task::spawn_blocking(move || load_services_from_disk(&reload))
         .await
         .map_err(|err| format!("config reload task failed: {err}"))?
@@ -1050,15 +1039,15 @@ fn sorted_variables(
         .collect()
 }
 
-/// The values of the session-wide `env_file`, read from disk now with the resolver every
-/// configured service uses.
+/// The session's own environment: the session-wide `env_file`, read from disk now with the
+/// resolver every configured service uses, and the session's variables over it.
 ///
-/// The session's variables are not among them; the caller applies them on top.
-fn session_env_file_values(
+/// It blocks on the filesystem, so the scheduler runs it on a blocking thread.
+fn session_environment(
     config_dir: &Path,
     entries: &[crate::config::EnvFile],
     session: &crate::SessionEnvironment,
-) -> Result<indexmap::IndexMap<String, String>, CommandRejection> {
+) -> EnvironmentResult {
     let supervisor_environment = std::env::vars().collect();
     let files = crate::service::load_session_env_files(
         config_dir,
@@ -1070,19 +1059,7 @@ fn session_env_file_values(
     .map_err(|err| {
         CommandRejection::ConfigReload(format!("cannot resolve the session environment: {err}"))
     })?;
-    Ok(files.into_iter().collect())
-}
-
-/// The session's own environment: the session-wide `env_file`, read from disk now, and the
-/// session's variables over it.
-///
-/// It blocks on the filesystem, so the scheduler runs it on a blocking thread.
-fn session_environment(
-    config_dir: &Path,
-    entries: &[crate::config::EnvFile],
-    session: &crate::SessionEnvironment,
-) -> EnvironmentResult {
-    let mut variables = session_env_file_values(config_dir, entries, session)?;
+    let mut variables = files.into_iter().collect();
     session.apply_to(&mut variables);
     Ok(ResolvedEnvironment {
         variables: sorted_variables(&variables),
@@ -1117,9 +1094,8 @@ struct SchedulerRuntime {
     writer: SessionModelWriter,
     shutdown: CancellationToken,
     config_dir: PathBuf,
-    /// The session-wide `env_file` entries of the config last loaded, which follow config
-    /// reloads.
-    session_env_files: Vec<crate::config::EnvFile>,
+    /// The session-wide `env_file` of the config last loaded, which follows config reloads.
+    session_env_files: crate::SessionEnvFiles,
     dynamic_policy: DynamicServicesPolicy,
     /// The latched session; holding it keeps the session registered until the scheduler has
     /// drained every service.
@@ -1139,7 +1115,7 @@ struct SchedulerResources {
     writer: SessionModelWriter,
     shutdown: CancellationToken,
     config_dir: PathBuf,
-    session_env_files: Vec<crate::config::EnvFile>,
+    session_env_files: crate::SessionEnvFiles,
     dynamic_policy: DynamicServicesPolicy,
     /// The latched session; holding it keeps the session registered until the scheduler has
     /// drained every service.
@@ -1616,13 +1592,10 @@ impl SchedulerRuntime {
         spec.normalize()
             .map_err(|err| CommandRejection::InvalidSpec(err.to_string()))?;
         spec.command.extend(params.extra_args.clone());
-        // Like a configured service, a dynamic one sits on the session-wide env files, read now,
-        // and sees the session variables too, which it cannot shadow.
-        let mut environment = session_env_file_values(
-            &self.config_dir,
-            &self.session_env_files,
-            &self.session.environment,
-        )?;
+        // Like a configured service, a dynamic one sits on the session-wide env files as the
+        // last config load resolved them, and sees the session variables too, which it cannot
+        // shadow.
+        let mut environment = self.session_env_files.values.clone();
         environment.extend(std::mem::take(&mut spec.environment));
         spec.environment = environment;
         self.session.environment.apply_to(&mut spec.environment);
@@ -2170,7 +2143,7 @@ impl SchedulerRuntime {
         let Some(reload) = self.reload_config.clone() else {
             return Ok(());
         };
-        let LoadedConfig {
+        let LoadedServices {
             services: updated,
             session_env_files,
         } = self
@@ -2480,7 +2453,7 @@ impl SchedulerRuntime {
             )
         })?;
         let config_path = reload.config_path.display().to_string();
-        let LoadedConfig {
+        let LoadedServices {
             services: updated,
             session_env_files,
         } = self
@@ -2768,7 +2741,7 @@ impl SchedulerRuntime {
     /// from disk, on a blocking thread so a slow filesystem never stalls the scheduler.
     fn session_environment(&self, ack: control::EnvironmentCommandAck) {
         let config_dir = self.config_dir.clone();
-        let entries = self.session_env_files.clone();
+        let entries = self.session_env_files.entries.clone();
         let session = std::sync::Arc::clone(&self.session);
         tokio::task::spawn_blocking(move || {
             ack.send(session_environment(
@@ -3196,7 +3169,7 @@ pub(crate) struct SchedulerInput {
     pub(crate) writer: SessionModelWriter,
     pub(crate) shutdown: CancellationToken,
     pub(crate) config_dir: PathBuf,
-    pub(crate) session_env_files: Vec<crate::config::EnvFile>,
+    pub(crate) session_env_files: crate::SessionEnvFiles,
     pub(crate) dynamic_policy: DynamicServicesPolicy,
     pub(crate) session: std::sync::Arc<crate::session::SessionContext>,
     pub(crate) session_status: crate::SessionStatus,

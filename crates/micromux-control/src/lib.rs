@@ -57,12 +57,13 @@ pub use select::{
     config_for_target, probe_detail, resolve_selector, resolve_selector_in_runtime_dirs,
     resolve_selector_with_statuses, session_config_path_is_under, session_matches_config_path,
 };
-#[cfg(unix)]
-pub use server::claim_project_at;
 pub use server::{
     ClaimError, ControlServer, EndpointGuard, ProjectClaim, SESSION_ALREADY_STARTING,
-    SessionIdentity, bind, bind_project, claim_project, endpoint_owner_lock_held, project_claimed,
+    SessionIdentity, UnclaimedProject, bind, bind_project, claim_project, endpoint_owner_lock_held,
+    hold_unclaimed_project,
 };
+#[cfg(unix)]
+pub use server::{claim_project_at, hold_unclaimed_project_at};
 
 /// Maximum size of a single protocol frame. Oversized frames are rejected, not buffered, so a
 /// broken peer cannot pin memory.

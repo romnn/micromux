@@ -34,9 +34,9 @@ pub(super) fn endpoint_owner_lock_held(_endpoint: &ControlEndpoint) -> Result<bo
     Err(ControlError::Unsupported)
 }
 
-pub(super) fn project_claimed(
+pub(super) fn hold_unclaimed_project(
     _config_path: &crate::CanonicalConfigPath,
-) -> Result<bool, ControlError> {
+) -> Result<Option<super::UnclaimedProject>, ControlError> {
     Err(ControlError::Unsupported)
 }
 

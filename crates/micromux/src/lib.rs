@@ -212,26 +212,29 @@ impl ToDiagnostics for MaterializationFailure {
 /// The services that materialized, plus what went wrong or was skipped for the rest.
 struct MaterializedServices {
     services: ServiceMap,
+    /// The session-wide `env_file` values the services sit on.
+    session_env_values: indexmap::IndexMap<String, String>,
     errors: Vec<ServiceError>,
     skipped_env_files: Vec<SkippedEnvFile>,
 }
 
-impl MaterializedServices {
-    fn into_result(self) -> Result<ServiceMap, MaterializationFailure> {
-        let Self {
-            services,
-            errors,
-            skipped_env_files,
-        } = self;
-        if errors.is_empty() {
-            Ok(services)
-        } else {
-            Err(MaterializationFailure {
-                errors,
-                skipped_env_files,
-            })
-        }
-    }
+/// The session-wide `env_file` of the config a session last loaded.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SessionEnvFiles {
+    /// The entries, which the session's own environment reads from disk for every query.
+    pub(crate) entries: Vec<config::EnvFile>,
+    /// Their values as that load resolved them, without the session's variables.
+    ///
+    /// Every service materialized by that load, and every dynamic service started since, sits
+    /// on these, so starting one never reads a file on the scheduler's thread.
+    pub(crate) values: indexmap::IndexMap<String, String>,
+}
+
+/// The services of one config load, and the session-wide `env_file` they sit on.
+#[derive(Debug)]
+pub(crate) struct LoadedServices {
+    pub(crate) services: ServiceMap,
+    pub(crate) session_env_files: SessionEnvFiles,
 }
 
 /// Materialize every configured service, keeping the errors of the ones that fail.
@@ -261,6 +264,7 @@ fn materialize_services<F>(
         Err(err) => {
             return MaterializedServices {
                 services: ServiceMap::new(),
+                session_env_values: indexmap::IndexMap::new(),
                 errors: vec![err],
                 skipped_env_files,
             };
@@ -299,16 +303,36 @@ fn materialize_services<F>(
     }
     MaterializedServices {
         services,
+        session_env_values: session_files.into_iter().collect(),
         errors,
         skipped_env_files,
     }
 }
 
-pub(crate) fn service_map_from_config<F>(
+/// Materialize every configured service, or report every one that fails.
+pub(crate) fn load_services<F>(
     config_file: &config::ConfigFile<F>,
     pinned: &SessionEnvironment,
-) -> Result<ServiceMap, MaterializationFailure> {
-    materialize_services(config_file, pinned).into_result()
+) -> Result<LoadedServices, MaterializationFailure> {
+    let MaterializedServices {
+        services,
+        session_env_values,
+        errors,
+        skipped_env_files,
+    } = materialize_services(config_file, pinned);
+    if !errors.is_empty() {
+        return Err(MaterializationFailure {
+            errors,
+            skipped_env_files,
+        });
+    }
+    Ok(LoadedServices {
+        services,
+        session_env_files: SessionEnvFiles {
+            entries: config_file.config.env_file.clone(),
+            values: session_env_values,
+        },
+    })
 }
 
 /// Severity of one config-validation diagnostic.
@@ -456,6 +480,7 @@ fn validate_materialization(
         services: service_map,
         errors,
         skipped_env_files,
+        ..
     } = materialize_services(config, &session.environment());
     if errors.is_empty()
         && let Err(route_errors) = session::resolve_routes(
@@ -526,9 +551,8 @@ pub struct Micromux {
     routes: Vec<Route>,
     reload_config: Option<ReloadConfig>,
     config_dir: PathBuf,
-    /// The session-wide `env_file` entries, which the session's own environment reads from disk
-    /// on every request.
-    session_env_files: Vec<config::EnvFile>,
+    /// The session-wide `env_file` the services sit on.
+    session_env_files: SessionEnvFiles,
     dynamic_policy: DynamicServicesPolicy,
     default_log_retention: LogRetention,
     default_log_display: LogDisplay,
@@ -623,7 +647,10 @@ impl Micromux {
         session: Session,
     ) -> Result<Self, Error> {
         let session = Arc::new(session.into_context());
-        let services = service_map_from_config(config_file, &session.environment)?;
+        let LoadedServices {
+            services,
+            session_env_files,
+        } = load_services(config_file, &session.environment)?;
         let routes = session::resolve_routes(&session, &services, &std::env::vars().collect())
             .map_err(|errors| RouteFailure { errors })?;
         let unbounded_services = services
@@ -665,7 +692,7 @@ impl Micromux {
             routes,
             reload_config,
             config_dir: config_file.config_dir.clone(),
-            session_env_files: config_file.config.env_file.clone(),
+            session_env_files,
             dynamic_policy,
             default_log_retention: config_file.config.log_retention,
             default_log_display: config_file.config.log_display.clone(),

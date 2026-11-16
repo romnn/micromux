@@ -36,7 +36,7 @@ async fn run_test_scheduler(
         writer,
         shutdown,
         config_dir: Path::new(".").to_path_buf(),
-        session_env_files: Vec::new(),
+        session_env_files: crate::SessionEnvFiles::default(),
         dynamic_policy: DynamicServicesPolicy::default(),
         session: std::sync::Arc::new(crate::session::SessionContext::unconfigured()),
         session_status: unrouted_session_status(),
@@ -135,18 +135,18 @@ fn spawn_harness_with_session(
         config_dir,
         dynamic_policy,
         session,
-        Vec::new(),
+        crate::SessionEnvFiles::default(),
     )
 }
 
-/// A harness whose session also has the session-wide `env_file` entries `session_env_files`.
+/// A harness whose session also has the session-wide `env_file` `session_env_files`.
 fn spawn_harness_with_session_env_files(
     services: ServiceMap,
     reload_config: Option<ReloadConfig>,
     config_dir: PathBuf,
     dynamic_policy: DynamicServicesPolicy,
     session: std::sync::Arc<crate::session::SessionContext>,
-    session_env_files: Vec<config::EnvFile>,
+    session_env_files: crate::SessionEnvFiles,
 ) -> Harness {
     raise_test_file_descriptor_limit();
     let (commands_tx, commands_rx) = mpsc::channel(64);
@@ -204,7 +204,7 @@ async fn config_reload_wait_keeps_draining_process_events() -> eyre::Result<()> 
             writer,
             shutdown: CancellationToken::new(),
             config_dir: PathBuf::new(),
-            session_env_files: Vec::new(),
+            session_env_files: crate::SessionEnvFiles::default(),
             dynamic_policy: DynamicServicesPolicy::default(),
             session: std::sync::Arc::new(crate::session::SessionContext::unconfigured()),
             session_status: unrouted_session_status(),
@@ -260,7 +260,7 @@ async fn config_reload_wait_yields_to_session_shutdown() -> eyre::Result<()> {
             writer,
             shutdown: shutdown.clone(),
             config_dir: PathBuf::new(),
-            session_env_files: Vec::new(),
+            session_env_files: crate::SessionEnvFiles::default(),
             dynamic_policy: DynamicServicesPolicy::default(),
             session: std::sync::Arc::new(crate::session::SessionContext::unconfigured()),
             session_status: unrouted_session_status(),
@@ -1809,7 +1809,7 @@ fn services_from_config_path_in_session(
         .ok_or_else(|| eyre::eyre!("missing config parent"))?;
     let mut diagnostics = Vec::new();
     let config = crate::config::from_str(&raw, config_dir, 0usize, None, &mut diagnostics)?;
-    Ok(crate::service_map_from_config(&config, session)?)
+    Ok(crate::load_services(&config, session)?.services)
 }
 
 #[test]
@@ -2401,7 +2401,6 @@ async fn spawn_session_env_file_harness(
         ]),
         ..crate::session::SessionContext::unconfigured()
     });
-    let services = services_from_config_path_in_session(&config_path, &session.environment)?;
     let parsed = crate::config::from_str(
         &fs::read_to_string(&config_path)?,
         dir,
@@ -2409,6 +2408,10 @@ async fn spawn_session_env_file_harness(
         None,
         &mut Vec::new(),
     )?;
+    let crate::LoadedServices {
+        services,
+        session_env_files,
+    } = crate::load_services(&parsed, &session.environment)?;
     let reload = ReloadConfig {
         config_path,
         config_dir: dir.to_path_buf(),
@@ -2421,7 +2424,7 @@ async fn spawn_session_env_file_harness(
         dir.to_path_buf(),
         dynamic_policy,
         session,
-        parsed.config.env_file,
+        session_env_files,
     );
     wait_until(&harness.reader, "svc", |snapshot| {
         snapshot.execution == Execution::Running
@@ -2518,24 +2521,36 @@ async fn session_environment_reads_the_session_env_file_fresh() -> eyre::Result<
     Ok(())
 }
 
-/// A dynamic service started without `from_service` sits on the session-wide env file like a
-/// configured service: its own entries override the file's, and the pinned variables both.
+/// A dynamic service started without `from_service` sits on the session-wide env file as the
+/// last config load resolved it, like a configured service: its own entries override the file's,
+/// and the pinned variables both.
+/// Starting it reads no file, so a file whose read would block cannot stall the scheduler.
 #[tokio::test]
-async fn dynamic_services_sit_on_the_session_env_file() -> eyre::Result<()> {
+async fn dynamic_services_sit_on_the_loaded_session_env_file() -> eyre::Result<()> {
     let dir = tempfile::tempdir()?;
-    fs::write(
-        dir.path().join("session.env"),
-        "SHARED=file\nOWN=file\nSESSION_PORT=1\n",
-    )?;
+    let file = dir.path().join("session.env");
+    fs::write(&file, "SHARED=file\nOWN=file\nSESSION_PORT=1\n")?;
     let harness =
         spawn_session_env_file_harness(dir.path(), enabled_dynamic_policy(dir.path())?).await?;
+
+    // A FIFO nobody writes blocks whoever opens it for reading.
+    fs::remove_file(&file)?;
+    let status = std::process::Command::new("mkfifo").arg(&file).status()?;
+    eyre::ensure!(status.success(), "mkfifo failed: {status}");
 
     let mut params = dynamic_params("debug", &["sh", "-c", "sleep 60"]);
     params.spec.environment = Some(indexmap::IndexMap::from([
         ("OWN".to_string(), "dynamic".to_string()),
         ("SESSION_PORT".to_string(), "2".to_string()),
     ]));
-    dynamic_accepted(harness.control.start_dynamic(params).await)?;
+    dynamic_accepted(
+        timeout(
+            Duration::from_secs(10),
+            harness.control.start_dynamic(params),
+        )
+        .await
+        .map_err(|_| eyre::eyre!("starting a dynamic service read the session env file"))?,
+    )?;
 
     let environment = environment_accepted(
         harness

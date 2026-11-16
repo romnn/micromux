@@ -193,20 +193,49 @@ pub fn endpoint_owner_lock_held(endpoint: &ControlEndpoint) -> Result<bool, Cont
     platform::endpoint_owner_lock_held(endpoint)
 }
 
-/// Return whether a session claims `config_path`: it holds the config's owner lock, which a
-/// session takes before it starts anything and releases as it starts stopping.
+/// A shared hold on a config's owner lock, which shows that no session claims the config while
+/// it lasts.
 ///
-/// A session that runs without a control plane, or is still starting, claims its config too,
-/// so `false` means that no session runs for it.
-/// Like [`endpoint_owner_lock_held`], it never takes the lock from a session, and a session that
-/// claims the config meanwhile waits the probe out.
+/// A session that claims the config meanwhile waits for the hold to end, as it waits out every
+/// probe, so whatever its holder checks under it, such as whether a stopping session still
+/// drains, cannot be overtaken by a successor's claim.
+/// Drop it promptly: a claim gives up after waiting a few seconds.
+#[derive(Debug)]
+pub struct UnclaimedProject {
+    #[expect(
+        dead_code,
+        reason = "held for RAII: the shared lock keeps a successor from claiming the config"
+    )]
+    lock: std::fs::File,
+}
+
+/// Take a hold on the owner lock of `config_path` when no session claims the config, or return
+/// `None` when one does.
+///
+/// A session holds that lock from before it starts anything until it starts stopping, so a
+/// session that is still starting, or runs without a control plane, claims its config too.
 ///
 /// # Errors
 ///
-/// Returns [`ControlError::Io`] if the lock file exists but cannot be opened or probed, or
+/// Returns [`ControlError::Io`] if the lock file cannot be opened or locked, or
 /// [`ControlError::Unsupported`] on an unsupported platform.
-pub fn project_claimed(config_path: &CanonicalConfigPath) -> Result<bool, ControlError> {
-    platform::project_claimed(config_path)
+pub fn hold_unclaimed_project(
+    config_path: &CanonicalConfigPath,
+) -> Result<Option<UnclaimedProject>, ControlError> {
+    platform::hold_unclaimed_project(config_path)
+}
+
+/// Takes a hold on the owner lock at `lock_path` like [`hold_unclaimed_project`], for tests that
+/// keep their locks out of the user's coordination directory.
+///
+/// # Errors
+///
+/// Returns the same errors as [`hold_unclaimed_project`].
+#[cfg(unix)]
+pub fn hold_unclaimed_project_at(
+    lock_path: &Path,
+) -> Result<Option<UnclaimedProject>, ControlError> {
+    platform::hold_unclaimed_project_at(lock_path)
 }
 
 /// Unlinks a dead endpoint's leftover socket when its ownership lock proves no session owns it,
