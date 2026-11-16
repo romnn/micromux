@@ -65,7 +65,7 @@ pub use config::{
     parse_ui_section, read_config_file, read_config_file_async,
 };
 pub use diagnostics::{Printer, ToDiagnostics, render_to_string};
-pub use env::{Error as EnvironmentError, InterpolationError};
+pub use env::{Dotenv, Error as EnvironmentError, InterpolationError, is_shell_name, to_dotenv};
 pub use graph::Error as GraphError;
 pub use health_check::Health;
 pub use model::{
@@ -84,8 +84,8 @@ pub use scheduler::{
     TerminalSize,
 };
 pub use service::{
-    Error as ServiceError, RestartPolicy, Site as ServiceSite, SkipReason as EnvFileSkipReason,
-    SkippedEnvFile, WorkingDirectoryError,
+    Error as ServiceError, RestartPolicy, SessionSite, Site as ServiceSite,
+    SkipReason as EnvFileSkipReason, SkippedEnvFile, WorkingDirectoryError,
 };
 pub use session::{
     PortRegistry, Route, RouteError, RoutingStatus, STATE_DIR_VARIABLE, Session,
@@ -96,6 +96,7 @@ pub use shell::shell_join;
 pub use spec::{
     DependencySpec, DynamicOrigin, DynamicServiceParams, HealthcheckSpec, Lease,
     PartialServiceSpec, ServiceKind, ServiceOrigin, ServiceSpec, SpecError, SpecField, StopSignal,
+    service_id_is_valid,
 };
 pub use structured_log::{
     FIELDS_KEY, LogDisplay, MESSAGE_KEYS, RecordTimestamp, StructuredLogLevel, TIMESTAMP_KEYS,
@@ -175,9 +176,10 @@ pub(crate) struct ReloadConfig {
 #[derive(Debug, thiserror::Error)]
 #[error("{}", join_messages(errors))]
 pub struct MaterializationFailure {
-    /// One error per failing service, in config order.
+    /// One error per failing service, in config order, or the one error of the session-wide
+    /// `env_file`, which every service loads.
     pub errors: Vec<ServiceError>,
-    /// Every optional env file skipped across all services, in config order.
+    /// Every optional env file skipped, the session-wide ones first, in config order.
     pub skipped_env_files: Vec<SkippedEnvFile>,
 }
 
@@ -242,6 +244,25 @@ fn materialize_services<F>(
     // against the same values.
     let supervisor_environment: std::collections::HashMap<String, String> =
         std::env::vars().collect();
+    let mut skipped_env_files = Vec::new();
+    // Every service loads the session-wide files beneath its own, so they resolve once, and a
+    // failure there is reported once rather than for every service.
+    let session_files = match service::load_session_env_files(
+        config_dir,
+        &config_file.config.env_file,
+        &supervisor_environment,
+        pinned,
+        &mut skipped_env_files,
+    ) {
+        Ok(files) => files,
+        Err(err) => {
+            return MaterializedServices {
+                services: ServiceMap::new(),
+                errors: vec![err],
+                skipped_env_files,
+            };
+        }
+    };
     let cleanup_directory = config_file
         .config
         .services
@@ -251,7 +272,6 @@ fn materialize_services<F>(
         .flatten();
     let mut services = ServiceMap::new();
     let mut errors = Vec::new();
-    let mut skipped_env_files = Vec::new();
     for (name, service_config) in &config_file.config.services {
         let service_id = name.as_ref().clone();
         match service::Service::from_config(
@@ -260,6 +280,7 @@ fn materialize_services<F>(
             service_config.clone(),
             &supervisor_environment,
             pinned,
+            &session_files,
             &mut skipped_env_files,
         ) {
             Ok(mut service) => {
@@ -502,6 +523,9 @@ pub struct Micromux {
     routes: Vec<Route>,
     reload_config: Option<ReloadConfig>,
     config_dir: PathBuf,
+    /// The session-wide `env_file` entries, which the session's own environment reads from disk
+    /// on every request.
+    session_env_files: Vec<config::EnvFile>,
     dynamic_policy: DynamicServicesPolicy,
     default_log_retention: LogRetention,
     default_log_display: LogDisplay,
@@ -638,6 +662,7 @@ impl Micromux {
             routes,
             reload_config,
             config_dir: config_file.config_dir.clone(),
+            session_env_files: config_file.config.env_file.clone(),
             dynamic_policy,
             default_log_retention: config_file.config.log_retention,
             default_log_display: config_file.config.log_display.clone(),
@@ -749,6 +774,7 @@ impl Micromux {
                 writer,
                 shutdown: shutdown.clone(),
                 config_dir: self.config_dir.clone(),
+                session_env_files: self.session_env_files.clone(),
                 dynamic_policy: self.dynamic_policy.clone(),
                 session: self.session.clone(),
                 session_status,
@@ -1228,6 +1254,67 @@ services:
             rendered.contains("write `$$f` to pass a literal `$f` through to the shell"),
             "{rendered}"
         );
+        Ok(())
+    }
+
+    /// A broken session-wide env file is one error naming the top-level entry, not one per
+    /// service, and its skipped optional entries are notes like a service's.
+    #[test]
+    fn config_validation_reports_the_top_level_env_file_once() -> eyre::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let config_path = dir.path().join("micromux.yaml");
+        std::fs::write(
+            dir.path().join("shared.env"),
+            "URL=${MICROMUX_TEST_UNSET_URL}\n",
+        )?;
+        std::fs::write(
+            &config_path,
+            r#"version: 1
+env_file:
+  - path: "${MICROMUX_TEST_UNSET_ENV_DIR}/.env"
+    optional: true
+  - shared.env
+services:
+  first:
+    command: ["true"]
+  second:
+    command: ["true"]
+"#,
+        )?;
+
+        let report = validate_config_file(&config_path, None)?;
+
+        assert!(!report.valid);
+        assert_eq!(report.services, Vec::<String>::new());
+        let shared = dir.path().canonicalize()?.join("shared.env");
+        let messages = report
+            .diagnostics
+            .iter()
+            .map(|diagnostic| (diagnostic.severity, diagnostic.message.clone()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            messages,
+            vec![
+                (
+                    ConfigDiagnosticSeverity::Note,
+                    "optional top-level env_file[0] skipped: variable \
+                     `MICROMUX_TEST_UNSET_ENV_DIR` is not set"
+                        .to_string(),
+                ),
+                (
+                    ConfigDiagnosticSeverity::Error,
+                    format!(
+                        "cannot resolve key `URL` in top-level env_file[1] ({}): variable \
+                         `MICROMUX_TEST_UNSET_URL` is not set",
+                        shared.display()
+                    ),
+                ),
+            ]
+        );
+        let rendered = report
+            .rendered
+            .ok_or_else(|| eyre::eyre!("missing rendered diagnostics"))?;
+        assert!(rendered.contains("- shared.env"), "{rendered}");
         Ok(())
     }
 

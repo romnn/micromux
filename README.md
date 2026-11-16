@@ -158,6 +158,7 @@ See [Agent control](https://romnn.github.io/micromux/docs/agent-control/).
 micromux ctl restart api
 micromux ctl wait api                     # until healthy, or fail fast
 micromux exec ./scripts/seed.sh           # with the session's ports and variables
+micromux env --file --if-running          # a dotenv file with them, for go-task and friends
 micromux attach                           # TUI for a headless `micromux serve` session
 ```
 

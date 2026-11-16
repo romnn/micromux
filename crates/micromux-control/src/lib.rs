@@ -48,7 +48,8 @@ pub use micromux::{
 pub use protocol::{
     DiskLogReadHealth, DynamicServicesCaps, ENVIRONMENT_PROTOCOL_VERSION, EVENTS_PROTOCOL_VERSION,
     ErrorCode, InputBytes, MAX_REMOTE_PASTE_BYTES, PROTOCOL_VERSION, ProtocolVersion, Request,
-    Response, ServiceBrief, SessionCapabilities, SessionInfo, TERMINAL_PROTOCOL_VERSION,
+    Response, SESSION_ENV_FILE_PROTOCOL_VERSION, ServiceBrief, SessionCapabilities, SessionInfo,
+    TERMINAL_PROTOCOL_VERSION,
 };
 pub use select::{
     AmbiguousSelection, LISTED_ABSENT_PROBES, ProbeReport, ResolvedSession, RuntimeDirDetail,
@@ -60,7 +61,7 @@ pub use select::{
 pub use server::claim_project_at;
 pub use server::{
     ClaimError, ControlServer, EndpointGuard, ProjectClaim, SESSION_ALREADY_STARTING,
-    SessionIdentity, bind, bind_project, claim_project, endpoint_owner_lock_held,
+    SessionIdentity, bind, bind_project, claim_project, endpoint_owner_lock_held, project_claimed,
 };
 
 /// Maximum size of a single protocol frame. Oversized frames are rejected, not buffered, so a

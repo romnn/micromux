@@ -193,6 +193,22 @@ pub fn endpoint_owner_lock_held(endpoint: &ControlEndpoint) -> Result<bool, Cont
     platform::endpoint_owner_lock_held(endpoint)
 }
 
+/// Return whether a session claims `config_path`: it holds the config's owner lock, which a
+/// session takes before it starts anything and releases as it starts stopping.
+///
+/// A session that runs without a control plane, or is still starting, claims its config too,
+/// so `false` means that no session runs for it.
+/// Like [`endpoint_owner_lock_held`], it never takes the lock from a session, and a session that
+/// claims the config meanwhile waits the probe out.
+///
+/// # Errors
+///
+/// Returns [`ControlError::Io`] if the lock file exists but cannot be opened or probed, or
+/// [`ControlError::Unsupported`] on an unsupported platform.
+pub fn project_claimed(config_path: &CanonicalConfigPath) -> Result<bool, ControlError> {
+    platform::project_claimed(config_path)
+}
+
 /// Unlinks a dead endpoint's leftover socket when its ownership lock proves no session owns it,
 /// and returns whether it removed one.
 ///
@@ -256,7 +272,8 @@ impl ControlServer {
         self
     }
 
-    /// Accept connections until `shutdown`, then unlink the endpoint (via the guard's `Drop`).
+    /// Accept connections until `shutdown`, then unlink the endpoint and remove the session's
+    /// environment files (via the guard's `Drop`).
     ///
     /// # Errors
     ///

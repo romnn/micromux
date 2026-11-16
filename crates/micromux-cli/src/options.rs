@@ -143,7 +143,7 @@ pub enum Command {
     /// Run a command in this terminal with a running session's environment.
     ///
     /// The command keeps the variables of the shell that runs `micromux exec`, such as `PATH`,
-    /// and the session's variables override any of the same name.
+    /// and the session's override any of the same name.
     /// It replaces the micromux process, so it gets the terminal, the signals, and the exit
     /// status directly.
     /// Exits 125 when micromux fails before the command runs, such as without a running session,
@@ -153,9 +153,13 @@ pub enum Command {
         /// Session selector: `name:`, `pid:`, `hash:`, or a bare session name.
         #[arg(long)]
         session: Option<String>,
-        /// Use the environment of the service with this id instead of the session's variables.
+        /// Use the environment of the service with this id instead of the session's own.
         #[arg(long)]
         service: Option<String>,
+        /// When no session runs for the project, run the command with this environment
+        /// unchanged instead of failing; every other failure still fails.
+        #[arg(long, conflicts_with = "session")]
+        if_running: bool,
         /// The command and its arguments; everything after the command name is passed to it.
         #[arg(
             value_name = "COMMAND",
@@ -167,17 +171,26 @@ pub enum Command {
     },
     /// Print a running session's environment.
     ///
-    /// Without `--service`, these are the variables the session injects into every service: its
-    /// name, domain, proxy port, host suffix, and allocated ports.
-    /// With `--service`, they are that service's resolved environment.
+    /// Without `--service`, this is the session's own environment: the top-level `env_file`,
+    /// read from disk now, and the variables the session injects into every service over it,
+    /// which are its name, domain, proxy port, host suffix, and allocated ports.
+    /// With `--service`, it is that service's resolved environment.
     /// Exits 1 on any failure, including a NAME that is not set.
     Env {
         /// Session selector: `name:`, `pid:`, `hash:`, or a bare session name.
         #[arg(long)]
         session: Option<String>,
-        /// Print the environment of the service with this id instead of the session's variables.
+        /// Print the environment of the service with this id instead of the session's own.
         #[arg(long)]
         service: Option<String>,
+        /// Have the session write the environment to a dotenv file it owns and removes when it
+        /// stops, and print the file's path, for tools that only read dotenv files.
+        #[arg(long, conflicts_with_all = ["export", "format", "names"])]
+        file: bool,
+        /// When no session runs for the project, print nothing and succeed instead of failing;
+        /// every other failure still fails.
+        #[arg(long, conflicts_with = "session")]
+        if_running: bool,
         /// Print `export` lines for `eval "$(micromux env --export)"`, as `--format shell` does.
         #[arg(long, conflicts_with = "format")]
         export: bool,
@@ -358,6 +371,8 @@ mod tests {
                 service: Some(service),
                 export: false,
                 format: Some(EnvFormat::Json),
+                file: false,
+                if_running: false,
                 names,
             }) if service == "api" && names == ["A", "B"]
         ));
@@ -376,6 +391,56 @@ mod tests {
         assert!(
             Options::try_parse_from(["micromux", "env", "--export", "--format", "json"]).is_err()
         );
+        Ok(())
+    }
+
+    /// `--file` writes the whole environment, so it takes no output format or names, and
+    /// `--if-running` asks about the project, so it takes no session selector.
+    #[test]
+    fn env_file_and_if_running_take_only_the_options_that_apply() -> Result<(), clap::Error> {
+        let options = Options::try_parse_from([
+            "micromux",
+            "env",
+            "--file",
+            "--if-running",
+            "--service",
+            "api",
+        ])?;
+        assert!(matches!(
+            options.command,
+            Some(Command::Env {
+                file: true,
+                if_running: true,
+                service: Some(service),
+                ..
+            }) if service == "api"
+        ));
+        let options =
+            Options::try_parse_from(["micromux", "exec", "--if-running", "--", "task", "x"])?;
+        assert!(matches!(
+            options.command,
+            Some(Command::Exec { if_running: true, command, .. }) if command.len() == 2
+        ));
+
+        for conflicting in [
+            &["micromux", "env", "--file", "--export"][..],
+            &["micromux", "env", "--file", "--format", "json"],
+            &["micromux", "env", "--file", "NAME"],
+            &["micromux", "env", "--if-running", "--session", "name:api"],
+            &[
+                "micromux",
+                "exec",
+                "--if-running",
+                "--session",
+                "name:api",
+                "true",
+            ],
+        ] {
+            assert!(
+                Options::try_parse_from(conflicting).is_err(),
+                "{conflicting:?}"
+            );
+        }
         Ok(())
     }
 

@@ -74,6 +74,25 @@ env_file:
     optional: true
 ```
 
+### Session-wide env files
+
+A top-level `env_file` takes the same entries and lies beneath every service's own `env_file` and `environment`, so a list every service would repeat is written once:
+
+```yaml
+env_file:
+  - .env
+  - path: .env.local
+    optional: true
+services:
+  api:
+    command: "./run-api"
+    env_file: api.env       # sees and overrides the session-wide values
+```
+
+Its values resolve like a service's env files: against the environment micromux runs in, the files before them, and their own earlier lines, with the [session variables]({{< relref "sessions.md" >}}#injected-variables) winning, so `DATABASE_URL=postgres://127.0.0.1:${POSTGRES_PORT}/app` gets the allocated port. A service sees them in its own env files, its `environment`, and everything after.
+
+The session's own environment includes them too: `micromux env` and `micromux exec` without `--service` read them from disk on every call, and `micromux env --file` writes them to a dotenv file for tools that only read files. See [Run commands in the session environment]({{< relref "../agent-control/control-plane.md" >}}#run-commands-in-the-session-environment).
+
 ## Variable interpolation
 
 Every value that reaches the service process may reference variables: the contents of `env_file`, `environment`, `ports`, `command`, and `healthcheck.test`.
@@ -87,7 +106,7 @@ Every value that reaches the service process may reference variables: the conten
 
 A `$` is only special directly before `{` or a name. A lone `$$`, `$1`, `$?`, or `$(…)` is left alone.
 
-**What a reference sees.** Values resolve against the environment the process receives (apart from the terminal-color variables micromux sets at spawn): the environment micromux itself runs in, then each `env_file` in order, then `environment`. The [session variables]({{< relref "sessions.md" >}}#injected-variables) (`MICROMUX_SESSION` and every allocated port) count as part of micromux's own environment and override any `env_file` or `environment` definition of the same name. Entries resolve top to bottom, so an `env_file` line can use earlier lines and earlier files, and an `environment` entry can use every env file and only the entries above it. The exception is paths — `working_dir` and every `env_file` path — which only see micromux's own environment, because they have to be resolved before any file can be loaded.
+**What a reference sees.** Values resolve against the environment the process receives (apart from the terminal-color variables micromux sets at spawn): the environment micromux itself runs in, then the [session-wide `env_file`](#session-wide-env-files), then each of the service's `env_file` in order, then `environment`. The [session variables]({{< relref "sessions.md" >}}#injected-variables) (`MICROMUX_SESSION` and every allocated port) count as part of micromux's own environment and override any `env_file` or `environment` definition of the same name. Entries resolve top to bottom, so an `env_file` line can use earlier lines and earlier files, and an `environment` entry can use every env file and only the entries above it. The exception is paths — `working_dir` and every `env_file` path — which only see micromux's own environment, because they have to be resolved before any file can be loaded.
 
 **Unset variables are errors.** micromux never substitutes an empty string on its own. A reference to an unset variable fails validation and startup with a message naming the service, the field, and the variable, and any optional `env_file` that was skipped is reported alongside it as a note. Write `${VAR:-}` to ask for an empty value explicitly. Because `validate_config` runs in its own process, its environment can differ from the session's; an optional `env_file` found on one machine may be skipped on another.
 

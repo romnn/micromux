@@ -284,9 +284,9 @@ pub enum Command {
         /// Optional reply channel for acknowledged commands.
         ack: Option<DynamicCommandAck>,
     },
-    /// Report the session's variables, or one service's resolved environment.
+    /// Report the session's own environment, or one service's resolved environment.
     Environment {
-        /// Service id, or `None` for the session's own variables.
+        /// Service id, or `None` for the session's own environment.
         service: Option<ServiceID>,
         /// Required reply channel.
         ack: EnvironmentCommandAck,

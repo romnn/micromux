@@ -424,13 +424,19 @@ async fn run_command(command: options::Command, options: options::Options) -> Re
             service,
             export,
             format,
+            file,
+            if_running,
             names,
         } => {
             let target = session_env::Target {
                 session: session.as_deref(),
                 service: service.as_deref(),
                 config: options.config_path.as_deref(),
+                if_running,
             };
+            if file {
+                return session_env::write_file(&target).await;
+            }
             let format = if export {
                 options::EnvFormat::Shell
             } else {
@@ -448,12 +454,14 @@ async fn run_command(command: options::Command, options: options::Options) -> Re
         options::Command::Exec {
             session,
             service,
+            if_running,
             command,
         } => {
             let target = session_env::Target {
                 session: session.as_deref(),
                 service: service.as_deref(),
                 config: options.config_path.as_deref(),
+                if_running,
             };
             session_env::exec(&target, &command).await
         }

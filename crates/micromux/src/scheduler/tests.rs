@@ -36,6 +36,7 @@ async fn run_test_scheduler(
         writer,
         shutdown,
         config_dir: Path::new(".").to_path_buf(),
+        session_env_files: Vec::new(),
         dynamic_policy: DynamicServicesPolicy::default(),
         session: std::sync::Arc::new(crate::session::SessionContext::unconfigured()),
         session_status: unrouted_session_status(),
@@ -128,6 +129,25 @@ fn spawn_harness_with_session(
     dynamic_policy: DynamicServicesPolicy,
     session: std::sync::Arc<crate::session::SessionContext>,
 ) -> Harness {
+    spawn_harness_with_session_env_files(
+        services,
+        reload_config,
+        config_dir,
+        dynamic_policy,
+        session,
+        Vec::new(),
+    )
+}
+
+/// A harness whose session also has the session-wide `env_file` entries `session_env_files`.
+fn spawn_harness_with_session_env_files(
+    services: ServiceMap,
+    reload_config: Option<ReloadConfig>,
+    config_dir: PathBuf,
+    dynamic_policy: DynamicServicesPolicy,
+    session: std::sync::Arc<crate::session::SessionContext>,
+    session_env_files: Vec<config::EnvFile>,
+) -> Harness {
     raise_test_file_descriptor_limit();
     let (commands_tx, commands_rx) = mpsc::channel(64);
     let (events_tx, events_rx) = mpsc::channel(256);
@@ -149,6 +169,7 @@ fn spawn_harness_with_session(
                 writer,
                 shutdown,
                 config_dir,
+                session_env_files,
                 dynamic_policy,
                 session,
                 session_status: unrouted_session_status(),
@@ -183,6 +204,7 @@ async fn config_reload_wait_keeps_draining_process_events() -> eyre::Result<()> 
             writer,
             shutdown: CancellationToken::new(),
             config_dir: PathBuf::new(),
+            session_env_files: Vec::new(),
             dynamic_policy: DynamicServicesPolicy::default(),
             session: std::sync::Arc::new(crate::session::SessionContext::unconfigured()),
             session_status: unrouted_session_status(),
@@ -238,6 +260,7 @@ async fn config_reload_wait_yields_to_session_shutdown() -> eyre::Result<()> {
             writer,
             shutdown: shutdown.clone(),
             config_dir: PathBuf::new(),
+            session_env_files: Vec::new(),
             dynamic_policy: DynamicServicesPolicy::default(),
             session: std::sync::Arc::new(crate::session::SessionContext::unconfigured()),
             session_status: unrouted_session_status(),
@@ -2349,6 +2372,134 @@ async fn reconcile_marks_a_changed_env_file_stale() -> eyre::Result<()> {
     );
     assert!(reconciled.stale);
     wait_until(&harness.reader, "svc", |snapshot| snapshot.config_stale).await?;
+
+    harness.shutdown.cancel();
+    harness.handle.await??;
+    Ok(())
+}
+
+/// The config of [`spawn_session_env_file_harness`], whose session-wide `env_file` is `env_file`.
+fn session_env_file_yaml(env_file: &str) -> String {
+    format!(
+        "version: 1\nenv_file: {env_file}\nservices:\n  svc:\n    command: [\"sh\", \"-c\", \
+         \"sleep 60\"]\n"
+    )
+}
+
+/// Runs `svc` with the session-wide `env_file` `session.env`, in a session that pins
+/// `MICROMUX_SESSION` and `SESSION_PORT` the way it pins allocated ports.
+async fn spawn_session_env_file_harness(dir: &Path) -> eyre::Result<Harness> {
+    let config_path = dir.join("micromux.yaml");
+    fs::write(&config_path, session_env_file_yaml("session.env"))?;
+    let session = std::sync::Arc::new(crate::session::SessionContext {
+        environment: crate::SessionEnvironment::from_pairs(&[
+            ("MICROMUX_SESSION", "test"),
+            ("SESSION_PORT", "20001"),
+        ]),
+        ..crate::session::SessionContext::unconfigured()
+    });
+    let services = services_from_config_path_in_session(&config_path, &session.environment)?;
+    let parsed = crate::config::from_str(
+        &fs::read_to_string(&config_path)?,
+        dir,
+        0usize,
+        None,
+        &mut Vec::new(),
+    )?;
+    let reload = ReloadConfig {
+        config_path,
+        config_dir: dir.to_path_buf(),
+        strict_override: None,
+        session: session.clone(),
+    };
+    let harness = spawn_harness_with_session_env_files(
+        services,
+        Some(reload),
+        dir.to_path_buf(),
+        DynamicServicesPolicy::default(),
+        session,
+        parsed.config.env_file,
+    );
+    wait_until(&harness.reader, "svc", |snapshot| {
+        snapshot.execution == Execution::Running
+    })
+    .await?;
+    Ok(harness)
+}
+
+/// The session's own environment reads the session-wide env file from disk on every request,
+/// so an edit shows without a restart, with the pinned variables on top, while a running
+/// service keeps what it started with; a reconcile moves the session to a new file list.
+#[tokio::test]
+async fn session_environment_reads_the_session_env_file_fresh() -> eyre::Result<()> {
+    let dir = tempfile::tempdir()?;
+    fs::write(
+        dir.path().join("session.env"),
+        "SHARED=one\nSESSION_PORT=1\nURL=http://127.0.0.1:${SESSION_PORT}\n",
+    )?;
+    let harness = spawn_session_env_file_harness(dir.path()).await?;
+    let svc = "svc".to_string();
+
+    let session_environment = environment_accepted(harness.control.environment(None).await)?;
+    assert_eq!(
+        session_environment,
+        ResolvedEnvironment {
+            variables: variables(&[
+                ("MICROMUX_SESSION", "test"),
+                ("SESSION_PORT", "20001"),
+                ("SHARED", "one"),
+                ("URL", "http://127.0.0.1:20001"),
+            ]),
+            stale: false,
+        }
+    );
+
+    // An edit shows at once, a running service keeps what it got.
+    fs::write(dir.path().join("session.env"), "SHARED=two\nADDED=new\n")?;
+    let edited = environment_accepted(harness.control.environment(None).await)?;
+    assert_eq!(
+        edited.variables,
+        variables(&[
+            ("ADDED", "new"),
+            ("MICROMUX_SESSION", "test"),
+            ("SESSION_PORT", "20001"),
+            ("SHARED", "two"),
+        ])
+    );
+    let service = environment_accepted(harness.control.environment(Some(&svc)).await)?;
+    assert_eq!(
+        service.variables.get("SHARED").map(String::as_str),
+        Some("one")
+    );
+
+    // A file that cannot be loaded is a rejection that names it.
+    fs::remove_file(dir.path().join("session.env"))?;
+    let rejection = harness
+        .control
+        .environment(None)
+        .await
+        .map_err(|_| eyre::eyre!("scheduler stopped"))?;
+    assert!(
+        matches!(
+            &rejection,
+            Err(CommandRejection::ConfigReload(message))
+                if message.contains("cannot load top-level env_file[0]")
+        ),
+        "{rejection:?}"
+    );
+
+    // A reconcile applies a changed list.
+    fs::write(dir.path().join("other.env"), "SHARED=other\n")?;
+    fs::write(
+        dir.path().join("micromux.yaml"),
+        session_env_file_yaml("other.env"),
+    )?;
+    reconcile_accepted(harness.control.reconcile_config(false).await)?;
+    let reconciled = environment_accepted(harness.control.environment(None).await)?;
+    assert_eq!(
+        reconciled.variables.get("SHARED").map(String::as_str),
+        Some("other")
+    );
 
     harness.shutdown.cancel();
     harness.handle.await??;

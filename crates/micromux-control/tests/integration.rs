@@ -154,8 +154,9 @@ async fn describe_reports_the_session_name_and_allocated_ports() -> eyre::Result
     Ok(())
 }
 
-/// `GetEnvironment` returns the session's variables, or a service's `env_file` and inline
-/// entries with those variables pinned over them, and types an unknown service.
+/// `GetEnvironment` returns the session's own environment, here its variables alone, or a
+/// service's `env_file` and inline entries with those variables pinned over them, and types an
+/// unknown service.
 #[tokio::test]
 async fn environment_crosses_the_socket() -> eyre::Result<()> {
     let dir = unique_dir("environment")?;

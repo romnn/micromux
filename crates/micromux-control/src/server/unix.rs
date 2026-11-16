@@ -13,6 +13,8 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
+#[path = "unix/environment_files.rs"]
+mod environment_files;
 #[path = "unix/log_reads.rs"]
 mod log_reads;
 
@@ -89,12 +91,16 @@ impl SubscriptionPolicy {
     }
 }
 
-/// A bound control endpoint plus the lifetime ownership lock. Dropping it unlinks the socket while
-/// the lock is still held, so a successor (which cannot acquire the lock until this process exits)
-/// never has its fresh socket removed.
+/// A bound control endpoint plus the lifetime ownership lock.
+///
+/// Dropping it unlinks the socket and removes the session's environment files while the lock is
+/// still held, so a successor (which cannot acquire the lock until this process exits) never has
+/// its fresh socket or files removed.
 pub struct EndpointGuard {
     listener: tokio::net::UnixListener,
     socket_path: PathBuf,
+    /// The private directory next to the socket where the session writes environment files.
+    environment_files: PathBuf,
     // Held for the whole process lifetime; the OS releases the advisory lock on exit (incl. crash).
     _lock: std::fs::File,
     // Kept under fixed per-user `/tmp`, independent of the endpoint's XDG/TMP runtime directory.
@@ -103,8 +109,16 @@ pub struct EndpointGuard {
 
 impl Drop for EndpointGuard {
     fn drop(&mut self) {
-        // Unlink the socket under the still-held lock. The permanent `<hash>.lock` file is left in
-        // place; only its advisory lock is released (when `_lock` drops).
+        // Remove the environment files and unlink the socket under the still-held lock.
+        // The permanent `<hash>.lock` file is left in place; only its advisory lock is released
+        // (when `_lock` drops).
+        if let Err(err) = environment_files::remove(&self.environment_files) {
+            tracing::warn!(
+                %err,
+                directory = %self.environment_files.display(),
+                "cannot remove the session's environment files"
+            );
+        }
         let _ = std::fs::remove_file(&self.socket_path);
     }
 }
@@ -165,18 +179,16 @@ pub(super) fn claim_project_at(lock_path: &Path) -> Result<super::ProjectClaim, 
     project_lock
         .set_permissions(std::fs::Permissions::from_mode(0o600))
         .map_err(ControlError::from)?;
-    match fs2::FileExt::try_lock_exclusive(&project_lock) {
-        Ok(()) => {}
-        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-            // The holder writes its pid right after locking, so a reader rarely sees none.
-            let mut recorded = String::new();
-            let pid = project_lock
-                .read_to_string(&mut recorded)
-                .ok()
-                .and_then(|_| recorded.trim().parse().ok());
-            return Err(super::ClaimError::Held { pid });
-        }
-        Err(err) => return Err(ControlError::from(err).into()),
+    // Probes such as `micromux env --if-running` hold the lock shared for a moment, which must
+    // not make a starting session believe another one holds it.
+    if !try_lock_owner(&project_lock).map_err(ControlError::from)? {
+        // The holder writes its pid right after locking, so a reader rarely sees none.
+        let mut recorded = String::new();
+        let pid = project_lock
+            .read_to_string(&mut recorded)
+            .ok()
+            .and_then(|_| recorded.trim().parse().ok());
+        return Err(super::ClaimError::Held { pid });
     }
     // The pid only names the holder in another start's error; failing to record it is harmless.
     if let Err(err) = project_lock
@@ -209,9 +221,13 @@ pub(super) fn bind_project(
 
 pub(super) fn endpoint_owner_lock_held(endpoint: &ControlEndpoint) -> Result<bool, ControlError> {
     match endpoint {
-        ControlEndpoint::Unix(path) => owner_lock_held_unix(path),
+        ControlEndpoint::Unix(path) => lock_held(&path.with_extension("lock")),
         ControlEndpoint::WindowsNamedPipe(_) => Err(ControlError::Unsupported),
     }
+}
+
+pub(super) fn project_claimed(config_path: &CanonicalConfigPath) -> Result<bool, ControlError> {
+    lock_held(&project_lock_path(config_path)?)
 }
 
 /// Opens the endpoint's ownership lock file, creating it when missing.
@@ -239,16 +255,19 @@ fn bind_unix(
 
     // The lifetime-held lock is the authoritative ownership signal — more robust than connect-probing
     // a possibly-wedged listener. "lock acquirable" ⇔ "no live owner".
-    if !try_lock_endpoint_owner(&lock_file)? {
+    if !try_lock_owner(&lock_file)? {
         return Ok(None);
     }
 
-    // We hold the lock ⇒ no live owner: unlink any crash-leaked socket and bind.
+    // We hold the lock ⇒ no live owner: unlink any crash-leaked socket and environment files, and
+    // bind.
     if let Err(err) = std::fs::remove_file(socket_path)
         && err.kind() != std::io::ErrorKind::NotFound
     {
         return Err(err.into());
     }
+    let environment_files = environment_files::directory(socket_path);
+    environment_files::reset(&environment_files)?;
     let listener = tokio::net::UnixListener::bind(socket_path)?;
     // Defence in depth: the directory mode (0700) is what actually gates `connect`.
     std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600))?;
@@ -256,13 +275,14 @@ fn bind_unix(
     Ok(Some(EndpointGuard {
         listener,
         socket_path: socket_path.to_path_buf(),
+        environment_files,
         _lock: lock_file,
         _project_lock: project_lock,
     }))
 }
 
-/// Acquires the endpoint lock unless another session owns it, waiting out overlapping
-/// diagnostic probes.
+/// Acquires an owner lock, of an endpoint or of a config, unless another session owns it, waiting
+/// out overlapping diagnostic probes.
 ///
 /// BSD `flock` has no non-mutating ownership query, so probes take a shared lock briefly, while an
 /// owner holds the lock exclusively for its lifetime.
@@ -270,7 +290,7 @@ fn bind_unix(
 /// beside probes but not beside an owner.
 /// The wait therefore lasts exactly as long as probes hold the lock, however slowly they are
 /// scheduled.
-fn try_lock_endpoint_owner(lock_file: &std::fs::File) -> std::io::Result<bool> {
+fn try_lock_owner(lock_file: &std::fs::File) -> std::io::Result<bool> {
     let would_block = |err: &std::io::Error| err.kind() == std::io::ErrorKind::WouldBlock;
     let deadline = std::time::Instant::now() + OWNER_PROBE_LOCK_WAIT_LIMIT;
     loop {
@@ -303,7 +323,7 @@ fn try_lock_endpoint_owner(lock_file: &std::fs::File) -> std::io::Result<bool> {
 ///
 /// The lock is taken shared, which already excludes every owner.
 /// A session that starts meanwhile sees a shared holder as a probe and waits it out, as
-/// [`try_lock_endpoint_owner`] does, instead of mistaking the pruner for a live owner.
+/// [`try_lock_owner`] does, instead of mistaking the pruner for a live owner.
 /// Concurrent pruners share the lock too; the losers find the socket gone.
 ///
 /// The lock file stays.
@@ -329,12 +349,14 @@ pub(super) fn prune_dead_socket(socket_path: &Path) -> std::io::Result<bool> {
     removed
 }
 
-fn owner_lock_held_unix(socket_path: &Path) -> Result<bool, ControlError> {
-    let lock_path = socket_path.with_extension("lock");
+/// Whether an owner holds the lock at `lock_path`, which a missing file never is.
+///
+/// It takes the lock shared for a moment, which owners waiting in [`try_lock_owner`] wait out.
+fn lock_held(lock_path: &Path) -> Result<bool, ControlError> {
     let lock_file = match std::fs::OpenOptions::new()
         .read(true)
         .write(true)
-        .open(&lock_path)
+        .open(lock_path)
     {
         Ok(lock_file) => lock_file,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
@@ -354,6 +376,7 @@ pub(super) async fn serve(
     shutdown: CancellationToken,
 ) -> Result<(), ControlError> {
     let connections = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+    let environment_files: Arc<Path> = Arc::from(guard.environment_files.as_path());
     loop {
         tokio::select! {
             () = shutdown.cancelled() => break,
@@ -365,10 +388,11 @@ pub(super) async fn serve(
                             continue;
                         };
                         let server = Arc::clone(&server);
+                        let environment_files = Arc::clone(&environment_files);
                         let shutdown = shutdown.clone();
                         tokio::spawn(async move {
                             let _permit = permit;
-                            handle_connection(server, stream, shutdown).await;
+                            handle_connection(server, &environment_files, stream, shutdown).await;
                         });
                     }
                     Err(err) => {
@@ -380,13 +404,18 @@ pub(super) async fn serve(
             }
         }
     }
-    // Dropping `guard` here unlinks the socket while the lock is still held.
+    // Dropping `guard` here unlinks the socket and removes the environment files while the lock
+    // is still held.
     drop(guard);
     Ok(())
 }
 
-async fn handle_connection<S>(server: Arc<ControlServer>, stream: S, shutdown: CancellationToken)
-where
+async fn handle_connection<S>(
+    server: Arc<ControlServer>,
+    environment_files: &Path,
+    stream: S,
+    shutdown: CancellationToken,
+) where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
     let mut conn = framed(stream);
@@ -437,7 +466,10 @@ where
         // wedged scheduler must not pin this task, and shutdown must stay responsive during dispatch.
         let response = tokio::select! {
             () = shutdown.cancelled() => return,
-            dispatched = tokio::time::timeout(REQUEST_TIMEOUT, dispatch(&server, request)) => {
+            dispatched = tokio::time::timeout(
+                REQUEST_TIMEOUT,
+                dispatch(&server, environment_files, request),
+            ) => {
                 match dispatched {
                     Ok(response) => response,
                     Err(_) => {
@@ -617,7 +649,9 @@ fn lag_replay_changes(snapshots: &[ServiceSnapshot]) -> impl Iterator<Item = Ses
     }))
 }
 
-async fn dispatch(server: &ControlServer, request: Request) -> Response {
+/// Answers one request; `environment_files` is the directory [`Request::WriteEnvironmentFile`]
+/// writes to.
+async fn dispatch(server: &ControlServer, environment_files: &Path, request: Request) -> Response {
     match request {
         Request::Describe => Response::Description(describe_with_git(server).await),
         Request::ListServices => Response::Services(server.reader.services()),
@@ -695,6 +729,9 @@ async fn dispatch(server: &ControlServer, request: Request) -> Response {
             acknowledge_dynamic(server.control.stop_dynamic(&service).await)
         }
         Request::GetEnvironment { service } => environment(server, service.as_ref()).await,
+        Request::WriteEnvironmentFile { service } => {
+            write_environment_file(server, environment_files, service).await
+        }
         Request::ReconcileConfig { dry_run } => reconcile(server, dry_run).await,
         Request::SendInput {
             service,
@@ -803,6 +840,65 @@ async fn environment(server: &ControlServer, service: Option<&micromux::ServiceI
         server.control.environment(service).await,
         Response::Environment,
     )
+}
+
+/// Writes the environment [`Request::GetEnvironment`] returns for `service` to its dotenv file in
+/// `directory`.
+async fn write_environment_file(
+    server: &ControlServer,
+    directory: &Path,
+    service: Option<micromux::ServiceID>,
+) -> Response {
+    // Only a valid id, which is always a single path component, names a file.
+    if let Some(service) = service
+        .as_deref()
+        .filter(|service| !micromux::service_id_is_valid(service))
+    {
+        return unknown_service(service);
+    }
+    let micromux::ResolvedEnvironment { variables, stale } =
+        match server.control.environment(service.as_ref()).await {
+            Ok(Ok(environment)) => environment,
+            Ok(Err(rejection)) => return rejection_response(rejection),
+            Err(SchedulerStopped) => {
+                return Response::error(ErrorCode::SchedulerStopped, "the scheduler has stopped");
+            }
+        };
+    let micromux::Dotenv { text, skipped } = micromux::to_dotenv(
+        variables
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str())),
+    );
+    let directory = directory.to_path_buf();
+    let written = tokio::task::spawn_blocking(move || {
+        environment_files::write(&directory, service.as_deref(), &text)
+    })
+    .await;
+    // The errors name the file, never its contents.
+    match written {
+        Ok(Ok(path)) => match path.into_os_string().into_string() {
+            Ok(path) => Response::EnvironmentFile {
+                path,
+                stale,
+                skipped,
+            },
+            Err(path) => Response::error(
+                ErrorCode::Internal,
+                format!(
+                    "the environment file path {} is not valid UTF-8",
+                    Path::new(&path).display()
+                ),
+            ),
+        },
+        Ok(Err(err)) => Response::error(
+            ErrorCode::Internal,
+            format!("cannot write the environment file: {err}"),
+        ),
+        Err(err) => Response::error(
+            ErrorCode::Internal,
+            format!("the environment file writer failed: {err}"),
+        ),
+    }
 }
 
 /// Exact ids take precedence over display names, as [`Request::GetService`] documents.
@@ -1847,7 +1943,7 @@ mod tests {
             Request::ResizeTerminal { cols: 80, rows: 24 },
         ] {
             assert_matches!(
-                dispatch(&server, request).await,
+                dispatch(&server, directory.path(), request).await,
                 Response::Error {
                     code: ErrorCode::PolicyDenied,
                     ..
@@ -1875,7 +1971,7 @@ mod tests {
             paste: false,
         };
         assert_matches!(
-            dispatch(&server, send("missing")).await,
+            dispatch(&server, directory.path(), send("missing")).await,
             Response::Error {
                 code: ErrorCode::UnknownService,
                 ..
@@ -1884,7 +1980,7 @@ mod tests {
         // The scheduler never ran, so `svc` has no process to type into, and the client hears so
         // instead of its input vanishing.
         assert_matches!(
-            dispatch(&server, send("svc")).await,
+            dispatch(&server, directory.path(), send("svc")).await,
             Response::Error {
                 code: ErrorCode::InvalidState,
                 message,
@@ -1892,7 +1988,12 @@ mod tests {
         );
         for (cols, rows) in [(0, 24), (80, 0)] {
             assert_matches!(
-                dispatch(&server, Request::ResizeTerminal { cols, rows }).await,
+                dispatch(
+                    &server,
+                    directory.path(),
+                    Request::ResizeTerminal { cols, rows }
+                )
+                .await,
                 Response::Error {
                     code: ErrorCode::BadRequest,
                     ..
@@ -1900,14 +2001,24 @@ mod tests {
             );
         }
         assert_matches!(
-            dispatch(&server, Request::ResizeTerminal { cols: 80, rows: 24 }).await,
+            dispatch(
+                &server,
+                directory.path(),
+                Request::ResizeTerminal { cols: 80, rows: 24 }
+            )
+            .await,
             Response::TerminalQueued
         );
 
         // Once the scheduler is gone, nothing can deliver a resize.
         drop(runner);
         assert_matches!(
-            dispatch(&server, Request::ResizeTerminal { cols: 80, rows: 24 }).await,
+            dispatch(
+                &server,
+                directory.path(),
+                Request::ResizeTerminal { cols: 80, rows: 24 }
+            )
+            .await,
             Response::Error {
                 code: ErrorCode::SchedulerStopped,
                 ..

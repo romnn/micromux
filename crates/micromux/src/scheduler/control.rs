@@ -107,7 +107,7 @@ pub struct ResolvedEnvironment {
     /// Whether the service's definition changed since its running process started.
     ///
     /// The variables are then those of the running process, not the ones its next run gets.
-    /// Always `false` for the session's own variables, which are fixed while the session runs.
+    /// Always `false` for the session's own environment, which is resolved anew for every query.
     pub stale: bool,
 }
 
@@ -371,18 +371,21 @@ impl ServiceControl {
 
     /// Report the environment the session gives its services.
     ///
-    /// With `None`, these are the session's own variables: its name, domain, proxy port, host
-    /// suffix, and allocated ports.
-    /// With a service id, they are that service's resolved `env_file` and `environment` entries
-    /// with the session's variables applied, as its live run got them, or as its next run gets
-    /// them when no run is live.
+    /// With `None`, this is the session's own environment: the session-wide `env_file`, read
+    /// from disk for this query with the resolver services use, and the session's variables
+    /// over it, which are its name, domain, proxy port, host suffix, and allocated ports.
+    /// With a service id, they are that service's resolved session-wide `env_file`, own
+    /// `env_file`, and `environment` entries with the session's variables applied, as its live
+    /// run got them, or as its next run gets them when no run is live.
     /// The variables micromux sets on every spawn itself, such as `TERM`, are not included.
     /// The id must match exactly; a display name does not select a service.
     ///
     /// # Errors
     ///
     /// Returns [`SchedulerStopped`] if the scheduler is no longer accepting commands.
-    /// The inner result rejects an unknown service with [`CommandRejection::UnknownService`].
+    /// The inner result rejects an unknown service with [`CommandRejection::UnknownService`],
+    /// and a session-wide `env_file` that cannot be loaded with
+    /// [`CommandRejection::ConfigReload`].
     pub async fn environment(
         &self,
         service: Option<&ServiceID>,

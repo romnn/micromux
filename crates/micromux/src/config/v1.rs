@@ -70,6 +70,7 @@ const KNOWN_CONFIG_KEYS: &[&str] = &[
     "allocate_ports",
     "routes",
     "proxy",
+    "env_file",
     "services",
 ];
 
@@ -1492,6 +1493,11 @@ pub fn parse_config<F: Copy + PartialEq>(
     )?;
     let log_display = parse_log_display(value.get("logs"), &LogDisplay::default())?;
     let session = parse_session(value, file_id, strict, diagnostics)?;
+    let env_file = value
+        .as_mapping()
+        .map(parse_env_file)
+        .transpose()?
+        .unwrap_or_default();
     let services = parse_services(
         value,
         ServiceDefaults {
@@ -1514,6 +1520,7 @@ pub fn parse_config<F: Copy + PartialEq>(
         restart_policy,
         healthcheck_defaults,
         session,
+        env_file,
         services,
     })
 }
@@ -2372,6 +2379,74 @@ mod tests {
             Some(".env")
         );
 
+        Ok(())
+    }
+
+    /// The session-wide `env_file` takes a service's entry forms, and the published schema
+    /// agrees with the parser about which shapes are valid.
+    #[test]
+    fn top_level_env_file_takes_the_service_entry_forms() -> eyre::Result<()> {
+        let schema: serde_json::Value =
+            serde_json::from_str(include_str!("../../../../micromux.schema.json"))?;
+        let schema = jsonschema::options()
+            .with_draft(jsonschema::Draft::Draft7)
+            .build(&schema)?;
+        let parse = |env_file: &str| -> eyre::Result<Option<Vec<(String, bool)>>> {
+            let yaml = format!(
+                "version: 1\nenv_file: {env_file}\nservices:\n  app:\n    command: \"true\"\n"
+            );
+            let mut diagnostics: Vec<Diagnostic<usize>> = Vec::new();
+            let parsed = config::from_str(&yaml, Path::new("."), 0, None, &mut diagnostics);
+            let document: serde_json::Value = serde_yaml::from_str(&yaml)?;
+            eyre::ensure!(
+                parsed.is_ok() == schema.validate(&document).is_ok(),
+                "the schema disagrees with the parser about `{env_file}`"
+            );
+            let Ok(parsed) = parsed else {
+                return Ok(None);
+            };
+            // A known key draws no unknown-field warning.
+            eyre::ensure!(
+                diagnostics.is_empty(),
+                "unexpected diagnostics for `{env_file}`"
+            );
+            Ok(Some(
+                parsed
+                    .config
+                    .env_file
+                    .iter()
+                    .map(|entry| (entry.path.as_ref().clone(), entry.optional))
+                    .collect(),
+            ))
+        };
+        let entry = |path: &str, optional: bool| (path.to_string(), optional);
+
+        assert_eq!(parse(".env")?, Some(vec![entry(".env", false)]));
+        assert_eq!(
+            parse("{ path: .env, optional: true }")?,
+            Some(vec![entry(".env", true)])
+        );
+        assert_eq!(
+            parse("[.env, { path: \"${ENV_DIR:-.}/.env.local\", optional: true }]")?,
+            Some(vec![
+                entry(".env", false),
+                entry("${ENV_DIR:-.}/.env.local", true)
+            ])
+        );
+        assert_eq!(parse("[{ optional: true }]")?, None);
+        assert_eq!(parse("{ path: .env, optional: \"yes\" }")?, None);
+        assert_eq!(parse("42")?, None);
+
+        // Without the key, nothing is loaded.
+        let mut diagnostics: Vec<Diagnostic<usize>> = Vec::new();
+        let parsed = config::from_str(
+            "version: 1\nservices:\n  app:\n    command: \"true\"\n",
+            Path::new("."),
+            0,
+            None,
+            &mut diagnostics,
+        )?;
+        assert_eq!(parsed.config.env_file, Vec::new());
         Ok(())
     }
 
