@@ -1050,15 +1050,15 @@ fn sorted_variables(
         .collect()
 }
 
-/// The session's own environment: the session-wide `env_file`, read from disk now with the
-/// resolver every service uses, and the session's variables over it.
+/// The values of the session-wide `env_file`, read from disk now with the resolver every
+/// configured service uses.
 ///
-/// It blocks on the filesystem, so the scheduler runs it on a blocking thread.
-fn session_environment(
+/// The session's variables are not among them; the caller applies them on top.
+fn session_env_file_values(
     config_dir: &Path,
     entries: &[crate::config::EnvFile],
     session: &crate::SessionEnvironment,
-) -> EnvironmentResult {
+) -> Result<indexmap::IndexMap<String, String>, CommandRejection> {
     let supervisor_environment = std::env::vars().collect();
     let files = crate::service::load_session_env_files(
         config_dir,
@@ -1070,7 +1070,19 @@ fn session_environment(
     .map_err(|err| {
         CommandRejection::ConfigReload(format!("cannot resolve the session environment: {err}"))
     })?;
-    let mut variables = files.into_iter().collect();
+    Ok(files.into_iter().collect())
+}
+
+/// The session's own environment: the session-wide `env_file`, read from disk now, and the
+/// session's variables over it.
+///
+/// It blocks on the filesystem, so the scheduler runs it on a blocking thread.
+fn session_environment(
+    config_dir: &Path,
+    entries: &[crate::config::EnvFile],
+    session: &crate::SessionEnvironment,
+) -> EnvironmentResult {
+    let mut variables = session_env_file_values(config_dir, entries, session)?;
     session.apply_to(&mut variables);
     Ok(ResolvedEnvironment {
         variables: sorted_variables(&variables),
@@ -1604,7 +1616,15 @@ impl SchedulerRuntime {
         spec.normalize()
             .map_err(|err| CommandRejection::InvalidSpec(err.to_string()))?;
         spec.command.extend(params.extra_args.clone());
-        // Dynamic services see the session variables too, and cannot shadow them.
+        // Like a configured service, a dynamic one sits on the session-wide env files, read now,
+        // and sees the session variables too, which it cannot shadow.
+        let mut environment = session_env_file_values(
+            &self.config_dir,
+            &self.session_env_files,
+            &self.session.environment,
+        )?;
+        environment.extend(std::mem::take(&mut spec.environment));
+        spec.environment = environment;
         self.session.environment.apply_to(&mut spec.environment);
 
         let working_dir = spec
@@ -2733,20 +2753,20 @@ impl SchedulerRuntime {
         Ok(acks)
     }
 
-    /// Answers `ack` with the session's own environment, or a service's as its live run got it.
-    ///
-    /// The session's own environment reads the session-wide `env_file` from disk, on a blocking
-    /// thread so a slow filesystem never stalls the scheduler.
-    fn environment(
-        &self,
-        services: &ServiceMap,
-        service: Option<&ServiceID>,
-        ack: control::EnvironmentCommandAck,
-    ) {
-        if let Some(service_id) = service {
-            ack.send(self.service_environment(services, service_id));
-            return;
-        }
+    /// The session's variables, or a service's environment as its live run got it.
+    fn environment(&self, services: &ServiceMap, service: Option<&ServiceID>) -> EnvironmentResult {
+        let Some(service_id) = service else {
+            return Ok(ResolvedEnvironment {
+                variables: sorted_variables(self.session.environment.variables()),
+                stale: false,
+            });
+        };
+        self.service_environment(services, service_id)
+    }
+
+    /// Answers `ack` with the session's own environment, which reads the session-wide `env_file`
+    /// from disk, on a blocking thread so a slow filesystem never stalls the scheduler.
+    fn session_environment(&self, ack: control::EnvironmentCommandAck) {
         let config_dir = self.config_dir.clone();
         let entries = self.session_env_files.clone();
         let session = std::sync::Arc::clone(&self.session);
@@ -2841,7 +2861,11 @@ impl SchedulerRuntime {
             }
             // A read changes nothing, so it skips the scheduling pass a reply waits for.
             Command::Environment { service, ack } => {
-                self.environment(services, service.as_ref(), ack);
+                ack.send(self.environment(services, service.as_ref()));
+                return None;
+            }
+            Command::SessionEnvironment { ack } => {
+                self.session_environment(ack);
                 return None;
             }
             Command::ResizeAll { cols, rows } => {

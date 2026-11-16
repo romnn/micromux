@@ -65,7 +65,10 @@ pub use config::{
     parse_ui_section, read_config_file, read_config_file_async,
 };
 pub use diagnostics::{Printer, ToDiagnostics, render_to_string};
-pub use env::{Dotenv, Error as EnvironmentError, InterpolationError, is_shell_name, to_dotenv};
+pub use env::{
+    Error as EnvironmentError, InterpolationError, UnrepresentableVariables, is_shell_name,
+    to_dotenv,
+};
 pub use graph::Error as GraphError;
 pub use health_check::Health;
 pub use model::{

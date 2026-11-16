@@ -154,9 +154,8 @@ async fn describe_reports_the_session_name_and_allocated_ports() -> eyre::Result
     Ok(())
 }
 
-/// `GetEnvironment` returns the session's own environment, here its variables alone, or a
-/// service's `env_file` and inline entries with those variables pinned over them, and types an
-/// unknown service.
+/// `GetEnvironment` returns the session's variables, or a service's `env_file` and inline
+/// entries with those variables pinned over them, and types an unknown service.
 #[tokio::test]
 async fn environment_crosses_the_socket() -> eyre::Result<()> {
     let dir = unique_dir("environment")?;
@@ -252,6 +251,42 @@ services:
             "{unknown}: {response:?}"
         );
     }
+
+    session.shutdown.cancel();
+    Ok(())
+}
+
+/// Only `GetSessionEnvironment` adds the session-wide `env_file`, whose values may be secrets,
+/// to the session's variables; `GetEnvironment` without a service keeps returning them alone,
+/// because older clients show those values unasked.
+#[tokio::test]
+async fn only_the_session_environment_carries_the_session_env_file() -> eyre::Result<()> {
+    let dir = unique_dir("session-environment")?;
+    std::fs::write(dir.path().join("session.env"), "SESSION_SECRET=s3cr3t\n")?;
+    let session = build_session_yaml(
+        dir.path(),
+        "version: 1\nenv_file: session.env\nservices:\n  svc:\n    command: [\"sh\", \"-c\", \
+         \"sleep 60\"]\n",
+    )?;
+    let mut client = Client::connect(&session.endpoint).await?;
+
+    let Response::Environment(variables) = client
+        .request(Request::GetEnvironment { service: None })
+        .await?
+    else {
+        eyre::bail!("expected the session's variables");
+    };
+    assert!(!variables.variables.contains_key("SESSION_SECRET"));
+
+    let Response::Environment(own) = client.request(Request::GetSessionEnvironment).await? else {
+        eyre::bail!("expected the session's own environment");
+    };
+    let mut without_the_file = own.variables.clone();
+    assert_eq!(
+        without_the_file.remove("SESSION_SECRET").as_deref(),
+        Some("s3cr3t")
+    );
+    assert_eq!(without_the_file, variables.variables);
 
     session.shutdown.cancel();
     Ok(())

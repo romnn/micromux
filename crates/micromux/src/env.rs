@@ -398,14 +398,33 @@ pub fn expand_env_values(
     Ok(out)
 }
 
-/// Variables rendered as a dotenv file, and the keys left out of it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Dotenv {
-    /// One `KEY="value"` line per written variable, in the order given.
-    pub text: String,
-    /// Keys left out, in the order given, because a dotenv reader could not read the key or its
-    /// value back literally.
-    pub skipped: Vec<String>,
+/// Variables [`to_dotenv`] cannot write so that every reader reads them back literally.
+///
+/// It names the variables, never a value, because values may be secrets.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{}", describe_unrepresentable(names, values))]
+pub struct UnrepresentableVariables {
+    /// Keys that are not POSIX shell names, in the order given.
+    pub names: Vec<String>,
+    /// Keys whose value no quoting carries through every reader, in the order given.
+    pub values: Vec<String>,
+}
+
+fn describe_unrepresentable(names: &[String], values: &[String]) -> String {
+    let mut problems = Vec::new();
+    if !names.is_empty() {
+        problems.push(format!("not shell variable names: {}", names.join(", ")));
+    }
+    if !values.is_empty() {
+        problems.push(format!(
+            "values no dotenv quoting carries literally: {}",
+            values.join(", ")
+        ));
+    }
+    format!(
+        "cannot write a dotenv file that every reader takes literally ({})",
+        problems.join("; ")
+    )
 }
 
 /// Render `variables` as a dotenv file that godotenv (go-task's `dotenv:`), Docker Compose's
@@ -417,26 +436,42 @@ pub struct Dotenv {
 /// godotenv misreads a double-quoted value that ends in `"` or `\`: it trims the escaped closing
 /// quote, and takes the quote after an escaped backslash for an escaped quote.
 /// A value that ends in `"` is single-quoted instead, which all three read verbatim, as long as
-/// it contains no `'`.
-/// A key that is not a POSIX shell name, which godotenv may reject, and a value no quoting
-/// carries through all three are left out and listed in [`Dotenv::skipped`].
-pub fn to_dotenv<'a>(variables: impl IntoIterator<Item = (&'a str, &'a str)>) -> Dotenv {
-    let mut dotenv = Dotenv {
-        text: String::new(),
-        skipped: Vec::new(),
+/// it contains no `'`, and no carriage return before a line feed, which godotenv turns into a
+/// line feed before it parses.
+///
+/// # Errors
+///
+/// Returns [`UnrepresentableVariables`] naming every key that is not a POSIX shell name, which
+/// godotenv may reject, and every key whose value no quoting carries through all three readers.
+/// Such a variable fails the whole file rather than going missing from it, because a reader
+/// would then take its value from the next file it loads.
+pub fn to_dotenv<'a>(
+    variables: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> Result<String, UnrepresentableVariables> {
+    let mut text = String::new();
+    let mut unrepresentable = UnrepresentableVariables {
+        names: Vec::new(),
+        values: Vec::new(),
     };
     for (key, value) in variables {
-        let quoted = is_shell_name(key).then(|| dotenv_value(value)).flatten();
-        let Some(quoted) = quoted else {
-            dotenv.skipped.push(key.to_string());
+        if !is_shell_name(key) {
+            unrepresentable.names.push(key.to_string());
+            continue;
+        }
+        let Some(quoted) = dotenv_value(value) else {
+            unrepresentable.values.push(key.to_string());
             continue;
         };
-        dotenv.text.push_str(key);
-        dotenv.text.push('=');
-        dotenv.text.push_str(&quoted);
-        dotenv.text.push('\n');
+        text.push_str(key);
+        text.push('=');
+        text.push_str(&quoted);
+        text.push('\n');
     }
-    dotenv
+    if unrepresentable.names.is_empty() && unrepresentable.values.is_empty() {
+        Ok(text)
+    } else {
+        Err(unrepresentable)
+    }
 }
 
 /// `value` quoted for [`to_dotenv`], or `None` when no quoting reads back literally in every
@@ -446,7 +481,9 @@ fn dotenv_value(value: &str) -> Option<String> {
         return None;
     }
     if value.ends_with('"') {
-        return (!value.contains('\'')).then(|| format!("'{value}'"));
+        // Single quotes carry every character as written, so godotenv's line-ending
+        // normalization would reach a carriage return before a line feed.
+        return (!value.contains('\'') && !value.contains("\r\n")).then(|| format!("'{value}'"));
     }
     let mut quoted = String::with_capacity(value.len() + 2);
     quoted.push('"');
@@ -954,7 +991,9 @@ mod tests {
         "C:\\new\\table",
         "\\\\ in the middle",
         "line\nbreak",
+        "crlf\r\nbreak",
         "trailing newline\n",
+        "newline\nthen a quote\"",
         "\\n is no newline",
         "tab\there",
         "carriage\rreturn",
@@ -978,18 +1017,18 @@ mod tests {
     }
 
     #[test]
-    fn dotenv_quotes_every_value_and_escapes_what_readers_unescape() {
-        let dotenv = to_dotenv([
+    fn dotenv_quotes_every_value_and_escapes_what_readers_unescape() -> eyre::Result<()> {
+        let text = to_dotenv([
             ("PLAIN", "20001"),
             ("EMPTY", ""),
             ("URL", "postgres://u:p@127.0.0.1:${PORT}/db"),
             ("ESCAPED", "a\"b\\c\nd$e"),
             ("RAW", "tab\tand\rcarriage"),
             ("ENDS_IN_QUOTE", "--flag=\"x\""),
-        ]);
+        ])?;
 
         assert_eq!(
-            dotenv.text,
+            text,
             concat!(
                 "PLAIN=\"20001\"\n",
                 "EMPTY=\"\"\n",
@@ -999,26 +1038,42 @@ mod tests {
                 "ENDS_IN_QUOTE='--flag=\"x\"'\n",
             )
         );
-        assert_eq!(dotenv.skipped, Vec::<String>::new());
+        Ok(())
     }
 
-    /// Names a reader may reject, and values no quoting carries through every reader, are left
-    /// out rather than written so that one reader misreads them.
+    /// Names a reader may reject, and values no quoting carries through every reader, fail the
+    /// whole file, which names each such variable but none of their values.
     #[test]
-    fn dotenv_skips_what_a_reader_would_misread() {
-        let dotenv = to_dotenv([
+    fn dotenv_refuses_what_a_reader_would_misread() -> eyre::Result<()> {
+        let result = to_dotenv([
             ("NOT-SHELL", "x"),
             ("1A", "x"),
-            ("ENDS_IN_BACKSLASH", "dir\\"),
-            ("BOTH_QUOTES", "it's \"x\""),
+            ("ENDS_IN_BACKSLASH", "secret\\"),
+            ("BOTH_QUOTES", "secret's \"x\""),
+            // godotenv would turn the single-quoted CRLF into a bare LF.
+            ("CRLF_ENDS_IN_QUOTE", "secret\r\nbreak\""),
             ("KEPT", "x"),
         ]);
 
-        assert_eq!(dotenv.text, "KEPT=\"x\"\n");
+        let Err(error) = result else {
+            eyre::bail!("an unrepresentable environment was written: {result:?}");
+        };
         assert_eq!(
-            dotenv.skipped,
-            ["NOT-SHELL", "1A", "ENDS_IN_BACKSLASH", "BOTH_QUOTES"]
+            error,
+            UnrepresentableVariables {
+                names: vec!["NOT-SHELL".to_string(), "1A".to_string()],
+                values: vec![
+                    "ENDS_IN_BACKSLASH".to_string(),
+                    "BOTH_QUOTES".to_string(),
+                    "CRLF_ENDS_IN_QUOTE".to_string(),
+                ],
+            }
         );
+        let message = error.to_string();
+        assert!(message.contains("NOT-SHELL, 1A"), "{message}");
+        assert!(message.contains("CRLF_ENDS_IN_QUOTE"), "{message}");
+        assert!(!message.contains("secret"), "{message}");
+        Ok(())
     }
 
     /// Every value reads back unchanged through godotenv's and Compose's grammars and through
@@ -1034,25 +1089,23 @@ mod tests {
             .zip(AWKWARD_VALUES.iter().copied())
             .map(|(key, value)| (key.to_string(), value.to_string()))
             .collect::<Vec<_>>();
-        let dotenv = to_dotenv(
+        let text = to_dotenv(
             keys.iter()
                 .map(String::as_str)
                 .zip(AWKWARD_VALUES.iter().copied()),
-        );
-        assert_eq!(dotenv.skipped, Vec::<String>::new());
+        )?;
 
         assert_eq!(
-            readers::godotenv(&dotenv.text).map_err(eyre::Report::msg)?,
+            readers::godotenv(&text).map_err(eyre::Report::msg)?,
             expected,
             "godotenv"
         );
         assert_eq!(
-            readers::compose(&dotenv.text).map_err(eyre::Report::msg)?,
+            readers::compose(&text).map_err(eyre::Report::msg)?,
             expected,
             "compose"
         );
-        let dotenvy =
-            dotenvy::from_read_iter(dotenv.text.as_bytes()).collect::<Result<Vec<_>, _>>()?;
+        let dotenvy = dotenvy::from_read_iter(text.as_bytes()).collect::<Result<Vec<_>, _>>()?;
         assert_eq!(dotenvy, expected, "dotenvy");
         Ok(())
     }

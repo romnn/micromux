@@ -2388,7 +2388,10 @@ fn session_env_file_yaml(env_file: &str) -> String {
 
 /// Runs `svc` with the session-wide `env_file` `session.env`, in a session that pins
 /// `MICROMUX_SESSION` and `SESSION_PORT` the way it pins allocated ports.
-async fn spawn_session_env_file_harness(dir: &Path) -> eyre::Result<Harness> {
+async fn spawn_session_env_file_harness(
+    dir: &Path,
+    dynamic_policy: DynamicServicesPolicy,
+) -> eyre::Result<Harness> {
     let config_path = dir.join("micromux.yaml");
     fs::write(&config_path, session_env_file_yaml("session.env"))?;
     let session = std::sync::Arc::new(crate::session::SessionContext {
@@ -2416,7 +2419,7 @@ async fn spawn_session_env_file_harness(dir: &Path) -> eyre::Result<Harness> {
         services,
         Some(reload),
         dir.to_path_buf(),
-        DynamicServicesPolicy::default(),
+        dynamic_policy,
         session,
         parsed.config.env_file,
     );
@@ -2437,10 +2440,11 @@ async fn session_environment_reads_the_session_env_file_fresh() -> eyre::Result<
         dir.path().join("session.env"),
         "SHARED=one\nSESSION_PORT=1\nURL=http://127.0.0.1:${SESSION_PORT}\n",
     )?;
-    let harness = spawn_session_env_file_harness(dir.path()).await?;
+    let harness =
+        spawn_session_env_file_harness(dir.path(), DynamicServicesPolicy::default()).await?;
     let svc = "svc".to_string();
 
-    let session_environment = environment_accepted(harness.control.environment(None).await)?;
+    let session_environment = environment_accepted(harness.control.session_environment().await)?;
     assert_eq!(
         session_environment,
         ResolvedEnvironment {
@@ -2454,9 +2458,17 @@ async fn session_environment_reads_the_session_env_file_fresh() -> eyre::Result<
         }
     );
 
+    // The request for the session's variables alone keeps meaning exactly them, so a client
+    // that shows those values never discloses an env file's.
+    let session_variables = environment_accepted(harness.control.environment(None).await)?;
+    assert_eq!(
+        session_variables.variables,
+        variables(&[("MICROMUX_SESSION", "test"), ("SESSION_PORT", "20001")])
+    );
+
     // An edit shows at once, a running service keeps what it got.
     fs::write(dir.path().join("session.env"), "SHARED=two\nADDED=new\n")?;
-    let edited = environment_accepted(harness.control.environment(None).await)?;
+    let edited = environment_accepted(harness.control.session_environment().await)?;
     assert_eq!(
         edited.variables,
         variables(&[
@@ -2476,7 +2488,7 @@ async fn session_environment_reads_the_session_env_file_fresh() -> eyre::Result<
     fs::remove_file(dir.path().join("session.env"))?;
     let rejection = harness
         .control
-        .environment(None)
+        .session_environment()
         .await
         .map_err(|_| eyre::eyre!("scheduler stopped"))?;
     assert!(
@@ -2495,10 +2507,50 @@ async fn session_environment_reads_the_session_env_file_fresh() -> eyre::Result<
         session_env_file_yaml("other.env"),
     )?;
     reconcile_accepted(harness.control.reconcile_config(false).await)?;
-    let reconciled = environment_accepted(harness.control.environment(None).await)?;
+    let reconciled = environment_accepted(harness.control.session_environment().await)?;
     assert_eq!(
         reconciled.variables.get("SHARED").map(String::as_str),
         Some("other")
+    );
+
+    harness.shutdown.cancel();
+    harness.handle.await??;
+    Ok(())
+}
+
+/// A dynamic service started without `from_service` sits on the session-wide env file like a
+/// configured service: its own entries override the file's, and the pinned variables both.
+#[tokio::test]
+async fn dynamic_services_sit_on_the_session_env_file() -> eyre::Result<()> {
+    let dir = tempfile::tempdir()?;
+    fs::write(
+        dir.path().join("session.env"),
+        "SHARED=file\nOWN=file\nSESSION_PORT=1\n",
+    )?;
+    let harness =
+        spawn_session_env_file_harness(dir.path(), enabled_dynamic_policy(dir.path())?).await?;
+
+    let mut params = dynamic_params("debug", &["sh", "-c", "sleep 60"]);
+    params.spec.environment = Some(indexmap::IndexMap::from([
+        ("OWN".to_string(), "dynamic".to_string()),
+        ("SESSION_PORT".to_string(), "2".to_string()),
+    ]));
+    dynamic_accepted(harness.control.start_dynamic(params).await)?;
+
+    let environment = environment_accepted(
+        harness
+            .control
+            .environment(Some(&"debug".to_string()))
+            .await,
+    )?;
+    assert_eq!(
+        environment.variables,
+        variables(&[
+            ("MICROMUX_SESSION", "test"),
+            ("OWN", "dynamic"),
+            ("SESSION_PORT", "20001"),
+            ("SHARED", "file"),
+        ])
     );
 
     harness.shutdown.cancel();

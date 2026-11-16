@@ -28,12 +28,11 @@ pub const EVENTS_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(3, 3);
 /// The first protocol revision whose sessions answer [`Request::GetEnvironment`].
 pub const ENVIRONMENT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(3, 15);
 
-/// The first protocol revision whose sessions include the session-wide `env_file` in their own
-/// environment, which [`Request::GetEnvironment`] returns without a service, and answer
-/// [`Request::WriteEnvironmentFile`].
+/// The first protocol revision whose sessions answer [`Request::GetSessionEnvironment`] and
+/// [`Request::WriteEnvironmentFile`], and load a session-wide `env_file`.
 ///
-/// An older session answers `GetEnvironment` without a service with its variables alone, so a
-/// client must not ask it for the session's environment.
+/// An older session has no session-wide `env_file`, so its variables alone, which
+/// [`Request::GetEnvironment`] returns without a service, are its whole environment.
 pub const SESSION_ENV_FILE_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(3, 20);
 
 /// The first protocol revision whose sessions answer [`Request::SendInput`] and
@@ -214,22 +213,31 @@ pub enum Request {
         /// Dynamic service id.
         service: ServiceID,
     },
-    /// Return the session's own environment, or one service's resolved environment, with their
-    /// values.
+    /// Return the session's variables, or one service's resolved environment, with their values.
     ///
     /// Sessions answer it from protocol [`ENVIRONMENT_PROTOCOL_VERSION`] on; older ones reject it
     /// as a bad request.
-    /// Without a service, only sessions from [`SESSION_ENV_FILE_PROTOCOL_VERSION`] on include
-    /// the session-wide `env_file`.
+    /// Without a service it never includes the session-wide `env_file`, whose values may be
+    /// secrets, because clients predating [`Request::GetSessionEnvironment`] show these values
+    /// unasked.
     /// See [`micromux::ServiceControl::environment`] for what the variables are.
     GetEnvironment {
-        /// Service id, matched exactly, or `None` for the session's own environment.
+        /// Service id, matched exactly, or `None` for the session's variables.
         service: Option<ServiceID>,
     },
-    /// Write the environment [`Request::GetEnvironment`] returns to a dotenv file the session
-    /// owns, and return its path.
+    /// Return the session's own environment, with its values: the session-wide `env_file`, read
+    /// from disk for this request, and the session's variables over it.
+    ///
+    /// Sessions answer it from protocol [`SESSION_ENV_FILE_PROTOCOL_VERSION`] on; older ones
+    /// reject it as a bad request.
+    GetSessionEnvironment,
+    /// Write the environment [`Request::GetEnvironment`] returns for a service, or
+    /// [`Request::GetSessionEnvironment`] without one, to a dotenv file the session owns, and
+    /// return its path.
     ///
     /// Sessions answer it from protocol [`SESSION_ENV_FILE_PROTOCOL_VERSION`] on.
+    /// An environment the file cannot carry literally fails the request, see
+    /// [`micromux::to_dotenv`], and leaves an earlier file as it was.
     /// Each request rewrites the file at the same path, in a private directory next to the
     /// session's control socket, and the session removes the directory when it stops.
     /// The format is [`micromux::to_dotenv`]'s.
@@ -305,6 +313,7 @@ impl Request {
                 | Self::GetHealthHistory { .. }
                 | Self::GetEvents { .. }
                 | Self::GetEnvironment { .. }
+                | Self::GetSessionEnvironment
                 | Self::WriteEnvironmentFile { .. }
                 | Self::ReconcileConfig { dry_run: true }
         )
@@ -594,7 +603,7 @@ pub enum Response {
     DynamicService(DynamicServiceAck),
     /// Reply to a config reconciliation.
     Reconcile(ReconcileReceipt),
-    /// Reply to [`Request::GetEnvironment`].
+    /// Reply to [`Request::GetEnvironment`] and [`Request::GetSessionEnvironment`].
     Environment(ResolvedEnvironment),
     /// Reply to [`Request::WriteEnvironmentFile`].
     EnvironmentFile {
@@ -602,8 +611,6 @@ pub enum Response {
         path: String,
         /// As [`ResolvedEnvironment::stale`].
         stale: bool,
-        /// Keys left out of the file, as [`micromux::Dotenv::skipped`] lists them.
-        skipped: Vec<String>,
     },
     /// A streamed change notification (only after [`Request::Subscribe`]).
     Change(SessionChange),
@@ -709,8 +716,8 @@ mod tests {
         assert!(PROTOCOL_VERSION.supports(ENVIRONMENT_PROTOCOL_VERSION));
     }
 
-    /// A session includes its session-wide env file and writes env files only from 3.20 on, and
-    /// never across a major line.
+    /// A session answers the requests for its own environment and its env files only from 3.20
+    /// on, and never across a major line.
     #[test]
     fn session_env_files_require_protocol_3_20_on_the_same_major_line() {
         assert!(ProtocolVersion::new(3, 20).supports(SESSION_ENV_FILE_PROTOCOL_VERSION));
@@ -731,26 +738,30 @@ mod tests {
             );
         }
         assert!(Request::WriteEnvironmentFile { service: None }.is_retry_safe());
+        let encoded = serde_json::to_value(Request::GetSessionEnvironment)?;
+        assert_eq!(encoded, json!("GetSessionEnvironment"));
+        assert_matches!(
+            serde_json::from_value::<Request>(encoded)?,
+            Request::GetSessionEnvironment
+        );
+        assert!(Request::GetSessionEnvironment.is_retry_safe());
 
         let encoded = serde_json::to_value(Response::EnvironmentFile {
             path: "/run/micromux/0123456789abcdef.env.d/session.env".to_string(),
             stale: false,
-            skipped: vec!["NOT-SHELL".to_string()],
         })?;
         assert_eq!(
             encoded,
             json!({
                 "EnvironmentFile": {
                     "path": "/run/micromux/0123456789abcdef.env.d/session.env",
-                    "stale": false,
-                    "skipped": ["NOT-SHELL"]
+                    "stale": false
                 }
             })
         );
         assert_matches!(
             serde_json::from_value::<Response>(encoded)?,
-            Response::EnvironmentFile { path, stale: false, skipped }
-                if path.ends_with("session.env") && skipped == ["NOT-SHELL"]
+            Response::EnvironmentFile { path, stale: false } if path.ends_with("session.env")
         );
         Ok(())
     }

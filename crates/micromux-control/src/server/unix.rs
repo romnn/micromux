@@ -18,6 +18,8 @@ mod environment_files;
 #[path = "unix/log_reads.rs"]
 mod log_reads;
 
+use environment_files::EnvironmentFiles;
+
 use super::ControlServer;
 use crate::endpoint::{CanonicalConfigPath, ControlEndpoint, project_lock_path};
 use crate::protocol::{
@@ -99,8 +101,9 @@ impl SubscriptionPolicy {
 pub struct EndpointGuard {
     listener: tokio::net::UnixListener,
     socket_path: PathBuf,
-    /// The private directory next to the socket where the session writes environment files.
-    environment_files: PathBuf,
+    /// The private directory next to the socket where the session writes environment files,
+    /// shared with the requests that write them.
+    environment_files: Arc<EnvironmentFiles>,
     // Held for the whole process lifetime; the OS releases the advisory lock on exit (incl. crash).
     _lock: std::fs::File,
     // Kept under fixed per-user `/tmp`, independent of the endpoint's XDG/TMP runtime directory.
@@ -112,10 +115,10 @@ impl Drop for EndpointGuard {
         // Remove the environment files and unlink the socket under the still-held lock.
         // The permanent `<hash>.lock` file is left in place; only its advisory lock is released
         // (when `_lock` drops).
-        if let Err(err) = environment_files::remove(&self.environment_files) {
+        if let Err(err) = self.environment_files.close() {
             tracing::warn!(
                 %err,
-                directory = %self.environment_files.display(),
+                directory = %self.environment_files.directory().display(),
                 "cannot remove the session's environment files"
             );
         }
@@ -266,8 +269,7 @@ fn bind_unix(
     {
         return Err(err.into());
     }
-    let environment_files = environment_files::directory(socket_path);
-    environment_files::reset(&environment_files)?;
+    let environment_files = Arc::new(EnvironmentFiles::create(socket_path)?);
     let listener = tokio::net::UnixListener::bind(socket_path)?;
     // Defence in depth: the directory mode (0700) is what actually gates `connect`.
     std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600))?;
@@ -376,7 +378,7 @@ pub(super) async fn serve(
     shutdown: CancellationToken,
 ) -> Result<(), ControlError> {
     let connections = Arc::new(Semaphore::new(MAX_CONNECTIONS));
-    let environment_files: Arc<Path> = Arc::from(guard.environment_files.as_path());
+    let environment_files = Arc::clone(&guard.environment_files);
     loop {
         tokio::select! {
             () = shutdown.cancelled() => break,
@@ -412,7 +414,7 @@ pub(super) async fn serve(
 
 async fn handle_connection<S>(
     server: Arc<ControlServer>,
-    environment_files: &Path,
+    environment_files: &Arc<EnvironmentFiles>,
     stream: S,
     shutdown: CancellationToken,
 ) where
@@ -649,9 +651,12 @@ fn lag_replay_changes(snapshots: &[ServiceSnapshot]) -> impl Iterator<Item = Ses
     }))
 }
 
-/// Answers one request; `environment_files` is the directory [`Request::WriteEnvironmentFile`]
-/// writes to.
-async fn dispatch(server: &ControlServer, environment_files: &Path, request: Request) -> Response {
+/// Answers one request; [`Request::WriteEnvironmentFile`] writes to `environment_files`.
+async fn dispatch(
+    server: &ControlServer,
+    environment_files: &Arc<EnvironmentFiles>,
+    request: Request,
+) -> Response {
     match request {
         Request::Describe => Response::Description(describe_with_git(server).await),
         Request::ListServices => Response::Services(server.reader.services()),
@@ -729,6 +734,7 @@ async fn dispatch(server: &ControlServer, environment_files: &Path, request: Req
             acknowledge_dynamic(server.control.stop_dynamic(&service).await)
         }
         Request::GetEnvironment { service } => environment(server, service.as_ref()).await,
+        Request::GetSessionEnvironment => session_environment(server).await,
         Request::WriteEnvironmentFile { service } => {
             write_environment_file(server, environment_files, service).await
         }
@@ -842,11 +848,21 @@ async fn environment(server: &ControlServer, service: Option<&micromux::ServiceI
     )
 }
 
-/// Writes the environment [`Request::GetEnvironment`] returns for `service` to its dotenv file in
-/// `directory`.
+async fn session_environment(server: &ControlServer) -> Response {
+    acknowledge_with(
+        server.control.session_environment().await,
+        Response::Environment,
+    )
+}
+
+/// Writes the environment [`Request::GetEnvironment`] returns for `service`, or
+/// [`Request::GetSessionEnvironment`] without one, to its dotenv file.
+///
+/// An environment the file cannot carry literally fails the request and leaves an earlier file
+/// as it was.
 async fn write_environment_file(
     server: &ControlServer,
-    directory: &Path,
+    files: &Arc<EnvironmentFiles>,
     service: Option<micromux::ServiceID>,
 ) -> Response {
     // Only a valid id, which is always a single path component, names a file.
@@ -856,32 +872,32 @@ async fn write_environment_file(
     {
         return unknown_service(service);
     }
-    let micromux::ResolvedEnvironment { variables, stale } =
-        match server.control.environment(service.as_ref()).await {
-            Ok(Ok(environment)) => environment,
-            Ok(Err(rejection)) => return rejection_response(rejection),
-            Err(SchedulerStopped) => {
-                return Response::error(ErrorCode::SchedulerStopped, "the scheduler has stopped");
-            }
-        };
-    let micromux::Dotenv { text, skipped } = micromux::to_dotenv(
+    let environment = match &service {
+        Some(service) => server.control.environment(Some(service)).await,
+        None => server.control.session_environment().await,
+    };
+    let micromux::ResolvedEnvironment { variables, stale } = match environment {
+        Ok(Ok(environment)) => environment,
+        Ok(Err(rejection)) => return rejection_response(rejection),
+        Err(SchedulerStopped) => {
+            return Response::error(ErrorCode::SchedulerStopped, "the scheduler has stopped");
+        }
+    };
+    // The error names the variables, never their values.
+    let text = match micromux::to_dotenv(
         variables
             .iter()
             .map(|(key, value)| (key.as_str(), value.as_str())),
-    );
-    let directory = directory.to_path_buf();
-    let written = tokio::task::spawn_blocking(move || {
-        environment_files::write(&directory, service.as_deref(), &text)
-    })
-    .await;
+    ) {
+        Ok(text) => text,
+        Err(err) => return Response::error(ErrorCode::InvalidState, err.to_string()),
+    };
+    let files = Arc::clone(files);
+    let written = tokio::task::spawn_blocking(move || files.write(service.as_deref(), &text)).await;
     // The errors name the file, never its contents.
     match written {
         Ok(Ok(path)) => match path.into_os_string().into_string() {
-            Ok(path) => Response::EnvironmentFile {
-                path,
-                stale,
-                skipped,
-            },
+            Ok(path) => Response::EnvironmentFile { path, stale },
             Err(path) => Response::error(
                 ErrorCode::Internal,
                 format!(
@@ -1894,6 +1910,15 @@ mod tests {
         Ok(())
     }
 
+    /// The environment files of a session whose socket would be in `directory`.
+    fn environment_files(
+        directory: &std::path::Path,
+    ) -> eyre::Result<std::sync::Arc<super::EnvironmentFiles>> {
+        Ok(std::sync::Arc::new(super::EnvironmentFiles::create(
+            &directory.join("0123456789abcdef.sock"),
+        )?))
+    }
+
     /// A session with one `svc` service whose scheduler never runs.
     struct UnscheduledSession {
         server: ControlServer,
@@ -1933,6 +1958,7 @@ mod tests {
     async fn terminal_requests_need_a_terminal_capability() -> eyre::Result<()> {
         let directory = tempfile::tempdir()?;
         let UnscheduledSession { server, .. } = unscheduled_session(directory.path())?;
+        let files = environment_files(directory.path())?;
 
         for request in [
             Request::SendInput {
@@ -1943,7 +1969,7 @@ mod tests {
             Request::ResizeTerminal { cols: 80, rows: 24 },
         ] {
             assert_matches!(
-                dispatch(&server, directory.path(), request).await,
+                dispatch(&server, &files, request).await,
                 Response::Error {
                     code: ErrorCode::PolicyDenied,
                     ..
@@ -1964,6 +1990,7 @@ mod tests {
             runner,
         } = unscheduled_session(directory.path())?;
         let server = server.with_terminal(terminal);
+        let files = environment_files(directory.path())?;
 
         let send = |service: &str| Request::SendInput {
             service: service.to_string(),
@@ -1971,7 +1998,7 @@ mod tests {
             paste: false,
         };
         assert_matches!(
-            dispatch(&server, directory.path(), send("missing")).await,
+            dispatch(&server, &files, send("missing")).await,
             Response::Error {
                 code: ErrorCode::UnknownService,
                 ..
@@ -1980,7 +2007,7 @@ mod tests {
         // The scheduler never ran, so `svc` has no process to type into, and the client hears so
         // instead of its input vanishing.
         assert_matches!(
-            dispatch(&server, directory.path(), send("svc")).await,
+            dispatch(&server, &files, send("svc")).await,
             Response::Error {
                 code: ErrorCode::InvalidState,
                 message,
@@ -1988,12 +2015,7 @@ mod tests {
         );
         for (cols, rows) in [(0, 24), (80, 0)] {
             assert_matches!(
-                dispatch(
-                    &server,
-                    directory.path(),
-                    Request::ResizeTerminal { cols, rows }
-                )
-                .await,
+                dispatch(&server, &files, Request::ResizeTerminal { cols, rows }).await,
                 Response::Error {
                     code: ErrorCode::BadRequest,
                     ..
@@ -2003,7 +2025,7 @@ mod tests {
         assert_matches!(
             dispatch(
                 &server,
-                directory.path(),
+                &files,
                 Request::ResizeTerminal { cols: 80, rows: 24 }
             )
             .await,
@@ -2015,7 +2037,7 @@ mod tests {
         assert_matches!(
             dispatch(
                 &server,
-                directory.path(),
+                &files,
                 Request::ResizeTerminal { cols: 80, rows: 24 }
             )
             .await,

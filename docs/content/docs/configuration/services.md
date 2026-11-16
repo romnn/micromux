@@ -89,7 +89,7 @@ services:
     env_file: api.env       # sees and overrides the session-wide values
 ```
 
-Its values resolve like a service's env files: against the environment micromux runs in, the files before them, and their own earlier lines, with the [session variables]({{< relref "sessions.md" >}}#injected-variables) winning, so `DATABASE_URL=postgres://127.0.0.1:${POSTGRES_PORT}/app` gets the allocated port. A service sees them in its own env files, its `environment`, and everything after.
+Its values resolve like a service's env files: against the environment micromux runs in, the files before them, and their own earlier lines, with the [session variables]({{< relref "sessions.md" >}}#injected-variables) winning, so `DATABASE_URL=postgres://127.0.0.1:${POSTGRES_PORT}/app` gets the allocated port. A service sees them in its own env files, its `environment`, and everything after. A [dynamic service]({{< relref "../agent-control/dynamic-services.md" >}}) gets them too, read when it starts, beneath its own `environment`.
 
 The session's own environment includes them too: `micromux env` and `micromux exec` without `--service` read them from disk on every call, and `micromux env --file` writes them to a dotenv file for tools that only read files. See [Run commands in the session environment]({{< relref "../agent-control/control-plane.md" >}}#run-commands-in-the-session-environment).
 

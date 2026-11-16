@@ -102,25 +102,10 @@ pub(crate) async fn write_file(target: &Target<'_>) -> Result<(), crate::Error> 
                 service: target.service.map(str::to_string),
             })
             .await?;
-        let Response::EnvironmentFile {
-            path,
-            stale,
-            skipped,
-        } = response
-        else {
+        let Response::EnvironmentFile { path, stale } = response else {
             return Err(request_error(response, &session, target.service));
         };
         note_stale(stale, target.service);
-        for key in &skipped {
-            if micromux::is_shell_name(key) {
-                eprintln!(
-                    "micromux: skipping {key:?}, whose value no dotenv quoting carries through \
-                     every reader"
-                );
-            } else {
-                eprintln!("micromux: skipping {key:?}, which is not a valid shell variable name");
-            }
-        }
         write_stdout(&format!("{path}\n"))
     }
     .await;
@@ -164,22 +149,21 @@ async fn fetch(
     let Some((mut client, session)) = connect(target, command).await? else {
         return Ok(None);
     };
-    // Without a service, an older session answers with its variables alone, without the
-    // session-wide env file, which must not pass for the session's environment.
-    require(
-        &session,
-        if target.service.is_some() {
-            ENVIRONMENT_PROTOCOL_VERSION
-        } else {
-            SESSION_ENV_FILE_PROTOCOL_VERSION
-        },
-        command,
-    )?;
-    let response = client
-        .request(Request::GetEnvironment {
+    require(&session, ENVIRONMENT_PROTOCOL_VERSION, command)?;
+    // A session too old for a session-wide env file has its variables alone for its own
+    // environment.
+    let request = if target.service.is_none()
+        && session
+            .protocol_version
+            .supports(SESSION_ENV_FILE_PROTOCOL_VERSION)
+    {
+        Request::GetSessionEnvironment
+    } else {
+        Request::GetEnvironment {
             service: target.service.map(str::to_string),
-        })
-        .await?;
+        }
+    };
+    let response = client.request(request).await?;
     let Response::Environment(environment) = response else {
         return Err(request_error(response, &session, target.service));
     };
@@ -251,7 +235,7 @@ async fn connect(
     let Some(selector) = selector else {
         return match crate::ctl::connect_project(target.config).await {
             Ok(session) => Ok(Some((session.client, session.info))),
-            Err(err) if target.if_running => unclaimed_or(err, target.config).await,
+            Err(err) if target.if_running => not_running_or(err, target.config).await,
             Err(err) => Err(err),
         };
     };
@@ -265,23 +249,27 @@ async fn connect(
     Ok(Some((client, resolved.info)))
 }
 
-/// `None` when no session claims the project, which `--if-running` treats as nothing to read,
-/// and otherwise `err`, why the session that claims it did not answer.
+/// `None` when no session runs for the project, which `--if-running` treats as nothing to read,
+/// and otherwise `err`, why the session that runs for it did not answer.
 ///
-/// The config's owner lock decides, not the failed connection: a session that is starting, or
-/// runs without a control plane, holds the lock but answers nothing, and must not pass for a
-/// project without a session.
-async fn unclaimed_or(
+/// Locks decide, not the failed connection: a session that is starting, or runs without a
+/// control plane, holds its config's owner lock but answers nothing, and one that is stopping
+/// has released that lock and its endpoint while its services still drain, but keeps its
+/// registry lock until they are gone.
+/// Neither must pass for a project without a session.
+async fn not_running_or(
     err: crate::Error,
     config: Option<&Path>,
 ) -> Result<Option<(Client, SessionInfo)>, crate::Error> {
     let working_dir = std::env::current_dir()?;
     let config_path = crate::control::resolve_config_path(config, &working_dir).await?;
-    if !micromux_control::project_claimed(&config_path)? {
+    if !micromux_control::project_claimed(&config_path)?
+        && !micromux::PortRegistry::user().is_live(&config_path)?
+    {
         return Ok(None);
     }
     Err(crate::Error::Message(format!(
-        "{err}\nnote: a session claims {}, so --if-running does not skip it; it is starting, \
+        "{err}\nnote: a session runs for {}, so --if-running does not skip it; it is starting, \
          stopping, or runs without a control plane",
         config_path.display()
     )))

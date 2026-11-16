@@ -1516,31 +1516,30 @@ impl McpServer {
             .await
             .map_err(error_data)?;
         let version = resolved.info.protocol_version;
-        // Without a service, an older session answers with its variables alone, without the
-        // session-wide env file, which must not pass for the session's environment.
-        let required = if args.service.is_some() {
-            ENVIRONMENT_PROTOCOL_VERSION
-        } else {
-            SESSION_ENV_FILE_PROTOCOL_VERSION
-        };
-        if !version.supports(required) {
+        if !version.supports(ENVIRONMENT_PROTOCOL_VERSION) {
             return Err(ErrorData::invalid_params(
                 format!(
                     "session `{}` speaks control protocol {version}, but get_session_env needs \
-                     {required} or later; restart the session with this micromux",
+                     {ENVIRONMENT_PROTOCOL_VERSION} or later; restart the session with this \
+                     micromux",
                     resolved.info.name
                 ),
                 None,
             ));
         }
-        let response = send_request(
-            &resolved.endpoint,
-            Request::GetEnvironment {
-                service: args.service.clone(),
-            },
-        )
-        .await
-        .map_err(error_data)?;
+        // A session too old for a session-wide env file has its variables alone for its own
+        // environment.
+        let request =
+            if args.service.is_none() && version.supports(SESSION_ENV_FILE_PROTOCOL_VERSION) {
+                Request::GetSessionEnvironment
+            } else {
+                Request::GetEnvironment {
+                    service: args.service.clone(),
+                }
+            };
+        let response = send_request(&resolved.endpoint, request)
+            .await
+            .map_err(error_data)?;
         let environment = match &args.service {
             Some(service) => {
                 service_result(&self.discovery, service, convert::environment(response)).await?

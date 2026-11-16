@@ -21,9 +21,9 @@ mod common;
 
 use common::MICROMUX;
 
-/// A session with one allocated port, a session-wide env file, and a service whose environment
+/// A session with one allocated port, a session-wide env file, a service whose environment
 /// mixes its own env file, an interpolated inline entry that needs quoting, and a key no shell
-/// can assign.
+/// can assign, and a service whose environment every dotenv reader takes.
 const CONFIG: &str = r#"version: 1
 allocate_ports: [EXEC_TEST_PORT]
 env_file: session.env
@@ -35,6 +35,10 @@ services:
     environment:
       INLINE: "it's ${FROM_ENV_FILE}"
       NOT-SHELL: "x"
+  plain:
+    command: ["sh", "-c", "exec sleep 300"]
+    environment:
+      PLAIN: "plain value"
 "#;
 
 const ENV_FILE: &str = "FROM_ENV_FILE=from env file\n";
@@ -541,7 +545,8 @@ fn env_and_exec_fail_without_a_session_for_the_config() -> eyre::Result<()> {
 }
 
 /// A stand-in for a session started by an older micromux: it describes itself with the protocol
-/// it is given and rejects every other request, as a 3.13 session rejects `GetEnvironment`.
+/// it is given, answers `GetEnvironment` without a service with one allocated port, as a 3.19
+/// session does, and rejects every other request, as a 3.13 session rejects `GetEnvironment`.
 struct OldSession {
     socket: PathBuf,
     stop: Arc<AtomicBool>,
@@ -583,11 +588,22 @@ impl OldSession {
             session: None,
             capabilities: None,
         });
-        let description = serde_json::to_string(&description)?;
-        let rejection = serde_json::to_string(&micromux_control::Response::error(
-            micromux_control::ErrorCode::BadRequest,
-            "unknown variant",
-        ))?;
+        let replies = Replies {
+            description: serde_json::to_string(&description)?,
+            variables: serde_json::to_string(&micromux_control::Response::Environment(
+                micromux_control::ResolvedEnvironment {
+                    variables: BTreeMap::from([(
+                        "OLD_SESSION_PORT".to_string(),
+                        "20001".to_string(),
+                    )]),
+                    stale: false,
+                },
+            ))?,
+            rejection: serde_json::to_string(&micromux_control::Response::error(
+                micromux_control::ErrorCode::BadRequest,
+                "unknown variant",
+            ))?,
+        };
 
         let listener = UnixListener::bind(&socket)?;
         listener.set_nonblocking(true)?;
@@ -600,7 +616,7 @@ impl OldSession {
                         std::thread::sleep(Duration::from_millis(10));
                         continue;
                     };
-                    let _ = answer(stream, &description, &rejection);
+                    let _ = answer(stream, &replies);
                 }
             }
         });
@@ -612,20 +628,23 @@ impl OldSession {
     }
 }
 
+/// What an [`OldSession`] answers, as encoded frames.
+struct Replies {
+    description: String,
+    variables: String,
+    rejection: String,
+}
+
 /// Answers every request on one connection until the client hangs up.
-fn answer(
-    stream: std::os::unix::net::UnixStream,
-    description: &str,
-    rejection: &str,
-) -> std::io::Result<()> {
+fn answer(stream: std::os::unix::net::UnixStream, replies: &Replies) -> std::io::Result<()> {
     stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     let mut writer = stream.try_clone()?;
     for request in BufReader::new(stream).lines() {
-        let reply = if request? == "\"Describe\"" {
-            description
-        } else {
-            rejection
+        let reply = match serde_json::from_str::<micromux_control::Request>(&request?) {
+            Ok(micromux_control::Request::Describe) => &replies.description,
+            Ok(micromux_control::Request::GetEnvironment { service: None }) => &replies.variables,
+            _ => &replies.rejection,
         };
         writeln!(writer, "{reply}")?;
     }
@@ -678,11 +697,11 @@ fn env_and_exec_refuse_a_session_too_old_to_answer() -> eyre::Result<()> {
     Ok(())
 }
 
-/// A session that answers `GetEnvironment` but predates the session-wide env file would answer
-/// with its variables alone, so the session's environment is refused, written or not, and
-/// `--if-running` does not excuse it.
+/// A session that predates the session-wide env file has its variables alone for its own
+/// environment, so `env` and `exec` read those with the request it knows, and only writing a file
+/// needs a newer session; `--if-running` does not excuse that.
 #[test]
-fn the_session_environment_refuses_a_session_without_session_env_files() -> eyre::Result<()> {
+fn a_session_without_session_env_files_serves_its_variables() -> eyre::Result<()> {
     let project = tempfile::tempdir()?;
     std::fs::write(
         project.path().join("micromux.yaml"),
@@ -693,30 +712,38 @@ fn the_session_environment_refuses_a_session_without_session_env_files() -> eyre
         micromux_control::ProtocolVersion::new(3, 19),
     )?;
 
-    for (args, command) in [
-        (&["env"][..], "env"),
-        (&["env", "--if-running"], "env"),
-        (&["env", "--file"], "env --file"),
-        (&["env", "--file", "--service", "svc"], "env --file"),
+    let output = run(project.path(), &["env"])?;
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "OLD_SESSION_PORT=20001\n");
+    let output = run(
+        project.path(),
+        &[
+            "exec",
+            "--",
+            "sh",
+            "-c",
+            "printf '%s' \"$OLD_SESSION_PORT\"",
+        ],
+    )?;
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "20001");
+
+    for args in [
+        &["env", "--file"][..],
+        &["env", "--file", "--if-running"],
+        &["env", "--file", "--service", "svc"],
     ] {
         let output = run(project.path(), args)?;
         assert_eq!(output.status.code(), Some(1), "{args:?}");
         assert_eq!(stdout(&output), "", "{args:?}");
         assert!(
-            stderr(&output).contains(&format!(
-                "the running session `old` (protocol 3.19) is too old for `micromux {command}`"
-            )),
+            stderr(&output).contains(
+                "the running session `old` (protocol 3.19) is too old for `micromux env --file`"
+            ),
             "{args:?}: {}",
             stderr(&output)
         );
     }
-
-    let output = run(
-        project.path(),
-        &["exec", "--if-running", "--", "sh", "-c", "touch ran"],
-    )?;
-    assert_eq!(output.status.code(), Some(125));
-    assert!(!project.path().join("ran").exists());
     Ok(())
 }
 
@@ -774,25 +801,17 @@ fn env_file_writes_a_private_dotenv_file_the_session_owns() -> eyre::Result<()> 
     // The same file each time
     assert_eq!(env_file(&session, &[])?, path);
 
-    // A service's environment goes to its own file; the key no dotenv reader takes is left out
-    // with a warning that names only the key.
-    let output = session.run(&["env", "--file", "--service", "svc"])?;
-    assert!(output.status.success(), "{}", stderr(&output));
-    let service_path = PathBuf::from(stdout(&output).trim_end());
+    // A service's environment, the session-wide env file included, goes to its own file.
+    let service_path = env_file(&session, &["--service", "plain"])?;
     assert_ne!(service_path, path);
     assert_eq!(service_path.parent(), path.parent());
-    assert_eq!(
-        stderr(&output),
-        "micromux: skipping \"NOT-SHELL\", which is not a valid shell variable name\n"
-    );
     let contents = std::fs::read_to_string(&service_path)?;
-    assert!(
-        contents
-            .lines()
-            .any(|line| line == "INLINE=\"it's from env file\""),
-        "{contents}"
-    );
-    assert!(!contents.contains("NOT-SHELL"), "{contents}");
+    for line in ["PLAIN=\"plain value\"", "SHARED=\"from session file\""] {
+        assert!(
+            contents.lines().any(|written| written == line),
+            "{contents}"
+        );
+    }
 
     // An unknown service fails without writing anything.
     let output = session.run(&["env", "--file", "--service", "nope"])?;
@@ -803,6 +822,35 @@ fn env_file_writes_a_private_dotenv_file_the_session_owns() -> eyre::Result<()> 
         "{}",
         stderr(&output)
     );
+    Ok(())
+}
+
+/// An environment some dotenv reader would read differently fails the export with an error that
+/// names the variables but not their values, and the file it would replace stays as it was, so
+/// a tool never falls back to another file's value for a missing variable.
+#[test]
+fn env_file_refuses_an_environment_a_reader_would_misread() -> eyre::Result<()> {
+    let session = Session::start()?;
+    let path = env_file(&session, &[])?;
+    let before = std::fs::read_to_string(&path)?;
+
+    // A key no shell can assign
+    let output = session.run(&["env", "--file", "--service", "svc"])?;
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(stdout(&output), "");
+    assert!(stderr(&output).contains("NOT-SHELL"), "{}", stderr(&output));
+
+    // A value ending in a backslash, which godotenv cannot read back
+    std::fs::write(
+        session.path().join("session.env"),
+        "SHARED=edited\nTRAILING=secret\\\n",
+    )?;
+    let output = session.run(&["env", "--file"])?;
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(stdout(&output), "");
+    assert!(stderr(&output).contains("TRAILING"), "{}", stderr(&output));
+    assert!(!stderr(&output).contains("secret"), "{}", stderr(&output));
+    assert_eq!(std::fs::read_to_string(&path)?, before);
     Ok(())
 }
 
@@ -859,7 +907,7 @@ fn the_session_environment_reads_its_env_file_fresh() -> eyre::Result<()> {
 fn the_env_file_is_removed_when_the_session_stops() -> eyre::Result<()> {
     let mut session = Session::start()?;
     let path = env_file(&session, &[])?;
-    let service_path = env_file(&session, &["--service", "svc"])?;
+    let service_path = env_file(&session, &["--service", "plain"])?;
     let directory = path
         .parent()
         .ok_or_else(|| eyre::eyre!("no parent"))?
@@ -977,5 +1025,69 @@ fn if_running_fails_when_a_session_claims_the_project_without_answering() -> eyr
     )?;
     assert_eq!(output.status.code(), Some(125));
     assert!(!project.path().join("ran").exists());
+    Ok(())
+}
+
+/// A stopping session gives up its endpoint and its claim on the config at once, while its
+/// services may take their whole grace period to stop; `--if-running` must not take it for no
+/// session then, or a command would run against its defaults while the services still listen.
+#[test]
+fn if_running_fails_while_a_session_stops() -> eyre::Result<()> {
+    let directory = tempfile::tempdir()?;
+    // The service stops only once the test releases it.
+    std::fs::write(
+        directory.path().join("stubborn.sh"),
+        "trap 'while [ ! -e release ]; do sleep 0.05; done; exit 0' TERM\n\
+         while :; do sleep 0.05; done\n",
+    )?;
+    std::fs::write(
+        directory.path().join("micromux.yaml"),
+        "version: 1\nservices:\n  stubborn:\n    command: [\"sh\", \"./stubborn.sh\"]\n    \
+         stop_grace_period: 60s\n",
+    )?;
+    let config =
+        micromux_control::CanonicalConfigPath::new(directory.path().join("micromux.yaml"))?;
+    let claim_lock =
+        micromux_control::coordination_dir_in(&common::state_directory(directory.path())).join(
+            format!("{}.session.lock", micromux_control::endpoint_hash(&config)),
+        );
+    let mut session = Session::serve(directory)?;
+
+    // Stop the session, and wait until neither its endpoint nor its claim is left.
+    let output = session.run(&["ctl", "stop"])?;
+    assert!(output.status.success(), "{}", stderr(&output));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while session.run(&["ctl", "ls"])?.status.success()
+        || micromux_control::claim_project_at(&claim_lock).is_err()
+    {
+        eyre::ensure!(
+            Instant::now() < deadline,
+            "the stopping session kept its endpoint or its claim"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    eyre::ensure!(
+        session.supervisor.try_wait()?.is_none(),
+        "the session exited before its service stopped"
+    );
+
+    // The service still drains, so both commands fail instead of skipping.
+    let output = session.run(&["env", "--if-running"])?;
+    assert_eq!(output.status.code(), Some(1), "{}", stdout(&output));
+    assert!(
+        stderr(&output).contains("so --if-running does not skip it"),
+        "{}",
+        stderr(&output)
+    );
+    let output = session.run(&["exec", "--if-running", "--", "sh", "-c", "touch ran"])?;
+    assert_eq!(output.status.code(), Some(125));
+    assert!(!session.path().join("ran").exists());
+
+    // Once the session is gone, the flag skips.
+    std::fs::write(session.path().join("release"), "")?;
+    session.stop()?;
+    let output = session.run(&["env", "--if-running"])?;
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "");
     Ok(())
 }
