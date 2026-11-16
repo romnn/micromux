@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.4.5
+
 - **Share env files across services, and hand the session's resolved environment to tools that
   only read dotenv files.** Use the top-level `env_file`, `micromux env --file`, and
   `--if-running` on `env` and `exec`.
