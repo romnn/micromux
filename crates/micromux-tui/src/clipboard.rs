@@ -106,7 +106,7 @@ fn copy_with(candidates: &[Candidate], text: &str) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::{copy_with, gnome, unix_commands};
+    use super::{gnome, unix_commands};
     use similar_asserts::assert_eq;
 
     fn programs(wayland: bool, x11: bool, gnome: bool) -> Vec<&'static str> {
@@ -150,6 +150,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_failing_command_falls_back_to_the_next() {
+        use super::copy_with;
+
         // The last command succeeds only when it reads exactly the copied text.
         let candidates = [
             ("micromux-no-such-clipboard-command", &[] as &[&str]),
