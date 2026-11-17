@@ -9,3 +9,6 @@ clippy-wrapper = "run -q --package clippy-wrapper --"
 # linting
 lint = "clippy-wrapper lint"
 fixit = "clippy-wrapper fixit"
+
+[registries.crates-io]
+min-publish-age = "1 week"
