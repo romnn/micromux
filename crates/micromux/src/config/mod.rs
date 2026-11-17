@@ -204,11 +204,57 @@ pub struct UiConfig {
     pub width: Option<Spanned<usize>>,
     /// Render structured JSON logs as compact colored log lines in the TUI.
     pub pretty_json_logs: bool,
-    /// Whether the TUI captures the mouse, or `None` to leave the choice to the user config.
-    pub mouse: Option<bool>,
+    /// What the TUI may do with the mouse; the parts this config leaves open come from the user
+    /// config.
+    pub mouse: MouseConfig,
     /// Whether finishing a mouse selection copies it, or `None` to leave the choice to the user
     /// config.
     pub copy_on_select: Option<bool>,
+}
+
+/// What the TUI may do with the mouse, from `ui.mouse`, each part `None` where the file is
+/// silent.
+///
+/// `mouse: true` and `mouse: false` set every part, and a mapping only the parts it names.
+/// The TUI captures the mouse when any part is on.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct MouseConfig {
+    /// Whether a drag, a double or a triple click selects text in one pane, and a right click
+    /// copies it.
+    pub select: Option<bool>,
+    /// Whether a click focuses panes, selects services, presses hints, opens URLs and picks
+    /// levels.
+    pub navigate: Option<bool>,
+    /// Whether the wheel scrolls the pane, list or popup under the pointer.
+    pub scroll: Option<bool>,
+}
+
+impl MouseConfig {
+    /// Every part set to `enabled`, as `mouse: true` or `mouse: false` says.
+    #[must_use]
+    pub const fn all(enabled: bool) -> Self {
+        Self {
+            select: Some(enabled),
+            navigate: Some(enabled),
+            scroll: Some(enabled),
+        }
+    }
+
+    /// The parts of `self`, with those it leaves open taken from `below`.
+    #[must_use]
+    pub fn or(self, below: Self) -> Self {
+        Self {
+            select: self.select.or(below.select),
+            navigate: self.navigate.or(below.navigate),
+            scroll: self.scroll.or(below.scroll),
+        }
+    }
+
+    /// Whether every part is set, so a layer below has nothing left to add.
+    #[must_use]
+    pub const fn is_complete(self) -> bool {
+        self.select.is_some() && self.navigate.is_some() && self.scroll.is_some()
+    }
 }
 
 /// Agent-control configuration latched for the lifetime of a session.
@@ -255,7 +301,7 @@ impl Default for UiConfig {
         Self {
             width: None,
             pretty_json_logs: true,
-            mouse: None,
+            mouse: MouseConfig::default(),
             copy_on_select: None,
         }
     }
@@ -981,6 +1027,29 @@ mod tests {
         Ok(())
     }
 
+    /// The schema takes `ui.mouse` as a bool or a mapping of the known parts, as the parser does.
+    #[test]
+    fn schema_takes_the_mouse_as_a_bool_or_its_parts() -> eyre::Result<()> {
+        let validator = compiled_schema()?;
+        let config = |mouse: &str| -> eyre::Result<serde_json::Value> {
+            Ok(serde_yaml::from_str(&format!(
+                "version: 1\nui:\n  mouse: {mouse}\nservices:\n  app:\n    command: 'true'\n"
+            ))?)
+        };
+        for valid in [
+            "true",
+            "false",
+            "{}",
+            "{ select: true, navigate: false, scroll: true }",
+        ] {
+            assert!(validator.is_valid(&config(valid)?), "{valid}");
+        }
+        for invalid in ["sometimes", "{ hover: true }", "{ select: 1 }"] {
+            assert!(!validator.is_valid(&config(invalid)?), "{invalid}");
+        }
+        Ok(())
+    }
+
     /// An attached TUI reads the project's `ui` settings even where the rest of the file would
     /// not load, as with a key the session predates under `strict` or a broken service.
     #[test]
@@ -996,7 +1065,10 @@ mod tests {
               broken: 5
         "};
         let ui = super::parse_ui_section(yaml)?;
-        assert_eq!((ui.mouse, ui.copy_on_select), (Some(false), Some(true)));
+        assert_eq!(
+            (ui.mouse, ui.copy_on_select),
+            (super::MouseConfig::all(false), Some(true))
+        );
         assert_eq!(super::parse_ui_section("")?, super::UiConfig::default());
         assert!(super::parse_ui_section("ui: [1]").is_err());
         Ok(())
@@ -1136,8 +1208,61 @@ mod tests {
         assert_eq!(diagnostics, Vec::new());
         assert_eq!(parsed.config.ui_config.width.as_deref().copied(), Some(80));
         assert!(!parsed.config.ui_config.pretty_json_logs);
-        assert_eq!(parsed.config.ui_config.mouse, Some(false));
+        assert_eq!(
+            parsed.config.ui_config.mouse,
+            super::MouseConfig::all(false)
+        );
         assert_eq!(parsed.config.ui_config.copy_on_select, Some(true));
+        Ok(())
+    }
+
+    /// A mapping sets only the mouse parts it names, and in a strict config an unknown part is
+    /// an error rather than a warning.
+    #[test]
+    fn parse_config_mouse_parts() -> eyre::Result<()> {
+        use codespan_reporting::diagnostic::Severity;
+
+        let config = |strict: bool, mouse: &str| {
+            let yaml = format!(
+                "version: 1\nstrict: {strict}\nui:\n  mouse: {mouse}\nservices:\n  app:\n    command: \"true\"\n"
+            );
+            let mut diagnostics = vec![];
+            let parsed = super::from_str(&yaml, Path::new("."), 0usize, None, &mut diagnostics);
+            (parsed, diagnostics)
+        };
+
+        let (parsed, diagnostics) = config(true, "{ select: true, navigate: false }");
+        assert_eq!(diagnostics, Vec::new());
+        assert_eq!(
+            parsed?.config.ui_config.mouse,
+            super::MouseConfig {
+                select: Some(true),
+                navigate: Some(false),
+                scroll: None,
+            }
+        );
+
+        // An unknown part warns in a lenient config, and fails a strict one.
+        let (parsed, diagnostics) = config(false, "{ hover: true }");
+        assert_eq!(
+            parsed?.config.ui_config.mouse,
+            super::MouseConfig::default()
+        );
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].message, "unknown ui.mouse field `hover`");
+        assert_eq!(diagnostics[0].severity, Severity::Warning);
+        let (parsed, diagnostics) = config(true, "{ hover: true }");
+        parsed?;
+        let severities = diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.severity)
+            .collect::<Vec<_>>();
+        assert_eq!(severities, vec![Severity::Error]);
+
+        // A part that is not a bool, and a mouse setting that is neither a bool nor a mapping, are
+        // errors.
+        assert!(config(false, "{ select: sometimes }").0.is_err());
+        assert!(config(false, "sometimes").0.is_err());
         Ok(())
     }
 
@@ -1216,7 +1341,9 @@ mod tests {
             ui:
               width: 120
               pretty_json_logs: false
-              mouse: false
+              mouse:
+                select: true
+                navigate: false
               copy_on_select: false
             control:
               enabled: true

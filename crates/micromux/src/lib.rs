@@ -61,7 +61,7 @@ pub use cleanup::{
 pub use config::user::{UserConfig, parse_user_config, user_config_path};
 pub use config::{
     ConfigError, ConfigFile, ControlConfig, DependencyCondition, DynamicServicesPolicy,
-    MAX_CONFIG_FILE_BYTES, UiConfig, config_file_names, find_config_file, from_str,
+    MAX_CONFIG_FILE_BYTES, MouseConfig, UiConfig, config_file_names, find_config_file, from_str,
     parse_ui_section, read_config_file, read_config_file_async,
 };
 pub use diagnostics::{Printer, ToDiagnostics, render_to_string};

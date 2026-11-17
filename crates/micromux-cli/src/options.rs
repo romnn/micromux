@@ -86,7 +86,7 @@ pub struct Options {
         global = true,
         value_name = "on|off",
         value_parser = clap::builder::BoolishValueParser::new(),
-        help = "capture the mouse in the TUI for clicks, scrolling and selection; overrides `ui: { mouse: ... }` in the project and user configs"
+        help = "capture the mouse in the TUI for selecting, clicking and scrolling, all of them on or off; overrides `ui: { mouse: ... }` in the project and user configs"
     )]
     pub mouse: Option<bool>,
 
@@ -119,7 +119,9 @@ impl Options {
     /// The TUI settings the flags set, which take precedence over the configs.
     pub(crate) fn ui_setting_flags(&self) -> crate::ui_settings::Layers {
         crate::ui_settings::Layers {
-            mouse: self.mouse,
+            mouse: self
+                .mouse
+                .map_or_else(micromux::MouseConfig::default, micromux::MouseConfig::all),
             copy_on_select: self.copy_on_select,
         }
     }

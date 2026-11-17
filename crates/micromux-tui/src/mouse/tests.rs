@@ -956,8 +956,8 @@ async fn selecting_only_highlights_and_copying_takes_an_explicit_key() -> eyre::
 async fn copy_on_select_copies_when_the_drag_ends() -> eyre::Result<()> {
     let mut app = app(SERVICES)?;
     app.mouse = MouseState::new(crate::MouseOptions {
-        capture: true,
         copy_on_select: true,
+        ..crate::MouseOptions::default()
     });
     set_logs(&mut app, numbered(5))?;
     let frame = draw(&mut app);
@@ -1420,5 +1420,139 @@ async fn ctrl_close_bracket_leaves_pty_input_mode() -> eyre::Result<()> {
     let frame = draw(&mut app);
     click(&mut app, find(&frame, "Ctrl+] Exit")?);
     assert!(!app.pty_input_mode);
+    Ok(())
+}
+
+/// An app over the test services that may do with the mouse only what `options` turns on.
+fn app_with(options: crate::MouseOptions) -> eyre::Result<App> {
+    let mut app = app(SERVICES)?;
+    app.mouse = MouseState::new(options);
+    Ok(app)
+}
+
+/// Without navigation, a press selects text and the copy hint copies it, but nothing else a
+/// click does happens: no focus, service, hint or level changes, though a press outside a popup
+/// still closes it.
+#[tokio::test]
+async fn without_navigation_a_press_only_selects_text() -> eyre::Result<()> {
+    let mut app = app_with(crate::MouseOptions {
+        navigate: false,
+        ..crate::MouseOptions::default()
+    })?;
+    assert!(app.mouse.capture);
+    set_logs(&mut app, numbered(5))?;
+    let frame = draw(&mut app);
+
+    // A click on a service, on a hint or on the side pane hint changes nothing.
+    click(&mut app, find(&frame, "worker")?);
+    click(&mut app, find(&frame, "H/E Pane")?);
+    assert_eq!(app.state.selected_service, 0);
+    assert_eq!(app.focus, Focus::Services);
+    assert_eq!(app.side_pane, None);
+
+    // A drag in the logs selects text there and leaves the focus where it was.
+    let line = find(&frame, "line 2 of")?;
+    drag(&mut app, line, &[Position::new(line.x + 5, line.y)]);
+    assert_eq!(app.focus, Focus::Services);
+
+    // The copy hint still copies, since copying belongs to selecting.
+    let frame = draw(&mut app);
+    click(&mut app, find(&frame, "y Copy")?);
+    assert_eq!(copied(&mut app), vec!["line 2".to_string()]);
+
+    // The level picker keeps its level under a click, and a press outside closes it.
+    press_key(&mut app, KeyCode::Char('L'));
+    let frame = draw(&mut app);
+    click(&mut app, find(&frame, "ERROR")?);
+    assert!(app.level_picker.is_some());
+    click(&mut app, Position::new(1, HEIGHT / 2));
+    assert!(app.level_picker.is_none());
+    assert_eq!(
+        app.state
+            .current_service()
+            .map(crate::state::Service::min_level),
+        Some(None)
+    );
+
+    // The wheel still scrolls.
+    let frame = draw(&mut app);
+    mouse(&mut app, MouseEventKind::ScrollDown, find(&frame, "web")?);
+    assert_eq!(app.state.selected_service, 1);
+    Ok(())
+}
+
+/// Without selecting, a drag selects nothing and a right click copies nothing, while a click
+/// still focuses the pane under it.
+#[tokio::test]
+async fn without_selecting_a_drag_selects_nothing() -> eyre::Result<()> {
+    let mut app = app_with(crate::MouseOptions {
+        select: false,
+        ..crate::MouseOptions::default()
+    })?;
+    set_logs(&mut app, numbered(5))?;
+    let frame = draw(&mut app);
+
+    let line = find(&frame, "line 2 of")?;
+    drag(&mut app, line, &[Position::new(line.x + 5, line.y)]);
+    assert_eq!(app.mouse.selection, None);
+    assert_eq!(app.focus, Focus::Logs);
+    right_click(&mut app, line);
+    assert_eq!(copied(&mut app), Vec::<String>::new());
+    Ok(())
+}
+
+/// Without scrolling, the wheel moves neither a pane nor the services list.
+#[tokio::test]
+async fn without_scrolling_the_wheel_does_nothing() -> eyre::Result<()> {
+    let mut app = app_with(crate::MouseOptions {
+        scroll: false,
+        ..crate::MouseOptions::default()
+    })?;
+    set_logs(&mut app, numbered(100))?;
+    let frame = draw(&mut app);
+    let logs = find(&frame, "Logs")?;
+    let bottom = app.log_view.scroll_offset;
+
+    mouse(
+        &mut app,
+        MouseEventKind::ScrollUp,
+        Position::new(logs.x + 4, logs.y + 4),
+    );
+    assert_eq!(app.log_view.scroll_offset, bottom);
+    assert!(app.log_view.follow_tail);
+    mouse(&mut app, MouseEventKind::ScrollDown, find(&frame, "web")?);
+    assert_eq!(app.state.selected_service, 0);
+    Ok(())
+}
+
+/// `m` switches capture between the parts that are on and off, and with every part off it turns
+/// on all of them.
+#[tokio::test]
+async fn m_brings_back_the_parts_that_are_on() -> eyre::Result<()> {
+    // Navigation stays off across the toggle.
+    let mut app = app_with(crate::MouseOptions {
+        navigate: false,
+        ..crate::MouseOptions::default()
+    })?;
+    press_key(&mut app, KeyCode::Char('m'));
+    press_key(&mut app, KeyCode::Char('m'));
+    assert!(app.mouse.capture);
+    let frame = draw(&mut app);
+    click(&mut app, find(&frame, "worker")?);
+    assert_eq!(app.state.selected_service, 0);
+
+    // With every part off, capture starts off and `m` turns on the whole mouse.
+    let mut app = app_with(crate::MouseOptions {
+        select: false,
+        navigate: false,
+        scroll: false,
+        copy_on_select: false,
+    })?;
+    assert!(!app.mouse.capture);
+    press_key(&mut app, KeyCode::Char('m'));
+    assert!(app.mouse.capture);
+    let frame = draw(&mut app);
+    click(&mut app, find(&frame, "worker")?);
+    assert_eq!(app.state.selected_service, 2);
     Ok(())
 }

@@ -72,13 +72,20 @@ impl Default for ViewOptions {
 }
 
 /// How the TUI handles the mouse.
+///
+/// The TUI captures the mouse when any of `select`, `navigate` and `scroll` is on.
+/// Without capture the terminal keeps its own mouse handling, such as selecting text across the
+/// whole screen; the `m` key switches capture at runtime either way, back to the parts that are
+/// on, or to all of them when none is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MouseOptions {
-    /// Capture the mouse for clicks, the wheel and selecting text inside one pane.
-    ///
-    /// Without it the terminal keeps its own mouse handling, such as selecting text across the
-    /// whole screen; the `m` key switches capture at runtime either way.
-    pub capture: bool,
+    /// A drag, a double or a triple click selects text inside one pane, and a right click
+    /// copies it.
+    pub select: bool,
+    /// A click focuses panes, selects services, presses key hints, opens URLs and picks levels.
+    pub navigate: bool,
+    /// The wheel scrolls the pane, list or popup under the pointer.
+    pub scroll: bool,
     /// Copy a selection to the clipboard as soon as the drag ends, rather than only on an
     /// explicit copy key.
     pub copy_on_select: bool,
@@ -87,7 +94,9 @@ pub struct MouseOptions {
 impl Default for MouseOptions {
     fn default() -> Self {
         Self {
-            capture: true,
+            select: true,
+            navigate: true,
+            scroll: true,
             copy_on_select: false,
         }
     }
@@ -2166,9 +2175,17 @@ mod tests {
             );
             click(&mut app, column("http://app.tui.localhost:8080")?);
             assert_eq!(
-                app.effects,
+                std::mem::take(&mut app.effects),
                 vec![Effect::OpenUrl("http://app.tui.localhost:8080".to_string())]
             );
+
+            // Without navigation, a click on a URL opens nothing.
+            app.mouse = crate::mouse::MouseState::new(crate::MouseOptions {
+                navigate: false,
+                ..crate::MouseOptions::default()
+            });
+            click(&mut app, start);
+            assert_eq!(app.effects, Vec::new());
             Ok(())
         }
 

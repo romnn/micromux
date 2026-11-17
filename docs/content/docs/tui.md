@@ -99,6 +99,8 @@ With mouse capture on, which is the default, the mouse works as in most terminal
 - **Click** a URL in the Logs pane's title to open it in your browser.
 - **Click** outside an open popup to close it, as `Esc` does. In the level picker, click the threshold you want.
 
+[`ui.mouse`](#settings) can leave out any of these, such as every click but those that select and copy text.
+
 In PTY input mode, neither clicks nor the wheel change which service receives your keystrokes, a right-click copies nothing, and `y`, `Enter`, `Ctrl-C` and the copy shortcuts go to the service, as the bytes a terminal without the kitty keyboard protocol sends for them; leave the mode with `Ctrl+]` to copy.
 
 {{< figure src="images/mouse-selection.png" alt="Four request lines of the api service's logs highlighted by a mouse drag, with the footer offering y to copy them" caption="A drag selects lines inside the logs pane only, and y copies them." >}}
@@ -135,7 +137,7 @@ A service in PTY input mode never asked for the protocol, so micromux turns it, 
 
 Mouse capture keeps the terminal from seeing the mouse. To use your terminal's own selection or link clicking for a moment, hold its bypass modifier while you click or drag: **Shift** in most terminals, including GNOME Terminal, Konsole, kitty, Alacritty, WezTerm, foot, Ghostty and Windows Terminal, and **Option** in iTerm2. macOS Terminal switches mouse reporting off and on with **View › Allow Mouse Reporting**. Inside tmux with `mouse on`, Shift also bypasses tmux.
 
-Press `m` to turn capture off or on while the TUI runs; the footer shows `Mouse:ON` or `Mouse:OFF`. With capture off, the terminal behaves exactly as without micromux: micromux sends it no mouse sequences, and nothing in the TUI reacts to the mouse.
+Press `m` to turn capture off or on while the TUI runs; the footer shows `Mouse:ON` or `Mouse:OFF`. Capture comes back with what [`ui.mouse`](#settings) lets the mouse do, or with everything where it turns every part off. With capture off, the terminal behaves exactly as without micromux: micromux sends it no mouse sequences, and nothing in the TUI reacts to the mouse.
 
 ### Settings
 
@@ -143,10 +145,10 @@ Two settings shape the mouse:
 
 | Setting | Flag and environment variable | Default | Effect |
 |---|---|---|---|
-| `ui.mouse` | `--mouse on\|off`, `MICROMUX_MOUSE` | on | Capture the mouse. |
+| `ui.mouse` | `--mouse on\|off`, `MICROMUX_MOUSE` | on | What the mouse may do: `true` or `false` for everything, or [its parts](#mouse-parts). |
 | `ui.copy_on_select` | `--copy-on-select on\|off`, `MICROMUX_COPY_ON_SELECT` | off | Copy a selection as soon as the drag ends, without waiting for `y`. |
 
-For each, the first of these that says wins:
+For each, and for each part of `ui.mouse` on its own, the first of these that says wins:
 
 1. The flag or its environment variable, for one run. They also apply to `micromux attach`.
 2. The `ui` section of the project's `micromux.yaml`.
@@ -154,6 +156,22 @@ For each, the first of these that says wins:
 4. The default.
 
 A project setting wins over your own because it describes something about that project, such as a team that copies a lot of log output with the terminal's selection; your user config is the default for projects that do not care.
+
+#### Mouse parts
+
+`ui.mouse` also takes the parts of the mouse to turn on or off:
+
+```yaml
+ui:
+  mouse:
+    select: true    # a drag, double or triple click selects text in one pane; y, Enter, a right click or y Copy copies it
+    navigate: false # a click focuses panes, selects services, presses key hints, opens URLs and picks levels
+    scroll: true    # the wheel scrolls the pane, list or popup under the pointer
+```
+
+A part left out comes from the next setting down, and is on where none sets it, so `mouse: { navigate: false }` keeps selecting and scrolling. `mouse: true` and `mouse: false` set every part, and so does `--mouse`. micromux captures the mouse when any part is on.
+
+Without `navigate`, a press in the logs or a side pane still starts a selection there but does not focus the pane, and of the hints and URLs only the `y Copy` hint reacts to a click. A press outside a popup still closes it, so a popup cannot trap the pointer. The wheel over the services list moves the selected service as part of `scroll`.
 
 micromux releases the mouse, and the kitty keyboard protocol, whenever it lets go of the terminal: when it exits, however it is asked to, when you press `Ctrl-Z`, and when it panics. A stop signal sent from outside, such as `kill -TSTP` or `kill -STOP`, gives micromux no chance to let go first, but when it continues it takes the terminal over afresh and redraws.
 

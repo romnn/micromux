@@ -59,8 +59,30 @@
           "description": "Render structured JSON service logs as compact colored log lines in the TUI."
         },
         "mouse": {
-          "type": "boolean",
-          "description": "Capture the mouse in the TUI for clicks, scrolling and in-pane text selection. Overrides the user config; the --mouse flag overrides both."
+          "description": "What the TUI may do with the mouse: true or false for everything, or a mapping of the parts to set, each left out taken from the user config, else on. The TUI captures the mouse when any part is on. Overrides the user config; the --mouse flag overrides both.",
+          "oneOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "select": {
+                  "type": "boolean",
+                  "description": "A drag, double or triple click selects text in one pane; y, Enter or a right click copies it."
+                },
+                "navigate": {
+                  "type": "boolean",
+                  "description": "A click focuses panes, selects services, presses key hints, opens URLs and picks log levels."
+                },
+                "scroll": {
+                  "type": "boolean",
+                  "description": "The wheel scrolls the pane, list or popup under the pointer."
+                }
+              }
+            }
+          ]
         },
         "copy_on_select": {
           "type": "boolean",
