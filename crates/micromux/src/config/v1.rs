@@ -421,7 +421,7 @@ pub fn parse_ui_config<F: Copy>(
     let pretty_json_logs = parse_optional::<bool>(mapping.get("pretty_json_logs"))?
         .map(Spanned::into_inner)
         .unwrap_or(true);
-    let mouse = parse_optional::<bool>(mapping.get("mouse"))?.map(Spanned::into_inner);
+    let mouse = parse_mouse_config(mapping.get("mouse"), file_id, strict, diagnostics)?;
     let copy_on_select =
         parse_optional::<bool>(mapping.get("copy_on_select"))?.map(Spanned::into_inner);
     Ok(UiConfig {
@@ -430,6 +430,46 @@ pub fn parse_ui_config<F: Copy>(
         mouse,
         copy_on_select,
     })
+}
+
+/// Parses `ui.mouse`, which is either a bool for every part or a mapping of the parts it sets.
+pub(super) fn parse_mouse_config<F: Copy>(
+    value: Option<&yaml_spanned::Spanned<Value>>,
+    file_id: F,
+    strict: bool,
+    diagnostics: &mut Vec<Diagnostic<F>>,
+) -> Result<super::MouseConfig, ConfigError> {
+    let Some(value) = value else {
+        return Ok(super::MouseConfig::default());
+    };
+    match &value.inner {
+        Value::Bool(enabled) => Ok(super::MouseConfig::all(*enabled)),
+        Value::Mapping(mapping) => {
+            warn_unknown_keys(
+                mapping,
+                &["select", "navigate", "scroll"],
+                "ui.mouse",
+                file_id,
+                strict,
+                diagnostics,
+            );
+            let part = |name| {
+                parse_optional::<bool>(mapping.get(name)).map(|part| part.map(Spanned::into_inner))
+            };
+            Ok(super::MouseConfig {
+                select: part("select")?,
+                navigate: part("navigate")?,
+                scroll: part("scroll")?,
+            })
+        }
+        _ => Err(ConfigError::UnexpectedType {
+            message: "ui.mouse must be a boolean or a mapping of select, navigate and scroll"
+                .to_string(),
+            expected: vec![Kind::Bool, Kind::Mapping],
+            found: value.kind(),
+            span: value.span().into(),
+        }),
+    }
 }
 
 /// Parse the optional top-level control policy.

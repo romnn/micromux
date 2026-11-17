@@ -56,7 +56,7 @@ Add the `$schema` comment at the top and an editor with the YAML language server
 ui:
   width: 40              # initial sidebar width, in columns
   pretty_json_logs: true # render structured JSON logs as compact colored lines (default)
-  mouse: true            # capture the mouse in the TUI; omit to use the user config's setting
+  mouse: true            # what the TUI's mouse may do: true, false or { select, navigate, scroll }
   copy_on_select: false  # copy a mouse selection when the drag ends, not on y (default off)
 ```
 

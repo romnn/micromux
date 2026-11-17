@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- **Choose what the TUI's mouse does.** `ui.mouse` also takes a mapping of `select`,
+  `navigate` and `scroll`, such as `{ select: true, navigate: false }` to select and copy text
+  while clicks leave panes and services to the keys.
+
 - **Copying from the TUI on GNOME no longer flashes a window in the dock.** micromux tries
   `xclip` and `xsel` before `wl-copy` there.
 

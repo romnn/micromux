@@ -10,7 +10,7 @@ use codespan_reporting::diagnostic::Diagnostic;
 use yaml_spanned::{Spanned, Value};
 
 use super::v1::expect_mapping;
-use super::{ConfigError, parse_optional};
+use super::{ConfigError, MouseConfig, parse_optional};
 
 /// Name of the user config file inside micromux's config directory.
 pub const USER_CONFIG_FILE_NAME: &str = "config.yaml";
@@ -20,8 +20,9 @@ pub const USER_CONFIG_FILE_NAME: &str = "config.yaml";
 pub struct UserConfig {
     /// `git.metadata`: whether sessions fetch Git context, or `None` for the enabled default.
     pub git_metadata: Option<bool>,
-    /// `ui.mouse`: whether the TUI captures the mouse, or `None` when the file does not say.
-    pub mouse: Option<bool>,
+    /// `ui.mouse`: what the TUI may do with the mouse, each part `None` where the file does not
+    /// say.
+    pub mouse: MouseConfig,
     /// `ui.copy_on_select`: whether finishing a mouse selection copies it, or `None` when the
     /// file does not say.
     pub copy_on_select: Option<bool>,
@@ -107,7 +108,12 @@ pub fn parse_user_config<F: Copy>(
             diagnostics,
         );
     }
-    let mouse = parse_optional::<bool>(ui.and_then(|ui| ui.get("mouse")))?.map(Spanned::into_inner);
+    let mouse = super::v1::parse_mouse_config(
+        ui.and_then(|ui| ui.get("mouse")),
+        file_id,
+        false,
+        diagnostics,
+    )?;
     let copy_on_select = parse_optional::<bool>(ui.and_then(|ui| ui.get("copy_on_select")))?
         .map(Spanned::into_inner);
     Ok(UserConfig {
@@ -119,7 +125,7 @@ pub fn parse_user_config<F: Copy>(
 
 #[cfg(test)]
 mod tests {
-    use super::{UserConfig, parse_user_config};
+    use super::{MouseConfig, UserConfig, parse_user_config};
     use color_eyre::eyre;
     use indoc::indoc;
     use similar_asserts::assert_eq;
@@ -178,11 +184,39 @@ mod tests {
             config,
             UserConfig {
                 git_metadata: None,
-                mouse: Some(false),
+                mouse: MouseConfig::all(false),
                 copy_on_select: Some(true),
             }
         );
         assert_eq!(diagnostics, Vec::new());
+        Ok(())
+    }
+
+    /// A mapping sets only the mouse parts it names, and warns about the ones it does not know.
+    #[test]
+    fn reads_the_mouse_parts() -> eyre::Result<()> {
+        let raw = indoc! {"
+            ui:
+              mouse:
+                select: true
+                navigate: false
+                hover: true
+        "};
+        let mut diagnostics = Vec::new();
+        let config = parse_user_config(raw, 0usize, &mut diagnostics)?;
+        assert_eq!(
+            config.mouse,
+            MouseConfig {
+                select: Some(true),
+                navigate: Some(false),
+                scroll: None,
+            }
+        );
+        let messages = diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(messages, vec!["unknown ui.mouse field `hover`"]);
         Ok(())
     }
 
@@ -216,7 +250,7 @@ mod tests {
             config,
             UserConfig {
                 git_metadata: None,
-                mouse: Some(true),
+                mouse: MouseConfig::all(true),
                 copy_on_select: None,
             }
         );
@@ -238,6 +272,9 @@ mod tests {
     fn a_mouse_setting_that_is_not_a_bool_is_an_error() {
         let mut diagnostics = Vec::new();
         assert!(parse_user_config("ui:\n  mouse: sometimes\n", 0usize, &mut diagnostics).is_err());
+        assert!(
+            parse_user_config("ui:\n  mouse:\n    scroll: 1\n", 0usize, &mut diagnostics).is_err()
+        );
         assert!(parse_user_config("- ui\n", 0usize, &mut diagnostics).is_err());
     }
 }

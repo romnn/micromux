@@ -131,6 +131,12 @@ struct Press {
 pub(crate) struct MouseState {
     /// Whether the terminal reports the mouse to the TUI.
     pub(crate) capture: bool,
+    /// Whether a press and a drag select text, and a right click copies it.
+    select: bool,
+    /// Whether a click focuses, selects, presses hints, opens URLs and picks levels.
+    navigate: bool,
+    /// Whether the wheel scrolls.
+    scroll: bool,
     /// Whether ending a drag copies the selection.
     copy_on_select: bool,
     pub(crate) selection: Option<Selection>,
@@ -148,8 +154,14 @@ pub(crate) struct MouseState {
 
 impl MouseState {
     pub(crate) fn new(options: crate::MouseOptions) -> Self {
+        let capture = options.select || options.navigate || options.scroll;
+        // With every part off, capture starts off, and `m` turns it on with every part.
+        let part = |enabled| enabled || !capture;
         Self {
-            capture: options.capture,
+            capture,
+            select: part(options.select),
+            navigate: part(options.navigate),
+            scroll: part(options.scroll),
             copy_on_select: options.copy_on_select,
             selection: None,
             dragging: false,
@@ -260,12 +272,12 @@ impl App {
             // A right-click copies the selection as `y` does, wherever it is, and leaves it, the
             // focus and the selected service as they are.
             MouseEventKind::Up(MouseButton::Right)
-                if !self.pty_input_mode && self.level_picker.is_none() =>
+                if self.mouse.select && !self.pty_input_mode && self.level_picker.is_none() =>
             {
                 self.copy_selection();
             }
-            MouseEventKind::ScrollUp => self.wheel(position, false, at),
-            MouseEventKind::ScrollDown => self.wheel(position, true, at),
+            MouseEventKind::ScrollUp if self.mouse.scroll => self.wheel(position, false, at),
+            MouseEventKind::ScrollDown if self.mouse.scroll => self.wheel(position, true, at),
             _ => {}
         }
     }
@@ -303,8 +315,11 @@ impl App {
         // A hint or URL acts on release and keeps the selection, which the copy hint copies.
         // Under a popup only the copy hint does, since copying text selected in the popup is the
         // one thing a click outside it may do without closing it.
+        // Copying is part of selecting, so the copy hint works without navigation, while a press
+        // on any other hint or URL then counts as a press on whatever lies under it.
         if let Some(clickable) = self.clickable_at(position)
             && (self.hits.popup.is_none() || clickable == Clickable::Hint("y"))
+            && (self.mouse.navigate || (self.mouse.select && clickable == Clickable::Hint("y")))
         {
             self.mouse.pressed = Some(clickable);
             return;
@@ -324,16 +339,23 @@ impl App {
             } else {
                 PopupPress::Outside
             };
+            // A press outside closes the popup whatever the mouse may do, so the popup cannot trap
+            // the pointer.
             match target {
                 PopupPress::Outside => self.close_popup(),
-                PopupPress::Level(index) => self.pick_level(index),
-                PopupPress::Text(pane) => self.start_selection(pane, position, count),
-                PopupPress::Inert => {}
+                PopupPress::Level(index) if self.mouse.navigate => self.pick_level(index),
+                PopupPress::Text(pane) if self.mouse.select => {
+                    self.start_selection(pane, position, count);
+                }
+                PopupPress::Level(_) | PopupPress::Text(_) | PopupPress::Inert => {}
             }
             return;
         }
 
         if self.hits.services.contains(position) {
+            if !self.mouse.navigate {
+                return;
+            }
             self.focus = Focus::Services;
             // Typed input goes to the selected service, so a click must not retarget it.
             if !self.pty_input_mode && self.hits.service_rows.contains(position) {
@@ -344,11 +366,19 @@ impl App {
                 }
             }
         } else if self.hits.logs.contains(position) {
-            self.focus = Focus::Logs;
-            self.start_selection(TextPane::Logs, position, count);
+            if self.mouse.navigate {
+                self.focus = Focus::Logs;
+            }
+            if self.mouse.select {
+                self.start_selection(TextPane::Logs, position, count);
+            }
         } else if self.hits.side.contains(position) {
-            self.focus = Focus::Side;
-            if let Some(pane) = self.side_text_pane() {
+            if self.mouse.navigate {
+                self.focus = Focus::Side;
+            }
+            if self.mouse.select
+                && let Some(pane) = self.side_text_pane()
+            {
                 self.start_selection(pane, position, count);
             }
         }
