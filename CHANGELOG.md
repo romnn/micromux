@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- **Copying from the TUI on GNOME no longer flashes a window in the dock.** micromux tries
+  `xclip` and `xsel` before `wl-copy` there.
+
 ## v0.4.5
 
 - **Share env files across services, and hand the session's resolved environment to tools that
