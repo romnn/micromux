@@ -1,14 +1,58 @@
 # yaml-language-server: $schema=https://github.com/romnn/micromux/raw/main/micromux.schema.json
+#
+# A playground for trying micromux on its own repository: run `micromux` here.
+# It sets no session name, so each worktree runs a session named after its own directory.
+# Its routes need the shared proxy, which runs on Linux and macOS only.
 version: "1"
+
+# Restart a service that crashes, but leave the one-shot `true` commands below exited.
+restart: on-failure
+# Probe timing for every service with a `healthcheck.test`; each service brings its own test.
+healthcheck:
+  start_delay: "1s"
+  interval: "5s"
+  timeout: "2s"
+  retries: 3
+
+# A port of the session's own, so several worktrees serve the docs side by side.
+allocate_ports:
+  - DOCS_PORT
+
+proxy:
+  # Where port 80 cannot be bound, such as without the privilege to, the proxy serves on this one.
+  fallback_port: 8380
+
+routes:
+  - host: docs # http://docs.<session>.localhost, with :8380 when the proxy falls back
+    port: ${DOCS_PORT}
+
 ui:
   width: 40
+
 services:
+  docs:
+    name: Documentation site
+    working_dir: docs
+    # The proxy's address goes in the base URL and the live-reload port, so links and reloads
+    # stay on the routed hostname rather than the allocated port.
+    command:
+      - sh
+      - -c
+      - >-
+        exec hugo server --disableFastRender --bind 127.0.0.1 --port "$DOCS_PORT"
+        --baseURL "http://docs.$MICROMUX_HOST_SUFFIX/" --appendPort=false
+        --liveReloadPort "$MICROMUX_PROXY_PORT"
+    ports:
+      - ${DOCS_PORT}
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS -o /dev/null http://127.0.0.1:${DOCS_PORT}/"]
   ping:
     command: "ping google.com"
     env_file:
+      # A file outside the repository, so a fresh checkout runs without it.
       - path: ../../.env
+        optional: true
     restart: unless-stopped
-    watch: false
     environment:
       APP_ENV: production
       APP_DEBUG: "false"
@@ -29,7 +73,7 @@ services:
     depends_on:
       - api
   api:
-    name: Run frontend
+    name: Run API
     command: "true"
     healthcheck:
       test: "exit 1"
