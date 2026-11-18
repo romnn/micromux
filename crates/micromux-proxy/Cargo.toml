@@ -1,7 +1,7 @@
 [package]
 name = "micromux-proxy"
-license-file = "../../LICENSE"
-readme = "../../README.md"
+license-file.workspace = true
+readme.workspace = true
 documentation = "https://docs.rs/micromux-proxy"
 publish = true
 
@@ -25,13 +25,13 @@ workspace = true
 
 [dependencies]
 serde.workspace = true
-serde_json.workspace = true
-thiserror.workspace = true
 tracing.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 micromux = { path = "../micromux/" }
 micromux-control = { path = "../micromux-control/" }
+serde_json.workspace = true
+thiserror.workspace = true
 
 # async runtime + framing
 tokio.workspace = true

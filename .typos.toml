@@ -1,9 +1,10 @@
 [files]
 ignore-files = true
 extend-exclude = [
-  # Generated docs assets (marked linguist-generated in .gitattributes):
-  # chroma syntax CSS is full of short class names (.nd, .na, …) and the
-  # terminal snippets are captured verbatim from real output.
+  # Generated docs assets: chroma syntax CSS, full of short class names such as
+  # .nd and .na, and the terminal snippets rendered from real output
+  # (scripts/terminals.sh).
+  # The hand-written _custom.scss beside them stays checked.
   "docs/assets/_syntax.scss",
   "docs/assets/terminals/",
 ]
@@ -16,10 +17,10 @@ extend-ignore-re = [
   # "spellcheck:ignore-next-line" ignores the next line
   "(?Rm)^.*(#|//|--|<!--)\\s*spellcheck:ignore-next-line.*?\\n.*?$",
 
-  # "spellcheck:ignore-block" ignores all text in the following block (until the first empty line)
+  # "spellcheck:ignore-block" ignores the following block, ending at the first empty line
   "(?s)(#|//|--|<!--)\\s*spellcheck:ignore-block(.*?)(?:(?:\\r*\\n){2})",
 
-  # ignores any text within "spellcheck:ignore-start" and "spellcheck:ignore-end"
+  # Ignore everything between "spellcheck:ignore-start" and "spellcheck:ignore-end"
   "(?s)(#|//|--|<!--)\\s*spellcheck:ignore-start.*?\\n.*?(#|//|--|<!--)\\s*spellcheck:ignore-end",
 ]
 

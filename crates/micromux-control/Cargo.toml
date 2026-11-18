@@ -1,7 +1,7 @@
 [package]
 name = "micromux-control"
-license-file = "../../LICENSE"
-readme = "../../README.md"
+license-file.workspace = true
+readme.workspace = true
 documentation = "https://docs.rs/micromux-control"
 publish = true
 
