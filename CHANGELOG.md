@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.4.6
+
 - **Choose what the TUI's mouse does.** `ui.mouse` also takes a mapping of `select`,
   `navigate` and `scroll`, such as `{ select: true, navigate: false }` to select and copy text
   while clicks leave panes and services to the keys.
