@@ -1,7 +1,7 @@
 [package]
 name = "micromux"
-license-file = "../../LICENSE"
-readme = "../../README.md"
+license-file.workspace = true
+readme.workspace = true
 documentation = "https://docs.rs/micromux"
 publish = true
 
@@ -31,7 +31,6 @@ parking_lot.workspace = true
 
 # command and process management
 shlex = "2.0.1"
-nix = { workspace = true, features = ["event", "signal", "user"] }
 filedescriptor = "0.8.3"
 
 # terminal emulation
@@ -83,6 +82,7 @@ serde_yaml = "0"
 similar-asserts.workspace = true
 
 [target.'cfg(unix)'.dependencies]
+nix = { workspace = true, features = ["event", "signal", "user"] }
 rustix = { workspace = true, features = ["fs", "process"] }
 signal-hook = { version = "0.4.4", features = ["extended-siginfo"] }
 

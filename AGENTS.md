@@ -1,5 +1,14 @@
 # Agent guidelines
 
+## Architecture decision records
+
+Before changing an area that a decision governs, read its architecture decision
+record in `adr/`, along with the sections below.
+A change that alters a recorded decision adds a new ADR that supersedes the old
+one and sets the old one's status to `superseded by [ADR N](NNNN-….md)`.
+An accepted ADR is otherwise a record: fix its facts and code pointers, never
+its decision.
+
 ## Rust error handling in tests
 
 Do not scatter imports from `color_eyre::eyre::*` throughout test code. Import
@@ -25,6 +34,7 @@ depend on `color-eyre` only as a dev-dependency. Binary crates may use
 only in the binary's `main` entrypoint. Binary helper modules must also return
 typed `thiserror` errors. Test modules are the explicit exception and may use
 the dev-only `color_eyre::eyre` re-export described above.
+See [ADR 3](adr/0003-typed-errors-in-libraries-color-eyre-only-in-main.md).
 
 ## RAII guard fields
 
@@ -55,6 +65,8 @@ even when it adds features or changes library types; breaking any of them bumps
 the minor version. The control protocol stays backward compatible: additions
 bump its minor version, and clients send new requests only to sessions that
 report it.
+See [ADR 1](adr/0001-version-releases-by-what-users-see.md) and
+[ADR 2](adr/0002-control-protocol-stays-backward-compatible.md).
 
 ## TUI screenshots
 
