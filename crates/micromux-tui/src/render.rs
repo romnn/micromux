@@ -13,7 +13,7 @@ use ratatui::{
 #[cfg(test)]
 mod tests {
     use super::{
-        command_rows, lease_phrase,
+        command_rows, drawn_text, lease_phrase,
         log_view::{Highlights, LogView, PaneBorders, RenderedLineIndex, window_text},
         service_detail, short_local_time, state_name,
     };
@@ -23,6 +23,29 @@ mod tests {
         text::{Line, Span, Text},
     };
     use similar_asserts::assert_eq;
+
+    /// The text read back from a row is what ratatui drew there: a wide character without room
+    /// for all its cells is left out, a narrower one after it stays, and the blanks after the
+    /// text are not part of it.
+    #[test]
+    fn drawn_text_reads_what_was_drawn() {
+        use ratatui::buffer::Cell;
+        use ratatui::widgets::{Paragraph, Widget as _};
+
+        for (text, room, drawn) in [
+            ("ab界", 4, ("ab界", 4)),
+            ("ab界", 3, ("ab", 2)),
+            ("🧑\u{200d}🤝\u{200d}🧑x", 1, ("x", 1)),
+            ("🧑\u{200d}🤝\u{200d}🧑x", 3, ("🧑\u{200d}🤝\u{200d}🧑x", 3)),
+            ("web  ", 8, ("web", 3)),
+        ] {
+            let area = Rect::new(0, 0, 10, 1);
+            let mut buf = Buffer::filled(area, Cell::new(" "));
+            Paragraph::new(Line::raw(text)).render(Rect::new(1, 0, room, 1), &mut buf);
+            let (shown, width) = drawn_text(&buf, 0, 1, 1 + room);
+            assert_eq!((shown.as_str(), width), drawn, "{text:?} in {room} columns");
+        }
+    }
 
     fn wrapped_text_height(text: &ratatui::text::Text, wrap_width: u16) -> usize {
         let mut index = RenderedLineIndex::default();
@@ -1753,6 +1776,34 @@ fn logs_title(urls: &[String], width: usize) -> (Line<'static>, Vec<(usize, Stri
     (Line::from(spans), columns)
 }
 
+/// The text drawn in row `y` of `buf` from column `from` up to `to`, and the columns it takes,
+/// without the blanks after it.
+///
+/// It is read back from the cells rather than measured, since ratatui leaves out a character
+/// without room for all its cells and may draw narrower ones after it.
+fn drawn_text(buf: &Buffer, y: u16, from: u16, to: u16) -> (String, u16) {
+    use ratatui::buffer::CellWidth as _;
+
+    let mut text = String::new();
+    // The length of the text and the columns it takes up to its last non-blank character.
+    let mut end = (0, 0);
+    let mut x = from;
+    while x < to {
+        let Some(cell) = buf.cell((x, y)) else {
+            break;
+        };
+        let symbol = cell.symbol();
+        text.push_str(symbol);
+        // The cells a wide character covers past its first hold nothing of their own.
+        x = x.saturating_add(symbol.cell_width().max(1));
+        if !symbol.trim().is_empty() {
+            end = (text.len(), x.min(to) - from);
+        }
+    }
+    text.truncate(end.0);
+    (text, end.1)
+}
+
 /// The browser URLs of the routes whose port belongs to `service`, in config order.
 fn service_urls(session: Option<&micromux::SessionSummary>, service: &str) -> Vec<String> {
     session
@@ -1940,7 +1991,8 @@ impl Widget for &mut App {
                 .collect::<Vec<_>>(),
         )
         .render(layout.header, buf);
-        let (service_rows, first_service) = self.render_services(layout.services, buf);
+        let (service_rows, first_service, service_names) =
+            self.render_services(layout.services, buf);
         let links = self.render_logs(layout.logs, buf);
         if let Some(pane) = self.side_pane {
             self.render_side_pane(pane, layout.side, buf);
@@ -1960,6 +2012,7 @@ impl Widget for &mut App {
             services: layout.services,
             service_rows,
             first_service,
+            service_names,
             logs: layout.logs,
             side: layout.side,
             // The hints the quit hint covers cannot be clicked, since they do not show.
@@ -2268,10 +2321,15 @@ impl App {
             .or(self.input_notice.as_deref())
     }
 
-    /// Draws the services list and returns the rows it was drawn in and the index of the service
-    /// on the first of them.
-    fn render_services(&mut self, area: Rect, buf: &mut Buffer) -> (Rect, usize) {
-        let items: Vec<ListItem> = self
+    /// Draws the services list and returns the rows it was drawn in, the index of the service
+    /// on the first of them, and where the shown rows' names went.
+    fn render_services(
+        &mut self,
+        area: Rect,
+        buf: &mut Buffer,
+    ) -> (Rect, usize, Vec<crate::mouse::NameHit>) {
+        // Each row and the columns before its name.
+        let (items, name_columns): (Vec<ListItem>, Vec<usize>) = self
             .state
             .services
             .iter()
@@ -2285,20 +2343,17 @@ impl App {
                     micromux::OriginKind::Configured | micromux::OriginKind::Unknown => " ",
                 };
                 // Ports and URLs live in the `i` popup and the Logs title, not in the list.
-                let line = Line::from(vec![
-                    status,
-                    " ".into(),
-                    origin.fg(Color::DarkGray),
-                    if index == self.state.selected_service {
-                        service.snapshot.name.as_str().fg(FOCUS_COLOR).bold()
-                    } else {
-                        service.snapshot.name.as_str().into()
-                    },
-                ]);
+                let mut line = Line::from(vec![status, " ".into(), origin.fg(Color::DarkGray)]);
+                let name_column = line.width();
+                line.push_span(if index == self.state.selected_service {
+                    service.snapshot.name.as_str().fg(FOCUS_COLOR).bold()
+                } else {
+                    service.snapshot.name.as_str().into()
+                });
 
-                ListItem::new(line)
+                (ListItem::new(line), name_column)
             })
-            .collect();
+            .unzip();
 
         let block = pane_block(self.focus == crate::Focus::Services)
             .title(pane_name("Services", self.focus == crate::Focus::Services));
@@ -2315,20 +2370,42 @@ impl App {
         let mut state = ListState::default()
             .with_offset(self.first_service.min(max_offset))
             .with_selected(Some(self.state.selected_service));
+        // The marker takes the selected service's status color.
+        let marker = selection_marker(
+            self.state
+                .current_service()
+                .map_or_else(Style::default, |service| {
+                    crate::style::service_style(&service.snapshot)
+                }),
+        );
+        // The list puts the marker before the selected row and as many blanks before the others.
+        let marker_width = marker.width();
         let sidebar = List::new(items)
             .block(block)
             .highlight_style(Self::HIGHLIGHT_STYLE)
-            // The marker takes the selected service's status color.
-            .highlight_symbol(selection_marker(
-                self.state
-                    .current_service()
-                    .map_or_else(Style::default, |service| {
-                        crate::style::service_style(&service.snapshot)
-                    }),
-            ));
+            .highlight_symbol(marker);
         StatefulWidget::render(&sidebar, area, buf, &mut state);
         self.first_service = state.offset();
-        (rows, state.offset())
+
+        // A name is what its row shows of it, so a name cut short selects and copies only what
+        // shows, and one with no room keeps an empty place, so the names after it keep theirs.
+        let names = (rows.y..rows.bottom())
+            .zip(state.offset()..)
+            .map_while(|(y, index)| {
+                let service = self.state.services.get(index)?;
+                let x = rows
+                    .x
+                    .saturating_add(rows_u16(marker_width + name_columns.get(index)?))
+                    .min(rows.right());
+                let (text, width) = drawn_text(buf, y, x, rows.right());
+                Some(crate::mouse::NameHit {
+                    area: Rect::new(x, y, width, 1),
+                    service: service.snapshot.id.clone(),
+                    line: Line::raw(text),
+                })
+            })
+            .collect();
+        (rows, state.offset(), names)
     }
 
     /// Reads new log records and renders the text the log pane shows for a pane `area` wide.
@@ -2397,9 +2474,11 @@ impl App {
         if let Some(name) = title.spans.first_mut() {
             *name = pane_name("Logs", focused);
         }
-        // The title starts right after the pane's top-left corner.
+        // The title starts right after the pane's top-left corner, and a pane without rows draws
+        // no title, so its URLs are nowhere to click.
         let links = url_columns
             .into_iter()
+            .filter(|_| area.height > 0)
             .map(|(column, url)| crate::mouse::LinkHit {
                 area: Rect {
                     x: area.x.saturating_add(1).saturating_add(rows_u16(column)),
@@ -2407,6 +2486,7 @@ impl App {
                     width: rows_u16(url.chars().count()),
                     height: 1,
                 },
+                line: Line::raw(url.clone()),
                 url,
             })
             .collect();
@@ -3075,7 +3155,9 @@ pub mod log_view {
             if let Some(status) = status {
                 block = block.title(status.right_aligned());
             }
-            if let Some(BorderDetail { left, right }) = detail {
+            // A pane one row tall draws both borders on that row, where the bottom one's detail
+            // would cover the title and the URLs a click there acts on.
+            if let Some(BorderDetail { left, right }) = detail.filter(|_| log_area.height > 1) {
                 // The corners take a column each, and the gap keeps the two sides apart.
                 let left_width = usize::from(log_area.width)
                     .saturating_sub(right.width() + 2 + BORDER_DETAIL_GAP);

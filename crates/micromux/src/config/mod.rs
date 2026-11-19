@@ -220,7 +220,7 @@ pub struct UiConfig {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct MouseConfig {
     /// Whether a drag, a double or a triple click selects text in one pane, and a right click
-    /// copies it.
+    /// copies it, or the URL it lands on.
     pub select: Option<bool>,
     /// Whether a click focuses panes, selects services, presses hints, opens URLs and picks
     /// levels.

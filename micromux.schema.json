@@ -70,7 +70,7 @@
               "properties": {
                 "select": {
                   "type": "boolean",
-                  "description": "A drag, double or triple click selects text in one pane; y, Enter or a right click copies it."
+                  "description": "A drag, double or triple click selects text in one pane; y, Enter or a right click copies it, and a right click on a URL copies the URL."
                 },
                 "navigate": {
                   "type": "boolean",

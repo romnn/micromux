@@ -1556,3 +1556,176 @@ async fn m_brings_back_the_parts_that_are_on() -> eyre::Result<()> {
     assert_eq!(app.state.selected_service, 2);
     Ok(())
 }
+
+/// Whether every cell of the `len` cells from `at` shows as selected.
+fn highlighted(buffer: &Buffer, at: Position, len: u16) -> bool {
+    (at.x..at.x + len).all(|x| {
+        buffer
+            .cell((x, at.y))
+            .is_some_and(|cell| cell.modifier.contains(Modifier::REVERSED))
+    })
+}
+
+/// A service's name selects like a pane's text: a double click on it selects the name, which `y`
+/// copies, while the press still selects the service and focuses the list.
+#[tokio::test]
+async fn a_double_click_selects_a_service_name() -> eyre::Result<()> {
+    let mut app = app(SERVICES)?;
+    let frame = draw(&mut app);
+    let worker = find(&frame, "worker")?;
+    click(&mut app, worker);
+    click(&mut app, worker);
+    assert_eq!(app.state.selected_service, 2);
+    assert_eq!(app.focus, Focus::Services);
+    let frame = draw(&mut app);
+    assert!(
+        highlighted(&frame, worker, 6),
+        "{}",
+        row_text(&frame, worker.y)
+    );
+    assert!(!highlighted(
+        &frame,
+        Position::new(worker.x - 1, worker.y),
+        1
+    ));
+    assert_eq!(yank(&mut app), vec!["worker".to_string()]);
+    Ok(())
+}
+
+/// Of a service's row only its name selects: a drag from the name across the list keeps to the
+/// name, and a press on the status selects the service but no text.
+#[tokio::test]
+async fn only_a_service_name_selects() -> eyre::Result<()> {
+    let mut app = app(SERVICES)?;
+    let frame = draw(&mut app);
+    let worker = find(&frame, "worker")?;
+    let api = find(&frame, "api")?;
+    drag(
+        &mut app,
+        worker,
+        &[Position::new(0, worker.y), Position::new(WIDTH - 1, api.y)],
+    );
+    assert_eq!(yank(&mut app), vec!["worker".to_string()]);
+
+    let status = Position::new(worker.x - 3, worker.y);
+    for _ in 0..3 {
+        click(&mut app, status);
+    }
+    assert_eq!(app.state.selected_service, 2);
+    assert_eq!(app.mouse.selection, None);
+    assert_eq!(yank(&mut app), Vec::<String>::new());
+    Ok(())
+}
+
+/// Without navigation a press on a service's name neither selects the service nor moves the
+/// focus, but a drag still selects the name; without selecting, a drag selects nothing.
+#[tokio::test]
+async fn the_services_list_selects_text_as_its_mouse_parts_allow() -> eyre::Result<()> {
+    let mut app = app_with(crate::MouseOptions {
+        navigate: false,
+        ..crate::MouseOptions::default()
+    })?;
+    app.focus = Focus::Logs;
+    let frame = draw(&mut app);
+    let worker = find(&frame, "worker")?;
+    drag(&mut app, worker, &[Position::new(worker.x + 5, worker.y)]);
+    assert_eq!(app.state.selected_service, 0);
+    assert_eq!(app.focus, Focus::Logs);
+    assert_eq!(yank(&mut app), vec!["worker".to_string()]);
+
+    let mut app = app_with(crate::MouseOptions {
+        select: false,
+        ..crate::MouseOptions::default()
+    })?;
+    let frame = draw(&mut app);
+    let worker = find(&frame, "worker")?;
+    drag(&mut app, worker, &[Position::new(worker.x + 5, worker.y)]);
+    assert_eq!(app.state.selected_service, 2);
+    assert_eq!(yank(&mut app), Vec::<String>::new());
+    Ok(())
+}
+
+/// A selection in a service's name holds while its row shows the same service under the same
+/// name, as when the selected service or a status changes, and goes once the row shows another
+/// service or the service another name.
+#[tokio::test]
+async fn a_name_selection_goes_with_its_name() -> eyre::Result<()> {
+    let mut app = app(SERVICES)?;
+    let frame = draw(&mut app);
+    let worker = find(&frame, "worker")?;
+    drag(&mut app, worker, &[Position::new(worker.x + 5, worker.y)]);
+    press_key(&mut app, KeyCode::Up);
+    draw(&mut app);
+    assert!(app.has_selection());
+
+    app.state.services.swap(1, 2);
+    draw(&mut app);
+    assert!(!app.has_selection());
+    assert_eq!(yank(&mut app), Vec::<String>::new());
+
+    // A service that keeps its ID under another name shows other text in the same columns.
+    let frame = draw(&mut app);
+    let web = find(&frame, "web")?;
+    drag(&mut app, web, &[Position::new(web.x + 2, web.y)]);
+    draw(&mut app);
+    assert!(app.has_selection());
+    if let Some(service) = app.state.services.get_mut(2) {
+        service.snapshot.name = "frontend".to_string();
+    }
+    draw(&mut app);
+    assert!(!app.has_selection());
+    Ok(())
+}
+
+/// A double click on a service started at runtime selects its name without the `+` that marks
+/// it.
+#[tokio::test]
+async fn a_double_click_leaves_out_a_runtime_services_marker() -> eyre::Result<()> {
+    let mut app = app(SERVICES)?;
+    if let Some(service) = app.state.services.get_mut(2) {
+        service.snapshot.origin = micromux::OriginKind::Dynamic;
+    }
+    let frame = draw(&mut app);
+    assert!(row_text(&frame, find(&frame, "worker")?.y).contains("+worker"));
+    let worker = find(&frame, "worker")?;
+    click(&mut app, worker);
+    click(&mut app, worker);
+    assert_eq!(yank(&mut app), vec!["worker".to_string()]);
+    Ok(())
+}
+
+/// A name the narrow list cuts short selects and copies what its row shows of it, up to the
+/// list's edge.
+#[tokio::test]
+async fn a_name_cut_short_copies_what_shows() -> eyre::Result<()> {
+    let mut app = app(SERVICES)?;
+    let name = "worker-with-a-name-longer-than-the-list";
+    if let Some(service) = app.state.services.get_mut(2) {
+        service.snapshot.name = name.to_string();
+    }
+    let frame = draw(&mut app);
+    let worker = find(&frame, "worker-with")?;
+    assert!(!row_text(&frame, worker.y).contains(name));
+    let area = app
+        .hits
+        .service_names
+        .get(2)
+        .map(|hit| hit.area)
+        .ok_or_else(|| eyre::eyre!("no name on the third row"))?;
+    assert_eq!(area.right(), app.hits.service_rows.right());
+    let row = row_text(&frame, worker.y);
+    let shown = row
+        .chars()
+        .skip(usize::from(area.x))
+        .take(usize::from(area.width))
+        .collect::<String>();
+    assert!(
+        name.starts_with(&shown) && shown.len() < name.len(),
+        "{shown}"
+    );
+    for _ in 0..3 {
+        click(&mut app, worker);
+    }
+    assert_eq!(yank(&mut app), vec![shown]);
+    Ok(())
+}

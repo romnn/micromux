@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- **Copy service names and the Logs title's URLs from the TUI.** Select them with the mouse as
+  in the logs, or right-click a URL to copy it, which also works over ssh, where micromux cannot
+  open a browser.
+
 ## v0.4.6
 
 - **Choose what the TUI's mouse does.** `ui.mouse` also takes a mapping of `select`,
