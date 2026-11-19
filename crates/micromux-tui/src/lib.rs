@@ -110,7 +110,12 @@ enum Effect {
     /// Put the text on the clipboard.
     Copy(String),
     /// Open the URL in the browser.
-    OpenUrl(String),
+    OpenUrl {
+        url: String,
+        /// How often the mouse's notice had changed when the URL was clicked, so a failure to
+        /// open it says so only while nothing has changed the notice since.
+        notice_changes: u64,
+    },
     /// Give the terminal back and stop until the shell continues the process.
     Suspend,
 }
@@ -606,15 +611,27 @@ impl App {
     }
 
     /// When the event loop must wake by itself: to retry queued PTY input, or to take back the
-    /// quit hint.
+    /// quit hint or a notice that a URL could not be opened.
     fn next_timer(&self) -> Option<std::time::Instant> {
         let retry = (!self.pending_pty_input.is_empty())
             .then(|| std::time::Instant::now() + PENDING_PTY_INPUT_RETRY);
         let hint = self.quit_hint_at.map(|at| at + QUIT_HINT_DURATION);
-        retry.into_iter().chain(hint).min()
+        let failed = self
+            .failed_notice_at()
+            .map(|at| at + mouse::FAILED_NOTICE_DURATION);
+        retry.into_iter().chain(hint).chain(failed).min()
     }
 
-    /// Does what is due `now`: retries queued PTY input and takes back an expired quit hint.
+    /// When the footer began to say that a URL could not be opened, if it says so.
+    fn failed_notice_at(&self) -> Option<std::time::Instant> {
+        match self.mouse.notice {
+            Some(mouse::Notice::Failed { at, .. }) => Some(at),
+            Some(mouse::Notice::Copied(_)) | None => None,
+        }
+    }
+
+    /// Does what is due `now`: retries queued PTY input and takes back an expired quit hint or
+    /// notice that a URL could not be opened.
     fn on_timer(&mut self, now: std::time::Instant) {
         if !self.pending_pty_input.is_empty() {
             self.flush_pending_pty_input();
@@ -624,6 +641,12 @@ impl App {
             .is_some_and(|at| now.saturating_duration_since(at) >= QUIT_HINT_DURATION)
         {
             self.quit_hint_at = None;
+        }
+        if self
+            .failed_notice_at()
+            .is_some_and(|at| now.saturating_duration_since(at) >= mouse::FAILED_NOTICE_DURATION)
+        {
+            self.mouse.set_notice(None);
         }
     }
 
@@ -657,10 +680,13 @@ impl App {
                     )?;
                     clipboard::copy_locally(text);
                 }
-                Effect::OpenUrl(url) => {
+                Effect::OpenUrl {
+                    url,
+                    notice_changes,
+                } => {
                     if let Err(err) = open_url(&url) {
                         tracing::warn!(?err, url, "cannot open the URL in a browser");
-                        self.mouse.notice = Some(format!("cannot open a browser: {err}"));
+                        self.url_open_failed(notice_changes, std::time::Instant::now());
                     }
                 }
                 Effect::Suspend => suspend = true,
@@ -855,7 +881,7 @@ impl App {
                 self.maybe_resize_pty();
             }
             crossterm::event::Event::Key(key) if key.kind == KeyEventKind::Press => {
-                self.mouse.notice = None;
+                self.mouse.set_notice(None);
                 self.handle_key_press(key);
             }
             crossterm::event::Event::Mouse(mouse) => {
@@ -2182,17 +2208,11 @@ mod tests {
             click(&mut app, start);
             click(&mut app, start + width - 1);
             click(&mut app, start - 2);
-            assert_eq!(
-                std::mem::take(&mut app.effects),
-                vec![
-                    Effect::OpenUrl(api.to_string()),
-                    Effect::OpenUrl(api.to_string())
-                ]
-            );
+            assert_eq!(opened(&mut app), vec![api.to_string(), api.to_string()]);
             click(&mut app, column("http://app.tui.localhost:8080")?);
             assert_eq!(
-                std::mem::take(&mut app.effects),
-                vec![Effect::OpenUrl("http://app.tui.localhost:8080".to_string())]
+                opened(&mut app),
+                vec!["http://app.tui.localhost:8080".to_string()]
             );
 
             // Without navigation, a click on a URL opens nothing.
@@ -2311,6 +2331,19 @@ mod tests {
             send(app, MouseEventKind::Up(MouseButton::Right), to);
         }
 
+        /// The URLs the effects so far open, which it leaves out of the effects; the others stay.
+        fn opened(app: &mut App) -> Vec<String> {
+            let mut urls = Vec::new();
+            app.effects.retain(|effect| match effect {
+                Effect::OpenUrl { url, .. } => {
+                    urls.push(url.clone());
+                    false
+                }
+                _ => true,
+            });
+            urls
+        }
+
         fn copied(app: &mut App) -> Vec<String> {
             std::mem::take(&mut app.effects)
                 .into_iter()
@@ -2337,7 +2370,10 @@ mod tests {
             for at in [urls.api, urls.api_end] {
                 right_click(app, at, at);
                 assert_eq!(copied(app), vec![API_URL.to_string()], "{at:?}");
-                assert_eq!(app.mouse.notice.as_deref(), Some("copied the URL"));
+                assert_eq!(
+                    app.mouse.notice,
+                    Some(crate::mouse::Notice::Copied("copied the URL".to_string()))
+                );
             }
             right_click(app, urls.root, urls.root);
             assert_eq!(copied(app), vec![ROOT_URL.to_string()]);
@@ -2402,7 +2438,7 @@ mod tests {
                 right_click(app, api, api);
                 send(app, MouseEventKind::Down(MouseButton::Left), api);
                 send(app, MouseEventKind::Up(MouseButton::Left), api);
-                std::mem::take(&mut app.effects)
+                (opened(app), copied(app))
             };
 
             app.mouse = crate::mouse::MouseState::new(crate::MouseOptions {
@@ -2412,7 +2448,7 @@ mod tests {
             assert!(app.mouse.capture);
             assert_eq!(
                 right_then_left_click(app),
-                vec![Effect::OpenUrl(API_URL.to_string())]
+                (vec![API_URL.to_string()], vec![])
             );
 
             app.mouse = crate::mouse::MouseState::new(crate::MouseOptions {
@@ -2421,7 +2457,7 @@ mod tests {
             });
             assert_eq!(
                 right_then_left_click(app),
-                vec![Effect::Copy(API_URL.to_string())]
+                (vec![], vec![API_URL.to_string()])
             );
             Ok(())
         }
@@ -2593,20 +2629,14 @@ mod tests {
             // The click leaves no caret behind, so `Esc` would go on to clear a search.
             assert_eq!(app.mouse.selection, None);
             left_click(app, urls.api);
-            assert_eq!(
-                std::mem::take(&mut app.effects),
-                vec![Effect::OpenUrl(API_URL.to_string())]
-            );
+            assert_eq!(opened(app), vec![API_URL.to_string()]);
             assert_eq!(yank(app), vec![API_URL.to_string()]);
 
             // A drag along the URL opened nothing, so a quick click after it, on the cell it
             // started from, still opens the URL.
             left_drag(app, urls.root, Position::new(urls.root.x + 5, urls.root.y));
             left_click(app, urls.root);
-            assert_eq!(
-                std::mem::take(&mut app.effects),
-                vec![Effect::OpenUrl(ROOT_URL.to_string())]
-            );
+            assert_eq!(opened(app), vec![ROOT_URL.to_string()]);
             Ok(())
         }
 
@@ -2631,10 +2661,7 @@ mod tests {
                 ..crate::MouseOptions::default()
             });
             left_drag(app, urls.root, Position::new(urls.root.x + 5, urls.root.y));
-            assert_eq!(
-                std::mem::take(&mut app.effects),
-                vec![Effect::OpenUrl(ROOT_URL.to_string())]
-            );
+            assert_eq!(opened(app), vec![ROOT_URL.to_string()]);
             assert_eq!(yank(app), Vec::<String>::new());
             Ok(())
         }
@@ -2699,6 +2726,72 @@ mod tests {
                 "{}",
                 footer(&terminal)
             );
+            Ok(())
+        }
+
+        /// The notice count of the one URL the effects so far open, which it takes out of them.
+        fn open_stamp(app: &mut App) -> eyre::Result<u64> {
+            let stamps = std::mem::take(&mut app.effects)
+                .into_iter()
+                .filter_map(|effect| match effect {
+                    Effect::OpenUrl { notice_changes, .. } => Some(notice_changes),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            match stamps.as_slice() {
+                [stamp] => Ok(*stamp),
+                _ => eyre::bail!("the click opened {} URLs", stamps.len()),
+            }
+        }
+
+        /// A URL that cannot be opened says so only while nothing after its click, handled in the
+        /// same batch of input before the opener runs, changed what the footer says: not a copy,
+        /// not a key, and not a click that opened another URL.
+        #[tokio::test]
+        async fn a_failed_open_never_overwrites_a_later_notice() -> eyre::Result<()> {
+            let mut urls = TitleUrls::new()?;
+            let app = &mut urls.app;
+            let now = std::time::Instant::now();
+            let failed = Some(crate::mouse::Notice::Failed {
+                text: "cannot open the URL; right-click it to copy it".to_string(),
+                at: now,
+            });
+
+            // Alone, a failure says so.
+            left_click(app, urls.api);
+            let stamp = open_stamp(app)?;
+            app.url_open_failed(stamp, now);
+            assert_eq!(app.mouse.notice, failed);
+
+            // A right-click that copied a URL after the click.
+            left_click(app, urls.root);
+            let stamp = open_stamp(app)?;
+            right_click(app, urls.api, urls.api);
+            app.url_open_failed(stamp, now);
+            assert_eq!(
+                app.mouse.notice,
+                Some(crate::mouse::Notice::Copied("copied the URL".to_string()))
+            );
+
+            // A click that opened another URL after it, which opened.
+            left_click(app, urls.api);
+            let first = open_stamp(app)?;
+            left_click(app, urls.root);
+            let second = open_stamp(app)?;
+            app.url_open_failed(first, now);
+            assert_eq!(app.mouse.notice, None);
+            app.url_open_failed(second, now);
+            assert_eq!(app.mouse.notice, failed);
+
+            // A key that cleared the notice after the click, here opening the help.
+            left_click(app, urls.api);
+            let stamp = open_stamp(app)?;
+            app.handle_crossterm_event(&crossterm::event::Event::Key(KeyEvent::new(
+                KeyCode::Char('?'),
+                KeyModifiers::NONE,
+            )));
+            app.url_open_failed(stamp, now);
+            assert_eq!(app.mouse.notice, None);
             Ok(())
         }
 

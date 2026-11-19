@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- **The TUI's mouse selections take wide characters whole and line up with text after
+  halfwidth katakana, and a URL micromux cannot start a browser for, as over ssh, says so in the
+  footer.**
+
 - **Copy service names and the Logs title's URLs from the TUI.** Select them with the mouse as
   in the logs, or right-click a URL to copy it, which also works over ssh, where micromux cannot
   open a browser.
