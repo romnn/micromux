@@ -2397,9 +2397,11 @@ impl App {
         if let Some(name) = title.spans.first_mut() {
             *name = pane_name("Logs", focused);
         }
-        // The title starts right after the pane's top-left corner.
+        // The title starts right after the pane's top-left corner, and a pane without rows draws
+        // no title, so its URLs are nowhere to click.
         let links = url_columns
             .into_iter()
+            .filter(|_| area.height > 0)
             .map(|(column, url)| crate::mouse::LinkHit {
                 area: Rect {
                     x: area.x.saturating_add(1).saturating_add(rows_u16(column)),
@@ -3075,7 +3077,9 @@ pub mod log_view {
             if let Some(status) = status {
                 block = block.title(status.right_aligned());
             }
-            if let Some(BorderDetail { left, right }) = detail {
+            // A pane one row tall draws both borders on that row, where the bottom one's detail
+            // would cover the title and the URLs a click there acts on.
+            if let Some(BorderDetail { left, right }) = detail.filter(|_| log_area.height > 1) {
                 // The corners take a column each, and the gap keeps the two sides apart.
                 let left_width = usize::from(log_area.width)
                     .saturating_sub(right.width() + 2 + BORDER_DETAIL_GAP);

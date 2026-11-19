@@ -13,6 +13,7 @@
 //!
 //! Hints and URLs act on a click, a press and a release on the same one, so a press that slides
 //! off does nothing.
+//! A right-click copies the URL it presses and releases on, and the selection anywhere else.
 
 use std::time::{Duration, Instant};
 
@@ -118,6 +119,15 @@ enum Clickable {
     Link(String),
 }
 
+/// A press of the right button on a URL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RightPress {
+    /// The URL, which a release on it copies.
+    Link(String),
+    /// A URL the pointer slid off, so the release copies nothing, not even the selection.
+    SlidOff,
+}
+
 /// The last press of the left button, to count a quick second one on the same cell.
 #[derive(Debug, Clone, Copy)]
 struct Press {
@@ -131,7 +141,7 @@ struct Press {
 pub(crate) struct MouseState {
     /// Whether the terminal reports the mouse to the TUI.
     pub(crate) capture: bool,
-    /// Whether a press and a drag select text, and a right click copies it.
+    /// Whether a press and a drag select text, and a right click copies it or a URL.
     select: bool,
     /// Whether a click focuses, selects, presses hints, opens URLs and picks levels.
     navigate: bool,
@@ -144,6 +154,8 @@ pub(crate) struct MouseState {
     dragging: bool,
     /// The hint or URL the left button went down on, which a release on it clicks.
     pressed: Option<Clickable>,
+    /// The URL the right button went down on, or `None` when it went down elsewhere.
+    right_pressed: Option<RightPress>,
     last_press: Option<Press>,
     /// When the wheel event that last scrolled arrived, to fold the burst of events some
     /// terminals send for one notch into one step.
@@ -166,6 +178,7 @@ impl MouseState {
             selection: None,
             dragging: false,
             pressed: None,
+            right_pressed: None,
             last_press: None,
             last_wheel: None,
             notice: None,
@@ -249,6 +262,7 @@ impl App {
         self.mouse.selection = None;
         self.mouse.dragging = false;
         self.mouse.pressed = None;
+        self.mouse.right_pressed = None;
         self.effects.push(Effect::MouseCapture(capture));
     }
 
@@ -262,6 +276,14 @@ impl App {
         // last frame does not show yet, so the frame's areas no longer say what is where.
         let popup_open = self.show_help || self.info.is_some() || self.level_picker.is_some();
         if popup_open != self.hits.popup.is_some() {
+            // A right-button gesture that loses its press or release here ends, so the next one
+            // never acts on what it pressed.
+            if matches!(
+                event.kind,
+                MouseEventKind::Down(MouseButton::Right) | MouseEventKind::Up(MouseButton::Right)
+            ) {
+                self.mouse.right_pressed = None;
+            }
             return;
         }
         let position = Position::new(event.column, event.row);
@@ -269,16 +291,68 @@ impl App {
             MouseEventKind::Down(MouseButton::Left) => self.press(position, at),
             MouseEventKind::Drag(MouseButton::Left) => self.drag_to(position),
             MouseEventKind::Up(MouseButton::Left) => self.release(position),
-            // A right-click copies the selection as `y` does, wherever it is, and leaves it, the
-            // focus and the selected service as they are.
-            MouseEventKind::Up(MouseButton::Right)
-                if self.mouse.select && !self.pty_input_mode && self.level_picker.is_none() =>
-            {
-                self.copy_selection();
+            // A right-click copies the URL under it, or else the selection as `y` does, wherever
+            // it is, and leaves the selection, the focus and the selected service as they are.
+            // Every press and release of the right button updates what it went down on, even one
+            // that copies nothing, so a gesture never acts on what an earlier one pressed.
+            MouseEventKind::Down(MouseButton::Right) => {
+                self.mouse.right_pressed = self
+                    .link_at(position)
+                    .filter(|_| self.right_click_copies())
+                    .map(|url| RightPress::Link(url.to_string()));
+            }
+            MouseEventKind::Drag(MouseButton::Right) => {
+                if let Some(RightPress::Link(url)) = &self.mouse.right_pressed
+                    && self.link_at(position) != Some(url.as_str())
+                {
+                    self.mouse.right_pressed = Some(RightPress::SlidOff);
+                }
+            }
+            MouseEventKind::Up(MouseButton::Right) => {
+                let pressed = self.mouse.right_pressed.take();
+                if self.right_click_copies() {
+                    self.right_release(pressed, position);
+                }
             }
             MouseEventKind::ScrollUp if self.mouse.scroll => self.wheel(position, false, at),
             MouseEventKind::ScrollDown if self.mouse.scroll => self.wheel(position, true, at),
             _ => {}
+        }
+    }
+
+    /// Whether a right-click copies: selecting is on, keys go to the TUI rather than a service,
+    /// and the level picker, which has nothing to copy, is closed.
+    fn right_click_copies(&self) -> bool {
+        self.mouse.select && !self.pty_input_mode && self.level_picker.is_none()
+    }
+
+    /// The URL drawn at `position`, if any; under a popup none reacts.
+    fn link_at(&self, position: Position) -> Option<&str> {
+        if self.hits.popup.is_some() {
+            return None;
+        }
+        self.hits
+            .links
+            .iter()
+            .find(|link| link.area.contains(position))
+            .map(|link| link.url.as_str())
+    }
+
+    /// The right button, `pressed` on a URL or elsewhere, came up at `position`.
+    ///
+    /// A right-click on a URL copies it, and one that went down on a URL but slid off it copies
+    /// nothing, so the clipboard only takes a URL pressed and released on.
+    /// Any other right-click copies the selection.
+    fn right_release(&mut self, pressed: Option<RightPress>, position: Position) {
+        match pressed {
+            Some(RightPress::Link(url)) => {
+                if self.link_at(position) == Some(url.as_str()) {
+                    self.mouse.notice = Some("copied the URL".to_string());
+                    self.effects.push(Effect::Copy(url));
+                }
+            }
+            Some(RightPress::SlidOff) => {}
+            None => self.copy_selection(),
         }
     }
 

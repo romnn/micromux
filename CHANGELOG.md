@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- **Right-click a URL in the TUI's Logs title to copy it.** This works over ssh too, where
+  micromux cannot open a browser.
+
 ## v0.4.6
 
 - **Choose what the TUI's mouse does.** `ui.mouse` also takes a mapping of `select`,

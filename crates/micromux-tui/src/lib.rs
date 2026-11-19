@@ -80,7 +80,7 @@ impl Default for ViewOptions {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MouseOptions {
     /// A drag, a double or a triple click selects text inside one pane, and a right click
-    /// copies it.
+    /// copies it, or the URL it lands on.
     pub select: bool,
     /// A click focuses panes, selects services, presses key hints, opens URLs and picks levels.
     pub navigate: bool,
@@ -1971,6 +1971,8 @@ mod tests {
     #[cfg(unix)]
     mod routed {
         use super::*;
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        use ratatui::layout::Position;
         use similar_asserts::assert_eq;
 
         /// A local app for a session established from `yaml` in `directory`, with its live session
@@ -2186,6 +2188,322 @@ mod tests {
             });
             click(&mut app, start);
             assert_eq!(app.effects, Vec::new());
+            Ok(())
+        }
+
+        /// An app over a service with two URLs in its Logs title and three lines of its own logs,
+        /// drawn 200 × 24, with where its URLs and its second line start.
+        struct TitleUrls {
+            app: App,
+            api: Position,
+            api_end: Position,
+            root: Position,
+            line: Position,
+            #[expect(dead_code, reason = "keeps the session's registry and cache directory")]
+            directory: tempfile::TempDir,
+        }
+
+        const API_URL: &str = "http://app.tui.localhost:8080/api/";
+        const ROOT_URL: &str = "http://app.tui.localhost:8080";
+
+        impl TitleUrls {
+            fn new() -> eyre::Result<Self> {
+                let directory = tempfile::tempdir()?;
+                let yaml = indoc! {r#"
+                    version: 1
+                    session: { name: tui }
+                    proxy: { port: 8080 }
+                    routes:
+                      - host: app
+                        port: 9997
+                      - host: app
+                        path: /api/
+                        port: 9998
+                    services:
+                      web:
+                        command: ["sleep", "30"]
+                        ports: [9997, 9998]
+                      worker:
+                        command: ["sleep", "30"]
+                "#};
+                let (mut app, _session, _) = routed_app(directory.path(), yaml)?;
+                // The lines go in after the first frame read the model's empty log, which would
+                // otherwise replace them.
+                screen_text(&mut app, 200, 24);
+                let service = app
+                    .state
+                    .current_service_mut()
+                    .ok_or_else(|| eyre::eyre!("no service is selected"))?;
+                service.logs_dirty = false;
+                service.cached_lines = (1..=3)
+                    .map(|seq| crate::state::CachedLine {
+                        seq,
+                        timestamp_unix_ms: 0,
+                        text: format!("line {seq}"),
+                    })
+                    .collect();
+                service.text_dirty = true;
+                let screen = screen_text(&mut app, 200, 24);
+                let api = find_on(&screen, API_URL)?;
+                Ok(Self {
+                    api,
+                    api_end: Position::new(api.x + u16::try_from(API_URL.len())? - 1, api.y),
+                    root: find_on(&screen, ROOT_URL)?,
+                    line: find_on(&screen, "line 2")?,
+                    app,
+                    directory,
+                })
+            }
+
+            /// Selects "line 2" with a drag, as a user does.
+            fn select_line(&mut self) {
+                let end = Position::new(self.line.x + 5, self.line.y);
+                send(
+                    &mut self.app,
+                    MouseEventKind::Down(MouseButton::Left),
+                    self.line,
+                );
+                send(&mut self.app, MouseEventKind::Drag(MouseButton::Left), end);
+                send(&mut self.app, MouseEventKind::Up(MouseButton::Left), end);
+            }
+        }
+
+        /// The cell where `needle` starts on `screen`.
+        fn find_on(screen: &str, needle: &str) -> eyre::Result<Position> {
+            for (y, row) in screen.lines().enumerate() {
+                if let Some(byte) = row.find(needle) {
+                    let x = row.get(..byte).unwrap_or_default().chars().count();
+                    return Ok(Position::new(u16::try_from(x)?, u16::try_from(y)?));
+                }
+            }
+            eyre::bail!("{needle} is not on screen:\n{screen}")
+        }
+
+        fn send(app: &mut App, kind: MouseEventKind, at: Position) {
+            app.handle_mouse(
+                MouseEvent {
+                    kind,
+                    column: at.x,
+                    row: at.y,
+                    modifiers: KeyModifiers::NONE,
+                },
+                std::time::Instant::now(),
+            );
+        }
+
+        /// Presses the right button at `from` and releases it at `to`.
+        fn right_click(app: &mut App, from: Position, to: Position) {
+            send(app, MouseEventKind::Down(MouseButton::Right), from);
+            send(app, MouseEventKind::Up(MouseButton::Right), to);
+        }
+
+        fn copied(app: &mut App) -> Vec<String> {
+            std::mem::take(&mut app.effects)
+                .into_iter()
+                .filter_map(|effect| match effect {
+                    Effect::Copy(text) => Some(text),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        /// A right-click on a URL in the Logs title copies that URL, the one way to reach it over
+        /// ssh, where no browser opens, and leaves the selection, the focus and the selected
+        /// service as they are; between the URLs it copies the selection, as anywhere else.
+        #[tokio::test]
+        async fn right_clicking_a_url_in_the_logs_title_copies_it() -> eyre::Result<()> {
+            let mut urls = TitleUrls::new()?;
+            urls.select_line();
+            let app = &mut urls.app;
+            app.focus = Focus::Services;
+            let selection = app.mouse.selection.clone();
+            assert!(selection.is_some());
+
+            // Either end of a URL copies that URL rather than the selection, path included.
+            for at in [urls.api, urls.api_end] {
+                right_click(app, at, at);
+                assert_eq!(copied(app), vec![API_URL.to_string()], "{at:?}");
+                assert_eq!(app.mouse.notice.as_deref(), Some("copied the URL"));
+            }
+            right_click(app, urls.root, urls.root);
+            assert_eq!(copied(app), vec![ROOT_URL.to_string()]);
+            assert_eq!(app.mouse.selection, selection);
+            assert_eq!(app.focus, Focus::Services);
+            assert_eq!(app.state.selected_service, 0);
+
+            let separator = Position::new(urls.api.x - 2, urls.api.y);
+            right_click(app, separator, separator);
+            assert_eq!(copied(app), vec!["line 2".to_string()]);
+            Ok(())
+        }
+
+        /// Only a press and a release on the same URL copy it: a press on a URL that comes up
+        /// elsewhere copies nothing, not even the selection, and a press elsewhere that comes up
+        /// on a URL copies the selection, never the URL.
+        #[tokio::test]
+        async fn a_right_click_copies_a_url_only_pressed_and_released_on() -> eyre::Result<()> {
+            let mut urls = TitleUrls::new()?;
+            urls.select_line();
+            let app = &mut urls.app;
+
+            right_click(app, urls.api, urls.root);
+            right_click(app, urls.api, urls.line);
+            assert_eq!(copied(app), Vec::<String>::new());
+            right_click(app, urls.line, urls.api);
+            assert_eq!(copied(app), vec!["line 2".to_string()]);
+
+            // Sliding off the URL cancels the copy, even when the pointer comes back to it, while
+            // sliding along it does not.
+            send(app, MouseEventKind::Down(MouseButton::Right), urls.api);
+            send(app, MouseEventKind::Drag(MouseButton::Right), urls.line);
+            send(app, MouseEventKind::Drag(MouseButton::Right), urls.api);
+            send(app, MouseEventKind::Up(MouseButton::Right), urls.api);
+            assert_eq!(copied(app), Vec::<String>::new());
+            send(app, MouseEventKind::Down(MouseButton::Right), urls.api);
+            send(app, MouseEventKind::Drag(MouseButton::Right), urls.api_end);
+            send(app, MouseEventKind::Up(MouseButton::Right), urls.api_end);
+            assert_eq!(copied(app), vec![API_URL.to_string()]);
+
+            // The release copies, so a press alone does nothing yet.
+            send(app, MouseEventKind::Down(MouseButton::Right), urls.api);
+            assert_eq!(copied(app), Vec::<String>::new());
+            // A URL that a new frame drew in the same cells between the press and the release is
+            // not the one pressed, so it is not copied either.
+            for link in &mut app.hits.links {
+                link.url = format!("{}other/", link.url);
+            }
+            send(app, MouseEventKind::Up(MouseButton::Right), urls.api);
+            assert_eq!(copied(app), Vec::<String>::new());
+            Ok(())
+        }
+
+        /// Copying a URL is part of selecting: it needs `select`, and not `navigate`, which only
+        /// opens URLs.
+        #[tokio::test]
+        async fn copying_a_url_needs_select_but_not_navigate() -> eyre::Result<()> {
+            let mut urls = TitleUrls::new()?;
+            let api = urls.api;
+            let app = &mut urls.app;
+            let right_then_left_click = |app: &mut App| {
+                right_click(app, api, api);
+                send(app, MouseEventKind::Down(MouseButton::Left), api);
+                send(app, MouseEventKind::Up(MouseButton::Left), api);
+                std::mem::take(&mut app.effects)
+            };
+
+            app.mouse = crate::mouse::MouseState::new(crate::MouseOptions {
+                select: false,
+                ..crate::MouseOptions::default()
+            });
+            assert!(app.mouse.capture);
+            assert_eq!(
+                right_then_left_click(app),
+                vec![Effect::OpenUrl(API_URL.to_string())]
+            );
+
+            app.mouse = crate::mouse::MouseState::new(crate::MouseOptions {
+                navigate: false,
+                ..crate::MouseOptions::default()
+            });
+            assert_eq!(
+                right_then_left_click(app),
+                vec![Effect::Copy(API_URL.to_string())]
+            );
+            Ok(())
+        }
+
+        /// Under a popup a right-click copies the popup's selection, even on a URL the popup
+        /// leaves uncovered, and in PTY input mode it copies nothing, nor leaves a press on a URL
+        /// for a later right-click to copy.
+        #[tokio::test]
+        async fn a_popup_or_pty_input_mode_keeps_a_right_click_off_urls() -> eyre::Result<()> {
+            let mut urls = TitleUrls::new()?;
+            let api = urls.api;
+            let app = &mut urls.app;
+
+            app.handle_key_press(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
+            let popup = screen_text(app, 200, 24);
+            assert!(
+                popup
+                    .lines()
+                    .nth(usize::from(api.y))
+                    .is_some_and(|row| row.contains(API_URL)),
+                "the help popup covers the URL:\n{popup}"
+            );
+            let word = find_on(&popup, "Follow tail")?;
+            let end = Position::new(word.x + 5, word.y);
+            send(app, MouseEventKind::Down(MouseButton::Left), word);
+            send(app, MouseEventKind::Drag(MouseButton::Left), end);
+            send(app, MouseEventKind::Up(MouseButton::Left), end);
+            right_click(app, api, api);
+            assert_eq!(copied(app), vec!["Follow".to_string()]);
+            assert!(app.show_help);
+
+            app.show_help = false;
+            screen_text(app, 200, 24);
+            app.enter_pty_input_mode();
+            right_click(app, api, api);
+            assert_eq!(copied(app), Vec::<String>::new());
+
+            // A press on the URL whose release, or a later press, comes before the frame shows a
+            // popup the key opened, is dropped there and leaves nothing for a lone release on the
+            // URL, as from a gesture whose own press was lost, to copy.
+            app.leave_pty_input_mode();
+            let help = KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE);
+            for kind in [
+                MouseEventKind::Up(MouseButton::Right),
+                MouseEventKind::Down(MouseButton::Right),
+            ] {
+                send(app, MouseEventKind::Down(MouseButton::Right), api);
+                app.handle_key_press(help);
+                send(app, kind, api);
+                app.handle_key_press(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+                send(app, MouseEventKind::Up(MouseButton::Right), api);
+                assert_eq!(copied(app), Vec::<String>::new(), "{kind:?}");
+            }
+
+            // A press on the URL before PTY input mode, released in it, and a press in the logs
+            // in it, released on the URL after it, never join into a click on the URL.
+            send(app, MouseEventKind::Down(MouseButton::Right), api);
+            app.enter_pty_input_mode();
+            send(app, MouseEventKind::Up(MouseButton::Right), api);
+            send(app, MouseEventKind::Down(MouseButton::Right), urls.line);
+            app.leave_pty_input_mode();
+            send(app, MouseEventKind::Up(MouseButton::Right), api);
+            assert_eq!(copied(app), Vec::<String>::new());
+            Ok(())
+        }
+
+        /// A click acts on a URL only where the frame shows it: in a Logs pane one row tall, the
+        /// title keeps its row from the bottom border, and a terminal so short that the header
+        /// and footer take every row draws no Logs title, so no URL waits in the footer's cells.
+        #[tokio::test]
+        async fn urls_are_clicked_only_where_the_title_shows_them() -> eyre::Result<()> {
+            let mut urls = TitleUrls::new()?;
+            let app = &mut urls.app;
+            let chrome = app.chrome_rows(200);
+            for height in [24, chrome.header + chrome.footer + 1] {
+                let screen = screen_text(app, 200, height);
+                assert_eq!(
+                    app.hits.links.len(),
+                    2,
+                    "{height} rows: {:?}",
+                    app.hits.links
+                );
+                for link in &app.hits.links {
+                    let shown = screen
+                        .lines()
+                        .nth(usize::from(link.area.y))
+                        .unwrap_or_default()
+                        .chars()
+                        .skip(usize::from(link.area.x))
+                        .take(usize::from(link.area.width))
+                        .collect::<String>();
+                    assert_eq!(shown, link.url, "{height} rows:\n{screen}");
+                }
+            }
+            screen_text(app, 200, chrome.header + chrome.footer);
+            assert_eq!(app.hits.links, Vec::new());
             Ok(())
         }
 
