@@ -2733,17 +2733,26 @@ impl App {
     /// the hints leave room, so it never changes the layout; returns the row the quit hint covers
     /// instead, when there is no room for it.
     fn render_mouse_notice(&self, footer: &[HintRow], area: Rect, buf: &mut Buffer) -> Option<u16> {
-        // How to quit matters more than what the last copy took.
+        // How to quit matters more than what the mouse did last.
         let quitting = self.quit_hint_at.is_some();
-        let (notice, color) = if quitting {
+        // The quit hint and a failure must show, so they cover the hints when they lack room.
+        let (notice, color, urgent) = if quitting {
             let action = if self.source.attachment_status().is_some() {
                 "detach"
             } else {
                 "quit"
             };
-            (Some(format!("press q to {action}")), Color::Yellow)
+            (Some(format!("press q to {action}")), Color::Yellow, true)
         } else {
-            (self.mouse.notice.clone(), Color::Green)
+            match &self.mouse.notice {
+                Some(crate::mouse::Notice::Copied(text)) => {
+                    (Some(text.clone()), Color::Green, false)
+                }
+                Some(crate::mouse::Notice::Failed { text, .. }) => {
+                    (Some(text.clone()), Color::Red, true)
+                }
+                None => (None, Color::Green, false),
+            }
         };
         let (Some(notice), Some(last)) = (notice, footer.last()) else {
             return None;
@@ -2755,9 +2764,9 @@ impl App {
             return None;
         }
         if used.saturating_add(width) > area.width {
-            // The quit hint must show, so for its two seconds it covers the hints of the
-            // footer's last row; other notices wait for room.
-            if !quitting {
+            // For the few seconds they last, they cover the hints of the footer's last row;
+            // other notices wait for room.
+            if !urgent {
                 return None;
             }
             let row = Rect {

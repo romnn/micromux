@@ -269,7 +269,10 @@ async fn a_drag_selects_text_inside_one_pane_and_copies_it_on_release() -> eyre:
         yank(&mut app),
         vec!["of the log\nline 3 of the log\nline 4".to_string()]
     );
-    assert_eq!(app.mouse.notice.as_deref(), Some("copied 3 lines"));
+    assert_eq!(
+        app.mouse.notice,
+        Some(crate::mouse::Notice::Copied("copied 3 lines".to_string()))
+    );
 
     // The selection stays highlighted, on the selected cells only.
     let frame = draw(&mut app);
@@ -928,7 +931,12 @@ async fn selecting_only_highlights_and_copying_takes_an_explicit_key() -> eyre::
         key_with(&mut app, code, modifiers);
         assert_eq!(copied(&mut app), vec!["line 2".to_string()], "{code:?}");
     }
-    assert_eq!(app.mouse.notice.as_deref(), Some("copied 6 characters"));
+    assert_eq!(
+        app.mouse.notice,
+        Some(crate::mouse::Notice::Copied(
+            "copied 6 characters".to_string()
+        ))
+    );
     assert!(app.running);
 
     // Ctrl-C never copies, not even with text selected: it only says that `q` quits.
@@ -1248,7 +1256,12 @@ async fn a_right_click_copies_the_selection_and_changes_nothing_else() -> eyre::
         assert_eq!(app.focus, Focus::Services);
         assert_eq!(app.state.selected_service, 0);
     }
-    assert_eq!(app.mouse.notice.as_deref(), Some("copied 6 characters"));
+    assert_eq!(
+        app.mouse.notice,
+        Some(crate::mouse::Notice::Copied(
+            "copied 6 characters".to_string()
+        ))
+    );
 
     // The release copies, so a press alone does nothing yet.
     mouse(&mut app, MouseEventKind::Down(MouseButton::Right), line);
@@ -1727,5 +1740,150 @@ async fn a_name_cut_short_copies_what_shows() -> eyre::Result<()> {
         click(&mut app, worker);
     }
     assert_eq!(yank(&mut app), vec![shown]);
+    Ok(())
+}
+
+/// The screen cell of the first cell at or after `from` on row `y` that holds `symbol`, found by
+/// cells rather than characters, since a cell can hold several characters.
+fn find_cell(buffer: &Buffer, y: u16, from: u16, symbol: &str) -> eyre::Result<Position> {
+    (from..buffer.area.width)
+        .find(|&x| {
+            buffer
+                .cell((x, y))
+                .is_some_and(|cell| cell.symbol() == symbol)
+        })
+        .map(|x| Position::new(x, y))
+        .ok_or_else(|| eyre::eyre!("{symbol:?} is not on row {y}: {}", row_text(buffer, y)))
+}
+
+/// A drag that starts on the second cell of a wide character selects the character whole: it
+/// lights up both its cells and copies it, unwrapped or wrapped, as it does from the first cell.
+#[tokio::test]
+async fn a_selection_takes_a_wide_character_from_either_cell() -> eyre::Result<()> {
+    let mut app = app(SERVICES)?;
+    set_logs(&mut app, ["ab界xy".to_string()])?;
+    for wrap in [false, true] {
+        if wrap {
+            press_key(&mut app, KeyCode::Char('w'));
+        }
+        let frame = draw(&mut app);
+        let wide = find(&frame, "界")?;
+        let x = find_cell(&frame, wide.y, wide.x, "x")?;
+        drag(&mut app, Position::new(wide.x + 1, wide.y), &[x]);
+        let frame = draw(&mut app);
+        assert!(highlighted(&frame, wide, 3), "wrap {wrap}");
+        assert!(!highlighted(&frame, Position::new(wide.x - 1, wide.y), 1));
+        assert_eq!(yank(&mut app), vec!["界x".to_string()], "wrap {wrap}");
+
+        // Ending on the wide character's second cell takes it too.
+        let a = find(&frame, "ab")?;
+        drag(&mut app, a, &[Position::new(wide.x + 1, wide.y)]);
+        assert_eq!(yank(&mut app), vec!["ab界".to_string()], "wrap {wrap}");
+    }
+    Ok(())
+}
+
+/// A service's name selects a wide character whole from either of its cells, as a pane does.
+#[tokio::test]
+async fn a_name_takes_a_wide_character_from_either_cell() -> eyre::Result<()> {
+    let mut app = app(SERVICES)?;
+    if let Some(service) = app.state.services.get_mut(2) {
+        service.snapshot.name = "界x".to_string();
+    }
+    let frame = draw(&mut app);
+    let wide = find(&frame, "界")?;
+    drag(
+        &mut app,
+        Position::new(wide.x + 1, wide.y),
+        &[Position::new(wide.x + 2, wide.y)],
+    );
+    assert_eq!(yank(&mut app), vec!["界x".to_string()]);
+    Ok(())
+}
+
+/// Text is laid out in cells as ratatui draws it, so after a halfwidth katakana with its sound
+/// mark, which takes a cell of its own, a double click on the next word selects that word.
+#[tokio::test]
+async fn text_after_a_halfwidth_sound_mark_selects_where_it_shows() -> eyre::Result<()> {
+    let mut app = app(SERVICES)?;
+    set_logs(&mut app, ["ｶﾞ xy z".to_string()])?;
+    let frame = draw(&mut app);
+    let kana = find(&frame, "ｶﾞ")?;
+    let x = find_cell(&frame, kana.y, kana.x, "x")?;
+    click(&mut app, x);
+    click(&mut app, x);
+    assert_eq!(yank(&mut app), vec!["xy".to_string()]);
+    let z = find_cell(&frame, kana.y, x.x, "z")?;
+    click(&mut app, z);
+    click(&mut app, z);
+    assert_eq!(yank(&mut app), vec!["z".to_string()]);
+    Ok(())
+}
+
+/// Reports that a URL clicked just now failed to open, as the event loop does once the input
+/// around the click is handled.
+fn fail_to_open(app: &mut App, now: Instant) {
+    let notice_changes = app.mouse.notice_changes;
+    app.url_open_failed(notice_changes, now);
+}
+
+/// A URL that cannot be opened says so in red on the footer's last row, covering its hints when
+/// they leave no room, says that a right-click copies it where one would, and goes after a few
+/// seconds.
+#[tokio::test]
+async fn a_url_that_cannot_open_says_so_over_the_footer() -> eyre::Result<()> {
+    let mut app = app(SERVICES)?;
+    let text = "cannot open the URL; right-click it to copy it";
+    let last_row = |app: &mut App, width: u16| {
+        let area = Rect::new(0, 0, width, HEIGHT);
+        let mut frame = Buffer::empty(area);
+        app.render(area, &mut frame);
+        (row_text(&frame, HEIGHT - 1), frame)
+    };
+    // A width whose footer leaves no room beside its last row's hints, where a copy's notice
+    // does not show.
+    let full = (60..=200)
+        .find(|&width| {
+            app.mouse.notice = Some(super::Notice::Copied(text.to_string()));
+            !last_row(&mut app, width).0.contains(text)
+        })
+        .ok_or_else(|| eyre::eyre!("every footer has room for the notice"))?;
+
+    let now = Instant::now();
+    fail_to_open(&mut app, now);
+    let (last, frame) = last_row(&mut app, full);
+    assert!(last.contains(text), "{full} columns: {last}");
+    let notice = find(&frame, "cannot open")?;
+    assert_eq!(
+        frame.cell(notice).map(|cell| cell.fg),
+        Some(ratatui::style::Color::Red)
+    );
+
+    // The notice goes on its own: the event loop wakes for it, and the hints come back.
+    assert_eq!(app.next_timer(), Some(now + super::FAILED_NOTICE_DURATION));
+    app.on_timer(now + super::FAILED_NOTICE_DURATION);
+    assert_eq!(app.next_timer(), None);
+    assert_eq!(app.mouse.notice, None);
+    assert!(!last_row(&mut app, full).0.contains("cannot open"));
+
+    // Where a right-click would not copy, the notice does not offer it.
+    let mut unselecting = app_with(crate::MouseOptions {
+        select: false,
+        ..crate::MouseOptions::default()
+    })?;
+    fail_to_open(&mut unselecting, now);
+    assert_eq!(
+        unselecting.mouse.notice,
+        Some(super::Notice::Failed {
+            text: "cannot open the URL".to_string(),
+            at: now
+        })
+    );
+    press_key(&mut app, KeyCode::Char('m'));
+    fail_to_open(&mut app, now);
+    assert!(matches!(
+        &app.mouse.notice,
+        Some(super::Notice::Failed { text, .. }) if text == "cannot open the URL"
+    ));
     Ok(())
 }

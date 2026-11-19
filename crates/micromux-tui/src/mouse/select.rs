@@ -4,12 +4,14 @@
 //! on the same text while a busy log scrolls on or drops its oldest lines.
 //! What it copies is drawn again off screen exactly as the pane draws it, so it matches what
 //! the pane shows, wrapped or not.
+//! A character wider than a cell is selected whole once any of its cells is, and every width
+//! is measured in cells as ratatui draws them.
 //!
 //! A service's name in the list and a URL in the Logs pane's title each select on their own,
 //! as one row that never wraps, and a selection in one holds only while that place shows the
 //! same name or URL.
 
-use ratatui::buffer::{Buffer, Cell};
+use ratatui::buffer::{Buffer, Cell, CellWidth as _};
 use ratatui::layout::{Position, Rect};
 use ratatui::style::Modifier;
 use ratatui::widgets::{Paragraph, Widget as _};
@@ -141,6 +143,28 @@ impl Placed {
     }
 }
 
+/// The cells `symbol` takes as ratatui draws it, which for some characters differs from their
+/// Unicode width.
+fn cells_of(symbol: &str) -> usize {
+    usize::from(symbol.cell_width())
+}
+
+/// The first and last column of the character drawn over column `x` of row `y` of `buf`, which
+/// for a wide one start where it does and end where its last hidden cell does.
+fn character_at(buf: &Buffer, y: u16, x: u16) -> (u16, u16) {
+    (0..=x)
+        .rev()
+        .find_map(|start| {
+            let symbol = buf.cell((start, y))?.symbol();
+            (symbol != UNWRITTEN).then(|| {
+                let end = start.saturating_add(rows_u16(cells_of(symbol).max(1) - 1));
+                (start, end)
+            })
+        })
+        .filter(|&(_, end)| end >= x)
+        .unwrap_or((x, x))
+}
+
 /// The last column of row `y` of `buf` that shows text, counting the hidden half of a wide
 /// character there, or `None` for a row without any.
 ///
@@ -149,10 +173,8 @@ impl Placed {
 fn text_end(buf: &Buffer, y: u16) -> Option<u16> {
     (0..buf.area.width).rev().find_map(|x| {
         let symbol = buf.cell((x, y))?.symbol();
-        (symbol != UNWRITTEN && !symbol.trim().is_empty()).then(|| {
-            let width = ratatui::text::Span::raw(symbol).width();
-            x.saturating_add(rows_u16(width.saturating_sub(1)))
-        })
+        (symbol != UNWRITTEN && !symbol.trim().is_empty())
+            .then(|| x.saturating_add(rows_u16(cells_of(symbol).saturating_sub(1))))
     })
 }
 
@@ -174,9 +196,7 @@ fn row_cells(buf: &Buffer, y: u16) -> RowCells {
 fn drawn_graphemes(line: &ratatui::text::Line<'_>) -> Vec<String> {
     line.styled_graphemes(ratatui::style::Style::default())
         .map(|grapheme| grapheme.symbol)
-        .filter(|symbol| {
-            !symbol.contains(char::is_control) && ratatui::text::Span::raw(*symbol).width() > 0
-        })
+        .filter(|symbol| !symbol.contains(char::is_control) && cells_of(symbol) > 0)
         .map(str::to_string)
         .collect()
 }
@@ -188,7 +208,7 @@ fn unwrapped_cells(line: &ratatui::text::Line<'_>) -> RowCells {
         .into_iter()
         .map(|symbol| {
             let at = col;
-            col += ratatui::text::Span::raw(symbol.as_str()).width();
+            col += cells_of(&symbol);
             (at, symbol)
         })
         .collect()
@@ -204,14 +224,15 @@ fn cells_text_end(cells: &RowCells) -> Option<usize> {
         .iter()
         .rev()
         .find(|(_, symbol)| !symbol.trim().is_empty())
-        .map(|(col, symbol)| col + ratatui::text::Span::raw(symbol.as_str()).width().max(1) - 1)
+        .map(|(col, symbol)| col + cells_of(symbol).max(1) - 1)
 }
 
-/// The text of `cells` from column `from` to `to`, both included.
+/// The text of `cells` from column `from` to `to`, both included, with every character that
+/// has a cell there, so a wide one comes whole from either of its cells.
 fn cells_between(cells: &RowCells, from: usize, to: usize) -> String {
     cells
         .iter()
-        .filter(|(col, _)| (from..=to).contains(col))
+        .filter(|(col, symbol)| *col <= to && col + cells_of(symbol).max(1) > from)
         .map(|(_, symbol)| symbol.as_str())
         .collect()
 }
@@ -696,7 +717,7 @@ impl App {
                 .map(unwrapped_cells)
                 .unwrap_or_default()
         };
-        let width = |symbol: &str| ratatui::text::Span::raw(symbol).width().max(1);
+        let width = |symbol: &str| cells_of(symbol).max(1);
         let col = usize::from(pos.col);
         // Cells are in column order, so the clicked one is the last that starts at or before it.
         let clicked = cells
@@ -796,7 +817,16 @@ impl App {
             ) else {
                 continue;
             };
-            for x in from..=to.min(text_end) {
+            let to = to.min(text_end);
+            if from > to {
+                continue;
+            }
+            // A wide character lights up whole from either of its cells, as it copies.
+            let (from, to) = (
+                character_at(&drawn, y, from).0,
+                character_at(&drawn, y, to).1,
+            );
+            for x in from..=to {
                 let position = Position::new(area.x + x, area.y + y);
                 if covered.is_some_and(|popup| popup.contains(position)) {
                     continue;

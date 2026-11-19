@@ -144,6 +144,19 @@ enum RightPress {
     SlidOff,
 }
 
+/// What the footer says about the last thing the mouse did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Notice {
+    /// What a copy took, shown only where the footer's last row has room beside its hints.
+    Copied(String),
+    /// That a URL could not be opened, which covers the hints of the footer's last row when it
+    /// has no room beside them, until [`FAILED_NOTICE_DURATION`] after `at`.
+    Failed { text: String, at: Instant },
+}
+
+/// How long a notice that a URL could not be opened stays.
+pub(crate) const FAILED_NOTICE_DURATION: Duration = Duration::from_secs(4);
+
 /// The last press of the left button, to count a quick second one on the same cell.
 #[derive(Debug, Clone, Copy)]
 struct Press {
@@ -178,8 +191,12 @@ pub(crate) struct MouseState {
     /// When the wheel event that last scrolled arrived, to fold the burst of events some
     /// terminals send for one notch into one step.
     last_wheel: Option<Instant>,
-    /// What the last copy took, shown in the footer until the next press or key.
-    pub(crate) notice: Option<String>,
+    /// What the footer says about the last thing the mouse did, until the next press or key.
+    ///
+    /// Changes go through [`MouseState::set_notice`], which counts them.
+    pub(crate) notice: Option<Notice>,
+    /// How often the notice changed, to tell whether it did since a URL was clicked.
+    notice_changes: u64,
 }
 
 impl MouseState {
@@ -201,7 +218,14 @@ impl MouseState {
             last_press: None,
             last_wheel: None,
             notice: None,
+            notice_changes: 0,
         }
+    }
+
+    /// Changes what the footer says about the last thing the mouse did.
+    pub(crate) fn set_notice(&mut self, notice: Option<Notice>) {
+        self.notice = notice;
+        self.notice_changes += 1;
     }
 
     /// Whether a wheel event that arrived `at` scrolls, rather than belonging to the burst of
@@ -366,7 +390,8 @@ impl App {
         match pressed {
             Some(RightPress::Link(url)) => {
                 if self.link_at(position) == Some(url.as_str()) {
-                    self.mouse.notice = Some("copied the URL".to_string());
+                    self.mouse
+                        .set_notice(Some(Notice::Copied("copied the URL".to_string())));
                     self.effects.push(Effect::Copy(url));
                 }
             }
@@ -407,7 +432,7 @@ impl App {
         if count == 1 {
             self.mouse.opened = None;
         }
-        self.mouse.notice = None;
+        self.mouse.set_notice(None);
         self.mouse.dragging = false;
         self.mouse.pressed = None;
 
@@ -536,7 +561,10 @@ impl App {
             }
             Clickable::Link(url) => {
                 self.mouse.opened = Some(url.clone());
-                self.effects.push(Effect::OpenUrl(url));
+                self.effects.push(Effect::OpenUrl {
+                    url,
+                    notice_changes: self.mouse.notice_changes,
+                });
             }
         }
     }
@@ -679,12 +707,34 @@ impl App {
             return;
         };
         let lines = text.lines().count().max(1);
-        self.mouse.notice = Some(if lines == 1 {
+        self.mouse.set_notice(Some(Notice::Copied(if lines == 1 {
             format!("copied {} characters", text.chars().count())
         } else {
             format!("copied {lines} lines")
-        });
+        })));
         self.effects.push(Effect::Copy(text));
+    }
+
+    /// Says in the footer, from `now`, that a URL clicked when the notice had changed
+    /// `notice_changes` times could not be opened, and that a right-click on it copies it where
+    /// one would.
+    ///
+    /// The failure is known only once the input around the click is all handled, so a press or
+    /// key since then, which changed the notice, keeps it from saying so.
+    pub(crate) fn url_open_failed(&mut self, notice_changes: u64, now: Instant) {
+        if notice_changes != self.mouse.notice_changes {
+            return;
+        }
+        let copies = self.mouse.capture && self.right_click_copies() && self.hits.popup.is_none();
+        let text = if copies {
+            "cannot open the URL; right-click it to copy it"
+        } else {
+            "cannot open the URL"
+        };
+        self.mouse.set_notice(Some(Notice::Failed {
+            text: text.to_string(),
+            at: now,
+        }));
     }
 
     /// A turn of the wheel at `position` that arrived `at`: under a popup it scrolls the popup,
