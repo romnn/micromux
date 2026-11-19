@@ -4,6 +4,10 @@
 //! on the same text while a busy log scrolls on or drops its oldest lines.
 //! What it copies is drawn again off screen exactly as the pane draws it, so it matches what
 //! the pane shows, wrapped or not.
+//!
+//! A service's name in the list and a URL in the Logs pane's title each select on their own,
+//! as one row that never wraps, and a selection in one holds only while that place shows the
+//! same name or URL.
 
 use ratatui::buffer::{Buffer, Cell};
 use ratatui::layout::{Position, Rect};
@@ -25,6 +29,11 @@ pub(crate) const END_OF_LINE: u16 = u16::MAX;
 /// A pane whose text can be selected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TextPane {
+    /// The name of the service on the services list's shown row of this index, counted from
+    /// the first.
+    ServiceName(usize),
+    /// The URL of this index in the Logs pane's title.
+    Url(usize),
     Logs,
     Healthcheck,
     Events,
@@ -70,6 +79,9 @@ pub(crate) struct TextContext {
     formats: std::collections::BTreeMap<String, crate::json_log::LineFormat>,
     wrap: bool,
     width: u16,
+    /// What a service name or a URL shows: the service's ID and name, or the URL; empty for
+    /// every other pane.
+    identity: Vec<String>,
 }
 
 impl TextContext {
@@ -92,6 +104,7 @@ impl TextContext {
             && same_formats
             && self.wrap == now.wrap
             && (!width_matters || self.width == now.width)
+            && self.identity == now.identity
     }
 }
 
@@ -224,6 +237,8 @@ impl App {
     /// Where `pane`'s text was drawn in the last frame.
     pub(crate) fn text_area(&self, pane: TextPane) -> Option<Rect> {
         match pane {
+            TextPane::ServiceName(index) => self.hits.service_names.get(index).map(|n| n.area),
+            TextPane::Url(index) => self.hits.links.get(index).map(|link| link.area),
             TextPane::Logs => Some(crate::render::log_view::text_area(self.hits.logs)),
             // Both side panes draw in one place, so only the one showing has text there.
             TextPane::Healthcheck | TextPane::Events if self.side_text_pane() == Some(pane) => {
@@ -255,6 +270,23 @@ impl App {
             )
         };
         let no_formats = std::collections::BTreeMap::new;
+        // The frame's own record of what these show, since a key may have changed the state
+        // since it was drawn.
+        let identity = match pane {
+            TextPane::ServiceName(index) => self
+                .hits
+                .service_names
+                .get(index)
+                .map(|name| vec![name.service.clone(), name.line.to_string()])
+                .unwrap_or_default(),
+            TextPane::Url(index) => self
+                .hits
+                .links
+                .get(index)
+                .map(|link| vec![link.url.clone()])
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
         let (service, formats, wrap) = match pane {
             // Every service's logs stay in the pane whichever service is selected, and so does a
             // selection in them.
@@ -272,7 +304,10 @@ impl App {
                 (Some(service?), no_formats(), self.side_view.wrap)
             }
             TextPane::Info(InfoView::Service) => (service, no_formats(), false),
-            TextPane::Help | TextPane::Info(InfoView::Session) => (None, no_formats(), false),
+            TextPane::ServiceName(_)
+            | TextPane::Url(_)
+            | TextPane::Help
+            | TextPane::Info(InfoView::Session) => (None, no_formats(), false),
         };
         Some(TextContext {
             pane,
@@ -280,20 +315,22 @@ impl App {
             formats,
             wrap,
             width: area.width,
+            identity,
         })
     }
 
     /// The row drawn at the top of `pane`.
     pub(crate) fn first_row(&self, pane: TextPane) -> usize {
         match pane {
+            TextPane::ServiceName(_) | TextPane::Url(_) => 0,
             TextPane::Logs => self.log_view.scroll_offset,
             TextPane::Healthcheck | TextPane::Events => self.side_view.scroll_offset,
             TextPane::Help | TextPane::Info(_) => self.popup_scroll,
         }
     }
 
-    /// The lines of `pane`'s text and the rows they are drawn on, or `None` for a popup, whose
-    /// lines never wrap.
+    /// The lines of `pane`'s text and the rows they are drawn on, or `None` for a pane whose
+    /// lines never wrap, which [`Self::plain_lines`] holds.
     fn pane_text(
         &self,
         pane: TextPane,
@@ -314,18 +351,35 @@ impl App {
                 let pane = &self.state.current_service()?.events_pane;
                 Some((&pane.text, &pane.line_index))
             }
-            TextPane::Help | TextPane::Info(_) => None,
+            TextPane::ServiceName(_) | TextPane::Url(_) | TextPane::Help | TextPane::Info(_) => {
+                None
+            }
         }
     }
 
-    /// The lines a popup shows, every one it can scroll through.
-    fn popup_lines(&self) -> &[ratatui::text::Line<'static>] {
-        match &self.hits.popup {
-            Some(PopupHit {
-                content: PopupContent::Text { lines, .. },
-                ..
-            }) => lines,
-            _ => &[],
+    /// The lines of a pane whose lines never wrap, every one it can scroll through, one per row.
+    fn plain_lines(&self, pane: TextPane) -> &[ratatui::text::Line<'static>] {
+        match pane {
+            TextPane::ServiceName(index) => self
+                .hits
+                .service_names
+                .get(index)
+                .map(|name| std::slice::from_ref(&name.line))
+                .unwrap_or_default(),
+            TextPane::Url(index) => self
+                .hits
+                .links
+                .get(index)
+                .map(|link| std::slice::from_ref(&link.line))
+                .unwrap_or_default(),
+            TextPane::Help | TextPane::Info(_) => match &self.hits.popup {
+                Some(PopupHit {
+                    content: PopupContent::Text { lines, .. },
+                    ..
+                }) => lines,
+                _ => &[],
+            },
+            TextPane::Logs | TextPane::Healthcheck | TextPane::Events => &[],
         }
     }
 
@@ -333,8 +387,7 @@ impl App {
     pub(crate) fn total_rows(&self, pane: TextPane) -> usize {
         match self.pane_text(pane) {
             Some((_, index)) => index.total_lines(),
-            None if matches!(pane, TextPane::Help | TextPane::Info(_)) => self.popup_lines().len(),
-            None => 0,
+            None => self.plain_lines(pane).len(),
         }
     }
 
@@ -354,7 +407,11 @@ impl App {
                 .current_service()
                 .and_then(|service| service.event_seqs.get(index))
                 .map_or(LineKey::Index(index), |seq| LineKey::Event(*seq)),
-            TextPane::Healthcheck | TextPane::Help | TextPane::Info(_) => LineKey::Index(index),
+            TextPane::ServiceName(_)
+            | TextPane::Url(_)
+            | TextPane::Healthcheck
+            | TextPane::Help
+            | TextPane::Info(_) => LineKey::Index(index),
         }
     }
 
@@ -499,7 +556,12 @@ impl App {
             )
             .render(area, &mut buf);
         } else {
-            let shown = self.popup_lines().get(rows).unwrap_or_default().to_vec();
+            // A pane taller than its lines asks for rows past the last one, which show nothing.
+            let lines = self.plain_lines(context.pane);
+            let shown = lines
+                .get(rows.start.min(lines.len())..rows.end.min(lines.len()))
+                .unwrap_or_default()
+                .to_vec();
             Paragraph::new(shown).render(area, &mut buf);
         }
         buf
@@ -534,7 +596,7 @@ impl App {
     ) -> Option<&ratatui::text::Line<'static>> {
         match self.pane_text(context.pane) {
             Some((text, index)) => text.lines.get(index.line_of_row(row)?.0),
-            None => self.popup_lines().get(row),
+            None => self.plain_lines(context.pane).get(row),
         }
     }
 
@@ -717,12 +779,7 @@ impl App {
             .hits
             .popup
             .as_ref()
-            .filter(|_| {
-                matches!(
-                    context.pane,
-                    TextPane::Logs | TextPane::Healthcheck | TextPane::Events
-                )
-            })
+            .filter(|_| !matches!(context.pane, TextPane::Help | TextPane::Info(_)))
             .map(|popup| popup.area);
         let first = self.first_row(context.pane);
         // Rows end where their text does, as terminals highlight a selection, rather than at the

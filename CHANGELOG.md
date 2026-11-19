@@ -2,8 +2,9 @@
 
 ## Unreleased
 
-- **Right-click a URL in the TUI's Logs title to copy it.** This works over ssh too, where
-  micromux cannot open a browser.
+- **Copy service names and the Logs title's URLs from the TUI.** Select them with the mouse as
+  in the logs, or right-click a URL to copy it, which also works over ssh, where micromux cannot
+  open a browser.
 
 ## v0.4.6
 

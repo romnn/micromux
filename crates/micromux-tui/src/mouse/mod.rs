@@ -7,6 +7,8 @@
 //!
 //! Text is selected inside one pane at a time, never across panes: a drag selects from where it
 //! started, a double click a word and a triple click a line.
+//! A service's name in the list and a URL in the Logs pane's title select like a pane of their
+//! own, so a selection never takes in a status, a marker or the title around a URL.
 //! Selecting only highlights; `y` or Enter copies, or ending the drag when copy-on-select is
 //! on.
 //! A drag past the top or bottom of a pane scrolls it a row at a time.
@@ -51,6 +53,8 @@ pub(crate) struct Hits {
     pub(crate) service_rows: Rect,
     /// Index of the service on the first row of the list.
     pub(crate) first_service: usize,
+    /// The services' names on the list's shown rows, one for each row from the first.
+    pub(crate) service_names: Vec<NameHit>,
     /// The logs pane, borders and scrollbar included.
     pub(crate) logs: Rect,
     /// The side pane, or an empty area while it is hidden.
@@ -71,11 +75,23 @@ pub(crate) struct HintHit {
     pub(crate) keys: &'static str,
 }
 
+/// A service's name in the services list and the cells it was drawn in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NameHit {
+    pub(crate) area: Rect,
+    /// The service's ID.
+    pub(crate) service: String,
+    /// The name as the row shows it, which may cut it short.
+    pub(crate) line: Line<'static>,
+}
+
 /// A URL and the cells it was drawn in.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LinkHit {
     pub(crate) area: Rect,
     pub(crate) url: String,
+    /// The URL as a line of text to select in.
+    pub(crate) line: Line<'static>,
 }
 
 /// The popup of the last frame.
@@ -154,6 +170,8 @@ pub(crate) struct MouseState {
     dragging: bool,
     /// The hint or URL the left button went down on, which a release on it clicks.
     pressed: Option<Clickable>,
+    /// The URL the first click of the current quick series of presses opened.
+    opened: Option<String>,
     /// The URL the right button went down on, or `None` when it went down elsewhere.
     right_pressed: Option<RightPress>,
     last_press: Option<Press>,
@@ -178,6 +196,7 @@ impl MouseState {
             selection: None,
             dragging: false,
             pressed: None,
+            opened: None,
             right_pressed: None,
             last_press: None,
             last_wheel: None,
@@ -356,6 +375,15 @@ impl App {
         }
     }
 
+    /// The URL drawn at `position` as a pane to select in, if any.
+    fn url_pane_at(&self, position: Position) -> Option<TextPane> {
+        self.hits
+            .links
+            .iter()
+            .position(|link| link.area.contains(position))
+            .map(TextPane::Url)
+    }
+
     /// The hint or URL drawn at `position`, if any.
     fn clickable_at(&self, position: Position) -> Option<Clickable> {
         let hint = self
@@ -376,6 +404,9 @@ impl App {
     /// A press of the left button at `position`, `now`.
     fn press(&mut self, position: Position, now: Instant) {
         let count = self.mouse.count_press(position, now);
+        if count == 1 {
+            self.mouse.opened = None;
+        }
         self.mouse.notice = None;
         self.mouse.dragging = false;
         self.mouse.pressed = None;
@@ -386,7 +417,8 @@ impl App {
             return;
         }
 
-        // A hint or URL acts on release and keeps the selection, which the copy hint copies.
+        // A hint or URL acts on release, and a hint keeps the selection, which the copy hint
+        // copies.
         // Under a popup only the copy hint does, since copying text selected in the popup is the
         // one thing a click outside it may do without closing it.
         // Copying is part of selecting, so the copy hint works without navigation, while a press
@@ -395,7 +427,21 @@ impl App {
             && (self.hits.popup.is_none() || clickable == Clickable::Hint("y"))
             && (self.mouse.navigate || (self.mouse.select && clickable == Clickable::Hint("y")))
         {
-            self.mouse.pressed = Some(clickable);
+            // Once a click of a quick series opened the URL, the presses after it only select.
+            let opened = match &clickable {
+                Clickable::Link(url) => self.mouse.opened.as_ref() == Some(url),
+                Clickable::Hint(_) => false,
+            };
+            if !(opened && self.mouse.select) {
+                self.mouse.pressed = Some(clickable);
+            }
+            // A press on a URL also starts a selection in it, so a drag along the URL selects it
+            // instead of opening it.
+            if self.mouse.select
+                && let Some(pane) = self.url_pane_at(position)
+            {
+                self.start_selection(pane, position, count);
+            }
             return;
         }
         self.mouse.selection = None;
@@ -427,24 +473,35 @@ impl App {
         }
 
         if self.hits.services.contains(position) {
-            if !self.mouse.navigate {
-                return;
-            }
-            self.focus = Focus::Services;
-            // Typed input goes to the selected service, so a click must not retarget it.
-            if !self.pty_input_mode && self.hits.service_rows.contains(position) {
-                let index =
-                    self.hits.first_service + usize::from(position.y - self.hits.service_rows.y);
-                if index < self.state.services.len() {
-                    self.state.selected_service = index;
+            if self.mouse.navigate {
+                self.focus = Focus::Services;
+                // Typed input goes to the selected service, so a click must not retarget it.
+                if !self.pty_input_mode && self.hits.service_rows.contains(position) {
+                    let index = self.hits.first_service
+                        + usize::from(position.y - self.hits.service_rows.y);
+                    if index < self.state.services.len() {
+                        self.state.selected_service = index;
+                    }
                 }
+            }
+            // Of a service's row only its name selects.
+            if self.mouse.select
+                && let Some(index) = self
+                    .hits
+                    .service_names
+                    .iter()
+                    .position(|name| name.area.contains(position))
+            {
+                self.start_selection(TextPane::ServiceName(index), position, count);
             }
         } else if self.hits.logs.contains(position) {
             if self.mouse.navigate {
                 self.focus = Focus::Logs;
             }
+            // Of the title only its URLs select.
             if self.mouse.select {
-                self.start_selection(TextPane::Logs, position, count);
+                let pane = self.url_pane_at(position).unwrap_or(TextPane::Logs);
+                self.start_selection(pane, position, count);
             }
         } else if self.hits.side.contains(position) {
             if self.mouse.navigate {
@@ -477,7 +534,10 @@ impl App {
                 }
                 self.handle_key_press(key);
             }
-            Clickable::Link(url) => self.effects.push(Effect::OpenUrl(url)),
+            Clickable::Link(url) => {
+                self.mouse.opened = Some(url.clone());
+                self.effects.push(Effect::OpenUrl(url));
+            }
         }
     }
 
@@ -543,13 +603,16 @@ impl App {
     /// The left button moved to `position` while down: the selection extends there, and past the
     /// pane's top or bottom the pane scrolls a row.
     fn drag_to(&mut self, position: Position) {
-        // Sliding off a hint or URL cancels its click.
-        if self
+        // Sliding off a hint or URL cancels its click, and so does a drag that selects along a
+        // URL.
+        let moved = self
             .mouse
-            .pressed
-            .as_ref()
-            .is_some_and(|pressed| self.clickable_at(position).as_ref() != Some(pressed))
-        {
+            .last_press
+            .is_some_and(|press| press.position != position);
+        if self.mouse.pressed.as_ref().is_some_and(|pressed| {
+            self.clickable_at(position).as_ref() != Some(pressed)
+                || (matches!(pressed, Clickable::Link(_)) && self.mouse.dragging && moved)
+        }) {
             self.mouse.pressed = None;
         }
         if !self.mouse.dragging {
@@ -593,13 +656,19 @@ impl App {
     /// The left button came up at `position`: a click on a hint or URL acts, and a selection
     /// being made ends, copied only when copy-on-select is on.
     fn release(&mut self, position: Position) {
+        let dragging = std::mem::take(&mut self.mouse.dragging);
         if let Some(pressed) = self.mouse.pressed.take()
             && self.clickable_at(position).as_ref() == Some(&pressed)
         {
+            // The caret the press on a URL placed goes with the click, so `Esc` goes on to clear
+            // the search.
+            if matches!(pressed, Clickable::Link(_)) && !self.has_selection() {
+                self.mouse.selection = None;
+            }
             self.click(pressed);
             return;
         }
-        if std::mem::take(&mut self.mouse.dragging) && self.mouse.copy_on_select {
+        if dragging && self.mouse.copy_on_select {
             self.copy_selection();
         }
     }
@@ -667,6 +736,8 @@ impl App {
             (TextPane::Logs, true) => self.scroll_logs_down(rows),
             (TextPane::Healthcheck | TextPane::Events, false) => self.scroll_side_pane_up(rows),
             (TextPane::Healthcheck | TextPane::Events, true) => self.scroll_side_pane_down(rows),
+            // A service's name and a URL are one row each.
+            (TextPane::ServiceName(_) | TextPane::Url(_), _) => {}
             (TextPane::Help | TextPane::Info(_), false) => {
                 self.popup_scroll = self.popup_scroll.saturating_sub(usize::from(rows));
             }

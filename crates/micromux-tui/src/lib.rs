@@ -508,7 +508,7 @@ impl App {
 
         // Seed the view from the model before the first frame.
         self.resync();
-        terminal.draw(|frame| frame.render_widget(&mut self, frame.area()))?;
+        self.draw(&mut terminal)?;
         let mut last_frame = tokio::time::Instant::now();
 
         while self.is_running() {
@@ -585,8 +585,22 @@ impl App {
             if tokio::time::Instant::now() < frame_deadline {
                 tokio::time::sleep_until(frame_deadline).await;
             }
-            terminal.draw(|frame| frame.render_widget(&mut self, frame.area()))?;
+            self.draw(&mut terminal)?;
             last_frame = tokio::time::Instant::now();
+        }
+        Ok(())
+    }
+
+    /// Draws a frame, and once more when the frame took away a selection whose text the panes
+    /// no longer show, since the footer, drawn before the panes, still offered to copy it.
+    fn draw<B: ratatui::backend::Backend>(
+        &mut self,
+        terminal: &mut ratatui::Terminal<B>,
+    ) -> Result<(), B::Error> {
+        let selected = self.mouse.selection.is_some();
+        terminal.draw(|frame| frame.render_widget(&mut *self, frame.area()))?;
+        if selected && self.mouse.selection.is_none() {
+            terminal.draw(|frame| frame.render_widget(&mut *self, frame.area()))?;
         }
         Ok(())
     }
@@ -2504,6 +2518,201 @@ mod tests {
             }
             screen_text(app, 200, chrome.header + chrome.footer);
             assert_eq!(app.hits.links, Vec::new());
+            Ok(())
+        }
+
+        /// Presses and releases the left button at `at`.
+        fn left_click(app: &mut App, at: Position) {
+            send(app, MouseEventKind::Down(MouseButton::Left), at);
+            send(app, MouseEventKind::Up(MouseButton::Left), at);
+        }
+
+        /// Drags with the left button from `from` to `to`.
+        fn left_drag(app: &mut App, from: Position, to: Position) {
+            send(app, MouseEventKind::Down(MouseButton::Left), from);
+            send(app, MouseEventKind::Drag(MouseButton::Left), to);
+            send(app, MouseEventKind::Up(MouseButton::Left), to);
+        }
+
+        /// Copies the selection with `y` and returns what was copied.
+        fn yank(app: &mut App) -> Vec<String> {
+            app.handle_key_press(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+            copied(app)
+        }
+
+        /// A URL in the Logs title selects like a pane's text: a drag along it selects it,
+        /// highlighted, and opens nothing, and a selection never leaves the URL, so the title
+        /// around it never selects.
+        #[tokio::test]
+        async fn dragging_along_a_url_selects_it_without_opening_it() -> eyre::Result<()> {
+            let mut urls = TitleUrls::new()?;
+            let app = &mut urls.app;
+            left_drag(app, urls.api, urls.api_end);
+            assert_eq!(app.effects, Vec::new());
+            let area = ratatui::layout::Rect::new(0, 0, 200, 24);
+            let mut frame = ratatui::buffer::Buffer::empty(area);
+            ratatui::widgets::Widget::render(&mut *app, area, &mut frame);
+            let reversed = |x: u16| {
+                frame
+                    .cell((x, urls.api.y))
+                    .is_some_and(|cell| cell.modifier.contains(ratatui::style::Modifier::REVERSED))
+            };
+            assert!((urls.api.x..=urls.api_end.x).all(reversed));
+            assert!(!reversed(urls.api.x - 1) && !reversed(urls.api_end.x + 1));
+            assert_eq!(yank(app), vec![API_URL.to_string()]);
+
+            // From the URL's end back over the separator and the URL before it.
+            left_drag(app, urls.api_end, urls.root);
+            assert_eq!(app.effects, Vec::new());
+            assert_eq!(yank(app), vec![API_URL.to_string()]);
+
+            // A triple click on the pane's name selects nothing, and one on a URL the URL.
+            let logs = find_on(&screen_text(app, 200, 24), "┌Logs")?;
+            for _ in 0..3 {
+                left_click(app, Position::new(logs.x + 1, logs.y));
+            }
+            assert_eq!(yank(app), Vec::<String>::new());
+            app.mouse = crate::mouse::MouseState::new(crate::MouseOptions {
+                navigate: false,
+                ..crate::MouseOptions::default()
+            });
+            for _ in 0..3 {
+                left_click(app, urls.api);
+            }
+            assert_eq!(yank(app), vec![API_URL.to_string()]);
+            Ok(())
+        }
+
+        /// A click on a URL opens it, and a quick second click selects it without opening it
+        /// again.
+        #[tokio::test]
+        async fn a_double_click_on_a_url_opens_it_once_and_selects_it() -> eyre::Result<()> {
+            let mut urls = TitleUrls::new()?;
+            let app = &mut urls.app;
+            left_click(app, urls.api);
+            // The click leaves no caret behind, so `Esc` would go on to clear a search.
+            assert_eq!(app.mouse.selection, None);
+            left_click(app, urls.api);
+            assert_eq!(
+                std::mem::take(&mut app.effects),
+                vec![Effect::OpenUrl(API_URL.to_string())]
+            );
+            assert_eq!(yank(app), vec![API_URL.to_string()]);
+
+            // A drag along the URL opened nothing, so a quick click after it, on the cell it
+            // started from, still opens the URL.
+            left_drag(app, urls.root, Position::new(urls.root.x + 5, urls.root.y));
+            left_click(app, urls.root);
+            assert_eq!(
+                std::mem::take(&mut app.effects),
+                vec![Effect::OpenUrl(ROOT_URL.to_string())]
+            );
+            Ok(())
+        }
+
+        /// Without navigation, a click or a drag on a URL selects and never opens; without
+        /// selecting, a click on a URL opens and a drag selects nothing.
+        #[tokio::test]
+        async fn the_title_selects_as_its_mouse_parts_allow() -> eyre::Result<()> {
+            let mut urls = TitleUrls::new()?;
+            let app = &mut urls.app;
+            app.mouse = crate::mouse::MouseState::new(crate::MouseOptions {
+                navigate: false,
+                ..crate::MouseOptions::default()
+            });
+            left_click(app, urls.api);
+            left_drag(app, urls.api, urls.api_end);
+            assert_eq!(copied(app), Vec::<String>::new());
+            assert_eq!(app.effects, Vec::new());
+            assert_eq!(yank(app), vec![API_URL.to_string()]);
+
+            app.mouse = crate::mouse::MouseState::new(crate::MouseOptions {
+                select: false,
+                ..crate::MouseOptions::default()
+            });
+            left_drag(app, urls.root, Position::new(urls.root.x + 5, urls.root.y));
+            assert_eq!(
+                std::mem::take(&mut app.effects),
+                vec![Effect::OpenUrl(ROOT_URL.to_string())]
+            );
+            assert_eq!(yank(app), Vec::<String>::new());
+            Ok(())
+        }
+
+        /// A selection in a URL holds only while the title shows that URL in its place:
+        /// selecting another service, or a narrower pane that no longer fits it, takes it away,
+        /// while a URL that still fits keeps its selection.
+        #[tokio::test]
+        async fn a_url_selection_goes_with_its_url() -> eyre::Result<()> {
+            let mut urls = TitleUrls::new()?;
+            let app = &mut urls.app;
+            left_drag(app, urls.api, urls.api_end);
+            screen_text(app, 200, 24);
+            assert!(app.has_selection());
+            app.state.selected_service = 1;
+            screen_text(app, 200, 24);
+            assert!(!app.has_selection());
+
+            app.state.selected_service = 0;
+            screen_text(app, 200, 24);
+            left_drag(app, urls.root, Position::new(urls.root.x + 3, urls.root.y));
+            let narrow = screen_text(app, 100, 24);
+            assert!(narrow.contains("+1 more"), "{narrow}");
+            assert_eq!(yank(app), vec!["http".to_string()]);
+
+            screen_text(app, 200, 24);
+            left_drag(app, urls.api, urls.api_end);
+            screen_text(app, 100, 24);
+            assert!(!app.has_selection());
+            assert_eq!(yank(app), Vec::<String>::new());
+            Ok(())
+        }
+
+        /// A frame that takes away a selection whose URL went draws again, so the footer stops
+        /// offering to copy it.
+        #[tokio::test]
+        async fn the_footer_drops_the_copy_hint_with_the_selection() -> eyre::Result<()> {
+            let mut urls = TitleUrls::new()?;
+            let app = &mut urls.app;
+            let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(200, 24))?;
+            app.draw(&mut terminal)?;
+            left_drag(app, urls.api, urls.api_end);
+            let footer = |terminal: &ratatui::Terminal<ratatui::backend::TestBackend>| {
+                let buffer = terminal.backend().buffer();
+                (0..buffer.area.width)
+                    .filter_map(|x| buffer.cell((x, buffer.area.height - 1)))
+                    .map(ratatui::buffer::Cell::symbol)
+                    .collect::<String>()
+            };
+            app.draw(&mut terminal)?;
+            assert!(
+                footer(&terminal).contains("y Copy"),
+                "{}",
+                footer(&terminal)
+            );
+
+            app.handle_key_press(KeyEvent::new(KeyCode::Char('A'), KeyModifiers::NONE));
+            app.draw(&mut terminal)?;
+            assert_eq!(app.mouse.selection, None);
+            assert!(
+                !footer(&terminal).contains("y Copy"),
+                "{}",
+                footer(&terminal)
+            );
+            Ok(())
+        }
+
+        /// A right-click on a URL copies the whole URL even while part of the title is selected,
+        /// and leaves that selection for `y` to copy.
+        #[tokio::test]
+        async fn a_right_click_on_a_url_keeps_a_title_selection() -> eyre::Result<()> {
+            let mut urls = TitleUrls::new()?;
+            let app = &mut urls.app;
+            left_drag(app, urls.api, Position::new(urls.api.x + 10, urls.api.y));
+            assert_eq!(app.effects, Vec::new());
+            right_click(app, urls.root, urls.root);
+            assert_eq!(copied(app), vec![ROOT_URL.to_string()]);
+            assert_eq!(yank(app), vec!["http://app.".to_string()]);
             Ok(())
         }
 
