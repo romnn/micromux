@@ -271,7 +271,10 @@ async fn a_drag_selects_text_inside_one_pane_and_copies_it_on_release() -> eyre:
     );
     assert_eq!(
         app.mouse.notice,
-        Some(crate::mouse::Notice::Copied("copied 3 lines".to_string()))
+        Some(crate::mouse::Notice::Copied {
+            text: "copied 3 lines".to_string(),
+            url: false,
+        })
     );
 
     // The selection stays highlighted, on the selected cells only.
@@ -933,9 +936,10 @@ async fn selecting_only_highlights_and_copying_takes_an_explicit_key() -> eyre::
     }
     assert_eq!(
         app.mouse.notice,
-        Some(crate::mouse::Notice::Copied(
-            "copied 6 characters".to_string()
-        ))
+        Some(crate::mouse::Notice::Copied {
+            text: "copied 6 characters".to_string(),
+            url: false,
+        })
     );
     assert!(app.running);
 
@@ -1258,9 +1262,10 @@ async fn a_right_click_copies_the_selection_and_changes_nothing_else() -> eyre::
     }
     assert_eq!(
         app.mouse.notice,
-        Some(crate::mouse::Notice::Copied(
-            "copied 6 characters".to_string()
-        ))
+        Some(crate::mouse::Notice::Copied {
+            text: "copied 6 characters".to_string(),
+            url: false,
+        })
     );
 
     // The release copies, so a press alone does nothing yet.
@@ -1844,7 +1849,10 @@ async fn a_url_that_cannot_open_says_so_over_the_footer() -> eyre::Result<()> {
     // does not show.
     let full = (60..=200)
         .find(|&width| {
-            app.mouse.notice = Some(super::Notice::Copied(text.to_string()));
+            app.mouse.notice = Some(super::Notice::Copied {
+                text: text.to_string(),
+                url: true,
+            });
             !last_row(&mut app, width).0.contains(text)
         })
         .ok_or_else(|| eyre::eyre!("every footer has room for the notice"))?;
@@ -1860,8 +1868,9 @@ async fn a_url_that_cannot_open_says_so_over_the_footer() -> eyre::Result<()> {
     );
 
     // The notice goes on its own: the event loop wakes for it, and the hints come back.
-    assert_eq!(app.next_timer(), Some(now + super::FAILED_NOTICE_DURATION));
-    app.on_timer(now + super::FAILED_NOTICE_DURATION);
+    let deadline = now + Duration::from_secs(4);
+    assert_eq!(app.next_timer(), Some(deadline));
+    app.on_timer(deadline);
     assert_eq!(app.next_timer(), None);
     assert_eq!(app.mouse.notice, None);
     assert!(!last_row(&mut app, full).0.contains("cannot open"));
@@ -1874,16 +1883,115 @@ async fn a_url_that_cannot_open_says_so_over_the_footer() -> eyre::Result<()> {
     fail_to_open(&mut unselecting, now);
     assert_eq!(
         unselecting.mouse.notice,
-        Some(super::Notice::Failed {
-            text: "cannot open the URL".to_string(),
-            at: now
-        })
+        Some(super::Notice::Failed("cannot open the URL".to_string()))
     );
     press_key(&mut app, KeyCode::Char('m'));
     fail_to_open(&mut app, now);
     assert!(matches!(
         &app.mouse.notice,
-        Some(super::Notice::Failed { text, .. }) if text == "cannot open the URL"
+        Some(super::Notice::Failed(text)) if text == "cannot open the URL"
     ));
+    Ok(())
+}
+
+/// Draws the app `width` columns wide, as a terminal that wide would.
+fn draw_at(app: &mut App, width: u16) -> Buffer {
+    let area = Rect::new(0, 0, width, HEIGHT);
+    let mut buffer = Buffer::empty(area);
+    app.render(area, &mut buffer);
+    buffer
+}
+
+/// The footer's rows as drawn `width` columns wide.
+fn footer_at(app: &mut App, width: u16) -> String {
+    let frame = draw_at(app, width);
+    let rows = app.chrome_rows(width).footer;
+    (HEIGHT - rows..HEIGHT)
+        .map(|y| row_text(&frame, y))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The widest terminal, from 200 columns down, whose footer has no room beside its last row's
+/// hints for the copy notice that is current.
+fn width_without_room(app: &mut App) -> eyre::Result<u16> {
+    let Some(super::Notice::Copied { text, .. }) = app.mouse.notice.clone() else {
+        eyre::bail!("no copy notice is current");
+    };
+    (60..=200)
+        .rev()
+        .find(|&width| !footer_at(app, width).contains(&text))
+        .ok_or_else(|| eyre::eyre!("every footer has room for {text:?}"))
+}
+
+/// A copy whose notice has no room beside the footer's hints says so in the copy hint, which
+/// keeps its width, so the footer keeps its rows; where the notice has room, the hint stays as
+/// it was. Either goes after a few seconds.
+#[tokio::test]
+async fn a_copy_says_so_in_the_copy_hint_without_room() -> eyre::Result<()> {
+    let mut app = app(SERVICES)?;
+    set_logs(&mut app, numbered(5))?;
+    let frame = draw(&mut app);
+    let line = find(&frame, "line 2 of")?;
+    drag(&mut app, line, &[Position::new(line.x + 5, line.y)]);
+    let before = (60..=200)
+        .map(|width| app.chrome_rows(width))
+        .collect::<Vec<_>>();
+    assert_eq!(yank(&mut app), vec!["line 2".to_string()]);
+    let full = width_without_room(&mut app)?;
+
+    let footer = footer_at(&mut app, full);
+    assert!(footer.contains("y Copied"), "{footer}");
+    assert!(!footer.contains("y Copy "), "{footer}");
+    let after = (60..=200)
+        .map(|width| app.chrome_rows(width))
+        .collect::<Vec<_>>();
+    assert_eq!(after, before);
+    let footer = footer_at(&mut app, 200);
+    assert!(footer.contains("copied 6 characters"), "{footer}");
+    assert!(footer.contains("y Copy "), "{footer}");
+
+    let deadline = app.mouse.notice_at + Duration::from_secs(3);
+    assert_eq!(app.next_timer(), Some(deadline));
+    app.on_timer(deadline);
+    let footer = footer_at(&mut app, full);
+    assert!(footer.contains("y Copy "), "{footer}");
+    assert!(!footer.contains("Copied"), "{footer}");
+    Ok(())
+}
+
+/// A copy in PTY input mode, as copy-on-select makes there, says so in the mouse hint's place
+/// and leaves `Ctrl+]`, the one hint that acts in the mode, where a click still finds it.
+#[tokio::test]
+async fn a_copy_in_pty_input_mode_leaves_its_exit_hint() -> eyre::Result<()> {
+    let mut app = app_with(crate::MouseOptions {
+        copy_on_select: true,
+        ..crate::MouseOptions::default()
+    })?;
+    set_logs(&mut app, numbered(5))?;
+    press_key(&mut app, KeyCode::Char('a'));
+    assert!(app.pty_input_mode);
+    let frame = draw(&mut app);
+    let line = find(&frame, "line 2 of")?;
+    drag(&mut app, line, &[Position::new(line.x + 5, line.y)]);
+    assert_eq!(copied(&mut app), vec!["line 2".to_string()]);
+    let full = width_without_room(&mut app)?;
+    // The footer takes the same rows at every width as it does without the notice.
+    let chrome = |app: &App| {
+        (60..=200)
+            .map(|width| app.chrome_rows(width))
+            .collect::<Vec<_>>()
+    };
+    let with_notice = chrome(&app);
+    let notice = app.mouse.notice.take();
+    assert_eq!(with_notice, chrome(&app));
+    app.mouse.notice = notice;
+
+    let frame = draw_at(&mut app, full);
+    let footer = footer_at(&mut app, full);
+    assert!(footer.contains("Copied"), "{footer}");
+    assert!(!footer.contains("Mouse:"), "{footer}");
+    click(&mut app, find(&frame, "Ctrl+]")?);
+    assert!(!app.pty_input_mode);
     Ok(())
 }

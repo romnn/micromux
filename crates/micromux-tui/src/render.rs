@@ -13,9 +13,9 @@ use ratatui::{
 #[cfg(test)]
 mod tests {
     use super::{
-        command_rows, drawn_text, lease_phrase,
+        KeyHint, command_rows, drawn_text, lease_phrase,
         log_view::{Highlights, LogView, PaneBorders, RenderedLineIndex, window_text},
-        service_detail, short_local_time, state_name,
+        pack_key_hints, service_detail, short_local_time, state_name,
     };
     use ratatui::{
         buffer::Buffer,
@@ -44,6 +44,23 @@ mod tests {
             Paragraph::new(Line::raw(text)).render(Rect::new(1, 0, room, 1), &mut buf);
             let (shown, width) = drawn_text(&buf, 0, 1, 1 + room);
             assert_eq!((shown.as_str(), width), drawn, "{text:?} in {room} columns");
+        }
+    }
+
+    /// A note in a hint's place takes exactly the hint's columns, so the footer packs the same.
+    #[test]
+    fn a_note_takes_the_place_of_its_hint() {
+        let drawn = |hint: KeyHint| pack_key_hints(&[hint], 80)[0].line.width();
+        for hint in [
+            || KeyHint::toggle("m", "Mouse", "ON"),
+            || KeyHint::toggle("m", "Mouse", "OFF"),
+            || KeyHint::new("y", "Copy    "),
+        ] {
+            for note in ["Copied", "URL copied"] {
+                let status = KeyHint::status(note, hint().width());
+                assert_eq!(status.width(), hint().width(), "{note}");
+                assert_eq!(drawn(status), drawn(hint()), "{note}");
+            }
         }
     }
 
@@ -1342,6 +1359,25 @@ impl KeyHint {
         }
     }
 
+    /// A note with no key, such as that a copy succeeded, padded to `width` columns.
+    fn status(note: &str, width: usize) -> Self {
+        Self {
+            keys: "",
+            description: format!("{note:<width$}"),
+            value: None,
+        }
+    }
+
+    /// The columns the hint takes in the footer, as `pack_key_hints` draws it.
+    fn width(&self) -> usize {
+        let columns = |text: &str| Span::raw(text).width();
+        let space = usize::from(!self.keys.is_empty());
+        columns(self.keys)
+            + space
+            + columns(&self.description)
+            + self.value.as_deref().map_or(0, columns)
+    }
+
     /// A hint for a toggle, rendered as `keys label:value`.
     fn toggle(keys: &'static str, label: &str, value: impl Into<String>) -> Self {
         Self {
@@ -1456,10 +1492,15 @@ fn pack_key_hints(hints: &[KeyHint], width: usize) -> Vec<HintRow> {
         value,
     } in hints
     {
-        let mut hint = vec![
-            keys.fg(Color::Yellow).bold(),
-            format!(" {description}").fg(Color::DarkGray),
-        ];
+        // A note without a key is said plainly, in the color of a copy's notice.
+        let mut hint = if keys.is_empty() {
+            vec![description.clone().fg(Color::Green)]
+        } else {
+            vec![
+                keys.fg(Color::Yellow).bold(),
+                format!(" {description}").fg(Color::DarkGray),
+            ]
+        };
         if let Some(value) = value {
             hint.push(value.clone().fg(Color::DarkGray).bold());
         }
@@ -2035,10 +2076,20 @@ impl Widget for &mut App {
     }
 }
 
+/// Whether `notice` fits at the right end of `row`, the footer's last, in a footer `width`
+/// columns wide.
+fn notice_fits(row: &HintRow, notice: &str, width: u16) -> bool {
+    // The notice keeps two columns from the hints and has a space after it.
+    let drawn = notice.chars().count() + 1;
+    row.line.width() + 2 + drawn <= usize::from(width)
+}
+
 /// Where each key hint of `rows`, drawn in `area`, landed on screen.
 fn hint_hits(rows: &[HintRow], area: Rect) -> Vec<crate::mouse::HintHit> {
     let mut hits = Vec::new();
     for (row, line) in rows.iter().zip(area.rows()) {
+        // A note without a key takes a press, which does nothing but end the note, so a press
+        // there leaves the selection as a press on any hint does.
         for &(x, width, keys) in &row.hints {
             let x = area.x.saturating_add(rows_u16(x));
             if x < area.right() {
@@ -2159,7 +2210,19 @@ impl App {
 
     /// The footer rows at `width`, wrapping whole key hints onto further rows as needed.
     pub(crate) fn footer_rows(&self, width: u16) -> Vec<HintRow> {
-        pack_key_hints(&self.action_key_hints(), usize::from(width))
+        let rows = pack_key_hints(&self.action_key_hints(None), usize::from(width));
+        // A copy whose notice has no room beside the hints says so in the copy or mouse hint,
+        // which keeps its width, so the footer keeps its rows and no other hint moves.
+        match &self.mouse.notice {
+            Some(crate::mouse::Notice::Copied { text, url })
+                if rows
+                    .last()
+                    .is_some_and(|row| !notice_fits(row, text, width)) =>
+            {
+                pack_key_hints(&self.action_key_hints(Some(*url)), usize::from(width))
+            }
+            _ => rows,
+        }
     }
 
     /// Header and footer heights at `width`; the panes get the rows in between.
@@ -2244,8 +2307,9 @@ impl App {
         ]
     }
 
-    /// Keys that move around the TUI or act on services and the session.
-    fn action_key_hints(&self) -> Vec<KeyHint> {
+    /// Keys that move around the TUI or act on services and the session, with the copy or mouse
+    /// hint saying a copy took a URL or the selection when `copied` says which.
+    fn action_key_hints(&self, copied: Option<bool>) -> Vec<KeyHint> {
         let focus = match self.focus {
             crate::Focus::Services => "SERVICES",
             crate::Focus::Logs => "LOGS",
@@ -2295,15 +2359,18 @@ impl App {
         // width, so the footer keeps its rows and the panes and service terminals their size.
         // Capture is on whenever there is a selection, so the toggle has nothing to report.
         // The level picker takes `y` for nothing, so the hint would promise what it cannot do.
-        if self.has_selection() && !self.pty_input_mode && self.level_picker.is_none() {
-            hints.push(KeyHint::new("y", "Copy    "));
+        let slot = if self.has_selection() && !self.pty_input_mode && self.level_picker.is_none() {
+            KeyHint::new("y", "Copy    ")
         } else {
-            hints.push(KeyHint::toggle(
-                "m",
-                "Mouse",
-                if self.mouse.capture { "ON" } else { "OFF" },
-            ));
-        }
+            KeyHint::toggle("m", "Mouse", if self.mouse.capture { "ON" } else { "OFF" })
+        };
+        // The `y` hint stays clickable after copying the selection; a URL's copy, or one that
+        // took the place of the mouse toggle, is said where the hint was, at its width.
+        hints.push(match copied {
+            Some(false) if slot.keys == "y" => KeyHint::new("y", "Copied  "),
+            Some(url) => KeyHint::status(if url { "URL copied" } else { "Copied" }, slot.width()),
+            None => slot,
+        });
         hints.push(KeyHint::new(
             "q",
             if self.source.attachment_status().is_some() {
@@ -2745,27 +2812,25 @@ impl App {
             (Some(format!("press q to {action}")), Color::Yellow, true)
         } else {
             match &self.mouse.notice {
-                Some(crate::mouse::Notice::Copied(text)) => {
+                Some(crate::mouse::Notice::Copied { text, .. }) => {
                     (Some(text.clone()), Color::Green, false)
                 }
-                Some(crate::mouse::Notice::Failed { text, .. }) => {
-                    (Some(text.clone()), Color::Red, true)
-                }
+                Some(crate::mouse::Notice::Failed(text)) => (Some(text.clone()), Color::Red, true),
                 None => (None, Color::Green, false),
             }
         };
         let (Some(notice), Some(last)) = (notice, footer.last()) else {
             return None;
         };
-        let notice = format!("{notice} ");
-        let width = rows_u16(notice.chars().count());
-        let used = rows_u16(last.line.width()).saturating_add(2);
         if area.height == 0 {
             return None;
         }
-        if used.saturating_add(width) > area.width {
+        let fits = notice_fits(last, &notice, area.width);
+        let notice = format!("{notice} ");
+        let width = rows_u16(notice.chars().count());
+        if !fits {
             // For the few seconds they last, they cover the hints of the footer's last row;
-            // other notices wait for room.
+            // a copy's notice leaves them, and its hint says it copied instead.
             if !urgent {
                 return None;
             }
