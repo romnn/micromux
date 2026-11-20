@@ -754,8 +754,10 @@ fn cleanup_only_shim_kills_a_cleanup_past_its_timeout() -> eyre::Result<()> {
         .process_group(0)
         .spawn()?;
 
-    // The timeout, the stop grace, and slack for a loaded machine
-    let deadline = started + Duration::from_millis(500) + Duration::from_secs(5 + 5);
+    // The timeout, the stop grace, and slack for a loaded machine.
+    // The bound only catches a shim that never stops the cleanup; the status below tells a
+    // timed-out cleanup from one that ran to its end.
+    let deadline = started + Duration::from_millis(500) + Duration::from_secs(5 + 20);
     let status = loop {
         if let Some(status) = shim.try_wait()? {
             break status;
