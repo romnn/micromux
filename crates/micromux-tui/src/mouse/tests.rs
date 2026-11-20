@@ -1995,3 +1995,19 @@ async fn a_copy_in_pty_input_mode_leaves_its_exit_hint() -> eyre::Result<()> {
     assert!(!app.pty_input_mode);
     Ok(())
 }
+
+/// The service popup is wide enough for its widest row as ratatui draws it, so a command with
+/// halfwidth katakana sound marks, which take a cell of their own, shows to its end.
+#[tokio::test]
+async fn the_service_popup_shows_a_row_with_sound_marks_to_its_end() -> eyre::Result<()> {
+    let mut app = app(indoc! {r#"
+        version: 1
+        services:
+          api:
+            command: ["echo", "ｶﾞｶﾞｶﾞｶﾞｶﾞｶﾞ-a-command-wider-than-any-other-row-END"]
+    "#})?;
+    press_key(&mut app, KeyCode::Char('i'));
+    let frame = draw(&mut app);
+    find(&frame, "row-END")?;
+    Ok(())
+}
