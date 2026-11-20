@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- **The TUI's borders, header and search prompt place wide characters and halfwidth katakana
+  sound marks in the cells the terminal draws them in.** A search with them no longer cuts off
+  the Logs title or its URLs, and a long service name shows whole in its popup's title.
+
 - **The TUI says when a URL's opener reports an error, such as `xdg-open` finding no
   browser.**
 

@@ -365,6 +365,11 @@ impl RemoteSource {
         (source, forwarding)
     }
 
+    /// Mirrors a session whose configuration is at `path`.
+    pub(crate) fn set_config_path(&self, path: &str) {
+        self.store.write().session.config_path = path.to_string();
+    }
+
     /// Replaces the mirrored lifecycle events of service `id` with `events`, as a refresh after an
     /// events change would, and tells the TUI with that change alone.
     pub(crate) fn record_events(&self, id: &str, events: Vec<micromux::ServiceEvent>) {

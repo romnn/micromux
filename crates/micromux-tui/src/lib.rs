@@ -5,6 +5,7 @@
 //! view state and re-reads its synchronous source on each [`micromux::SessionChange`].
 
 mod all_logs;
+mod cells;
 mod clipboard;
 mod event;
 mod json_log;
@@ -2986,6 +2987,48 @@ mod tests {
             Ok(())
         }
 
+        /// A URL shows in the Logs title only where it fits whole beside the search status as the
+        /// terminal draws it, a cell wider than its unicode width for each halfwidth katakana sound
+        /// mark, so at every width each URL a click opens is drawn where the click lands.
+        #[tokio::test]
+        async fn title_urls_fit_beside_a_status_with_sound_marks() -> eyre::Result<()> {
+            let mut urls = TitleUrls::new()?;
+            let app = &mut urls.app;
+            let key = |app: &mut App, code: KeyCode| {
+                app.handle_crossterm_event(&crossterm::event::Event::Key(KeyEvent::new(
+                    code,
+                    KeyModifiers::NONE,
+                )));
+            };
+            key(app, KeyCode::Char('/'));
+            for ch in "ｶﾞｶﾞｶﾞｶﾞ".chars() {
+                key(app, KeyCode::Char(ch));
+            }
+            key(app, KeyCode::Enter);
+
+            let mut shown = 0;
+            for width in 60..=160 {
+                let area = ratatui::layout::Rect::new(0, 0, width, 24);
+                let mut buffer = ratatui::buffer::Buffer::empty(area);
+                ratatui::widgets::Widget::render(&mut *app, area, &mut buffer);
+                for link in &app.hits.links {
+                    let drawn = (link.area.left()..link.area.right())
+                        .filter_map(|x| buffer.cell((x, link.area.y)))
+                        .map(ratatui::buffer::Cell::symbol)
+                        .collect::<String>();
+                    assert_eq!(drawn, link.url, "{width} columns");
+                    shown += 1;
+                }
+                let title = (0..width)
+                    .filter_map(|x| buffer.cell((x, app.hits.logs.y)))
+                    .map(ratatui::buffer::Cell::symbol)
+                    .collect::<String>();
+                assert!(title.contains("no match ┐"), "{width} columns: {title}");
+            }
+            assert!(shown > 0);
+            Ok(())
+        }
+
         /// A failed opener wakes the event loop by itself, with no input after it, so an idle TUI
         /// still says so.
         #[tokio::test]
@@ -3788,6 +3831,45 @@ mod tests {
             kind: KeyEventKind::Press,
             state: KeyEventState::NONE,
         }
+    }
+
+    /// The header's controls are placed in the cells the terminal draws them in, so beside a
+    /// session path with halfwidth katakana sound marks, which take a cell more than their
+    /// unicode width, each control is drawn where a click on it lands, and the last one whole.
+    #[tokio::test]
+    async fn header_controls_are_clicked_where_they_are_drawn() -> eyre::Result<()> {
+        let (source, _forwarding) = RemoteSource::offline();
+        source.set_config_path("/ｶﾞｶﾞｶﾞｶﾞ/micromux.yaml");
+        let terminal = source.terminal();
+        let mut app = App::new(
+            SessionSource::Remote(source),
+            terminal,
+            micromux::CancellationToken::new(),
+            ViewOptions::default(),
+        );
+        let area = ratatui::layout::Rect::new(0, 0, 140, 20);
+        let mut buffer = ratatui::buffer::Buffer::empty(area);
+        ratatui::widgets::Widget::render(&mut app, area, &mut buffer);
+        let row = (0..area.width)
+            .filter_map(|x| buffer.cell((x, 0)).map(ratatui::buffer::Cell::symbol))
+            .collect::<Vec<_>>();
+        let header = app.hits.hints.iter().filter(|hit| hit.area.y == 0);
+        let mut clicked = 0;
+        for hit in header {
+            let shown = row
+                .get(usize::from(hit.area.x)..)
+                .unwrap_or_default()
+                .concat();
+            assert!(shown.starts_with(hit.keys), "{} under {shown:?}", hit.keys);
+            clicked += 1;
+        }
+        assert!(clicked > 0, "{}", row.concat());
+        assert!(
+            row.concat().trim_end().ends_with("Pane:OFF  A All:OFF"),
+            "{}",
+            row.concat()
+        );
+        Ok(())
     }
 
     /// Watching a session never resizes its PTYs: an attached TUI resizes them only while it

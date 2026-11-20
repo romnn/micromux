@@ -356,6 +356,10 @@ fn tags_pad_names_to_one_width_and_cut_long_ones_in_the_middle() {
         "payment…vice-api │ "
     );
 
+    // Names are measured in the cells they are drawn in and cut between whole graphemes.
+    assert_eq!(fit_name("界界界界界界", 6), "界…界");
+    assert_eq!(text(tag("界界界界界界", 0, 6)), "界…界  │ ");
+
     // Services take the theme's colors by their number, and the colors repeat after the last.
     let color = |number| tag("api", number, 3).first().and_then(|span| span.style.fg);
     assert_eq!(color(0), Some(Color::Cyan));

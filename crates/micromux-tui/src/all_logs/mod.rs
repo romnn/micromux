@@ -24,6 +24,7 @@ use std::collections::HashMap;
 use ratatui::style::{Color, Stylize as _};
 use ratatui::text::Span;
 
+use crate::cells::{Keep, str_cells, take_cells};
 use crate::log_text::{LogText, RecordId, RecordKey, TaggedRecord};
 use crate::state::{CachedLine, Service};
 
@@ -128,7 +129,7 @@ impl AllLogs {
         let names = &self.names;
         let name_width = services
             .iter()
-            .map(|service| Span::raw(service.snapshot.name.as_str()).width())
+            .map(|service| str_cells(&service.snapshot.name))
             .max()
             .unwrap_or_default()
             .min(MAX_TAG_NAME_WIDTH);
@@ -284,7 +285,7 @@ fn order(names: &[String], key: RecordKey) -> Order<'_> {
 }
 
 /// The spans that lead each line of service `number`: its display name in its color,
-/// padded or cut to `name_width` columns, and a separator.
+/// padded or cut to `name_width` cells, and a separator.
 fn tag(name: &str, number: u32, name_width: usize) -> Vec<Span<'static>> {
     let color = usize::try_from(number)
         .ok()
@@ -292,43 +293,26 @@ fn tag(name: &str, number: u32, name_width: usize) -> Vec<Span<'static>> {
         .copied()
         .unwrap_or(Color::Cyan);
     let name = fit_name(name, name_width);
-    let padding = " ".repeat(name_width.saturating_sub(Span::raw(name.as_str()).width()));
+    let padding = " ".repeat(name_width.saturating_sub(str_cells(&name)));
     vec![
         format!("{name}{padding}").fg(color).bold(),
         " │ ".fg(Color::DarkGray),
     ]
 }
 
-/// `id` cut to `width` columns in the middle, an ellipsis taking a column, so names that share
+/// `id` cut to `width` cells in the middle, between whole graphemes, an ellipsis taking a cell, so names that share
 /// a long prefix, such as `payments-service-api` and `payments-service-worker`, keep the end
 /// that tells them apart.
 fn fit_name(id: &str, width: usize) -> String {
-    if Span::raw(id).width() <= width {
+    if str_cells(id) <= width {
         return id.to_string();
     }
     let Some(room) = width.checked_sub(1) else {
         return String::new();
     };
-    let char_width = |ch: char| Span::raw(ch.to_string()).width();
-    let take = |chars: &mut dyn Iterator<Item = char>, columns: usize| {
-        let mut taken = Vec::new();
-        let mut used = 0;
-        for ch in chars {
-            if used + char_width(ch) > columns {
-                break;
-            }
-            used += char_width(ch);
-            taken.push(ch);
-        }
-        taken
-    };
-    let head = take(&mut id.chars(), room / 2);
-    let mut tail = take(&mut id.chars().rev(), room - room / 2);
-    tail.reverse();
-    head.into_iter()
-        .chain(std::iter::once('…'))
-        .chain(tail)
-        .collect()
+    let head = take_cells(id, room / 2, Keep::Start);
+    let tail = take_cells(id, room - room / 2, Keep::End);
+    format!("{head}…{tail}")
 }
 
 /// A record of one service in the merged order.

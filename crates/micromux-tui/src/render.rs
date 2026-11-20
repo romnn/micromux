@@ -1,4 +1,5 @@
 use crate::App;
+use crate::cells::{Keep, fit_line, line_cells, str_cells, take_cells};
 
 use ansi_to_tui::IntoText;
 use itertools::intersperse;
@@ -476,6 +477,61 @@ mod tests {
         assert_eq!(cut, " $ run --listen 1 ... ");
         assert!(cut.chars().count() <= 22);
         assert_eq!(truncate_with_dots(" $ run --listen x", 12), " $ run ... ");
+
+        // The limit counts the cells the text is drawn in, and a cut keeps whole graphemes.
+        let cut = truncate_with_dots("界界界界界界界界界界界界", 10);
+        assert_eq!(cut, "界界 ... ");
+        assert!(crate::cells::str_cells(&cut) <= 10);
+        assert_eq!(truncate_with_dots("abcdｶﾞｶﾞｶﾞｶﾞ", 10), "abcd ... ");
+        // Six wide characters fit ten characters but take twelve cells.
+        assert_eq!(truncate_with_dots("界界界界界界", 10), "界界 ... ");
+    }
+
+    /// The search in the logs pane's border is cut to its cell limit between whole graphemes.
+    #[test]
+    fn a_long_query_is_cut_between_graphemes() {
+        let status = |query: &str| {
+            super::search_fact(crate::search::SearchStatus {
+                query,
+                current: None,
+                count: 0,
+            })
+            .content
+            .to_string()
+        };
+        let long = format!("{}ｶﾞX", "a".repeat(22));
+        assert_eq!(status(&long), format!("/{}… no match", "a".repeat(22)));
+        assert_eq!(status("ｶﾞｶﾞ"), "/ｶﾞｶﾞ no match");
+    }
+
+    /// A border's text is placed in the cells it is drawn in: the right side whole against the
+    /// right corner, however many spans and styles it has, and the left side in what it leaves,
+    /// cut to keep its start.
+    #[test]
+    fn border_text_is_placed_in_cells() {
+        use ratatui::style::Stylize as _;
+        use ratatui::widgets::{Block, Borders, Widget as _};
+
+        let draw = |width: u16, left: &str, right: Line<'_>| {
+            let area = Rect::new(0, 0, width, 1);
+            let mut buf = Buffer::empty(area);
+            Block::default()
+                .borders(Borders::TOP)
+                .render(area, &mut buf);
+            super::draw_border_row(&mut buf, area, 0, Some(&Line::from(left)), Some(&right));
+            let mut row = String::new();
+            let mut x = 0;
+            while let Some(cell) = buf.cell((x, 0)) {
+                row.push_str(cell.symbol());
+                x += super::rows_u16(crate::cells::str_cells(cell.symbol()).max(1));
+            }
+            row
+        };
+        let status = || Line::from(vec![" ".into(), "/ｶﾞ no match".red(), " ".into()]);
+        assert_eq!(draw(24, "Logs", status()), "─Logs─── /ｶﾞ no match ─");
+        // The status keeps its end and the title gives way.
+        assert_eq!(draw(19, "Logs", status()), "─Lo /ｶﾞ no match ─");
+        assert_eq!(draw(13, "Logs", status()), "─L no match ─");
     }
 
     #[test]
@@ -1028,19 +1084,6 @@ fn info_rows<V: Into<Line<'static>>>(label: &str, values: Vec<V>) -> Vec<Line<'s
     .collect()
 }
 
-/// The cells `line` takes as a paragraph that never wraps draws it: each of its graphemes in
-/// the cells ratatui gives it, without the control characters it leaves out.
-///
-/// It differs from [`Line::width`] where unicode-width and ratatui disagree, as on a halfwidth
-/// katakana sound mark, which ratatui draws in a cell of its own.
-fn line_cells(line: &Line<'_>) -> usize {
-    use ratatui::buffer::CellWidth as _;
-
-    line.styled_graphemes(Style::default())
-        .map(|grapheme| usize::from(grapheme.symbol.cell_width()))
-        .sum()
-}
-
 /// Splits an info popup row wider than `width` cells into rows of at most `width` cells,
 /// continuing under the value column.
 ///
@@ -1507,6 +1550,12 @@ fn centered_popup(area: Rect, content_width: usize, content_rows: usize) -> Rect
     }
 }
 
+/// The width a popup's content needs for `body_cells` of body under the title `title`, so the
+/// title fits on the popup's top border.
+fn popup_content_width(body_cells: usize, title: &str) -> usize {
+    body_cells.max(str_cells(title))
+}
+
 /// The keys of the one hint for both side panes, which take turns beside the logs and so share
 /// the header's room.
 pub(crate) const SIDE_PANE_KEYS: &str = "H/E";
@@ -1844,8 +1893,8 @@ fn logs_status(
     (!facts.is_empty()).then(|| border_facts(facts))
 }
 
-/// Longest query the logs pane's border shows in full.
-const MAX_SHOWN_QUERY_CHARS: usize = 24;
+/// Cells of the longest query the logs pane's border shows in full.
+const MAX_SHOWN_QUERY_CELLS: usize = 24;
 
 /// The search for the logs pane's border: the query and which match is current, how many there
 /// are, or that there is none.
@@ -1855,11 +1904,8 @@ fn search_fact(search: crate::search::SearchStatus<'_>) -> Span<'static> {
         current,
         count,
     } = search;
-    let query = if query.chars().count() > MAX_SHOWN_QUERY_CHARS {
-        let kept = query
-            .chars()
-            .take(MAX_SHOWN_QUERY_CHARS - 1)
-            .collect::<String>();
+    let query = if str_cells(query) > MAX_SHOWN_QUERY_CELLS {
+        let kept = take_cells(query, MAX_SHOWN_QUERY_CELLS - 1, Keep::Start);
         format!("{kept}…")
     } else {
         query.to_string()
@@ -1977,16 +2023,16 @@ fn level_color(min_level: Option<micromux::StructuredLogLevel>) -> Color {
     }
 }
 
-/// Shortens `text` to at most `max_chars`, ending a cut with a spaced `...` so it reads apart
-/// from the border line that follows.
-fn truncate_with_dots(text: &str, max_chars: usize) -> String {
+/// Shortens `text` to at most `max_cells` cells, between whole graphemes, ending a cut with a
+/// spaced `...` so it reads apart from the border line that follows.
+fn truncate_with_dots(text: &str, max_cells: usize) -> String {
     const MARKER: &str = " ... ";
 
-    if text.chars().count() <= max_chars {
+    if str_cells(text) <= max_cells {
         return text.to_string();
     }
-    let kept = max_chars.saturating_sub(MARKER.len());
-    let mut truncated = text.chars().take(kept).collect::<String>();
+    let kept = max_cells.saturating_sub(MARKER.len());
+    let mut truncated = take_cells(text, kept, Keep::Start).to_string();
     truncated.truncate(truncated.trim_end().len());
     truncated.push_str(MARKER);
     truncated
@@ -2019,6 +2065,38 @@ fn lease_phrase(expires_at_unix_ms: Option<u64>, now_unix_ms: u64) -> String {
         format!("expires in ~{}h", secs / 3600)
     } else {
         format!("expires in ~{}d", secs / 86_400)
+    }
+}
+
+/// Draws `left` and `right` into row `y` of a frame drawn in `border`, between its corners, in
+/// the cells ratatui draws them in.
+///
+/// The right text goes first, flush against the right corner and cut to keep its end, and the
+/// left text takes what it leaves after the left corner, cut to keep its start.
+/// `Block` lays its titles out in unicode width, so a title holding text ratatui draws wider,
+/// such as a halfwidth katakana sound mark, would lose its end there.
+fn draw_border_row(
+    buf: &mut Buffer,
+    border: Rect,
+    y: u16,
+    left: Option<&Line<'_>>,
+    right: Option<&Line<'_>>,
+) {
+    let border = border.intersection(buf.area);
+    if border.width < 2 || !(border.top()..border.bottom()).contains(&y) {
+        return;
+    }
+    let room = usize::from(border.width - 2);
+    let mut right_cells = 0;
+    if let Some(right) = right {
+        let right = fit_line(right, room, Keep::End);
+        right_cells = line_cells(&right);
+        let x = (border.right() - 1).saturating_sub(rows_u16(right_cells));
+        buf.set_line(x, y, &right, rows_u16(right_cells));
+    }
+    if let Some(left) = left {
+        let left = fit_line(left, room - right_cells, Keep::Start);
+        buf.set_line(border.x + 1, y, &left, rows_u16(line_cells(&left)));
     }
 }
 
@@ -2269,11 +2347,12 @@ impl App {
         let urls = self.routing_problem_line().map(HintRow::plain);
         let status = self.status_line();
         let controls = pack_key_hints(&self.view_key_hints(), width);
+        let status_cells = line_cells(&status);
         if let [single_row] = controls.as_slice()
-            && status.width() + 1 + single_row.line.width() <= width
+            && status_cells + 1 + line_cells(&single_row.line) <= width
         {
-            let gap = width - status.width() - single_row.line.width();
-            let shift = status.width() + gap;
+            let gap = width - status_cells - line_cells(&single_row.line);
+            let shift = status_cells + gap;
             let row = single_row.clone().shifted(shift);
             let mut spans = status.spans;
             spans.push(" ".repeat(gap).into());
@@ -2629,7 +2708,7 @@ impl App {
         // The pane's border spans its width less the scrollbar column and both corners.
         let title_width = usize::from(area.width)
             .saturating_sub(3)
-            .saturating_sub(status.as_ref().map_or(0, Line::width))
+            .saturating_sub(status.as_ref().map_or(0, line_cells))
             .saturating_sub(LOGS_TITLE_GAP);
         let (title, url_columns) = logs_title(
             &service_urls(session.as_ref(), &current_service.snapshot.id),
@@ -2743,18 +2822,14 @@ impl App {
         let title = format!(" Level · {name} ");
         let hint = " ↵ select · Esc cancel ";
         let widest_item = items.iter().map(ListItem::width).max().unwrap_or_default();
-        let content_width = title
-            .chars()
-            .count()
-            .max(hint.chars().count())
+        let body_cells = str_cells(hint)
             // The highlight symbol shares the row with each item.
             .max(widest_item.saturating_add(3));
-        let popup = centered_popup(area, content_width, items.len());
+        let popup = centered_popup(area, popup_content_width(body_cells, &title), items.len());
 
         let block = Block::default()
             .borders(Borders::ALL)
             .padding(POPUP_PADDING)
-            .title(title)
             .title_bottom(hint.fg(Color::DarkGray));
         let rows = block.inner(popup);
         let list = List::new(items)
@@ -2765,6 +2840,10 @@ impl App {
         state.select(Some(picker.cursor));
         Clear.render(popup, buf);
         StatefulWidget::render(&list, popup, buf, &mut state);
+        // A popup one row high keeps the hint that closes it on that row.
+        if popup.height > 1 {
+            draw_border_row(buf, popup, popup.y, Some(&Line::from(title)), None);
+        }
         self.hits.popup = Some(crate::mouse::PopupHit {
             area: popup,
             content: crate::mouse::PopupContent::Levels {
@@ -2774,7 +2853,7 @@ impl App {
         });
     }
 
-    fn render_info(&mut self, view: crate::InfoView, area: Rect, buf: &mut Buffer) {
+    pub(crate) fn render_info(&mut self, view: crate::InfoView, area: Rect, buf: &mut Buffer) {
         let session = self.source.session_summary();
         let (title, rows) = match view {
             crate::InfoView::Service => {
@@ -2825,24 +2904,24 @@ impl App {
             .into_iter()
             .flat_map(|row| wrap_info_row(row, wrap_width))
             .collect::<Vec<_>>();
-        let content_width = rows
+        let body_cells = rows
             .iter()
             .map(|row| line_cells(row))
             .max()
             .unwrap_or_default();
-        let popup = centered_popup(area, content_width, rows.len());
+        let popup = centered_popup(area, popup_content_width(body_cells, &title), rows.len());
         let visible = usize::from(popup.height).saturating_sub(vertical_chrome);
         let max_scroll = rows.len().saturating_sub(visible);
         self.popup_scroll = self.popup_scroll.min(max_scroll);
         let mut block = Block::default()
             .borders(Borders::ALL)
             .padding(POPUP_PADDING)
-            .title(title)
             .title_bottom(format!(" {key} or Esc closes ").fg(Color::DarkGray));
         if max_scroll > 0 {
             block = block.title_bottom(self.scroll_position(visible, rows.len()));
         }
-        self.render_text_popup(crate::mouse::TextPane::Info(view), popup, block, rows, buf);
+        let pane = crate::mouse::TextPane::Info(view);
+        self.render_text_popup(pane, popup, block, &Line::from(title), rows, buf);
     }
 
     /// Where a scrolled popup is, for its bottom border's right side.
@@ -2854,12 +2933,14 @@ impl App {
             .into_right_aligned_line()
     }
 
-    /// Draws a popup of `rows` scrolled to the current popup row, and records it for the mouse.
+    /// Draws a popup of `rows` scrolled to the current popup row, in the frame `block` draws with
+    /// `title` on its top border, and records it for the mouse.
     fn render_text_popup(
         &mut self,
         pane: crate::mouse::TextPane,
         popup: Rect,
         block: Block<'_>,
+        title: &Line<'_>,
         rows: Vec<Line<'static>>,
         buf: &mut Buffer,
     ) {
@@ -2869,6 +2950,10 @@ impl App {
             .scroll((rows_u16(self.popup_scroll), 0));
         Clear.render(popup, buf);
         Widget::render(&paragraph, popup, buf);
+        // A popup one row high keeps the hint that closes it on that row.
+        if popup.height > 1 {
+            draw_border_row(buf, popup, popup.y, Some(title), None);
+        }
         self.hits.popup = Some(crate::mouse::PopupHit {
             area: popup,
             content: crate::mouse::PopupContent::Text {
@@ -2894,12 +2979,19 @@ impl App {
         let mut block = Block::default()
             .borders(Borders::ALL)
             .padding(POPUP_PADDING)
-            .title(" Keys ")
             .title_bottom(" Esc closes ".fg(Color::DarkGray));
         if max_scroll > 0 {
             block = block.title_bottom(self.scroll_position(visible, rows.len()));
         }
-        self.render_text_popup(crate::mouse::TextPane::Help, popup, block, rows, buf);
+        let title = Line::from(" Keys ");
+        self.render_text_popup(
+            crate::mouse::TextPane::Help,
+            popup,
+            block,
+            &title,
+            rows,
+            buf,
+        );
     }
 
     /// Draws what the last mouse release copied at the right end of the footer's last row, where
@@ -2992,26 +3084,14 @@ impl App {
         };
         let width = usize::from(row.width);
         // The query's end that fits beside the " /" before it and the cursor after it.
-        let room = width.saturating_sub(3);
-        let mut used = 0;
-        let mut shown_from = prompt.len();
-        for (start, ch) in prompt.char_indices().rev() {
-            let ch_width = prompt
-                .get(start..start + ch.len_utf8())
-                .map_or(0, |text| Span::raw(text).width());
-            if used + ch_width > room {
-                break;
-            }
-            used += ch_width;
-            shown_from = start;
-        }
+        let shown = take_cells(prompt, width.saturating_sub(3), Keep::End);
         let line = Line::from(vec![
             " /".fg(Color::Yellow).bold(),
-            Span::raw(prompt.get(shown_from..).unwrap_or_default()),
+            Span::raw(shown.to_string()),
             Span::styled(" ", Style::new().add_modifier(Modifier::REVERSED)),
         ]);
         let hint = " ↵ search · Esc cancel ".fg(Color::DarkGray);
-        let gap = width.saturating_sub(line.width() + hint.width());
+        let gap = width.saturating_sub(line_cells(&line) + str_cells(&hint.content));
         let mut spans = line.spans;
         if gap > 0 {
             spans.extend([Span::raw(" ".repeat(gap)), hint]);
@@ -3343,27 +3423,32 @@ pub mod log_view {
                 highlights,
             );
 
-            let mut block = super::pane_block(focused).title(title);
-            if let Some(status) = status {
-                block = block.title(status.right_aligned());
-            }
+            let paragraph = paragraph.block(super::pane_block(focused));
+            Widget::render(&paragraph, log_area, buf);
+
+            // The border's text is drawn in cells, the status on the right first, so the title
+            // takes what it leaves.
+            super::draw_border_row(buf, log_area, log_area.y, Some(&title), status.as_ref());
             // A pane one row tall draws both borders on that row, where the bottom one's detail
             // would cover the title and the URLs a click there acts on.
             if let Some(BorderDetail { left, right }) = detail.filter(|_| log_area.height > 1) {
                 // The corners take a column each, and the gap keeps the two sides apart.
-                let left_width = usize::from(log_area.width)
-                    .saturating_sub(right.width() + 2 + BORDER_DETAIL_GAP);
-                if left_width >= MIN_BORDER_DETAIL_LEFT_WIDTH {
-                    block = block.title_bottom(ratatui::text::Span::styled(
-                        super::truncate_with_dots(&left.content, left_width),
+                let left_cells = usize::from(log_area.width)
+                    .saturating_sub(super::line_cells(&right) + 2 + BORDER_DETAIL_GAP);
+                let left = (left_cells >= MIN_BORDER_DETAIL_LEFT_WIDTH).then(|| {
+                    ratatui::text::Line::from(ratatui::text::Span::styled(
+                        super::truncate_with_dots(&left.content, left_cells),
                         left.style,
-                    ));
-                }
-                block = block.title_bottom(right.right_aligned());
+                    ))
+                });
+                super::draw_border_row(
+                    buf,
+                    log_area,
+                    log_area.bottom() - 1,
+                    left.as_ref(),
+                    Some(&right),
+                );
             }
-            let paragraph = paragraph.block(block);
-
-            Widget::render(&paragraph, log_area, buf);
 
             let scrollbar = Scrollbar::new(ratatui::widgets::ScrollbarOrientation::VerticalRight)
                 .begin_symbol(None)
