@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- **The TUI's `i` and `u` popups fit rows with halfwidth katakana sound marks.** They are
+  sized and wrapped in the cells the terminal draws, so such a row is no longer cut short.
+
 - **The TUI confirms every copy, even when the footer has no room for its notice.** The copy or
   mouse hint reads `y Copied`, `Copied` or `URL copied` for a few seconds instead.
 

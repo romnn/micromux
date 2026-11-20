@@ -13,9 +13,9 @@ use ratatui::{
 #[cfg(test)]
 mod tests {
     use super::{
-        KeyHint, command_rows, drawn_text, lease_phrase,
+        KeyHint, command_rows, drawn_text, lease_phrase, line_cells,
         log_view::{Highlights, LogView, PaneBorders, RenderedLineIndex, window_text},
-        pack_key_hints, service_detail, short_local_time, state_name,
+        pack_key_hints, service_detail, short_local_time, state_name, wrap_info_row,
     };
     use ratatui::{
         buffer::Buffer,
@@ -62,6 +62,68 @@ mod tests {
                 assert_eq!(drawn(status), drawn(hint()), "{note}");
             }
         }
+    }
+
+    /// An info row wraps between whole graphemes measured in the cells ratatui draws them in, so
+    /// no row runs past the popup, and a continuation's indent gives way to a grapheme too wide
+    /// to fit after it.
+    #[test]
+    fn info_rows_wrap_between_whole_graphemes() {
+        let texts = |rows: &[Line<'_>]| rows.iter().map(Line::to_string).collect::<Vec<_>>();
+        // `ｶﾞ` takes three cells, so after a two-cell indent it would not fit in four.
+        let rows = wrap_info_row(Line::from("abcdｶﾞZ"), 4);
+        assert_eq!(texts(&rows), ["abcd", " ｶﾞ", "  Z"]);
+        assert!(rows.iter().all(|row| line_cells(row) <= 4));
+
+        // What a paragraph `width` cells wide draws of `line`, its blanks left out: it leaves
+        // out what takes no cells and what takes more than the row.
+        let drawn = |line: &Line<'_>, width: u16| {
+            use ratatui::buffer::CellWidth as _;
+            line.styled_graphemes(ratatui::style::Style::default())
+                .filter(|grapheme| {
+                    (1..=width).contains(&grapheme.symbol.cell_width()) && grapheme.symbol != " "
+                })
+                .map(|grapheme| grapheme.symbol)
+                .collect::<String>()
+        };
+        // The cells a paragraph `width` cells wide fills with `line`.
+        let drawn_cells = |line: &Line<'_>, width: u16| {
+            use ratatui::buffer::CellWidth as _;
+            line.styled_graphemes(ratatui::style::Style::default())
+                .map(|grapheme| grapheme.symbol.cell_width())
+                .filter(|cells| *cells <= width)
+                .map(usize::from)
+                .sum::<usize>()
+        };
+        let draws_the_same = |row: &str, width: u16| {
+            let row = Line::from(row.to_string());
+            let rows = wrap_info_row(row.clone(), usize::from(width));
+            assert!(
+                rows.iter()
+                    .all(|wrapped| drawn_cells(wrapped, width) <= usize::from(width)),
+                "{row} in {width}"
+            );
+            let wrapped = rows.iter().map(|wrapped| drawn(wrapped, width));
+            assert_eq!(
+                wrapped.collect::<String>(),
+                drawn(&row, width),
+                "{row} in {width}"
+            );
+        };
+        // Control characters take no room and stay where they were, so a combining accent after
+        // a tab stays apart from the letter before the tab, as a paragraph draws the row
+        // unwrapped.
+        draws_the_same(
+            &format!("{}b\t\u{301}c{}", "x".repeat(10), "y".repeat(30)),
+            20,
+        );
+
+        // A grapheme wider than the whole row takes no room and stays, so it never takes a row of
+        // its own, and the graphemes around it stay apart: a paragraph draws `가` alone of
+        // `가ｶﾞᆨ` two cells wide, never the `각` it would draw had `ｶﾞ` gone.
+        assert_eq!(texts(&wrap_info_row(Line::from("aｶﾞZ"), 2)), ["aｶﾞZ"]);
+        draws_the_same("가ｶﾞᆨ", 2);
+        draws_the_same("aｶﾞZaｶﾞZaｶﾞZ", 2);
     }
 
     fn wrapped_text_height(text: &ratatui::text::Text, wrap_width: u16) -> usize {
@@ -966,31 +1028,64 @@ fn info_rows<V: Into<Line<'static>>>(label: &str, values: Vec<V>) -> Vec<Line<'s
     .collect()
 }
 
-/// Splits an info popup row wider than `width` into rows of at most `width` columns, continuing
-/// under the value column.
+/// The cells `line` takes as a paragraph that never wraps draws it: each of its graphemes in
+/// the cells ratatui gives it, without the control characters it leaves out.
+///
+/// It differs from [`Line::width`] where unicode-width and ratatui disagree, as on a halfwidth
+/// katakana sound mark, which ratatui draws in a cell of its own.
+fn line_cells(line: &Line<'_>) -> usize {
+    use ratatui::buffer::CellWidth as _;
+
+    line.styled_graphemes(Style::default())
+        .map(|grapheme| usize::from(grapheme.symbol.cell_width()))
+        .sum()
+}
+
+/// Splits an info popup row wider than `width` cells into rows of at most `width` cells,
+/// continuing under the value column.
+///
+/// It breaks between graphemes, measured as ratatui draws them, so none is ever split, and the
+/// continuation's indent gives way to a grapheme too wide to fit after it.
+/// It only ever inserts breaks and never drops text, so the text on either side of any grapheme
+/// falls into the same graphemes as before.
+/// Control characters and graphemes wider than `width`, which a paragraph leaves out, take no
+/// room, so neither ever takes a row of its own.
 fn wrap_info_row(row: Line<'static>, width: usize) -> Vec<Line<'static>> {
+    use ratatui::buffer::CellWidth as _;
+    use unicode_segmentation::UnicodeSegmentation as _;
+
     let indent = INFO_LABEL_WIDTH.min(width / 2);
-    if width == 0 || row.width() <= width {
+    if width == 0 || line_cells(&row) <= width {
         return vec![row];
     }
     let mut rows = Vec::new();
     let mut current: Vec<Span<'static>> = Vec::new();
     let mut used = 0;
-    for span in row.spans {
+    // Whether the row holds anything but its indent, without which a wrap would only add an
+    // empty row.
+    let mut filled = false;
+    for span in &row.spans {
         let mut text = String::new();
-        for character in span.content.chars() {
-            // Columns, not characters: a wide character takes two.
-            let columns = Span::raw(character.to_string()).width();
-            if used + columns > width && used > indent {
+        for grapheme in span.content.graphemes(true) {
+            let columns = if grapheme.contains(char::is_control) {
+                0
+            } else {
+                Some(usize::from(grapheme.cell_width()))
+                    .filter(|&columns| columns <= width)
+                    .unwrap_or_default()
+            };
+            if used + columns > width && filled {
                 if !text.is_empty() {
                     current.push(Span::styled(std::mem::take(&mut text), span.style));
                 }
                 rows.push(Line::from(std::mem::take(&mut current)));
-                current.push(" ".repeat(indent).into());
-                used = indent;
+                let row_indent = indent.min(width.saturating_sub(columns));
+                current.push(" ".repeat(row_indent).into());
+                used = row_indent;
             }
-            text.push(character);
+            text.push_str(grapheme);
             used += columns;
+            filled |= columns > 0;
         }
         if !text.is_empty() {
             current.push(Span::styled(text, span.style));
@@ -1698,9 +1793,12 @@ fn help_rows() -> Vec<Line<'static>> {
 
     let columns = HELP_COLUMNS.map(help_column_rows);
     let height = columns.iter().map(Vec::len).max().unwrap_or_default();
-    let widths = columns
-        .each_ref()
-        .map(|rows| rows.iter().map(Line::width).max().unwrap_or_default());
+    let widths = columns.each_ref().map(|rows| {
+        rows.iter()
+            .map(|row| line_cells(row))
+            .max()
+            .unwrap_or_default()
+    });
     (0..height)
         .map(|index| {
             let mut spans = Vec::new();
@@ -1709,7 +1807,7 @@ fn help_rows() -> Vec<Line<'static>> {
                     spans.push(" ".repeat(COLUMN_GAP).into());
                 }
                 let row = rows.get(index).cloned().unwrap_or_default();
-                let padding = width.saturating_sub(row.width());
+                let padding = width.saturating_sub(line_cells(&row));
                 spans.extend(row.spans);
                 spans.push(" ".repeat(padding).into());
             }
@@ -2727,7 +2825,11 @@ impl App {
             .into_iter()
             .flat_map(|row| wrap_info_row(row, wrap_width))
             .collect::<Vec<_>>();
-        let content_width = rows.iter().map(Line::width).max().unwrap_or_default();
+        let content_width = rows
+            .iter()
+            .map(|row| line_cells(row))
+            .max()
+            .unwrap_or_default();
         let popup = centered_popup(area, content_width, rows.len());
         let visible = usize::from(popup.height).saturating_sub(vertical_chrome);
         let max_scroll = rows.len().saturating_sub(visible);
@@ -2779,7 +2881,11 @@ impl App {
 
     fn render_help(&mut self, area: Rect, buf: &mut Buffer) {
         let rows = help_rows();
-        let content_width = rows.iter().map(Line::width).max().unwrap_or_default();
+        let content_width = rows
+            .iter()
+            .map(|row| line_cells(row))
+            .max()
+            .unwrap_or_default();
         let popup = centered_popup(area, content_width, rows.len());
         let vertical_chrome = usize::from(POPUP_PADDING.top + POPUP_PADDING.bottom + 2);
         let visible = usize::from(popup.height).saturating_sub(vertical_chrome);
