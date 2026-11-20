@@ -611,27 +611,17 @@ impl App {
     }
 
     /// When the event loop must wake by itself: to retry queued PTY input, or to take back the
-    /// quit hint or a notice that a URL could not be opened.
+    /// quit hint or the mouse's notice.
     fn next_timer(&self) -> Option<std::time::Instant> {
         let retry = (!self.pending_pty_input.is_empty())
             .then(|| std::time::Instant::now() + PENDING_PTY_INPUT_RETRY);
         let hint = self.quit_hint_at.map(|at| at + QUIT_HINT_DURATION);
-        let failed = self
-            .failed_notice_at()
-            .map(|at| at + mouse::FAILED_NOTICE_DURATION);
-        retry.into_iter().chain(hint).chain(failed).min()
-    }
-
-    /// When the footer began to say that a URL could not be opened, if it says so.
-    fn failed_notice_at(&self) -> Option<std::time::Instant> {
-        match self.mouse.notice {
-            Some(mouse::Notice::Failed { at, .. }) => Some(at),
-            Some(mouse::Notice::Copied(_)) | None => None,
-        }
+        let notice = self.mouse.notice_deadline();
+        retry.into_iter().chain(hint).chain(notice).min()
     }
 
     /// Does what is due `now`: retries queued PTY input and takes back an expired quit hint or
-    /// notice that a URL could not be opened.
+    /// mouse notice.
     fn on_timer(&mut self, now: std::time::Instant) {
         if !self.pending_pty_input.is_empty() {
             self.flush_pending_pty_input();
@@ -643,10 +633,11 @@ impl App {
             self.quit_hint_at = None;
         }
         if self
-            .failed_notice_at()
-            .is_some_and(|at| now.saturating_duration_since(at) >= mouse::FAILED_NOTICE_DURATION)
+            .mouse
+            .notice_deadline()
+            .is_some_and(|deadline| now >= deadline)
         {
-            self.mouse.set_notice(None);
+            self.mouse.set_notice(None, now);
         }
     }
 
@@ -881,7 +872,7 @@ impl App {
                 self.maybe_resize_pty();
             }
             crossterm::event::Event::Key(key) if key.kind == KeyEventKind::Press => {
-                self.mouse.set_notice(None);
+                self.mouse.set_notice(None, std::time::Instant::now());
                 self.handle_key_press(key);
             }
             crossterm::event::Event::Mouse(mouse) => {
@@ -2372,7 +2363,10 @@ mod tests {
                 assert_eq!(copied(app), vec![API_URL.to_string()], "{at:?}");
                 assert_eq!(
                     app.mouse.notice,
-                    Some(crate::mouse::Notice::Copied("copied the URL".to_string()))
+                    Some(crate::mouse::Notice::Copied {
+                        text: "copied the URL".to_string(),
+                        url: true,
+                    })
                 );
             }
             right_click(app, urls.root, urls.root);
@@ -2752,10 +2746,9 @@ mod tests {
             let mut urls = TitleUrls::new()?;
             let app = &mut urls.app;
             let now = std::time::Instant::now();
-            let failed = Some(crate::mouse::Notice::Failed {
-                text: "cannot open the URL; right-click it to copy it".to_string(),
-                at: now,
-            });
+            let failed = Some(crate::mouse::Notice::Failed(
+                "cannot open the URL; right-click it to copy it".to_string(),
+            ));
 
             // Alone, a failure says so.
             left_click(app, urls.api);
@@ -2770,7 +2763,10 @@ mod tests {
             app.url_open_failed(stamp, now);
             assert_eq!(
                 app.mouse.notice,
-                Some(crate::mouse::Notice::Copied("copied the URL".to_string()))
+                Some(crate::mouse::Notice::Copied {
+                    text: "copied the URL".to_string(),
+                    url: true,
+                })
             );
 
             // A click that opened another URL after it, which opened.
@@ -2792,6 +2788,60 @@ mod tests {
             )));
             app.url_open_failed(stamp, now);
             assert_eq!(app.mouse.notice, None);
+            Ok(())
+        }
+
+        /// A URL's copy whose notice has no room beside the footer's hints says that a URL was
+        /// copied, never that the highlighted selection was, and keeps the footer's rows.
+        #[tokio::test]
+        async fn a_url_copy_never_reads_as_the_selections() -> eyre::Result<()> {
+            // Right-clicks copy whether or not clicks navigate, and so does the note.
+            for navigate in [true, false] {
+                let mut urls = TitleUrls::new()?;
+                urls.app.mouse = crate::mouse::MouseState::new(crate::MouseOptions {
+                    navigate,
+                    ..crate::MouseOptions::default()
+                });
+                urls.select_line();
+                let app = &mut urls.app;
+                let before = (60..=200)
+                    .map(|width| app.chrome_rows(width))
+                    .collect::<Vec<_>>();
+                right_click(app, urls.api, urls.api);
+                assert_eq!(copied(app), vec![API_URL.to_string()]);
+                let footer = |app: &mut App, width: u16| {
+                    let screen = screen_text(app, width, 24);
+                    let rows = usize::from(app.chrome_rows(width).footer);
+                    let lines = screen.lines().collect::<Vec<_>>();
+                    lines[lines.len() - rows..].join("\n")
+                };
+                let full = (60..=200)
+                    .rev()
+                    .find(|&width| !footer(app, width).contains("copied the URL"))
+                    .ok_or_else(|| eyre::eyre!("every footer has room for the notice"))?;
+                let shown = footer(app, full);
+                assert!(shown.contains("URL copied"), "{full} columns:\n{shown}");
+                assert!(!shown.contains("y Copied"), "{shown}");
+                let after = (60..=200)
+                    .map(|width| app.chrome_rows(width))
+                    .collect::<Vec<_>>();
+                assert_eq!(after, before);
+
+                // A press on the note ends it and nothing else: the selection the URL's copy kept
+                // stays, and the `y Copy` hint the next frame puts back there does not act on the
+                // release.
+                let note = {
+                    let screen = screen_text(app, full, 24);
+                    find_on(&screen, "URL copied")?
+                };
+                send(app, MouseEventKind::Down(MouseButton::Left), note);
+                assert_eq!(app.mouse.notice, None);
+                let shown = footer(app, full);
+                assert!(shown.contains("y Copy"), "{shown}");
+                send(app, MouseEventKind::Up(MouseButton::Left), note);
+                assert_eq!(app.effects, Vec::new());
+                assert_eq!(yank(app), vec!["line 2".to_string()]);
+            }
             Ok(())
         }
 

@@ -144,18 +144,26 @@ enum RightPress {
     SlidOff,
 }
 
-/// What the footer says about the last thing the mouse did.
+/// What the footer says about the last thing the mouse did, for a few seconds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Notice {
-    /// What a copy took, shown only where the footer's last row has room beside its hints.
-    Copied(String),
+    /// What a copy took, shown where the footer's last row has room beside its hints; where it
+    /// has none, the footer's copy or mouse hint says that a URL or the selection was copied.
+    Copied { text: String, url: bool },
     /// That a URL could not be opened, which covers the hints of the footer's last row when it
-    /// has no room beside them, until [`FAILED_NOTICE_DURATION`] after `at`.
-    Failed { text: String, at: Instant },
+    /// has no room beside them.
+    Failed(String),
 }
 
-/// How long a notice that a URL could not be opened stays.
-pub(crate) const FAILED_NOTICE_DURATION: Duration = Duration::from_secs(4);
+impl Notice {
+    /// How long the notice stays.
+    pub(crate) fn duration(&self) -> Duration {
+        match self {
+            Self::Copied { .. } => Duration::from_secs(3),
+            Self::Failed(_) => Duration::from_secs(4),
+        }
+    }
+}
 
 /// The last press of the left button, to count a quick second one on the same cell.
 #[derive(Debug, Clone, Copy)]
@@ -195,6 +203,8 @@ pub(crate) struct MouseState {
     ///
     /// Changes go through [`MouseState::set_notice`], which counts them.
     pub(crate) notice: Option<Notice>,
+    /// When the notice was given, from which it lasts its [`Notice::duration`].
+    pub(crate) notice_at: Instant,
     /// How often the notice changed, to tell whether it did since a URL was clicked.
     notice_changes: u64,
 }
@@ -218,14 +228,23 @@ impl MouseState {
             last_press: None,
             last_wheel: None,
             notice: None,
+            notice_at: Instant::now(),
             notice_changes: 0,
         }
     }
 
-    /// Changes what the footer says about the last thing the mouse did.
-    pub(crate) fn set_notice(&mut self, notice: Option<Notice>) {
+    /// Changes what the footer says about the last thing the mouse did, `now`.
+    pub(crate) fn set_notice(&mut self, notice: Option<Notice>, now: Instant) {
         self.notice = notice;
+        self.notice_at = now;
         self.notice_changes += 1;
+    }
+
+    /// When the notice goes, if there is one.
+    pub(crate) fn notice_deadline(&self) -> Option<Instant> {
+        self.notice
+            .as_ref()
+            .map(|notice| self.notice_at + notice.duration())
     }
 
     /// Whether a wheel event that arrived `at` scrolls, rather than belonging to the burst of
@@ -390,8 +409,11 @@ impl App {
         match pressed {
             Some(RightPress::Link(url)) => {
                 if self.link_at(position) == Some(url.as_str()) {
-                    self.mouse
-                        .set_notice(Some(Notice::Copied("copied the URL".to_string())));
+                    let notice = Notice::Copied {
+                        text: "copied the URL".to_string(),
+                        url: true,
+                    };
+                    self.mouse.set_notice(Some(notice), Instant::now());
                     self.effects.push(Effect::Copy(url));
                 }
             }
@@ -432,7 +454,7 @@ impl App {
         if count == 1 {
             self.mouse.opened = None;
         }
-        self.mouse.set_notice(None);
+        self.mouse.set_notice(None, now);
         self.mouse.dragging = false;
         self.mouse.pressed = None;
 
@@ -446,11 +468,13 @@ impl App {
         // copies.
         // Under a popup only the copy hint does, since copying text selected in the popup is the
         // one thing a click outside it may do without closing it.
-        // Copying is part of selecting, so the copy hint works without navigation, while a press
-        // on any other hint or URL then counts as a press on whatever lies under it.
+        // Copying is part of selecting, so the copy hint, and the note that says a copy took the
+        // hint's place, work without navigation, while a press on any other hint or URL then
+        // counts as a press on whatever lies under it.
+        let copying = |clickable: &Clickable| matches!(clickable, Clickable::Hint("y" | ""));
         if let Some(clickable) = self.clickable_at(position)
             && (self.hits.popup.is_none() || clickable == Clickable::Hint("y"))
-            && (self.mouse.navigate || (self.mouse.select && clickable == Clickable::Hint("y")))
+            && (self.mouse.navigate || (self.mouse.select && copying(&clickable)))
         {
             // Once a click of a quick series opened the URL, the presses after it only select.
             let opened = match &clickable {
@@ -707,11 +731,16 @@ impl App {
             return;
         };
         let lines = text.lines().count().max(1);
-        self.mouse.set_notice(Some(Notice::Copied(if lines == 1 {
+        let text_notice = if lines == 1 {
             format!("copied {} characters", text.chars().count())
         } else {
             format!("copied {lines} lines")
-        })));
+        };
+        let notice = Notice::Copied {
+            text: text_notice,
+            url: false,
+        };
+        self.mouse.set_notice(Some(notice), Instant::now());
         self.effects.push(Effect::Copy(text));
     }
 
@@ -731,10 +760,8 @@ impl App {
         } else {
             "cannot open the URL"
         };
-        self.mouse.set_notice(Some(Notice::Failed {
-            text: text.to_string(),
-            at: now,
-        }));
+        self.mouse
+            .set_notice(Some(Notice::Failed(text.to_string())), now);
     }
 
     /// A turn of the wheel at `position` that arrived `at`: under a popup it scrolls the popup,
