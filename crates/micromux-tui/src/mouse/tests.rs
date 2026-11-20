@@ -2022,3 +2022,49 @@ async fn the_service_popup_shows_a_row_with_sound_marks_to_its_end() -> eyre::Re
     find(&frame, "row-END")?;
     Ok(())
 }
+
+/// A popup is as wide as its title needs, in the cells the terminal draws it in, so a service
+/// name longer than any of the popup's rows shows to its end, both a long ASCII id and a display
+/// name with halfwidth katakana sound marks, which take a cell more than their unicode width.
+#[tokio::test]
+async fn a_popup_title_longer_than_its_rows_shows_to_its_end() -> eyre::Result<()> {
+    for yaml in [
+        indoc! {r#"
+            version: 1
+            services:
+              a-service-whose-name-is-wider-than-every-row-of-its-popup-END:
+                command: ["true"]
+        "#},
+        indoc! {r#"
+            version: 1
+            services:
+              api:
+                name: "ｶﾞｶﾞｶﾞｶﾞｶﾞｶﾞｶﾞｶﾞｶﾞｶﾞｶﾞｶﾞｶﾞｶﾞ-popup-END"
+                command: ["true"]
+        "#},
+    ] {
+        let mut app = app(yaml)?;
+        press_key(&mut app, KeyCode::Char('i'));
+        let frame = draw(&mut app);
+        find(&frame, "popup-END ")?;
+    }
+    Ok(())
+}
+
+/// A popup one row high keeps the hint that closes it, which its title would otherwise cover.
+#[tokio::test]
+async fn a_one_row_popup_keeps_its_close_hint() -> eyre::Result<()> {
+    let mut app = app(indoc! {r#"
+        version: 1
+        services:
+          a-service-whose-name-is-wider-than-every-row-of-its-popup:
+            command: ["true"]
+    "#})?;
+    press_key(&mut app, KeyCode::Char('i'));
+    let area = Rect::new(0, 0, WIDTH, 1);
+    let mut buffer = Buffer::empty(area);
+    app.render_info(crate::InfoView::Service, area, &mut buffer);
+    let row = row_text(&buffer, 0);
+    assert!(row.contains("i or Esc closes"), "{row}");
+    Ok(())
+}

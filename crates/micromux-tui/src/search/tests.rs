@@ -705,3 +705,51 @@ async fn the_view_stays_on_the_match_while_old_lines_are_dropped() -> eyre::Resu
     }
     Ok(())
 }
+
+/// Row `y` as drawn, each grapheme once, without the cells a wide one spans past its first.
+fn drawn_row(buffer: &Buffer, y: u16) -> String {
+    let mut row = String::new();
+    let mut x = 0;
+    while let Some(cell) = buffer.cell((x, y)) {
+        row.push_str(cell.symbol());
+        x += u16::try_from(crate::cells::str_cells(cell.symbol()).max(1)).unwrap_or(1);
+    }
+    row
+}
+
+/// A query with halfwidth katakana sound marks, which the terminal draws a cell wider than their
+/// unicode width, shows whole in the logs pane's border beside its name, and the prompt typing
+/// one keeps its cursor and hint on screen.
+#[tokio::test]
+async fn a_query_with_sound_marks_keeps_the_border_and_prompt_whole() -> eyre::Result<()> {
+    let mut app = app(SERVICES)?;
+    set_records(&mut app, log_with_needles(5, &[1]))?;
+
+    search(&mut app, "ｶﾞｶﾞｶﾞｶﾞ");
+    let frame = draw(&mut app);
+    let top = (0..HEIGHT)
+        .map(|y| drawn_row(&frame, y))
+        .find(|row| row.contains("Logs"))
+        .ok_or_else(|| eyre::eyre!("no Logs title"))?;
+    assert!(top.contains("/ｶﾞｶﾞｶﾞｶﾞ no match ┐"), "{top}");
+
+    // A query that fits beside the hint keeps it; one wider than the row keeps its end and the
+    // cursor after it.
+    for (marks, hint) in [(30, true), (40, false)] {
+        press(&mut app, KeyCode::Char('/'));
+        type_text(&mut app, &"ｶﾞ".repeat(marks));
+        let frame = draw(&mut app);
+        let last = drawn_row(&frame, HEIGHT - 1);
+        assert_eq!(last.contains("↵ search · Esc cancel"), hint, "{last}");
+        let cursor = (0..WIDTH).filter(|&x| {
+            frame
+                .cell((x, HEIGHT - 1))
+                .is_some_and(|cell| cell.modifier.contains(Modifier::REVERSED))
+        });
+        let cursor = cursor.collect::<Vec<_>>();
+        let end = u16::try_from(2 + 3 * marks.min(39))?;
+        assert_eq!(cursor, [end], "{last}");
+        press(&mut app, KeyCode::Esc);
+    }
+    Ok(())
+}
