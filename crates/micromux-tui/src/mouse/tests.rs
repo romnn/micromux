@@ -1825,11 +1825,23 @@ async fn text_after_a_halfwidth_sound_mark_selects_where_it_shows() -> eyre::Res
     Ok(())
 }
 
+const FAILED_URL: &str = "http://example.localhost";
+
 /// Reports that a URL clicked just now failed to open, as the event loop does once the input
 /// around the click is handled.
 fn fail_to_open(app: &mut App, now: Instant) {
     let notice_changes = app.mouse.notice_changes;
-    app.url_open_failed(notice_changes, now);
+    app.url_open_failed(FAILED_URL, notice_changes, now);
+}
+
+/// What the footer says of the failed URL in a frame whose Logs title shows it.
+fn failure_note_showing_it(app: &App) -> &'static str {
+    let link = super::LinkHit {
+        area: Rect::new(0, 0, 1, 1),
+        url: FAILED_URL.to_string(),
+        line: ratatui::text::Line::raw(FAILED_URL),
+    };
+    app.open_failure_note(FAILED_URL, &[link])
 }
 
 /// A URL that cannot be opened says so in red on the footer's last row, covering its hints when
@@ -1859,8 +1871,13 @@ async fn a_url_that_cannot_open_says_so_over_the_footer() -> eyre::Result<()> {
 
     let now = Instant::now();
     fail_to_open(&mut app, now);
+    assert_eq!(failure_note_showing_it(&app), text);
     let (last, frame) = last_row(&mut app, full);
-    assert!(last.contains(text), "{full} columns: {last}");
+    // This frame shows no URL to right-click.
+    assert!(
+        last.contains("cannot open the URL "),
+        "{full} columns: {last}"
+    );
     let notice = find(&frame, "cannot open")?;
     assert_eq!(
         frame.cell(notice).map(|cell| cell.fg),
@@ -1881,16 +1898,10 @@ async fn a_url_that_cannot_open_says_so_over_the_footer() -> eyre::Result<()> {
         ..crate::MouseOptions::default()
     })?;
     fail_to_open(&mut unselecting, now);
-    assert_eq!(
-        unselecting.mouse.notice,
-        Some(super::Notice::Failed("cannot open the URL".to_string()))
-    );
+    assert_eq!(failure_note_showing_it(&unselecting), "cannot open the URL");
     press_key(&mut app, KeyCode::Char('m'));
     fail_to_open(&mut app, now);
-    assert!(matches!(
-        &app.mouse.notice,
-        Some(super::Notice::Failed(text)) if text == "cannot open the URL"
-    ));
+    assert_eq!(failure_note_showing_it(&app), "cannot open the URL");
     Ok(())
 }
 

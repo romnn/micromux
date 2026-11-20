@@ -145,6 +145,10 @@ pub struct App {
     changes: broadcast::Receiver<SessionChange>,
     /// Changes to the local session's URLs and routing status, which the model does not carry.
     summary_changes: Option<tokio::sync::watch::Receiver<micromux::SessionSummary>>,
+    /// Where the threads that wait for URL openers report the ones that exited with an error.
+    opener_failures: tokio::sync::mpsc::UnboundedSender<OpenerFailure>,
+    /// The openers that exited with an error, for the event loop to say so.
+    failed_openers: tokio::sync::mpsc::UnboundedReceiver<OpenerFailure>,
     /// Event handler
     input_event_handler: event::InputHandler,
     /// Current state
@@ -242,6 +246,7 @@ impl App {
         let log_view = render::log_view::LogView::default();
         let side_view = render::log_view::LogView::default();
 
+        let (opener_failures, failed_openers) = tokio::sync::mpsc::unbounded_channel();
         Self {
             running: true,
             input,
@@ -253,6 +258,8 @@ impl App {
             source,
             changes,
             summary_changes,
+            opener_failures,
+            failed_openers,
             input_event_handler: event::InputHandler::new(),
             state: state::State::new(services),
             log_view,
@@ -483,25 +490,45 @@ impl App {
         self.input_notice = Some(DISCONNECTED_INPUT_NOTICE.to_string());
     }
 
+    /// Waits for what wakes the event loop next: input, a change to the session, a timer, a
+    /// continue after a stop, or an opener that exited with an error; `None` once the session
+    /// ends.
+    async fn next_wake(&mut self, continued: &mut platform::Continued) -> Option<Wake> {
+        let timer = self.next_timer();
+        tokio::select! {
+            () = self.shutdown.cancelled() => None,
+            input = self.input_event_handler.next() => Some(Wake::Input(input)),
+            change = self.changes.recv() => match change {
+                Ok(change) => Some(Wake::Change(change)),
+                Err(broadcast::error::RecvError::Lagged(_)) => Some(Wake::Resync),
+                Err(broadcast::error::RecvError::Closed) => None,
+            },
+            () = async {
+                match timer {
+                    Some(at) => tokio::time::sleep_until(at.into()).await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => Some(Wake::Timer),
+            () = async {
+                let changed = match self.summary_changes.as_mut() {
+                    Some(summary) => summary.changed().await.is_ok(),
+                    None => false,
+                };
+                if !changed {
+                    std::future::pending::<()>().await;
+                }
+            } => Some(Wake::Summary),
+            () = continued.recv() => Some(Wake::Continued),
+            Some(failure) = self.failed_openers.recv() => Some(Wake::OpenerFailed(failure)),
+        }
+    }
+
     /// Run the TUI event loop.
     ///
     /// # Errors
     ///
     /// Returns an error if the underlying terminal backend fails to draw.
     pub async fn run(mut self, mut terminal: DefaultTerminal) -> Result<(), Error> {
-        enum Wake {
-            Input(event::Input),
-            Change(SessionChange),
-            /// The change broadcast lagged (or this is the initial draw): re-read everything.
-            Resync,
-            /// Queued PTY input is due for another try, or the quit prompt for one.
-            Timer,
-            /// The session's URLs or routing status changed; only the header needs a redraw.
-            Summary,
-            /// The process continued after a stop, and the shell may have taken the terminal.
-            Continued,
-        }
-
         let mut continued = platform::Continued::watch();
 
         let area = terminal.size()?;
@@ -517,34 +544,7 @@ impl App {
         let mut last_frame = tokio::time::Instant::now();
 
         while self.is_running() {
-            let timer = self.next_timer();
-            let wake = tokio::select! {
-                () = self.shutdown.cancelled() => None,
-                input = self.input_event_handler.next() => {
-                    Some(Wake::Input(input))
-                },
-                change = self.changes.recv() => match change {
-                    Ok(change) => Some(Wake::Change(change)),
-                    Err(broadcast::error::RecvError::Lagged(_)) => Some(Wake::Resync),
-                    Err(broadcast::error::RecvError::Closed) => None,
-                },
-                () = async {
-                    match timer {
-                        Some(at) => tokio::time::sleep_until(at.into()).await,
-                        None => std::future::pending::<()>().await,
-                    }
-                } => Some(Wake::Timer),
-                () = async {
-                    let changed = match self.summary_changes.as_mut() {
-                        Some(summary) => summary.changed().await.is_ok(),
-                        None => false,
-                    };
-                    if !changed {
-                        std::future::pending::<()>().await;
-                    }
-                } => Some(Wake::Summary),
-                () = continued.recv() => Some(Wake::Continued),
-            };
+            let wake = self.next_wake(&mut continued).await;
 
             let mut needs_resync = false;
             match wake {
@@ -554,6 +554,9 @@ impl App {
                 Some(Wake::Timer) => self.on_timer(std::time::Instant::now()),
                 Some(Wake::Summary) => {}
                 Some(Wake::Continued) => self.take_terminal_again(&mut terminal)?,
+                Some(Wake::OpenerFailed(failure)) => {
+                    self.opener_failed(&failure, std::time::Instant::now());
+                }
                 None => {
                     self.running = false;
                     continue;
@@ -675,15 +678,34 @@ impl App {
                     url,
                     notice_changes,
                 } => {
-                    if let Err(err) = open_url(&url) {
-                        tracing::warn!(?err, url, "cannot open the URL in a browser");
-                        self.url_open_failed(notice_changes, std::time::Instant::now());
+                    let now = std::time::Instant::now();
+                    match open_url(&url) {
+                        Ok(opener) => reap_opener(
+                            opener,
+                            OpenerFailure {
+                                url,
+                                notice_changes,
+                                clicked_at: now,
+                            },
+                            self.opener_failures.clone(),
+                        ),
+                        Err(err) => {
+                            tracing::warn!(?err, url, "cannot open the URL in a browser");
+                            self.url_open_failed(&url, notice_changes, now);
+                        }
                     }
                 }
                 Effect::Suspend => suspend = true,
             }
         }
         Ok(suspend)
+    }
+
+    /// Says, `now`, that `failure`'s opener exited with an error, if it did so soon after its click.
+    fn opener_failed(&mut self, failure: &OpenerFailure, now: std::time::Instant) {
+        if now.saturating_duration_since(failure.clicked_at) <= OPENER_FAILURE_WINDOW {
+            self.url_open_failed(&failure.url, failure.notice_changes, now);
+        }
     }
 
     /// Suspends to the shell as Ctrl-Z does there, then takes the terminal again once the shell
@@ -1376,11 +1398,63 @@ pub fn release_terminal() {
     terminal::give_back().ok();
 }
 
-/// Opens `url` in the browser with the platform's opener, without waiting for it, unless the TUI
-/// runs over ssh, where the browser would open on the remote host, if anywhere.
+/// What wakes the event loop.
+#[derive(Debug)]
+enum Wake {
+    Input(event::Input),
+    Change(SessionChange),
+    /// The change broadcast lagged (or this is the initial draw): re-read everything.
+    Resync,
+    /// Queued PTY input is due for another try, or the quit prompt for one.
+    Timer,
+    /// The session's URLs or routing status changed; only the header needs a redraw.
+    Summary,
+    /// The process continued after a stop, and the shell may have taken the terminal.
+    Continued,
+    /// A URL's opener exited with an error.
+    OpenerFailed(OpenerFailure),
+}
+
+/// How long after its click an opener's error still says the URL could not be opened.
+///
+/// An opener that hands the URL to a running browser exits at once, but some of `xdg-open`'s
+/// fallbacks run the browser in the foreground and exit with its status when it quits, which
+/// says nothing about the click.
+const OPENER_FAILURE_WINDOW: Duration = Duration::from_secs(10);
+
+/// A URL whose opener exited with an error, and the click that opened it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OpenerFailure {
+    url: String,
+    /// How often the mouse's notice had changed when the URL was clicked.
+    notice_changes: u64,
+    clicked_at: std::time::Instant,
+}
+
+/// Waits for `opener` on a thread of its own, so it does not linger as a zombie, and reports
+/// `failure` on `failures` when it exits with an error.
+///
+/// Windows' `explorer` exits with an error even when it opens the URL, so there only starting it
+/// counts.
+fn reap_opener(
+    mut opener: std::process::Child,
+    failure: OpenerFailure,
+    failures: tokio::sync::mpsc::UnboundedSender<OpenerFailure>,
+) {
+    std::thread::spawn(move || {
+        let failed = opener.wait().is_ok_and(|status| !status.success());
+        if failed && !cfg!(windows) {
+            // The TUI may have ended, which nothing needs to hear of.
+            let _ = failures.send(failure);
+        }
+    });
+}
+
+/// Starts the platform's opener for `url`, without waiting for it, unless the TUI runs over ssh,
+/// where the browser would open on the remote host, if anywhere.
 ///
 /// The opener's output is discarded, since anything it prints would land on the TUI.
-fn open_url(url: &str) -> std::io::Result<()> {
+fn open_url(url: &str) -> std::io::Result<std::process::Child> {
     use std::process::{Command, Stdio};
 
     if clipboard::over_ssh() {
@@ -1401,10 +1475,7 @@ fn open_url(url: &str) -> std::io::Result<()> {
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     platform::detach(&mut command);
-    let mut child = command.spawn()?;
-    // Reap the opener once it exits, so it does not linger as a zombie.
-    std::thread::spawn(move || child.wait());
-    Ok(())
+    command.spawn()
 }
 
 /// Whether `key` is one of the terminals' standard copy shortcuts: Ctrl+Shift+C or Ctrl+Insert,
@@ -1995,6 +2066,27 @@ mod tests {
 
         assert!(!row.contains(":8080"), "{row}");
         assert!(!row.contains('['), "{row}");
+        Ok(())
+    }
+
+    /// The thread that waits for an opener reports it when it exits with an error, and not when
+    /// it succeeds.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_opener_that_exits_with_an_error_is_reported() -> eyre::Result<()> {
+        let failure = OpenerFailure {
+            url: "http://app.localhost".to_string(),
+            notice_changes: 7,
+            clicked_at: std::time::Instant::now(),
+        };
+        for (program, reported) in [("false", Some(failure.clone())), ("true", None)] {
+            let (failures, mut failed) = tokio::sync::mpsc::unbounded_channel();
+            let opener = std::process::Command::new(program).spawn()?;
+            reap_opener(opener, failure.clone(), failures);
+            // The thread drops its sender once the opener exits, which ends the channel.
+            let first = tokio::time::timeout(Duration::from_secs(10), failed.recv()).await?;
+            assert_eq!(first, reported, "{program}");
+        }
         Ok(())
     }
 
@@ -2723,18 +2815,22 @@ mod tests {
             Ok(())
         }
 
-        /// The notice count of the one URL the effects so far open, which it takes out of them.
-        fn open_stamp(app: &mut App) -> eyre::Result<u64> {
-            let stamps = std::mem::take(&mut app.effects)
+        /// The one URL the effects so far open and the notice count of its click, which it takes
+        /// out of them.
+        fn open_stamp(app: &mut App) -> eyre::Result<(String, u64)> {
+            let opens = std::mem::take(&mut app.effects)
                 .into_iter()
                 .filter_map(|effect| match effect {
-                    Effect::OpenUrl { notice_changes, .. } => Some(notice_changes),
+                    Effect::OpenUrl {
+                        url,
+                        notice_changes,
+                    } => Some((url, notice_changes)),
                     _ => None,
                 })
                 .collect::<Vec<_>>();
-            match stamps.as_slice() {
-                [stamp] => Ok(*stamp),
-                _ => eyre::bail!("the click opened {} URLs", stamps.len()),
+            match opens.as_slice() {
+                [open] => Ok(open.clone()),
+                _ => eyre::bail!("the click opened {} URLs", opens.len()),
             }
         }
 
@@ -2746,21 +2842,23 @@ mod tests {
             let mut urls = TitleUrls::new()?;
             let app = &mut urls.app;
             let now = std::time::Instant::now();
-            let failed = Some(crate::mouse::Notice::Failed(
-                "cannot open the URL; right-click it to copy it".to_string(),
-            ));
+            let failed = |url: &str| {
+                Some(crate::mouse::Notice::Failed {
+                    url: url.to_string(),
+                })
+            };
 
             // Alone, a failure says so.
             left_click(app, urls.api);
-            let stamp = open_stamp(app)?;
-            app.url_open_failed(stamp, now);
-            assert_eq!(app.mouse.notice, failed);
+            let (stamp_url, stamp) = open_stamp(app)?;
+            app.url_open_failed(&stamp_url, stamp, now);
+            assert_eq!(app.mouse.notice, failed(&stamp_url));
 
             // A right-click that copied a URL after the click.
             left_click(app, urls.root);
-            let stamp = open_stamp(app)?;
+            let (stamp_url, stamp) = open_stamp(app)?;
             right_click(app, urls.api, urls.api);
-            app.url_open_failed(stamp, now);
+            app.url_open_failed(&stamp_url, stamp, now);
             assert_eq!(
                 app.mouse.notice,
                 Some(crate::mouse::Notice::Copied {
@@ -2771,22 +2869,22 @@ mod tests {
 
             // A click that opened another URL after it, which opened.
             left_click(app, urls.api);
-            let first = open_stamp(app)?;
+            let (first_url, first) = open_stamp(app)?;
             left_click(app, urls.root);
-            let second = open_stamp(app)?;
-            app.url_open_failed(first, now);
+            let (second_url, second) = open_stamp(app)?;
+            app.url_open_failed(&first_url, first, now);
             assert_eq!(app.mouse.notice, None);
-            app.url_open_failed(second, now);
-            assert_eq!(app.mouse.notice, failed);
+            app.url_open_failed(&second_url, second, now);
+            assert_eq!(app.mouse.notice, failed(&second_url));
 
             // A key that cleared the notice after the click, here opening the help.
             left_click(app, urls.api);
-            let stamp = open_stamp(app)?;
+            let (stamp_url, stamp) = open_stamp(app)?;
             app.handle_crossterm_event(&crossterm::event::Event::Key(KeyEvent::new(
                 KeyCode::Char('?'),
                 KeyModifiers::NONE,
             )));
-            app.url_open_failed(stamp, now);
+            app.url_open_failed(&stamp_url, stamp, now);
             assert_eq!(app.mouse.notice, None);
             Ok(())
         }
@@ -2842,6 +2940,75 @@ mod tests {
                 assert_eq!(app.effects, Vec::new());
                 assert_eq!(yank(app), vec!["line 2".to_string()]);
             }
+            Ok(())
+        }
+
+        /// An opener that exits with an error says so only soon after its click, as a browser that
+        /// some openers wait for can quit with an error long after it opened the URL, and offers
+        /// the right-click that copies the URL only while the Logs title still shows it.
+        #[tokio::test]
+        async fn an_opener_error_says_so_only_soon_and_while_its_url_shows() -> eyre::Result<()> {
+            let mut urls = TitleUrls::new()?;
+            let app = &mut urls.app;
+            let now = std::time::Instant::now();
+            // Each click lands on another URL than the last, so none is a double click.
+            let failure = |app: &mut App, on: Position, at: std::time::Instant| {
+                left_click(app, on);
+                let (url, notice_changes) = open_stamp(app)?;
+                eyre::Ok(OpenerFailure {
+                    url,
+                    notice_changes,
+                    clicked_at: at,
+                })
+            };
+
+            // Long after its click, an error says nothing.
+            let late = failure(app, urls.api, now)?;
+            app.opener_failed(&late, now + OPENER_FAILURE_WINDOW + Duration::from_secs(1));
+            assert_eq!(app.mouse.notice, None);
+
+            let soon = failure(app, urls.root, now)?;
+            app.opener_failed(&soon, now + Duration::from_secs(2));
+            let screen = screen_text(app, 200, 24);
+            assert!(
+                screen.contains("cannot open the URL; right-click it to copy it"),
+                "{screen}"
+            );
+
+            // The note says what the frame it is drawn in allows: once another service is selected,
+            // as when the clicked one went after the failure arrived, its URL is gone.
+            let gone = failure(app, urls.api, now)?;
+            app.opener_failed(&gone, now);
+            app.state.selected_service = 1;
+            let screen = screen_text(app, 200, 24);
+            assert!(screen.contains("cannot open the URL"), "{screen}");
+            assert!(!screen.contains("right-click it"), "{screen}");
+            Ok(())
+        }
+
+        /// A failed opener wakes the event loop by itself, with no input after it, so an idle TUI
+        /// still says so.
+        #[tokio::test]
+        async fn a_failed_opener_wakes_the_event_loop() -> eyre::Result<()> {
+            let mut urls = TitleUrls::new()?;
+            let app = &mut urls.app;
+            let failure = OpenerFailure {
+                url: API_URL.to_string(),
+                notice_changes: 0,
+                clicked_at: std::time::Instant::now(),
+            };
+            app.opener_failures.send(failure.clone())?;
+            let mut continued = platform::Continued::watch();
+            // The session's own start may wake the loop first.
+            let woke = tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    if let Some(Wake::OpenerFailed(failed)) = app.next_wake(&mut continued).await {
+                        break failed;
+                    }
+                }
+            })
+            .await?;
+            assert_eq!(woke, failure);
             Ok(())
         }
 

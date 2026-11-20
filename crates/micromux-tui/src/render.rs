@@ -2143,7 +2143,7 @@ impl Widget for &mut App {
                 .collect::<Vec<_>>(),
         )
         .render(layout.footer, buf);
-        let covered = self.render_mouse_notice(&footer, layout.footer, buf);
+        let covered = self.render_mouse_notice(&footer, &links, layout.footer, buf);
         let covered = self.render_search_prompt(layout.footer, buf).or(covered);
 
         // The popups below record themselves as they draw.
@@ -2905,7 +2905,15 @@ impl App {
     /// Draws what the last mouse release copied at the right end of the footer's last row, where
     /// the hints leave room, so it never changes the layout; returns the row the quit hint covers
     /// instead, when there is no room for it.
-    fn render_mouse_notice(&self, footer: &[HintRow], area: Rect, buf: &mut Buffer) -> Option<u16> {
+    ///
+    /// A failure to open a URL says what to do instead as the frame's `links` allow.
+    fn render_mouse_notice(
+        &self,
+        footer: &[HintRow],
+        links: &[crate::mouse::LinkHit],
+        area: Rect,
+        buf: &mut Buffer,
+    ) -> Option<u16> {
         // How to quit matters more than what the mouse did last.
         let quitting = self.quit_hint_at.is_some();
         // The quit hint and a failure must show, so they cover the hints when they lack room.
@@ -2921,7 +2929,11 @@ impl App {
                 Some(crate::mouse::Notice::Copied { text, .. }) => {
                     (Some(text.clone()), Color::Green, false)
                 }
-                Some(crate::mouse::Notice::Failed(text)) => (Some(text.clone()), Color::Red, true),
+                Some(crate::mouse::Notice::Failed { url }) => (
+                    Some(self.open_failure_note(url, links).to_string()),
+                    Color::Red,
+                    true,
+                ),
                 None => (None, Color::Green, false),
             }
         };
