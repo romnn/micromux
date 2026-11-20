@@ -3668,7 +3668,10 @@ mod escaped_session {
                 snapshot.run_generation == 1 && snapshot.execution == Execution::Running
             })
             .await?;
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            // The writer is the third launch of this test binary, which a loaded macOS runner
+            // can take seconds to start each time, so the bound only catches a writer that never
+            // starts.
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
             while !ready_file.exists() {
                 if tokio::time::Instant::now() >= deadline {
                     eyre::bail!("escaped-session writer did not become ready");
