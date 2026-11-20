@@ -150,9 +150,9 @@ pub(crate) enum Notice {
     /// What a copy took, shown where the footer's last row has room beside its hints; where it
     /// has none, the footer's copy or mouse hint says that a URL or the selection was copied.
     Copied { text: String, url: bool },
-    /// That a URL could not be opened, which covers the hints of the footer's last row when it
-    /// has no room beside them.
-    Failed(String),
+    /// That `url` could not be opened, which covers the hints of the footer's last row when it
+    /// has no room beside them, and says what to do instead as the frame it is drawn in allows.
+    Failed { url: String },
 }
 
 impl Notice {
@@ -160,7 +160,7 @@ impl Notice {
     pub(crate) fn duration(&self) -> Duration {
         match self {
             Self::Copied { .. } => Duration::from_secs(3),
-            Self::Failed(_) => Duration::from_secs(4),
+            Self::Failed { .. } => Duration::from_secs(4),
         }
     }
 }
@@ -744,24 +744,34 @@ impl App {
         self.effects.push(Effect::Copy(text));
     }
 
-    /// Says in the footer, from `now`, that a URL clicked when the notice had changed
-    /// `notice_changes` times could not be opened, and that a right-click on it copies it where
-    /// one would.
+    /// Says in the footer, from `now`, that `url`, clicked when the notice had changed
+    /// `notice_changes` times, could not be opened.
     ///
     /// The failure is known only once the input around the click is all handled, so a press or
     /// key since then, which changed the notice, keeps it from saying so.
-    pub(crate) fn url_open_failed(&mut self, notice_changes: u64, now: Instant) {
+    pub(crate) fn url_open_failed(&mut self, url: &str, notice_changes: u64, now: Instant) {
         if notice_changes != self.mouse.notice_changes {
             return;
         }
-        let copies = self.mouse.capture && self.right_click_copies() && self.hits.popup.is_none();
-        let text = if copies {
+        let notice = Notice::Failed {
+            url: url.to_string(),
+        };
+        self.mouse.set_notice(Some(notice), now);
+    }
+
+    /// What the footer says of `url`, which could not be opened, in a frame whose Logs title
+    /// shows `links`: that a right-click on it copies it, while one would.
+    pub(crate) fn open_failure_note(&self, url: &str, links: &[LinkHit]) -> &'static str {
+        let popup = self.show_help || self.info.is_some() || self.level_picker.is_some();
+        let copies = links.iter().any(|link| link.url == url)
+            && self.mouse.capture
+            && self.right_click_copies()
+            && !popup;
+        if copies {
             "cannot open the URL; right-click it to copy it"
         } else {
             "cannot open the URL"
-        };
-        self.mouse
-            .set_notice(Some(Notice::Failed(text.to_string())), now);
+        }
     }
 
     /// A turn of the wheel at `position` that arrived `at`: under a popup it scrolls the popup,

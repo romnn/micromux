@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- **The TUI says when a URL's opener reports an error, such as `xdg-open` finding no
+  browser.**
+
 - **The TUI's `i` and `u` popups fit rows with halfwidth katakana sound marks.** They are
   sized and wrapped in the cells the terminal draws, so such a row is no longer cut short.
 
