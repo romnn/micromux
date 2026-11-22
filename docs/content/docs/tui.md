@@ -55,7 +55,7 @@ The services list, combined-log tags, and service popups show each service's con
 
 `Ctrl-Z` gives the terminal back and stops micromux as the shell would stop any foreground job, together with whatever started it in the same job, such as `cargo run` or a task runner. Until you resume it with `fg`, micromux supervises nothing: the services keep running, but their output piles up unread until they block on it, healthchecks and restart policies pause, agents talking to the session get no answer, and after about 15 seconds the shared proxy drops the session's routes, so its `*.localhost` URLs stop answering until micromux continues.
 
-Restart, disable, and enable all go through the [control plane]({{< relref "agent-control/control-plane.md" >}}), so they respect dependency gating and restart policy. When the session refuses one, such as a start of a service whose resource another session holds, the header shows why in red, naming the holder and the `micromux ctl reserve` command that queues for it, until a later command is accepted.
+Restart, disable, and enable all go through the [control plane]({{< relref "agent-control/control-plane.md" >}}), so they respect dependency gating and restart policy. When the session refuses one, such as a start of a service whose resource another session holds, the header shows why in red until a later command is accepted. It leads with the `micromux ctl reserve` command that queues for the resource; the holder follows when the terminal is wide enough, and the session overview (`u`) always shows it.
 
 ## Searching logs
 

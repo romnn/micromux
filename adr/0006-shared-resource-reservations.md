@@ -118,7 +118,7 @@ A client older than control protocol 3.21 never identifies, nor does one outside
 
 ### U3. The TUI gets no keys to reserve, renew or release
 
-A human driving the TUI alone holds the resource uncontested, and with contested lapse an uncontested grant keeps running past `renew_by`, so nothing forces them to renew. Queueing, renewing and releasing are for agents and scripts, which use `micromux ctl` and the MCP tools. A refused start in the TUI shows its message, naming the holder and the `ctl reserve` next step.
+A human driving the TUI alone holds the resource uncontested, and with contested lapse an uncontested grant keeps running past `renew_by`, so nothing forces them to renew. Queueing, renewing and releasing are for agents and scripts, which use `micromux ctl` and the MCP tools. A refused start in the TUI shows its message in the header, leading with the `ctl reserve` next step so it fits a normal terminal width; the holder follows when there is room, and the session overview (`u`) always shows it.
 
 - *Revisit* when humans need to queue for or hand over a resource from the TUI, or when the lapse rule stops being contested.
 
