@@ -2884,6 +2884,16 @@ impl SchedulerRuntime {
             .iter()
             .filter_map(|service_id| definitions.get(service_id)?.spec.resource.clone())
             .collect::<std::collections::BTreeSet<_>>();
+        // A refusal names the grants this command took, which the session keeps.
+        let keeping = |message: String, taken: &[&str]| {
+            if taken.is_empty() {
+                return message;
+            }
+            format!(
+                "{message}; the session keeps {}, which this command took, until released",
+                taken.join(", ")
+            )
+        };
         let mut taken = Vec::new();
         for resource in &resources {
             let held = self.mine.get(resource).is_some_and(|mine| mine.may_start());
@@ -2891,9 +2901,9 @@ impl SchedulerRuntime {
                 if taken.is_empty() {
                     return Err(rejection);
                 }
-                return Err(CommandRejection::ResourceUnavailable(format!(
-                    "{rejection}; the session keeps {}, which this command took, until released",
-                    taken.join(", ")
+                return Err(CommandRejection::ResourceUnavailable(keeping(
+                    rejection.to_string(),
+                    &taken,
                 )));
             }
             if !held {
@@ -2907,9 +2917,13 @@ impl SchedulerRuntime {
                 .get(*resource)
                 .is_some_and(|mine| mine.may_start())
         }) {
-            return Err(CommandRejection::ResourceUnavailable(format!(
-                "this session's grant of resource `{lapsed}` lapsed while the command waited; \
-                 nothing was restarted"
+            taken.retain(|resource| resource != lapsed);
+            return Err(CommandRejection::ResourceUnavailable(keeping(
+                format!(
+                    "this session's grant of resource `{lapsed}` lapsed while the command \
+                     waited; nothing was restarted"
+                ),
+                &taken,
             )));
         }
         if let Some(pending) = pending {
