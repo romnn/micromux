@@ -112,6 +112,30 @@ pub async fn connect_identified(
     Ok(IdentifiedConnection { client, session })
 }
 
+/// The services of the session behind `client` that need `resource` but are disabled, so they
+/// do not start on their own once the session holds it; a restarting service is not among them.
+///
+/// # Errors
+///
+/// Returns a transport error, or [`ControlError::Unexpected`] for an answer other than a
+/// service list.
+pub async fn stopped_services(
+    client: &mut Client,
+    resource: &str,
+) -> Result<Vec<micromux::ServiceID>, ControlError> {
+    match client.request(Request::ListServices).await? {
+        Response::Services(services) => Ok(services
+            .into_iter()
+            .filter(|service| {
+                service.resource.as_deref() == Some(resource)
+                    && service.desired == micromux::Desired::Disabled
+            })
+            .map(|service| service.id)
+            .collect()),
+        other => Err(ControlError::Unexpected(format!("{other:?}"))),
+    }
+}
+
 /// Refuses a session that predates reservations, which would not understand a reservation
 /// request.
 ///

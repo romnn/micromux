@@ -501,8 +501,9 @@ pub(crate) struct CleanupTask {
     pub(crate) working_dir: SpawnWorkingDirectory,
     /// The run's log, which receives the cleanup's output as `[cleanup]` lines.
     pub(crate) sink: RunSink,
-    /// The fence of the resource the service needs, which the cleanup-only shim locks shared.
-    pub(crate) fence: Option<std::path::PathBuf>,
+    /// The locked fence of the resource the service needs, held until the cleanup ended: the
+    /// cleanup-only shim inherits it as its stdout, so the lock outlives a supervisor that dies.
+    pub(crate) fence: Option<std::fs::File>,
 }
 
 /// A cleanup whose log is started and whose shim, under containment, is waiting for its go.
@@ -531,7 +532,7 @@ impl CleanupTask {
     ///
     /// The shim takes the cleanup lock and waits for [`PreparedCleanup::run`] to say go, or for
     /// the supervisor to die, so a supervisor killed from here on still leaves the cleanup to it.
-    pub(crate) fn prepare(self) -> PreparedCleanup {
+    pub(crate) fn prepare(mut self) -> PreparedCleanup {
         let tail = self.spec.files.as_ref().and_then(|files| {
             LogTail::start(
                 &files.log,
@@ -542,11 +543,7 @@ impl CleanupTask {
             })
             .ok()
         });
-        let launch = match crate::containment::wrap_cleanup(
-            &self.spec,
-            self.stop_signal,
-            self.fence.as_deref(),
-        ) {
+        let launch = match crate::containment::wrap_cleanup(&self.spec, self.stop_signal) {
             Some(wrapped) => self.spawn_shim(wrapped).unwrap_or_else(|err| {
                 let error = format!("cannot start the cleanup shim: {err}");
                 if let Some(files) = &self.spec.files {
@@ -563,15 +560,18 @@ impl CleanupTask {
         }
     }
 
-    fn spawn_shim(&self, wrapped: crate::containment::Wrapped) -> std::io::Result<Launch> {
+    fn spawn_shim(&mut self, wrapped: crate::containment::Wrapped) -> std::io::Result<Launch> {
         let mut command = tokio::process::Command::new(&wrapped.program);
+        // The shim's stdout is the locked fence, which it never writes to and its cleanup
+        // command never inherits, so the lock lasts until the shim exits.
+        let stdout = self.fence.take().map_or_else(Stdio::null, Stdio::from);
         command
             .args(&wrapped.args)
             .envs(&self.environment)
             .envs(wrapped.env)
             .current_dir(self.working_dir.as_path())
             .stdin(Stdio::piped())
-            .stdout(Stdio::null())
+            .stdout(stdout)
             .stderr(Stdio::null());
         // Out of the terminal's foreground group, so a Ctrl-C meant for the supervisor does not
         // interrupt the cleanup; and not killed on drop, so it outlives a supervisor that exits.

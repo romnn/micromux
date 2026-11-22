@@ -591,7 +591,11 @@ struct ServiceListResult {
     services: Vec<ServiceSnapshot>,
     /// Holder and queue of every resource the session uses.
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    reservations: Vec<micromux::ResourceView>,
+    reservations: Vec<ResourceViewResult>,
+    /// The session left its reservations out of a description too large to send, so
+    /// `reservations` is empty though the session may use resources.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    reservations_truncated: bool,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -627,6 +631,75 @@ struct ReservationResult {
     session_ref: SessionRef,
     #[serde(flatten)]
     reply: micromux::ReservationReply,
+    /// Seconds until the session's own request must renew; negative once it is overdue.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    renew_in_secs: Option<i64>,
+    /// Seconds until the resource's holder must renew; negative once it is overdue.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    holder_renew_in_secs: Option<i64>,
+    /// The session's services that need the resource and do not run; once granted, start them
+    /// with `enable_service`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    services: Vec<String>,
+}
+
+impl ReservationResult {
+    async fn new(
+        session: &SessionInfo,
+        client: &mut Client,
+        reply: micromux::ReservationReply,
+    ) -> Self {
+        let services = if reply.state == micromux::ReservationState::Granted {
+            micromux_control::stopped_services(client, &reply.view.name)
+                .await
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        Self {
+            session_ref: SessionRef::from(session),
+            renew_in_secs: reply
+                .own_claim()
+                .map(|claim| renew_in_secs(claim.renew_by_unix_ms)),
+            holder_renew_in_secs: reply
+                .view
+                .owner
+                .as_ref()
+                .map(|owner| renew_in_secs(owner.claim.renew_by_unix_ms)),
+            reply,
+            services,
+        }
+    }
+}
+
+/// A resource's holder and queue, with how long its holder has left to renew.
+#[derive(Serialize, JsonSchema)]
+struct ResourceViewResult {
+    #[serde(flatten)]
+    view: micromux::ResourceView,
+    /// Seconds until the holder must renew; negative once it is overdue.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    holder_renew_in_secs: Option<i64>,
+}
+
+impl From<micromux::ResourceView> for ResourceViewResult {
+    fn from(view: micromux::ResourceView) -> Self {
+        Self {
+            holder_renew_in_secs: view
+                .owner
+                .as_ref()
+                .map(|owner| renew_in_secs(owner.claim.renew_by_unix_ms)),
+            view,
+        }
+    }
+}
+
+/// Seconds from now until `renew_by_unix_ms`, negative once it passed.
+fn renew_in_secs(renew_by_unix_ms: u64) -> i64 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |now| i64::try_from(now.as_millis()).unwrap_or(i64::MAX));
+    (i64::try_from(renew_by_unix_ms).unwrap_or(i64::MAX) - now) / 1000
 }
 
 #[derive(Serialize, JsonSchema)]
@@ -645,9 +718,9 @@ struct ReservationWaitResult {
     #[serde(flatten)]
     session_ref: SessionRef,
     status: ReservationWaitStatus,
-    /// The grant, when the session holds the resource.
+    /// The grant, or after a timeout the request's last position and the holder.
     #[serde(skip_serializing_if = "Option::is_none")]
-    reply: Option<micromux::ReservationReply>,
+    reply: Option<ReservationResult>,
     /// Why the request can no longer be granted.
     #[serde(skip_serializing_if = "Option::is_none")]
     detail: Option<String>,
@@ -1388,10 +1461,10 @@ impl McpServer {
             .request(request)
             .await
             .map_err(|err| error_data(err.into()))?;
-        Ok(Json(ReservationResult {
-            session_ref: SessionRef::from(&session),
-            reply: convert::reservation(response).map_err(error_data)?,
-        }))
+        let reply = convert::reservation(response).map_err(error_data)?;
+        Ok(Json(
+            ReservationResult::new(&session, &mut client, reply).await,
+        ))
     }
 
     async fn mutate(
@@ -1795,10 +1868,17 @@ impl McpServer {
             session: resolved.info.name,
             session_selector,
             services,
+            reservations_truncated: resolved.info.reservations_truncated,
             reservations: resolved
                 .info
                 .session
-                .map(|session| session.reservations)
+                .map(|session| {
+                    session
+                        .reservations
+                        .into_iter()
+                        .map(ResourceViewResult::from)
+                        .collect()
+                })
                 .unwrap_or_default(),
         }))
     }
@@ -2564,10 +2644,11 @@ impl McpServer {
     #[tool(
         description = "Wait until the current project's session holds a resource it queued for \
         with reserve_resource, renewing the queued request every 2 seconds while it waits. \
-        Returns status granted, ended (the request was released or lapsed, or the session \
-        stopped or was replaced; detail says why), or timeout, after which the request stays \
-        queued and you can call again. A session whose services were refused the resource at \
-        start does not start them on its own once granted: enable them then."
+        Returns status granted with the services to start, ended (the request was released, or \
+        the session stopped or was replaced; detail says why), or timeout with the request's \
+        last position and the holder, after which the request stays queued and you can call \
+        again. A session whose services were refused the resource at start does not start them \
+        on its own once granted: enable them then."
     )]
     async fn wait_for_reservation(
         &self,
@@ -2580,20 +2661,29 @@ impl McpServer {
                 .unwrap_or(DEFAULT_WAIT_TIMEOUT_SECS)
                 .min(MAX_WAIT_TIMEOUT_SECS),
         );
-        let waited = tokio::time::timeout(
-            timeout,
-            wait::wait_for_reservation(&resolved.endpoint, &self.cwd, &args.resource),
+        let waited = wait::wait_for_reservation(
+            &resolved.endpoint,
+            &self.cwd,
+            &args.resource,
+            tokio::time::Instant::now() + timeout,
         )
-        .await;
+        .await
+        .map_err(|err| error_data(ToolError::from(err)))?;
         let (status, reply, detail) = match waited {
-            Ok(Ok(wait::ReservationWait::Granted(reply))) => {
-                (ReservationWaitStatus::Granted, Some(*reply), None)
+            wait::ReservationWait::Granted(reply) => {
+                (ReservationWaitStatus::Granted, Some(reply), None)
             }
-            Ok(Ok(wait::ReservationWait::Ended(why))) => {
-                (ReservationWaitStatus::Ended, None, Some(why))
+            wait::ReservationWait::Ended(why) => (ReservationWaitStatus::Ended, None, Some(why)),
+            wait::ReservationWait::TimedOut(last) => (ReservationWaitStatus::Timeout, last, None),
+        };
+        let reply = match reply {
+            Some(reply) => {
+                let mut client = Client::connect(&resolved.endpoint)
+                    .await
+                    .map_err(|err| error_data(err.into()))?;
+                Some(ReservationResult::new(&resolved.info, &mut client, *reply).await)
             }
-            Ok(Err(err)) => return Err(error_data(ToolError::from(err))),
-            Err(_) => (ReservationWaitStatus::Timeout, None, None),
+            None => None,
         };
         Ok(Json(ReservationWaitResult {
             session_ref: SessionRef::from(&resolved.info),

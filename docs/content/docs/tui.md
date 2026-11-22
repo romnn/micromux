@@ -43,7 +43,7 @@ The services list, combined-log tags, and service popups show each service's con
 | `T` | Toggle timestamps on the selected service's structured JSON log lines |
 | `F` | Toggle the selected service's fields that `logs.fields` hides |
 | `i` | Show everything about the selected service: URLs, ports by variable, command, directory, dependencies, restart and stop policy, the last healthcheck, the current run, and the last cleanup (close with `i` or `Esc`) |
-| `u` | Show the session: its domain, the proxy port, every route with its port and service, and the allocated ports (close with `u` or `Esc`) |
+| `u` | Show the session: its domain, the proxy port, every route with its port and service, the allocated ports, and each [shared resource]({{< relref "configuration/services.md" >}}#shared-resources) the session uses with its holder and queue (close with `u` or `Esc`) |
 | `?` | Show every key binding (close with `Esc`) |
 | `m` | Toggle mouse capture (see [Mouse](#mouse)) |
 | `Ctrl-Z` | Suspend to the shell; `fg` brings the TUI back |
@@ -55,7 +55,7 @@ The services list, combined-log tags, and service popups show each service's con
 
 `Ctrl-Z` gives the terminal back and stops micromux as the shell would stop any foreground job, together with whatever started it in the same job, such as `cargo run` or a task runner. Until you resume it with `fg`, micromux supervises nothing: the services keep running, but their output piles up unread until they block on it, healthchecks and restart policies pause, agents talking to the session get no answer, and after about 15 seconds the shared proxy drops the session's routes, so its `*.localhost` URLs stop answering until micromux continues.
 
-Restart, disable, and enable all go through the [control plane]({{< relref "agent-control/control-plane.md" >}}), so they respect dependency gating and restart policy.
+Restart, disable, and enable all go through the [control plane]({{< relref "agent-control/control-plane.md" >}}), so they respect dependency gating and restart policy. When the session refuses one, such as a start of a service whose resource another session holds, the header shows why in red, naming the holder and the `micromux ctl reserve` command that queues for it, until a later command is accepted.
 
 ## Searching logs
 

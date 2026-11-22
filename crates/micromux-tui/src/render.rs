@@ -1365,7 +1365,12 @@ fn cleanup_phrase(cleanup: &micromux::CleanupStatus) -> String {
 }
 
 /// The session's name, proxy and every route, for the session popup.
-fn session_info_rows(session: Option<&micromux::SessionSummary>) -> Vec<Line<'static>> {
+/// The session popup's rows; `reservations_truncated` says the session left its reservations
+/// out of a description too large to send.
+fn session_info_rows(
+    session: Option<&micromux::SessionSummary>,
+    reservations_truncated: bool,
+) -> Vec<Line<'static>> {
     let Some(session) = session else {
         return vec![Line::raw("This session reports no session details.")];
     };
@@ -1425,7 +1430,15 @@ fn session_info_rows(session: Option<&micromux::SessionSummary>) -> Vec<Line<'st
             .map(|(name, port)| Span::raw(format!(":{port}  {name}")))
             .collect(),
     ));
-    if !session.reservations.is_empty() {
+    if reservations_truncated {
+        rows.push(Line::default());
+        rows.extend(info_rows(
+            "Resources",
+            vec![Span::raw(
+                "too many to show here; run `micromux ctl ls` in the session's project",
+            )],
+        ));
+    } else if !session.reservations.is_empty() {
         rows.push(Line::default());
         rows.extend(info_rows(
             "Resources",
@@ -1437,32 +1450,25 @@ fn session_info_rows(session: Option<&micromux::SessionSummary>) -> Vec<Line<'st
 
 /// Each resource's holder, then the requests waiting for it in queue order.
 fn reservation_rows(reservations: &[micromux::ResourceView]) -> Vec<Line<'static>> {
-    let time = |unix_ms| short_local_time(unix_ms).unwrap_or_default();
     let mut rows = Vec::new();
     for view in reservations {
         let holder = match &view.owner {
-            Some(owner) => {
-                let state = match owner.state {
-                    micromux::OwnerState::Granted => "held by",
-                    micromux::OwnerState::Draining => "releasing, held by",
-                };
-                format!(
-                    "{}  {state} {}  granted {}  renew by {}",
-                    view.name,
-                    owner.claim,
-                    time(owner.granted_at_unix_ms),
-                    time(owner.claim.renew_by_unix_ms)
-                )
-            }
+            Some(owner) => format!(
+                "{}  held by {}, granted {}, {}",
+                view.name,
+                owner.claim,
+                micromux::display_time(owner.granted_at_unix_ms),
+                micromux::renew_label(owner.claim.renew_by_unix_ms)
+            ),
             None => format!("{}  free", view.name),
         };
         rows.push(Line::raw(holder));
         for (index, waiter) in view.waiters.iter().enumerate() {
             rows.push(Line::from(
                 format!(
-                    "  {}. {waiter}  waiting since {}",
+                    "  {}. {waiter}, queued {}",
                     index + 1,
-                    time(waiter.requested_at_unix_ms)
+                    micromux::display_time(waiter.requested_at_unix_ms)
                 )
                 .fg(Color::DarkGray),
             ));
@@ -2363,13 +2369,13 @@ impl App {
         let notice = self
             .source
             .local_notice()
-            .or_else(|| self.terminal_notice())?;
+            .or_else(|| self.terminal_notice().map(str::to_string))?;
         Some(Line::from(vec![
             format!("micromux v{}", env!("CARGO_PKG_VERSION"))
                 .bold()
                 .fg(App::HEADER_COLOR),
             " — WARNING: ".fg(Color::Red).bold(),
-            notice.to_string().fg(Color::Red),
+            notice.fg(Color::Red),
         ]))
     }
 
@@ -2943,7 +2949,7 @@ impl App {
                     .map_or_else(|| "no session".to_string(), |session| session.name.clone());
                 (
                     format!(" Session · {name} "),
-                    session_info_rows(session.as_ref()),
+                    session_info_rows(session.as_ref(), self.source.reservations_truncated()),
                 )
             }
         };

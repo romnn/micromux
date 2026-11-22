@@ -23,10 +23,8 @@ pub(crate) use registry::{
     DEFAULT_PORT_RANGE, Lease, PortRequest, create_private_dir, user_state_directory,
 };
 pub use registry::{PortRegistry, STATE_DIR_VARIABLE, state_directory_override};
-pub use reservations::{
-    Claim, Owner, OwnerState, ReservationReply, ReservationState, ResourceView,
-};
-pub(crate) use reservations::{Holder, Request, ReservationError, ResourceStore};
+pub use reservations::{Claim, Owner, ReservationReply, ReservationState, ResourceView};
+pub(crate) use reservations::{Fence, Holder, Request, ReservationError, ResourceStore};
 pub use routes::{CATCH_ALL_HOST, Route, RouteError, route_path_problem};
 pub(crate) use routes::{owner as route_owner, resolve as resolve_routes};
 pub use status::{RoutingStatus, SessionStatus, SessionSummary};

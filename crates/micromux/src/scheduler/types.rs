@@ -353,8 +353,8 @@ pub enum Command {
         /// Required reply channel.
         ack: ReplyAck<ReservationReply>,
     },
-    /// Ask whether a caller may shut the session down.
-    AuthorizeShutdown {
+    /// Stop the session for a caller, unless it may not.
+    Shutdown {
         /// Who asks.
         caller: Caller,
         /// Required reply channel.
@@ -370,7 +370,7 @@ pub enum Command {
 }
 
 impl Command {
-    /// Fire-and-forget restart (no acknowledgement). Used by the trusted in-process TUI.
+    /// Fire-and-forget restart (no acknowledgement).
     #[must_use]
     pub fn restart(service: ServiceID) -> Self {
         Self::Restart {

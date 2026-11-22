@@ -146,12 +146,6 @@ impl SessionStatus {
             .collect()
     }
 
-    /// Whether the session holds, waits for, or has services that need any resource.
-    #[must_use]
-    pub fn uses_resources(&self) -> bool {
-        !self.watched_resources.lock().is_empty()
-    }
-
     /// Follows changes to the summary.
     #[must_use]
     pub fn subscribe(&self) -> watch::Receiver<SessionSummary> {

@@ -33,7 +33,8 @@ use tokio_util::codec::{Framed, LinesCodec};
 pub use client::{
     Client, EndpointProbe, EndpointProbeResult, IdentifiedConnection, Subscription,
     answering_session_probes, connect_identified, probe_endpoint, probe_endpoints,
-    probe_runtime_dir, probe_runtime_dirs, require_reservations, unique_answering_session_probes,
+    probe_runtime_dir, probe_runtime_dirs, require_reservations, stopped_services,
+    unique_answering_session_probes,
 };
 #[cfg(unix)]
 pub use endpoint::coordination_dir;
@@ -121,6 +122,9 @@ pub enum ControlError {
     /// The peer sent a response that did not match the request.
     #[error("unexpected control response: {0}")]
     Unexpected(String),
+    /// The session refused the request; carries its message.
+    #[error("{0}")]
+    Refused(String),
     /// The session predates reservations.
     #[error(
         "session `{session}` speaks control protocol {peer}, but reservations need \

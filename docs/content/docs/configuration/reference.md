@@ -52,7 +52,7 @@ Every key in `micromux.yaml`. The machine-readable source of truth is [`micromux
 | `cleanup` | object | A [cleanup command]({{< relref "services.md" >}}#cleanup) run after each of the service's processes exits; see [`cleanup`](#cleanup). |
 | `logs` | object | [Log retention]({{< relref "logs.md" >}}) for this service. |
 | `color` | bool | Force color handling for this service. |
-| `resource` | string | A [shared resource]({{< relref "services.md" >}}#shared-resources) the service needs; only the session holding it runs the service. A lowercase hostname label, such as `desktop-app`. Needs a config loaded from a file. |
+| `resource` | string | A [shared resource]({{< relref "services.md" >}}#shared-resources) the service needs; only the session holding it runs the service. A lowercase hostname label, such as `desktop-app`. Needs a config loaded from a file and process containment, so it is refused on Windows. |
 
 ## `cleanup`
 

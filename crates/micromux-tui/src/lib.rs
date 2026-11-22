@@ -519,6 +519,7 @@ impl App {
                     std::future::pending::<()>().await;
                 }
             } => Some(Wake::Summary),
+            () = self.source.local_notice_changed() => Some(Wake::Summary),
             () = continued.recv() => Some(Wake::Continued),
             Some(failure) = self.failed_openers.recv() => Some(Wake::OpenerFailed(failure)),
         }
@@ -1408,7 +1409,8 @@ enum Wake {
     Resync,
     /// Queued PTY input is due for another try, or the quit prompt for one.
     Timer,
-    /// The session's URLs or routing status changed; only the header needs a redraw.
+    /// The session's URLs or routing status, or the local notice, changed; only the header
+    /// needs a redraw.
     Summary,
     /// The process continued after a stop, and the shell may have taken the terminal.
     Continued,
@@ -3549,6 +3551,54 @@ mod tests {
         Ok(())
     }
 
+    /// A refused lifecycle command of the local TUI shows its message in the header.
+    #[tokio::test]
+    async fn a_refused_local_command_shows_why_in_the_header() -> eyre::Result<()> {
+        let yaml = "version: 1\nservices:\n  svc:\n    command: [\"sh\", \"-c\", \"sleep 60\"]\n    \
+                    disabled: true\n";
+        let mut diagnostics = Vec::new();
+        let parsed = micromux::from_str(yaml, Path::new("."), 0usize, None, &mut diagnostics)?;
+        let cache = tempfile::tempdir()?;
+        let mux = std::sync::Arc::new(test_micromux(&parsed, &cache)?);
+        let shutdown = micromux::CancellationToken::new();
+        let (runner, handles) = mux.start(shutdown.clone());
+        let runner = tokio::spawn(runner);
+        let mut app = App::new(
+            SessionSource::Local(LocalSource::new(handles.reader, handles.commands.clone())),
+            Some(handles.terminal),
+            shutdown.clone(),
+            ViewOptions::default(),
+        );
+        let key = |code| KeyEvent {
+            code,
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        };
+        app.resync();
+
+        app.handle_key_press(key(KeyCode::Char('r')));
+        tokio::time::timeout(Duration::from_secs(5), app.source.local_notice_changed()).await?;
+        let notice = app.source.local_notice();
+        assert!(
+            notice
+                .as_deref()
+                .is_some_and(|notice| notice.contains("enable it before restarting")),
+            "{notice:?}"
+        );
+        let area = ratatui::layout::Rect::new(0, 0, 160, 24);
+        let mut buffer = ratatui::buffer::Buffer::empty(area);
+        (&mut app).render(area, &mut buffer);
+        let header = (0..area.width)
+            .filter_map(|x| buffer.cell((x, 0)).map(|cell| cell.symbol().to_string()))
+            .collect::<String>();
+        assert!(header.contains("enable it before restarting"), "{header}");
+
+        shutdown.cancel();
+        runner.await??;
+        Ok(())
+    }
+
     #[tokio::test]
     async fn oversized_paste_is_discarded_with_an_operator_notice() -> eyre::Result<()> {
         let yaml = "version: 1\nservices:\n  svc:\n    command: [\"true\"]\n";
@@ -3713,6 +3763,42 @@ mod tests {
         assert!(text.contains("session warning"));
         assert!(!text.contains("input warning"));
         assert!(!text.contains(TERMINAL_INPUT_CLOSED_NOTICE));
+        Ok(())
+    }
+
+    /// A refusal of a start whose resource another session holds shows the holder and the
+    /// command that queues for it at 120 columns.
+    #[tokio::test]
+    async fn a_resource_refusal_fits_the_header() -> eyre::Result<()> {
+        let yaml = "version: 1\nservices:\n  svc:\n    command: [\"true\"]\n";
+        let mut diagnostics = Vec::new();
+        let parsed = micromux::from_str(yaml, Path::new("."), 0usize, None, &mut diagnostics)?;
+        let cache = tempfile::tempdir()?;
+        let mux = std::sync::Arc::new(test_micromux(&parsed, &cache)?);
+        let (_runner, handles) = mux.start(micromux::CancellationToken::new());
+        let (commands, _commands_rx) = mpsc::channel(1);
+        let refusal = "resource `desktop-app` is held by session a; queue with `micromux ctl \
+                       reserve desktop-app` (MCP: reserve_resource). Holder: a \
+                       (/home/user/src/a), must renew within 59m (by 23:22 +01:00). Once \
+                       granted, enable the service.";
+        let mut app = App::new(
+            SessionSource::Local(LocalSource::new(handles.reader, commands).with_notice(refusal)),
+            Some(handles.terminal),
+            micromux::CancellationToken::new(),
+            ViewOptions::default(),
+        );
+
+        let area = ratatui::layout::Rect::new(0, 0, 120, 24);
+        let mut buffer = ratatui::buffer::Buffer::empty(area);
+        (&mut app).render(area, &mut buffer);
+        let header = (0..area.width)
+            .filter_map(|x| buffer.cell((x, 0)).map(ratatui::buffer::Cell::symbol))
+            .collect::<String>();
+        assert!(header.contains("held by session a"), "{header}");
+        assert!(
+            header.contains("micromux ctl reserve desktop-app"),
+            "{header}"
+        );
         Ok(())
     }
 
@@ -4190,7 +4276,7 @@ mod tests {
             } => {
                 assert_eq!(caller, micromux::Caller::Local);
                 assert_eq!(service, "svc");
-                assert!(ack.is_none());
+                assert!(ack.is_some());
             }
             other => {
                 eyre::bail!("expected stop-dynamic command, got {other:?}");

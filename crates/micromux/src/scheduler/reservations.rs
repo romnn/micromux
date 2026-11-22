@@ -2,12 +2,15 @@
 //! for, or releases, who may control the services that need them, and the store transactions
 //! behind each change.
 //!
-//! The store records who holds a resource across sessions; this side decides when this session
-//! starts, stops, and gives up its own runs.
-//! A grant's authority ends at its deadline, taken from the store's `renew_by` on the monotonic
-//! clock when the grant is made, renewed, or noticed after a promotion.
+//! The store records who holds a resource across sessions and its `renew_by`, the one deadline;
+//! this side decides when this session starts, stops, and gives up its own runs.
+//! Before the deadline the scheduler only wakes up to look at the wall clock; once the deadline
+//! passed it asks the store, which keeps the grant while nobody waits and refuses it once
+//! somebody does.
+//! See [ADR 6](https://github.com/romnn/micromux/blob/main/adr/0006-shared-resource-reservations.md)
+//! for the decisions behind it.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::time::Duration;
 
 use tokio::sync::mpsc;
@@ -24,32 +27,72 @@ use crate::session::{
 /// How often the scheduler checks on a queued request and on a release in progress.
 pub(super) const POLL_INTERVAL: Duration = Duration::from_secs(2);
 
-/// Where this session's request for one resource stands.
+/// The longest the scheduler sleeps before looking at the wall clock again while a grant is not
+/// yet due, so a suspended machine that wakes past the deadline notices within a minute.
+const WALL_CLOCK_LOOK: Duration = Duration::from_mins(1);
+
+/// How often the store judges again a grant past its deadline that nobody waited for, so a
+/// waiter that arrives later is noticed.
+const OVERDUE_REJUDGE: Duration = Duration::from_secs(30);
+
+/// Where this session's claim of one resource stands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum Mine {
-    /// The request waits in the queue.
+pub(super) enum Standing {
+    /// The claim waits in the queue.
     Waiting,
-    /// The session may start the resource's services until `deadline`.
-    Granted { deadline: tokio::time::Instant },
-    /// The session stops its services that need the resource, then gives it up.
-    Draining {
-        /// Whether giving it up failed once, so only the poll timer retries it.
-        removal_pending: bool,
+    /// The session holds the resource until `renew_by_unix_ms`, past which it goes on while the
+    /// store, which judged it last until `judged_until`, finds nobody waiting.
+    Granted {
+        renew_by_unix_ms: u64,
+        judged_until: tokio::time::Instant,
     },
+    /// The session stops its services that need the resource, then removes its claim.
+    Releasing,
 }
 
-impl Mine {
-    /// Whether the session may start a service of the resource now: it holds the grant and the
-    /// grant's deadline has not passed.
+impl Standing {
+    /// Whether the session may start a service of the resource now without asking the store.
     pub(super) fn may_start(self) -> bool {
-        matches!(self, Self::Granted { deadline } if deadline > tokio::time::Instant::now())
+        match self {
+            Self::Granted {
+                renew_by_unix_ms,
+                judged_until,
+            } => !overdue(renew_by_unix_ms) || judged_until > tokio::time::Instant::now(),
+            Self::Waiting | Self::Releasing => false,
+        }
+    }
+
+    /// A grant the store just confirmed with `renew_by_unix_ms`.
+    fn granted(renew_by_unix_ms: u64) -> Self {
+        Self::Granted {
+            renew_by_unix_ms,
+            judged_until: tokio::time::Instant::now() + OVERDUE_REJUDGE,
+        }
+    }
+
+    /// When the scheduler must next wake for this grant: to look at the wall clock before its
+    /// deadline, or to have the store judge it again after.
+    fn wake_at(self) -> Option<tokio::time::Instant> {
+        let Self::Granted {
+            renew_by_unix_ms,
+            judged_until,
+        } = self
+        else {
+            return None;
+        };
+        let now = unix_now_ms().unwrap_or_default();
+        if renew_by_unix_ms > now {
+            let remaining = Duration::from_millis(renew_by_unix_ms - now);
+            Some(tokio::time::Instant::now() + remaining.min(WALL_CLOCK_LOOK))
+        } else {
+            Some(judged_until)
+        }
     }
 }
 
-/// The monotonic deadline of a grant that lapses at `renew_by_unix_ms`.
-fn deadline(renew_by_unix_ms: u64) -> tokio::time::Instant {
-    let remaining = renew_by_unix_ms.saturating_sub(unix_now_ms().unwrap_or_default());
-    tokio::time::Instant::now() + Duration::from_millis(remaining)
+/// Whether the wall clock is at or past `renew_by_unix_ms`.
+fn overdue(renew_by_unix_ms: u64) -> bool {
+    unix_now_ms().unwrap_or_default() >= renew_by_unix_ms
 }
 
 /// The command rejection that reports `err`.
@@ -68,7 +111,7 @@ fn rejection(err: &ReservationError) -> CommandRejection {
         | ReservationError::Queued { .. }
         | ReservationError::Waiting { .. }
         | ReservationError::Stopping { .. }
-        | ReservationError::Draining { .. }
+        | ReservationError::Releasing { .. }
         | ReservationError::Lapsed { .. } => CommandRejection::ResourceUnavailable(message),
     }
 }
@@ -105,12 +148,27 @@ impl SchedulerRuntime {
         }
     }
 
-    /// The project that may control this session's services that need a resource.
-    fn own_project(&self) -> String {
-        self.session.resources.as_ref().map_or_else(
+    /// Refuses `caller`, which is not the session's own, saying what only the own project may do
+    /// and how to become it.
+    fn refuse_foreign(&self, caller: &Caller, what: &str) -> CommandRejection {
+        let project = self.session.resources.as_ref().map_or_else(
             || "this session's own process".to_string(),
-            |store| format!("the project of {}", store.config_path()),
-        )
+            |store| {
+                let config = std::path::Path::new(store.config_path());
+                config.parent().unwrap_or(config).display().to_string()
+            },
+        );
+        let how = match caller {
+            Caller::Unknown => format!(
+                "this connection did not name its project (an older micromux, or a working \
+                 directory outside any project); run micromux from inside {project}"
+            ),
+            Caller::Local | Caller::Project(_) => format!(
+                "the client's working directory decides its project, not the session it \
+                 targets; run it from inside {project}"
+            ),
+        };
+        CommandRejection::PolicyDenied(format!("only the project in {project} may {what}; {how}"))
     }
 
     /// Refuses `caller` from another project when `service` needs `resource`.
@@ -121,10 +179,10 @@ impl SchedulerRuntime {
         resource: Option<&str>,
     ) -> Result<(), CommandRejection> {
         match resource {
-            Some(resource) if !self.is_own(caller) => Err(CommandRejection::PolicyDenied(format!(
-                "service `{service}` needs resource `{resource}`, so only {} may control it",
-                self.own_project()
-            ))),
+            Some(resource) if !self.is_own(caller) => Err(self.refuse_foreign(
+                caller,
+                &format!("control service `{service}`, which needs resource `{resource}`"),
+            )),
             _ => Ok(()),
         }
     }
@@ -145,30 +203,6 @@ impl SchedulerRuntime {
             })
     }
 
-    /// Runs `op` on the reservation store off the scheduler task, handling process events
-    /// meanwhile.
-    pub(super) async fn store_op<T: Send + 'static>(
-        &mut self,
-        services: &ServiceMap,
-        events_rx: &mut mpsc::Receiver<ProcessEvent>,
-        op: impl FnOnce(&ResourceStore) -> Result<T, ReservationError> + Send + 'static,
-    ) -> Result<T, CommandRejection> {
-        let Some(store) = self.session.resources.clone() else {
-            return Err(CommandRejection::ResourceUnavailable(
-                "the session has no config file, so it cannot hold resources".to_string(),
-            ));
-        };
-        let task = async move {
-            tokio::task::spawn_blocking(move || op(&store))
-                .await
-                .map_err(|err| format!("reservation task failed: {err}"))
-        };
-        self.await_loaded_services(services, events_rx, task)
-            .await
-            .map_err(CommandRejection::ReservationStore)?
-            .map_err(|err| rejection(&err))
-    }
-
     /// Refuses a command from another project that would start `service` with its definition,
     /// which may differ from the one in `services`, when the live run or either definition
     /// names a resource.
@@ -184,34 +218,102 @@ impl SchedulerRuntime {
         self.require_own(caller, &service.id, protected.as_deref())
     }
 
-    /// Lets this session start services of `resource`: a grant it holds is used as it is, and
-    /// otherwise the store grants the resource, or reports the grant a promotion gave this
-    /// session.
+    /// Refuses a command from another project whose config reload changes a definition that
+    /// names a resource or whose live run captured one, as a reconcile of it would be refused.
+    pub(super) fn require_own_reload(
+        &self,
+        services: &ServiceMap,
+        caller: &Caller,
+        loaded: &ServiceMap,
+    ) -> Result<(), CommandRejection> {
+        for (service_id, updated) in loaded {
+            if services
+                .get(service_id)
+                .is_some_and(|current| current.spec == updated.spec)
+            {
+                continue;
+            }
+            let resource = self
+                .resource_of(services, service_id)
+                .or_else(|| updated.spec.resource.clone());
+            self.require_own(caller, service_id, resource.as_deref())
+                .map_err(|refusal| {
+                    refusal.with_note(&format!(
+                        "refused because this command reloads a changed definition of \
+                         `{service_id}`"
+                    ))
+                })?;
+        }
+        Ok(())
+    }
+
+    /// Runs `op` for `resource` on the reservation store off the scheduler task, handling
+    /// process events meanwhile.
     ///
-    /// A valid grant needs no store transaction, and its deadline stays as it is. A claim this
-    /// session is releasing or let lapse stays ended, whatever the store says.
+    /// When the store refuses the session's grant because it is past its deadline while others
+    /// wait, the session starts releasing the resource.
+    pub(super) async fn store_op<T: Send + 'static>(
+        &mut self,
+        services: &ServiceMap,
+        events_rx: &mut mpsc::Receiver<ProcessEvent>,
+        resource: &str,
+        op: impl FnOnce(&ResourceStore) -> Result<T, ReservationError> + Send + 'static,
+    ) -> Result<T, CommandRejection> {
+        let Some(store) = self.session.resources.clone() else {
+            return Err(CommandRejection::ResourceUnavailable(
+                "the session has no config file, so it cannot hold resources".to_string(),
+            ));
+        };
+        let task = async move {
+            tokio::task::spawn_blocking(move || op(&store))
+                .await
+                .map_err(|err| format!("reservation task failed: {err}"))
+        };
+        let result = self
+            .await_loaded_services(services, events_rx, task)
+            .await
+            .map_err(CommandRejection::ReservationStore)?;
+        if let Err(err @ ReservationError::Lapsed { .. }) = &result {
+            self.begin_release(services, resource, &format!("service disabled: {err}"));
+        }
+        result.map_err(|err| rejection(&err))
+    }
+
+    /// Lets this session start services of `resource`: a grant it holds is used as it is, and
+    /// otherwise the store judges the grant, or grants the free resource with `reason` saying
+    /// why.
+    ///
+    /// A grant before its check needs no store transaction. A claim this session is releasing
+    /// stays released, whatever the store says.
     pub(super) async fn admit(
         &mut self,
         services: &ServiceMap,
         events_rx: &mut mpsc::Receiver<ProcessEvent>,
         resource: &str,
+        reason: String,
     ) -> Result<(), CommandRejection> {
-        if let Some(ended) = self.claim_ended(resource) {
-            return Err(rejection(&ended));
+        if let Some(refusal) = self.releasing_refusal(resource) {
+            return Err(refusal);
         }
-        if self.mine.get(resource).is_some_and(|mine| mine.may_start()) {
+        if self
+            .claims
+            .get(resource)
+            .is_some_and(|standing| standing.may_start())
+        {
             return Ok(());
         }
         let name = resource.to_string();
+        let request = Request {
+            estimate_secs: None,
+            reason: Some(reason),
+        };
         let renew_by = self
-            .store_op(services, events_rx, move |store| store.admit(&name))
+            .store_op(services, events_rx, resource, move |store| {
+                store.admit(&name, request)
+            })
             .await?;
-        self.mine.insert(
-            resource.to_string(),
-            Mine::Granted {
-                deadline: deadline(renew_by),
-            },
-        );
+        self.claims
+            .insert(resource.to_string(), Standing::granted(renew_by));
         Ok(())
     }
 
@@ -234,24 +336,13 @@ impl SchedulerRuntime {
         })
     }
 
-    /// Starts giving up `resource`: disables every service that needs it, so its runs stop, and
-    /// marks the grant as draining.
+    /// Starts releasing `resource`: refuses further starts and renewals, and disables every
+    /// service that needs it, with `detail` as the event, so its runs stop.
     ///
-    /// The runs stop even when the store cannot be written: the session holds no grant once it
-    /// decided so.
-    pub(super) async fn begin_drain(
-        &mut self,
-        services: &ServiceMap,
-        events_rx: &mut mpsc::Receiver<ProcessEvent>,
-        resource: &str,
-        detail: &str,
-    ) {
-        self.mine.insert(
-            resource.to_string(),
-            Mine::Draining {
-                removal_pending: false,
-            },
-        );
+    /// The claim stays in the store until the runs are gone, see [`Self::settle_releases`].
+    fn begin_release(&mut self, services: &ServiceMap, resource: &str, detail: &str) {
+        self.claims
+            .insert(resource.to_string(), Standing::Releasing);
         let affected = services
             .iter()
             .filter(|(service_id, service)| {
@@ -265,96 +356,113 @@ impl SchedulerRuntime {
             .map(|(service_id, _)| service_id.clone())
             .collect::<Vec<_>>();
         for service_id in &affected {
-            self.disable_for_resource(services, service_id, detail);
-        }
-        let name = resource.to_string();
-        if let Err(err) = self
-            .store_op(services, events_rx, move |store| store.begin_drain(&name))
-            .await
-        {
-            tracing::warn!(%err, resource, "cannot mark the reservation as draining");
+            if self
+                .services
+                .get(service_id)
+                .is_some_and(|runtime| runtime.desired != super::DesiredState::Disabled)
+            {
+                self.disable_for_resource(services, service_id, detail);
+            }
         }
     }
 
-    /// Gives up every draining resource none of whose runs is left.
+    /// Removes the claim of every resource this session releases whose runs are gone.
     ///
-    /// A resource whose removal failed before is retried only with `retry_pending`.
-    pub(super) async fn settle_drains(
+    /// A removal that fails keeps the resource releasing, so the next poll retries it.
+    pub(super) async fn settle_releases(
         &mut self,
         services: &ServiceMap,
         events_rx: &mut mpsc::Receiver<ProcessEvent>,
-        retry_pending: bool,
     ) {
         let done = self
-            .mine
+            .claims
             .iter()
-            .filter(|(resource, mine)| {
-                matches!(mine, Mine::Draining { removal_pending } if retry_pending || !removal_pending)
-                    && !self.runs_resource(resource)
+            .filter(|(resource, standing)| {
+                **standing == Standing::Releasing && !self.runs_resource(resource)
             })
             .map(|(resource, _)| resource.clone())
             .collect::<Vec<_>>();
         for resource in done {
             let name = resource.clone();
             match self
-                .store_op(services, events_rx, move |store| store.finish_drain(&name))
+                .store_op(services, events_rx, &resource, move |store| {
+                    store.remove(&name)
+                })
                 .await
             {
                 Ok(()) => {
-                    self.mine.remove(&resource);
+                    self.claims.remove(&resource);
                 }
                 Err(err) => {
                     tracing::warn!(%err, resource, "cannot release the reservation; retrying");
-                    self.mine.insert(
-                        resource,
-                        Mine::Draining {
-                            removal_pending: true,
-                        },
-                    );
                 }
             }
         }
     }
 
-    /// The earliest deadline of a grant, when this session holds any.
-    pub(super) fn next_lapse(&self) -> Option<tokio::time::Instant> {
-        self.mine
+    /// When the scheduler must next wake for a grant, if this session holds any.
+    pub(super) fn next_grant_check(&self) -> Option<tokio::time::Instant> {
+        self.claims
             .values()
-            .filter_map(|mine| match mine {
-                Mine::Granted { deadline } => Some(*deadline),
-                Mine::Waiting | Mine::Draining { .. } => None,
-            })
+            .filter_map(|standing| standing.wake_at())
             .min()
     }
 
-    /// Starts giving up every grant past its deadline.
-    pub(super) async fn lapse_due(
+    /// Has the store judge every grant past its deadline whose last judgement ran out: it keeps
+    /// one that nobody waits for and refuses one that others wait for, which the session then
+    /// releases. A grant before its deadline needs no store transaction.
+    ///
+    /// Returns whether the store judged any grant.
+    pub(super) async fn check_due_grants(
         &mut self,
         services: &ServiceMap,
         events_rx: &mut mpsc::Receiver<ProcessEvent>,
-    ) {
-        let now = tokio::time::Instant::now();
+    ) -> bool {
         let due = self
-            .mine
+            .claims
             .iter()
-            .filter(|(_, mine)| matches!(mine, Mine::Granted { deadline } if *deadline <= now))
+            .filter(|(_, standing)| {
+                matches!(standing, Standing::Granted { renew_by_unix_ms, .. } if overdue(*renew_by_unix_ms))
+                    && !standing.may_start()
+            })
             .map(|(resource, _)| resource.clone())
             .collect::<Vec<_>>();
+        let judged_any = !due.is_empty();
         for resource in due {
-            let detail = format!(
-                "service disabled because this session's reservation of resource `{resource}` \
-                 lapsed"
-            );
-            self.begin_drain(services, events_rx, &resource, &detail)
+            let name = resource.clone();
+            let judged = self
+                .store_op(services, events_rx, &resource, move |store| {
+                    store.admit(&name, Request::default())
+                })
                 .await;
+            match judged {
+                Ok(renew_by) => {
+                    self.claims.insert(resource, Standing::granted(renew_by));
+                }
+                // Releasing already, see `store_op`.
+                Err(_) if self.claims.get(&resource) == Some(&Standing::Releasing) => {}
+                Err(CommandRejection::ReservationStore(err)) => {
+                    tracing::warn!(%err, resource, "cannot check the reservation; retrying");
+                    if let Some(Standing::Granted { judged_until, .. }) =
+                        self.claims.get_mut(&resource)
+                    {
+                        *judged_until = tokio::time::Instant::now() + POLL_INTERVAL;
+                    }
+                }
+                Err(err) => {
+                    let detail = format!("service disabled: {}", err.message());
+                    self.begin_release(services, &resource, &detail);
+                }
+            }
         }
+        judged_any
     }
 
     /// Whether a queued request or a release needs the poll timer.
     pub(super) fn needs_poll(&self) -> bool {
-        self.mine
+        self.claims
             .values()
-            .any(|mine| matches!(mine, Mine::Waiting | Mine::Draining { .. }))
+            .any(|standing| matches!(standing, Standing::Waiting | Standing::Releasing))
     }
 
     /// Finishes releases whose runs are gone and notices queued requests that were granted or
@@ -364,17 +472,19 @@ impl SchedulerRuntime {
         services: &ServiceMap,
         events_rx: &mut mpsc::Receiver<ProcessEvent>,
     ) {
-        self.settle_drains(services, events_rx, true).await;
+        self.settle_releases(services, events_rx).await;
         let waiting = self
-            .mine
+            .claims
             .iter()
-            .filter(|(_, mine)| matches!(mine, Mine::Waiting))
+            .filter(|(_, standing)| **standing == Standing::Waiting)
             .map(|(resource, _)| resource.clone())
             .collect::<Vec<_>>();
         for resource in waiting {
             let name = resource.clone();
             match self
-                .store_op(services, events_rx, move |store| store.poll(&name))
+                .store_op(services, events_rx, &resource, move |store| {
+                    store.poll(&name)
+                })
                 .await
             {
                 Ok(reply) => self.track(&resource, &reply),
@@ -383,43 +493,27 @@ impl SchedulerRuntime {
         }
     }
 
-    /// Follows where this session's request stands after a store operation.
-    ///
-    /// The caller made sure the claim had not ended before the operation, and nothing ends it
-    /// while the scheduler awaits the store, so a renewal the store committed always moves the
-    /// deadline.
+    /// Records where this session's claim stands after the store answered `reply`.
     fn track(&mut self, resource: &str, reply: &ReservationReply) {
-        let mine = match (reply.state, reply.own_claim()) {
-            (ReservationState::Granted, Some(claim)) => Mine::Granted {
-                deadline: deadline(claim.renew_by_unix_ms),
-            },
-            (ReservationState::Waiting { .. }, _) => Mine::Waiting,
-            (ReservationState::Draining, _) => Mine::Draining {
-                removal_pending: false,
-            },
+        let standing = match (reply.state, reply.own_claim()) {
+            (ReservationState::Granted, Some(claim)) => Standing::granted(claim.renew_by_unix_ms),
+            (ReservationState::Waiting { .. }, _) => Standing::Waiting,
+            (ReservationState::Releasing, _) => Standing::Releasing,
             (ReservationState::Released | ReservationState::Granted, _) => {
-                self.mine.remove(resource);
+                self.claims.remove(resource);
                 return;
             }
         };
-        self.mine.insert(resource.to_string(), mine);
+        self.claims.insert(resource.to_string(), standing);
     }
 
-    /// Why this session's claim of `resource` can no longer be renewed, if it is releasing or
-    /// past its deadline.
-    fn claim_ended(&self, resource: &str) -> Option<ReservationError> {
-        let resource_name = resource.to_string();
-        match self.mine.get(resource) {
-            Some(Mine::Draining { .. }) => Some(ReservationError::Draining {
-                resource: resource_name,
-            }),
-            Some(Mine::Granted { deadline }) if *deadline <= tokio::time::Instant::now() => {
-                Some(ReservationError::Lapsed {
-                    resource: resource_name,
-                })
-            }
-            Some(Mine::Granted { .. } | Mine::Waiting) | None => None,
-        }
+    /// The refusal for a start or renewal of `resource` while this session releases it.
+    fn releasing_refusal(&self, resource: &str) -> Option<CommandRejection> {
+        (self.claims.get(resource) == Some(&Standing::Releasing)).then(|| {
+            rejection(&ReservationError::Releasing {
+                resource: resource.to_string(),
+            })
+        })
     }
 
     /// Applies `request` for `caller`, which must be the session's own process or project.
@@ -431,19 +525,16 @@ impl SchedulerRuntime {
         request: ReservationRequest,
     ) -> Result<ReservationReply, CommandRejection> {
         if !self.is_own(caller) {
-            return Err(CommandRejection::PolicyDenied(format!(
-                "only {} may reserve, renew, or release resources for this session",
-                self.own_project()
-            )));
+            return Err(self.refuse_foreign(caller, "reserve, renew, or release resources for it"));
         }
-        match request {
+        let (resource, reply) = match request {
             ReservationRequest::Reserve {
                 resource,
                 estimate_secs,
                 reason,
             } => {
-                if let Some(ended) = self.claim_ended(&resource) {
-                    return Err(rejection(&ended));
+                if let Some(refusal) = self.releasing_refusal(&resource) {
+                    return Err(refusal);
                 }
                 let request = Request {
                     estimate_secs,
@@ -451,83 +542,106 @@ impl SchedulerRuntime {
                 };
                 let name = resource.clone();
                 let reply = self
-                    .store_op(services, events_rx, move |store| {
+                    .store_op(services, events_rx, &resource, move |store| {
                         store.reserve(&name, request)
                     })
                     .await?;
                 self.track(&resource, &reply);
-                Ok(reply)
+                (resource, reply)
             }
             ReservationRequest::Renew { resource, claim } => {
-                if let Some(ended) = self.claim_ended(&resource) {
-                    return Err(rejection(&ended));
+                if let Some(refusal) = self.releasing_refusal(&resource) {
+                    return Err(refusal);
                 }
                 let name = resource.clone();
                 let reply = self
-                    .store_op(services, events_rx, move |store| {
+                    .store_op(services, events_rx, &resource, move |store| {
                         store.renew(&name, claim.as_deref())
                     })
                     .await?;
                 self.track(&resource, &reply);
-                Ok(reply)
+                (resource, reply)
             }
             ReservationRequest::Release { resource } => {
-                self.release(services, events_rx, resource).await
+                let reply = self.release(services, events_rx, &resource).await?;
+                (resource, reply)
             }
-        }
+        };
+        Ok(self.with_local_standing(&resource, reply))
     }
 
-    /// Releases this session's request for `resource`: a queued request goes at once, a grant
-    /// once the services that need it stopped.
+    /// `reply` with the state this session knows locally: the store shows a holder that
+    /// releases as the ordinary owner until its runs are gone.
+    fn with_local_standing(&self, resource: &str, mut reply: ReservationReply) -> ReservationReply {
+        if self.claims.get(resource) == Some(&Standing::Releasing) {
+            reply.state = ReservationState::Releasing;
+        }
+        reply
+    }
+
+    /// Releases this session's claim of `resource`: a queued request goes at once, a grant once
+    /// the services that need it stopped.
     async fn release(
         &mut self,
         services: &ServiceMap,
         events_rx: &mut mpsc::Receiver<ProcessEvent>,
-        resource: String,
+        resource: &str,
     ) -> Result<ReservationReply, CommandRejection> {
-        match self.mine.get(&resource) {
-            Some(Mine::Granted { .. }) => {
+        match self.claims.get(resource) {
+            Some(Standing::Granted { .. }) => {
                 let detail =
                     format!("service disabled because this session released resource `{resource}`");
-                self.begin_drain(services, events_rx, &resource, &detail)
-                    .await;
-                self.settle_drains(services, events_rx, false).await;
+                self.begin_release(services, resource, &detail);
+                self.settle_releases(services, events_rx).await;
             }
-            Some(Mine::Draining { .. }) => {}
-            Some(Mine::Waiting) | None => {
-                let name = resource.clone();
-                self.store_op(services, events_rx, move |store| store.finish_drain(&name))
-                    .await?;
-                self.mine.remove(&resource);
+            Some(Standing::Releasing) => {}
+            Some(Standing::Waiting) | None => {
+                let name = resource.to_string();
+                self.store_op(services, events_rx, resource, move |store| {
+                    store.remove(&name)
+                })
+                .await?;
+                self.claims.remove(resource);
             }
         }
-        let name = resource.clone();
-        self.store_op(services, events_rx, move |store| store.poll(&name))
-            .await
+        let name = resource.to_string();
+        self.store_op(services, events_rx, resource, move |store| {
+            store.poll(&name)
+        })
+        .await
     }
 
-    /// Whether `caller` may shut the session down: another project may not while the session
-    /// holds or waits for a resource, or runs or configures a service that needs one.
-    pub(super) fn authorize_shutdown(
-        &self,
-        services: &ServiceMap,
-        caller: &Caller,
-    ) -> Result<(), CommandRejection> {
-        if self.is_own(caller) {
-            return Ok(());
+    /// Stops the session for `caller`, unless another project asks while the session holds,
+    /// waits for, or releases a resource, or a run of a service that needs one has not ended.
+    ///
+    /// An accepted stop cancels the session in this same scheduler turn, so nothing is admitted
+    /// or started after it.
+    pub(super) fn shutdown_for(&self, caller: &Caller) -> Result<(), CommandRejection> {
+        if !self.is_own(caller) {
+            let running = self
+                .services
+                .values()
+                .filter_map(|runtime| runtime.running.as_ref()?.resource.clone());
+            let resources = self
+                .claims
+                .keys()
+                .cloned()
+                .chain(running)
+                .collect::<BTreeSet<_>>();
+            if !resources.is_empty() {
+                let resources = resources.into_iter().collect::<Vec<_>>().join(", ");
+                return Err(self.refuse_foreign(
+                    caller,
+                    &format!("stop it while it uses resources {resources}"),
+                ));
+            }
         }
-        let resources = self.watched_resources(services);
-        if resources.is_empty() {
-            return Ok(());
-        }
-        Err(CommandRejection::PolicyDenied(format!(
-            "the session uses resources {}, so only {} may stop it",
-            resources.into_iter().collect::<Vec<_>>().join(", "),
-            self.own_project()
-        )))
+        self.shutdown.cancel();
+        Ok(())
     }
 
-    /// The resources this session holds, waits for, runs, or names in a live service.
+    /// The resources this session holds, waits for, runs, or names in a live service, for
+    /// display.
     pub(super) fn watched_resources(&self, services: &ServiceMap) -> BTreeSet<String> {
         let named = services.iter().filter_map(|(service_id, service)| {
             let runtime = self.services.get(service_id)?;
@@ -542,52 +656,72 @@ impl SchedulerRuntime {
                     .flatten()
             })
         });
-        self.mine.keys().cloned().chain(named).collect()
+        self.claims.keys().cloned().chain(named).collect()
     }
 
-    /// Admits the resources that services ready to start on their own need, at most once each,
-    /// and schedules again after every grant, until nothing new is needed.
+    /// Starts every service that is ready, taking the resource of each that needs one when it
+    /// becomes ready.
     ///
-    /// A service refused its resource is disabled with an event naming the holder.
-    pub(super) async fn schedule_with_admission(
+    /// A service refused its resource is disabled with one event naming why.
+    pub(super) async fn start_ready(
         &mut self,
         services: &ServiceMap,
         events_rx: &mut mpsc::Receiver<ProcessEvent>,
     ) {
-        let mut attempted = BTreeSet::new();
-        loop {
-            let mut needed = BTreeMap::<String, Vec<ServiceID>>::new();
-            super::schedule::schedule_ready(&mut super::schedule::ScheduleContext {
-                services,
-                runtimes: &mut self.services,
-                current_pty_size: self.current_pty_size,
-                events_tx: &self.events_tx,
-                #[cfg(test)]
-                test_events: &mut self.test_events,
-                writer: &self.writer,
-                shutdown: &self.shutdown,
-                resources: self.session.resources.as_ref(),
-                mine: &self.mine,
-                needed_resources: &mut needed,
-            });
-            needed.retain(|resource, _| !attempted.contains(resource));
-            if needed.is_empty() || self.shutdown.is_cancelled() {
+        while !self.shutdown.is_cancelled() {
+            let needs_grant =
+                super::schedule::schedule_ready(&mut super::schedule::ScheduleContext {
+                    services,
+                    runtimes: &mut self.services,
+                    current_pty_size: self.current_pty_size,
+                    events_tx: &self.events_tx,
+                    #[cfg(test)]
+                    test_events: &mut self.test_events,
+                    writer: &self.writer,
+                    shutdown: &self.shutdown,
+                    resources: self.session.resources.as_ref(),
+                    claims: &self.claims,
+                });
+            let Some((service_id, resource)) = needs_grant else {
                 break;
-            }
-            for (resource, waiting) in needed {
-                if let Err(rejection) = self.admit(services, events_rx, &resource).await {
-                    for service_id in &waiting {
-                        self.disable_for_resource(
-                            services,
-                            service_id,
-                            &format!("service disabled because {rejection}"),
-                        );
-                    }
-                }
-                attempted.insert(resource);
+            };
+            let reason = format!("taken to start {service_id}");
+            if let Err(rejection) = self.admit(services, events_rx, &resource, reason).await
+                && self
+                    .services
+                    .get(&service_id)
+                    .is_some_and(|runtime| runtime.desired != super::DesiredState::Disabled)
+            {
+                let detail = format!("service disabled: {}", rejection.message());
+                self.disable_for_resource(services, &service_id, &detail);
             }
         }
         self.session_status
             .set_watched_resources(self.watched_resources(services));
+    }
+
+    /// Removes this session's claims from the store once its services stopped, as it stops, so
+    /// it no longer shows as holder or waiter.
+    pub(super) async fn remove_claims_on_stop(&mut self) {
+        let Some(store) = self.session.resources.clone() else {
+            return;
+        };
+        if self.claims.is_empty() || self.running_count() > 0 {
+            return;
+        }
+        let resources = std::mem::take(&mut self.claims)
+            .into_keys()
+            .collect::<Vec<_>>();
+        let removed = tokio::task::spawn_blocking(move || {
+            for resource in resources {
+                if let Err(err) = store.remove(&resource) {
+                    tracing::warn!(%err, resource, "cannot remove the reservation on stop");
+                }
+            }
+        })
+        .await;
+        if let Err(err) = removed {
+            tracing::warn!(%err, "cannot remove the reservations on stop");
+        }
     }
 }

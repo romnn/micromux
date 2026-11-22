@@ -1323,6 +1323,17 @@ fn parse_startup_mode(
 /// Parse a service's `resource`, a lowercase hostname label.
 fn parse_resource(mapping: &yaml_spanned::Mapping) -> Result<Option<Spanned<String>>, ConfigError> {
     let resource = parse_optional::<String>(mapping.get("resource"))?;
+    // Only containment keeps a dead holder's processes from outliving its grant.
+    if let Some(resource) = &resource
+        && !cfg!(unix)
+    {
+        return Err(ConfigError::InvalidValue {
+            message: "resource is not supported on this platform, which has no process \
+                      containment to stop a dead holder's services"
+                .to_string(),
+            span: resource.span.into(),
+        });
+    }
     if let Some(resource) = &resource
         && !crate::session::is_hostname_label(resource)
     {

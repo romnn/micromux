@@ -5345,6 +5345,64 @@ async fn send_input_reaches_process() -> eyre::Result<()> {
     Ok(())
 }
 
+/// Input bound to a run never reaches the run that replaced it; it is dropped with an event.
+#[tokio::test]
+async fn input_for_a_replaced_run_is_discarded() -> eyre::Result<()> {
+    let mut services: ServiceMap = ServiceMap::new();
+    services.insert(
+        "svc".to_string(),
+        Service::new(
+            "svc",
+            Path::new("."),
+            service_config("svc", ("sh", &["-c", "read line; echo got:$$line"])),
+        )?,
+    );
+    let harness = spawn_harness(services, None);
+    let first = wait_until(&harness.reader, "svc", |snapshot| {
+        snapshot.execution == Execution::Running
+    })
+    .await?;
+    accepted(harness.control.restart(Caller::Local, &"svc".into()).await)?;
+    wait_until(&harness.reader, "svc", |snapshot| {
+        snapshot.execution == Execution::Running && snapshot.run_generation > first.run_generation
+    })
+    .await?;
+
+    let stale = harness
+        .terminal
+        .prepare_input("svc".to_string(), b"stale\r".to_vec())?
+        .for_run(first.run_generation);
+    harness.terminal.try_send(stale)?;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !harness
+            .reader
+            .events("svc", None, None)
+            .0
+            .iter()
+            .any(|event| event.kind == ServiceEventKind::InputDropped)
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await?;
+    let fresh = harness
+        .terminal
+        .prepare_input("svc".to_string(), b"fresh\r".to_vec())?;
+    harness.terminal.try_send(fresh)?;
+    wait_for_log(&harness.reader, "svc", "got:fresh").await?;
+    assert!(
+        !harness
+            .reader
+            .logs("svc", None)
+            .iter()
+            .any(|line| line.line.contains("got:stale"))
+    );
+
+    harness.shutdown.cancel();
+    harness.handle.await??;
+    Ok(())
+}
+
 #[tokio::test]
 async fn dropped_paste_emits_an_operator_visible_event() -> eyre::Result<()> {
     let config_dir = Path::new(".");
@@ -6842,7 +6900,7 @@ fn a_stopped_job_run_that_exits_zero_is_pending_again() -> eyre::Result<()> {
 
 mod reservations {
     use super::*;
-    use crate::scheduler::reservations::Mine;
+    use crate::scheduler::reservations::Standing;
     use crate::session::{Request, ReservationState, SessionContext};
     use color_eyre::eyre;
     use similar_asserts::assert_eq;
@@ -6919,7 +6977,7 @@ mod reservations {
         let root = tempfile::tempdir()?;
         let registry = crate::PortRegistry::at(root.path().join("registry"));
         let other = registered(&registry, root.path(), "other")?;
-        store(&other)?.admit("desk")?;
+        store(&other)?.admit("desk", Request::default())?;
 
         let own = registered(&registry, root.path(), "own")?;
         let harness = spawn_harness_with_session(
@@ -6935,12 +6993,19 @@ mod reservations {
         })
         .await?;
         assert_eq!(disabled.run_generation, 0);
+        // One event says why, without a doubled prefix.
         let events = harness.reader.events("app", None, None).0;
+        let refusals = events
+            .iter()
+            .filter(|event| event.detail.contains("session other"))
+            .map(|event| event.detail.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(refusals.len(), 1, "{events:?}");
         assert!(
-            events
+            refusals
                 .iter()
-                .any(|event| event.detail.contains("session other")),
-            "{events:?}"
+                .all(|detail| detail.starts_with("service disabled: resource `desk`")),
+            "{refusals:?}"
         );
 
         let rejection = rejected(harness.control.enable(Caller::Local, &"app".into()).await)?;
@@ -6971,8 +7036,7 @@ mod reservations {
         assert!(harness.reader.service("clone").is_none());
 
         // Once the resource is free, the same request starts the clone afresh.
-        store(&other)?.begin_drain("desk")?;
-        store(&other)?.finish_drain("desk")?;
+        store(&other)?.remove("desk")?;
         dynamic_accepted(harness.control.start_dynamic(Caller::Local, clone).await)?;
         let clone = running(&harness, "clone").await?;
         assert_eq!(clone.resource.as_deref(), Some("desk"));
@@ -6990,7 +7054,7 @@ mod reservations {
         let root = tempfile::tempdir()?;
         let registry = crate::PortRegistry::at(root.path().join("registry"));
         let other = registered(&registry, root.path(), "other")?;
-        store(&other)?.admit("desk")?;
+        store(&other)?.admit("desk", Request::default())?;
         let own = registered(&registry, root.path(), "own")?;
         // `db` has no healthcheck, so `app` never becomes ready on its own.
         let config_path = root.path().join("own").join("micromux.yaml");
@@ -7033,8 +7097,7 @@ mod reservations {
         assert_eq!(app(), Some(Desired::Disabled));
 
         // Once the resource is free, enabling takes it though `app` still waits for `db`.
-        store(&other)?.begin_drain("desk")?;
-        store(&other)?.finish_drain("desk")?;
+        store(&other)?.remove("desk")?;
         accepted(harness.control.enable(Caller::Local, &"app".into()).await)?;
         let owner = store(&other)?.written_view("desk")?.owner;
         assert_eq!(
@@ -7062,7 +7125,7 @@ mod reservations {
         let root = tempfile::tempdir()?;
         let registry = crate::PortRegistry::at(root.path().join("registry"));
         let other = registered(&registry, root.path(), "other")?;
-        store(&other)?.admit("desk")?;
+        store(&other)?.admit("desk", Request::default())?;
         let own = registered(&registry, root.path(), "own")?;
         let harness = spawn_harness_with_session(
             roster([sleeper("app", Some("desk"))?]),
@@ -7139,7 +7202,7 @@ mod reservations {
         assert_eq!(snapshot.resource.as_deref(), Some("desk"));
 
         // The other session is refused, naming the holder, and queues.
-        let refused = store(&other)?.admit("desk");
+        let refused = store(&other)?.admit("desk", Request::default());
         let Err(err) = refused else {
             eyre::bail!("expected the resource to be held");
         };
@@ -7165,7 +7228,7 @@ mod reservations {
         assert!(
             matches!(
                 released.state,
-                ReservationState::Draining | ReservationState::Released
+                ReservationState::Releasing | ReservationState::Released
             ),
             "{released:?}"
         );
@@ -7233,22 +7296,65 @@ mod reservations {
         let own = registered(&registry, root.path(), "own")?;
         let services = roster([sleeper("app", Some("desk"))?]);
         let (mut runtime, mut events_rx) = unscheduled(&services, &own);
-        let granted = Mine::Granted {
-            deadline: tokio::time::Instant::now() + Duration::from_secs(600),
+        // A deadline an hour out that the store never recorded.
+        let granted = Standing::Granted {
+            renew_by_unix_ms: unix_now_ms().unwrap_or_default() + 3_600_000,
+            judged_until: tokio::time::Instant::now(),
         };
-        runtime.mine.insert("desk".to_string(), granted);
+        runtime.claims.insert("desk".to_string(), granted);
 
-        runtime.admit(&services, &mut events_rx, "desk").await?;
-        assert_eq!(runtime.mine.get("desk"), Some(&granted));
+        let reason = "taken by restart app".to_string();
+        runtime
+            .admit(&services, &mut events_rx, "desk", reason)
+            .await?;
+        assert_eq!(runtime.claims.get("desk"), Some(&granted));
         // The store never saw the session take the resource.
         assert_eq!(store(&own)?.written_view("desk")?.owner, None);
         Ok(())
     }
 
-    /// A grant that reaches its deadline disables its services, and the resource passes on only
-    /// after their runs exited.
+    /// A session that stops gracefully removes its claims once its services stopped, so the
+    /// resource passes to the waiting session.
     #[tokio::test]
-    async fn a_lapsed_grant_stops_its_runs_before_the_resource_passes_on() -> eyre::Result<()> {
+    async fn a_graceful_stop_removes_the_claims() -> eyre::Result<()> {
+        let root = tempfile::tempdir()?;
+        let registry = crate::PortRegistry::at(root.path().join("registry"));
+        let own = registered(&registry, root.path(), "own")?;
+        let other = registered(&registry, root.path(), "other")?;
+        let harness = harness(roster([sleeper("app", Some("desk"))?]), own);
+        running(&harness, "app").await?;
+        let waiting = store(&other)?.reserve("desk", Request::default())?;
+        assert_eq!(waiting.state, ReservationState::Waiting { position: 1 });
+
+        harness.shutdown.cancel();
+        harness.handle.await??;
+        assert_eq!(
+            store(&other)?.poll("desk")?.state,
+            ReservationState::Granted
+        );
+        Ok(())
+    }
+
+    /// Moves the deadline of the grant of `resource` in `root`'s registry into the past, as a
+    /// suspended machine wakes up to find it.
+    fn make_overdue(root: &Path, resource: &str) -> eyre::Result<()> {
+        let path = root
+            .join("registry/resources")
+            .join(format!("{resource}.json"));
+        let mut file: serde_json::Value = serde_json::from_slice(&fs::read(&path)?)?;
+        let renew_by = file
+            .pointer_mut("/owner/claim/renew_by_unix_ms")
+            .ok_or_else(|| eyre::eyre!("{resource} has no owner"))?;
+        *renew_by = serde_json::json!(1);
+        fs::write(&path, serde_json::to_vec(&file)?)?;
+        Ok(())
+    }
+
+    /// A grant past its deadline goes on while nobody waits, and renew, reserve and starts agree
+    /// on it; once a session waits, the holder releases it: its services stop, and the resource
+    /// passes on only after their runs exited.
+    #[tokio::test]
+    async fn an_overdue_grant_lapses_only_when_contested() -> eyre::Result<()> {
         let root = tempfile::tempdir()?;
         let registry = crate::PortRegistry::at(root.path().join("registry"));
         let own = registered(&registry, root.path(), "own")?;
@@ -7256,12 +7362,23 @@ mod reservations {
         let services = roster([sleeper("app", Some("desk"))?]);
         let (mut runtime, mut events_rx) = unscheduled(&services, &own);
 
-        // The session holds the resource with a live run, and its grant is due now.
-        store(&own)?.admit("desk")?;
-        runtime.mine.insert(
+        // The session holds the resource with a live run.
+        store(&own)?.admit("desk", Request::default())?;
+        let held = store(&own)?.poll("desk")?;
+        let renew_by = held
+            .own_claim()
+            .map(|claim| claim.renew_by_unix_ms)
+            .ok_or_else(|| eyre::eyre!("the grant is missing"))?;
+        // Judged long ago, so the timer asks the store once the wall clock is past the deadline.
+        let overdue_standing = Standing::Granted {
+            renew_by_unix_ms: 1,
+            judged_until: tokio::time::Instant::now(),
+        };
+        runtime.claims.insert(
             "desk".to_string(),
-            Mine::Granted {
-                deadline: tokio::time::Instant::now(),
+            Standing::Granted {
+                renew_by_unix_ms: renew_by,
+                judged_until: tokio::time::Instant::now(),
             },
         );
         let app = runtime
@@ -7272,47 +7389,45 @@ mod reservations {
         if let Some(running) = &mut app.running {
             running.resource = Some("desk".to_string());
         }
-        store(&other)?.reserve("desk", Request::default())?;
 
-        // Past its deadline the grant can neither be renewed nor admit a start, whatever the store
-        // still says.
+        // Before the deadline the timer needs no store.
+        assert!(!runtime.check_due_grants(&services, &mut events_rx).await);
+
+        // Overdue but uncontested, the grant goes on, and a renewal extends it.
+        make_overdue(root.path(), "desk")?;
+        runtime.claims.insert("desk".to_string(), overdue_standing);
+        assert!(runtime.check_due_grants(&services, &mut events_rx).await);
+        assert!(
+            runtime
+                .claims
+                .get("desk")
+                .is_some_and(|standing| standing.may_start())
+        );
         let renew = ReservationRequest::Renew {
             resource: "desk".to_string(),
             claim: None,
         };
         let renewed = runtime
             .reservation(&services, &mut events_rx, &Caller::Local, renew.clone())
-            .await;
-        assert_matches!(
-            renewed,
-            Err(CommandRejection::ResourceUnavailable(message)) if message.contains("lapsed")
-        );
-        let admitted = runtime.admit(&services, &mut events_rx, "desk");
-        assert_matches!(
-            admitted.await,
-            Err(CommandRejection::ResourceUnavailable(message)) if message.contains("lapsed")
-        );
+            .await?;
+        assert_eq!(renewed.state, ReservationState::Granted);
 
-        // The lapse stops the run, but the resource stays while the run is live.
-        runtime.lapse_due(&services, &mut events_rx).await;
-        runtime
-            .settle_drains(&services, &mut events_rx, false)
-            .await;
+        // Overdue with a waiter, the timer's judgement makes the session release.
+        make_overdue(root.path(), "desk")?;
+        runtime.claims.insert("desk".to_string(), overdue_standing);
+        store(&other)?.reserve("desk", Request::default())?;
+        assert!(runtime.check_due_grants(&services, &mut events_rx).await);
         let app = runtime
             .services
             .get("app")
             .ok_or_else(|| eyre::eyre!("app runtime is missing"))?;
         assert_eq!(app.desired, DesiredState::Disabled);
         assert!(app.running.as_ref().is_some_and(|run| run.stop_requested));
-        assert_eq!(
-            runtime.mine.get("desk"),
-            Some(&Mine::Draining {
-                removal_pending: false
-            })
-        );
-        assert_eq!(
-            store(&other)?.poll("desk")?.state,
-            ReservationState::Waiting { position: 1 }
+        assert_eq!(runtime.claims.get("desk"), Some(&Standing::Releasing));
+        let admitted = runtime.admit(&services, &mut events_rx, "desk", "test".to_string());
+        assert_matches!(
+            admitted.await,
+            Err(CommandRejection::ResourceUnavailable(message)) if message.contains("releasing")
         );
         let renewed = runtime.reservation(&services, &mut events_rx, &Caller::Local, renew);
         assert_matches!(
@@ -7320,7 +7435,12 @@ mod reservations {
             Err(CommandRejection::ResourceUnavailable(message)) if message.contains("releasing")
         );
 
-        // Once the run exited, the release completes and the waiter gets the resource.
+        // The resource stays while the run is live, and passes on once it exited.
+        runtime.settle_releases(&services, &mut events_rx).await;
+        assert_eq!(
+            store(&other)?.poll("desk")?.state,
+            ReservationState::Waiting { position: 1 }
+        );
         let spec = services
             .get("app")
             .map(|service| service.spec.clone())
@@ -7328,10 +7448,8 @@ mod reservations {
         if let Some(app) = runtime.services.get_mut("app") {
             app.finish_current_run(&spec, 0);
         }
-        runtime
-            .settle_drains(&services, &mut events_rx, false)
-            .await;
-        assert_eq!(runtime.mine.get("desk"), None);
+        runtime.settle_releases(&services, &mut events_rx).await;
+        assert_eq!(runtime.claims.get("desk"), None);
         assert_eq!(
             store(&other)?.poll("desk")?.state,
             ReservationState::Granted
@@ -7366,10 +7484,16 @@ mod reservations {
                     .reserve(Caller::Unknown, "desk", None, None)
                     .await,
             )?,
-            rejected(harness.control.authorize_shutdown(foreign.clone()).await)?,
+            rejected(harness.control.shutdown(foreign.clone()).await)?,
         ] {
             assert_matches!(rejection, CommandRejection::PolicyDenied(_));
         }
+        // A client that names no project learns how to name one.
+        let unnamed = rejected(harness.control.restart(Caller::Unknown, &app).await)?;
+        assert_matches!(
+            unnamed,
+            CommandRejection::PolicyDenied(message) if message.contains("did not name its project")
+        );
 
         // The own project, the own process, and anyone for an untagged service pass.
         accepted(
@@ -7382,11 +7506,36 @@ mod reservations {
         accepted(harness.control.disable(Caller::Local, &app).await)?;
         harness
             .control
-            .authorize_shutdown(own_project)
+            .shutdown(own_project)
             .await
             .map_err(|_| eyre::eyre!("scheduler stopped"))??;
+        assert!(harness.shutdown.is_cancelled());
+        harness.handle.await??;
+        Ok(())
+    }
 
-        harness.shutdown.cancel();
+    /// Another project may stop a session that holds, waits for, and runs nothing, even when its
+    /// config names a resource; the accepted stop cancels the session before the reply.
+    #[tokio::test]
+    async fn a_session_that_uses_no_resource_may_be_stopped_from_elsewhere() -> eyre::Result<()> {
+        let root = tempfile::tempdir()?;
+        let registry = crate::PortRegistry::at(root.path().join("registry"));
+        let other = registered(&registry, root.path(), "other")?;
+        store(&other)?.admit("desk", Request::default())?;
+        let own = registered(&registry, root.path(), "own")?;
+        let harness = harness(roster([sleeper("app", Some("desk"))?]), own);
+        wait_until(&harness.reader, "app", |app| {
+            app.desired == Desired::Disabled
+        })
+        .await?;
+
+        let foreign = Caller::Project("someone-else".to_string());
+        harness
+            .control
+            .shutdown(foreign)
+            .await
+            .map_err(|_| eyre::eyre!("scheduler stopped"))??;
+        assert!(harness.shutdown.is_cancelled());
         harness.handle.await??;
         Ok(())
     }
@@ -7575,11 +7724,12 @@ mod reservations {
         // admitted `display` after `base` started.
         running(&harness, "base").await?;
         running(&harness, "top").await?;
-        for resource in ["desk", "display"] {
+        // Each grant records how it was taken.
+        for (resource, service) in [("desk", "base"), ("display", "top")] {
             let owner = store(&own)?.written_view(resource)?.owner;
             assert_eq!(
-                owner.map(|owner| owner.claim.session_name),
-                Some("own".to_string())
+                owner.map(|owner| (owner.claim.session_name, owner.claim.reason)),
+                Some(("own".to_string(), Some(format!("taken to start {service}"))))
             );
         }
 

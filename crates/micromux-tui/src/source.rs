@@ -1,10 +1,14 @@
 //! Synchronous session data and lifecycle commands consumed by the TUI.
 
+use std::sync::Arc;
+
 use micromux::{
-    Command, HealthAttempt, LogLine, ServiceEvent, ServiceID, ServiceSnapshot, SessionChange,
-    SessionModelReader, SessionStatus, SessionSummary,
+    Caller, Command, CommandRejection, HealthAttempt, LogLine, SchedulerStopped, ServiceControl,
+    ServiceEvent, ServiceID, ServiceSnapshot, SessionChange, SessionModelReader, SessionStatus,
+    SessionSummary,
 };
-use tokio::sync::{broadcast, mpsc};
+use parking_lot::Mutex;
+use tokio::sync::{Notify, broadcast, mpsc};
 
 use crate::RemoteSource;
 
@@ -25,23 +29,51 @@ pub enum SessionSource {
     Remote(RemoteSource),
 }
 
+/// A lifecycle command of the local TUI.
+enum LocalCommand {
+    Restart(ServiceID),
+    RestartAll,
+    Enable(ServiceID),
+    Disable(ServiceID),
+    StopDynamic(ServiceID),
+}
+
 /// An in-process session model and its lifecycle command sender.
 pub struct LocalSource {
     reader: SessionModelReader,
-    lifecycle: mpsc::UnboundedSender<Command>,
+    lifecycle: mpsc::UnboundedSender<LocalCommand>,
     notice: Option<String>,
+    /// Why the latest lifecycle command was refused, until one is accepted.
+    refusal: Arc<Mutex<Option<String>>>,
+    /// Wakes the TUI when `refusal` changed.
+    refusal_changed: Arc<Notify>,
     session: Option<SessionStatus>,
 }
 
 impl LocalSource {
     /// Construct a source for a session owned by this process.
+    ///
+    /// Its lifecycle commands run one after another; a refused one's message shows in the header
+    /// until a later command is accepted.
     #[must_use]
     pub fn new(reader: SessionModelReader, commands: mpsc::Sender<Command>) -> Self {
         let (lifecycle, mut queued) = mpsc::unbounded_channel();
-        tokio::spawn(async move {
-            while let Some(command) = queued.recv().await {
-                if commands.send(command).await.is_err() {
-                    break;
+        let refusal = Arc::new(Mutex::new(None));
+        let refusal_changed = Arc::new(Notify::new());
+        let control = ServiceControl::from(commands);
+        tokio::spawn({
+            let refusal = Arc::clone(&refusal);
+            let refusal_changed = Arc::clone(&refusal_changed);
+            async move {
+                while let Some(command) = queued.recv().await {
+                    let Ok(refused) = run_local(&control, command).await else {
+                        break;
+                    };
+                    let mut current = refusal.lock();
+                    if *current != refused {
+                        *current = refused;
+                        refusal_changed.notify_one();
+                    }
                 }
             }
         });
@@ -49,6 +81,8 @@ impl LocalSource {
             reader,
             lifecycle,
             notice: None,
+            refusal,
+            refusal_changed,
             session: None,
         }
     }
@@ -66,6 +100,23 @@ impl LocalSource {
         self.notice = Some(notice.into());
         self
     }
+}
+
+/// Runs `command` as the session's own process and returns why the scheduler refused it, if it
+/// did.
+async fn run_local(
+    control: &ServiceControl,
+    command: LocalCommand,
+) -> Result<Option<String>, SchedulerStopped> {
+    let refused = |rejection: CommandRejection| Some(rejection.message());
+    Ok(match command {
+        LocalCommand::Restart(id) => control.restart(Caller::Local, &id).await?.err(),
+        LocalCommand::RestartAll => control.restart_all(Caller::Local).await?.err(),
+        LocalCommand::Enable(id) => control.enable(Caller::Local, &id).await?.err(),
+        LocalCommand::Disable(id) => control.disable(Caller::Local, &id).await?.err(),
+        LocalCommand::StopDynamic(id) => control.stop_dynamic(Caller::Local, &id).await?.err(),
+    }
+    .and_then(refused))
 }
 
 impl SessionSource {
@@ -163,7 +214,7 @@ impl SessionSource {
     pub(crate) fn restart(&self, id: ServiceID) {
         match self {
             Self::Local(source) => {
-                let _ = source.lifecycle.send(Command::restart(id));
+                let _ = source.lifecycle.send(LocalCommand::Restart(id));
             }
             Self::Remote(source) => source.restart(id),
         }
@@ -172,7 +223,7 @@ impl SessionSource {
     pub(crate) fn restart_all(&self) {
         match self {
             Self::Local(source) => {
-                let _ = source.lifecycle.send(Command::restart_all());
+                let _ = source.lifecycle.send(LocalCommand::RestartAll);
             }
             Self::Remote(source) => source.restart_all(),
         }
@@ -181,7 +232,7 @@ impl SessionSource {
     pub(crate) fn enable(&self, id: ServiceID) {
         match self {
             Self::Local(source) => {
-                let _ = source.lifecycle.send(Command::enable(id));
+                let _ = source.lifecycle.send(LocalCommand::Enable(id));
             }
             Self::Remote(source) => source.enable(id),
         }
@@ -190,7 +241,7 @@ impl SessionSource {
     pub(crate) fn disable(&self, id: ServiceID) {
         match self {
             Self::Local(source) => {
-                let _ = source.lifecycle.send(Command::disable(id));
+                let _ = source.lifecycle.send(LocalCommand::Disable(id));
             }
             Self::Remote(source) => source.disable(id),
         }
@@ -199,7 +250,7 @@ impl SessionSource {
     pub(crate) fn stop_dynamic(&self, id: ServiceID) {
         match self {
             Self::Local(source) => {
-                let _ = source.lifecycle.send(Command::stop_dynamic(id));
+                let _ = source.lifecycle.send(LocalCommand::StopDynamic(id));
             }
             Self::Remote(source) => source.stop_dynamic(id),
         }
@@ -239,6 +290,14 @@ impl SessionSource {
         }
     }
 
+    /// Whether the session left its reservations out of a description too large to send.
+    pub(crate) fn reservations_truncated(&self) -> bool {
+        match self {
+            Self::Local(_) => false,
+            Self::Remote(source) => source.attachment_status().session.reservations_truncated,
+        }
+    }
+
     /// Holder and queue of every resource the session uses, read now for a local session and
     /// as last described for a remote one.
     pub(crate) fn reservations(&self) -> Vec<micromux::ResourceView> {
@@ -255,10 +314,25 @@ impl SessionSource {
         }
     }
 
-    pub(crate) fn local_notice(&self) -> Option<&str> {
+    /// The local session's notice: why its latest lifecycle command was refused, else its
+    /// persistent warning.
+    pub(crate) fn local_notice(&self) -> Option<String> {
         match self {
-            Self::Local(source) => source.notice.as_deref(),
+            Self::Local(source) => source
+                .refusal
+                .lock()
+                .clone()
+                .or_else(|| source.notice.clone()),
             Self::Remote(_) => None,
+        }
+    }
+
+    /// Waits until a local lifecycle command's refusal changed; never for a remote session,
+    /// whose notice arrives as a session change.
+    pub(crate) async fn local_notice_changed(&self) {
+        match self {
+            Self::Local(source) => source.refusal_changed.notified().await,
+            Self::Remote(_) => std::future::pending().await,
         }
     }
 }

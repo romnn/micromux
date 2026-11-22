@@ -9,24 +9,27 @@
 //! Every change is one transaction under the registry lock.
 //! It first drops the claims of dead session instances and expired waiters, then grants the
 //! resource to the head of the queue once it has no owner and its fence is free.
-//! Only the holder ends its own grant: it stops its services that name the resource first, then
-//! removes itself.
+//!
+//! The holder's `renew_by` is the one deadline, kept in wall-clock time, and only the holder
+//! judges it, in the transaction that admits, reserves, or renews for it: a holder past its
+//! deadline goes on while nobody waits, and is refused, so that it releases the resource, once
+//! somebody does. A holder releases by stopping its services that name the resource, then
+//! removing its claim; until then the file shows it as the ordinary owner.
 //!
 //! # Handoff
 //!
-//! A waiter is promoted only when no shim of a previous holder holds the fence at that instant.
-//! Under containment, the shim of every service process that names the resource, and the
-//! cleanup-only shim of its cleanup, hold the fence shared until they exit: a service shim
-//! through its teardown after its supervisor died, a cleanup shim until the cleanup ended.
+//! A waiter is promoted only when nothing holds the fence at that instant.
+//! The supervisor locks the fence shared before it starts a run of a service that names the
+//! resource and keeps it until the run exited; the run's shim locks it too, through its teardown
+//! after its supervisor died, and the supervisor hands its locked descriptor to the cleanup-only
+//! shim of the run's cleanup, which keeps it until the cleanup ended.
 //! So the next holder starts only once the previous holder's processes and cleanups are gone,
 //! even when the previous holder died without stopping them.
-//! The exceptions:
+//! Reservations need containment, so a config that names a resource is refused where micromux
+//! has none.
 //!
-//! - A cleanup-only shim takes the fence by itself, so a supervisor that dies between spawning
-//!   it and the shim taking the fence lets the resource pass on while that cleanup runs.
-//! - A cleanup-only shim that cannot lock the fence still runs its cleanup, unfenced.
-//! - Without containment, as on Windows, there are no shims and no fence, and nothing stops a
-//!   dead holder's services.
+//! The decisions behind this design are recorded in
+//! [ADR 6](https://github.com/romnn/micromux/blob/main/adr/0006-shared-resource-reservations.md).
 //!
 //! A session instance is live while it holds its instance lock and its port record still names
 //! the instance's token, so a restart of the same config does not inherit the old instance's
@@ -79,20 +82,8 @@ pub struct ResourceView {
 pub struct Owner {
     /// The holder's request.
     pub claim: Claim,
-    /// Whether the holder still uses the resource or is stopping its services to release it.
-    pub state: OwnerState,
     /// When the resource was granted, in Unix milliseconds.
     pub granted_at_unix_ms: u64,
-}
-
-/// Whether a holder still uses a resource.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum OwnerState {
-    /// The holder may run the resource's services until its claim's `renew_by`.
-    Granted,
-    /// The holder is stopping its services that name the resource, and then releases it.
-    Draining,
 }
 
 /// One session's request for a resource.
@@ -132,7 +123,7 @@ pub enum ReservationState {
         position: usize,
     },
     /// The session stops its services that name the resource, and then releases it.
-    Draining,
+    Releasing,
     /// The session neither holds nor waits for the resource.
     Released,
 }
@@ -218,10 +209,11 @@ pub(crate) enum ReservationError {
     },
     /// Another session holds the resource.
     #[error(
-        "resource `{resource}` is held by session {}, which renews by {}; queue for it with \
-         `micromux ctl reserve {resource}`",
+        "resource `{resource}` is held by session {}; queue with `micromux ctl reserve \
+         {resource}` (MCP: reserve_resource). Holder: {}, {}. Once granted, enable the service.",
+        owner.claim.session_name,
         owner.claim,
-        renew_by_label(&owner.claim)
+        crate::renew_label(owner.claim.renew_by_unix_ms)
     )]
     Held {
         /// The resource.
@@ -231,8 +223,8 @@ pub(crate) enum ReservationError {
     },
     /// Other sessions queue for the resource.
     #[error(
-        "{waiting} request(s) already queue for resource `{resource}`; queue with \
-         `micromux ctl reserve {resource}`"
+        "{waiting} request(s) already queue for resource `{resource}`; queue with `micromux ctl \
+         reserve {resource}` (MCP: reserve_resource). Once granted, enable the service."
     )]
     Queued {
         /// The resource.
@@ -241,7 +233,10 @@ pub(crate) enum ReservationError {
         waiting: usize,
     },
     /// This session's request waits in the queue.
-    #[error("this session waits for resource `{resource}` at position {position} of the queue")]
+    #[error(
+        "this session already waits at position {position} for `{resource}`; wait with \
+         `micromux ctl wait --reservation {resource}` (MCP: wait_for_reservation)"
+    )]
     Waiting {
         /// The resource.
         resource: String,
@@ -262,18 +257,27 @@ pub(crate) enum ReservationError {
         "this session is releasing resource `{resource}`; reserve it again once its services \
          stopped"
     )]
-    Draining {
+    Releasing {
         /// The resource.
         resource: String,
     },
-    /// This session's grant passed its `renew_by` deadline.
-    #[error("this session's reservation of resource `{resource}` lapsed; reserve it again")]
+    /// This session's grant is past its `renew_by` deadline while other sessions wait, so the
+    /// session releases it.
+    #[error(
+        "this session's reservation of resource `{resource}` was due to renew, and {waiting} \
+         request(s) wait for it, so the session releases it"
+    )]
     Lapsed {
         /// The resource.
         resource: String,
+        /// How many requests wait.
+        waiting: usize,
     },
     /// This session has no request for the resource, or not the one named.
-    #[error("this session has no reservation of resource `{resource}`; reserve it again")]
+    #[error(
+        "this session has no reservation of resource `{resource}`; reserve it first with \
+         `micromux ctl reserve {resource}` (MCP: reserve_resource)"
+    )]
     Gone {
         /// The resource.
         resource: String,
@@ -287,12 +291,6 @@ pub(crate) enum ReservationError {
     /// The reason is too long.
     #[error("a reservation reason may have at most {MAX_REASON_CHARS} characters")]
     ReasonTooLong,
-}
-
-/// When `claim` must renew, for a message.
-fn renew_by_label(claim: &Claim) -> String {
-    let renew_by = std::time::UNIX_EPOCH + Duration::from_millis(claim.renew_by_unix_ms);
-    humantime::format_rfc3339_seconds(renew_by).to_string()
 }
 
 /// The session instance a store acts for.
@@ -328,6 +326,16 @@ impl Holder {
     }
 }
 
+/// A resource's fence, locked shared for one run.
+#[derive(Debug)]
+pub(crate) struct Fence {
+    /// The fence file, which the run's shim locks by itself as well.
+    pub(crate) path: PathBuf,
+    /// The locked file. The lock lasts as long as this file or a descriptor duplicated from it
+    /// is open, such as the one a cleanup-only shim inherits.
+    pub(crate) lock: File,
+}
+
 /// What a reservation request says about itself, for display.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct Request {
@@ -353,7 +361,7 @@ impl ResourceFile {
     /// Drops the claims of dead instances and expired waiters, then grants the resource to the
     /// head of the queue when it has no owner and no process of a previous holder is left.
     ///
-    /// An expired grant stays: only its holder ends it, after stopping its services.
+    /// A grant past its deadline stays: only its holder judges it, see [`Self::judge`].
     fn normalize(&mut self, now: u64, live: impl Fn(&Claim) -> bool, fence_free: bool) {
         if self.owner.as_ref().is_some_and(|owner| !live(&owner.claim)) {
             self.owner = None;
@@ -365,10 +373,21 @@ impl ResourceFile {
             claim.renew_by_unix_ms = renew_by(now);
             self.owner = Some(Owner {
                 claim,
-                state: OwnerState::Granted,
                 granted_at_unix_ms: now,
             });
         }
+    }
+
+    /// Refuses the holder `owner` once it is past its deadline while requests wait, so that it
+    /// releases the resource; a holder past its deadline that nobody waits for goes on.
+    fn judge(&self, resource: &str, owner: &Owner, now: u64) -> Result<(), ReservationError> {
+        if owner.claim.renew_by_unix_ms <= now && !self.waiters.is_empty() {
+            return Err(ReservationError::Lapsed {
+                resource: resource.to_string(),
+                waiting: self.waiters.len(),
+            });
+        }
+        Ok(())
     }
 
     fn mine_mut<'a>(&'a mut self, me: &Holder) -> Option<&'a mut Owner> {
@@ -388,26 +407,24 @@ impl ResourceFile {
         now: u64,
         fence_free: bool,
     ) -> Result<Option<u64>, ReservationError> {
-        let resource = resource.to_string();
+        if let Some(index) = self.waiters.iter().position(|claim| me.holds(claim)) {
+            return Err(ReservationError::Waiting {
+                resource: resource.to_string(),
+                position: index + 1,
+            });
+        }
         match &self.owner {
-            Some(owner) if me.holds(&owner.claim) => match owner.state {
-                OwnerState::Draining => Err(ReservationError::Draining { resource }),
-                OwnerState::Granted if owner.claim.renew_by_unix_ms <= now => {
-                    Err(ReservationError::Lapsed { resource })
-                }
-                OwnerState::Granted => Ok(Some(owner.claim.renew_by_unix_ms)),
-            },
+            Some(owner) if me.holds(&owner.claim) => {
+                self.judge(resource, owner, now)?;
+                Ok(Some(owner.claim.renew_by_unix_ms))
+            }
             Some(owner) => Err(ReservationError::Held {
-                resource,
+                resource: resource.to_string(),
                 owner: Box::new(owner.clone()),
             }),
             None => {
-                if let Some(index) = self.waiters.iter().position(|claim| me.holds(claim)) {
-                    Err(ReservationError::Waiting {
-                        resource,
-                        position: index + 1,
-                    })
-                } else if !self.waiters.is_empty() {
+                let resource = resource.to_string();
+                if !self.waiters.is_empty() {
                     Err(ReservationError::Queued {
                         resource,
                         waiting: self.waiters.len(),
@@ -421,30 +438,31 @@ impl ResourceFile {
         }
     }
 
-    /// Takes the resource for `me` when it is free, as a reserve without estimate or reason
-    /// would, and returns the grant's `renew_by`.
+    /// Takes the resource for `me` when it is free, as a reserve with `request` would, and
+    /// returns the grant's `renew_by`.
     fn admit(
         &mut self,
         resource: &str,
         me: &Holder,
         now: u64,
         fence_free: bool,
+        request: Request,
         claim_id: impl FnOnce() -> String,
     ) -> Result<u64, ReservationError> {
         if let Some(renew_by) = self.admission(resource, me, now, fence_free)? {
             return Ok(renew_by);
         }
-        let claim = me.claim(claim_id(), Request::default(), now);
+        let claim = me.claim(claim_id(), request, now);
         let renew_by = claim.renew_by_unix_ms;
         self.owner = Some(Owner {
             claim,
-            state: OwnerState::Granted,
             granted_at_unix_ms: now,
         });
         Ok(renew_by)
     }
 
-    /// Queues a request of `me`, or updates and renews the one it has.
+    /// Queues a request of `me`, or renews the one it has and takes the estimate and reason
+    /// `request` gives, keeping those it leaves out.
     ///
     /// The transaction's final normalization grants a request queued for a free resource.
     fn reserve(
@@ -462,28 +480,30 @@ impl ResourceFile {
         {
             return Err(ReservationError::ReasonTooLong);
         }
-        let resource = resource.to_string();
-        if let Some(owner) = self.mine_mut(me) {
-            match owner.state {
-                OwnerState::Draining => return Err(ReservationError::Draining { resource }),
-                OwnerState::Granted if owner.claim.renew_by_unix_ms <= now => {
-                    return Err(ReservationError::Lapsed { resource });
-                }
-                OwnerState::Granted => {}
+        if let Some(owner) = self.owner.as_ref().filter(|owner| me.holds(&owner.claim)) {
+            self.judge(resource, owner, now)?;
+        }
+        let update = |claim: &mut Claim| {
+            if request.estimate_secs.is_some() {
+                claim.estimate_secs = request.estimate_secs;
             }
-            owner.claim.estimate_secs = request.estimate_secs;
-            owner.claim.reason = request.reason;
-            owner.claim.renew_by_unix_ms = renew_by(now);
+            if request.reason.is_some() {
+                claim.reason.clone_from(&request.reason);
+            }
+            claim.renew_by_unix_ms = renew_by(now);
+        };
+        if let Some(owner) = self.mine_mut(me) {
+            update(&mut owner.claim);
             return Ok(());
         }
         if let Some(claim) = self.waiter_mut(me) {
-            claim.estimate_secs = request.estimate_secs;
-            claim.reason = request.reason;
-            claim.renew_by_unix_ms = renew_by(now);
+            update(claim);
             return Ok(());
         }
         if self.waiters.len() >= MAX_WAITERS {
-            return Err(ReservationError::QueueFull { resource });
+            return Err(ReservationError::QueueFull {
+                resource: resource.to_string(),
+            });
         }
         self.waiters.push(me.claim(claim_id(), request, now));
         Ok(())
@@ -497,23 +517,20 @@ impl ResourceFile {
         now: u64,
         claim_id: Option<&str>,
     ) -> Result<(), ReservationError> {
-        let resource = resource.to_string();
         let named = |claim: &Claim| claim_id.is_none_or(|id| id == claim.id);
-        if let Some(owner) = self.mine_mut(me) {
+        if let Some(owner) = self.owner.as_ref().filter(|owner| me.holds(&owner.claim)) {
             if !named(&owner.claim) {
-                return Err(ReservationError::Gone { resource });
+                return Err(ReservationError::Gone {
+                    resource: resource.to_string(),
+                });
             }
-            return match owner.state {
-                OwnerState::Draining => Err(ReservationError::Draining { resource }),
-                OwnerState::Granted if owner.claim.renew_by_unix_ms <= now => {
-                    Err(ReservationError::Lapsed { resource })
-                }
-                OwnerState::Granted => {
-                    owner.claim.renew_by_unix_ms = renew_by(now);
-                    Ok(())
-                }
-            };
+            self.judge(resource, owner, now)?;
         }
+        if let Some(owner) = self.mine_mut(me) {
+            owner.claim.renew_by_unix_ms = renew_by(now);
+            return Ok(());
+        }
+        let resource = resource.to_string();
         match self.waiter_mut(me) {
             Some(claim) if named(claim) => {
                 let next = renew_by(now);
@@ -526,16 +543,9 @@ impl ResourceFile {
         }
     }
 
-    /// Marks the grant of `me` as draining, and drops its queued request.
-    fn begin_drain(&mut self, me: &Holder) {
-        if let Some(owner) = self.mine_mut(me) {
-            owner.state = OwnerState::Draining;
-        }
-        self.waiters.retain(|claim| !me.holds(claim));
-    }
-
-    /// Removes every claim of `me`, once none of its processes for the resource is left.
-    fn finish_drain(&mut self, me: &Holder) {
+    /// Removes every claim of `me`; the holder removes its grant once none of its processes for
+    /// the resource is left.
+    fn remove(&mut self, me: &Holder) {
         if self.mine_mut(me).is_some() {
             self.owner = None;
         }
@@ -558,13 +568,7 @@ impl ResourceFile {
             .enumerate()
             .find(|(_, claim)| me.holds(claim));
         let (claim, state) = match (owner, waiter) {
-            (Some(owner), _) => (
-                Some(owner.claim.id.clone()),
-                match owner.state {
-                    OwnerState::Granted => ReservationState::Granted,
-                    OwnerState::Draining => ReservationState::Draining,
-                },
-            ),
+            (Some(owner), _) => (Some(owner.claim.id.clone()), ReservationState::Granted),
             (None, Some((index, claim))) => (
                 Some(claim.id.clone()),
                 ReservationState::Waiting {
@@ -622,13 +626,16 @@ impl ResourceStore {
     }
 
     /// Lets this session start the services of `resource`: it holds the resource already, or
-    /// takes it while it is free.
+    /// takes it while it is free, with `request` saying why.
     ///
-    /// Returns the grant's `renew_by` in Unix milliseconds.
-    pub(crate) fn admit(&self, resource: &str) -> Result<u64, ReservationError> {
+    /// Returns the grant's `renew_by` in Unix milliseconds, which is past for a holder past its
+    /// deadline that nobody waits for.
+    pub(crate) fn admit(&self, resource: &str, request: Request) -> Result<u64, ReservationError> {
         let mut renew_by = 0;
         self.transaction(resource, |file, now, fence_free| {
-            renew_by = file.admit(resource, &self.me, now, fence_free, || self.claim_id())?;
+            renew_by = file.admit(resource, &self.me, now, fence_free, request, || {
+                self.claim_id()
+            })?;
             Ok(())
         })?;
         Ok(renew_by)
@@ -667,22 +674,29 @@ impl ResourceStore {
         Ok(file.reply(resource, &self.me))
     }
 
-    /// Marks this session's grant of `resource` as draining and drops its queued request.
-    pub(crate) fn begin_drain(&self, resource: &str) -> Result<(), ReservationError> {
+    /// Removes this session's claims of `resource`, which a holder does once no process of it
+    /// for the resource is left; removing what is already gone changes nothing.
+    pub(crate) fn remove(&self, resource: &str) -> Result<(), ReservationError> {
         self.transaction(resource, |file, _, _| {
-            file.begin_drain(&self.me);
+            file.remove(&self.me);
             Ok(())
         })
         .map(|_| ())
     }
 
-    /// Gives `resource` up, once no process of this session for it is left.
-    pub(crate) fn finish_drain(&self, resource: &str) -> Result<(), ReservationError> {
-        self.transaction(resource, |file, _, _| {
-            file.finish_drain(&self.me);
-            Ok(())
-        })
-        .map(|_| ())
+    /// Opens the fence of `resource` and locks it shared, for a run of a service that names it.
+    pub(crate) fn lock_fence(&self, resource: &str) -> std::io::Result<Fence> {
+        let resources = self.directory.join(RESOURCES_DIRECTORY);
+        create_private_dir(&resources)?;
+        let path = self.fence_path(resource);
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)?;
+        lock.lock_shared()?;
+        Ok(Fence { path, lock })
     }
 
     /// The holder and queue of `resource` as last written, which may still show claims of
@@ -868,13 +882,15 @@ mod tests {
     fn the_queue_is_granted_in_order_once_the_fence_is_free() -> eyre::Result<()> {
         let (one, two, three) = (holder("one"), holder("two"), holder("three"));
         let mut file = ResourceFile::default();
-        file.admit("desk", &one, NOW, true, || "one-claim".to_string())?;
+        file.admit("desk", &one, NOW, true, Request::default(), || {
+            "one-claim".to_string()
+        })?;
         queued(&mut file, &two, NOW)?;
         queued(&mut file, &three, NOW + 10)?;
         assert_eq!(waiter_names(&file), ["two", "three"]);
 
         // The holder gives the resource up while its processes still hold the fence.
-        file.finish_drain(&one);
+        file.remove(&one);
         let later = NOW + 5_000;
         file.normalize(later, everyone_lives, false);
         assert_eq!(owner_name(&file), None);
@@ -898,7 +914,9 @@ mod tests {
     fn dead_and_expired_claims_are_dropped() -> eyre::Result<()> {
         let (one, two, three) = (holder("one"), holder("two"), holder("three"));
         let mut file = ResourceFile::default();
-        file.admit("desk", &one, NOW, true, || "one-claim".to_string())?;
+        file.admit("desk", &one, NOW, true, Request::default(), || {
+            "one-claim".to_string()
+        })?;
         queued(&mut file, &two, NOW)?;
         queued(&mut file, &three, NOW + 1)?;
 
@@ -928,7 +946,9 @@ mod tests {
             Err(ReservationError::Stopping { .. })
         ));
         assert_eq!(
-            file.admit("desk", &one, NOW, true, || "one-claim".to_string())?,
+            file.admit("desk", &one, NOW, true, Request::default(), || {
+                "one-claim".to_string()
+            })?,
             renew_by(NOW)
         );
 
@@ -938,20 +958,15 @@ mod tests {
             eyre::bail!("expected the resource to be held, got {held:?}");
         };
         let message = err.to_string();
-        assert!(message.contains("session one (/projects/one)"), "{message}");
-        assert!(message.contains("micromux ctl reserve desk"), "{message}");
+        assert!(
+            message.starts_with(
+                "resource `desk` is held by session one; queue with `micromux ctl reserve desk`"
+            ),
+            "{message}"
+        );
+        assert!(message.contains("Holder: one (/projects/one)"), "{message}");
 
-        // The holder's own grant lapses at its deadline and cannot be renewed after it.
-        assert!(matches!(
-            file.admission("desk", &one, renew_by(NOW), true),
-            Err(ReservationError::Lapsed { .. })
-        ));
-        assert!(matches!(
-            file.renew("desk", &one, renew_by(NOW), None),
-            Err(ReservationError::Lapsed { .. })
-        ));
-
-        // A renewal before the deadline moves it; a release in progress refuses renewals.
+        // A renewal moves the deadline, and one naming another request is refused.
         file.renew("desk", &one, NOW + 1_000, Some("one-claim"))?;
         assert_eq!(
             file.owner
@@ -963,15 +978,76 @@ mod tests {
             file.renew("desk", &one, NOW, Some("older-claim")),
             Err(ReservationError::Gone { .. })
         ));
-        file.begin_drain(&one);
-        assert!(matches!(
-            file.renew("desk", &one, NOW, None),
-            Err(ReservationError::Draining { .. })
-        ));
         assert!(matches!(
             file.renew("desk", &two, NOW, None),
             Err(ReservationError::Gone { .. })
         ));
+        Ok(())
+    }
+
+    /// Only the holder judges its deadline: past it, the holder goes on and renews while nobody
+    /// waits, and is refused once somebody does, in the same transaction that sees the waiter.
+    #[test]
+    fn a_holder_past_its_deadline_lapses_only_when_contested() -> eyre::Result<()> {
+        let (one, two) = (holder("one"), holder("two"));
+        let mut file = ResourceFile::default();
+        file.admit("desk", &one, NOW, true, Request::default(), || {
+            "one-claim".to_string()
+        })?;
+        let overdue = renew_by(NOW) + 1;
+
+        // Uncontested, a late holder keeps its grant: admission, reserve and renew agree, and a
+        // late renewal extends it.
+        assert_eq!(
+            file.admission("desk", &one, overdue, true)?,
+            Some(renew_by(NOW))
+        );
+        file.renew("desk", &one, overdue, None)?;
+        assert_eq!(
+            file.owner
+                .as_ref()
+                .map(|owner| owner.claim.renew_by_unix_ms),
+            Some(renew_by(overdue))
+        );
+
+        // A waiter makes the next overdue check refuse the holder, which keeps the file as it
+        // is until it removed itself.
+        let later = renew_by(overdue) + 1;
+        queued(&mut file, &two, later)?;
+        let contested = file.clone();
+        for refused in [
+            file.admission("desk", &one, later, true).map(|_| ()),
+            file.renew("desk", &one, later, None),
+            file.reserve("desk", &one, later, Request::default(), String::new),
+        ] {
+            assert!(
+                matches!(refused, Err(ReservationError::Lapsed { waiting: 1, .. })),
+                "{refused:?}"
+            );
+        }
+        assert_eq!(file, contested);
+        file.remove(&one);
+        file.normalize(later, everyone_lives, true);
+        assert_eq!(owner_name(&file), Some("two"));
+        Ok(())
+    }
+
+    /// A reserve that gives no estimate or reason keeps the ones the request has.
+    #[test]
+    fn reserving_again_keeps_the_estimate_and_reason() -> eyre::Result<()> {
+        let one = holder("one");
+        let mut file = ResourceFile::default();
+        let request = Request {
+            estimate_secs: Some(600),
+            reason: Some("demo".to_string()),
+        };
+        file.reserve("desk", &one, NOW, request, || "one-claim".to_string())?;
+        file.reserve("desk", &one, NOW + 1, Request::default(), String::new)?;
+        let claim = file.waiters.first().cloned();
+        assert_eq!(
+            claim.map(|claim| (claim.estimate_secs, claim.reason)),
+            Some((Some(600), Some("demo".to_string())))
+        );
         Ok(())
     }
 
@@ -981,7 +1057,9 @@ mod tests {
     fn waiter_renewals_skip_small_moves() -> eyre::Result<()> {
         let (one, two) = (holder("one"), holder("two"));
         let mut file = ResourceFile::default();
-        file.admit("desk", &one, NOW, true, || "one-claim".to_string())?;
+        file.admit("desk", &one, NOW, true, Request::default(), || {
+            "one-claim".to_string()
+        })?;
         queued(&mut file, &two, NOW)?;
 
         let unchanged = file.clone();
@@ -1000,7 +1078,9 @@ mod tests {
     fn reasons_and_queues_are_bounded() -> eyre::Result<()> {
         let one = holder("one");
         let mut file = ResourceFile::default();
-        file.admit("desk", &one, NOW, true, || "one-claim".to_string())?;
+        file.admit("desk", &one, NOW, true, Request::default(), || {
+            "one-claim".to_string()
+        })?;
 
         let too_long = Request {
             estimate_secs: None,
@@ -1062,19 +1142,17 @@ mod tests {
         );
 
         // The first session takes the resource; the second is refused and queues.
-        one.admit("desk")?;
+        one.admit("desk", Request::default())?;
         assert!(matches!(
-            two.admit("desk"),
+            two.admit("desk", Request::default()),
             Err(ReservationError::Held { .. })
         ));
         let waiting = two.reserve("desk", Request::default())?;
         assert_eq!(waiting.state, ReservationState::Waiting { position: 1 });
 
         // While a process of the first session holds the fence, its release hands nothing on.
-        let fence = File::open(one.fence_path("desk"))?;
-        fence.lock_shared()?;
-        one.begin_drain("desk")?;
-        one.finish_drain("desk")?;
+        let fence = one.lock_fence("desk")?;
+        one.remove("desk")?;
         assert_eq!(
             two.poll("desk")?.state,
             ReservationState::Waiting { position: 1 }

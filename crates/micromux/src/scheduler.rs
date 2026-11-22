@@ -1177,7 +1177,7 @@ struct SchedulerRuntime {
     default_log_display: LogDisplay,
     idempotency: VecDeque<IdempotencyRecord>,
     /// This session's requests for resources, by resource.
-    mine: std::collections::BTreeMap<String, reservations::Mine>,
+    claims: std::collections::BTreeMap<String, reservations::Standing>,
     /// When the poll timer next checks on queued requests and releases.
     next_reservation_poll: Option<tokio::time::Instant>,
 }
@@ -1266,7 +1266,7 @@ impl SchedulerRuntime {
             default_log_retention,
             default_log_display,
             idempotency: VecDeque::new(),
-            mine: std::collections::BTreeMap::new(),
+            claims: std::collections::BTreeMap::new(),
             next_reservation_poll: None,
         }
     }
@@ -1319,10 +1319,16 @@ impl SchedulerRuntime {
             .append_event(service_id, service_event(generation, kind, detail));
     }
 
-    fn running_pty(&self, service_id: &ServiceID) -> Result<&pty::PtyHandles, pty::PtyInputDrop> {
+    /// The terminal of the service's live run, when it is the run `run` names, if any.
+    fn running_pty(
+        &self,
+        service_id: &ServiceID,
+        run: Option<u64>,
+    ) -> Result<&pty::PtyHandles, pty::PtyInputDrop> {
         self.services
             .get(service_id)
             .and_then(|runtime| runtime.running.as_ref())
+            .filter(|running| run.is_none_or(|run| running.run_id.get() == run))
             .map(|running| &running.pty)
             .ok_or(pty::PtyInputDrop::WriterStopped)
     }
@@ -1425,7 +1431,7 @@ impl SchedulerRuntime {
             let next_expiry = self.next_expiry();
             let next_drain_deadline = self.next_drain_deadline();
             let next_input_drop_report = self.next_input_drop_report();
-            let next_lapse = self.next_lapse();
+            let next_grant_check = self.next_grant_check();
             self.next_reservation_poll = self.needs_poll().then(|| {
                 self.next_reservation_poll
                     .unwrap_or_else(|| tokio::time::Instant::now() + reservations::POLL_INTERVAL)
@@ -1464,7 +1470,7 @@ impl SchedulerRuntime {
                     let service_id = input.service_id().to_string();
                     let input_kind = input.kind().as_str();
                     let result = self
-                        .running_pty(&service_id)
+                        .running_pty(&service_id, input.run())
                         .and_then(|pty| pty.write_input(input));
                     self.report_input_drop(&service_id, input_kind, result);
                     false
@@ -1485,9 +1491,9 @@ impl SchedulerRuntime {
                     self.report_due_input_drops();
                     false
                 }
-                () = sleep_until_some(next_lapse) => {
-                    self.lapse_due(services, events_rx).await;
-                    true
+                // Before a deadline this only looks at the wall clock and sleeps again.
+                () = sleep_until_some(next_grant_check) => {
+                    self.check_due_grants(services, events_rx).await
                 }
                 () = sleep_until_some(next_reservation_poll) => {
                     self.next_reservation_poll = None;
@@ -1853,7 +1859,8 @@ impl SchedulerRuntime {
         self.require_own_start(services, caller, &service)?;
         // The resource is taken before the service exists, so a refusal leaves no trace of it.
         if let Some(resource) = service.spec.resource.clone() {
-            self.admit(services, events_rx, &resource).await?;
+            let reason = format!("taken by the start of {}", params.service);
+            self.admit(services, events_rx, &resource, reason).await?;
         }
 
         let mut runtime = ServiceRuntime::new(ServiceRuntimeInit::from(&service));
@@ -1959,7 +1966,8 @@ impl SchedulerRuntime {
         // The resource is taken before the live run, revision, or lease change, so a refusal
         // leaves them as they were.
         if let Some(resource) = candidate.spec.resource.clone() {
-            self.admit(services, events_rx, &resource).await?;
+            let reason = format!("taken by the replacement of {service_id}");
+            self.admit(services, events_rx, &resource, reason).await?;
         }
 
         let runtime = self
@@ -2672,8 +2680,7 @@ impl SchedulerRuntime {
         if self.shutdown.is_cancelled() {
             return;
         }
-        self.settle_drains(services, events_rx, false).await;
-        self.schedule_with_admission(services, events_rx).await;
+        self.start_ready(services, events_rx).await;
     }
 
     fn reply(ack: Option<ReplyAck<Vec<ServiceCommandAck>>>, result: ServiceCommandResult) {
@@ -2735,9 +2742,13 @@ impl SchedulerRuntime {
             .get(service_id)
             .ok_or(CommandRejection::UnknownService)?;
         self.require_own_start(services, caller, definition)?;
+        if let Some(pending) = &pending {
+            self.require_own_reload(services, caller, &pending.services)?;
+        }
         // The run takes the resource of the definition it starts with, before anything changes.
         if let Some(resource) = definition.spec.resource.clone() {
-            self.admit(services, events_rx, &resource).await?;
+            let reason = format!("taken by restart {service_id}");
+            self.admit(services, events_rx, &resource, reason).await?;
         }
         if let Some(pending) = pending {
             self.publish_reload(services, pending);
@@ -2793,8 +2804,12 @@ impl SchedulerRuntime {
         // one takes no resource. A service takes its resource now, even while it still waits for
         // its dependencies.
         let job = definition.spec.kind == crate::ServiceKind::Job;
+        if let Some(pending) = &pending {
+            self.require_own_reload(services, caller, &pending.services)?;
+        }
         if !job && let Some(resource) = definition.spec.resource.clone() {
-            self.admit(services, events_rx, &resource).await?;
+            let reason = format!("taken by enable {service_id}");
+            self.admit(services, events_rx, &resource, reason).await?;
         }
         if let Some(pending) = pending {
             self.publish_reload(services, pending);
@@ -2874,6 +2889,9 @@ impl SchedulerRuntime {
             .map(|(service_id, _)| service_id.clone())
             .collect::<Vec<_>>();
         // Refuse the whole command before restarting anything.
+        if let Some(pending) = &pending {
+            self.require_own_reload(services, caller, &pending.services)?;
+        }
         for service in restart_set
             .iter()
             .filter_map(|service_id| definitions.get(service_id))
@@ -2884,47 +2902,20 @@ impl SchedulerRuntime {
             .iter()
             .filter_map(|service_id| definitions.get(service_id)?.spec.resource.clone())
             .collect::<std::collections::BTreeSet<_>>();
-        // A refusal names the grants this command took, which the session keeps.
-        let keeping = |message: String, taken: &[&str]| {
-            if taken.is_empty() {
-                return message;
-            }
-            format!(
-                "{message}; the session keeps {}, which this command took, until released",
-                taken.join(", ")
-            )
-        };
-        let mut taken = Vec::new();
+        // Every resource is taken before anything restarts; a refusal names those taken before
+        // it, which the session keeps.
+        let mut admitted = Vec::new();
         for resource in &resources {
-            let held = self.mine.get(resource).is_some_and(|mine| mine.may_start());
-            if let Err(rejection) = self.admit(services, events_rx, resource).await {
-                if taken.is_empty() {
+            let reason = "taken by restart-all".to_string();
+            if let Err(rejection) = self.admit(services, events_rx, resource, reason).await {
+                if admitted.is_empty() {
                     return Err(rejection);
                 }
-                return Err(CommandRejection::ResourceUnavailable(keeping(
-                    rejection.to_string(),
-                    &taken,
-                )));
+                return Err(
+                    rejection.with_note(&format!("the session holds {}", admitted.join(", ")))
+                );
             }
-            if !held {
-                taken.push(resource.as_str());
-            }
-        }
-        // A grant taken first may have lapsed while a later one was awaited.
-        if let Some(lapsed) = resources.iter().find(|resource| {
-            !self
-                .mine
-                .get(*resource)
-                .is_some_and(|mine| mine.may_start())
-        }) {
-            taken.retain(|resource| resource != lapsed);
-            return Err(CommandRejection::ResourceUnavailable(keeping(
-                format!(
-                    "this session's grant of resource `{lapsed}` lapsed while the command \
-                     waited; nothing was restarted"
-                ),
-                &taken,
-            )));
+            admitted.push(resource.as_str());
         }
         if let Some(pending) = pending {
             self.publish_reload(services, pending);
@@ -3118,8 +3109,8 @@ impl SchedulerRuntime {
                     .await;
                 Reply::Reservation(ack, Box::new(result))
             }
-            Command::AuthorizeShutdown { caller, ack } => {
-                ack.send(self.authorize_shutdown(services, &caller));
+            Command::Shutdown { caller, ack } => {
+                ack.send(self.shutdown_for(&caller));
                 return None;
             }
             // A read changes nothing, so it skips the scheduling pass a reply waits for.
@@ -3525,6 +3516,7 @@ pub(crate) async fn scheduler(input: SchedulerInput) -> Result<(), crate::graph:
 
     rt.cancel_all_running();
     rt.drain_on_shutdown(&services, &mut events_rx).await;
+    rt.remove_claims_on_stop().await;
     Ok(())
 }
 

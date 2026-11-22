@@ -221,6 +221,40 @@ pub type ReconcileResult = Result<ReconcileReceipt, CommandRejection>;
 /// Result of one environment query.
 pub type EnvironmentResult = Result<ResolvedEnvironment, CommandRejection>;
 
+impl CommandRejection {
+    /// What went wrong, without the kind of rejection in front, for a sentence of its own.
+    #[must_use]
+    pub fn message(&self) -> String {
+        match self {
+            Self::InvalidState(message)
+            | Self::ConfigReload(message)
+            | Self::PolicyDenied(message)
+            | Self::LimitExceeded(message)
+            | Self::InvalidSpec(message)
+            | Self::ResourceUnavailable(message)
+            | Self::ReservationStore(message) => message.clone(),
+            Self::UnknownService | Self::RevisionMismatch { .. } => self.to_string(),
+        }
+    }
+
+    /// The same rejection with `note` appended to its message; a rejection without a message
+    /// stays as it is.
+    #[must_use]
+    pub(crate) fn with_note(self, note: &str) -> Self {
+        let noted = |message: String| format!("{message}; {note}");
+        match self {
+            Self::InvalidState(message) => Self::InvalidState(noted(message)),
+            Self::ConfigReload(message) => Self::ConfigReload(noted(message)),
+            Self::PolicyDenied(message) => Self::PolicyDenied(noted(message)),
+            Self::LimitExceeded(message) => Self::LimitExceeded(noted(message)),
+            Self::InvalidSpec(message) => Self::InvalidSpec(noted(message)),
+            Self::ResourceUnavailable(message) => Self::ResourceUnavailable(noted(message)),
+            Self::ReservationStore(message) => Self::ReservationStore(noted(message)),
+            Self::UnknownService | Self::RevisionMismatch { .. } => self,
+        }
+    }
+}
+
 /// Result of one reserve, renew or release.
 pub type ReservationResult = Result<ReservationReply, CommandRejection>;
 
@@ -247,6 +281,12 @@ impl<T> ReplyAck<T> {
     /// Satisfy the command. A dropped receiver (caller gone) is not an error here.
     pub(crate) fn send(self, result: Result<T, CommandRejection>) {
         let _ = self.tx.send(result);
+    }
+}
+
+impl From<mpsc::Sender<Command>> for ServiceControl {
+    fn from(tx: mpsc::Sender<Command>) -> Self {
+        Self::new(tx)
     }
 }
 
@@ -575,20 +615,21 @@ impl ServiceControl {
         .await
     }
 
-    /// Whether `caller` may shut the session down.
+    /// Stops the session for `caller`: the scheduler cancels the session before it replies, so
+    /// it admits and starts nothing more.
     ///
-    /// A caller from another project may not while the session holds or waits for a resource,
-    /// or runs or configures a service that needs one.
+    /// A caller from another project may not while the session holds, waits for, or releases a
+    /// resource, or a run of a service that needs one has not ended.
     ///
     /// # Errors
     ///
     /// Returns [`SchedulerStopped`] if the scheduler is no longer accepting commands.
     /// The inner result refuses with [`CommandRejection::PolicyDenied`] naming the resources.
-    pub async fn authorize_shutdown(
+    pub async fn shutdown(
         &self,
         caller: Caller,
     ) -> Result<Result<(), CommandRejection>, SchedulerStopped> {
-        self.request(move |ack| Command::AuthorizeShutdown { caller, ack })
+        self.request(move |ack| Command::Shutdown { caller, ack })
             .await
     }
 }

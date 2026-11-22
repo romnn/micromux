@@ -509,7 +509,14 @@ async fn handle_connection<S>(
             // Acknowledge first, then cancel the shared session token: the accept loop, scheduler,
             // and TUI all observe it, so this stops the whole session (the same path as Ctrl-C).
             // Writing before cancelling ensures the client sees the ack before the endpoint vanishes.
-            let _ = write_response(&mut conn, &Response::ShuttingDown, &shutdown).await;
+            // The scheduler may have cancelled the session already, so the ack is written under a
+            // token of its own, still bounded by the write timeout.
+            let _ = write_response(
+                &mut conn,
+                &Response::ShuttingDown,
+                &CancellationToken::new(),
+            )
+            .await;
             shutdown.cancel();
             return;
         }
@@ -851,23 +858,14 @@ async fn dispatch(
 
 /// Why `caller` may not stop the session, if it may not.
 ///
-/// Another project may not stop a session that uses a resource. The own project may always, and
-/// anyone may stop a session that uses none, even when the scheduler is wedged.
+/// The own project stops it directly, even when the scheduler is wedged. Anyone else asks the
+/// scheduler, which refuses while the session uses a resource and otherwise cancels the session
+/// before it answers, so it admits and starts nothing more.
 async fn shutdown_refusal(server: &ControlServer, caller: &Caller) -> Option<Response> {
-    // Without a status to tell, the scheduler decides.
-    let uses_resources = server
-        .session
-        .as_ref()
-        .is_none_or(micromux::SessionStatus::uses_resources);
-    if is_own(server, caller) || !uses_resources {
+    if is_own(server, caller) {
         return None;
     }
-    match tokio::time::timeout(
-        REQUEST_TIMEOUT,
-        server.control.authorize_shutdown(caller.clone()),
-    )
-    .await
-    {
+    match tokio::time::timeout(REQUEST_TIMEOUT, server.control.shutdown(caller.clone())).await {
         Ok(Ok(Ok(()))) => None,
         Ok(Ok(Err(rejection))) => Some(rejection_response(rejection)),
         Ok(Err(SchedulerStopped)) => Some(Response::error(
@@ -934,8 +932,9 @@ async fn send_input(
     } else {
         terminal.prepare_input(service, data)
     };
+    // Bound to the run authorized above, so a replacement never gets it.
     let prepared = match prepared {
-        Ok(prepared) => prepared,
+        Ok(prepared) => prepared.for_run(snapshot.run_generation),
         Err(err) => return Response::error(ErrorCode::LimitExceeded, err.to_string()),
     };
     match terminal.send(prepared).await {

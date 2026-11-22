@@ -826,13 +826,14 @@ fn sessions_wait_for_a_previous_sessions_cleanup() -> eyre::Result<()> {
     Ok(())
 }
 
-/// A resource held by a session whose supervisor is killed with `SIGKILL` passes to the waiting
-/// session only once the dead session's service, which takes seconds to stop, has ended.
-#[test]
-fn a_killed_holder_hands_its_resource_on_only_after_its_teardown() -> eyre::Result<()> {
-    let root = tempfile::tempdir()?;
+/// Runs a holding session and a queued session of `config` in one shared registry, kills the
+/// holder's supervisor with `SIGKILL` once `kill_after` exists, and returns how long the queued
+/// session's `ctl wait --reservation desk` took after the kill.
+///
+/// `config`'s service names resource `desk` and writes `app.pid` in its project as it starts.
+fn handover_after_a_kill(root: &Path, config: &str, kill_after: &Path) -> eyre::Result<Duration> {
     // Both sessions share one registry; the name is short, since control sockets live inside it.
-    let state = root.path().join("s");
+    let state = root.join("s");
     let session = |project: &Path| {
         let mut command = Command::new(MICROMUX);
         command
@@ -841,19 +842,11 @@ fn a_killed_holder_hands_its_resource_on_only_after_its_teardown() -> eyre::Resu
             .stdin(Stdio::null());
         command
     };
-    let holder = root.path().join("a");
-    let queued_project = root.path().join("b");
-    let stopped = root.path().join("stopped");
-    // The holder's service notes its start, and on the stop signal takes three seconds before
-    // it notes its stop and exits. It ends on its own after a minute in any case.
-    let config = format!(
-        "version: 1\nservices:\n  app:\n    resource: desk\n    command:\n      - sh\n      - -c\n      \
-         - trap 'sleep 3; echo > {}; exit 0' TERM; echo $$ > app.pid; sleep 60 & wait\n",
-        stopped.display()
-    );
+    let holder = root.join("a");
+    let queued_project = root.join("b");
     for project in [&holder, &queued_project] {
         std::fs::create_dir(project)?;
-        std::fs::write(project.join("micromux.yaml"), &config)?;
+        std::fs::write(project.join("micromux.yaml"), config)?;
     }
 
     let mut first = session(&holder)
@@ -894,6 +887,10 @@ fn a_killed_holder_hands_its_resource_on_only_after_its_teardown() -> eyre::Resu
         .stderr(Stdio::piped())
         .spawn()?;
 
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !kill_after.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
     let killed = Instant::now();
     first.kill()?;
     first.wait()?;
@@ -908,9 +905,51 @@ fn a_killed_holder_hands_its_resource_on_only_after_its_teardown() -> eyre::Resu
         String::from_utf8_lossy(&granted.stdout),
         String::from_utf8_lossy(&granted.stderr)
     );
+    Ok(waited)
+}
+
+/// A resource held by a session whose supervisor is killed with `SIGKILL` passes to the waiting
+/// session only once the dead session's service, which takes seconds to stop, has ended.
+#[test]
+fn a_killed_holder_hands_its_resource_on_only_after_its_teardown() -> eyre::Result<()> {
+    let root = tempfile::tempdir()?;
+    let stopped = root.path().join("stopped");
+    // The holder's service notes its start, and on the stop signal takes three seconds before
+    // it notes its stop and exits. It ends on its own after a minute in any case.
+    let config = format!(
+        "version: 1\nservices:\n  app:\n    resource: desk\n    command:\n      - sh\n      - -c\n      \
+         - trap 'sleep 3; echo > {}; exit 0' TERM; echo $$ > app.pid; sleep 60 & wait\n",
+        stopped.display()
+    );
+    let started = root.path().join("a/app.pid");
+    let waited = handover_after_a_kill(root.path(), &config, &started)?;
     assert!(
         stopped.exists(),
         "the resource passed on before the holder's service stopped"
+    );
+    assert!(waited < Duration::from_secs(30), "waited {waited:?}");
+    Ok(())
+}
+
+/// A resource whose holder's supervisor is killed with `SIGKILL` during a cleanup passes on only
+/// once the cleanup ended: the cleanup-only shim keeps the fence the supervisor handed it.
+#[test]
+fn a_killed_holder_hands_its_resource_on_only_after_its_cleanup() -> eyre::Result<()> {
+    let root = tempfile::tempdir()?;
+    let cleaning = root.path().join("cleaning");
+    let cleaned = root.path().join("cleaned");
+    // The service exits on its own after a second, and its cleanup takes three seconds.
+    let config = format!(
+        "version: 1\nservices:\n  app:\n    resource: desk\n    restart: \"no\"\n    command:\n      \
+         - sh\n      - -c\n      - echo $$ > app.pid; sleep 1\n    cleanup:\n      command:\n        \
+         - sh\n        - -c\n        - echo > {}; sleep 3; echo > {}\n",
+        cleaning.display(),
+        cleaned.display()
+    );
+    let waited = handover_after_a_kill(root.path(), &config, &cleaning)?;
+    assert!(
+        cleaned.exists(),
+        "the resource passed on before the holder's cleanup ended"
     );
     assert!(waited < Duration::from_secs(30), "waited {waited:?}");
     Ok(())

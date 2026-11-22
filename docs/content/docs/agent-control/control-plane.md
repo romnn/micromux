@@ -78,19 +78,19 @@ micromux ctl renew desktop-app                             # move renew_by an ho
 micromux ctl release desktop-app                           # stop the services that need it, then pass it on
 ```
 
-`ctl ls` and `ctl describe` end with each resource the session uses: its holder's session and worktree, whether it holds or releases it, its estimate and reason, when it was granted and must renew, then the waiting requests in order.
+`ctl ls` marks each service that names a resource with `resource=<name>`, and `ctl ls` and `ctl describe` end with each resource the session uses: its holder's session and worktree, its estimate and reason, when it was granted and must renew, then the waiting requests in order. Times read relative first, then as the local clock time with its UTC offset, such as `renews in 59m (at 23:22 +01:00)`. When the description would be too large, the resources are left out and the listing says so.
 
-`wait --reservation` renews the queued request every two seconds while it waits, so a request whose waiter is gone lapses on its own. It pins the session instance it first reaches and the request its first renewal reports, and the timeout bounds finding the session too. A store it cannot read or write for a moment, a slow answer, or a broken connection does not end it: it reconnects to the same instance and keeps renewing until the timeout. The exit code tells the outcomes apart:
+`wait --reservation` renews the queued request every two seconds while it waits, so a request whose waiter is gone lapses on its own. A brief failure, a slow answer, or a broken connection does not end it; it keeps renewing until the timeout. Waiting without a queued request fails and says to reserve first. The exit code tells the outcomes apart:
 
 | Code | Meaning |
 |---|---|
 | `0` | The session holds the resource. |
-| `5` | The request can no longer be granted: it was released or lapsed, or the session stopped or was replaced. |
-| `124` | The timeout elapsed; the request stays queued. |
+| `5` | The request can no longer be granted: it was released, or the session stopped or was replaced. |
+| `124` | The timeout elapsed; the request stays queued, and the last position and holder are printed. |
 
-Every client names the project it works in, the config found at or above its working directory, on the connections it sends changes over, whatever session it talks to. A session lets only clients of its own project control its services that need a resource, reserve for it, or stop it while it uses one; it refuses everyone else, `ctl` and MCP clients in other worktrees included. Sessions older than protocol 3.21 know nothing of resources.
+Your working directory decides your project: the config found at or above it, whatever `-c` selects. A session lets only clients of its own project control its services that need a resource, reserve for it, or stop it while it holds, waits for, or runs one; it refuses everyone else, `ctl` and MCP clients in other worktrees included, and says which project may. A client older than control protocol 3.21 names no project and is refused the same way, with a message to run a newer micromux from inside the project. Sessions older than protocol 3.21 know nothing of resources.
 
-The MCP server offers the same operations for the session of the project it runs in, whatever `MICROMUX_SESSION` selects: `reserve_resource`, `renew_reservation`, `release_resource`, and `wait_for_reservation`, whose timeout is bounded like `wait_for_healthy`'s. `list_sessions` and `list_services` show each resource's holder and queue.
+The MCP server offers the same operations for the session of the project it runs in, whatever `MICROMUX_SESSION` selects: `reserve_resource`, `renew_reservation`, `release_resource`, and `wait_for_reservation`, whose timeout is bounded like `wait_for_healthy`'s. Their replies carry `renew_in_secs` next to the Unix-millisecond deadlines, and after a grant the `services` that need the resource and do not run yet. A `wait_for_reservation` that times out returns the request's last position and the holder. `list_sessions` and `list_services` show each resource's holder and queue.
 
 ## Run commands in the session environment
 

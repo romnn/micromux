@@ -24,7 +24,7 @@ pub(super) enum Error {
 }
 
 impl Error {
-    fn operation(operation: &'static str, error: impl std::fmt::Display) -> Self {
+    pub(super) fn operation(operation: &'static str, error: impl std::fmt::Display) -> Self {
         Self::Operation {
             operation,
             message: error.to_string(),
@@ -285,8 +285,9 @@ pub(super) struct StartServiceParams<'a> {
     pub(super) shutdown: &'a CancellationToken,
     pub(super) terminate: &'a CancellationToken,
     pub(super) pty_size: portable_pty::PtySize,
-    /// The fence of the resource the service needs, which the run's processes lock shared.
-    pub(super) fence: Option<std::path::PathBuf>,
+    /// The fence of the resource the service needs, locked for the run: the run's shim locks it
+    /// by path too, and its cleanup gets the locked descriptor.
+    pub(super) fence: Option<crate::session::Fence>,
 }
 
 impl PtyHandles {
@@ -1788,6 +1789,9 @@ struct TerminationTaskArgs {
     health_task: Option<tokio::task::JoinHandle<()>>,
     /// The service's cleanup, which runs once the process exited.
     cleanup: Option<crate::cleanup::CleanupTask>,
+    /// The locked fence of a run without a cleanup, held until the run exited; a run with a
+    /// cleanup hands it to the cleanup instead.
+    fence: Option<std::fs::File>,
     #[cfg(windows)]
     process_job: win32job::Job,
 }
@@ -2490,6 +2494,7 @@ fn spawn_termination_task_with_timing(args: TerminationTaskArgs, timing: Termina
             mut child,
             mut health_task,
             mut cleanup,
+            fence,
             #[cfg(windows)]
             process_job,
         } = args;
@@ -2615,6 +2620,8 @@ fn spawn_termination_task_with_timing(args: TerminationTaskArgs, timing: Termina
                 }
             }
         }
+        // The run has exited, so the resource's fence may go.
+        drop(fence);
 
         // Best-effort tail: the kills themselves already landed before `Exited`, so a
         // runtime teardown cutting this short loses only the retry rounds and the leak
@@ -2645,6 +2652,7 @@ pub(super) fn start_service_with_pty_size(
         pty_size,
         fence,
     } = params;
+    let (fence_path, mut fence_lock) = fence.map(|fence| (fence.path, fence.lock)).unzip();
     let service_id = service.id.clone();
     let Some((prog, args)) = service.spec.command.split_first() else {
         return Err(Error::EmptyCommand);
@@ -2698,7 +2706,7 @@ pub(super) fn start_service_with_pty_size(
         args,
         stop,
         service.spec.cleanup.as_ref(),
-        fence.as_deref(),
+        fence_path.as_deref(),
         path.as_deref(),
         working_dir.as_path(),
     )
@@ -2813,7 +2821,7 @@ pub(super) fn start_service_with_pty_size(
             environment: env_vars.clone(),
             working_dir: working_dir.clone(),
             sink: sink.clone(),
-            fence: fence.clone(),
+            fence: fence_lock.take(),
         });
 
     let health_task = service.spec.healthcheck.clone().map(|health_check| {
@@ -2864,6 +2872,7 @@ pub(super) fn start_service_with_pty_size(
             child,
             health_task,
             cleanup,
+            fence: fence_lock,
             #[cfg(windows)]
             process_job,
         },
@@ -4378,6 +4387,7 @@ mod tests {
                     child: Box::new(child),
                     health_task: None,
                     cleanup: None,
+                    fence: None,
                 },
                 TerminationTiming {
                     force_kill_after: Duration::from_millis(10),

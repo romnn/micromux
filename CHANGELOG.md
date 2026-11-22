@@ -5,6 +5,8 @@
 - **Reserve a shared resource that one session at a time runs.** A service's `resource` names
   it; `micromux ctl reserve`, `wait --reservation`, `renew` and `release` and the matching MCP
   tools queue for it, and only the holder's own project may control those services.
+- **The TUI shows why the session refused a restart, enable or disable.** The refusal appears
+  in red in the header, such as a start whose resource another session holds.
 
 ## v0.4.7
 
