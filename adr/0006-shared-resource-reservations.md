@@ -112,7 +112,7 @@ See A1.
 
 ### U2. Clients that name no project are refused protected operations
 
-A client older than control protocol 3.21 never identifies, so it is refused for protected operations with "this connection did not name its project; run a micromux that supports control protocol 3.21 or newer from inside <project dir>". Older clients cannot control tagged services or stop a session that holds a resource.
+A client older than control protocol 3.21 never identifies, nor does one outside any project, so it is refused for protected operations with "this connection did not name its project; run a micromux with control protocol 3.21 or newer from inside <project dir> (a client outside any project names none)". Older clients cannot control tagged services or stop a session that holds a resource.
 
 - *Rejected:* trusting unidentified clients (any old `ctl` in any worktree could take a resource away).
 

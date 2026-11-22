@@ -778,6 +778,9 @@ mod tests {
 
     /// A service that needs a resource needs the config file, which identifies the session
     /// that holds the resource.
+    ///
+    /// Only Unix supports resources (see ADR 6).
+    #[cfg(unix)]
     #[test]
     fn resources_need_a_config_file() -> eyre::Result<()> {
         let directory = tempfile::tempdir()?;

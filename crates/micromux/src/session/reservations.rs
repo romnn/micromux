@@ -209,9 +209,8 @@ pub(crate) enum ReservationError {
     },
     /// Another session holds the resource.
     #[error(
-        "resource `{resource}` is held by session {}; queue with `micromux ctl reserve \
-         {resource}` (MCP: reserve_resource). Holder: {}, {}. Once granted, enable the service.",
-        owner.claim.session_name,
+        "resource `{resource}` is held: queue with `micromux ctl reserve {resource}` (MCP: \
+         reserve_resource); held by session {}, {}; once granted, enable the service",
         owner.claim,
         crate::renew_label(owner.claim.renew_by_unix_ms)
     )]
@@ -223,8 +222,8 @@ pub(crate) enum ReservationError {
     },
     /// Other sessions queue for the resource.
     #[error(
-        "{waiting} request(s) already queue for resource `{resource}`; queue with `micromux ctl \
-         reserve {resource}` (MCP: reserve_resource). Once granted, enable the service."
+        "resource `{resource}` is queued for: queue with `micromux ctl reserve {resource}` (MCP: \
+         reserve_resource); {waiting} request(s) already wait; once granted, enable the service"
     )]
     Queued {
         /// The resource.
@@ -234,8 +233,9 @@ pub(crate) enum ReservationError {
     },
     /// This session's request waits in the queue.
     #[error(
-        "this session already waits at position {position} for `{resource}`; wait with \
-         `micromux ctl wait --reservation {resource}` (MCP: wait_for_reservation)"
+        "resource `{resource}` is queued for: wait with `micromux ctl wait --reservation \
+         {resource}` (MCP: wait_for_reservation); this session already waits at position \
+         {position}"
     )]
     Waiting {
         /// The resource.
@@ -254,8 +254,8 @@ pub(crate) enum ReservationError {
     },
     /// This session is releasing the resource.
     #[error(
-        "this session is releasing resource `{resource}`; reserve it again once its services \
-         stopped"
+        "resource `{resource}` is being released: reserve it again with `micromux ctl reserve \
+         {resource}` (MCP: reserve_resource) once this session's services that need it stopped"
     )]
     Releasing {
         /// The resource.
@@ -264,8 +264,9 @@ pub(crate) enum ReservationError {
     /// This session's grant is past its `renew_by` deadline while other sessions wait, so the
     /// session releases it.
     #[error(
-        "this session's reservation of resource `{resource}` was due to renew, and {waiting} \
-         request(s) wait for it, so the session releases it"
+        "resource `{resource}` is being released: queue for it again with `micromux ctl \
+         reserve {resource}` (MCP: reserve_resource); this session's grant was due to renew \
+         while {waiting} request(s) wait"
     )]
     Lapsed {
         /// The resource.
@@ -959,12 +960,13 @@ mod tests {
         };
         let message = err.to_string();
         assert!(
-            message.starts_with(
-                "resource `desk` is held by session one; queue with `micromux ctl reserve desk`"
-            ),
+            message.starts_with("resource `desk` is held: queue with `micromux ctl reserve desk`"),
             "{message}"
         );
-        assert!(message.contains("Holder: one (/projects/one)"), "{message}");
+        assert!(
+            message.contains("held by session one (/projects/one)"),
+            "{message}"
+        );
 
         // A renewal moves the deadline, and one naming another request is refused.
         file.renew("desk", &one, NOW + 1_000, Some("one-claim"))?;

@@ -3766,8 +3766,8 @@ mod tests {
         Ok(())
     }
 
-    /// A refusal of a start whose resource another session holds shows the holder and the
-    /// command that queues for it at 120 columns.
+    /// A refusal of a start whose resource another session holds shows the command that queues
+    /// for it at 120 columns, whatever the holder's name.
     #[tokio::test]
     async fn a_resource_refusal_fits_the_header() -> eyre::Result<()> {
         let yaml = "version: 1\nservices:\n  svc:\n    command: [\"true\"]\n";
@@ -3777,10 +3777,10 @@ mod tests {
         let mux = std::sync::Arc::new(test_micromux(&parsed, &cache)?);
         let (_runner, handles) = mux.start(micromux::CancellationToken::new());
         let (commands, _commands_rx) = mpsc::channel(1);
-        let refusal = "resource `desktop-app` is held by session a; queue with `micromux ctl \
-                       reserve desktop-app` (MCP: reserve_resource). Holder: a \
-                       (/home/user/src/a), must renew within 59m (by 23:22 +01:00). Once \
-                       granted, enable the service.";
+        let refusal = "resource `desktop-app` is held: queue with `micromux ctl reserve \
+                       desktop-app` (MCP: reserve_resource); held by session \
+                       feature-model-loader (/home/user/src/feature-model-loader), must renew \
+                       within 59m (by 23:22 +01:00); once granted, enable the service";
         let mut app = App::new(
             SessionSource::Local(LocalSource::new(handles.reader, commands).with_notice(refusal)),
             Some(handles.terminal),
@@ -3794,9 +3794,8 @@ mod tests {
         let header = (0..area.width)
             .filter_map(|x| buffer.cell((x, 0)).map(ratatui::buffer::Cell::symbol))
             .collect::<String>();
-        assert!(header.contains("held by session a"), "{header}");
         assert!(
-            header.contains("micromux ctl reserve desktop-app"),
+            header.contains("queue with `micromux ctl reserve desktop-app`"),
             "{header}"
         );
         Ok(())

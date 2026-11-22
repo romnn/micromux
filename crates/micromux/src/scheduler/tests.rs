@@ -7427,12 +7427,12 @@ mod reservations {
         let admitted = runtime.admit(&services, &mut events_rx, "desk", "test".to_string());
         assert_matches!(
             admitted.await,
-            Err(CommandRejection::ResourceUnavailable(message)) if message.contains("releasing")
+            Err(CommandRejection::ResourceUnavailable(message)) if message.contains("being released")
         );
         let renewed = runtime.reservation(&services, &mut events_rx, &Caller::Local, renew);
         assert_matches!(
             renewed.await,
-            Err(CommandRejection::ResourceUnavailable(message)) if message.contains("releasing")
+            Err(CommandRejection::ResourceUnavailable(message)) if message.contains("being released")
         );
 
         // The resource stays while the run is live, and passes on once it exited.

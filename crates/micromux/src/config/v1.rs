@@ -2801,8 +2801,30 @@ mod tests {
         Ok(())
     }
 
+    /// Without process containment a dead holder's services would outlive its grant, so
+    /// platforms other than Unix reject `resource` (see ADR 6).
+    #[cfg(not(unix))]
+    #[test]
+    fn resources_are_rejected_without_containment() {
+        let mut diagnostics: Vec<Diagnostic<usize>> = Vec::new();
+        let parsed = config::from_str(
+            "version: 1\nservices:\n  app:\n    command: \"true\"\n    resource: desktop-app\n",
+            Path::new("."),
+            0,
+            None,
+            &mut diagnostics,
+        );
+        assert!(
+            parsed.is_err_and(|err| err.to_string().contains("not supported on this platform")),
+            "resource must be rejected"
+        );
+    }
+
     /// The parser and the published schema agree on which `resource` names are valid, and the
     /// parser keeps the name.
+    ///
+    /// Only Unix supports resources (see ADR 6).
+    #[cfg(unix)]
     #[test]
     fn resource_names_match_the_published_schema() -> eyre::Result<()> {
         let schema: serde_json::Value =

@@ -2,6 +2,9 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// A minute in milliseconds: anything closer to now reads "just now".
+const MINUTE_MS: u64 = 60_000;
+
 /// The current time in Unix milliseconds.
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -10,11 +13,14 @@ fn now_ms() -> u64 {
 }
 
 /// `unix_ms` as how far it is from now, then the local time with its UTC offset, such as
-/// `in 59m (at 23:22 +01:00)` or `5m ago (at 22:20 +01:00)`.
+/// `in 59m (at 23:22 +01:00)`, `5m ago (at 22:20 +01:00)`, or `just now (at 22:25 +01:00)`
+/// within a minute of now.
 #[must_use]
 pub fn display_time(unix_ms: u64) -> String {
     let now = now_ms();
-    let relative = if unix_ms >= now {
+    let relative = if unix_ms.abs_diff(now) < MINUTE_MS {
+        "just now".to_string()
+    } else if unix_ms >= now {
         format!("in {}", distance(unix_ms - now))
     } else {
         format!("{} ago", distance(now - unix_ms))
@@ -22,12 +28,19 @@ pub fn display_time(unix_ms: u64) -> String {
     with_clock(relative, "at", unix_ms)
 }
 
-/// When a claim must renew, as an obligation: `must renew within 59m (by 23:22 +01:00)`, or
-/// `was due to renew 5m ago (at 22:20 +01:00)` once it is overdue.
+/// When a claim must renew, as an obligation: `must renew within 59m (by 23:22 +01:00)`,
+/// `was due to renew 5m ago (at 22:20 +01:00)` once it is overdue, or `is due to renew just now`
+/// within a minute of now.
 #[must_use]
 pub fn renew_label(renew_by_unix_ms: u64) -> String {
     let now = now_ms();
-    if renew_by_unix_ms >= now {
+    if renew_by_unix_ms.abs_diff(now) < MINUTE_MS {
+        with_clock(
+            "is due to renew just now".to_string(),
+            "at",
+            renew_by_unix_ms,
+        )
+    } else if renew_by_unix_ms >= now {
         with_clock(
             format!("must renew within {}", distance(renew_by_unix_ms - now)),
             "by",
@@ -60,11 +73,10 @@ fn with_clock(relative: String, preposition: &str, unix_ms: u64) -> String {
     format!("{relative} ({preposition} {})", time.format(format))
 }
 
-/// A distance in time rounded to the nearest minute: `1h`, `1h 5m`, `59m`, or `under a minute`.
+/// A distance of a minute or more rounded to the nearest minute: `1h`, `1h 5m`, or `59m`.
 fn distance(ms: u64) -> String {
-    let minutes = (ms + 30_000) / 60_000;
+    let minutes = (ms + MINUTE_MS / 2) / MINUTE_MS;
     match (minutes / 60, minutes % 60) {
-        (0, 0) => "under a minute".to_string(),
         (0, minutes) => format!("{minutes}m"),
         (hours, 0) => format!("{hours}h"),
         (hours, minutes) => format!("{hours}h {minutes}m"),
@@ -81,7 +93,15 @@ mod tests {
         assert_eq!(distance(3_600_000 - 400), "1h");
         assert_eq!(distance(3_725_000), "1h 2m");
         assert_eq!(distance(3_540_500), "59m");
-        assert_eq!(distance(20_000), "under a minute");
+    }
+
+    #[test]
+    fn times_within_a_minute_read_just_now() {
+        let now = now_ms();
+        assert!(display_time(now).starts_with("just now (at "));
+        assert!(display_time(now + 20_000).starts_with("just now"));
+        assert!(display_time(now - 20_000).starts_with("just now"));
+        assert!(renew_label(now + 20_000).starts_with("is due to renew just now"));
     }
 
     #[test]

@@ -160,8 +160,8 @@ impl SchedulerRuntime {
         );
         let how = match caller {
             Caller::Unknown => format!(
-                "this connection did not name its project (an older micromux, or a working \
-                 directory outside any project); run micromux from inside {project}"
+                "this connection did not name its project; run a micromux with control protocol \
+                 3.21 or newer from inside {project} (a client outside any project names none)"
             ),
             Caller::Local | Caller::Project(_) => format!(
                 "the client's working directory decides its project, not the session it \
