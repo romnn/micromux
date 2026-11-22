@@ -914,6 +914,7 @@ async fn run(
         args,
         params.stop,
         None,
+        None,
         path.as_deref(),
         cwd,
     );

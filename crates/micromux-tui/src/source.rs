@@ -239,6 +239,22 @@ impl SessionSource {
         }
     }
 
+    /// Holder and queue of every resource the session uses, read now for a local session and
+    /// as last described for a remote one.
+    pub(crate) fn reservations(&self) -> Vec<micromux::ResourceView> {
+        match self {
+            Self::Local(source) => source
+                .session
+                .as_ref()
+                .map(SessionStatus::reservations)
+                .unwrap_or_default(),
+            Self::Remote(_) => self
+                .session_summary()
+                .map(|session| session.reservations)
+                .unwrap_or_default(),
+        }
+    }
+
     pub(crate) fn local_notice(&self) -> Option<&str> {
         match self {
             Self::Local(source) => source.notice.as_deref(),

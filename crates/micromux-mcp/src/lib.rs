@@ -126,7 +126,12 @@ attempt, `list_log_runs` for retained runs, and `log_cursors` plus \
 `follow_all_logs` around hot reloads. Log tools strip ANSI by default and support regex, context, \
 time, trace-id, compact JSON, and minimum-level filters. Actions go through micromux and retain its \
 dependency and restart semantics. Use `start_session` to create a project's headless session; a \
-human can run `micromux attach` to observe it. Use `stop_session` to stop it explicitly.";
+human can run `micromux attach` to observe it. Use `stop_session` to stop it explicitly. A service \
+that names a `resource` runs in one session at a time: only the session holding the resource runs \
+it, and only clients working in that session's project may control it. For the current project, \
+`reserve_resource` takes a resource or queues for it, `wait_for_reservation` waits for the grant, \
+`renew_reservation` keeps it within the hour and lists who waits, and `release_resource` gives it \
+back; `list_sessions` and `list_services` show each resource's holder and queue.";
 
 /// The MCP server handler. Cheap to clone; holds no supervision state.
 #[derive(Clone)]
@@ -584,6 +589,68 @@ struct ServiceListResult {
     /// `session` on follow-up calls to avoid re-disambiguating.
     session_selector: String,
     services: Vec<ServiceSnapshot>,
+    /// Holder and queue of every resource the session uses.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    reservations: Vec<micromux::ResourceView>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct ReserveArgs {
+    /// The resource, as services name it in `resource`.
+    resource: String,
+    /// How long you expect to hold it, in seconds; shown to other sessions.
+    #[serde(default)]
+    estimate_secs: Option<u64>,
+    /// Why you need it, at most 200 characters; shown to other sessions.
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct ResourceArgs {
+    /// The resource, as services name it in `resource`.
+    resource: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct ReservationWaitArgs {
+    /// The resource, as services name it in `resource`.
+    resource: String,
+    /// Maximum seconds to wait (default 60, capped at 600); call again to keep waiting.
+    #[serde(default)]
+    timeout_secs: Option<u64>,
+}
+
+#[derive(Serialize, JsonSchema)]
+struct ReservationResult {
+    #[serde(flatten)]
+    session_ref: SessionRef,
+    #[serde(flatten)]
+    reply: micromux::ReservationReply,
+}
+
+#[derive(Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum ReservationWaitStatus {
+    /// The session holds the resource.
+    Granted,
+    /// The request can no longer be granted; `detail` says why.
+    Ended,
+    /// The timeout elapsed while the request waits; it stays queued.
+    Timeout,
+}
+
+#[derive(Serialize, JsonSchema)]
+struct ReservationWaitResult {
+    #[serde(flatten)]
+    session_ref: SessionRef,
+    status: ReservationWaitStatus,
+    /// The grant, when the session holds the resource.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reply: Option<micromux::ReservationReply>,
+    /// Why the request can no longer be granted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
 }
 
 #[derive(Serialize, JsonSchema)]
@@ -1037,9 +1104,21 @@ async fn send_request(endpoint: &ControlEndpoint, request: Request) -> Result<Re
     Ok(client.request(request).await?)
 }
 
+/// Sends a mutation on a connection that names the project the MCP server runs in, `cwd`.
+async fn send_mutation(
+    endpoint: &ControlEndpoint,
+    cwd: &Path,
+    request: Request,
+) -> Result<Response, ToolError> {
+    let mut connection = micromux_control::connect_identified(endpoint, cwd).await?;
+    Ok(connection.client.request(request).await?)
+}
+
 struct SessionConn {
     endpoint: ControlEndpoint,
     client: Client,
+    /// The project the connection names for its mutations, named again after a reconnect.
+    project: Option<PathBuf>,
 }
 
 impl SessionConn {
@@ -1047,6 +1126,18 @@ impl SessionConn {
         Ok(Self {
             endpoint: endpoint.clone(),
             client: Client::connect(endpoint).await?,
+            project: None,
+        })
+    }
+
+    /// A connection for mutations, which names the project the MCP server runs in, `cwd`.
+    async fn connect_identified(endpoint: &ControlEndpoint, cwd: &Path) -> Result<Self, ToolError> {
+        Ok(Self {
+            endpoint: endpoint.clone(),
+            client: micromux_control::connect_identified(endpoint, cwd)
+                .await?
+                .client,
+            project: Some(cwd.to_path_buf()),
         })
     }
 
@@ -1055,7 +1146,14 @@ impl SessionConn {
         match self.client.request(request.clone()).await {
             Ok(response) => Ok(response),
             Err(ControlError::Io(_) | ControlError::Closed) if retry_safe => {
-                self.client = Client::connect(&self.endpoint).await?;
+                self.client = match &self.project {
+                    Some(cwd) => {
+                        micromux_control::connect_identified(&self.endpoint, cwd)
+                            .await?
+                            .client
+                    }
+                    None => Client::connect(&self.endpoint).await?,
+                };
                 Ok(self.client.request(request).await?)
             }
             Err(err) => Err(err.into()),
@@ -1265,6 +1363,37 @@ impl McpServer {
         }
     }
 
+    /// The session of the project the MCP server runs in.
+    ///
+    /// A reservation belongs to that project, so `MICROMUX_SESSION` never redirects it.
+    async fn reservation_session(&self) -> Result<select::Resolved, ErrorData> {
+        self.discovery
+            .resolve_project(&self.cwd)
+            .await
+            .map_err(error_data)
+    }
+
+    /// Sends a reservation request for the current project's session, on a connection whose own
+    /// description shows the session understands it.
+    async fn reservation(&self, request: Request) -> ToolResult<ReservationResult> {
+        let resolved = self.reservation_session().await?;
+        let micromux_control::IdentifiedConnection {
+            mut client,
+            session,
+        } = micromux_control::connect_identified(&resolved.endpoint, &self.cwd)
+            .await
+            .map_err(|err| error_data(err.into()))?;
+        micromux_control::require_reservations(&session).map_err(|err| error_data(err.into()))?;
+        let response = client
+            .request(request)
+            .await
+            .map_err(|err| error_data(err.into()))?;
+        Ok(Json(ReservationResult {
+            session_ref: SessionRef::from(&session),
+            reply: convert::reservation(response).map_err(error_data)?,
+        }))
+    }
+
     async fn mutate(
         &self,
         session: Option<String>,
@@ -1277,7 +1406,7 @@ impl McpServer {
             .await
             .map_err(error_data)?;
         let log_cursor = capture_mutation_cursor(&resolved.endpoint, service).await;
-        let mut conn = SessionConn::connect(&resolved.endpoint)
+        let mut conn = SessionConn::connect_identified(&resolved.endpoint, &self.cwd)
             .await
             .map_err(error_data)?;
         let response = conn.request(request).await.map_err(error_data)?;
@@ -1410,7 +1539,7 @@ impl McpServer {
             .await
             .map_err(error_data)?;
         Self::require_dynamic_capability(&resolved.info)?;
-        let response = send_request(&resolved.endpoint, request)
+        let response = send_mutation(&resolved.endpoint, &self.cwd, request)
             .await
             .map_err(error_data)?;
         let receipt =
@@ -1460,7 +1589,8 @@ impl McpServer {
         description = "List all micromux sessions currently running for this user, with their \
         name, pid, config path, working directory, advertised capabilities, discovery \
         diagnostics, and under `session` their browser URLs (`routes[].url`), allocated ports, \
-        routing status, and optional Git branch and cached open PR number (`session.git`)."
+        routing status, optional Git branch and cached open PR number (`session.git`), and the \
+        holder and queue of each resource the session uses (`session.reservations`)."
     )]
     async fn list_sessions(&self) -> ToolResult<SessionListResult> {
         let list = self.discovery.list_sessions().await.map_err(error_data)?;
@@ -1624,8 +1754,9 @@ impl McpServer {
             .resolve(&self.cwd, args.session)
             .await
             .map_err(error_data)?;
-        let response = send_request(
+        let response = send_mutation(
             &resolved.endpoint,
+            &self.cwd,
             Request::ReconcileConfig {
                 dry_run: args.dry_run,
             },
@@ -1643,8 +1774,9 @@ impl McpServer {
     #[tool(
         description = "List the services in a session with their desired/execution state, health, \
         advertised ports, pid, start time, config drift, uptime, restart state/policy, last exit \
-        code, run generation, configured/dynamic origin and revision, resolved command (argv), and \
-        working directory. The result carries a copy-pasteable session_selector."
+        code, run generation, configured/dynamic origin and revision, resolved command (argv), \
+        working directory, and the shared `resource` a service needs, plus the holder and queue \
+        of each resource the session uses. The result carries a copy-pasteable session_selector."
     )]
     async fn list_services(&self, args: Parameters<SessionArgs>) -> ToolResult<ServiceListResult> {
         let Parameters(args) = args;
@@ -1663,6 +1795,11 @@ impl McpServer {
             session: resolved.info.name,
             session_selector,
             services,
+            reservations: resolved
+                .info
+                .session
+                .map(|session| session.reservations)
+                .unwrap_or_default(),
         }))
     }
 
@@ -1976,7 +2113,7 @@ impl McpServer {
             .log_limit
             .unwrap_or(DEFAULT_RESTART_LOG_LIMIT)
             .clamp(1, MAX_RESTART_LOG_LIMIT);
-        let mut conn = SessionConn::connect(&resolved.endpoint)
+        let mut conn = SessionConn::connect_identified(&resolved.endpoint, &self.cwd)
             .await
             .map_err(error_data)?;
 
@@ -2091,7 +2228,7 @@ impl McpServer {
             .resolve(&self.cwd, args.session)
             .await
             .map_err(error_data)?;
-        let response = send_request(&resolved.endpoint, Request::RestartAll)
+        let response = send_mutation(&resolved.endpoint, &self.cwd, Request::RestartAll)
             .await
             .map_err(error_data)?;
         let acks = convert::accepted(response).map_err(error_data)?;
@@ -2341,7 +2478,7 @@ impl McpServer {
             .map_err(error_data)?;
         #[cfg(unix)]
         let process_exit = ProcessExitWatch::new(resolved.info.pid);
-        let response = send_request(&resolved.endpoint, Request::Shutdown)
+        let response = send_mutation(&resolved.endpoint, &self.cwd, Request::Shutdown)
             .await
             .map_err(error_data)?;
         convert::shutting_down(response).map_err(error_data)?;
@@ -2365,6 +2502,104 @@ impl McpServer {
             stopped,
             session_ref: SessionRef::from(&resolved.info),
             note,
+        }))
+    }
+
+    #[tool(
+        description = "Reserve a shared resource for the current project's session: granted at \
+        once while it is free, queued first in, first out otherwise. Only the session holding a \
+        resource runs the services that name it in `resource`, and starting such a service while \
+        the resource is free reserves it too. estimate_secs and reason are shown to every other \
+        session. A grant lapses unless renewed within the hour; the result's `state` says whether \
+        the session holds the resource or waits at a position, and `view` lists the holder and \
+        queue. Calling it again updates and renews the request."
+    )]
+    async fn reserve_resource(
+        &self,
+        args: Parameters<ReserveArgs>,
+    ) -> ToolResult<ReservationResult> {
+        let Parameters(args) = args;
+        self.reservation(Request::Reserve {
+            resource: args.resource,
+            estimate_secs: args.estimate_secs,
+            reason: args.reason,
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Renew the current project's session's reservation of a resource, granted \
+        or queued, moving its renew_by deadline an hour out. Renew at least hourly while you \
+        need the resource: a lapsed grant stops the session's services that need it and passes \
+        it on. The result lists the queue, so check who waits and release early when you can."
+    )]
+    async fn renew_reservation(
+        &self,
+        args: Parameters<ResourceArgs>,
+    ) -> ToolResult<ReservationResult> {
+        let Parameters(args) = args;
+        self.reservation(Request::RenewReservation {
+            resource: args.resource,
+            claim: None,
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Release the current project's session's reservation of a resource. A \
+        queued request goes at once; a grant first stops and disables the session's services \
+        that need the resource (state `draining`), then passes it to the next request."
+    )]
+    async fn release_resource(
+        &self,
+        args: Parameters<ResourceArgs>,
+    ) -> ToolResult<ReservationResult> {
+        let Parameters(args) = args;
+        self.reservation(Request::ReleaseReservation {
+            resource: args.resource,
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Wait until the current project's session holds a resource it queued for \
+        with reserve_resource, renewing the queued request every 2 seconds while it waits. \
+        Returns status granted, ended (the request was released or lapsed, or the session \
+        stopped or was replaced; detail says why), or timeout, after which the request stays \
+        queued and you can call again. A session whose services were refused the resource at \
+        start does not start them on its own once granted: enable them then."
+    )]
+    async fn wait_for_reservation(
+        &self,
+        args: Parameters<ReservationWaitArgs>,
+    ) -> ToolResult<ReservationWaitResult> {
+        let Parameters(args) = args;
+        let resolved = self.reservation_session().await?;
+        let timeout = Duration::from_secs(
+            args.timeout_secs
+                .unwrap_or(DEFAULT_WAIT_TIMEOUT_SECS)
+                .min(MAX_WAIT_TIMEOUT_SECS),
+        );
+        let waited = tokio::time::timeout(
+            timeout,
+            wait::wait_for_reservation(&resolved.endpoint, &self.cwd, &args.resource),
+        )
+        .await;
+        let (status, reply, detail) = match waited {
+            Ok(Ok(wait::ReservationWait::Granted(reply))) => {
+                (ReservationWaitStatus::Granted, Some(*reply), None)
+            }
+            Ok(Ok(wait::ReservationWait::Ended(why))) => {
+                (ReservationWaitStatus::Ended, None, Some(why))
+            }
+            Ok(Err(err)) => return Err(error_data(ToolError::from(err))),
+            Err(_) => (ReservationWaitStatus::Timeout, None, None),
+        };
+        Ok(Json(ReservationWaitResult {
+            session_ref: SessionRef::from(&resolved.info),
+            status,
+            reply,
+            detail,
         }))
     }
 
@@ -3050,7 +3285,7 @@ impl McpServer {
             }
             Err(err) => return Err(error_data(err)),
         };
-        let mut conn = SessionConn::connect(&resolved.endpoint)
+        let mut conn = SessionConn::connect_identified(&resolved.endpoint, &self.cwd)
             .await
             .map_err(error_data)?;
         let mut snapshot = match service_snapshot(&mut conn, &args.service).await {
@@ -4114,6 +4349,25 @@ services:
                 "missing {name} tool"
             );
         }
+        // The reservation tools act for the current project's session only.
+        for name in [
+            "reserve_resource",
+            "renew_reservation",
+            "release_resource",
+            "wait_for_reservation",
+        ] {
+            let tool = tools
+                .iter()
+                .find(|tool| tool.name == name)
+                .ok_or_else(|| eyre::eyre!("missing {name} tool"))?;
+            let properties = tool
+                .input_schema
+                .get("properties")
+                .and_then(serde_json::Value::as_object)
+                .ok_or_else(|| eyre::eyre!("missing {name} input properties"))?;
+            assert!(properties.contains_key("resource"), "{name}");
+            assert!(!properties.contains_key("session"), "{name}");
+        }
         for name in ["start_dynamic_service", "replace_dynamic_service"] {
             let description = tools
                 .iter()
@@ -4780,6 +5034,7 @@ services:
                 })
                 .collect(),
             services_truncated: false,
+            reservations_truncated: false,
             micromux_version: env!("CARGO_PKG_VERSION").to_string(),
             capabilities: None,
         }

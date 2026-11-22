@@ -207,6 +207,19 @@ pub fn shutting_down(response: Response) -> Result<(), ToolError> {
     }
 }
 
+/// Extract where the session's request for a resource stands.
+///
+/// # Errors
+///
+/// Returns a [`ToolError`] if the session replied with an error or an unexpected response.
+pub fn reservation(response: Response) -> Result<micromux::ReservationReply, ToolError> {
+    match response {
+        Response::Reservation(reply) => Ok(*reply),
+        Response::Error { code, message } => Err(remote_error(code, message)),
+        other => Err(ToolError::Unexpected(format!("{other:?}"))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

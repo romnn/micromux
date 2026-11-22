@@ -531,15 +531,23 @@ pub enum CtlAction {
         #[arg(long)]
         history: bool,
     },
-    /// Wait until a service is healthy, or until its run exits with `--exit`.
+    /// Wait until a service is healthy, until its run exits with `--exit`, or until the session
+    /// holds a resource with `--reservation`.
     ///
     /// Exits 0 once the condition holds (with `--exit`, once the run exits with status 0), 3 when
     /// the run exited instead (with `--exit`, with a non-zero status), 4 when the service is
     /// blocked behind a dependency that can no longer meet its condition, 5 when the service is
     /// disabled or retired, and 124 when the timeout elapses.
+    /// With `--reservation`, it renews the session's queued request while it waits, exits 0 once
+    /// the request is granted, 5 when it can no longer be granted (it was released or lapsed, or
+    /// the session stopped or was replaced), and 124 when the timeout elapses.
+    #[command(group = clap::ArgGroup::new("target").required(true).args(["service", "reservation"]))]
     Wait {
         /// The service to wait for.
-        service: String,
+        service: Option<String>,
+        /// Wait until the session holds this resource, which `reserve` queued for.
+        #[arg(long, conflicts_with_all = ["service", "healthy", "exit", "after_generation"])]
+        reservation: Option<String>,
         /// Wait until the service is up, and healthy if it has a healthcheck (the default).
         #[arg(long, conflicts_with = "exit")]
         healthy: bool,
@@ -552,6 +560,34 @@ pub enum CtlAction {
         /// Accept only a run newer than this generation, such as the one `restart` printed.
         #[arg(long)]
         after_generation: Option<u64>,
+    },
+    /// Reserve a shared resource for the session: granted at once while it is free, queued
+    /// otherwise.
+    ///
+    /// Only the session holding a resource runs the services that name it.
+    /// Renew the reservation within the hour, or it lapses and passes to the next request.
+    Reserve {
+        /// The resource, as services name it in `resource`.
+        resource: String,
+        /// How long you expect to hold it, such as `1h`; shown to other sessions.
+        #[arg(long = "for", value_parser = humantime::parse_duration)]
+        estimate: Option<std::time::Duration>,
+        /// Why you need it; shown to other sessions.
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Renew the session's reservation of a resource, granted or queued, and show its queue.
+    Renew {
+        /// The resource.
+        resource: String,
+    },
+    /// Release the session's reservation of a resource.
+    ///
+    /// The session first stops its services that need the resource, then passes it to the next
+    /// request.
+    Release {
+        /// The resource.
+        resource: String,
     },
     /// Show the session identity.
     Describe,

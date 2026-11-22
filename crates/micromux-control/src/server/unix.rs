@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use futures::{SinkExt, StreamExt};
 use micromux::{
-    ChangeKind, CommandRejection, PtyInputSendError, SchedulerStopped, ServiceCommandResult,
-    ServiceSnapshot, SessionChange, SessionModelReader, TerminalSize,
+    Caller, ChangeKind, CommandRejection, PtyInputSendError, SchedulerStopped,
+    ServiceCommandResult, ServiceSnapshot, SessionChange, SessionModelReader, TerminalSize,
 };
 use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -446,6 +446,8 @@ async fn handle_connection<S>(
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
     let mut conn = framed(stream);
+    // Who the client is, which `Identify` names for the rest of the connection.
+    let mut caller = Caller::Unknown;
     loop {
         let read = tokio::select! {
             () = shutdown.cancelled() => return,
@@ -480,7 +482,30 @@ async fn handle_connection<S>(
             _ => {}
         }
 
+        if let Request::Identify { project } = request {
+            let response = if crate::endpoint::is_endpoint_hash(&project) {
+                caller = Caller::Project(project);
+                Response::Identified
+            } else {
+                Response::error(
+                    ErrorCode::BadRequest,
+                    "a project is the endpoint hash of its canonical config path",
+                )
+            };
+            if !write_response(&mut conn, &response, &shutdown).await {
+                return;
+            }
+            continue;
+        }
+
         if matches!(request, Request::Shutdown) {
+            let refusal = shutdown_refusal(&server, &caller).await;
+            if let Some(refusal) = refusal {
+                if !write_response(&mut conn, &refusal, &shutdown).await {
+                    return;
+                }
+                continue;
+            }
             // Acknowledge first, then cancel the shared session token: the accept loop, scheduler,
             // and TUI all observe it, so this stops the whole session (the same path as Ctrl-C).
             // Writing before cancelling ensures the client sees the ack before the endpoint vanishes.
@@ -495,7 +520,7 @@ async fn handle_connection<S>(
             () = shutdown.cancelled() => return,
             dispatched = tokio::time::timeout(
                 REQUEST_TIMEOUT,
-                dispatch(&server, environment_files, request),
+                dispatch(&server, environment_files, &caller, request),
             ) => {
                 match dispatched {
                     Ok(response) => response,
@@ -544,7 +569,20 @@ fn response_within_frame(response: &Response) -> Cow<'_, Response> {
     ))
 }
 
+/// The description shortened to fit the frame: first its service index, then, when that is not
+/// enough, its reservations.
 fn bounded_description(info: &SessionInfo) -> Option<SessionInfo> {
+    bounded_service_index(info).or_else(|| {
+        let mut info = info.clone();
+        if let Some(session) = &mut info.session {
+            session.reservations.clear();
+        }
+        info.reservations_truncated = true;
+        bounded_service_index(&info)
+    })
+}
+
+fn bounded_service_index(info: &SessionInfo) -> Option<SessionInfo> {
     let mut info = info.clone();
     let services = std::mem::take(&mut info.services);
     info.services_truncated = true;
@@ -677,11 +715,17 @@ fn lag_replay_changes(snapshots: &[ServiceSnapshot]) -> impl Iterator<Item = Ses
 }
 
 /// Answers one request; [`Request::WriteEnvironmentFile`] writes to `environment_files`.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one flat arm per request variant; splitting the dispatch would scatter it"
+)]
 async fn dispatch(
     server: &ControlServer,
     environment_files: &Arc<EnvironmentFiles>,
+    caller: &Caller,
     request: Request,
 ) -> Response {
+    let caller = caller.clone();
     match request {
         Request::Describe => Response::Description(describe_with_git(server).await),
         Request::ListServices => Response::Services(server.reader.services()),
@@ -728,12 +772,12 @@ async fn dispatch(
             after,
             tail,
         } => get_events(&server.reader, &service, after, tail),
-        Request::Restart { service } => acknowledge(server.control.restart(&service).await),
-        Request::RestartAll => acknowledge(server.control.restart_all().await),
-        Request::Enable { service } => acknowledge(server.control.enable(&service).await),
-        Request::Disable { service } => acknowledge(server.control.disable(&service).await),
+        Request::Restart { service } => acknowledge(server.control.restart(caller, &service).await),
+        Request::RestartAll => acknowledge(server.control.restart_all(caller).await),
+        Request::Enable { service } => acknowledge(server.control.enable(caller, &service).await),
+        Request::Disable { service } => acknowledge(server.control.disable(caller, &service).await),
         Request::StartDynamicService { params } => {
-            acknowledge_dynamic(server.control.start_dynamic(params).await)
+            acknowledge_dynamic(server.control.start_dynamic(caller, params).await)
         }
         Request::ReplaceDynamicService {
             service,
@@ -742,7 +786,7 @@ async fn dispatch(
         } => acknowledge_dynamic(
             server
                 .control
-                .replace_dynamic(&service, expected_revision, params)
+                .replace_dynamic(caller, &service, expected_revision, params)
                 .await,
         ),
         Request::RenewDynamicService {
@@ -752,34 +796,93 @@ async fn dispatch(
         } => acknowledge_dynamic(
             server
                 .control
-                .renew_dynamic(&service, expected_revision, expires_after)
+                .renew_dynamic(caller, &service, expected_revision, expires_after)
                 .await,
         ),
         Request::StopDynamicService { service } => {
-            acknowledge_dynamic(server.control.stop_dynamic(&service).await)
+            acknowledge_dynamic(server.control.stop_dynamic(caller, &service).await)
         }
         Request::GetEnvironment { service } => environment(server, service.as_ref()).await,
         Request::GetSessionEnvironment => session_environment(server).await,
         Request::WriteEnvironmentFile { service } => {
             write_environment_file(server, environment_files, service).await
         }
-        Request::ReconcileConfig { dry_run } => reconcile(server, dry_run).await,
+        Request::ReconcileConfig { dry_run } => {
+            acknowledge_reconcile(server.control.reconcile_config(caller, dry_run).await)
+        }
         Request::SendInput {
             service,
             data,
             paste,
-        } => send_input(server, service, data.into_inner(), paste).await,
+        } => send_input(server, &caller, service, data.into_inner(), paste).await,
+        Request::Reserve {
+            resource,
+            estimate_secs,
+            reason,
+        } => acknowledge_reservation(
+            server
+                .control
+                .reserve(caller, &resource, estimate_secs, reason)
+                .await,
+        ),
+        Request::RenewReservation { resource, claim } => acknowledge_reservation(
+            server
+                .control
+                .renew_reservation(caller, &resource, claim)
+                .await,
+        ),
+        Request::ReleaseReservation { resource } => {
+            acknowledge_reservation(server.control.release_reservation(caller, &resource).await)
+        }
         Request::ResizeTerminal { cols, rows } => resize_terminal(server, cols, rows).await,
         // Subscribe is intercepted before dispatch; reaching here is a protocol misuse.
         Request::Subscribe | Request::SubscribeWithVersion { .. } => Response::error(
             ErrorCode::BadRequest,
             "subscribe must be the only request on a connection",
         ),
-        // Shutdown is intercepted before dispatch; reaching here is a protocol misuse.
-        Request::Shutdown => {
-            Response::error(ErrorCode::BadRequest, "shutdown is handled before dispatch")
-        }
+        // Shutdown and Identify are intercepted before dispatch; reaching here is a protocol
+        // misuse.
+        Request::Shutdown | Request::Identify { .. } => Response::error(
+            ErrorCode::BadRequest,
+            "shutdown and identify are handled before dispatch",
+        ),
     }
+}
+
+/// Why `caller` may not stop the session, if it may not.
+///
+/// Another project may not stop a session that uses a resource. The own project may always, and
+/// anyone may stop a session that uses none, even when the scheduler is wedged.
+async fn shutdown_refusal(server: &ControlServer, caller: &Caller) -> Option<Response> {
+    let uses_resources = server
+        .session
+        .as_ref()
+        .is_some_and(micromux::SessionStatus::uses_resources);
+    if is_own(server, caller) || !uses_resources {
+        return None;
+    }
+    match tokio::time::timeout(
+        REQUEST_TIMEOUT,
+        server.control.authorize_shutdown(caller.clone()),
+    )
+    .await
+    {
+        Ok(Ok(Ok(()))) => None,
+        Ok(Ok(Err(rejection))) => Some(rejection_response(rejection)),
+        Ok(Err(SchedulerStopped)) => Some(Response::error(
+            ErrorCode::SchedulerStopped,
+            "the scheduler has stopped",
+        )),
+        Err(_) => Some(Response::error(
+            ErrorCode::Busy,
+            "the scheduler did not answer in time whether the session may stop",
+        )),
+    }
+}
+
+/// Whether `caller` works in this session's own project.
+fn is_own(server: &ControlServer, caller: &Caller) -> bool {
+    matches!(caller, Caller::Project(project) if *project == server.identity.id)
 }
 
 /// Queues input for a running service's PTY behind any earlier input, from this or another
@@ -789,6 +892,7 @@ async fn dispatch(
 /// clients interleaves only at request boundaries, like two terminals typing into one tmux pane.
 async fn send_input(
     server: &ControlServer,
+    caller: &Caller,
     service: micromux::ServiceID,
     data: Vec<u8>,
     paste: bool,
@@ -799,6 +903,18 @@ async fn send_input(
     let Some(snapshot) = server.reader.service(&service) else {
         return unknown_service(&service);
     };
+    if let Some(resource) = snapshot.resource.as_deref()
+        && !is_own(server, caller)
+    {
+        return Response::error(
+            ErrorCode::PolicyDenied,
+            format!(
+                "service `{service}` needs resource `{resource}`, so only the project of {} may \
+                 type into it",
+                server.identity.config_path
+            ),
+        );
+    }
     // The scheduler would drop this input and record the drop only as a service event, which an
     // attached TUI does not follow, so refuse it here, where the client sees why.
     // The scheduler still drops input that loses a race with the process exiting.
@@ -860,10 +976,6 @@ fn no_terminal() -> Response {
         ErrorCode::PolicyDenied,
         "this session does not accept terminal input",
     )
-}
-
-async fn reconcile(server: &ControlServer, dry_run: bool) -> Response {
-    acknowledge_reconcile(server.control.reconcile_config(dry_run).await)
 }
 
 async fn environment(server: &ControlServer, service: Option<&micromux::ServiceID>) -> Response {
@@ -1093,6 +1205,11 @@ async fn describe_with_git(server: &ControlServer) -> SessionInfo {
         session.git = status
             .git_context(std::path::Path::new(&info.working_dir))
             .await;
+        // The reservation files are read from disk, off the async workers.
+        let status = status.clone();
+        session.reservations = tokio::task::spawn_blocking(move || status.reservations())
+            .await
+            .unwrap_or_default();
     }
     info
 }
@@ -1138,6 +1255,7 @@ fn describe(server: &ControlServer) -> SessionInfo {
         config_path: server.identity.config_path.clone(),
         services,
         services_truncated: false,
+        reservations_truncated: false,
         micromux_version: server.identity.micromux_version.clone(),
         session: server
             .session
@@ -1496,6 +1614,10 @@ fn rejection_response(rejection: CommandRejection) -> Response {
             format!("expected revision {expected}, actual revision {actual}"),
         ),
         CommandRejection::InvalidSpec(message) => Response::error(ErrorCode::InvalidSpec, message),
+        CommandRejection::ResourceUnavailable(message) => Response::error(ErrorCode::Busy, message),
+        CommandRejection::ReservationStore(message) => {
+            Response::error(ErrorCode::Internal, message)
+        }
     }
 }
 
@@ -1516,6 +1638,12 @@ fn acknowledge_with<T>(
 
 fn acknowledge(result: Result<ServiceCommandResult, SchedulerStopped>) -> Response {
     acknowledge_with(result, |services| Response::Accepted { services })
+}
+
+fn acknowledge_reservation(
+    result: Result<micromux::ReservationResult, SchedulerStopped>,
+) -> Response {
+    acknowledge_with(result, |reply| Response::Reservation(Box::new(reply)))
 }
 
 fn acknowledge_dynamic(
@@ -1760,6 +1888,7 @@ mod tests {
             config_path: "/project/micromux.yaml".to_string(),
             services,
             services_truncated: false,
+            reservations_truncated: false,
             micromux_version: "test".to_string(),
             capabilities: None,
         };
@@ -2021,7 +2150,7 @@ mod tests {
             Request::ResizeTerminal { cols: 80, rows: 24 },
         ] {
             assert_matches!(
-                dispatch(&server, &files, request).await,
+                dispatch(&server, &files, &micromux::Caller::Unknown, request).await,
                 Response::Error {
                     code: ErrorCode::PolicyDenied,
                     ..
@@ -2050,7 +2179,7 @@ mod tests {
             paste: false,
         };
         assert_matches!(
-            dispatch(&server, &files, send("missing")).await,
+            dispatch(&server, &files, &micromux::Caller::Unknown, send("missing")).await,
             Response::Error {
                 code: ErrorCode::UnknownService,
                 ..
@@ -2059,7 +2188,7 @@ mod tests {
         // The scheduler never ran, so `svc` has no process to type into, and the client hears so
         // instead of its input vanishing.
         assert_matches!(
-            dispatch(&server, &files, send("svc")).await,
+            dispatch(&server, &files, &micromux::Caller::Unknown, send("svc")).await,
             Response::Error {
                 code: ErrorCode::InvalidState,
                 message,
@@ -2067,7 +2196,13 @@ mod tests {
         );
         for (cols, rows) in [(0, 24), (80, 0)] {
             assert_matches!(
-                dispatch(&server, &files, Request::ResizeTerminal { cols, rows }).await,
+                dispatch(
+                    &server,
+                    &files,
+                    &micromux::Caller::Unknown,
+                    Request::ResizeTerminal { cols, rows }
+                )
+                .await,
                 Response::Error {
                     code: ErrorCode::BadRequest,
                     ..
@@ -2078,6 +2213,7 @@ mod tests {
             dispatch(
                 &server,
                 &files,
+                &micromux::Caller::Unknown,
                 Request::ResizeTerminal { cols: 80, rows: 24 }
             )
             .await,
@@ -2090,6 +2226,7 @@ mod tests {
             dispatch(
                 &server,
                 &files,
+                &micromux::Caller::Unknown,
                 Request::ResizeTerminal { cols: 80, rows: 24 }
             )
             .await,

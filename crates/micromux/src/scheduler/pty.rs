@@ -285,6 +285,8 @@ pub(super) struct StartServiceParams<'a> {
     pub(super) shutdown: &'a CancellationToken,
     pub(super) terminate: &'a CancellationToken,
     pub(super) pty_size: portable_pty::PtySize,
+    /// The fence of the resource the service needs, which the run's processes lock shared.
+    pub(super) fence: Option<std::path::PathBuf>,
 }
 
 impl PtyHandles {
@@ -2641,6 +2643,7 @@ pub(super) fn start_service_with_pty_size(
         shutdown,
         terminate,
         pty_size,
+        fence,
     } = params;
     let service_id = service.id.clone();
     let Some((prog, args)) = service.spec.command.split_first() else {
@@ -2695,6 +2698,7 @@ pub(super) fn start_service_with_pty_size(
         args,
         stop,
         service.spec.cleanup.as_ref(),
+        fence.as_deref(),
         path.as_deref(),
         working_dir.as_path(),
     )
@@ -2809,6 +2813,7 @@ pub(super) fn start_service_with_pty_size(
             environment: env_vars.clone(),
             working_dir: working_dir.clone(),
             sink: sink.clone(),
+            fence: fence.clone(),
         });
 
     let health_task = service.spec.healthcheck.clone().map(|health_check| {

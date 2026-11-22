@@ -1141,6 +1141,23 @@ fn wrap_info_row(row: Line<'static>, width: usize) -> Vec<Line<'static>> {
 }
 
 /// Everything known about one service, for its details popup.
+/// The latest run's generation, start time, and exit code, as far as known.
+fn run_summary(snapshot: &micromux::ServiceSnapshot) -> Vec<String> {
+    let mut run = vec![format!("generation {}", snapshot.run_generation)];
+    run.extend(
+        snapshot
+            .started_at_unix_ms
+            .and_then(short_local_time)
+            .map(|started| format!("started {started}")),
+    );
+    run.extend(
+        snapshot
+            .last_exit_code
+            .map(|code| format!("last exit code {code}")),
+    );
+    run
+}
+
 fn service_info_rows(
     snapshot: &micromux::ServiceSnapshot,
     dependency_kind: &dyn Fn(&str) -> Option<micromux::ServiceKind>,
@@ -1183,18 +1200,7 @@ fn service_info_rows(
         snapshot.stop_signal,
         snapshot.stop_grace_period.as_secs()
     );
-    let mut run = vec![format!("generation {}", snapshot.run_generation)];
-    run.extend(
-        snapshot
-            .started_at_unix_ms
-            .and_then(short_local_time)
-            .map(|started| format!("started {started}")),
-    );
-    run.extend(
-        snapshot
-            .last_exit_code
-            .map(|code| format!("last exit code {code}")),
-    );
+    let run = run_summary(snapshot);
 
     let mut rows = info_rows("State", vec![Line::from(state)]);
     if snapshot.name != snapshot.id {
@@ -1208,6 +1214,9 @@ fn service_info_rows(
     }
     rows.extend(info_rows("URLs", urls));
     rows.extend(info_rows("Ports", port_rows(snapshot, session)));
+    if let Some(resource) = &snapshot.resource {
+        rows.extend(info_rows("Resource", vec![resource.clone()]));
+    }
     rows.extend(info_rows(
         "Command",
         command_rows(&micromux::shell_join(&snapshot.command)),
@@ -1416,6 +1425,49 @@ fn session_info_rows(session: Option<&micromux::SessionSummary>) -> Vec<Line<'st
             .map(|(name, port)| Span::raw(format!(":{port}  {name}")))
             .collect(),
     ));
+    if !session.reservations.is_empty() {
+        rows.push(Line::default());
+        rows.extend(info_rows(
+            "Resources",
+            reservation_rows(&session.reservations),
+        ));
+    }
+    rows
+}
+
+/// Each resource's holder, then the requests waiting for it in queue order.
+fn reservation_rows(reservations: &[micromux::ResourceView]) -> Vec<Line<'static>> {
+    let time = |unix_ms| short_local_time(unix_ms).unwrap_or_default();
+    let mut rows = Vec::new();
+    for view in reservations {
+        let holder = match &view.owner {
+            Some(owner) => {
+                let state = match owner.state {
+                    micromux::OwnerState::Granted => "held by",
+                    micromux::OwnerState::Draining => "releasing, held by",
+                };
+                format!(
+                    "{}  {state} {}  granted {}  renew by {}",
+                    view.name,
+                    owner.claim,
+                    time(owner.granted_at_unix_ms),
+                    time(owner.claim.renew_by_unix_ms)
+                )
+            }
+            None => format!("{}  free", view.name),
+        };
+        rows.push(Line::raw(holder));
+        for (index, waiter) in view.waiters.iter().enumerate() {
+            rows.push(Line::from(
+                format!(
+                    "  {}. {waiter}  waiting since {}",
+                    index + 1,
+                    time(waiter.requested_at_unix_ms)
+                )
+                .fg(Color::DarkGray),
+            ));
+        }
+    }
     rows
 }
 
@@ -2882,6 +2934,10 @@ impl App {
                 )
             }
             crate::InfoView::Session => {
+                let mut session = session;
+                if let Some(session) = &mut session {
+                    session.reservations = self.source.reservations();
+                }
                 let name = session
                     .as_ref()
                     .map_or_else(|| "no session".to_string(), |session| session.name.clone());

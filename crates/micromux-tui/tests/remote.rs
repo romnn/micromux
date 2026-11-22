@@ -130,7 +130,7 @@ async fn wait_for_running(source: &RemoteSource) -> eyre::Result<u64> {
 async fn remote_source_observes_logs_and_restart_generation() -> eyre::Result<()> {
     let dir = unique_dir("remote")?;
     let session = build_session(dir.path(), SESSION_YAML)?;
-    let source = RemoteSource::connect(session.endpoint.clone()).await?;
+    let source = RemoteSource::connect(session.endpoint.clone(), std::env::current_dir()?).await?;
 
     let deadline = Instant::now() + Duration::from_secs(3);
     let initial_line = loop {
@@ -181,7 +181,7 @@ async fn remote_source_observes_logs_and_restart_generation() -> eyre::Result<()
 async fn remote_terminal_types_into_and_resizes_the_service() -> eyre::Result<()> {
     let dir = unique_dir("remote-terminal")?;
     let session = build_session(dir.path(), INTERACTIVE_YAML)?;
-    let source = RemoteSource::connect(session.endpoint.clone()).await?;
+    let source = RemoteSource::connect(session.endpoint.clone(), std::env::current_dir()?).await?;
     let terminal = source
         .terminal()
         .ok_or_else(|| eyre::eyre!("a current session accepts terminal input"))?;
@@ -260,7 +260,7 @@ async fn boot_replacement(dir: &Path) -> eyre::Result<Session> {
 async fn replaced_session_instance_recovers_the_render_log_cursor() -> eyre::Result<()> {
     let dir = unique_dir("replace")?;
     let session = build_session(dir.path(), TICKER_YAML)?;
-    let source = RemoteSource::connect(session.endpoint.clone()).await?;
+    let source = RemoteSource::connect(session.endpoint.clone(), std::env::current_dir()?).await?;
 
     let mut cached = Vec::new();
     let initial_line = follow_until(&source, &mut cached, Duration::from_secs(3), |cached| {
@@ -314,7 +314,7 @@ async fn detach_after_resolution_leaves_the_session_running() -> eyre::Result<()
         Some(&session.config_path),
     )
     .await?;
-    let source = RemoteSource::connect(resolved.endpoint).await?;
+    let source = RemoteSource::connect(resolved.endpoint, std::env::current_dir()?).await?;
     wait_for_running(&source).await?;
 
     source.cancel();

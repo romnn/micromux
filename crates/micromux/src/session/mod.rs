@@ -8,6 +8,7 @@
 
 mod git;
 mod registry;
+mod reservations;
 mod routes;
 mod status;
 
@@ -22,6 +23,10 @@ pub(crate) use registry::{
     DEFAULT_PORT_RANGE, Lease, PortRequest, create_private_dir, user_state_directory,
 };
 pub use registry::{PortRegistry, STATE_DIR_VARIABLE, state_directory_override};
+pub use reservations::{
+    Claim, Owner, OwnerState, ReservationReply, ReservationState, ResourceView,
+};
+pub(crate) use reservations::{Holder, Request, ReservationError, ResourceStore};
 pub use routes::{CATCH_ALL_HOST, Route, RouteError, route_path_problem};
 pub(crate) use routes::{owner as route_owner, resolve as resolve_routes};
 pub use status::{RoutingStatus, SessionStatus, SessionSummary};
@@ -87,9 +92,9 @@ pub enum SessionError {
     /// No per-user state directory could be determined for the port registry.
     #[error("cannot determine a per-user state directory for the port registry")]
     NoStateDirectory,
-    /// Allocations and routes need the config file's path, which identifies the session across
-    /// restarts.
-    #[error("allocate_ports and routes need a config loaded from a file")]
+    /// Allocations, routes and resources need the config file's path, which identifies the
+    /// session across restarts.
+    #[error("allocate_ports, routes and a service's resource need a config loaded from a file")]
     NoConfigPath,
     /// Another micromux already runs this config.
     #[error(
@@ -272,6 +277,7 @@ pub struct Session {
     proxy_port: u16,
     preferred_proxy_port: u16,
     lease: Option<Lease>,
+    resources: Option<ResourceStore>,
 }
 
 impl Session {
@@ -280,8 +286,8 @@ impl Session {
     /// A config loaded from a file is registered until the returned session (and every
     /// [`crate::Micromux`] built from it) is dropped, which keeps session names unique among live
     /// sessions and reserves the allocated ports.
-    /// A config without a file path is not registered and can use neither `allocate_ports` nor
-    /// `routes`.
+    /// A config without a file path is not registered and can use neither `allocate_ports`,
+    /// `routes`, nor a service `resource`.
     /// No allocated port ever equals the configured proxy ports.
     ///
     /// # Errors
@@ -290,8 +296,8 @@ impl Session {
     /// [`SessionError::NameInUse`] when another live session has the same name,
     /// [`SessionError::PortBusy`] when a persisted port is held by a foreign process,
     /// [`SessionError::PortReserved`] when a persisted port became a proxy port,
-    /// [`SessionError::NoConfigPath`] when a config without a file path allocates ports or has
-    /// routes, and an I/O variant when the registry cannot be accessed.
+    /// [`SessionError::NoConfigPath`] when a config without a file path allocates ports, has
+    /// routes, or names a resource, and an I/O variant when the registry cannot be accessed.
     pub fn establish<F>(
         config: &ConfigFile<F>,
         registry: &PortRegistry,
@@ -317,7 +323,12 @@ impl Session {
         let proxy_port =
             proxy_port.map_or_else(|| settings.proxy.port(), std::num::NonZeroU16::get);
         let Some(config_path) = config.config_path.as_deref() else {
-            if settings.needs_config_path() {
+            let has_resource = config
+                .config
+                .services
+                .values()
+                .any(|service| service.resource.is_some());
+            if settings.needs_config_path() || has_resource {
                 return Err(SessionError::NoConfigPath);
             }
             return Ok(Self {
@@ -328,6 +339,7 @@ impl Session {
                 proxy_port,
                 preferred_proxy_port: proxy_port,
                 lease: None,
+                resources: None,
             });
         };
         let requests = port_requests(&settings);
@@ -341,6 +353,15 @@ impl Session {
             &excluded,
             &settings.port_range(),
         )?;
+        let resources = ResourceStore::new(
+            registry,
+            Holder {
+                session_id: config_path_key(config_path),
+                instance: lease.token.clone(),
+                session_name: identity.name.clone(),
+                config_path: config_path.display().to_string(),
+            },
+        )?;
         Ok(Self {
             identity,
             settings,
@@ -349,6 +370,7 @@ impl Session {
             proxy_port,
             preferred_proxy_port: proxy_port,
             lease: Some(lease),
+            resources: Some(resources),
         })
     }
 
@@ -424,6 +446,7 @@ impl Session {
             ports,
             provisional,
             lease: None,
+            resources: None,
         }
     }
 
@@ -495,6 +518,7 @@ impl Session {
             ports: self.ports,
             proxy_port: self.proxy_port,
             lease: self.lease,
+            resources: self.resources,
         }
     }
 }
@@ -512,6 +536,9 @@ pub(crate) struct SessionContext {
         reason = "held for RAII: the registry lease keeps the allocated ports reserved"
     )]
     pub(crate) lease: Option<Lease>,
+    /// The session's reservations of shared resources; `None` without a config file, which a
+    /// session needs to hold any.
+    pub(crate) resources: Option<ResourceStore>,
 }
 
 #[cfg(all(test, unix))]
@@ -528,7 +555,35 @@ impl SessionContext {
             ports: IndexMap::new(),
             proxy_port: 80,
             lease: None,
+            resources: None,
         }
+    }
+
+    /// A session registered in `registry` for `config_path`, which can hold resources.
+    pub(crate) fn registered(
+        registry: &PortRegistry,
+        config_path: &Path,
+        name: &str,
+    ) -> Result<Self, SessionError> {
+        let (_, lease) = registry.acquire(config_path, name, &[], &[], &DEFAULT_PORT_RANGE)?;
+        let resources = ResourceStore::new(
+            registry,
+            Holder {
+                session_id: config_path_key(config_path),
+                instance: lease.token.clone(),
+                session_name: name.to_string(),
+                config_path: config_path.display().to_string(),
+            },
+        )?;
+        Ok(Self {
+            identity: SessionIdentity {
+                name: name.to_string(),
+                domain: DEFAULT_DOMAIN.to_string(),
+            },
+            resources: Some(resources),
+            lease: Some(lease),
+            ..Self::unconfigured()
+        })
     }
 }
 
@@ -720,6 +775,31 @@ mod tests {
             session.environment().variables.get(PROXY_PORT_VARIABLE),
             Some(&"8181".to_string())
         );
+        Ok(())
+    }
+
+    /// A service that needs a resource needs the config file, which identifies the session
+    /// that holds the resource.
+    #[test]
+    fn resources_need_a_config_file() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let registry = PortRegistry::at(directory.path());
+        let mut config = crate::config::from_str(
+            "version: 1\nservices:\n  app:\n    command: [\"true\"]\n    resource: desk\n",
+            Path::new("/projects/one"),
+            0usize,
+            None,
+            &mut Vec::new(),
+        )?;
+        let session = Session::establish(&config, &registry);
+        assert!(
+            matches!(session, Err(SessionError::NoConfigPath)),
+            "{session:?}"
+        );
+
+        config.config_path = Some(PathBuf::from("/projects/one/micromux.yaml"));
+        let session = Session::establish(&config, &registry)?;
+        assert!(session.resources.is_some());
         Ok(())
     }
 

@@ -825,3 +825,93 @@ fn sessions_wait_for_a_previous_sessions_cleanup() -> eyre::Result<()> {
     let _ = survivors_after(&pids, Duration::from_secs(20));
     Ok(())
 }
+
+/// A resource held by a session whose supervisor is killed with `SIGKILL` passes to the waiting
+/// session only once the dead session's service, which takes seconds to stop, has ended.
+#[test]
+fn a_killed_holder_hands_its_resource_on_only_after_its_teardown() -> eyre::Result<()> {
+    let root = tempfile::tempdir()?;
+    // Both sessions share one registry; the name is short, since control sockets live inside it.
+    let state = root.path().join("s");
+    let session = |project: &Path| {
+        let mut command = Command::new(MICROMUX);
+        command
+            .env(micromux::STATE_DIR_VARIABLE, &state)
+            .current_dir(project)
+            .stdin(Stdio::null());
+        command
+    };
+    let holder = root.path().join("a");
+    let queued_project = root.path().join("b");
+    let stopped = root.path().join("stopped");
+    // The holder's service notes its start, and on the stop signal takes three seconds before
+    // it notes its stop and exits. It ends on its own after a minute in any case.
+    let config = format!(
+        "version: 1\nservices:\n  app:\n    resource: desk\n    command:\n      - sh\n      - -c\n      \
+         - trap 'sleep 3; echo > {}; exit 0' TERM; echo $$ > app.pid; sleep 60 & wait\n",
+        stopped.display()
+    );
+    for project in [&holder, &queued_project] {
+        std::fs::create_dir(project)?;
+        std::fs::write(project.join("micromux.yaml"), &config)?;
+    }
+
+    let mut first = session(&holder)
+        .arg("serve")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn()?;
+    read_pids(&holder, &["app.pid"], &mut first)?;
+    let second = KillGroupOnDrop(
+        session(&queued_project)
+            .arg("serve")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()?,
+    );
+    let ctl = |args: &[&str]| session(&queued_project).arg("ctl").args(args).output();
+
+    // The second session queues behind the first.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let queued = loop {
+        let output = ctl(&["reserve", "desk"])?;
+        if output.status.success() || Instant::now() >= deadline {
+            break output;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    let text = String::from_utf8_lossy(&queued.stdout);
+    eyre::ensure!(
+        queued.status.success() && text.contains("waiting at position 1"),
+        "{text}{}",
+        String::from_utf8_lossy(&queued.stderr)
+    );
+    let waiting = session(&queued_project)
+        .args(["ctl", "wait", "--reservation", "desk", "--timeout", "60s"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    let killed = Instant::now();
+    first.kill()?;
+    first.wait()?;
+    let granted = waiting.wait_with_output()?;
+    let waited = killed.elapsed();
+
+    let _ = ctl(&["stop"]);
+    drop(second);
+    eyre::ensure!(
+        granted.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&granted.stdout),
+        String::from_utf8_lossy(&granted.stderr)
+    );
+    assert!(
+        stopped.exists(),
+        "the resource passed on before the holder's service stopped"
+    );
+    assert!(waited < Duration::from_secs(30), "waited {waited:?}");
+    Ok(())
+}

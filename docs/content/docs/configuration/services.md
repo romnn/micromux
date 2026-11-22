@@ -231,6 +231,49 @@ Known gaps:
 - On macOS, processes that a timed-out cleanup detached from its process tree can escape the kill.
 - On Windows there is no shim: micromux runs the cleanup itself, and micromux exiting kills a cleanup that is still running.
 
+## Shared resources
+
+Sessions of different worktrees run side by side, but some services should run only once per machine, because each copy costs memory, a GPU, or a fixed port: a desktop app every worktree uses, say. Name such a service's `resource`, and only one session at a time runs it:
+
+```yaml
+services:
+  desktop:
+    command: ./run-desktop-app
+    resource: desktop-app      # lowercase letters, digits and inner hyphens, at most 63 characters
+```
+
+**Who holds it.** A resource is held by at most one session of your user on this host; the rest queue for it, first in, first out. Only the session holding the resource starts the services that name it. A command that starts such a service, `restart`, `enable`, `restart-all`, or a dynamic service's start or replacement, takes the resource at once, even while the service still waits for its dependencies, as `reserve` without options would; the session then holds it until it releases it or the grant lapses. While another session holds the resource, the command fails, changes nothing, and names the holder: its session and worktree, its estimate and reason, and when it must renew. Session startup and other automatic starts take the resource when the service is ready to run, and while another session holds it they disable the service with an event naming the holder. A disabled service does not start on its own once the session gets the resource later: enable it then.
+
+**Reserve, wait, renew, release.** From a session's project:
+
+```bash
+micromux ctl reserve desktop-app --for 1h --reason "test the model loader against this worktree's build"
+micromux ctl wait --reservation desktop-app --timeout 2h   # renews the queued request while it waits
+micromux ctl renew desktop-app                             # lists who waits
+micromux ctl release desktop-app
+```
+
+`reserve` grants the resource at once when it is free and queues the request otherwise. `--for` and `--reason` are shown to everyone else and change nothing about the grant. The MCP server has the same operations as `reserve_resource`, `wait_for_reservation`, `renew_reservation`, and `release_resource`. See [the control plane]({{< relref "../agent-control/control-plane.md" >}}#shared-resources) for the exit codes.
+
+**Renew or lose it.** A grant holds until its `renew_by` deadline, one hour after it was granted or last renewed, and a session may keep a resource for as long as it keeps renewing. Each renewal lists the queue, so a holder sees the demand at least once an hour. A grant that is not renewed in time lapses: the session stops and disables its services that need the resource, then passes it to the next request. Renewing after the deadline fails; reserve again. A queued request lapses the same way, and a running `wait --reservation` renews it.
+
+**Release.** Releasing first stops and disables the session's services that need the resource, then passes it on; until they have stopped, the reservation reads as releasing. The next session gets the resource only once none of those processes is left, so it can start its own copy on the same ports.
+
+**Dead sessions.** When a session's process is gone, through a crash, a kill, or a reboot, the next session that looks drops its grant and queued requests at once, without waiting for the deadline. It gets the resource only once the dead session's services and their cleanups have ended, as after a release.
+
+**Who may control these services.** Only clients working in the session's own project, the config found at or above their working directory, may start, restart, enable, disable, or replace a service that names a resource, type into it in an attached TUI, reserve, renew, or release for the session, apply a reconcile that touches such a service, or stop the session while it uses a resource. Every other client is refused, with the project that may. The scope is cooperative: it keeps sessions of one user from taking each other's resources by accident, it is no security boundary. The session's own TUI may always.
+
+**Changing `resource`.** A config reload, a restart's or a reconcile, refuses to add, remove, or rename the `resource` of a service that is running; stop the service first.
+
+**Rollout.** Every worktree that runs the service needs a micromux that understands `resource`: an older one ignores the key with a warning and runs the service regardless. Set `strict: true` so an older micromux refuses the config instead. A service with a `resource` needs a config loaded from a file.
+
+Known limitations:
+
+- If micromux dies in the moment after it started a service's cleanup and before the cleanup's shim locked the resource, the next session can get the resource while that cleanup still runs.
+- Without process containment, as on Windows, nothing stops a dead session's services, and the next session can get the resource while they still run.
+- The deadline is kept in wall-clock time between sessions, so a clock step can end a queued request early, or keep a request whose agent is gone queued longer.
+- `ctl ls`, `ctl describe`, MCP, and the TUI show the reservation files as last written, so a session that died can show as holder or waiter until any session next reserves, renews, polls, or starts a service that needs the resource.
+
 ## Per-service overrides
 
 `restart`, `healthcheck` timing, and `logs` set at the top level are inherited by every service, and any service can override them:

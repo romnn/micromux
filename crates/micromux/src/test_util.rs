@@ -48,6 +48,7 @@ pub(crate) fn service_config(name: &str, command: (&str, &[&str])) -> config::Se
         color: None,
         log_retention: LogRetention::default(),
         log_display: crate::LogDisplay::default(),
+        resource: None,
     }
 }
 

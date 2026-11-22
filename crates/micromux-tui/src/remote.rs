@@ -12,9 +12,9 @@ use micromux::{
     TerminalForwarding, TerminalSize,
 };
 use micromux_control::{
-    Client, ControlEndpoint, ControlError, EVENTS_PROTOCOL_VERSION, ErrorCode, InputBytes,
-    MAX_REMOTE_PASTE_BYTES, Request, Response, SessionInfo, Subscription,
-    TERMINAL_PROTOCOL_VERSION,
+    Client, ControlEndpoint, ControlError, EVENTS_PROTOCOL_VERSION, ErrorCode,
+    IdentifiedConnection, InputBytes, MAX_REMOTE_PASTE_BYTES, Request, Response, SessionInfo,
+    Subscription, TERMINAL_PROTOCOL_VERSION, connect_identified,
 };
 use parking_lot::RwLock;
 use tokio::sync::{broadcast, mpsc};
@@ -59,6 +59,13 @@ struct MirrorEntry {
     // Manual restarts clear visible logs without resetting their sequence. The acknowledged
     // generation distinguishes that clear from an automatic restart, which retains logs.
     clear_logs_after_generation: Option<u64>,
+}
+
+/// Where the mirror connects, and the directory whose project its commands name.
+struct SessionTarget {
+    endpoint: ControlEndpoint,
+    /// The attached TUI's working directory, see [`connect_identified`].
+    cwd: std::path::PathBuf,
 }
 
 /// What the TUI asks of the session, drained by the mirror task.
@@ -139,14 +146,22 @@ impl RequestConnection for Client {
 impl RemoteSource {
     /// Connect to a session, populate the mirror, and start its refresh task.
     ///
+    /// The connection that carries the TUI's commands and input names the project found at or
+    /// above `cwd`, see [`connect_identified`].
+    ///
     /// # Errors
     ///
     /// Returns a typed control error if the initial connection, protocol check, subscription, or
     /// mirror population fails. Once connected, transport failures are handled by reconnecting in
     /// the background.
-    pub async fn connect(endpoint: ControlEndpoint) -> Result<Self, ControlError> {
-        let mut request = Client::connect(&endpoint).await?;
-        let session = request.describe().await?;
+    pub async fn connect(
+        endpoint: ControlEndpoint,
+        cwd: std::path::PathBuf,
+    ) -> Result<Self, ControlError> {
+        let IdentifiedConnection {
+            client: mut request,
+            session,
+        } = connect_identified(&endpoint, &cwd).await?;
         let store = Arc::new(RwLock::new(MirrorStore {
             session,
             services: IndexMap::new(),
@@ -163,7 +178,7 @@ impl RemoteSource {
         let (terminal, forwarding) = TerminalControl::forwarding(MAX_REMOTE_PASTE_BYTES);
         let shutdown = CancellationToken::new();
         tokio::spawn(run_remote(
-            endpoint,
+            SessionTarget { endpoint, cwd },
             Arc::clone(&store),
             changes.clone(),
             RemoteInbox {
@@ -344,6 +359,7 @@ impl RemoteSource {
             config_path: "/micromux.yaml".to_string(),
             services: Vec::new(),
             services_truncated: false,
+            reservations_truncated: false,
             micromux_version: "test".to_string(),
             capabilities: None,
         };
@@ -431,7 +447,7 @@ impl Drop for RemoteSource {
 }
 
 async fn run_remote(
-    endpoint: ControlEndpoint,
+    target: SessionTarget,
     store: Arc<RwLock<MirrorStore>>,
     changes: broadcast::Sender<SessionChange>,
     mut inbox: RemoteInbox,
@@ -472,7 +488,7 @@ async fn run_remote(
 
             let established = tokio::select! {
                 () = shutdown.cancelled() => return,
-                established = establish(&endpoint, &store, &changes) => established,
+                established = establish(&target, &store, &changes) => established,
             };
             match established {
                 Ok((new_request, new_subscription)) => {
@@ -613,15 +629,17 @@ async fn run_connected(
 }
 
 async fn establish(
-    endpoint: &ControlEndpoint,
+    target: &SessionTarget,
     store: &Arc<RwLock<MirrorStore>>,
     changes: &broadcast::Sender<SessionChange>,
 ) -> Result<(Client, Subscription), ControlError> {
-    let mut request = Client::connect(endpoint).await?;
-    let session = request.describe().await?;
+    let IdentifiedConnection {
+        client: mut request,
+        session,
+    } = connect_identified(&target.endpoint, &target.cwd).await?;
     update_session(store, session);
     let (subscription, service_ids) =
-        subscribe_without_sync_gap(endpoint, &mut request, store).await?;
+        subscribe_without_sync_gap(&target.endpoint, &mut request, store).await?;
     store.write().connected = true;
     publish_full_refresh(changes, &service_ids);
     Ok((request, subscription))
@@ -1344,6 +1362,7 @@ mod tests {
             config_path: "/tmp/micromux.yaml".to_string(),
             services: Vec::new(),
             services_truncated: false,
+            reservations_truncated: false,
             micromux_version: "test".to_string(),
             capabilities: None,
         }
@@ -1578,6 +1597,7 @@ mod tests {
             routes: Vec::new(),
             allocated_ports: IndexMap::new(),
             routing: Some(routing),
+            reservations: Vec::new(),
         };
         let described = |routing| SessionInfo {
             session: Some(Box::new(summary(routing))),

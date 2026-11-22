@@ -8,7 +8,7 @@ use micromux_control::{
     runtime_dir_statuses, unique_answering_session_probes, usable_runtime_dirs,
 };
 
-use micromux_control::wait::{self, ChangeWaker, WaitFor, WaitVerdict};
+use micromux_control::wait::{self, ChangeWaker, ReservationWait, WaitFor, WaitVerdict};
 
 use crate::options::CtlAction;
 
@@ -53,13 +53,132 @@ fn request_for(action: &CtlAction) -> Request {
         } => Request::GetHealthHistory {
             service: service.clone(),
         },
-        // A wait polls the service; `wait` drives the loop.
-        CtlAction::Wait { service, .. } => Request::GetService {
-            service: service.clone(),
+        // A wait polls the service, or renews the reservation; `run` drives the loop.
+        CtlAction::Wait {
+            service,
+            reservation,
+            ..
+        } => match reservation {
+            Some(resource) => Request::RenewReservation {
+                resource: resource.clone(),
+                claim: None,
+            },
+            None => Request::GetService {
+                service: service.clone().unwrap_or_default(),
+            },
+        },
+        CtlAction::Reserve {
+            resource,
+            estimate,
+            reason,
+        } => Request::Reserve {
+            resource: resource.clone(),
+            estimate_secs: estimate.map(|estimate| estimate.as_secs()),
+            reason: reason.clone(),
+        },
+        CtlAction::Renew { resource } => Request::RenewReservation {
+            resource: resource.clone(),
+            claim: None,
+        },
+        CtlAction::Release { resource } => Request::ReleaseReservation {
+            resource: resource.clone(),
         },
         CtlAction::Describe => Request::Describe,
         CtlAction::Stop => Request::Shutdown,
     }
+}
+
+/// Whether the action changes the session, so its connection names the project `ctl` runs in.
+fn mutates(action: &CtlAction) -> bool {
+    match action {
+        CtlAction::Ls
+        | CtlAction::Logs { .. }
+        | CtlAction::LogRuns { .. }
+        | CtlAction::Health { .. }
+        | CtlAction::Describe => false,
+        CtlAction::Wait { reservation, .. } => reservation.is_some(),
+        CtlAction::Restart { .. }
+        | CtlAction::RestartAll
+        | CtlAction::Enable { .. }
+        | CtlAction::Disable { .. }
+        | CtlAction::StopDynamic { .. }
+        | CtlAction::Reconcile { .. }
+        | CtlAction::Reserve { .. }
+        | CtlAction::Renew { .. }
+        | CtlAction::Release { .. }
+        | CtlAction::Stop => true,
+    }
+}
+
+/// A Unix-milliseconds time in the local time zone, for display.
+fn local_time(unix_ms: u64) -> String {
+    i64::try_from(unix_ms)
+        .ok()
+        .and_then(chrono::DateTime::from_timestamp_millis)
+        .map_or_else(
+            || unix_ms.to_string(),
+            |time| {
+                time.with_timezone(&chrono::Local)
+                    .format("%Y-%m-%d %H:%M:%S")
+                    .to_string()
+            },
+        )
+}
+
+/// Prints each resource's holder, then the requests waiting for it in queue order.
+fn print_reservations(reservations: &[micromux::ResourceView]) {
+    if reservations.is_empty() {
+        return;
+    }
+    println!("  resources:");
+    for view in reservations {
+        match &view.owner {
+            Some(owner) => {
+                let state = match owner.state {
+                    micromux::OwnerState::Granted => "held",
+                    micromux::OwnerState::Draining => "releasing",
+                };
+                println!(
+                    "    - {}: {state} by {}, granted at {}, renew by {}",
+                    view.name,
+                    owner.claim,
+                    local_time(owner.granted_at_unix_ms),
+                    local_time(owner.claim.renew_by_unix_ms)
+                );
+            }
+            None => println!("    - {}: free", view.name),
+        }
+        for (index, claim) in view.waiters.iter().enumerate() {
+            println!(
+                "      {}. {}, waiting since {}, renew by {}",
+                index + 1,
+                claim,
+                local_time(claim.requested_at_unix_ms),
+                local_time(claim.renew_by_unix_ms)
+            );
+        }
+    }
+}
+
+/// Prints where the session's request for a resource stands, then the resource's queue.
+fn print_reservation(reply: &micromux::ReservationReply) {
+    let resource = &reply.view.name;
+    match (reply.state, reply.own_claim()) {
+        (micromux::ReservationState::Granted, Some(claim)) => println!(
+            "{resource}: granted, renew by {}",
+            local_time(claim.renew_by_unix_ms)
+        ),
+        (micromux::ReservationState::Waiting { position }, Some(claim)) => println!(
+            "{resource}: waiting at position {position} of {}, renew by {}",
+            reply.view.waiters.len(),
+            local_time(claim.renew_by_unix_ms)
+        ),
+        (micromux::ReservationState::Draining, _) => {
+            println!("{resource}: releasing once the services that need it stopped");
+        }
+        _ => println!("{resource}: released"),
+    }
+    print_reservations(std::slice::from_ref(&reply.view));
 }
 
 fn service_origin_label(service: &micromux::ServiceSnapshot) -> String {
@@ -294,6 +413,12 @@ fn print_response(response: &Response) -> Result<(), crate::Error> {
             if info.services_truncated {
                 println!("    … service index truncated by server limits");
             }
+            if let Some(session) = &info.session {
+                print_reservations(&session.reservations);
+            }
+            if info.reservations_truncated {
+                println!("  … reservations left out by server limits");
+            }
         }
         Response::Accepted { services } => {
             if services.is_empty() {
@@ -310,6 +435,7 @@ fn print_response(response: &Response) -> Result<(), crate::Error> {
             println!("{}", dynamic_receipt_line(receipt));
         }
         Response::Reconcile(receipt) => print_reconcile(receipt),
+        Response::Reservation(reply) => print_reservation(reply),
         Response::Error { code, message } => {
             return Err(crate::Error::Message(format!("{code:?}: {message}")));
         }
@@ -320,7 +446,8 @@ fn print_response(response: &Response) -> Result<(), crate::Error> {
         Response::Change(_)
         | Response::Environment(_)
         | Response::EnvironmentFile { .. }
-        | Response::TerminalQueued => {}
+        | Response::TerminalQueued
+        | Response::Identified => {}
     }
     Ok(())
 }
@@ -553,11 +680,35 @@ async fn connect_project_session(
 /// Returns an error if no session is running for this project, the runtime dir is unresolvable, or
 /// the request fails.
 pub async fn run(action: CtlAction, config_path: Option<&Path>) -> Result<(), crate::Error> {
+    if let CtlAction::Wait {
+        reservation: Some(resource),
+        timeout,
+        ..
+    } = &action
+    {
+        // The timeout bounds finding the session too.
+        let outcome = tokio::time::timeout(*timeout, wait_for_reservation(config_path, resource))
+            .await
+            .ok();
+        return report_reservation_wait(resource, *timeout, outcome.transpose()?);
+    }
+
     let ProjectSession {
         endpoint,
         mut client,
         ..
     } = connect_project(config_path).await?;
+    if mutates(&action) {
+        let info = client
+            .describe_identified(&std::env::current_dir()?)
+            .await?;
+        if matches!(
+            action,
+            CtlAction::Reserve { .. } | CtlAction::Renew { .. } | CtlAction::Release { .. }
+        ) {
+            micromux_control::require_reservations(&info)?;
+        }
+    }
 
     if let CtlAction::Wait {
         exit,
@@ -583,7 +734,50 @@ pub async fn run(action: CtlAction, config_path: Option<&Path>) -> Result<(), cr
     }
 
     let response = client.request(request_for(&action)).await?;
-    print_response(&response)
+    print_response(&response)?;
+    // A listing ends with the resources the session uses, which only its description carries.
+    if matches!(action, CtlAction::Ls)
+        && let Some(session) = client.describe().await?.session
+    {
+        print_reservations(&session.reservations);
+    }
+    Ok(())
+}
+
+/// Connects to the project's session and waits until it holds `resource`.
+async fn wait_for_reservation(
+    config_path: Option<&Path>,
+    resource: &str,
+) -> Result<ReservationWait, crate::Error> {
+    let ProjectSession { endpoint, .. } = connect_project(config_path).await?;
+    let cwd = std::env::current_dir()?;
+    Ok(wait::wait_for_reservation(&endpoint, &cwd, resource).await?)
+}
+
+/// Prints how a `ctl wait --reservation` ended, `None` when it timed out, and maps it to the
+/// process exit code.
+fn report_reservation_wait(
+    resource: &str,
+    timeout: std::time::Duration,
+    outcome: Option<ReservationWait>,
+) -> Result<(), crate::Error> {
+    match outcome {
+        Some(ReservationWait::Granted(reply)) => {
+            print_reservation(&reply);
+            Ok(())
+        }
+        Some(ReservationWait::Ended(why)) => {
+            eprintln!("the reservation of {resource} can no longer be granted: {why}");
+            Err(crate::Error::Exit(WAIT_UNAVAILABLE))
+        }
+        None => {
+            eprintln!(
+                "timed out after {} waiting for the reservation of {resource}",
+                humantime::format_duration(timeout)
+            );
+            Err(crate::Error::Exit(WAIT_TIMED_OUT))
+        }
+    }
 }
 
 /// Poll a service with `request` until the wait resolves or `timeout` elapses.
@@ -641,7 +835,8 @@ const WAIT_POLL: std::time::Duration = std::time::Duration::from_millis(500);
 const WAIT_EXITED: i32 = 3;
 /// Exit code of a `ctl wait` on a service blocked behind a failed dependency.
 const WAIT_DEPENDENCY_FAILED: i32 = 4;
-/// Exit code of a `ctl wait` on a disabled or retired service.
+/// Exit code of a `ctl wait` on a disabled or retired service, or on a reservation that can no
+/// longer be granted.
 const WAIT_UNAVAILABLE: i32 = 5;
 /// Exit code of a `ctl wait` that timed out, as `timeout(1)` uses.
 const WAIT_TIMED_OUT: i32 = 124;
@@ -711,7 +906,10 @@ fn report_wait(
 
 #[cfg(test)]
 mod tests {
-    use super::{dynamic_receipt_line, request_for, service_origin_label, service_retired_label};
+    use super::{
+        ReservationWait, dynamic_receipt_line, report_reservation_wait, request_for,
+        service_origin_label, service_retired_label,
+    };
     use crate::options::CtlAction;
     use micromux_control::{DynamicServiceAck, Request};
     use similar_asserts::assert_eq;
@@ -804,5 +1002,32 @@ mod tests {
             line,
             "accepted debug (revision 2, generation 3, already_retired=true)"
         );
+    }
+
+    /// A granted reservation exits 0, one that can no longer be granted 5, and a timeout 124.
+    #[test]
+    fn reservation_waits_map_to_exit_codes() {
+        let granted = micromux::ReservationReply {
+            view: micromux::ResourceView {
+                name: "desk".to_string(),
+                owner: None,
+                waiters: Vec::new(),
+            },
+            claim: None,
+            state: micromux::ReservationState::Granted,
+        };
+        let timeout = std::time::Duration::from_secs(1);
+        let code = |outcome| match report_reservation_wait("desk", timeout, outcome) {
+            Ok(()) => 0,
+            Err(crate::Error::Exit(code)) => code,
+            Err(_) => -1,
+        };
+
+        assert_eq!(code(Some(ReservationWait::Granted(Box::new(granted)))), 0);
+        assert_eq!(
+            code(Some(ReservationWait::Ended("released".to_string()))),
+            5
+        );
+        assert_eq!(code(None), 124);
     }
 }

@@ -1002,6 +1002,7 @@ mod tests {
                     timeout: Duration::from_secs(120),
                     files: None,
                 }),
+                resource: None,
             }
         );
         Ok(())
@@ -1722,6 +1723,7 @@ impl Service {
                 stop_grace_period: config.stop_grace_period.into_inner(),
                 stop_signal: config.stop_signal.into_inner(),
                 cleanup,
+                resource: config.resource.map(yaml_spanned::Spanned::into_inner),
             },
             origin: ServiceOrigin::Configured,
             startup_mode: config.startup_mode,

@@ -4183,7 +4183,12 @@ mod tests {
             .await?
             .ok_or_else(|| eyre::eyre!("lifecycle relay stopped"))?;
         match command {
-            micromux::Command::StopDynamic { service, ack } => {
+            micromux::Command::StopDynamic {
+                caller,
+                service,
+                ack,
+            } => {
+                assert_eq!(caller, micromux::Caller::Local);
                 assert_eq!(service, "svc");
                 assert!(ack.is_none());
             }

@@ -501,6 +501,8 @@ pub(crate) struct CleanupTask {
     pub(crate) working_dir: SpawnWorkingDirectory,
     /// The run's log, which receives the cleanup's output as `[cleanup]` lines.
     pub(crate) sink: RunSink,
+    /// The fence of the resource the service needs, which the cleanup-only shim locks shared.
+    pub(crate) fence: Option<std::path::PathBuf>,
 }
 
 /// A cleanup whose log is started and whose shim, under containment, is waiting for its go.
@@ -540,7 +542,11 @@ impl CleanupTask {
             })
             .ok()
         });
-        let launch = match crate::containment::wrap_cleanup(&self.spec, self.stop_signal) {
+        let launch = match crate::containment::wrap_cleanup(
+            &self.spec,
+            self.stop_signal,
+            self.fence.as_deref(),
+        ) {
             Some(wrapped) => self.spawn_shim(wrapped).unwrap_or_else(|err| {
                 let error = format!("cannot start the cleanup shim: {err}");
                 if let Some(files) = &self.spec.files {

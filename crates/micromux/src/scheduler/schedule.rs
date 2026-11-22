@@ -8,7 +8,7 @@ use crate::config::DependencyCondition;
 use crate::model::{DependencyFailure, DependencyFailureReason};
 use crate::service::StartupMode;
 use crate::{DependencySpec, ServiceEventKind, ServiceKind, ServiceMap, health_check::Health};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -21,6 +21,14 @@ pub(super) struct ScheduleContext<'a> {
     pub(super) test_events: &'a mut TestEventSink,
     pub(super) writer: &'a SessionModelWriter,
     pub(super) shutdown: &'a CancellationToken,
+    /// The session's reservations, which locate each resource's fence; `None` when the session
+    /// cannot hold resources.
+    pub(super) resources: Option<&'a crate::session::ResourceStore>,
+    /// This session's requests for resources, checked at each spawn.
+    pub(super) mine: &'a BTreeMap<String, super::reservations::Mine>,
+    /// Resources that services ready to start need but this session may not start yet, with the
+    /// services that wait for each.
+    pub(super) needed_resources: &'a mut BTreeMap<String, Vec<ServiceID>>,
 }
 
 /// One dependency that is holding a service back, kept with its condition so the wait can be
@@ -362,6 +370,7 @@ fn finish_service_start(
                 since: tokio::time::Instant::now(),
                 exited_at: None,
                 stop_requested: false,
+                resource: service.spec.resource.clone(),
             });
             sync_model(ctx.writer, service, runtime);
             let mut event = service_event(
@@ -431,6 +440,24 @@ fn start_service_if_ready(
     if !blocking_dependencies(ctx, service).is_empty() {
         return false;
     }
+    // A service that needs a resource starts only while the session holds it, and every
+    // process of the run locks the resource's fence.
+    let fence = match &service.spec.resource {
+        None => None,
+        Some(resource) => {
+            let store = ctx
+                .resources
+                .filter(|_| ctx.mine.get(resource).is_some_and(|mine| mine.may_start()));
+            let Some(store) = store else {
+                ctx.needed_resources
+                    .entry(resource.clone())
+                    .or_default()
+                    .push(service_id.clone());
+                return false;
+            };
+            Some(store.fence_path(resource))
+        }
+    };
 
     tracing::info!(service_id, "starting service");
 
@@ -481,6 +508,7 @@ fn start_service_if_ready(
         shutdown: ctx.shutdown,
         terminate: &terminate,
         pty_size: ctx.current_pty_size,
+        fence,
     });
     finish_service_start(
         ctx,
@@ -578,6 +606,7 @@ mod tests {
         writer: &'a SessionModelWriter,
         shutdown: &'a CancellationToken,
         #[cfg(test)] test_events: &'a mut TestEventSink,
+        needed_resources: &'a mut BTreeMap<String, Vec<ServiceID>>,
     ) -> ScheduleContext<'a> {
         ScheduleContext {
             services,
@@ -593,6 +622,9 @@ mod tests {
             test_events,
             writer,
             shutdown,
+            resources: None,
+            mine: const { &BTreeMap::new() },
+            needed_resources,
         }
     }
 
@@ -629,6 +661,7 @@ mod tests {
         let shutdown = CancellationToken::new();
         let (test_tx, _test_rx) = mpsc::channel(1);
         let mut test_events = TestEventSink::new(test_tx);
+        let mut needed_resources = BTreeMap::new();
         let ctx = test_context(
             &services,
             &mut runtimes,
@@ -636,6 +669,7 @@ mod tests {
             &writer,
             &shutdown,
             &mut test_events,
+            &mut needed_resources,
         );
 
         // Only the `healthy` entry blocks: `dep` is running, so its `started` entry is satisfied.

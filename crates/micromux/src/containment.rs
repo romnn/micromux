@@ -34,6 +34,12 @@
 //! Either shim holds the cleanup lock while it cleans up, so a restarted session can wait for it
 //! (see [`crate::wait_for_previous_cleanups`]).
 //!
+//! For a service that needs a shared resource, both shims also lock the resource's fence shared
+//! (`--fence`) for as long as they run: the service shim before it first checks the supervisor,
+//! so it never starts the command once a dead supervisor's resource passed on, and the
+//! cleanup-only shim before it waits for its go.
+//! The handoff contract and its exceptions are in the reservation store's documentation.
+//!
 //! What stays outside: a process that detaches in the milliseconds between a forced stop's last
 //! process walk and its group kill, if the supervisor dies right then, and descendants that a
 //! probe detached before it ended.
@@ -121,6 +127,8 @@ pub(crate) struct Wrapped {
 ///
 /// `cleanup` is the service's cleanup, which the shim runs itself should the supervisor die;
 /// probes have none.
+/// `fence` is the fence of the resource the service needs, which the shim locks shared while it
+/// runs.
 /// `path` and `cwd` are the command's `PATH` and working directory.
 ///
 /// # Errors
@@ -139,6 +147,7 @@ pub(crate) fn wrap(
     args: &[String],
     stop: StopPolicy,
     cleanup: Option<&crate::spec::CleanupSpec>,
+    fence: Option<&Path>,
     path: Option<&std::ffi::OsStr>,
     cwd: &Path,
 ) -> std::io::Result<Option<Wrapped>> {
@@ -149,19 +158,21 @@ pub(crate) fn wrap(
     locate(program, path, cwd)?;
     #[cfg(not(unix))]
     let _ = (path, cwd);
-    Ok(Some(under(shim, program, args, stop, cleanup)))
+    Ok(Some(under(shim, program, args, stop, cleanup, fence)))
 }
 
 /// How to run `cleanup` under a cleanup-only shim, or `None` when containment is off.
 ///
 /// The shim starts the cleanup once it reads a byte from its stdin or the stdin closes, and
 /// enforces the cleanup's timeout itself.
+/// It locks `fence` shared, if given, before it waits.
 pub(crate) fn wrap_cleanup(
     cleanup: &crate::spec::CleanupSpec,
     stop_signal: crate::spec::StopSignal,
+    fence: Option<&Path>,
 ) -> Option<Wrapped> {
     SHIM.get()
-        .map(|shim| cleanup_under(shim, cleanup, stop_signal))
+        .map(|shim| cleanup_under(shim, cleanup, stop_signal, fence))
 }
 
 /// The command line that runs `cleanup` under a cleanup-only shim at `shim`.
@@ -169,6 +180,7 @@ fn cleanup_under(
     shim: &Path,
     cleanup: &crate::spec::CleanupSpec,
     stop_signal: crate::spec::StopSignal,
+    fence: Option<&Path>,
 ) -> Wrapped {
     let args = [
         SHIM_COMMAND,
@@ -179,6 +191,7 @@ fn cleanup_under(
     .into_iter()
     .map(OsString::from)
     .chain(cleanup_flags(cleanup))
+    .chain(fence_flags(fence))
     .collect();
     Wrapped {
         program: shim.to_path_buf(),
@@ -200,6 +213,7 @@ fn under(
         grace,
     }: StopPolicy,
     cleanup: Option<&crate::spec::CleanupSpec>,
+    fence: Option<&Path>,
 ) -> Wrapped {
     let mut shim_args: Vec<OsString> = vec![
         SHIM_COMMAND.into(),
@@ -221,6 +235,7 @@ fn under(
             cleanup.command.iter().map(OsString::from),
         ));
     }
+    shim_args.extend(fence_flags(fence));
     Wrapped {
         program: shim.to_path_buf(),
         args: shim_args,
@@ -243,6 +258,13 @@ fn cleanup_flags(cleanup: &crate::spec::CleanupSpec) -> Vec<OsString> {
         ]);
     }
     flags
+}
+
+/// The shim flag that names a resource's fence.
+fn fence_flags(fence: Option<&Path>) -> Vec<OsString> {
+    fence
+        .map(|fence| vec!["--fence".into(), fence.as_os_str().to_owned()])
+        .unwrap_or_default()
 }
 
 /// The variables that carry `argv`, one per element, named `prefix` plus its position.
@@ -349,6 +371,8 @@ struct ShimArgs {
     cleanup: Option<Cleanup>,
     /// The variables that carried the commands, which neither command inherits.
     carriers: Vec<OsString>,
+    /// The fence the shim locks shared for as long as it runs.
+    fence: Option<PathBuf>,
 }
 
 #[cfg(unix)]
@@ -358,6 +382,8 @@ struct CleanupOnlyArgs {
     cleanup: Cleanup,
     /// The variables that carried the command, which the command does not inherit.
     carriers: Vec<OsString>,
+    /// The fence the shim locks shared for as long as it runs.
+    fence: Option<PathBuf>,
 }
 
 /// A cleanup command and how to run it.
@@ -384,6 +410,7 @@ impl Invocation {
         let mut cleanup_timeout = None;
         let mut cleanup_log = None;
         let mut cleanup_lock = None;
+        let mut fence = None;
         while let Some(flag) = args.next() {
             let name = flag.to_string_lossy().into_owned();
             match name.as_str() {
@@ -401,6 +428,7 @@ impl Invocation {
                 }
                 "--cleanup-log" => cleanup_log = Some(PathBuf::from(value(&mut args, &name)?)),
                 "--cleanup-lock" => cleanup_lock = Some(PathBuf::from(value(&mut args, &name)?)),
+                "--fence" => fence = Some(PathBuf::from(value(&mut args, &name)?)),
                 _ => return Err(format!("unknown argument `{name}`")),
             }
         }
@@ -426,6 +454,7 @@ impl Invocation {
                 stop_signal,
                 cleanup: cleanup(command)?,
                 carriers,
+                fence,
             }));
         }
         let program = command.remove(0);
@@ -439,6 +468,7 @@ impl Invocation {
                 .then(|| cleanup(cleanup_command))
                 .transpose()?,
             carriers,
+            fence,
         }))
     }
 }
@@ -542,6 +572,15 @@ mod shim {
             }
         };
 
+        // Taken before the supervisor check, so a shim whose supervisor died before it holds the
+        // fence never starts the command of a resource that may have passed on.
+        let _fence = match args.fence.as_deref().map(lock_fence).transpose() {
+            Ok(fence) => fence,
+            Err(err) => {
+                eprintln!("micromux shim: cannot lock the resource fence: {err}");
+                return EXIT_CANNOT_RUN;
+            }
+        };
         if !supervisor_alive(args.supervisor) {
             return 1;
         }
@@ -632,6 +671,14 @@ mod shim {
     ///
     /// The supervisor already started the log with a header for the run.
     pub(super) fn run_cleanup_only(args: &CleanupOnlyArgs) -> i32 {
+        // A cleanup still runs without the fence: leaving the service's leftovers would be worse.
+        let _fence = args.fence.as_deref().and_then(|path| {
+            lock_fence(path)
+                .inspect_err(|err| {
+                    eprintln!("micromux shim: cannot lock {}: {err}", path.display());
+                })
+                .ok()
+        });
         // Adopt the cleanup's orphans, so a timeout still reaches what it detached.
         #[cfg(target_os = "linux")]
         if let Err(err) = rustix::process::set_child_subreaper(Some(rustix::process::getpid())) {
@@ -659,6 +706,18 @@ mod shim {
         let status = run_cleanup(&args.cleanup, args.stop_signal, &args.carriers, false, lock);
         drop(signals);
         status
+    }
+
+    /// Locks the resource fence at `path` shared, waiting while a session probes it.
+    fn lock_fence(path: &std::path::Path) -> std::io::Result<File> {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)?;
+        file.lock_shared()?;
+        Ok(file)
     }
 
     /// Whether the supervisor exits within [`SUPERVISOR_EXIT_WAIT`].
@@ -1097,6 +1156,7 @@ mod tests {
             &["-c".to_string(), "next dev".to_string()],
             StopPolicy::default(),
             None,
+            None,
         );
         assert!(
             !wrapped
@@ -1204,6 +1264,7 @@ mod tests {
             &["compose".to_string(), "up".to_string()],
             StopPolicy::default(),
             Some(&cleanup),
+            None,
         );
         assert!(
             !wrapped
@@ -1243,6 +1304,7 @@ mod tests {
             Path::new("/bin/micromux"),
             &cleanup_spec(false),
             crate::spec::StopSignal::Int,
+            None,
         );
         let args = wrapped.args.clone();
         let parsed = cleanup_only(args.into_iter().skip(1), wrapped_env(wrapped))?;
@@ -1255,6 +1317,35 @@ mod tests {
         assert_eq!(parsed.cleanup.log, None);
         assert_eq!(parsed.cleanup.lock, None);
         assert_eq!(parsed.carriers.len(), 3);
+        assert_eq!(parsed.fence, None);
+        Ok(())
+    }
+
+    /// Both shims of a service that needs a resource learn the resource's fence.
+    #[test]
+    fn fences_travel_to_both_shims() -> Result<(), String> {
+        let fence = Path::new("/state/ports/resources/desktop.fence");
+        let wrapped = under(
+            Path::new("/bin/micromux"),
+            Path::new("app"),
+            &[],
+            StopPolicy::default(),
+            None,
+            Some(fence),
+        );
+        let args = wrapped.args.clone();
+        let parsed = supervise(args.into_iter().skip(1), wrapped_env(wrapped))?;
+        assert_eq!(parsed.fence.as_deref(), Some(fence));
+
+        let wrapped = cleanup_under(
+            Path::new("/bin/micromux"),
+            &cleanup_spec(true),
+            crate::spec::StopSignal::Term,
+            Some(fence),
+        );
+        let args = wrapped.args.clone();
+        let parsed = cleanup_only(args.into_iter().skip(1), wrapped_env(wrapped))?;
+        assert_eq!(parsed.fence.as_deref(), Some(fence));
         Ok(())
     }
 }

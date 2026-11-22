@@ -585,6 +585,8 @@ pub struct Service {
     pub log_retention: LogRetention,
     /// Effective viewer presentation after applying global defaults and this service's overrides.
     pub log_display: LogDisplay,
+    /// Shared resource the service needs, which one session at a time may run.
+    pub resource: Option<Spanned<String>>,
 }
 
 /// A service's `cleanup` mapping.

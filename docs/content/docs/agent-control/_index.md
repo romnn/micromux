@@ -60,6 +60,7 @@ The tools cover the full lifecycle:
 - **Session lifecycle** — when the MCP server has `--allow-session-start` (add it to the configuration above if wanted), `start_session` spawns a detached headless `micromux serve`, capped at eight requests per minute; `stop_session` stops a session and frees its ports (handy when switching between git worktrees that bind the same ports).
 - **Config** — `validate_config` (a candidate file) and `reconcile_config` (apply on-disk edits to a live session; see [Reconcile]({{< relref "control-plane.md" >}}#reconcile-on-disk-changes)).
 - **Runtime services** — the `start_dynamic_service` / `replace_dynamic_service` / `stop_dynamic_service` lifecycle. See [Dynamic services]({{< relref "dynamic-services.md" >}}).
+- **Shared resources** — `reserve_resource`, `wait_for_reservation`, `renew_reservation`, and `release_resource` for the current project's session, for a service that only one session at a time may run. See [Shared resources]({{< relref "control-plane.md" >}}#shared-resources).
 
 Manual restarts, enables, and due automatic restarts reload the latest `micromux.yaml` service definitions before spawning, so command, environment, port, restart-policy, healthcheck, and log-retention edits take effect without stopping the session.
 

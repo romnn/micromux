@@ -35,7 +35,7 @@ use super::{SessionError, config_path_key};
 /// connections never take a port a session has been promised.
 pub(crate) const DEFAULT_PORT_RANGE: RangeInclusive<u16> = 20000..=32767;
 
-const REGISTRY_LOCK: &str = "registry.lock";
+pub(super) const REGISTRY_LOCK: &str = "registry.lock";
 
 /// How long a starting session waits for one holder to release the registry lock.
 ///
@@ -66,13 +66,19 @@ pub const STATE_DIR_VARIABLE: &str = "MICROMUX_STATE_DIR";
 
 /// Persisted port assignment of one session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct Record {
+pub(super) struct Record {
     /// Canonical config path, for humans and conflict messages.
     config_path: String,
     /// Session name, which must be unique among live sessions.
     session_name: String,
     /// Allocated port per variable name.
     ports: IndexMap<String, u16>,
+    /// Token of the session instance that wrote the record, which tells a restarted session from
+    /// the one a reservation names.
+    ///
+    /// Absent in records written by a micromux that does not know reservations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) instance: Option<String>,
 }
 
 /// One variable a session asks a port for.
@@ -100,6 +106,8 @@ pub(crate) struct Lease {
         reason = "held for RAII: the exclusive lock marks this session live in the registry"
     )]
     instance: File,
+    /// Identifies this session instance in its registry record, unique across restarts.
+    pub(crate) token: String,
 }
 
 /// Where the per-user port registry lives.
@@ -109,7 +117,7 @@ pub struct PortRegistry {
     /// Whether nothing on the host listens on a port.
     port_is_free: fn(u16) -> bool,
     /// How long [`Self::acquire`] waits for the registry lock.
-    lock_timeout: Duration,
+    pub(super) lock_timeout: Duration,
 }
 
 impl Default for PortRegistry {
@@ -153,7 +161,7 @@ impl PortRegistry {
         }
     }
 
-    fn directory(&self) -> Result<PathBuf, SessionError> {
+    pub(super) fn directory(&self) -> Result<PathBuf, SessionError> {
         let directory = match &self.directory {
             Some(directory) => directory.clone(),
             None => user_registry_directory().ok_or(SessionError::NoStateDirectory)?,
@@ -206,7 +214,8 @@ impl PortRegistry {
     /// A session that had to fall back therefore moves to its preferred port once no other record
     /// claims it, while a stopped session that holds its preferred port gets it back.
     ///
-    /// The returned lease marks the session live until it is dropped.
+    /// The returned lease marks the session live until it is dropped, and carries the token this
+    /// instance wrote into its record.
     pub(crate) fn acquire(
         &self,
         config_path: &Path,
@@ -226,27 +235,7 @@ impl PortRegistry {
 
         // Claim this session's own instance lock
         let key = config_path_key(config_path);
-        let instance_path = directory.join(format!("{key}.lock"));
-        let instance = open_lock_file(&instance_path, true)
-            .map_err(io(&instance_path))?
-            .ok_or_else(|| SessionError::Io {
-                path: instance_path.clone(),
-                source: std::io::ErrorKind::NotFound.into(),
-            })?;
-        match instance.try_lock() {
-            Ok(()) => {}
-            Err(TryLockError::WouldBlock) => {
-                return Err(SessionError::AlreadyRunning {
-                    config_path: config_path.to_path_buf(),
-                });
-            }
-            Err(TryLockError::Error(source)) => {
-                return Err(SessionError::Io {
-                    path: instance_path,
-                    source,
-                });
-            }
-        }
+        let instance = lock_instance(&directory.join(format!("{key}.lock")), config_path)?;
 
         // Survey the other sessions
         let survey = survey(&directory, &key, session_name)?;
@@ -322,14 +311,47 @@ impl PortRegistry {
         }
 
         // Commit before any service can start using the ports
+        let instance_token = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
         let record = Record {
             config_path: config_path.display().to_string(),
             session_name: session_name.to_string(),
             ports: ports.clone(),
+            instance: Some(instance_token.clone()),
         };
         write_record(&directory, &record_path, &record).map_err(io(&record_path))?;
         drop(registry_lock);
-        Ok((ports, Lease { instance }))
+        Ok((
+            ports,
+            Lease {
+                instance,
+                token: instance_token,
+            },
+        ))
+    }
+}
+
+/// Takes the instance lock at `path` of the session for `config_path`.
+fn lock_instance(path: &Path, config_path: &Path) -> Result<File, SessionError> {
+    let io = |source| SessionError::Io {
+        path: path.to_path_buf(),
+        source,
+    };
+    let instance = open_lock_file(path, true)
+        .map_err(io)?
+        .ok_or_else(|| io(std::io::ErrorKind::NotFound.into()))?;
+    match instance.try_lock() {
+        Ok(()) => Ok(instance),
+        Err(TryLockError::WouldBlock) => Err(SessionError::AlreadyRunning {
+            config_path: config_path.to_path_buf(),
+        }),
+        Err(TryLockError::Error(source)) => Err(io(source)),
     }
 }
 
@@ -491,7 +513,7 @@ fn ipv6_unavailable(err: &std::io::Error) -> bool {
 
 /// The held registry lock, which records the holder's pid in the lock file while held.
 #[derive(Debug)]
-struct RegistryLock(File);
+pub(super) struct RegistryLock(File);
 
 impl Drop for RegistryLock {
     fn drop(&mut self) {
@@ -506,7 +528,7 @@ impl Drop for RegistryLock {
 /// the pid each holder records shows.
 /// Where the pid cannot be read, as on Windows or behind a micromux that does not record it,
 /// `timeout` bounds the whole wait instead.
-fn lock_registry(path: &Path, timeout: Duration) -> Result<RegistryLock, SessionError> {
+pub(super) fn lock_registry(path: &Path, timeout: Duration) -> Result<RegistryLock, SessionError> {
     let io = |source| SessionError::Io {
         path: path.to_path_buf(),
         source,
@@ -578,7 +600,7 @@ fn lock_holder(path: &Path) -> Option<u32> {
 /// Only called under the registry lock, which every session also holds while claiming its own
 /// instance lock, so the brief probe lock can never make a starting session look like a
 /// duplicate.
-fn owner_is_live(path: &Path) -> std::io::Result<bool> {
+pub(super) fn owner_is_live(path: &Path) -> std::io::Result<bool> {
     let Some(file) = open_lock_file(path, false)? else {
         return Ok(false);
     };
@@ -607,7 +629,7 @@ fn open_lock_file(path: &Path, create: bool) -> std::io::Result<Option<File>> {
 }
 
 /// Reads a record, `Ok(None)` when there is none, and a message when it cannot be parsed.
-fn read_record(path: &Path) -> Result<Option<Record>, String> {
+pub(super) fn read_record(path: &Path) -> Result<Option<Record>, String> {
     match std::fs::read(path) {
         Ok(bytes) => serde_json::from_slice(&bytes)
             .map(Some)

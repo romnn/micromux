@@ -35,6 +35,7 @@ const KNOWN_SERVICE_KEYS: &[&str] = &[
     "cleanup",
     "color",
     "logs",
+    "resource",
 ];
 
 const KNOWN_HEALTHCHECK_TIMING_KEYS: &[&str] = &[
@@ -1215,27 +1216,7 @@ fn parse_service<F: Copy>(
     );
     let name = parse_optional::<String>(mapping.get("name"))?.unwrap_or_else(|| name.clone());
     let kind = parse_kind(mapping)?;
-    let manual = parse_job_run(mapping, kind)?;
-    let disabled = parse_optional::<bool>(mapping.get("disabled"))?
-        .map(Spanned::into_inner)
-        .unwrap_or(false);
-    if disabled
-        && manual
-        && let Some(value) = mapping.get("disabled")
-    {
-        return Err(ConfigError::InvalidValue {
-            message: "a manual job runs only when restarted already; drop `disabled: true`"
-                .to_string(),
-            span: value.span().into(),
-        });
-    }
-    let startup_mode = if disabled {
-        StartupMode::Disabled
-    } else if manual {
-        StartupMode::Manual
-    } else {
-        StartupMode::Enabled
-    };
+    let startup_mode = parse_startup_mode(mapping, kind)?;
     let color = parse_optional::<bool>(mapping.get("color"))?;
     let working_dir = mapping
         .get("working_dir")
@@ -1286,6 +1267,7 @@ fn parse_service<F: Copy>(
         diagnostics,
     )?;
     let log_display = parse_log_display(mapping.get("logs"), defaults.log_display)?;
+    let resource = parse_resource(mapping)?;
 
     Ok(Service {
         name,
@@ -1306,7 +1288,54 @@ fn parse_service<F: Copy>(
         color,
         log_retention,
         log_display,
+        resource,
     })
+}
+
+/// Parse whether a service starts with the session, stays disabled, or is a manual job.
+fn parse_startup_mode(
+    mapping: &yaml_spanned::Mapping,
+    kind: ServiceKind,
+) -> Result<StartupMode, ConfigError> {
+    let manual = parse_job_run(mapping, kind)?;
+    let disabled = parse_optional::<bool>(mapping.get("disabled"))?
+        .map(Spanned::into_inner)
+        .unwrap_or(false);
+    if disabled
+        && manual
+        && let Some(value) = mapping.get("disabled")
+    {
+        return Err(ConfigError::InvalidValue {
+            message: "a manual job runs only when restarted already; drop `disabled: true`"
+                .to_string(),
+            span: value.span().into(),
+        });
+    }
+    Ok(if disabled {
+        StartupMode::Disabled
+    } else if manual {
+        StartupMode::Manual
+    } else {
+        StartupMode::Enabled
+    })
+}
+
+/// Parse a service's `resource`, a lowercase hostname label.
+fn parse_resource(mapping: &yaml_spanned::Mapping) -> Result<Option<Spanned<String>>, ConfigError> {
+    let resource = parse_optional::<String>(mapping.get("resource"))?;
+    if let Some(resource) = &resource
+        && !crate::session::is_hostname_label(resource)
+    {
+        return Err(ConfigError::InvalidValue {
+            message: format!(
+                "resource `{}` must be a lowercase name (a-z, 0-9, inner hyphens, at most 63 \
+                 characters)",
+                resource.inner
+            ),
+            span: resource.span.into(),
+        });
+    }
+    Ok(resource)
 }
 
 /// Parse a service's `kind`: `service` (the default) or `job`.
@@ -2758,6 +2787,51 @@ mod tests {
         check("docker compose down", false)?;
         check("{ timeout: 2m }", false)?;
         check("{ command: [] }", false)?;
+        Ok(())
+    }
+
+    /// The parser and the published schema agree on which `resource` names are valid, and the
+    /// parser keeps the name.
+    #[test]
+    fn resource_names_match_the_published_schema() -> eyre::Result<()> {
+        let schema: serde_json::Value =
+            serde_json::from_str(include_str!("../../../../micromux.schema.json"))?;
+        let schema = jsonschema::options()
+            .with_draft(jsonschema::Draft::Draft7)
+            .build(&schema)?;
+        let check = |resource: &str, accepted: bool| -> eyre::Result<()> {
+            let yaml = format!(
+                "version: 1\nservices:\n  app:\n    command: \"true\"\n    resource: {resource}\n"
+            );
+            let mut diagnostics: Vec<Diagnostic<usize>> = Vec::new();
+            let parsed = config::from_str(&yaml, Path::new("."), 0, None, &mut diagnostics);
+            let document: serde_json::Value = serde_yaml::from_str(&yaml)?;
+            eyre::ensure!(
+                parsed.is_ok() == accepted,
+                "the parser disagrees about `{resource}`"
+            );
+            eyre::ensure!(
+                schema.validate(&document).is_ok() == accepted,
+                "the schema disagrees about `{resource}`"
+            );
+            if let Ok(parsed) = parsed {
+                let parsed = parsed
+                    .config
+                    .services
+                    .values()
+                    .next()
+                    .and_then(|service| service.resource.as_ref())
+                    .map(|resource| resource.inner.clone());
+                eyre::ensure!(parsed.as_deref() == Some(resource), "lost `{resource}`");
+            }
+            Ok(())
+        };
+        check("desktop-app", true)?;
+        check("gpu0", true)?;
+        check("Desktop", false)?;
+        check("-desktop", false)?;
+        check("desk_app", false)?;
+        check(&"a".repeat(64), false)?;
         Ok(())
     }
 

@@ -646,6 +646,11 @@
         },
         "logs": {
           "$ref": "#/definitions/logs"
+        },
+        "resource": {
+          "type": "string",
+          "pattern": "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$",
+          "description": "Shared resource this service needs, such as a desktop app that runs once per machine. Only the session that holds the resource's reservation runs services that name it; starting one while the resource is free reserves it."
         }
       }
     }

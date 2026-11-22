@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- **Reserve a shared resource that one session at a time runs.** A service's `resource` names
+  it; `micromux ctl reserve`, `wait --reservation`, `renew` and `release` and the matching MCP
+  tools queue for it, and only the holder's own project may control those services.
+
 ## v0.4.7
 
 - **The TUI's borders, header and search prompt place wide characters and halfwidth katakana

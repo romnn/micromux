@@ -1,8 +1,9 @@
 //! Scheduler command and lifecycle types.
 
-use super::control::{CommandAck, DynamicCommandAck, EnvironmentCommandAck, ReconcileCommandAck};
+use super::control::{Caller, ReplyAck, ResolvedEnvironment, ServiceCommandAck};
 use crate::cleanup::CleanupOutcome;
 use crate::health_check::Health;
+use crate::session::ReservationReply;
 use crate::{DynamicServiceParams, Lease};
 
 /// Unique identifier for a service.
@@ -207,56 +208,98 @@ impl std::fmt::Display for Event {
     }
 }
 
+/// A change to this session's request for a resource.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReservationRequest {
+    /// Reserve the resource, or update and renew this session's request for it.
+    Reserve {
+        /// The resource.
+        resource: String,
+        /// How long the caller expects to hold it, for display.
+        estimate_secs: Option<u64>,
+        /// Why the caller wants it, for display.
+        reason: Option<String>,
+    },
+    /// Renew this session's request for the resource.
+    Renew {
+        /// The resource.
+        resource: String,
+        /// Renew only this request.
+        claim: Option<String>,
+    },
+    /// Release this session's request for the resource.
+    Release {
+        /// The resource.
+        resource: String,
+    },
+}
+
 /// A command sent to the scheduler.
 ///
 /// Acknowledged variants carry an optional reply half: the trusted in-process TUI passes `None`
 /// (fire-and-forget), while the narrow [`super::ServiceControl`] port attaches an ack so the
-/// scheduler validates and replies request/response. `Command` is not `Clone` because an ack is
+/// scheduler validates and replies request/response.
+/// Every mutating variant names its [`Caller`]; the constructors below act as
+/// [`Caller::Local`]. `Command` is not `Clone` because an ack is
 /// single-shot.
 #[derive(Debug)]
 pub enum Command {
     /// Restart a single service.
     Restart {
+        /// Who sent the command.
+        caller: Caller,
         /// Service to restart.
         service: ServiceID,
         /// Optional reply channel for acknowledged commands.
-        ack: Option<CommandAck>,
+        ack: Option<ReplyAck<Vec<ServiceCommandAck>>>,
     },
     /// Restart all enabled services.
     RestartAll {
+        /// Who sent the command.
+        caller: Caller,
         /// Optional reply channel for acknowledged commands.
-        ack: Option<CommandAck>,
+        ack: Option<ReplyAck<Vec<ServiceCommandAck>>>,
     },
     /// Disable a single service.
     Disable {
+        /// Who sent the command.
+        caller: Caller,
         /// Service to disable.
         service: ServiceID,
         /// Optional reply channel for acknowledged commands.
-        ack: Option<CommandAck>,
+        ack: Option<ReplyAck<Vec<ServiceCommandAck>>>,
     },
     /// Enable a single service.
     Enable {
+        /// Who sent the command.
+        caller: Caller,
         /// Service to enable.
         service: ServiceID,
         /// Optional reply channel for acknowledged commands.
-        ack: Option<CommandAck>,
+        ack: Option<ReplyAck<Vec<ServiceCommandAck>>>,
     },
     /// Reconcile configured services against the on-disk config.
     ReconcileConfig {
+        /// Who sent the command.
+        caller: Caller,
         /// Compute the semantic diff without mutating the session.
         dry_run: bool,
         /// Required reply channel.
-        ack: ReconcileCommandAck,
+        ack: ReplyAck<super::control::ReconcileReceipt>,
     },
     /// Create a dynamic service.
     StartDynamic {
+        /// Who sent the command.
+        caller: Caller,
         /// Definition and lease request.
         params: DynamicServiceParams,
         /// Optional reply channel for acknowledged commands.
-        ack: Option<DynamicCommandAck>,
+        ack: Option<ReplyAck<super::control::DynamicServiceAck>>,
     },
     /// Replace or revive a dynamic service.
     ReplaceDynamic {
+        /// Who sent the command.
+        caller: Caller,
         /// Existing dynamic service id.
         service: ServiceID,
         /// Required current revision.
@@ -264,10 +307,12 @@ pub enum Command {
         /// Replacement definition and lease request.
         params: DynamicServiceParams,
         /// Optional reply channel for acknowledged commands.
-        ack: Option<DynamicCommandAck>,
+        ack: Option<ReplyAck<super::control::DynamicServiceAck>>,
     },
     /// Renew a live dynamic service's lease without restarting it.
     RenewDynamic {
+        /// Who sent the command.
+        caller: Caller,
         /// Existing dynamic service id.
         service: ServiceID,
         /// Required current revision.
@@ -275,27 +320,45 @@ pub enum Command {
         /// Requested replacement lease.
         expires_after: Option<Lease>,
         /// Optional reply channel for acknowledged commands.
-        ack: Option<DynamicCommandAck>,
+        ack: Option<ReplyAck<super::control::DynamicServiceAck>>,
     },
     /// Retire a dynamic service.
     StopDynamic {
+        /// Who sent the command.
+        caller: Caller,
         /// Dynamic service id.
         service: ServiceID,
         /// Optional reply channel for acknowledged commands.
-        ack: Option<DynamicCommandAck>,
+        ack: Option<ReplyAck<super::control::DynamicServiceAck>>,
     },
     /// Report the session's variables, or one service's resolved environment.
     Environment {
         /// Service id, or `None` for the session's variables.
         service: Option<ServiceID>,
         /// Required reply channel.
-        ack: EnvironmentCommandAck,
+        ack: ReplyAck<ResolvedEnvironment>,
     },
     /// Report the session's own environment: the session-wide `env_file` and the session's
     /// variables over it.
     SessionEnvironment {
         /// Required reply channel.
-        ack: EnvironmentCommandAck,
+        ack: ReplyAck<ResolvedEnvironment>,
+    },
+    /// Reserve, renew, or release a resource for this session.
+    Reservation {
+        /// Who sent the command.
+        caller: Caller,
+        /// What to do with which resource.
+        request: ReservationRequest,
+        /// Required reply channel.
+        ack: ReplyAck<ReservationReply>,
+    },
+    /// Ask whether a caller may shut the session down.
+    AuthorizeShutdown {
+        /// Who asks.
+        caller: Caller,
+        /// Required reply channel.
+        ack: ReplyAck<()>,
     },
     /// Resize all PTYs.
     ResizeAll {
@@ -310,30 +373,49 @@ impl Command {
     /// Fire-and-forget restart (no acknowledgement). Used by the trusted in-process TUI.
     #[must_use]
     pub fn restart(service: ServiceID) -> Self {
-        Self::Restart { service, ack: None }
+        Self::Restart {
+            caller: Caller::Local,
+            service,
+            ack: None,
+        }
     }
 
     /// Fire-and-forget restart-all (no acknowledgement).
     #[must_use]
     pub fn restart_all() -> Self {
-        Self::RestartAll { ack: None }
+        Self::RestartAll {
+            caller: Caller::Local,
+            ack: None,
+        }
     }
 
     /// Fire-and-forget disable (no acknowledgement).
     #[must_use]
     pub fn disable(service: ServiceID) -> Self {
-        Self::Disable { service, ack: None }
+        Self::Disable {
+            caller: Caller::Local,
+            service,
+            ack: None,
+        }
     }
 
     /// Fire-and-forget enable (no acknowledgement).
     #[must_use]
     pub fn enable(service: ServiceID) -> Self {
-        Self::Enable { service, ack: None }
+        Self::Enable {
+            caller: Caller::Local,
+            service,
+            ack: None,
+        }
     }
 
     /// Fire-and-forget retirement of a dynamic service.
     #[must_use]
     pub fn stop_dynamic(service: ServiceID) -> Self {
-        Self::StopDynamic { service, ack: None }
+        Self::StopDynamic {
+            caller: Caller::Local,
+            service,
+            ack: None,
+        }
     }
 }

@@ -584,6 +584,7 @@ impl OldSession {
             config_path: config.to_string_lossy().into_owned(),
             services: Vec::new(),
             services_truncated: false,
+            reservations_truncated: false,
             micromux_version: "0.0.0".to_string(),
             session: None,
             capabilities: None,
