@@ -7195,20 +7195,17 @@ mod reservations {
         Ok(())
     }
 
-    /// A grant that reaches its deadline disables its services, and the resource passes on only
-    /// after their runs exited.
-    #[tokio::test]
-    async fn a_lapsed_grant_stops_its_runs_before_the_resource_passes_on() -> eyre::Result<()> {
-        let root = tempfile::tempdir()?;
-        let registry = crate::PortRegistry::at(root.path().join("registry"));
-        let own = registered(&registry, root.path(), "own")?;
-        let other = registered(&registry, root.path(), "other")?;
-        let services = roster([sleeper("app", Some("desk"))?]);
-        let (_reader, writer) = crate::model::new(crate::initial_model_entries(&services));
-        let (events_tx, mut events_rx) = mpsc::channel(8);
+    /// A scheduler for `services` in `session` whose loop never runs, so a test drives it step by
+    /// step.
+    fn unscheduled(
+        services: &ServiceMap,
+        session: &Arc<SessionContext>,
+    ) -> (SchedulerRuntime, mpsc::Receiver<ProcessEvent>) {
+        let (_reader, writer) = crate::model::new(crate::initial_model_entries(services));
+        let (events_tx, events_rx) = mpsc::channel(8);
         let (test_events_tx, _test_events_rx) = mpsc::channel(8);
-        let mut runtime = SchedulerRuntime::new(
-            &services,
+        let runtime = SchedulerRuntime::new(
+            services,
             SchedulerResources {
                 reload_config: None,
                 events_tx,
@@ -7218,12 +7215,46 @@ mod reservations {
                 config_dir: PathBuf::new(),
                 session_env_files: crate::SessionEnvFiles::default(),
                 dynamic_policy: DynamicServicesPolicy::default(),
-                session: Arc::clone(&own),
+                session: Arc::clone(session),
                 session_status: unrouted_session_status(),
                 default_log_retention: LogRetention::default(),
                 default_log_display: crate::LogDisplay::default(),
             },
         );
+        (runtime, events_rx)
+    }
+
+    /// A start under a grant the session holds uses it as it is: no store transaction, and the
+    /// same deadline.
+    #[tokio::test]
+    async fn a_held_grant_admits_without_the_store() -> eyre::Result<()> {
+        let root = tempfile::tempdir()?;
+        let registry = crate::PortRegistry::at(root.path().join("registry"));
+        let own = registered(&registry, root.path(), "own")?;
+        let services = roster([sleeper("app", Some("desk"))?]);
+        let (mut runtime, mut events_rx) = unscheduled(&services, &own);
+        let granted = Mine::Granted {
+            deadline: tokio::time::Instant::now() + Duration::from_secs(600),
+        };
+        runtime.mine.insert("desk".to_string(), granted);
+
+        runtime.admit(&services, &mut events_rx, "desk").await?;
+        assert_eq!(runtime.mine.get("desk"), Some(&granted));
+        // The store never saw the session take the resource.
+        assert_eq!(store(&own)?.written_view("desk")?.owner, None);
+        Ok(())
+    }
+
+    /// A grant that reaches its deadline disables its services, and the resource passes on only
+    /// after their runs exited.
+    #[tokio::test]
+    async fn a_lapsed_grant_stops_its_runs_before_the_resource_passes_on() -> eyre::Result<()> {
+        let root = tempfile::tempdir()?;
+        let registry = crate::PortRegistry::at(root.path().join("registry"));
+        let own = registered(&registry, root.path(), "own")?;
+        let other = registered(&registry, root.path(), "other")?;
+        let services = roster([sleeper("app", Some("desk"))?]);
+        let (mut runtime, mut events_rx) = unscheduled(&services, &own);
 
         // The session holds the resource with a live run, and its grant is due now.
         store(&own)?.admit("desk")?;

@@ -184,9 +184,12 @@ impl SchedulerRuntime {
         self.require_own(caller, &service.id, protected.as_deref())
     }
 
-    /// Takes `resource` for this session, or confirms the grant it holds, without renewing it.
+    /// Lets this session start services of `resource`: a grant it holds is used as it is, and
+    /// otherwise the store grants the resource, or reports the grant a promotion gave this
+    /// session.
     ///
-    /// A claim this session is releasing or let lapse stays ended, whatever the store says.
+    /// A valid grant needs no store transaction, and its deadline stays as it is. A claim this
+    /// session is releasing or let lapse stays ended, whatever the store says.
     pub(super) async fn admit(
         &mut self,
         services: &ServiceMap,
@@ -195,6 +198,9 @@ impl SchedulerRuntime {
     ) -> Result<(), CommandRejection> {
         if let Some(ended) = self.claim_ended(resource) {
             return Err(rejection(&ended));
+        }
+        if self.mine.get(resource).is_some_and(|mine| mine.may_start()) {
+            return Ok(());
         }
         let name = resource.to_string();
         let renew_by = self

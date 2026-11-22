@@ -854,10 +854,11 @@ async fn dispatch(
 /// Another project may not stop a session that uses a resource. The own project may always, and
 /// anyone may stop a session that uses none, even when the scheduler is wedged.
 async fn shutdown_refusal(server: &ControlServer, caller: &Caller) -> Option<Response> {
+    // Without a status to tell, the scheduler decides.
     let uses_resources = server
         .session
         .as_ref()
-        .is_some_and(micromux::SessionStatus::uses_resources);
+        .is_none_or(micromux::SessionStatus::uses_resources);
     if is_own(server, caller) || !uses_resources {
         return None;
     }

@@ -2885,12 +2885,9 @@ impl SchedulerRuntime {
             .filter_map(|service_id| definitions.get(service_id)?.spec.resource.clone())
             .collect::<std::collections::BTreeSet<_>>();
         let mut taken = Vec::new();
-        for resource in resources {
-            let held = self
-                .mine
-                .get(&resource)
-                .is_some_and(|mine| mine.may_start());
-            if let Err(rejection) = self.admit(services, events_rx, &resource).await {
+        for resource in &resources {
+            let held = self.mine.get(resource).is_some_and(|mine| mine.may_start());
+            if let Err(rejection) = self.admit(services, events_rx, resource).await {
                 if taken.is_empty() {
                     return Err(rejection);
                 }
@@ -2900,8 +2897,20 @@ impl SchedulerRuntime {
                 )));
             }
             if !held {
-                taken.push(resource);
+                taken.push(resource.as_str());
             }
+        }
+        // A grant taken first may have lapsed while a later one was awaited.
+        if let Some(lapsed) = resources.iter().find(|resource| {
+            !self
+                .mine
+                .get(*resource)
+                .is_some_and(|mine| mine.may_start())
+        }) {
+            return Err(CommandRejection::ResourceUnavailable(format!(
+                "this session's grant of resource `{lapsed}` lapsed while the command waited; \
+                 nothing was restarted"
+            )));
         }
         if let Some(pending) = pending {
             self.publish_reload(services, pending);

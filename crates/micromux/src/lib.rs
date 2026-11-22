@@ -782,6 +782,14 @@ impl Micromux {
         let session_status =
             SessionStatus::new(self.session_summary(), self.session.resources.clone())
                 .with_git_metadata(self.git_metadata_enabled);
+        // Until the scheduler's first pass publishes them, the resources the config names count
+        // as used, so no other project can stop the session in the meantime.
+        session_status.set_watched_resources(
+            self.services
+                .values()
+                .filter_map(|service| service.spec.resource.clone())
+                .collect(),
+        );
         let handles = Handles {
             reader,
             commands: commands_tx,
@@ -852,6 +860,28 @@ mod tests {
         assert_eq!(snapshot.desired, Desired::Disabled);
         assert_eq!(snapshot.execution, Execution::Pending);
         assert_eq!(snapshot.run_generation, 0);
+        Ok(())
+    }
+
+    /// A session whose config names a resource counts as using it as soon as it is built, before
+    /// its scheduler first runs, so a client of another project cannot stop it in that window.
+    #[test]
+    fn configured_resources_count_as_used_from_the_start() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let config_path = directory.path().join("micromux.yaml");
+        let raw = "version: 1\nservices:\n  app:\n    command: [\"sh\", \"-c\", \"sleep 60\"]\n    \
+                   resource: desk\n";
+        std::fs::write(&config_path, raw)?;
+        let mut diagnostics = Vec::new();
+        let mut config = from_str(raw, directory.path(), 0usize, None, &mut diagnostics)?;
+        config.config_path = Some(config_path);
+        let registry = PortRegistry::at(directory.path().join("registry"));
+        let mux = Arc::new(Micromux::with_session(
+            &config,
+            Session::establish(&config, &registry)?,
+        )?);
+        let (_runner, handles) = mux.start(CancellationToken::new());
+        assert!(handles.session.uses_resources());
         Ok(())
     }
 
