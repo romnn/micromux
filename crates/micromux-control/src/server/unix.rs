@@ -841,6 +841,9 @@ async fn dispatch(
         Request::ReleaseReservation { resource } => {
             acknowledge_reservation(server.control.release_reservation(caller, &resource).await)
         }
+        Request::ReservationStatus { resource } => {
+            acknowledge_reservation(server.control.reservation_status(caller, &resource).await)
+        }
         Request::ResizeTerminal { cols, rows } => resize_terminal(server, cols, rows).await,
         // Subscribe is intercepted before dispatch; reaching here is a protocol misuse.
         Request::Subscribe | Request::SubscribeWithVersion { .. } => Response::error(

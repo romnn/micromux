@@ -12,9 +12,8 @@ use micromux::{
     TerminalForwarding, TerminalSize,
 };
 use micromux_control::{
-    Client, ControlEndpoint, ControlError, EVENTS_PROTOCOL_VERSION, ErrorCode,
-    IdentifiedConnection, InputBytes, MAX_REMOTE_PASTE_BYTES, Request, Response, SessionInfo,
-    Subscription, TERMINAL_PROTOCOL_VERSION, connect_identified,
+    Client, ControlEndpoint, ControlError, ErrorCode, IdentifiedConnection, InputBytes,
+    MAX_REMOTE_PASTE_BYTES, Request, Response, SessionInfo, Subscription, connect_identified,
 };
 use parking_lot::RwLock;
 use tokio::sync::{broadcast, mpsc};
@@ -201,7 +200,6 @@ impl RemoteSource {
 
     /// Returns a capability that types into the session's services and resizes their PTYs.
     ///
-    /// It is `None` when the session predates [`TERMINAL_PROTOCOL_VERSION`].
     /// Input reaches the session in the order it was sent, over the same connection as the
     /// mirror's lifecycle commands, and other clients' input interleaves with it only between
     /// requests.
@@ -209,8 +207,8 @@ impl RemoteSource {
     /// While the mirror is reconnecting the capability refuses input, so the TUI discards it
     /// rather than replaying it later.
     #[must_use]
-    pub fn terminal(&self) -> Option<TerminalControl> {
-        accepts_terminal(&self.store.read().session).then(|| self.terminal.clone())
+    pub fn terminal(&self) -> TerminalControl {
+        self.terminal.clone()
     }
 
     pub(crate) fn attachment_status(&self) -> AttachmentStatus {
@@ -283,20 +281,13 @@ impl RemoteSource {
     }
 
     /// Return the mirrored lifecycle events of one service, oldest first.
-    ///
-    /// It is `None` when the session predates [`EVENTS_PROTOCOL_VERSION`] and reports no events.
     #[must_use]
-    pub fn events(&self, id: &str) -> Option<Vec<micromux::ServiceEvent>> {
-        let store = self.store.read();
-        if !accepts_events(&store.session) {
-            return None;
-        }
-        Some(
-            store
-                .services
-                .get(id)
-                .map_or_else(Vec::new, |entry| entry.events.events()),
-        )
+    pub fn events(&self, id: &str) -> Vec<micromux::ServiceEvent> {
+        self.store
+            .read()
+            .services
+            .get(id)
+            .map_or_else(Vec::new, |entry| entry.events.events())
     }
 
     /// Subscribe to mirror invalidations.
@@ -341,16 +332,9 @@ impl RemoteSource {
     /// A mirror of an empty current-protocol session with no background task, for tests that
     /// drive the TUI over it; the forwarding ends show what its terminal sends.
     pub(crate) fn offline() -> (Self, TerminalForwarding) {
-        Self::offline_at(micromux_control::PROTOCOL_VERSION)
-    }
-
-    /// A mirror of an empty session speaking `protocol_version`, as [`Self::offline`] is.
-    pub(crate) fn offline_at(
-        protocol_version: micromux_control::ProtocolVersion,
-    ) -> (Self, TerminalForwarding) {
         let session = SessionInfo {
             session: None,
-            protocol_version,
+            protocol_version: micromux_control::PROTOCOL_VERSION,
             id: "offline".to_string(),
             pid: 1,
             start_time: 1,
@@ -976,9 +960,6 @@ async fn refresh_events<C: RequestConnection>(
     store: &Arc<RwLock<MirrorStore>>,
     service_id: &str,
 ) -> Result<(), ControlError> {
-    if !accepts_events(&store.read().session) {
-        return Ok(());
-    }
     loop {
         let Some(after) = store
             .read()
@@ -1118,14 +1099,6 @@ async fn execute_command(
     Ok(())
 }
 
-fn accepts_events(session: &SessionInfo) -> bool {
-    session.protocol_version.supports(EVENTS_PROTOCOL_VERSION)
-}
-
-fn accepts_terminal(session: &SessionInfo) -> bool {
-    session.protocol_version.supports(TERMINAL_PROTOCOL_VERSION)
-}
-
 /// Sends one prepared input to the session, keeping its byte reservation until the session has
 /// queued it, so the forwarding budgets also bound input in flight.
 async fn forward_input<C: RequestConnection>(
@@ -1134,15 +1107,6 @@ async fn forward_input<C: RequestConnection>(
     changes: &broadcast::Sender<SessionChange>,
     input: PreparedPtyInput,
 ) -> Result<(), ControlError> {
-    // A reconnect may land on an older session than the one the TUI checked at startup.
-    if !accepts_terminal(&store.read().session) {
-        record_notice(
-            store,
-            changes,
-            "input discarded: this session does not accept terminal input".to_string(),
-        );
-        return Ok(());
-    }
     let response = request
         .request(Request::SendInput {
             service: input.service_id().to_string(),
@@ -1183,9 +1147,6 @@ async fn forward_resize<C: RequestConnection>(
     changes: &broadcast::Sender<SessionChange>,
     size: TerminalSize,
 ) -> Result<(), ControlError> {
-    if !accepts_terminal(&store.read().session) {
-        return Ok(());
-    }
     let TerminalSize { cols, rows } = size;
     let response = request
         .request(Request::ResizeTerminal { cols, rows })
@@ -1706,45 +1667,10 @@ mod tests {
         Ok(())
     }
 
-    /// A session older than the terminal protocol never sees input or resizes, which it would
-    /// reject as malformed and close the mirror's connection over.
-    #[tokio::test]
-    async fn older_sessions_never_receive_terminal_requests() -> eyre::Result<()> {
-        let store = store_with(entry_with_log(1, "line"));
-        store.write().session.protocol_version = micromux_control::ProtocolVersion::new(3, 17);
-        let (changes, _received) = broadcast::channel(8);
-        let (terminal, _forwarding) = TerminalControl::forwarding(MAX_REMOTE_PASTE_BYTES);
-        let source = source_for(Arc::clone(&store));
-        assert!(source.terminal().is_none());
-        let mut request = ScriptedConnection::new([]);
-
-        let key = terminal.prepare_input("svc".to_string(), b"k".to_vec())?;
-        forward_input(&mut request, &store, &changes, key).await?;
-        forward_resize(
-            &mut request,
-            &store,
-            &changes,
-            TerminalSize { cols: 80, rows: 24 },
-        )
-        .await?;
-
-        assert!(request.requests.is_empty());
-        assert!(
-            store
-                .read()
-                .notice
-                .as_deref()
-                .is_some_and(|notice| notice.contains("does not accept terminal input"))
-        );
-        Ok(())
-    }
-
     #[tokio::test]
     async fn forwarded_resize_carries_the_latest_size() -> eyre::Result<()> {
         let store = store_with(entry_with_log(1, "line"));
         let (changes, _received) = broadcast::channel(8);
-        let source = source_for(Arc::clone(&store));
-        assert!(source.terminal().is_some());
         let mut request = ScriptedConnection::new([Response::TerminalQueued]);
 
         forward_resize(
@@ -1931,7 +1857,6 @@ mod tests {
     fn mirrored_event_seqs(store: &Arc<RwLock<MirrorStore>>) -> Vec<u64> {
         source_for(Arc::clone(store))
             .events("svc")
-            .unwrap_or_default()
             .iter()
             .map(|event| event.seq)
             .collect()
@@ -2005,7 +1930,7 @@ mod tests {
         refresh_events(&mut request, &store, "svc").await?;
         assert_eq!(
             source_for(Arc::clone(&store)).events("svc"),
-            Some(recreated(1..=6))
+            recreated(1..=6)
         );
         assert_eq!(events_cursors(&request.requests)?, vec![Some(4), None]);
 
@@ -2088,21 +2013,6 @@ mod tests {
         assert_matches!(request.requests.as_slice(), [Request::GetEvents { .. }]);
         assert_eq!(mirrored_event_seqs(&store), vec![1]);
         assert_eq!(received.try_recv()?.kind, ChangeKind::Events);
-        Ok(())
-    }
-
-    /// A session older than the events protocol is never asked for events, and the mirror says
-    /// it has none to report rather than that there are none.
-    #[tokio::test]
-    async fn older_sessions_never_receive_events_requests() -> eyre::Result<()> {
-        let store = store_with(entry_with_log(1, "line"));
-        store.write().session.protocol_version = micromux_control::ProtocolVersion::new(3, 2);
-        let mut request = ScriptedConnection::new([]);
-
-        refresh_events(&mut request, &store, "svc").await?;
-
-        assert!(request.requests.is_empty());
-        assert_eq!(source_for(store).events("svc"), None);
         Ok(())
     }
 

@@ -11,8 +11,8 @@ use futures::future;
 use crate::ControlError;
 use crate::endpoint::ControlEndpoint;
 use crate::protocol::{
-    PROTOCOL_VERSION, ProtocolVersion, RESERVATIONS_PROTOCOL_VERSION, Request, Response,
-    SessionInfo, supports_versioned_subscriptions,
+    PROTOCOL_VERSION, ProtocolVersion, Request, Response, SessionInfo,
+    supports_versioned_subscriptions,
 };
 #[cfg(unix)]
 use crate::{PROBE_TIMEOUT, REQUEST_TIMEOUT, read_message, write_message};
@@ -112,51 +112,6 @@ pub async fn connect_identified(
     Ok(IdentifiedConnection { client, session })
 }
 
-/// The services of the session behind `client` that need `resource` but are disabled, so they
-/// do not start on their own once the session holds it; a restarting service is not among them.
-///
-/// # Errors
-///
-/// Returns a transport error, or [`ControlError::Unexpected`] for an answer other than a
-/// service list.
-pub async fn stopped_services(
-    client: &mut Client,
-    resource: &str,
-) -> Result<Vec<micromux::ServiceID>, ControlError> {
-    match client.request(Request::ListServices).await? {
-        Response::Services(services) => Ok(services
-            .into_iter()
-            .filter(|service| {
-                service.resource.as_deref() == Some(resource)
-                    && service.desired == micromux::Desired::Disabled
-            })
-            .map(|service| service.id)
-            .collect()),
-        other => Err(ControlError::Unexpected(format!("{other:?}"))),
-    }
-}
-
-/// Refuses a session that predates reservations, which would not understand a reservation
-/// request.
-///
-/// # Errors
-///
-/// Returns [`ControlError::NoReservations`] for a session older than
-/// [`RESERVATIONS_PROTOCOL_VERSION`].
-pub fn require_reservations(session: &SessionInfo) -> Result<(), ControlError> {
-    if session
-        .protocol_version
-        .supports(RESERVATIONS_PROTOCOL_VERSION)
-    {
-        Ok(())
-    } else {
-        Err(ControlError::NoReservations {
-            session: session.name.clone(),
-            peer: session.protocol_version,
-        })
-    }
-}
-
 impl Client {
     /// Readies this connection for mutations: describes the session on it, then names the
     /// project the client works in on it, and returns the description.
@@ -165,8 +120,7 @@ impl Client {
     /// `-c`, whichever session the connection reaches.
     /// The session lets only a client of its own project control its services that need a
     /// resource.
-    /// Nothing is named when no config is found or the session predates
-    /// [`RESERVATIONS_PROTOCOL_VERSION`]; the session then treats the client as unknown.
+    /// Nothing is named when no config is found; the session then treats the client as unknown.
     ///
     /// # Errors
     ///
@@ -174,11 +128,7 @@ impl Client {
     /// or [`ControlError::Unexpected`] when the session refuses the project.
     pub async fn describe_identified(&mut self, cwd: &Path) -> Result<SessionInfo, ControlError> {
         let session = self.describe().await?;
-        if session
-            .protocol_version
-            .supports(RESERVATIONS_PROTOCOL_VERSION)
-            && let Some(config_path) = crate::select::config_for_target(cwd).await
-        {
+        if let Some(config_path) = crate::select::config_for_target(cwd).await {
             let project = crate::endpoint::endpoint_hash(&config_path);
             match self.request(Request::Identify { project }).await? {
                 Response::Identified => {}
@@ -266,8 +216,8 @@ impl Client {
 
     /// Subscribe using capabilities supported by a previously described peer.
     ///
-    /// Clients retain the legacy request for pre-3.7 peers, which avoids sending an enum variant
-    /// that an older server cannot deserialize.
+    /// Clients send the legacy request to a peer of another major line, which may not know the
+    /// versioned one.
     ///
     /// # Errors
     ///

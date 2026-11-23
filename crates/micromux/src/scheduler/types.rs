@@ -232,6 +232,11 @@ pub enum ReservationRequest {
         /// The resource.
         resource: String,
     },
+    /// Report where this session's request for the resource stands, changing nothing.
+    Status {
+        /// The resource.
+        resource: String,
+    },
 }
 
 /// A command sent to the scheduler.

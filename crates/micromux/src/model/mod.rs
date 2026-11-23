@@ -380,6 +380,13 @@ pub struct ServiceSnapshot {
     /// session's own project may control it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resource: Option<String>,
+    /// Whether the service's start was accepted and waits for the session's queued request for
+    /// [`Self::resource`], which another session holds.
+    ///
+    /// It starts once the session gets the resource and its dependencies are ready, with no
+    /// further command.
+    #[serde(default)]
+    pub waiting_for_resource: bool,
 }
 
 /// How a service's most recent `cleanup` command ended.
@@ -442,6 +449,7 @@ impl ServiceSnapshot {
             dependency_failure: None,
             depends_on: Vec::new(),
             resource: None,
+            waiting_for_resource: false,
         }
     }
 }
@@ -652,7 +660,8 @@ impl ServiceEvent {
             | ServiceEventKind::Retired
             | ServiceEventKind::CleanupStarted
             | ServiceEventKind::CleanupFinished
-            | ServiceEventKind::CleanupFailed => Some(banner_line(&self.detail)),
+            | ServiceEventKind::CleanupFailed
+            | ServiceEventKind::ResourceGranted => Some(banner_line(&self.detail)),
             ServiceEventKind::ConfigReloaded
             | ServiceEventKind::Spawned
             | ServiceEventKind::Healthy
@@ -731,6 +740,8 @@ pub enum ServiceEventKind {
     CleanupFinished,
     /// A `cleanup` command failed, timed out, or could not start.
     CleanupFailed,
+    /// The session got the resource the service's queued start waited for.
+    ResourceGranted,
     /// A newer peer sent an event kind this binary does not know yet.
     #[serde(other)]
     Unknown,

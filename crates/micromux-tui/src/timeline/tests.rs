@@ -233,7 +233,7 @@ fn attached_app(source: RemoteSource) -> App {
     let terminal = source.terminal();
     let mut app = App::new(
         SessionSource::Remote(source),
-        terminal,
+        Some(terminal),
         micromux::CancellationToken::new(),
         ViewOptions::default(),
     );
@@ -498,20 +498,5 @@ async fn the_events_pane_switches_with_the_selected_service() -> eyre::Result<()
 
     press(&mut app, 'k');
     assert!(shows(&frame(&mut app), "api became healthy"));
-    Ok(())
-}
-
-/// An attached session too old to report events says so instead of claiming there are none.
-#[tokio::test]
-async fn the_events_pane_explains_an_older_session() -> eyre::Result<()> {
-    let (source, _forwarding) =
-        RemoteSource::offline_at(micromux_control::ProtocolVersion::new(3, 2));
-    let mut app = attached_app(source);
-    mirror(&mut app, "svc", Vec::new())?;
-    press(&mut app, 'E');
-
-    let rows = frame(&mut app);
-    assert!(shows(&rows, "this session predates lifecycle events"));
-    assert!(!shows(&rows, "no lifecycle events yet"));
     Ok(())
 }

@@ -13,8 +13,7 @@ use std::io::Write as _;
 use std::path::Path;
 
 use micromux_control::{
-    Client, ENVIRONMENT_PROTOCOL_VERSION, ErrorCode, PROTOCOL_VERSION, ProtocolVersion, Request,
-    ResolvedEnvironment, Response, SESSION_ENV_FILE_PROTOCOL_VERSION, SessionInfo, SessionSelector,
+    Client, ErrorCode, Request, ResolvedEnvironment, Response, SessionInfo, SessionSelector,
 };
 
 use crate::options::EnvFormat;
@@ -96,7 +95,6 @@ pub(crate) async fn write_file(target: &Target<'_>) -> Result<(), crate::Error> 
         let Some((mut client, session)) = connect(target, command).await? else {
             return Ok(());
         };
-        require(&session, SESSION_ENV_FILE_PROTOCOL_VERSION, command)?;
         let response = client
             .request(Request::WriteEnvironmentFile {
                 service: target.service.map(str::to_string),
@@ -149,19 +147,11 @@ async fn fetch(
     let Some((mut client, session)) = connect(target, command).await? else {
         return Ok(None);
     };
-    require(&session, ENVIRONMENT_PROTOCOL_VERSION, command)?;
-    // A session too old for a session-wide env file has its variables alone for its own
-    // environment.
-    let request = if target.service.is_none()
-        && session
-            .protocol_version
-            .supports(SESSION_ENV_FILE_PROTOCOL_VERSION)
-    {
-        Request::GetSessionEnvironment
-    } else {
-        Request::GetEnvironment {
-            service: target.service.map(str::to_string),
-        }
+    let request = match target.service {
+        None => Request::GetSessionEnvironment,
+        Some(service) => Request::GetEnvironment {
+            service: Some(service.to_string()),
+        },
     };
     let response = client.request(request).await?;
     let Response::Environment(environment) = response else {
@@ -169,22 +159,6 @@ async fn fetch(
     };
     note_stale(environment.stale, target.service);
     Ok(Some((session, environment)))
-}
-
-/// Refuses a session older than the protocol `revision` that `micromux <command>` needs.
-fn require(
-    session: &SessionInfo,
-    revision: ProtocolVersion,
-    command: &str,
-) -> Result<(), crate::Error> {
-    if session.protocol_version.supports(revision) {
-        return Ok(());
-    }
-    Err(crate::Error::Message(format!(
-        "the running session `{}` (protocol {}) is too old for `micromux {command}`; restart it \
-         with this micromux (protocol {PROTOCOL_VERSION})",
-        session.name, session.protocol_version
-    )))
 }
 
 /// The failure an environment request reports when the session answers with `response`.

@@ -28,7 +28,8 @@ Its server fails to parse the frame, answers `BadRequest`, and closes the connec
 - Payloads tolerate a peer from another minor revision.
   Additive fields deserialize with `#[serde(default)]`, and a wire enum that can grow ends in a `#[serde(other)] Unknown` variant, so a newer peer's value reads as `Unknown` instead of failing to parse.
   `ErrorCode`, `Health`, `Desired`, `Execution`, `ChangeKind`, `ServiceEventKind`, `OriginKind`, `RetiredReason`, `DependencyFailureReason` and `OutputStream` have one.
-- A request added in a minor revision gets a named constant for the first revision whose sessions answer it, such as `EVENTS_PROTOCOL_VERSION` (3.3), `ENVIRONMENT_PROTOCOL_VERSION` (3.15), `TERMINAL_PROTOCOL_VERSION` (3.18) and `SESSION_ENV_FILE_PROTOCOL_VERSION` (3.20).
+- A request added in a minor revision gets a named constant for the first revision whose sessions answer it, such as `EVENTS_PROTOCOL_VERSION` (3.3), `ENVIRONMENT_PROTOCOL_VERSION` (3.15), `TERMINAL_PROTOCOL_VERSION` (3.18) and `SESSION_ENV_FILE_PROTOCOL_VERSION` (3.20) on the 3.x line.
+  A major bump retires the constants of the line it leaves, since every peer of the new line answers every request it inherits; 4.0 did.
 - A client sends such a request only when the session's reported `SessionInfo::protocol_version` `supports` that revision.
   Otherwise it falls back to an older request, leaves the feature off, or refuses with a message that asks the user to restart the session.
 
@@ -36,7 +37,7 @@ The session reports its version in its `Describe` answer, and the client adapts 
 The session learns a client's version only from `SubscribeWithVersion`, which picks a subscription behavior both sides understand.
 
 "Protocol compatibility" in `docs/content/docs/agent-control/control-plane.md` describes the revisions from 3.8 on, and `micromux --version` prints the protocol version next to the release.
-Unit tests in `protocol.rs` pin each named revision gate, such as `events_require_protocol_3_3_on_the_same_major_line`.
+Unit tests in `protocol.rs` pin each named revision gate; on the 3.x line there was one per revision, such as `events_require_protocol_3_3_on_the_same_major_line`.
 
 ## Consequences
 
@@ -45,7 +46,7 @@ Unit tests in `protocol.rs` pin each named revision gate, such as `events_requir
 - New fields must be optional or defaulted, and a new enum variant must be harmless to read as `Unknown`.
 - An older client sees newer states only as `Unknown`, so the docs ask users to restart an attached TUI or a running `micromux mcp` after an upgrade that adds states, as 3.16 did for jobs.
 - A major bump still orphans every running session.
-  It happened twice on 2026-07-06, to 2.0 when `HealthAttempt.run_generation` became required and to 3.0 when `open_ports` was renamed, and not since.
+  It happened twice on 2026-07-06, to 2.0 when `HealthAttempt.run_generation` became required and to 3.0 when `open_ports` was renamed, and on 2026-11-23, to 4.0 when `Enable`, `Reserve` and `ReleaseReservation` changed meaning ([ADR 7](0007-reservations-are-requests-to-run.md)).
 - The gates are a convention that review keeps; nothing stops a client from sending a new request without one.
 
 The implementation falls short of the rule in known places:
@@ -60,12 +61,9 @@ It follows the same idea: every proxy accepts older sessions, and a session whos
 
 ## References
 
-- `crates/micromux-control/src/protocol.rs`: `PROTOCOL_VERSION`, `ProtocolVersion::is_compatible_with`, `ProtocolVersion::supports`, the revision constants, and their tests
+- `crates/micromux-control/src/protocol.rs`: `PROTOCOL_VERSION`, `ProtocolVersion::is_compatible_with`, `ProtocolVersion::supports`, and their tests; the 4.x line has no revision constant yet
 - `crates/micromux-control/src/client.rs`: `Client::describe` and the versioned subscription
 - `crates/micromux-control/src/server/unix.rs`: `handle_connection`, which rejects an unknown request with `BadRequest`
-- `crates/micromux-cli/src/session_env.rs`: `require` and `fetch`
-- `crates/micromux-mcp/src/lib.rs`: the version gate of `get_session_env`
-- `crates/micromux-tui/src/remote.rs`: `accepts_events` and `accepts_terminal`
 - `docs/content/docs/agent-control/control-plane.md`, "Protocol compatibility"
 - `docs/content/docs/installation.md`, on `micromux --version`
 - `AGENTS.md`, section "Versioning"

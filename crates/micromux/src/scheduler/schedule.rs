@@ -1,3 +1,4 @@
+use super::reservations::Standing;
 use super::{
     DesiredState, ProcessEvent, RunConfig, RunningService, ServiceID, ServiceRuntime,
     SessionModelWriter, State, pty, service_event, sync_model,
@@ -25,7 +26,7 @@ pub(super) struct ScheduleContext<'a> {
     /// cannot hold resources.
     pub(super) resources: Option<&'a crate::session::ResourceStore>,
     /// Where this session's claims of resources stand, checked at each spawn.
-    pub(super) claims: &'a BTreeMap<String, super::reservations::Standing>,
+    pub(super) claims: &'a BTreeMap<String, Standing>,
 }
 
 /// What `start_service_if_ready` did with a service.
@@ -223,6 +224,38 @@ enum StartCheck {
     Consider { exited_code: Option<i32> },
 }
 
+/// Whether `service` has a start to come: it is enabled, and its start was requested, it never
+/// ran and starts with the session, or its restart policy restarts it.
+///
+/// A requested restart waits for the live run to end, and a restart backoff or unmet
+/// dependencies only delay a start.
+/// A dynamic service whose lease ran out has none, even before it is retired.
+/// The session's claim of a resource lasts as long as a service that names it has a start to come
+/// or a live run, so this is the one place that decides it.
+pub(super) fn has_pending_start(
+    service: &crate::service::Service,
+    runtime: &ServiceRuntime,
+) -> bool {
+    if runtime.desired == DesiredState::Disabled
+        || runtime
+            .expires_at
+            .is_some_and(|deadline| deadline <= tokio::time::Instant::now())
+    {
+        return false;
+    }
+    if runtime.running.is_some() {
+        return runtime.start_requested;
+    }
+    match runtime.state {
+        // A manual job runs only when asked.
+        State::Pending => service.startup_mode != StartupMode::Manual || runtime.start_requested,
+        State::Exited { exit_code } => {
+            runtime.start_requested || runtime.will_auto_restart(&service.spec.restart, exit_code)
+        }
+        State::Starting | State::Running { .. } | State::Killed | State::Disabled => false,
+    }
+}
+
 fn should_consider_start(
     ctx: &ScheduleContext<'_>,
     service_id: &ServiceID,
@@ -231,41 +264,20 @@ fn should_consider_start(
     let Some(runtime) = ctx.runtimes.get(service_id) else {
         return StartCheck::Skip;
     };
-
-    if runtime.desired == DesiredState::Disabled || runtime.running.is_some() {
+    if runtime.running.is_some() || !has_pending_start(service, runtime) {
         return StartCheck::Skip;
     }
-
     if !runtime.start_requested
         && let Some(until) = runtime.restart.backoff_until
         && tokio::time::Instant::now() < until
     {
         return StartCheck::Skip;
     }
-
-    match runtime.state {
-        // A manual job runs only when asked.
-        State::Pending
-            if service.startup_mode == StartupMode::Manual && !runtime.start_requested =>
-        {
-            StartCheck::Skip
-        }
-        State::Pending => StartCheck::Consider { exited_code: None },
-        State::Starting | State::Running { .. } | State::Killed | State::Disabled => {
-            StartCheck::Skip
-        }
-        State::Exited { exit_code } => {
-            if runtime.start_requested
-                || runtime.will_auto_restart(&service.spec.restart, exit_code)
-            {
-                StartCheck::Consider {
-                    exited_code: Some(exit_code),
-                }
-            } else {
-                StartCheck::Skip
-            }
-        }
-    }
+    let exited_code = match runtime.state {
+        State::Exited { exit_code } => Some(exit_code),
+        _ => None,
+    };
+    StartCheck::Consider { exited_code }
 }
 
 fn decrement_failure_budget(
@@ -445,29 +457,14 @@ fn start_service_if_ready(
     if !blocking_dependencies(ctx, service).is_empty() {
         return Start::NotStarted;
     }
-    // A service that needs a resource starts only while the session holds it.
-    let store = match &service.spec.resource {
-        None => None,
-        Some(resource) => {
-            let held = ctx
-                .claims
-                .get(resource)
-                .is_some_and(|standing| standing.may_start());
-            match ctx.resources {
-                Some(store) if held => Some((store, resource)),
-                _ => return Start::NeedsGrant(resource.clone()),
-            }
-        }
-    };
-
-    tracing::info!(service_id, "starting service");
-
     let Some(runtime) = ctx.runtimes.get_mut(service_id) else {
         return Start::NotStarted;
     };
+    // The dependencies are ready, also for a start that still waits for its resource.
     if !runtime.blocked_on.is_empty() {
         runtime.blocked_on.clear();
         runtime.dependency_failure = None;
+        sync_model(ctx.writer, service, runtime);
         ctx.writer.append_event(
             service_id,
             service_event(
@@ -477,6 +474,22 @@ fn start_service_if_ready(
             ),
         );
     }
+    // A service that needs a resource starts only while the session holds it, and waits while the
+    // session's request is queued.
+    let store = match &service.spec.resource {
+        None => None,
+        Some(resource) => match (ctx.claims.get(resource), ctx.resources) {
+            (Some(Standing::Waiting), _) => return Start::NotStarted,
+            (Some(standing), Some(store)) if standing.may_start() => Some((store, resource)),
+            _ => return Start::NeedsGrant(resource.clone()),
+        },
+    };
+
+    tracing::info!(service_id, "starting service");
+
+    let Some(runtime) = ctx.runtimes.get_mut(service_id) else {
+        return Start::NotStarted;
+    };
     let explicit_start = runtime.start_requested;
     let clear_logs = runtime.clear_logs_on_start;
     decrement_failure_budget(runtime, service, explicit_start, exited_code);
@@ -555,19 +568,50 @@ fn record_stable_dependency_blocks(ctx: &mut ScheduleContext<'_>) {
     }
 }
 
-/// Starts every service that is ready, until one that is ready needs a resource the session
-/// may not start yet, which it returns with that resource.
+/// Records whether `service`, a start candidate when `candidate` holds, waits for the session's
+/// queued request for its resource.
+///
+/// It is kept apart from dependency blocks, so a service can show both.
+fn record_resource_wait(
+    ctx: &mut ScheduleContext<'_>,
+    service_id: &ServiceID,
+    service: &crate::service::Service,
+    candidate: bool,
+) {
+    let waiting = candidate
+        && service
+            .spec
+            .resource
+            .as_ref()
+            .is_some_and(|resource| ctx.claims.get(resource) == Some(&Standing::Waiting));
+    let Some(runtime) = ctx.runtimes.get_mut(service_id) else {
+        return;
+    };
+    if runtime.waiting_for_resource != waiting {
+        runtime.waiting_for_resource = waiting;
+        sync_model(ctx.writer, service, runtime);
+    }
+}
+
+/// Starts every service that is ready, and returns the first ready one that needs a resource the
+/// session may not start it with yet, with that resource.
+///
+/// It visits every service before returning, so the state the caller replies with is current for
+/// all of them, though taking that resource is left to the caller.
 pub(super) fn schedule_ready(ctx: &mut ScheduleContext<'_>) -> Option<(ServiceID, String)> {
+    let mut needs_grant = None;
     loop {
         let mut started = false;
         for (service_id, service) in ctx.services {
             let exited_code = match should_consider_start(ctx, service_id, service) {
                 StartCheck::Skip => {
                     clear_dependency_block(ctx, service_id, service);
+                    record_resource_wait(ctx, service_id, service, false);
                     continue;
                 }
                 StartCheck::Consider { exited_code } => exited_code,
             };
+            record_resource_wait(ctx, service_id, service, true);
 
             tracing::debug!(
                 service_id,
@@ -578,7 +622,9 @@ pub(super) fn schedule_ready(ctx: &mut ScheduleContext<'_>) -> Option<(ServiceID
             match start_service_if_ready(ctx, service_id, service, exited_code) {
                 Start::Started => started = true,
                 Start::NotStarted => {}
-                Start::NeedsGrant(resource) => return Some((service_id.clone(), resource)),
+                Start::NeedsGrant(resource) => {
+                    needs_grant.get_or_insert_with(|| (service_id.clone(), resource));
+                }
             }
         }
         // A successful start is the only synchronous transition that can unblock an earlier
@@ -586,7 +632,7 @@ pub(super) fn schedule_ready(ctx: &mut ScheduleContext<'_>) -> Option<(ServiceID
         // participate in this bounded fixed-point pass.
         if !started {
             record_stable_dependency_blocks(ctx);
-            return None;
+            return needs_grant;
         }
     }
 }

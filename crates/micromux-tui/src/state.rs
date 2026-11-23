@@ -116,12 +116,7 @@ impl Service {
         if !std::mem::take(&mut self.events_dirty) {
             return;
         }
-        let Some(events) = source.events(&self.snapshot.id) else {
-            self.event_seqs.clear();
-            self.events_pane
-                .set_text(crate::timeline::unsupported_text());
-            return;
-        };
+        let events = source.events(&self.snapshot.id);
         self.event_seqs = events.iter().map(|event| event.seq).collect();
         self.events_pane.set_text(crate::timeline::text(&events));
     }

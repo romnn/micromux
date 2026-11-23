@@ -828,9 +828,10 @@ fn sessions_wait_for_a_previous_sessions_cleanup() -> eyre::Result<()> {
 
 /// Runs a holding session and a queued session of `config` in one shared registry, kills the
 /// holder's supervisor with `SIGKILL` once `kill_after` exists, and returns how long the queued
-/// session's `ctl wait --reservation desk` took after the kill.
+/// session's service took to start on its own after the kill.
 ///
 /// `config`'s service names resource `desk` and writes `app.pid` in its project as it starts.
+/// A `ctl wait --reservation desk` after the start reports the grant.
 fn handover_after_a_kill(root: &Path, config: &str, kill_after: &Path) -> eyre::Result<Duration> {
     // Both sessions share one registry; the name is short, since control sockets live inside it.
     let state = root.join("s");
@@ -866,7 +867,8 @@ fn handover_after_a_kill(root: &Path, config: &str, kill_after: &Path) -> eyre::
     );
     let ctl = |args: &[&str]| session(&queued_project).arg("ctl").args(args).output();
 
-    // The second session queues behind the first.
+    // The second session queues behind the first; its reservation requests its service's start,
+    // so nothing has to run once the resource passes on.
     let deadline = Instant::now() + Duration::from_secs(30);
     let queued = loop {
         let output = ctl(&["reserve", "desk"])?;
@@ -881,11 +883,6 @@ fn handover_after_a_kill(root: &Path, config: &str, kill_after: &Path) -> eyre::
         "{text}{}",
         String::from_utf8_lossy(&queued.stderr)
     );
-    let waiting = session(&queued_project)
-        .args(["ctl", "wait", "--reservation", "desk", "--timeout", "60s"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
 
     let deadline = Instant::now() + Duration::from_secs(30);
     while !kill_after.exists() && Instant::now() < deadline {
@@ -894,38 +891,51 @@ fn handover_after_a_kill(root: &Path, config: &str, kill_after: &Path) -> eyre::
     let killed = Instant::now();
     first.kill()?;
     first.wait()?;
-    let granted = waiting.wait_with_output()?;
+    let started = queued_project.join("app.pid");
+    let deadline = killed + Duration::from_secs(60);
+    while !started.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
     let waited = killed.elapsed();
+    let granted = ctl(&["wait", "--reservation", "desk", "--timeout", "10s"])?;
 
     let _ = ctl(&["stop"]);
     drop(second);
     eyre::ensure!(
-        granted.status.success(),
-        "{}{}",
-        String::from_utf8_lossy(&granted.stdout),
+        started.exists(),
+        "the queued session's service never started"
+    );
+    let text = String::from_utf8_lossy(&granted.stdout);
+    eyre::ensure!(
+        granted.status.success() && text.contains("desk: granted"),
+        "{text}{}",
         String::from_utf8_lossy(&granted.stderr)
     );
     Ok(waited)
 }
 
 /// A resource held by a session whose supervisor is killed with `SIGKILL` passes to the waiting
-/// session only once the dead session's service, which takes seconds to stop, has ended.
+/// session, which starts its service on its own, only once the dead session's service, which
+/// takes seconds to stop, has ended.
 #[test]
 fn a_killed_holder_hands_its_resource_on_only_after_its_teardown() -> eyre::Result<()> {
     let root = tempfile::tempdir()?;
     let stopped = root.path().join("stopped");
-    // The holder's service notes its start, and on the stop signal takes three seconds before
-    // it notes its stop and exits. It ends on its own after a minute in any case.
+    // The service notes as it starts whether the holder's service had stopped by then, and on
+    // the stop signal takes three seconds before it notes its stop and exits. It ends on its own
+    // after a minute in any case.
     let config = format!(
         "version: 1\nservices:\n  app:\n    resource: desk\n    command:\n      - sh\n      - -c\n      \
-         - trap 'sleep 3; echo > {}; exit 0' TERM; echo $$ > app.pid; sleep 60 & wait\n",
-        stopped.display()
+         - trap 'sleep 3; echo > {stopped}; exit 0' TERM; test -e {stopped} && echo after > \
+         order || echo before > order; echo $$ > app.pid; sleep 60 & wait\n",
+        stopped = stopped.display()
     );
     let started = root.path().join("a/app.pid");
     let waited = handover_after_a_kill(root.path(), &config, &started)?;
-    assert!(
-        stopped.exists(),
-        "the resource passed on before the holder's service stopped"
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("b/order"))?.trim(),
+        "after",
+        "the queued session's service started before the holder's service stopped"
     );
     assert!(waited < Duration::from_secs(30), "waited {waited:?}");
     Ok(())
@@ -938,18 +948,21 @@ fn a_killed_holder_hands_its_resource_on_only_after_its_cleanup() -> eyre::Resul
     let root = tempfile::tempdir()?;
     let cleaning = root.path().join("cleaning");
     let cleaned = root.path().join("cleaned");
-    // The service exits on its own after a second, and its cleanup takes three seconds.
+    // The service notes as it starts whether the holder's cleanup had ended by then, and exits
+    // on its own after a second; its cleanup takes three seconds.
     let config = format!(
         "version: 1\nservices:\n  app:\n    resource: desk\n    restart: \"no\"\n    command:\n      \
-         - sh\n      - -c\n      - echo $$ > app.pid; sleep 1\n    cleanup:\n      command:\n        \
-         - sh\n        - -c\n        - echo > {}; sleep 3; echo > {}\n",
-        cleaning.display(),
-        cleaned.display()
+         - sh\n      - -c\n      - test -e {cleaned} && echo after > order || echo before > order; \
+         echo $$ > app.pid; sleep 1\n    cleanup:\n      command:\n        - sh\n        - -c\n        \
+         - echo > {cleaning}; sleep 3; echo > {cleaned}\n",
+        cleaning = cleaning.display(),
+        cleaned = cleaned.display()
     );
     let waited = handover_after_a_kill(root.path(), &config, &cleaning)?;
-    assert!(
-        cleaned.exists(),
-        "the resource passed on before the holder's cleanup ended"
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("b/order"))?.trim(),
+        "after",
+        "the queued session's service started before the holder's cleanup ended"
     );
     assert!(waited < Duration::from_secs(30), "waited {waited:?}");
     Ok(())

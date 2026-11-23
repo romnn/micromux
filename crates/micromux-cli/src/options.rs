@@ -538,14 +538,16 @@ pub enum CtlAction {
     /// the run exited instead (with `--exit`, with a non-zero status), 4 when the service is
     /// blocked behind a dependency that can no longer meet its condition, 5 when the service is
     /// disabled or retired, and 124 when the timeout elapses.
-    /// With `--reservation`, it renews the session's queued request while it waits, exits 0 once
-    /// the request is granted, 5 when it can no longer be granted (it was released or lapsed, or
-    /// the session stopped or was replaced), and 124 when the timeout elapses.
+    /// With `--reservation`, it only looks at the session's request, which the session keeps
+    /// queued by itself, and never extends a grant: it exits 0 once the session holds the
+    /// resource, 5 when the request can no longer be granted (it was released, replaced or
+    /// lapsed, the session hands the resource over, or the session stopped or was replaced), and
+    /// 124 when the timeout elapses.
     #[command(group = clap::ArgGroup::new("target").required(true).args(["service", "reservation"]))]
     Wait {
         /// The service to wait for.
         service: Option<String>,
-        /// Wait until the session holds this resource, which `reserve` queued for.
+        /// Wait until the session holds this resource, which `reserve` or `enable` queued for.
         #[arg(long, conflicts_with_all = ["service", "healthy", "exit", "after_generation"])]
         reservation: Option<String>,
         /// Wait until the service is up, and healthy if it has a healthcheck (the default).
@@ -565,7 +567,10 @@ pub enum CtlAction {
     /// otherwise.
     ///
     /// Only the session holding a resource runs the services that name it.
-    /// Renew the reservation within the hour, or it lapses and passes to the next request.
+    /// A fresh reservation starts the session's configured services that name the resource and
+    /// start with the session as soon as the session gets it; reserving again only renews.
+    /// The grant runs for an hour, and after that until another session queues; `renew` extends
+    /// it.
     Reserve {
         /// The resource, as services name it in `resource`.
         resource: String,
@@ -583,8 +588,9 @@ pub enum CtlAction {
     },
     /// Release the session's reservation of a resource.
     ///
-    /// The session first stops its services that need the resource, then passes it to the next
-    /// request.
+    /// A queued request goes at once, with the starts that waited for it.
+    /// A grant keeps running until another session queues: then the session stops its services
+    /// that need the resource and passes it on.
     Release {
         /// The resource.
         resource: String,

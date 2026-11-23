@@ -536,7 +536,9 @@ impl ServiceControl {
 
     /// Reserve `resource` for this session: granted at once while it is free, queued otherwise.
     ///
-    /// A request this session already has is updated and renewed.
+    /// A fresh request also requests a start of the session's configured services that name the
+    /// resource and start with the session, which then run as soon as the session gets it.
+    /// A request this session already has is updated and renewed, and enables nothing.
     /// `estimate_secs` and `reason` are shown to every other session and change nothing about
     /// the grant.
     ///
@@ -564,7 +566,8 @@ impl ServiceControl {
     ///
     /// With `claim`, only that request is renewed, so a waiter notices that its request was
     /// replaced.
-    /// A grant past its deadline has lapsed and cannot be renewed.
+    /// A grant past its deadline while another request waits is being handed over and cannot be
+    /// renewed.
     ///
     /// # Errors
     ///
@@ -584,9 +587,11 @@ impl ServiceControl {
 
     /// Release this session's request for `resource`.
     ///
-    /// A queued request is dropped at once.
-    /// A grant first stops and disables the session's services that need the resource, so the
-    /// reply says `draining` until they have stopped and the resource passes on.
+    /// A queued request is dropped at once, and the starts that waited for it with it.
+    /// A grant becomes due at once: while no other request waits, the session keeps it and its
+    /// services keep running, and the reply says `granted`; once one waits, the session stops and
+    /// disables its services that need the resource, and the reply says `releasing` until they
+    /// have stopped and the resource passes on.
     ///
     /// # Errors
     ///
@@ -597,6 +602,23 @@ impl ServiceControl {
         resource: &str,
     ) -> Result<ReservationResult, SchedulerStopped> {
         let request = ReservationRequest::Release {
+            resource: resource.to_string(),
+        };
+        self.reservation(caller, request).await
+    }
+
+    /// Report where this session's request for `resource` stands, as the reservation file was
+    /// last written, without renewing a queued request or extending a grant.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SchedulerStopped`] if the scheduler is no longer accepting commands.
+    pub async fn reservation_status(
+        &self,
+        caller: Caller,
+        resource: &str,
+    ) -> Result<ReservationResult, SchedulerStopped> {
+        let request = ReservationRequest::Status {
             resource: resource.to_string(),
         };
         self.reservation(caller, request).await

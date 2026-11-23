@@ -11,7 +11,7 @@ Running `micromux` with no subcommand opens the TUI for the current project. It'
 
 ## Layout
 
-- **Sidebar** — every service, one row each, showing its lifecycle state: pending, blocked, starting, running, healthy, unhealthy, exited, or disabled. A [job]({{< relref "configuration/services.md" >}}#jobs) shows **COMPLETED** once it exited with status 0, grayed out like a disabled service, **FAILED** with its exit code in red, **RETRYING** between attempts, and **IDLE** while a manual job waits to be run. The selected row drives the panes on the right.
+- **Sidebar** — every service, one row each, showing its lifecycle state: pending, blocked, starting, running, healthy, unhealthy, exited, or disabled. A [job]({{< relref "configuration/services.md" >}}#jobs) shows **COMPLETED** once it exited with status 0, grayed out like a disabled service, **FAILED** with its exit code in red, **RETRYING** between attempts, and **IDLE** while a manual job waits to be run. A service whose start waits for a [shared resource]({{< relref "configuration/services.md" >}}#shared-resources) another session holds shows **QUEUED** until the session gets it. The selected row drives the panes on the right.
 - **Log pane** — the selected service's live output, annotated with the lifecycle transitions that stall it. ANSI color and interactive/redrawing output are supported. `A` switches it to [every service's logs](#all-services-logs) in time order.
 - **Healthcheck pane** — toggled with `H`, it shows the selected service's latest probe: the command, its exit status, and its output.
 - **Events pane** — toggled with `E` in the healthcheck pane's place, it shows the selected service's [lifecycle events](#lifecycle-events): why it is blocked, restarting, or gone.
