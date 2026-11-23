@@ -599,9 +599,10 @@ fn record_resource_wait(
 /// It visits every service before returning, so the state the caller replies with is current for
 /// all of them, though taking that resource is left to the caller.
 pub(super) fn schedule_ready(ctx: &mut ScheduleContext<'_>) -> Option<(ServiceID, String)> {
-    let mut needs_grant = None;
     loop {
         let mut started = false;
+        // The last scan, in which nothing started, decides: a start can block a candidate again.
+        let mut needs_grant = None;
         for (service_id, service) in ctx.services {
             let exited_code = match should_consider_start(ctx, service_id, service) {
                 StartCheck::Skip => {
