@@ -37,6 +37,7 @@ mod spec;
 pub mod structured_log;
 #[cfg(test)]
 pub(crate) mod test_util;
+mod time_label;
 #[cfg(windows)]
 mod windows_job;
 
@@ -79,21 +80,21 @@ pub use model::{
     ServiceEventKind, ServiceSnapshot, SessionChange, SessionModelReader, trim_to_last_bytes,
 };
 pub use scheduler::{
-    Command, CommandRejection, DynamicServiceAck, DynamicServiceResult, EnvironmentResult,
+    Caller, Command, CommandRejection, DynamicServiceAck, DynamicServiceResult, EnvironmentResult,
     MAX_PTY_INPUT_BATCH_BYTES, MAX_PTY_PASTE_BYTES, OutputStream, PreparedPtyInput, PtyInputKind,
     PtyInputPrepareError, PtyInputSendError, ReconcileAction, ReconcileActionKind,
-    ReconcileReceipt, ReconcileResult, ResolvedEnvironment, SchedulerStopped, ServiceCommandAck,
-    ServiceCommandResult, ServiceControl, ServiceID, TerminalControl, TerminalForwarding,
-    TerminalSize,
+    ReconcileReceipt, ReconcileResult, ReservationRequest, ReservationResult, ResolvedEnvironment,
+    SchedulerStopped, ServiceCommandAck, ServiceCommandResult, ServiceControl, ServiceID,
+    TerminalControl, TerminalForwarding, TerminalSize,
 };
 pub use service::{
     Error as ServiceError, RestartPolicy, SessionSite, Site as ServiceSite,
     SkipReason as EnvFileSkipReason, SkippedEnvFile, WorkingDirectoryError,
 };
 pub use session::{
-    PortRegistry, Route, RouteError, RoutingStatus, STATE_DIR_VARIABLE, Session,
-    SessionEnvironment, SessionError, SessionIdentity, SessionStatus, SessionSummary,
-    state_directory_override,
+    Claim, Owner, PortRegistry, ReservationReply, ReservationState, ResourceView, Route,
+    RouteError, RoutingStatus, STATE_DIR_VARIABLE, Session, SessionEnvironment, SessionError,
+    SessionIdentity, SessionStatus, SessionSummary, state_directory_override,
 };
 pub use shell::shell_join;
 pub use spec::{
@@ -107,6 +108,7 @@ pub use structured_log::{
     numeric_timestamp_to_unix_ms, render_scalar, sanitize_text, structured_log_level_in_object,
     structured_log_level_in_record, structured_log_timestamp_in_record,
 };
+pub use time_label::{display_time, renew_label};
 
 pub(crate) type ServiceMap = indexmap::IndexMap<ServiceID, service::Service>;
 
@@ -741,6 +743,7 @@ impl Micromux {
             routes: self.routes.clone(),
             allocated_ports: self.session.ports.clone(),
             routing: (!self.routes.is_empty()).then_some(RoutingStatus::Pending),
+            reservations: Vec::new(),
         }
     }
 
@@ -779,7 +782,8 @@ impl Micromux {
         let (commands_tx, commands_rx) = mpsc::channel(1024);
         let (terminal, pty_input_rx) = TerminalControl::channel(commands_tx.clone());
         let session_status =
-            SessionStatus::new(self.session_summary()).with_git_metadata(self.git_metadata_enabled);
+            SessionStatus::new(self.session_summary(), self.session.resources.clone())
+                .with_git_metadata(self.git_metadata_enabled);
         let handles = Handles {
             reader,
             commands: commands_tx,
@@ -892,7 +896,7 @@ mod tests {
 
         let receipt = handles
             .service_control()
-            .reconcile_config(true)
+            .reconcile_config(Caller::Local, true)
             .await?
             .map_err(|rejection| eyre::eyre!("reconcile rejected: {rejection:?}"))?;
 
@@ -964,7 +968,10 @@ mod tests {
         let shutdown = CancellationToken::new();
         let (runner, handles) = mux.start(shutdown.clone());
         let runner = tokio::spawn(runner);
-        let result = handles.service_control().reconcile_config(true).await?;
+        let result = handles
+            .service_control()
+            .reconcile_config(Caller::Local, true)
+            .await?;
         let rejection = result.err().map(|rejection| rejection.to_string());
         assert!(
             rejection

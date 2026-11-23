@@ -2,16 +2,16 @@
 //!
 //! Domain payloads (`ServiceSnapshot`, `HealthAttempt`, `LogLine`, `SessionChange`,
 //! `ServiceCommandAck`, `DynamicServiceAck`, `ReconcileReceipt`, `ResolvedEnvironment`,
-//! `ServiceEvent`, and `DynamicServiceParams`) are the stable core types reused directly — no DTO
-//! mirror.
+//! `ServiceEvent`, `DynamicServiceParams`, and `ReservationReply`) are the stable core types reused
+//! directly — no DTO mirror.
 //! The session and the proxy accept peers that speak the same major protocol version, so
 //! additive payload changes do not orphan already-running sessions.
 
 use base64::Engine as _;
 use micromux::{
     DynamicServiceAck, DynamicServiceParams, HealthAttempt, Lease, LogLine, LogRunSummary,
-    ReconcileReceipt, ResolvedEnvironment, ServiceCommandAck, ServiceEvent, ServiceID,
-    ServiceSnapshot, SessionChange,
+    ReconcileReceipt, ReservationReply, ResolvedEnvironment, ServiceCommandAck, ServiceEvent,
+    ServiceID, ServiceSnapshot, SessionChange,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// Bump the minor for additive changes (new optional/defaulted fields, new tools that reuse
 /// existing requests), and bump the major for incompatible request/response semantics.
-pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(3, 20);
+pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(3, 21);
 
 /// The first protocol revision whose sessions answer [`Request::GetEvents`].
 pub const EVENTS_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(3, 3);
@@ -34,6 +34,11 @@ pub const ENVIRONMENT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(3
 /// An older session has no session-wide `env_file`, so its variables alone, which
 /// [`Request::GetEnvironment`] returns without a service, are its whole environment.
 pub const SESSION_ENV_FILE_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(3, 20);
+
+/// The first protocol revision whose sessions answer [`Request::Identify`], [`Request::Reserve`],
+/// [`Request::RenewReservation`], and [`Request::ReleaseReservation`], and report reservations in
+/// their description.
+pub const RESERVATIONS_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(3, 21);
 
 /// The first protocol revision whose sessions answer [`Request::SendInput`] and
 /// [`Request::ResizeTerminal`].
@@ -284,7 +289,58 @@ pub enum Request {
     /// Stop the whole session: stop every service and exit the session process (graceful, like the
     /// operator pressing Ctrl-C), freeing its ports. Acknowledged with [`Response::ShuttingDown`]
     /// just before the endpoint goes away.
+    ///
+    /// A client from another project than the session's is refused with
+    /// [`ErrorCode::PolicyDenied`] while the session uses a resource.
     Shutdown,
+    /// Name the project the client works in for the rest of the connection.
+    ///
+    /// Sessions answer it from protocol [`RESERVATIONS_PROTOCOL_VERSION`] on, with
+    /// [`Response::Identified`].
+    /// Only a client whose project is the session's own may control the session's services that
+    /// need a resource, reserve resources for it, or type into those services.
+    /// The scope is cooperative: every client of a user may name any project.
+    Identify {
+        /// The session id of the client's project: [`crate::endpoint_hash`] of its canonical
+        /// config path.
+        project: String,
+    },
+    /// Reserve a resource for the session: granted at once while it is free, queued otherwise.
+    ///
+    /// Sessions answer it from protocol [`RESERVATIONS_PROTOCOL_VERSION`] on, with
+    /// [`Response::Reservation`].
+    /// A request the session already has is updated and renewed.
+    Reserve {
+        /// The resource.
+        resource: String,
+        /// How long the client expects to hold it, shown to other sessions.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        estimate_secs: Option<u64>,
+        /// Why the client wants it, shown to other sessions.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+    /// Move the deadline of the session's request for a resource, granted or queued.
+    ///
+    /// Sessions answer it from protocol [`RESERVATIONS_PROTOCOL_VERSION`] on, with
+    /// [`Response::Reservation`], which lists the queue.
+    /// A grant past its deadline has lapsed and is refused.
+    RenewReservation {
+        /// The resource.
+        resource: String,
+        /// Renew only this request, so a waiter notices that its request was replaced.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        claim: Option<String>,
+    },
+    /// Release the session's request for a resource.
+    ///
+    /// Sessions answer it from protocol [`RESERVATIONS_PROTOCOL_VERSION`] on, with
+    /// [`Response::Reservation`]: `released`, or `draining` while the services that need the
+    /// resource stop.
+    ReleaseReservation {
+        /// The resource.
+        resource: String,
+    },
     /// Stream [`SessionChange`] notifications until the client disconnects.
     Subscribe,
     /// Stream change notifications and negotiate additive subscription behavior.
@@ -421,6 +477,9 @@ pub struct SessionInfo {
     /// Use [`Request::GetService`] for targeted lookup when this is true.
     #[serde(default)]
     pub services_truncated: bool,
+    /// Whether `session.reservations` was emptied to fit the control frame.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reservations_truncated: bool,
     /// The micromux version of the session binary.
     #[serde(default)]
     pub micromux_version: String,
@@ -623,6 +682,12 @@ pub enum Response {
     TerminalQueued,
     /// Acknowledgement of [`Request::Shutdown`], written just before the session begins exiting.
     ShuttingDown,
+    /// Reply to [`Request::Identify`].
+    Identified,
+    /// Reply to [`Request::Reserve`], [`Request::RenewReservation`], and
+    /// [`Request::ReleaseReservation`]: the resource's holder and queue and where the session's
+    /// request stands.
+    Reservation(Box<ReservationReply>),
     /// A typed error.
     Error {
         /// The error code.
@@ -663,6 +728,7 @@ mod tests {
             config_path: "/project/micromux.yaml".to_string(),
             services: Vec::new(),
             services_truncated: false,
+            reservations_truncated: false,
             micromux_version: env!("CARGO_PKG_VERSION").to_string(),
             capabilities: None,
         }
@@ -682,7 +748,7 @@ mod tests {
     fn protocol_version_uses_major_minor_shape_and_accepts_same_major() {
         assert_eq!(
             serde_json::to_value(PROTOCOL_VERSION).unwrap(),
-            json!({ "major": 3, "minor": 20 })
+            json!({ "major": 3, "minor": 21 })
         );
         assert_eq!(
             serde_json::from_value::<ProtocolVersion>(json!({ "major": 1, "minor": 0 })).unwrap(),
@@ -762,6 +828,50 @@ mod tests {
         assert_matches!(
             serde_json::from_value::<Response>(encoded)?,
             Response::EnvironmentFile { path, stale: false } if path.ends_with("session.env")
+        );
+        Ok(())
+    }
+
+    /// A session answers reservation requests only from 3.21 on, and none of them is repeated
+    /// after a lost response.
+    #[test]
+    fn reservation_requests_require_protocol_3_21_and_are_never_retried() -> serde_json::Result<()>
+    {
+        assert!(ProtocolVersion::new(3, 21).supports(RESERVATIONS_PROTOCOL_VERSION));
+        assert!(!ProtocolVersion::new(3, 20).supports(RESERVATIONS_PROTOCOL_VERSION));
+        assert!(PROTOCOL_VERSION.supports(RESERVATIONS_PROTOCOL_VERSION));
+
+        let requests = [
+            Request::Identify {
+                project: "0123456789abcdef".to_string(),
+            },
+            Request::Reserve {
+                resource: "desk".to_string(),
+                estimate_secs: Some(3600),
+                reason: None,
+            },
+            Request::RenewReservation {
+                resource: "desk".to_string(),
+                claim: None,
+            },
+            Request::ReleaseReservation {
+                resource: "desk".to_string(),
+            },
+        ];
+        for request in requests {
+            assert!(!request.is_retry_safe(), "{request:?}");
+            let encoded = serde_json::to_value(&request)?;
+            let decoded = serde_json::from_value::<Request>(encoded.clone())?;
+            assert_eq!(serde_json::to_value(decoded)?, encoded);
+        }
+        // Optional fields may be left out.
+        assert_matches!(
+            serde_json::from_value::<Request>(json!({ "Reserve": { "resource": "desk" } }))?,
+            Request::Reserve {
+                estimate_secs: None,
+                reason: None,
+                ..
+            }
         );
         Ok(())
     }
@@ -1116,7 +1226,7 @@ mod tests {
     fn protocol_version_ignores_additive_fields() {
         let version = serde_json::from_value::<ProtocolVersion>(json!({
             "major": 3,
-            "minor": 20,
+            "minor": 21,
             "future_capability": true
         }))
         .unwrap();

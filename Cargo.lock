@@ -1576,6 +1576,7 @@ dependencies = [
 name = "micromux-cli"
 version = "0.4.7"
 dependencies = [
+ "chrono",
  "clap",
  "codespan-reporting",
  "color-eyre",

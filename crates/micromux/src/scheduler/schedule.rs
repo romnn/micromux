@@ -8,7 +8,7 @@ use crate::config::DependencyCondition;
 use crate::model::{DependencyFailure, DependencyFailureReason};
 use crate::service::StartupMode;
 use crate::{DependencySpec, ServiceEventKind, ServiceKind, ServiceMap, health_check::Health};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -21,6 +21,19 @@ pub(super) struct ScheduleContext<'a> {
     pub(super) test_events: &'a mut TestEventSink,
     pub(super) writer: &'a SessionModelWriter,
     pub(super) shutdown: &'a CancellationToken,
+    /// The session's reservations, which locate each resource's fence; `None` when the session
+    /// cannot hold resources.
+    pub(super) resources: Option<&'a crate::session::ResourceStore>,
+    /// Where this session's claims of resources stand, checked at each spawn.
+    pub(super) claims: &'a BTreeMap<String, super::reservations::Standing>,
+}
+
+/// What `start_service_if_ready` did with a service.
+enum Start {
+    Started,
+    NotStarted,
+    /// The service is ready, but the session must first take this resource for it.
+    NeedsGrant(String),
 }
 
 /// One dependency that is holding a service back, kept with its condition so the wait can be
@@ -362,6 +375,7 @@ fn finish_service_start(
                 since: tokio::time::Instant::now(),
                 exited_at: None,
                 stop_requested: false,
+                resource: service.spec.resource.clone(),
             });
             sync_model(ctx.writer, service, runtime);
             let mut event = service_event(
@@ -427,15 +441,29 @@ fn start_service_if_ready(
     service_id: &ServiceID,
     service: &crate::service::Service,
     exited_code: Option<i32>,
-) -> bool {
+) -> Start {
     if !blocking_dependencies(ctx, service).is_empty() {
-        return false;
+        return Start::NotStarted;
     }
+    // A service that needs a resource starts only while the session holds it.
+    let store = match &service.spec.resource {
+        None => None,
+        Some(resource) => {
+            let held = ctx
+                .claims
+                .get(resource)
+                .is_some_and(|standing| standing.may_start());
+            match ctx.resources {
+                Some(store) if held => Some((store, resource)),
+                _ => return Start::NeedsGrant(resource.clone()),
+            }
+        }
+    };
 
     tracing::info!(service_id, "starting service");
 
     let Some(runtime) = ctx.runtimes.get_mut(service_id) else {
-        return false;
+        return Start::NotStarted;
     };
     if !runtime.blocked_on.is_empty() {
         runtime.blocked_on.clear();
@@ -473,16 +501,28 @@ fn start_service_if_ready(
     }
     let sink = ctx.writer.run_sink(service_id, run_id.get());
 
-    let result = pty::start_service_with_pty_size(pty::StartServiceParams {
-        service,
-        run_id,
-        sink,
-        events_tx: ctx.events_tx,
-        shutdown: ctx.shutdown,
-        terminate: &terminate,
-        pty_size: ctx.current_pty_size,
-    });
-    finish_service_start(
+    // The supervisor locks the resource's fence for the whole run, and a run whose fence cannot
+    // be locked does not start.
+    let fence = store
+        .map(|(store, resource)| store.lock_fence(resource))
+        .transpose();
+    let result = match fence {
+        Ok(fence) => pty::start_service_with_pty_size(pty::StartServiceParams {
+            service,
+            run_id,
+            sink,
+            events_tx: ctx.events_tx,
+            shutdown: ctx.shutdown,
+            terminate: &terminate,
+            pty_size: ctx.current_pty_size,
+            fence,
+        }),
+        Err(err) => Err(pty::Error::operation(
+            "failed to lock the resource fence",
+            err,
+        )),
+    };
+    let started = finish_service_start(
         ctx,
         service_id,
         service,
@@ -491,7 +531,12 @@ fn start_service_if_ready(
         #[cfg(test)]
         clear_logs,
         result,
-    )
+    );
+    if started {
+        Start::Started
+    } else {
+        Start::NotStarted
+    }
 }
 
 /// Records only blockers that remain after every startable dependency has been started.
@@ -510,7 +555,9 @@ fn record_stable_dependency_blocks(ctx: &mut ScheduleContext<'_>) {
     }
 }
 
-pub(super) fn schedule_ready(ctx: &mut ScheduleContext<'_>) {
+/// Starts every service that is ready, until one that is ready needs a resource the session
+/// may not start yet, which it returns with that resource.
+pub(super) fn schedule_ready(ctx: &mut ScheduleContext<'_>) -> Option<(ServiceID, String)> {
     loop {
         let mut started = false;
         for (service_id, service) in ctx.services {
@@ -528,14 +575,18 @@ pub(super) fn schedule_ready(ctx: &mut ScheduleContext<'_>) {
                 "evaluating service"
             );
 
-            started |= start_service_if_ready(ctx, service_id, service, exited_code);
+            match start_service_if_ready(ctx, service_id, service, exited_code) {
+                Start::Started => started = true,
+                Start::NotStarted => {}
+                Start::NeedsGrant(resource) => return Some((service_id.clone(), resource)),
+            }
         }
         // A successful start is the only synchronous transition that can unblock an earlier
         // candidate. Health and exit changes arrive later as events, so successful starts alone
         // participate in this bounded fixed-point pass.
         if !started {
             record_stable_dependency_blocks(ctx);
-            break;
+            return None;
         }
     }
 }
@@ -593,6 +644,8 @@ mod tests {
             test_events,
             writer,
             shutdown,
+            resources: None,
+            claims: const { &BTreeMap::new() },
         }
     }
 

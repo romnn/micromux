@@ -1141,6 +1141,23 @@ fn wrap_info_row(row: Line<'static>, width: usize) -> Vec<Line<'static>> {
 }
 
 /// Everything known about one service, for its details popup.
+/// The latest run's generation, start time, and exit code, as far as known.
+fn run_summary(snapshot: &micromux::ServiceSnapshot) -> Vec<String> {
+    let mut run = vec![format!("generation {}", snapshot.run_generation)];
+    run.extend(
+        snapshot
+            .started_at_unix_ms
+            .and_then(short_local_time)
+            .map(|started| format!("started {started}")),
+    );
+    run.extend(
+        snapshot
+            .last_exit_code
+            .map(|code| format!("last exit code {code}")),
+    );
+    run
+}
+
 fn service_info_rows(
     snapshot: &micromux::ServiceSnapshot,
     dependency_kind: &dyn Fn(&str) -> Option<micromux::ServiceKind>,
@@ -1183,18 +1200,7 @@ fn service_info_rows(
         snapshot.stop_signal,
         snapshot.stop_grace_period.as_secs()
     );
-    let mut run = vec![format!("generation {}", snapshot.run_generation)];
-    run.extend(
-        snapshot
-            .started_at_unix_ms
-            .and_then(short_local_time)
-            .map(|started| format!("started {started}")),
-    );
-    run.extend(
-        snapshot
-            .last_exit_code
-            .map(|code| format!("last exit code {code}")),
-    );
+    let run = run_summary(snapshot);
 
     let mut rows = info_rows("State", vec![Line::from(state)]);
     if snapshot.name != snapshot.id {
@@ -1208,6 +1214,9 @@ fn service_info_rows(
     }
     rows.extend(info_rows("URLs", urls));
     rows.extend(info_rows("Ports", port_rows(snapshot, session)));
+    if let Some(resource) = &snapshot.resource {
+        rows.extend(info_rows("Resource", vec![resource.clone()]));
+    }
     rows.extend(info_rows(
         "Command",
         command_rows(&micromux::shell_join(&snapshot.command)),
@@ -1356,7 +1365,12 @@ fn cleanup_phrase(cleanup: &micromux::CleanupStatus) -> String {
 }
 
 /// The session's name, proxy and every route, for the session popup.
-fn session_info_rows(session: Option<&micromux::SessionSummary>) -> Vec<Line<'static>> {
+/// The session popup's rows; `reservations_truncated` says the session left its reservations
+/// out of a description too large to send.
+fn session_info_rows(
+    session: Option<&micromux::SessionSummary>,
+    reservations_truncated: bool,
+) -> Vec<Line<'static>> {
     let Some(session) = session else {
         return vec![Line::raw("This session reports no session details.")];
     };
@@ -1416,6 +1430,50 @@ fn session_info_rows(session: Option<&micromux::SessionSummary>) -> Vec<Line<'st
             .map(|(name, port)| Span::raw(format!(":{port}  {name}")))
             .collect(),
     ));
+    if reservations_truncated {
+        rows.push(Line::default());
+        rows.extend(info_rows(
+            "Resources",
+            vec![Span::raw(
+                "too many to show here; run `micromux ctl ls` in the session's project",
+            )],
+        ));
+    } else if !session.reservations.is_empty() {
+        rows.push(Line::default());
+        rows.extend(info_rows(
+            "Resources",
+            reservation_rows(&session.reservations),
+        ));
+    }
+    rows
+}
+
+/// Each resource's holder, then the requests waiting for it in queue order.
+fn reservation_rows(reservations: &[micromux::ResourceView]) -> Vec<Line<'static>> {
+    let mut rows = Vec::new();
+    for view in reservations {
+        let holder = match &view.owner {
+            Some(owner) => format!(
+                "{}  held by {}, granted {}, {}",
+                view.name,
+                owner.claim,
+                micromux::display_time(owner.granted_at_unix_ms),
+                micromux::renew_label(owner.claim.renew_by_unix_ms)
+            ),
+            None => format!("{}  free", view.name),
+        };
+        rows.push(Line::raw(holder));
+        for (index, waiter) in view.waiters.iter().enumerate() {
+            rows.push(Line::from(
+                format!(
+                    "  {}. {waiter}, queued {}",
+                    index + 1,
+                    micromux::display_time(waiter.requested_at_unix_ms)
+                )
+                .fg(Color::DarkGray),
+            ));
+        }
+    }
     rows
 }
 
@@ -2311,13 +2369,13 @@ impl App {
         let notice = self
             .source
             .local_notice()
-            .or_else(|| self.terminal_notice())?;
+            .or_else(|| self.terminal_notice().map(str::to_string))?;
         Some(Line::from(vec![
             format!("micromux v{}", env!("CARGO_PKG_VERSION"))
                 .bold()
                 .fg(App::HEADER_COLOR),
             " — WARNING: ".fg(Color::Red).bold(),
-            notice.to_string().fg(Color::Red),
+            notice.fg(Color::Red),
         ]))
     }
 
@@ -2882,12 +2940,16 @@ impl App {
                 )
             }
             crate::InfoView::Session => {
+                let mut session = session;
+                if let Some(session) = &mut session {
+                    session.reservations = self.source.reservations();
+                }
                 let name = session
                     .as_ref()
                     .map_or_else(|| "no session".to_string(), |session| session.name.clone());
                 (
                     format!(" Session · {name} "),
-                    session_info_rows(session.as_ref()),
+                    session_info_rows(session.as_ref(), self.source.reservations_truncated()),
                 )
             }
         };

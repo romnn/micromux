@@ -48,16 +48,20 @@ async fn run_test_scheduler(
 
 /// The live summary of a session without routes, which no reload ever changes.
 fn unrouted_session_status() -> crate::SessionStatus {
-    crate::SessionStatus::new(crate::SessionSummary {
-        git: None,
-        name: "test".to_string(),
-        domain: "test.localhost".to_string(),
-        host_suffix: "test.localhost".to_string(),
-        proxy_port: 80,
-        routes: Vec::new(),
-        allocated_ports: indexmap::IndexMap::new(),
-        routing: None,
-    })
+    crate::SessionStatus::new(
+        crate::SessionSummary {
+            git: None,
+            name: "test".to_string(),
+            domain: "test.localhost".to_string(),
+            host_suffix: "test.localhost".to_string(),
+            proxy_port: 80,
+            routes: Vec::new(),
+            allocated_ports: indexmap::IndexMap::new(),
+            routing: None,
+            reservations: Vec::new(),
+        },
+        None,
+    )
 }
 
 /// A scheduler running against a temp config plus model/control handles.
@@ -336,7 +340,7 @@ async fn assert_idempotency_collision(control: &ServiceControl) -> eyre::Result<
     let mut collision = dynamic_params("debug", &["true"]);
     collision.idempotency_key = Some("create-debug".to_string());
     let collision = control
-        .start_dynamic(collision)
+        .start_dynamic(Caller::Local, collision)
         .await
         .map_err(|_| eyre::eyre!("scheduler stopped"))?;
     assert!(matches!(collision, Err(CommandRejection::PolicyDenied(_))));
@@ -347,7 +351,12 @@ async fn assert_dynamic_creation_and_idempotency(harness: &Harness) -> eyre::Res
     let mut params = dynamic_params("debug", &["sh", "-c", "echo dynamic; sleep 60"]);
     params.idempotency_key = Some("create-debug".to_string());
 
-    let created = dynamic_accepted(harness.control.start_dynamic(params.clone()).await)?;
+    let created = dynamic_accepted(
+        harness
+            .control
+            .start_dynamic(Caller::Local, params.clone())
+            .await,
+    )?;
     assert_eq!(created.revision, 1);
     assert_eq!(created.observed_generation, 0);
     wait_until(&harness.reader, "debug", |snapshot| {
@@ -356,7 +365,7 @@ async fn assert_dynamic_creation_and_idempotency(harness: &Harness) -> eyre::Res
     .await?;
     wait_for_log(&harness.reader, "debug", "dynamic").await?;
 
-    let replay = dynamic_accepted(harness.control.start_dynamic(params).await)?;
+    let replay = dynamic_accepted(harness.control.start_dynamic(Caller::Local, params).await)?;
     assert!(replay.idempotent_replay);
     assert_eq!(replay.revision, created.revision);
     assert_eq!(
@@ -370,7 +379,7 @@ async fn assert_dynamic_creation_and_idempotency(harness: &Harness) -> eyre::Res
 
     let duplicate = harness
         .control
-        .start_dynamic(dynamic_params("debug", &["true"]))
+        .start_dynamic(Caller::Local, dynamic_params("debug", &["true"]))
         .await
         .map_err(|_| eyre::eyre!("scheduler stopped"))?;
     assert!(matches!(duplicate, Err(CommandRejection::InvalidSpec(_))));
@@ -378,7 +387,12 @@ async fn assert_dynamic_creation_and_idempotency(harness: &Harness) -> eyre::Res
 }
 
 async fn assert_dynamic_retirement(harness: &Harness) -> eyre::Result<()> {
-    let stopped = dynamic_accepted(harness.control.stop_dynamic(&"debug".to_string()).await)?;
+    let stopped = dynamic_accepted(
+        harness
+            .control
+            .stop_dynamic(Caller::Local, &"debug".into())
+            .await,
+    )?;
     assert!(!stopped.already_retired);
     let retired = wait_until(&harness.reader, "debug", |snapshot| {
         snapshot.retired == Some(RetiredReason::Stopped)
@@ -386,7 +400,12 @@ async fn assert_dynamic_retirement(harness: &Harness) -> eyre::Result<()> {
     .await?;
     assert_eq!(retired.desired, Desired::Disabled);
     assert!(!harness.reader.logs("debug", None).is_empty());
-    let stopped_again = dynamic_accepted(harness.control.stop_dynamic(&"debug".to_string()).await)?;
+    let stopped_again = dynamic_accepted(
+        harness
+            .control
+            .stop_dynamic(Caller::Local, &"debug".into())
+            .await,
+    )?;
     assert!(stopped_again.already_retired);
 
     let mut blocked = dynamic_params("blocked", &["true"]);
@@ -396,7 +415,7 @@ async fn assert_dynamic_retirement(harness: &Harness) -> eyre::Result<()> {
     }]);
     let blocked = harness
         .control
-        .start_dynamic(blocked)
+        .start_dynamic(Caller::Local, blocked)
         .await
         .map_err(|_| eyre::eyre!("scheduler stopped"))?;
     assert!(matches!(
@@ -407,7 +426,7 @@ async fn assert_dynamic_retirement(harness: &Harness) -> eyre::Result<()> {
     ));
     let restart = harness
         .control
-        .restart(&"debug".to_string())
+        .restart(Caller::Local, &"debug".into())
         .await
         .map_err(|_| eyre::eyre!("scheduler stopped"))?;
     assert!(matches!(restart, Err(CommandRejection::InvalidState(_))));
@@ -433,7 +452,7 @@ async fn assert_incomplete_replacement_is_non_mutating(harness: &Harness) -> eyr
 
     let result = harness
         .control
-        .replace_dynamic(&"debug".to_string(), 1, incomplete)
+        .replace_dynamic(Caller::Local, &"debug".into(), 1, incomplete)
         .await
         .map_err(|_| eyre::eyre!("scheduler stopped"))?;
 
@@ -827,6 +846,7 @@ fn start_dummy_run(runtime: &mut ServiceRuntime) -> eyre::Result<RunId> {
         since: tokio::time::Instant::now(),
         exited_at: None,
         stop_requested: false,
+        resource: None,
     });
     Ok(run_id)
 }
@@ -916,12 +936,12 @@ async fn initially_disabled_service_stays_stopped_until_enabled() -> eyre::Resul
 
     let rejected = harness
         .control
-        .restart(&id)
+        .restart(Caller::Local, &id)
         .await
         .map_err(|_| eyre::eyre!("scheduler stopped"))?;
     assert!(matches!(rejected, Err(CommandRejection::InvalidState(_))));
 
-    accepted(harness.control.enable(&id).await)?;
+    accepted(harness.control.enable(Caller::Local, &id).await)?;
     let snapshot = wait_until(&harness.reader, "svc", |snapshot| {
         snapshot.desired == Desired::Enabled && snapshot.execution == Execution::Running
     })
@@ -955,7 +975,7 @@ async fn service_control_latches_generation_and_rejects_restart_when_disabled() 
     assert_eq!(snapshot.run_generation, 1);
 
     // Restart acks the *pre-restart* generation; a new run bumps it to 2.
-    let acks = accepted(harness.control.restart(&id).await)?;
+    let acks = accepted(harness.control.restart(Caller::Local, &id).await)?;
     assert_eq!(acks.first().map(|a| a.observed_generation), Some(1));
     wait_until(&harness.reader, "svc", |s| {
         s.run_generation == 2 && s.execution == Execution::Running
@@ -963,17 +983,17 @@ async fn service_control_latches_generation_and_rejects_restart_when_disabled() 
     .await?;
 
     // A strict (acknowledged) restart of a disabled service is rejected, not a silent re-enable.
-    accepted(harness.control.disable(&id).await)?;
+    accepted(harness.control.disable(Caller::Local, &id).await)?;
     wait_until(&harness.reader, "svc", |s| s.desired == Desired::Disabled).await?;
     let rejected = harness
         .control
-        .restart(&id)
+        .restart(Caller::Local, &id)
         .await
         .map_err(|_| eyre::eyre!("scheduler stopped"))?;
     assert!(matches!(rejected, Err(CommandRejection::InvalidState(_))));
 
     // Enable is the operation that starts a disabled service.
-    accepted(harness.control.enable(&id).await)?;
+    accepted(harness.control.enable(Caller::Local, &id).await)?;
     wait_until(&harness.reader, "svc", |s| {
         s.desired == Desired::Enabled && s.execution == Execution::Running
     })
@@ -999,7 +1019,8 @@ async fn dynamic_service_create_replace_stop_and_idempotency() -> eyre::Result<(
     let stale = harness
         .control
         .replace_dynamic(
-            &"debug".to_string(),
+            Caller::Local,
+            &"debug".into(),
             0,
             dynamic_params("debug", &["sh", "-c", "sleep 60"]),
         )
@@ -1017,7 +1038,8 @@ async fn dynamic_service_create_replace_stop_and_idempotency() -> eyre::Result<(
         harness
             .control
             .replace_dynamic(
-                &"debug".to_string(),
+                Caller::Local,
+                &"debug".into(),
                 1,
                 dynamic_params("debug", &["sh", "-c", "echo replaced; sleep 60"]),
             )
@@ -1051,7 +1073,10 @@ async fn self_referential_dynamic_replace_overlays_and_reappends_extra_args() ->
     let created = dynamic_accepted(
         harness
             .control
-            .start_dynamic(dynamic_params(&id, &["sh", "-c", "sleep 60"]))
+            .start_dynamic(
+                Caller::Local,
+                dynamic_params(&id, &["sh", "-c", "sleep 60"]),
+            )
             .await,
     )?;
     assert_eq!(created.command, vec!["sh", "-c", "sleep 60"]);
@@ -1064,14 +1089,19 @@ async fn self_referential_dynamic_replace_overlays_and_reappends_extra_args() ->
     let replaced = dynamic_accepted(
         harness
             .control
-            .replace_dynamic(&id, 1, replacement.clone())
+            .replace_dynamic(Caller::Local, &id, 1, replacement.clone())
             .await,
     )?;
     assert_eq!(replaced.revision, 2);
     assert_eq!(replaced.restart, RestartPolicy::Always);
     assert_eq!(replaced.command, vec!["sh", "-c", "sleep 60", "--trace"]);
 
-    let repeated = dynamic_accepted(harness.control.replace_dynamic(&id, 2, replacement).await)?;
+    let repeated = dynamic_accepted(
+        harness
+            .control
+            .replace_dynamic(Caller::Local, &id, 2, replacement)
+            .await,
+    )?;
     assert_eq!(repeated.revision, 3);
     assert_eq!(repeated.restart, RestartPolicy::Always);
     assert_eq!(
@@ -1104,7 +1134,7 @@ async fn dynamic_policy_limit_ttl_and_dependency_gating() -> eyre::Result<()> {
         service: "dep".to_string(),
         condition: Some(config::DependencyCondition::Started),
     }]);
-    let created = dynamic_accepted(harness.control.start_dynamic(params).await)?;
+    let created = dynamic_accepted(harness.control.start_dynamic(Caller::Local, params).await)?;
     let now = unix_now_ms().unwrap_or_default();
     assert!(
         created
@@ -1128,20 +1158,30 @@ async fn dynamic_policy_limit_ttl_and_dependency_gating() -> eyre::Result<()> {
 
     let limited = harness
         .control
-        .start_dynamic(dynamic_params("other", &["true"]))
+        .start_dynamic(Caller::Local, dynamic_params("other", &["true"]))
         .await
         .map_err(|_| eyre::eyre!("scheduler stopped"))?;
     assert!(matches!(limited, Err(CommandRejection::LimitExceeded(_))));
     // A merely *disabled* dynamic still holds its slot; only retirement or expiry frees it.
-    accepted(harness.control.disable(&"worker".to_string()).await)?;
+    accepted(
+        harness
+            .control
+            .disable(Caller::Local, &"worker".into())
+            .await,
+    )?;
     let limited = harness
         .control
-        .start_dynamic(dynamic_params("other", &["true"]))
+        .start_dynamic(Caller::Local, dynamic_params("other", &["true"]))
         .await
         .map_err(|_| eyre::eyre!("scheduler stopped"))?;
     assert!(matches!(limited, Err(CommandRejection::LimitExceeded(_))));
-    accepted(harness.control.enable(&"worker".to_string()).await)?;
-    accepted(harness.control.enable(&"dep".to_string()).await)?;
+    accepted(
+        harness
+            .control
+            .enable(Caller::Local, &"worker".into())
+            .await,
+    )?;
+    accepted(harness.control.enable(Caller::Local, &"dep".into()).await)?;
     wait_until(&harness.reader, "worker", |snapshot| {
         snapshot.execution == Execution::Running
     })
@@ -1169,7 +1209,10 @@ async fn dynamic_policy_limit_ttl_and_dependency_gating() -> eyre::Result<()> {
     dynamic_accepted(
         harness
             .control
-            .start_dynamic(dynamic_params("other", &["sh", "-c", "sleep 60"]))
+            .start_dynamic(
+                Caller::Local,
+                dynamic_params("other", &["sh", "-c", "sleep 60"]),
+            )
             .await,
     )?;
 
@@ -1188,7 +1231,7 @@ async fn dynamic_lifetime_overflow_is_rejected_without_mutating_the_roster() -> 
 
     let result = harness
         .control
-        .start_dynamic(dynamic_params("too-long", &["true"]))
+        .start_dynamic(Caller::Local, dynamic_params("too-long", &["true"]))
         .await
         .map_err(|_| eyre::eyre!("scheduler stopped"))?;
 
@@ -1212,7 +1255,7 @@ async fn unbounded_dynamic_lease_has_no_expiry_and_does_not_retire() -> eyre::Re
     let mut params = dynamic_params("unbounded", &["sh", "-c", "sleep 60"]);
     params.expires_after = Some(Lease::Unbounded);
 
-    let receipt = dynamic_accepted(harness.control.start_dynamic(params).await)?;
+    let receipt = dynamic_accepted(harness.control.start_dynamic(Caller::Local, params).await)?;
     assert_eq!(receipt.expires_at_unix_ms, None);
     tokio::time::sleep(Duration::from_millis(300)).await;
     let snapshot = harness
@@ -1241,7 +1284,7 @@ async fn renewing_dynamic_lease_preserves_the_running_process_and_revision() -> 
     );
     let mut params = dynamic_params("renewable", &["sh", "-c", "sleep 60"]);
     params.expires_after = Some(Lease::After(Duration::from_secs(10)));
-    dynamic_accepted(harness.control.start_dynamic(params).await)?;
+    dynamic_accepted(harness.control.start_dynamic(Caller::Local, params).await)?;
     let before = wait_until(&harness.reader, "renewable", |snapshot| {
         snapshot.execution == Execution::Running
     })
@@ -1254,7 +1297,7 @@ async fn renewing_dynamic_lease_preserves_the_running_process_and_revision() -> 
 
     let stale = harness
         .control
-        .renew_dynamic(&"renewable".to_string(), 0, None)
+        .renew_dynamic(Caller::Local, &"renewable".into(), 0, None)
         .await
         .map_err(|_| eyre::eyre!("scheduler stopped"))?;
     assert!(matches!(
@@ -1268,7 +1311,7 @@ async fn renewing_dynamic_lease_preserves_the_running_process_and_revision() -> 
     let receipt = dynamic_accepted(
         harness
             .control
-            .renew_dynamic(&"renewable".to_string(), 1, None)
+            .renew_dynamic(Caller::Local, &"renewable".into(), 1, None)
             .await,
     )?;
     let after = harness
@@ -1298,10 +1341,15 @@ async fn renewing_dynamic_lease_preserves_the_running_process_and_revision() -> 
             .any(|event| event.kind == ServiceEventKind::LeaseRenewed)
     );
 
-    dynamic_accepted(harness.control.stop_dynamic(&"renewable".to_string()).await)?;
+    dynamic_accepted(
+        harness
+            .control
+            .stop_dynamic(Caller::Local, &"renewable".into())
+            .await,
+    )?;
     let retired = harness
         .control
-        .renew_dynamic(&"renewable".to_string(), 1, None)
+        .renew_dynamic(Caller::Local, &"renewable".into(), 1, None)
         .await
         .map_err(|_| eyre::eyre!("scheduler stopped"))?;
     assert!(
@@ -1322,7 +1370,7 @@ async fn renewing_to_unbounded_clears_the_expiry_deadline() -> eyre::Result<()> 
         spawn_harness_with_policy(ServiceMap::new(), None, dir.path().to_path_buf(), policy);
     let mut params = dynamic_params("renewable", &["sh", "-c", "sleep 60"]);
     params.expires_after = Some(Lease::After(Duration::from_secs(10)));
-    dynamic_accepted(harness.control.start_dynamic(params).await)?;
+    dynamic_accepted(harness.control.start_dynamic(Caller::Local, params).await)?;
     let before = harness
         .reader
         .service("renewable")
@@ -1333,7 +1381,12 @@ async fn renewing_to_unbounded_clears_the_expiry_deadline() -> eyre::Result<()> 
     let receipt = dynamic_accepted(
         harness
             .control
-            .renew_dynamic(&"renewable".to_string(), 1, Some(Lease::Unbounded))
+            .renew_dynamic(
+                Caller::Local,
+                &"renewable".into(),
+                1,
+                Some(Lease::Unbounded),
+            )
             .await,
     )?;
     assert_eq!(receipt.expires_at_unix_ms, None);
@@ -1360,21 +1413,33 @@ async fn reviving_retired_dynamic_requires_a_free_live_slot() -> eyre::Result<()
     dynamic_accepted(
         harness
             .control
-            .start_dynamic(dynamic_params("retired", &["sh", "-c", "sleep 60"]))
+            .start_dynamic(
+                Caller::Local,
+                dynamic_params("retired", &["sh", "-c", "sleep 60"]),
+            )
             .await,
     )?;
-    dynamic_accepted(harness.control.stop_dynamic(&"retired".to_string()).await)?;
     dynamic_accepted(
         harness
             .control
-            .start_dynamic(dynamic_params("occupant", &["sh", "-c", "sleep 60"]))
+            .stop_dynamic(Caller::Local, &"retired".into())
+            .await,
+    )?;
+    dynamic_accepted(
+        harness
+            .control
+            .start_dynamic(
+                Caller::Local,
+                dynamic_params("occupant", &["sh", "-c", "sleep 60"]),
+            )
             .await,
     )?;
 
     let replacement = harness
         .control
         .replace_dynamic(
-            &"retired".to_string(),
+            Caller::Local,
+            &"retired".into(),
             1,
             dynamic_params("retired", &["sh", "-c", "sleep 60"]),
         )
@@ -1416,7 +1481,7 @@ async fn dynamic_working_root_rejects_symlink_escape() -> eyre::Result<()> {
 
     let result = harness
         .control
-        .start_dynamic(params)
+        .start_dynamic(Caller::Local, params)
         .await
         .map_err(|_| eyre::eyre!("scheduler stopped"))?;
     assert!(
@@ -1429,7 +1494,7 @@ async fn dynamic_working_root_rejects_symlink_escape() -> eyre::Result<()> {
     params.spec.working_dir = crate::SpecField::Value(PathBuf::from("allowed/../outside"));
     let result = harness
         .control
-        .start_dynamic(params)
+        .start_dynamic(Caller::Local, params)
         .await
         .map_err(|_| eyre::eyre!("scheduler stopped"))?;
     assert!(
@@ -1454,7 +1519,10 @@ async fn dynamic_replace_rejects_cycles_before_mutating() -> eyre::Result<()> {
     dynamic_accepted(
         harness
             .control
-            .start_dynamic(dynamic_params("a", &["sh", "-c", "sleep 60"]))
+            .start_dynamic(
+                Caller::Local,
+                dynamic_params("a", &["sh", "-c", "sleep 60"]),
+            )
             .await,
     )?;
     let mut b = dynamic_params("b", &["sh", "-c", "sleep 60"]);
@@ -1462,7 +1530,7 @@ async fn dynamic_replace_rejects_cycles_before_mutating() -> eyre::Result<()> {
         service: "a".to_string(),
         condition: Some(config::DependencyCondition::Started),
     }]);
-    dynamic_accepted(harness.control.start_dynamic(b).await)?;
+    dynamic_accepted(harness.control.start_dynamic(Caller::Local, b).await)?;
     let before = wait_until(&harness.reader, "a", |snapshot| {
         snapshot.execution == Execution::Running
     })
@@ -1475,7 +1543,7 @@ async fn dynamic_replace_rejects_cycles_before_mutating() -> eyre::Result<()> {
     }]);
     let result = harness
         .control
-        .replace_dynamic(&"a".to_string(), 1, replacement)
+        .replace_dynamic(Caller::Local, &"a".into(), 1, replacement)
         .await
         .map_err(|_| eyre::eyre!("scheduler stopped"))?;
     assert!(matches!(result, Err(CommandRejection::InvalidSpec(_))));
@@ -1503,7 +1571,10 @@ async fn retired_eviction_keeps_live_dependency_targets() -> eyre::Result<()> {
     dynamic_accepted(
         harness
             .control
-            .start_dynamic(dynamic_params("anchor", &["sh", "-c", "sleep 60"]))
+            .start_dynamic(
+                Caller::Local,
+                dynamic_params("anchor", &["sh", "-c", "sleep 60"]),
+            )
             .await,
     )?;
     wait_until(&harness.reader, "anchor", |snapshot| {
@@ -1516,26 +1587,36 @@ async fn retired_eviction_keeps_live_dependency_targets() -> eyre::Result<()> {
         service: "anchor".to_string(),
         condition: Some(config::DependencyCondition::Started),
     }]);
-    dynamic_accepted(harness.control.start_dynamic(dependent).await)?;
+    dynamic_accepted(
+        harness
+            .control
+            .start_dynamic(Caller::Local, dependent)
+            .await,
+    )?;
     wait_until(&harness.reader, "dependent", |snapshot| {
         snapshot.execution == Execution::Running
     })
     .await?;
-    dynamic_accepted(harness.control.stop_dynamic(&"anchor".to_string()).await)?;
+    dynamic_accepted(
+        harness
+            .control
+            .stop_dynamic(Caller::Local, &"anchor".into())
+            .await,
+    )?;
 
     for index in 0..(MAX_RETIRED_SERVICES + 2) {
         let id = format!("disposable-{index:02}");
         dynamic_accepted(
             harness
                 .control
-                .start_dynamic(dynamic_params(&id, &["true"]))
+                .start_dynamic(Caller::Local, dynamic_params(&id, &["true"]))
                 .await,
         )?;
         wait_until(&harness.reader, &id, |snapshot| {
             snapshot.execution == Execution::Exited
         })
         .await?;
-        dynamic_accepted(harness.control.stop_dynamic(&id).await)?;
+        dynamic_accepted(harness.control.stop_dynamic(Caller::Local, &id).await)?;
     }
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -1582,7 +1663,10 @@ async fn retired_eviction_keeps_dependencies_until_their_dependents_are_evicted(
     dynamic_accepted(
         harness
             .control
-            .start_dynamic(dynamic_params("anchor", &["sh", "-c", "sleep 60"]))
+            .start_dynamic(
+                Caller::Local,
+                dynamic_params("anchor", &["sh", "-c", "sleep 60"]),
+            )
             .await,
     )?;
     let mut dependent = dynamic_params("dependent", &["sh", "-c", "sleep 60"]);
@@ -1590,14 +1674,29 @@ async fn retired_eviction_keeps_dependencies_until_their_dependents_are_evicted(
         service: "anchor".to_string(),
         condition: Some(config::DependencyCondition::Started),
     }]);
-    dynamic_accepted(harness.control.start_dynamic(dependent).await)?;
+    dynamic_accepted(
+        harness
+            .control
+            .start_dynamic(Caller::Local, dependent)
+            .await,
+    )?;
     wait_until(&harness.reader, "dependent", |snapshot| {
         snapshot.execution == Execution::Running
     })
     .await?;
 
-    dynamic_accepted(harness.control.stop_dynamic(&"dependent".to_string()).await)?;
-    dynamic_accepted(harness.control.stop_dynamic(&"anchor".to_string()).await)?;
+    dynamic_accepted(
+        harness
+            .control
+            .stop_dynamic(Caller::Local, &"dependent".into())
+            .await,
+    )?;
+    dynamic_accepted(
+        harness
+            .control
+            .stop_dynamic(Caller::Local, &"anchor".into())
+            .await,
+    )?;
 
     // Create exactly one excess tombstone. Removing both sides of the dependency would hide an
     // invalid intermediate graph.
@@ -1606,14 +1705,14 @@ async fn retired_eviction_keeps_dependencies_until_their_dependents_are_evicted(
         dynamic_accepted(
             harness
                 .control
-                .start_dynamic(dynamic_params(&id, &["true"]))
+                .start_dynamic(Caller::Local, dynamic_params(&id, &["true"]))
                 .await,
         )?;
         wait_until(&harness.reader, &id, |snapshot| {
             snapshot.execution == Execution::Exited
         })
         .await?;
-        dynamic_accepted(harness.control.stop_dynamic(&id).await)?;
+        dynamic_accepted(harness.control.stop_dynamic(Caller::Local, &id).await)?;
     }
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -1643,7 +1742,7 @@ async fn retired_eviction_keeps_dependencies_until_their_dependents_are_evicted(
     dynamic_accepted(
         harness
             .control
-            .start_dynamic(dynamic_params("after-eviction", &["true"]))
+            .start_dynamic(Caller::Local, dynamic_params("after-eviction", &["true"]))
             .await,
     )?;
     wait_until(&harness.reader, "after-eviction", |snapshot| {
@@ -1671,22 +1770,25 @@ async fn retired_eviction_waits_for_slow_processes_and_log_readers() -> eyre::Re
         dynamic_accepted(
             harness
                 .control
-                .start_dynamic(dynamic_params(
-                    id,
-                    &["sh", "-c", "trap '' TERM; echo ready; sleep 60"],
-                ))
+                .start_dynamic(
+                    Caller::Local,
+                    dynamic_params(id, &["sh", "-c", "trap '' TERM; echo ready; sleep 60"]),
+                )
                 .await,
         )?;
         wait_for_log(&harness.reader, id, "ready").await?;
     }
     for id in &retired_ids {
-        dynamic_accepted(harness.control.stop_dynamic(id).await)?;
+        dynamic_accepted(harness.control.stop_dynamic(Caller::Local, id).await)?;
     }
 
     dynamic_accepted(
         harness
             .control
-            .start_dynamic(dynamic_params("trigger", &["sh", "-c", "sleep 60"]))
+            .start_dynamic(
+                Caller::Local,
+                dynamic_params("trigger", &["sh", "-c", "sleep 60"]),
+            )
             .await,
     )?;
 
@@ -1708,7 +1810,7 @@ async fn dynamic_services_are_denied_by_default() -> eyre::Result<()> {
     let harness = spawn_harness(ServiceMap::new(), None);
     let result = harness
         .control
-        .start_dynamic(dynamic_params("debug", &["true"]))
+        .start_dynamic(Caller::Local, dynamic_params("debug", &["true"]))
         .await
         .map_err(|_| eyre::eyre!("scheduler stopped"))?;
     assert!(matches!(result, Err(CommandRejection::PolicyDenied(_))));
@@ -1737,7 +1839,7 @@ async fn commands_do_not_depend_on_event_subscribers() -> eyre::Result<()> {
     .await?;
     // Acknowledged commands round-trip and advance the model without any event-channel
     // subscriber; the model is the scheduler's only runtime publication path.
-    let acks = accepted(harness.control.restart(&id).await)?;
+    let acks = accepted(harness.control.restart(Caller::Local, &id).await)?;
     assert_eq!(acks.first().map(|a| a.observed_generation), Some(1));
     wait_until(&harness.reader, "svc", |s| s.run_generation == 2).await?;
 
@@ -1894,7 +1996,7 @@ async fn reconcile_reorders_running_services_without_replacing_their_state() -> 
         ordered_service_yaml(&["api", "query", "worker"]),
     )?;
 
-    let dry_run = reconcile_accepted(harness.control.reconcile_config(true).await)?;
+    let dry_run = reconcile_accepted(harness.control.reconcile_config(Caller::Local, true).await)?;
     assert_eq!(
         dry_run
             .actions
@@ -1911,7 +2013,7 @@ async fn reconcile_reorders_running_services_without_replacing_their_state() -> 
                 && action.detail == "changed service order")
     );
     assert_eq!(roster_ids(&harness.reader), ["api", "worker", "query"]);
-    let applied = reconcile_accepted(harness.control.reconcile_config(false).await)?;
+    let applied = reconcile_accepted(harness.control.reconcile_config(Caller::Local, false).await)?;
     assert_eq!(applied.actions, dry_run.actions);
     assert_eq!(roster_ids(&harness.reader), ["api", "query", "worker"]);
 
@@ -1942,7 +2044,7 @@ async fn reconcile_reorders_running_services_without_replacing_their_state() -> 
         );
     }
     assert_eq!(
-        reconcile_accepted(harness.control.reconcile_config(false).await)?.actions,
+        reconcile_accepted(harness.control.reconcile_config(Caller::Local, false).await)?.actions,
         Vec::<ReconcileAction>::new()
     );
 
@@ -1951,7 +2053,7 @@ async fn reconcile_reorders_running_services_without_replacing_their_state() -> 
         &config_path,
         ordered_service_yaml(&["query", "worker", "api"]),
     )?;
-    accepted(harness.control.restart(&"api".to_string()).await)?;
+    accepted(harness.control.restart(Caller::Local, &"api".into()).await)?;
     assert_eq!(roster_ids(&harness.reader), ["query", "worker", "api"]);
     harness.shutdown.cancel();
     harness.handle.await??;
@@ -1976,14 +2078,17 @@ async fn reconcile_places_additions_and_revivals_before_dynamic_services_and_tom
     dynamic_accepted(
         harness
             .control
-            .start_dynamic(dynamic_params("debug", &["sh", "-c", "sleep 60"]))
+            .start_dynamic(
+                Caller::Local,
+                dynamic_params("debug", &["sh", "-c", "sleep 60"]),
+            )
             .await,
     )?;
     fs::write(
         &config_path,
         ordered_service_yaml(&["query", "added", "api"]),
     )?;
-    reconcile_accepted(harness.control.reconcile_config(false).await)?;
+    reconcile_accepted(harness.control.reconcile_config(Caller::Local, false).await)?;
     assert_eq!(
         roster_ids(&harness.reader),
         ["query", "added", "api", "worker", "debug"]
@@ -2007,7 +2112,7 @@ async fn reconcile_places_additions_and_revivals_before_dynamic_services_and_tom
         &config_path,
         ordered_service_yaml(&["worker", "api", "query", "added"]),
     )?;
-    reconcile_accepted(harness.control.reconcile_config(false).await)?;
+    reconcile_accepted(harness.control.reconcile_config(Caller::Local, false).await)?;
     assert_eq!(
         roster_ids(&harness.reader),
         ["worker", "api", "query", "added", "debug"]
@@ -2019,7 +2124,7 @@ async fn reconcile_places_additions_and_revivals_before_dynamic_services_and_tom
             .is_some_and(|snapshot| snapshot.retired.is_none())
     );
     assert_eq!(
-        reconcile_accepted(harness.control.reconcile_config(true).await)?.actions,
+        reconcile_accepted(harness.control.reconcile_config(Caller::Local, true).await)?.actions,
         Vec::<ReconcileAction>::new()
     );
     harness.shutdown.cancel();
@@ -2032,7 +2137,7 @@ async fn assert_reconcile_dry_run(
     before_x: &crate::model::ServiceSnapshot,
     before_y: &crate::model::ServiceSnapshot,
 ) -> eyre::Result<ReconcileReceipt> {
-    let dry_run = reconcile_accepted(harness.control.reconcile_config(true).await)?;
+    let dry_run = reconcile_accepted(harness.control.reconcile_config(Caller::Local, true).await)?;
     assert!(dry_run.dry_run);
     assert_eq!(
         dry_run
@@ -2081,7 +2186,7 @@ async fn apply_reconcile_and_assert(
     before_y: &crate::model::ServiceSnapshot,
     dry_run: &ReconcileReceipt,
 ) -> eyre::Result<()> {
-    let applied = reconcile_accepted(harness.control.reconcile_config(false).await)?;
+    let applied = reconcile_accepted(harness.control.reconcile_config(Caller::Local, false).await)?;
     assert!(!applied.dry_run);
     assert_eq!(applied.actions, dry_run.actions);
     let removed = wait_until(&harness.reader, "x", |snapshot| {
@@ -2107,7 +2212,7 @@ async fn apply_reconcile_and_assert(
     assert!(stale_y.config_stale);
     assert_eq!(stale_y.command, before_y.command);
 
-    accepted(harness.control.restart(&"y".to_string()).await)?;
+    accepted(harness.control.restart(Caller::Local, &"y".into()).await)?;
     wait_until(&harness.reader, "y", |snapshot| {
         snapshot.run_generation == before_y.run_generation + 1
             && snapshot.execution == Execution::Running
@@ -2132,13 +2237,13 @@ services:
     )?;
     let implicit_revival = harness
         .control
-        .restart(&"y".to_string())
+        .restart(Caller::Local, &"y".into())
         .await
         .map_err(|_| eyre::eyre!("scheduler stopped"))?;
     assert!(
         matches!(implicit_revival, Err(CommandRejection::ConfigReload(message)) if message.contains("reconcile_config"))
     );
-    let revived = reconcile_accepted(harness.control.reconcile_config(false).await)?;
+    let revived = reconcile_accepted(harness.control.reconcile_config(Caller::Local, false).await)?;
     let [revived_action] = revived.actions.as_slice() else {
         eyre::bail!("expected one revival action, got {:?}", revived.actions);
     };
@@ -2307,7 +2412,7 @@ async fn environment_reports_session_variables_and_the_live_run_environment() ->
     // A reconciled definition does not reach the running process, so the old values stay and
     // are marked stale, and the service snapshot agrees although only the environment changed.
     fs::write(dir.path().join("micromux.yaml"), environment_yaml("after"))?;
-    reconcile_accepted(harness.control.reconcile_config(false).await)?;
+    reconcile_accepted(harness.control.reconcile_config(Caller::Local, false).await)?;
     let reconciled = environment_accepted(harness.control.environment(Some(&svc)).await)?;
     assert_eq!(
         reconciled,
@@ -2320,7 +2425,7 @@ async fn environment_reports_session_variables_and_the_live_run_environment() ->
 
     // The restart runs the new definition, which is current again.
     let generation = running_generation(&harness, &svc)?;
-    accepted(harness.control.restart(&svc).await)?;
+    accepted(harness.control.restart(Caller::Local, &svc).await)?;
     wait_until(&harness.reader, "svc", |snapshot| {
         snapshot.run_generation > generation && snapshot.execution == Execution::Running
     })
@@ -2351,7 +2456,7 @@ async fn reconcile_marks_a_changed_env_file_stale() -> eyre::Result<()> {
         dir.path().join("svc.env"),
         "FROM_ENV_FILE=changed\nSESSION_PORT=1\n",
     )?;
-    let receipt = reconcile_accepted(harness.control.reconcile_config(false).await)?;
+    let receipt = reconcile_accepted(harness.control.reconcile_config(Caller::Local, false).await)?;
     assert_eq!(
         receipt
             .actions
@@ -2509,7 +2614,7 @@ async fn session_environment_reads_the_session_env_file_fresh() -> eyre::Result<
         dir.path().join("micromux.yaml"),
         session_env_file_yaml("other.env"),
     )?;
-    reconcile_accepted(harness.control.reconcile_config(false).await)?;
+    reconcile_accepted(harness.control.reconcile_config(Caller::Local, false).await)?;
     let reconciled = environment_accepted(harness.control.session_environment().await)?;
     assert_eq!(
         reconciled.variables.get("SHARED").map(String::as_str),
@@ -2546,7 +2651,7 @@ async fn dynamic_services_sit_on_the_loaded_session_env_file() -> eyre::Result<(
     dynamic_accepted(
         timeout(
             Duration::from_secs(10),
-            harness.control.start_dynamic(params),
+            harness.control.start_dynamic(Caller::Local, params),
         )
         .await
         .map_err(|_| eyre::eyre!("starting a dynamic service read the session env file"))?,
@@ -2588,7 +2693,7 @@ async fn environment_without_a_live_run_reports_the_current_definition() -> eyre
     let harness = spawn_environment_harness(dir.path()).await?;
     let svc = "svc".to_string();
 
-    accepted(harness.control.disable(&svc).await)?;
+    accepted(harness.control.disable(Caller::Local, &svc).await)?;
     wait_until(&harness.reader, "svc", |snapshot| {
         snapshot.execution != Execution::Running && snapshot.execution != Execution::Stopping
     })
@@ -2597,7 +2702,7 @@ async fn environment_without_a_live_run_reports_the_current_definition() -> eyre
         dir.path().join("micromux.yaml"),
         environment_yaml("disabled"),
     )?;
-    reconcile_accepted(harness.control.reconcile_config(false).await)?;
+    reconcile_accepted(harness.control.reconcile_config(Caller::Local, false).await)?;
     let idle = environment_accepted(harness.control.environment(Some(&svc)).await)?;
     assert_eq!(
         idle.variables.get("INLINE").map(String::as_str),
@@ -2661,7 +2766,7 @@ async fn reconcile_applies_log_display_without_a_restart() -> eyre::Result<()> {
                   level: info
         "#},
     )?;
-    let applied = reconcile_accepted(harness.control.reconcile_config(false).await)?;
+    let applied = reconcile_accepted(harness.control.reconcile_config(Caller::Local, false).await)?;
     let [action] = applied.actions.as_slice() else {
         eyre::bail!("expected one reconcile action, got {:?}", applied.actions);
     };
@@ -2706,7 +2811,7 @@ async fn reconcile_rejects_dynamic_dependencies_collisions_and_invalid_files_wit
         service: "svc".to_string(),
         condition: Some(config::DependencyCondition::Started),
     }]);
-    dynamic_accepted(harness.control.start_dynamic(params).await)?;
+    dynamic_accepted(harness.control.start_dynamic(Caller::Local, params).await)?;
     wait_until(&harness.reader, "job", |snapshot| {
         snapshot.execution == Execution::Running
     })
@@ -2715,7 +2820,7 @@ async fn reconcile_rejects_dynamic_dependencies_collisions_and_invalid_files_wit
     fs::write(&config_path, "version: 1\nservices: {}\n")?;
     let depended_on = harness
         .control
-        .reconcile_config(false)
+        .reconcile_config(Caller::Local, false)
         .await
         .map_err(|_| eyre::eyre!("scheduler stopped"))?;
     assert!(
@@ -2735,21 +2840,26 @@ services:
     )?;
     let collision = harness
         .control
-        .reconcile_config(false)
+        .reconcile_config(Caller::Local, false)
         .await
         .map_err(|_| eyre::eyre!("scheduler stopped"))?;
     assert!(
         matches!(collision, Err(CommandRejection::InvalidSpec(message)) if message.contains("live or retired dynamic service"))
     );
     assert_eq!(harness.reader.services().len(), 2);
-    dynamic_accepted(harness.control.stop_dynamic(&"job".to_string()).await)?;
+    dynamic_accepted(
+        harness
+            .control
+            .stop_dynamic(Caller::Local, &"job".into())
+            .await,
+    )?;
     wait_until(&harness.reader, "job", |snapshot| {
         snapshot.retired == Some(RetiredReason::Stopped)
     })
     .await?;
     let retired_collision = harness
         .control
-        .reconcile_config(false)
+        .reconcile_config(Caller::Local, false)
         .await
         .map_err(|_| eyre::eyre!("scheduler stopped"))?;
     assert!(
@@ -2770,7 +2880,7 @@ services:
     )?;
     let invalid = harness
         .control
-        .reconcile_config(false)
+        .reconcile_config(Caller::Local, false)
         .await
         .map_err(|_| eyre::eyre!("scheduler stopped"))?;
     assert!(matches!(invalid, Err(CommandRejection::ConfigReload(_))));
@@ -2792,7 +2902,7 @@ async fn reconcile_requires_a_reloadable_config_path() -> eyre::Result<()> {
     let harness = spawn_harness(ServiceMap::new(), None);
     let result = harness
         .control
-        .reconcile_config(false)
+        .reconcile_config(Caller::Local, false)
         .await
         .map_err(|_| eyre::eyre!("scheduler stopped"))?;
     assert!(
@@ -2820,7 +2930,7 @@ services:
 "#,
     )?;
 
-    reconcile_accepted(harness.control.reconcile_config(false).await)?;
+    reconcile_accepted(harness.control.reconcile_config(Caller::Local, false).await)?;
     let parked = harness
         .reader
         .service("parked")
@@ -2847,7 +2957,7 @@ async fn restart_reloads_latest_service_config_before_spawning() -> eyre::Result
     wait_for_log(&harness.reader, "svc", "old-config").await?;
     fs::write(&config_path, reload_test_yaml("new-config"))?;
 
-    let acks = accepted(harness.control.restart(&id).await)?;
+    let acks = accepted(harness.control.restart(Caller::Local, &id).await)?;
     assert_eq!(acks.first().map(|ack| ack.observed_generation), Some(1));
     wait_until(&harness.reader, "svc", |snapshot| {
         snapshot.run_generation == 2 && snapshot.execution == Execution::Running
@@ -2880,7 +2990,10 @@ async fn reload_preserves_dynamic_roster_and_rejects_collisions() -> eyre::Resul
     dynamic_accepted(
         harness
             .control
-            .start_dynamic(dynamic_params("debug", &["sh", "-c", "sleep 60"]))
+            .start_dynamic(
+                Caller::Local,
+                dynamic_params("debug", &["sh", "-c", "sleep 60"]),
+            )
             .await,
     )?;
     wait_until(&harness.reader, "debug", |snapshot| {
@@ -2889,7 +3002,7 @@ async fn reload_preserves_dynamic_roster_and_rejects_collisions() -> eyre::Resul
     .await?;
 
     fs::write(&config_path, reload_test_yaml("new-config"))?;
-    accepted(harness.control.restart(&"svc".to_string()).await)?;
+    accepted(harness.control.restart(Caller::Local, &"svc".into()).await)?;
     wait_for_log(&harness.reader, "svc", "new-config").await?;
     assert!(
         harness
@@ -2910,7 +3023,7 @@ services:
     )?;
     let collision = harness
         .control
-        .restart(&"svc".to_string())
+        .restart(Caller::Local, &"svc".into())
         .await
         .map_err(|_| eyre::eyre!("scheduler stopped"))?;
     assert!(
@@ -2947,7 +3060,7 @@ services:
 
     let rejected = harness
         .control
-        .restart(&id)
+        .restart(Caller::Local, &id)
         .await
         .map_err(|_| eyre::eyre!("scheduler stopped"))?;
     assert!(matches!(rejected, Err(CommandRejection::ConfigReload(_))));
@@ -3026,7 +3139,7 @@ async fn reload_does_not_rewrite_snapshot_for_unrestarted_run() -> eyre::Result<
         &config_path,
         reload_two_service_yaml("echo new-b; sleep 60", 4000)?,
     )?;
-    accepted(harness.control.restart(&a).await)?;
+    accepted(harness.control.restart(Caller::Local, &a).await)?;
     wait_until(&harness.reader, "a", |snapshot| {
         snapshot.run_generation == 2 && snapshot.execution == Execution::Running
     })
@@ -3039,7 +3152,7 @@ async fn reload_does_not_rewrite_snapshot_for_unrestarted_run() -> eyre::Result<
     assert_eq!(still_old_b.advertised_ports, vec![3000]);
     assert_eq!(still_old_b.command, before_b.command);
 
-    accepted(harness.control.restart(&b).await)?;
+    accepted(harness.control.restart(Caller::Local, &b).await)?;
     let restarted_b = wait_until(&harness.reader, "b", |snapshot| {
         snapshot.run_generation == 2 && snapshot.execution == Execution::Running
     })
@@ -3262,7 +3375,7 @@ services:
     assert_eq!(initial.result.map(|result| result.success), Some(true));
 
     fs::write(&config_path, yaml("after"))?;
-    let receipt = reconcile_accepted(harness.control.reconcile_config(false).await)?;
+    let receipt = reconcile_accepted(harness.control.reconcile_config(Caller::Local, false).await)?;
     // The regression only exists if reconciliation replaced the live service; guard against
     // a config diff that stops registering as a change and quietly makes this test vacuous.
     assert!(
@@ -3544,7 +3657,7 @@ async fn restart_reaps_service_while_pty_output_is_saturated() -> eyre::Result<(
         })
         .await?;
         tokio::time::sleep(Duration::from_millis(50)).await;
-        accepted(harness.control.restart(&"svc".to_string()).await)?;
+        accepted(harness.control.restart(Caller::Local, &"svc".into()).await)?;
         wait_until(&harness.reader, "svc", |snapshot| {
             snapshot.run_generation >= 2 && snapshot.execution == Execution::Running
         })
@@ -3682,7 +3795,7 @@ mod escaped_session {
             tokio::time::sleep(Duration::from_millis(100)).await;
 
             let restart_requested_at = tokio::time::Instant::now();
-            accepted(harness.control.restart(&"svc".to_string()).await)?;
+            accepted(harness.control.restart(Caller::Local, &"svc".into()).await)?;
             wait_until(&harness.reader, "svc", |snapshot| {
                 snapshot.run_generation >= 2 && snapshot.execution == Execution::Running
             })
@@ -3885,7 +3998,7 @@ mod escaped_descendants {
             fs::remove_file(fixture_dir.join("ready"))?;
             fs::remove_file(fixture_dir.join("pid"))?;
 
-            accepted(harness.control.restart(&"svc".to_string()).await)?;
+            accepted(harness.control.restart(Caller::Local, &"svc".into()).await)?;
             wait_until(&harness.reader, "svc", |snapshot| {
                 snapshot.run_generation >= 2 && snapshot.execution == Execution::Running
             })
@@ -4146,7 +4259,7 @@ async fn restart_timeline_orders_request_spawn_and_exit() -> eyre::Result<()> {
         snapshot.execution == Execution::Exited
     })
     .await?;
-    accepted(harness.control.restart(&"svc".to_string()).await)?;
+    accepted(harness.control.restart(Caller::Local, &"svc".into()).await)?;
     wait_until(&harness.reader, "svc", |snapshot| {
         snapshot.run_generation >= 2 && snapshot.execution == Execution::Exited
     })
@@ -4639,13 +4752,13 @@ async fn enable_after_disable_does_not_clear_logs() -> eyre::Result<()> {
     let harness = spawn_harness(services, None);
 
     wait_for_log(&harness.reader, "svc", "first-run").await?;
-    accepted(harness.control.disable(&"svc".to_string()).await)?;
+    accepted(harness.control.disable(Caller::Local, &"svc".into()).await)?;
     wait_until(&harness.reader, "svc", |snapshot| {
         snapshot.desired == Desired::Disabled && snapshot.execution == Execution::Exited
     })
     .await?;
 
-    accepted(harness.control.enable(&"svc".to_string()).await)?;
+    accepted(harness.control.enable(Caller::Local, &"svc".into()).await)?;
     wait_until(&harness.reader, "svc", |snapshot| {
         snapshot.run_generation == 2 && snapshot.execution == Execution::Running
     })
@@ -4992,8 +5105,8 @@ async fn restart_all_leaves_a_gated_dependent_blocked_with_an_explained_log() ->
 
     // Disabling the gate first makes the block permanent, so the assertions below describe the
     // stalled state itself rather than a race against a dependency that is about to come back.
-    accepted(harness.control.disable(&"gate".to_string()).await)?;
-    accepted(harness.control.restart_all().await)?;
+    accepted(harness.control.disable(Caller::Local, &"gate".into()).await)?;
+    accepted(harness.control.restart_all(Caller::Local).await)?;
 
     let blocked = wait_until(&harness.reader, "app", |snapshot| {
         snapshot.execution == Execution::Blocked
@@ -5030,7 +5143,7 @@ async fn restart_all_leaves_a_gated_dependent_blocked_with_an_explained_log() ->
     assert_eq!(blocked_on, Some(vec!["gate".to_string()]));
 
     // Reviving the gate releases the dependent, and only then does its log turn over to the new run.
-    accepted(harness.control.enable(&"gate".to_string()).await)?;
+    accepted(harness.control.enable(Caller::Local, &"gate".into()).await)?;
     wait_until(&harness.reader, "app", |snapshot| {
         snapshot.execution == Execution::Running && snapshot.run_generation == 2
     })
@@ -5226,6 +5339,64 @@ async fn send_input_reaches_process() -> eyre::Result<()> {
         .prepare_input("svc".to_string(), b"hello\r".to_vec())?;
     harness.terminal.try_send(input)?;
     wait_for_log(&harness.reader, "svc", "got:hello").await?;
+
+    harness.shutdown.cancel();
+    harness.handle.await??;
+    Ok(())
+}
+
+/// Input bound to a run never reaches the run that replaced it; it is dropped with an event.
+#[tokio::test]
+async fn input_for_a_replaced_run_is_discarded() -> eyre::Result<()> {
+    let mut services: ServiceMap = ServiceMap::new();
+    services.insert(
+        "svc".to_string(),
+        Service::new(
+            "svc",
+            Path::new("."),
+            service_config("svc", ("sh", &["-c", "read line; echo got:$$line"])),
+        )?,
+    );
+    let harness = spawn_harness(services, None);
+    let first = wait_until(&harness.reader, "svc", |snapshot| {
+        snapshot.execution == Execution::Running
+    })
+    .await?;
+    accepted(harness.control.restart(Caller::Local, &"svc".into()).await)?;
+    wait_until(&harness.reader, "svc", |snapshot| {
+        snapshot.execution == Execution::Running && snapshot.run_generation > first.run_generation
+    })
+    .await?;
+
+    let stale = harness
+        .terminal
+        .prepare_input("svc".to_string(), b"stale\r".to_vec())?
+        .for_run(first.run_generation);
+    harness.terminal.try_send(stale)?;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !harness
+            .reader
+            .events("svc", None, None)
+            .0
+            .iter()
+            .any(|event| event.kind == ServiceEventKind::InputDropped)
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await?;
+    let fresh = harness
+        .terminal
+        .prepare_input("svc".to_string(), b"fresh\r".to_vec())?;
+    harness.terminal.try_send(fresh)?;
+    wait_for_log(&harness.reader, "svc", "got:fresh").await?;
+    assert!(
+        !harness
+            .reader
+            .logs("svc", None)
+            .iter()
+            .any(|line| line.line.contains("got:stale"))
+    );
 
     harness.shutdown.cancel();
     harness.handle.await??;
@@ -5616,7 +5787,7 @@ async fn stopping_a_service_runs_its_cleanup_before_reporting_it_stopped() -> ey
     })
     .await?;
 
-    accepted(harness.control.disable(&"svc".to_string()).await)?;
+    accepted(harness.control.disable(Caller::Local, &"svc".into()).await)?;
     // While the cleanup runs the process is gone, so the run reports no pid, but the service is
     // still stopping.
     let cleaning = wait_until(&harness.reader, "svc", |snapshot| {
@@ -5708,7 +5879,7 @@ async fn restarts_wait_for_the_cleanup() -> eyre::Result<()> {
     // a restart before it would stop the first run before it records that it ran.
     wait_for_lines(&starts, 1).await?;
 
-    accepted(harness.control.restart(&"svc".to_string()).await)?;
+    accepted(harness.control.restart(Caller::Local, &"svc".into()).await)?;
     wait_until(&harness.reader, "svc", |snapshot| {
         snapshot.run_generation == 2 && snapshot.execution == Execution::Running
     })
@@ -5803,7 +5974,7 @@ async fn failing_cleanups_are_reported_and_do_not_block_a_restart() -> eyre::Res
     })
     .await?;
 
-    accepted(harness.control.restart(&"svc".to_string()).await)?;
+    accepted(harness.control.restart(Caller::Local, &"svc".into()).await)?;
     let restarted = wait_until(&harness.reader, "svc", |snapshot| {
         snapshot.run_generation == 2 && snapshot.execution == Execution::Running
     })
@@ -5854,7 +6025,7 @@ async fn cleanups_past_their_timeout_are_killed() -> eyre::Result<()> {
     })
     .await?;
 
-    accepted(harness.control.disable(&"svc".to_string()).await)?;
+    accepted(harness.control.disable(Caller::Local, &"svc".into()).await)?;
     // The timeout, the stop grace, and slack for a loaded machine.
     let stopped = wait_longer_until(&harness.reader, Duration::from_secs(20), |snapshot| {
         snapshot.execution == Execution::Exited
@@ -5980,12 +6151,17 @@ async fn dynamic_clones_do_not_inherit_the_cleanup() -> eyre::Result<()> {
     let mut params = dynamic_params("clone", &["sh", "-c", "exec sleep 60"]);
     params.from_service = Some("svc".to_string());
 
-    dynamic_accepted(harness.control.start_dynamic(params).await)?;
+    dynamic_accepted(harness.control.start_dynamic(Caller::Local, params).await)?;
     wait_until(&harness.reader, "clone", |snapshot| {
         snapshot.execution == Execution::Running
     })
     .await?;
-    dynamic_accepted(harness.control.stop_dynamic(&"clone".to_string()).await)?;
+    dynamic_accepted(
+        harness
+            .control
+            .stop_dynamic(Caller::Local, &"clone".into())
+            .await,
+    )?;
     let stopped = wait_until(&harness.reader, "clone", |snapshot| {
         snapshot.execution == Execution::Exited
     })
@@ -6108,7 +6284,8 @@ async fn a_dependency_that_will_not_restart_fails_its_dependents_transitively() 
     );
 
     // Restarting the blocked `worker` cannot get past `seed`, so `api` stays failed.
-    accepted(harness.control.restart(&"worker".to_string()).await)?;
+    let worker_id = "worker".to_string();
+    accepted(harness.control.restart(Caller::Local, &worker_id).await)?;
     tokio::time::sleep(Duration::from_millis(100)).await;
     for service in ["worker", "api"] {
         assert_eq!(
@@ -6123,7 +6300,7 @@ async fn a_dependency_that_will_not_restart_fails_its_dependents_transitively() 
     }
 
     fs::write(&marker, "")?;
-    accepted(harness.control.restart(&"seed".to_string()).await)?;
+    accepted(harness.control.restart(Caller::Local, &"seed".into()).await)?;
     assert_eq!(
         harness
             .reader
@@ -6223,7 +6400,7 @@ async fn only_dependencies_that_cannot_recover_on_their_own_fail_their_dependent
         .count();
     assert_eq!(blocked_while_restarting, 1);
 
-    accepted(harness.control.enable(&"gate".to_string()).await)?;
+    accepted(harness.control.enable(Caller::Local, &"gate".into()).await)?;
     assert_eq!(
         harness
             .reader
@@ -6322,14 +6499,14 @@ services:
         &config_path,
         yaml("\n    healthcheck:\n      test: [\"CMD\", \"true\"]\n      interval: 100ms"),
     )?;
-    reconcile_accepted(harness.control.reconcile_config(false).await)?;
+    reconcile_accepted(harness.control.reconcile_config(Caller::Local, false).await)?;
     assert_eq!(
         reason(&harness),
         Some(crate::DependencyFailureReason::NoHealthcheck),
         "the running db has no probe, whatever its config says now"
     );
 
-    accepted(harness.control.restart(&"db".to_string()).await)?;
+    accepted(harness.control.restart(Caller::Local, &"db".into()).await)?;
     assert_eq!(reason(&harness), None);
     wait_until(&harness.reader, "api", |snapshot| {
         snapshot.execution == Execution::Running
@@ -6537,7 +6714,7 @@ async fn a_manual_job_runs_only_when_restarted() -> eyre::Result<()> {
         (true, Execution::Pending, 0)
     );
 
-    accepted(harness.control.restart(&"seed".to_string()).await)?;
+    accepted(harness.control.restart(Caller::Local, &"seed".into()).await)?;
     wait_until(&harness.reader, "api", |snapshot| {
         snapshot.execution == Execution::Running
     })
@@ -6550,9 +6727,9 @@ async fn a_manual_job_runs_only_when_restarted() -> eyre::Result<()> {
     };
     assert_eq!(generation(&harness), Some((Execution::Completed, 1)));
 
-    accepted(harness.control.restart_all().await)?;
-    accepted(harness.control.disable(&"seed".to_string()).await)?;
-    accepted(harness.control.enable(&"seed".to_string()).await)?;
+    accepted(harness.control.restart_all(Caller::Local).await)?;
+    accepted(harness.control.disable(Caller::Local, &"seed".into()).await)?;
+    accepted(harness.control.enable(Caller::Local, &"seed".into()).await)?;
     assert_eq!(generation(&harness), Some((Execution::Completed, 1)));
 
     harness.shutdown.cancel();
@@ -6585,7 +6762,12 @@ async fn a_job_stopped_by_micromux_is_not_completed() -> eyre::Result<()> {
     })
     .await?;
 
-    accepted(harness.control.disable(&"migrate".to_string()).await)?;
+    accepted(
+        harness
+            .control
+            .disable(Caller::Local, &"migrate".into())
+            .await,
+    )?;
     // How the stopped shell exits differs between platforms; a status 0 is pinned below.
     let stopped = wait_until(&harness.reader, "migrate", |snapshot| {
         snapshot.last_exit_code.is_some() && snapshot.execution != Execution::Stopping
@@ -6593,7 +6775,12 @@ async fn a_job_stopped_by_micromux_is_not_completed() -> eyre::Result<()> {
     .await?;
     assert_ne!(stopped.execution, Execution::Completed);
 
-    accepted(harness.control.enable(&"migrate".to_string()).await)?;
+    accepted(
+        harness
+            .control
+            .enable(Caller::Local, &"migrate".into())
+            .await,
+    )?;
     let rerun = harness
         .reader
         .service("migrate")
@@ -6631,14 +6818,19 @@ async fn enabling_an_enabled_job_keeps_its_requested_run() -> eyre::Result<()> {
     );
     let harness = spawn_harness(services, None);
 
-    accepted(harness.control.restart(&"reset".to_string()).await)?;
-    accepted(harness.control.enable(&"reset".to_string()).await)?;
+    accepted(
+        harness
+            .control
+            .restart(Caller::Local, &"reset".into())
+            .await,
+    )?;
+    accepted(harness.control.enable(Caller::Local, &"reset".into()).await)?;
     assert_eq!(
         harness.reader.service("reset").map(|reset| reset.execution),
         Some(Execution::Blocked)
     );
 
-    accepted(harness.control.enable(&"gate".to_string()).await)?;
+    accepted(harness.control.enable(Caller::Local, &"gate".into()).await)?;
     let reset = wait_until(&harness.reader, "reset", |snapshot| {
         snapshot.execution == Execution::Completed
     })
@@ -6704,4 +6896,845 @@ fn a_stopped_job_run_that_exits_zero_is_pending_again() -> eyre::Result<()> {
         &runtime
     ));
     Ok(())
+}
+
+mod reservations {
+    use super::*;
+    use crate::scheduler::reservations::Standing;
+    use crate::session::{Request, ReservationState, SessionContext};
+    use color_eyre::eyre;
+    use similar_asserts::assert_eq;
+    use std::sync::Arc;
+
+    /// A session registered in `registry` for `<root>/<name>/micromux.yaml`, so it can hold
+    /// resources.
+    fn registered(
+        registry: &crate::PortRegistry,
+        root: &Path,
+        name: &str,
+    ) -> eyre::Result<Arc<SessionContext>> {
+        let directory = root.join(name);
+        fs::create_dir_all(&directory)?;
+        let config = directory.join("micromux.yaml");
+        fs::write(&config, "")?;
+        Ok(Arc::new(SessionContext::registered(
+            registry, &config, name,
+        )?))
+    }
+
+    fn store(session: &SessionContext) -> eyre::Result<&crate::session::ResourceStore> {
+        session
+            .resources
+            .as_ref()
+            .ok_or_else(|| eyre::eyre!("the session cannot hold resources"))
+    }
+
+    /// A long-running service that needs `resource`, or none.
+    fn sleeper(id: &str, resource: Option<&str>) -> eyre::Result<Service> {
+        let mut config = service_config(id, ("sh", &["-c", "sleep 60"]));
+        config.resource = resource.map(spanned_string);
+        Ok(Service::new(id, Path::new("."), config)?)
+    }
+
+    fn roster(services: impl IntoIterator<Item = Service>) -> ServiceMap {
+        services
+            .into_iter()
+            .map(|service| (service.id.clone(), service))
+            .collect()
+    }
+
+    fn harness(services: ServiceMap, session: Arc<SessionContext>) -> Harness {
+        spawn_harness_with_session(
+            services,
+            None,
+            Path::new(".").to_path_buf(),
+            DynamicServicesPolicy::default(),
+            session,
+        )
+    }
+
+    async fn running(harness: &Harness, id: &str) -> eyre::Result<ServiceSnapshot> {
+        wait_until(&harness.reader, id, |snapshot| {
+            snapshot.execution == Execution::Running
+        })
+        .await
+    }
+
+    fn rejected<T: std::fmt::Debug>(
+        result: Result<Result<T, CommandRejection>, SchedulerStopped>,
+    ) -> eyre::Result<CommandRejection> {
+        match result.map_err(|_| eyre::eyre!("scheduler stopped"))? {
+            Ok(value) => eyre::bail!("expected a rejection, got {value:?}"),
+            Err(rejection) => Ok(rejection),
+        }
+    }
+
+    /// A tagged service of a session that cannot get its resource is disabled with an event
+    /// naming the holder, and enabling it again or starting a clone of it is refused the same
+    /// way without changing anything.
+    #[tokio::test]
+    async fn a_resource_held_elsewhere_keeps_tagged_services_from_starting() -> eyre::Result<()> {
+        let root = tempfile::tempdir()?;
+        let registry = crate::PortRegistry::at(root.path().join("registry"));
+        let other = registered(&registry, root.path(), "other")?;
+        store(&other)?.admit("desk", Request::default())?;
+
+        let own = registered(&registry, root.path(), "own")?;
+        let harness = spawn_harness_with_session(
+            roster([sleeper("app", Some("desk"))?]),
+            None,
+            Path::new(".").to_path_buf(),
+            enabled_dynamic_policy(Path::new("."))?,
+            own,
+        );
+
+        let disabled = wait_until(&harness.reader, "app", |snapshot| {
+            snapshot.desired == Desired::Disabled
+        })
+        .await?;
+        assert_eq!(disabled.run_generation, 0);
+        // One event says why, without a doubled prefix.
+        let events = harness.reader.events("app", None, None).0;
+        let refusals = events
+            .iter()
+            .filter(|event| event.detail.contains("session other"))
+            .map(|event| event.detail.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(refusals.len(), 1, "{events:?}");
+        assert!(
+            refusals
+                .iter()
+                .all(|detail| detail.starts_with("service disabled: resource `desk`")),
+            "{refusals:?}"
+        );
+
+        let rejection = rejected(harness.control.enable(Caller::Local, &"app".into()).await)?;
+        assert_matches!(
+            rejection,
+            CommandRejection::ResourceUnavailable(message) if message.contains("session other")
+        );
+        let app = harness
+            .reader
+            .service("app")
+            .ok_or_else(|| eyre::eyre!("app disappeared"))?;
+        assert_eq!((app.desired, app.run_generation), (Desired::Disabled, 0));
+
+        // A refused clone leaves no service and no use of its idempotency key behind.
+        let mut clone = dynamic_params("clone", &["sh", "-c", "sleep 60"]);
+        clone.from_service = Some("app".to_string());
+        clone.idempotency_key = Some("clone-once".to_string());
+        let rejection = rejected(
+            harness
+                .control
+                .start_dynamic(Caller::Local, clone.clone())
+                .await,
+        )?;
+        assert_matches!(
+            rejection,
+            CommandRejection::ResourceUnavailable(message) if message.contains("session other")
+        );
+        assert!(harness.reader.service("clone").is_none());
+
+        // Once the resource is free, the same request starts the clone afresh.
+        store(&other)?.remove("desk")?;
+        dynamic_accepted(harness.control.start_dynamic(Caller::Local, clone).await)?;
+        let clone = running(&harness, "clone").await?;
+        assert_eq!(clone.resource.as_deref(), Some("desk"));
+
+        harness.shutdown.cancel();
+        harness.handle.await??;
+        Ok(())
+    }
+
+    /// Explicit starts take the resource before they change anything, even while the service
+    /// waits for a dependency, a refused one changes nothing, and a reload may not change the
+    /// resource of a start already accepted.
+    #[tokio::test]
+    async fn explicit_starts_take_the_resource_before_they_change_anything() -> eyre::Result<()> {
+        let root = tempfile::tempdir()?;
+        let registry = crate::PortRegistry::at(root.path().join("registry"));
+        let other = registered(&registry, root.path(), "other")?;
+        store(&other)?.admit("desk", Request::default())?;
+        let own = registered(&registry, root.path(), "own")?;
+        // `db` has no healthcheck, so `app` never becomes ready on its own.
+        let config_path = root.path().join("own").join("micromux.yaml");
+        let yaml = |resource: &str| {
+            format!(
+                "version: \"1\"\nservices:\n  db:\n    command: [\"sh\", \"-c\", \"sleep 60\"]\n  \
+                 app:\n    command: [\"sh\", \"-c\", \"sleep 60\"]\n    resource: {resource}\n    \
+                 depends_on:\n      - name: db\n        condition: healthy\n"
+            )
+        };
+        fs::write(&config_path, yaml("desk"))?;
+        let harness = spawn_harness_with_session(
+            services_from_config_path(&config_path)?,
+            Some(reload_config(&config_path)?),
+            root.path().join("own"),
+            DynamicServicesPolicy::default(),
+            own,
+        );
+        running(&harness, "db").await?;
+        wait_until(&harness.reader, "app", |app| {
+            app.dependency_failure.is_some()
+        })
+        .await?;
+        let app = || harness.reader.service("app").map(|app| app.desired);
+        let held_elsewhere = |rejection: CommandRejection| {
+            matches!(rejection, CommandRejection::ResourceUnavailable(message)
+                if message.contains("session other"))
+        };
+
+        // Refusals restart, enable, and take nothing.
+        let restart_all = rejected(harness.control.restart_all(Caller::Local).await)?;
+        assert!(held_elsewhere(restart_all));
+        let restart = rejected(harness.control.restart(Caller::Local, &"app".into()).await)?;
+        assert!(held_elsewhere(restart));
+        let db = harness.reader.service("db").map(|db| db.run_generation);
+        assert_eq!((db, app()), (Some(1), Some(Desired::Enabled)));
+        accepted(harness.control.disable(Caller::Local, &"app".into()).await)?;
+        let enable = rejected(harness.control.enable(Caller::Local, &"app".into()).await)?;
+        assert!(held_elsewhere(enable));
+        assert_eq!(app(), Some(Desired::Disabled));
+
+        // Once the resource is free, enabling takes it though `app` still waits for `db`.
+        store(&other)?.remove("desk")?;
+        accepted(harness.control.enable(Caller::Local, &"app".into()).await)?;
+        let owner = store(&other)?.written_view("desk")?.owner;
+        assert_eq!(
+            owner.map(|owner| owner.claim.session_name),
+            Some("own".to_string())
+        );
+
+        // The accepted start keeps the resource it took.
+        fs::write(&config_path, yaml("display"))?;
+        let reload = rejected(harness.control.restart(Caller::Local, &"db".into()).await)?;
+        assert_matches!(
+            reload,
+            CommandRejection::ConfigReload(message) if message.contains("stop them first: app")
+        );
+
+        harness.shutdown.cancel();
+        harness.handle.await??;
+        Ok(())
+    }
+
+    /// A replacement that would bring a resource held elsewhere is refused, and the live run,
+    /// revision, and lease stay as they were.
+    #[tokio::test]
+    async fn a_refused_replacement_keeps_the_live_run() -> eyre::Result<()> {
+        let root = tempfile::tempdir()?;
+        let registry = crate::PortRegistry::at(root.path().join("registry"));
+        let other = registered(&registry, root.path(), "other")?;
+        store(&other)?.admit("desk", Request::default())?;
+        let own = registered(&registry, root.path(), "own")?;
+        let harness = spawn_harness_with_session(
+            roster([sleeper("app", Some("desk"))?]),
+            None,
+            Path::new(".").to_path_buf(),
+            enabled_dynamic_policy(Path::new("."))?,
+            own,
+        );
+        dynamic_accepted(
+            harness
+                .control
+                .start_dynamic(
+                    Caller::Local,
+                    dynamic_params("job", &["sh", "-c", "sleep 60"]),
+                )
+                .await,
+        )?;
+        let before = running(&harness, "job").await?;
+
+        let mut clone = dynamic_params("job", &["sh", "-c", "sleep 60"]);
+        clone.from_service = Some("app".to_string());
+        let rejection = rejected(
+            harness
+                .control
+                .replace_dynamic(Caller::Local, &"job".into(), 1, clone)
+                .await,
+        )?;
+        assert_matches!(
+            rejection,
+            CommandRejection::ResourceUnavailable(message) if message.contains("session other")
+        );
+        let after = harness
+            .reader
+            .service("job")
+            .ok_or_else(|| eyre::eyre!("job disappeared"))?;
+        assert_eq!(
+            (
+                after.run_generation,
+                after.execution,
+                after.pid,
+                after.resource
+            ),
+            (1, Execution::Running, before.pid, None)
+        );
+        assert_eq!(after.dynamic, before.dynamic);
+
+        harness.shutdown.cancel();
+        harness.handle.await??;
+        Ok(())
+    }
+
+    /// Starting a tagged service takes the resource; releasing it stops the run first and only
+    /// then hands the resource to the session waiting for it.
+    #[tokio::test]
+    async fn release_stops_the_run_then_hands_the_resource_to_the_waiter() -> eyre::Result<()> {
+        let root = tempfile::tempdir()?;
+        let registry = crate::PortRegistry::at(root.path().join("registry"));
+        let own = registered(&registry, root.path(), "own")?;
+        let other = registered(&registry, root.path(), "other")?;
+        // The service notes when its trap is in place, and on the stop signal takes a moment to
+        // stop, then notes that it did.
+        let ready_marker = root.path().join("ready");
+        let stopped_marker = root.path().join("stopped");
+        let script = format!(
+            "trap 'sleep 0.3; echo > {}; exit 0' TERM; echo > {}; sleep 60 & wait",
+            stopped_marker.display(),
+            ready_marker.display()
+        );
+        let mut config = service_config("app", ("sh", &["-c", &script]));
+        config.resource = Some(spanned_string("desk"));
+        let app = Service::new("app", Path::new("."), config)?;
+        let harness = harness(roster([app]), Arc::clone(&own));
+        let snapshot = running(&harness, "app").await?;
+        assert_eq!(snapshot.resource.as_deref(), Some("desk"));
+
+        // The other session is refused, naming the holder, and queues.
+        let refused = store(&other)?.admit("desk", Request::default());
+        let Err(err) = refused else {
+            eyre::bail!("expected the resource to be held");
+        };
+        assert!(err.to_string().contains("session own"), "{err}");
+        let waiting = store(&other)?.reserve("desk", Request::default())?;
+        assert_eq!(waiting.state, ReservationState::Waiting { position: 1 });
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !ready_marker.exists() {
+            eyre::ensure!(
+                tokio::time::Instant::now() < deadline,
+                "the service never installed its trap"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let released = harness
+            .control
+            .release_reservation(Caller::Local, "desk")
+            .await
+            .map_err(|_| eyre::eyre!("scheduler stopped"))?
+            .map_err(|rejection| eyre::eyre!("unexpected rejection: {rejection}"))?;
+        // The run may have stopped before the reply.
+        assert!(
+            matches!(
+                released.state,
+                ReservationState::Releasing | ReservationState::Released
+            ),
+            "{released:?}"
+        );
+
+        // The waiter gets the resource only once the run is gone.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while store(&other)?.poll("desk")?.state != ReservationState::Granted {
+            eyre::ensure!(
+                tokio::time::Instant::now() < deadline,
+                "the resource never passed on"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            stopped_marker.exists(),
+            "the resource passed on before the run stopped"
+        );
+        let stopped = harness
+            .reader
+            .service("app")
+            .ok_or_else(|| eyre::eyre!("app disappeared"))?;
+        assert_eq!(stopped.desired, Desired::Disabled);
+        assert_eq!(stopped.pid, None);
+
+        harness.shutdown.cancel();
+        harness.handle.await??;
+        Ok(())
+    }
+
+    /// A scheduler for `services` in `session` whose loop never runs, so a test drives it step by
+    /// step.
+    fn unscheduled(
+        services: &ServiceMap,
+        session: &Arc<SessionContext>,
+    ) -> (SchedulerRuntime, mpsc::Receiver<ProcessEvent>) {
+        let (_reader, writer) = crate::model::new(crate::initial_model_entries(services));
+        let (events_tx, events_rx) = mpsc::channel(8);
+        let (test_events_tx, _test_events_rx) = mpsc::channel(8);
+        let runtime = SchedulerRuntime::new(
+            services,
+            SchedulerResources {
+                reload_config: None,
+                events_tx,
+                test_events: TestEventSink::new(test_events_tx),
+                writer,
+                shutdown: CancellationToken::new(),
+                config_dir: PathBuf::new(),
+                session_env_files: crate::SessionEnvFiles::default(),
+                dynamic_policy: DynamicServicesPolicy::default(),
+                session: Arc::clone(session),
+                session_status: unrouted_session_status(),
+                default_log_retention: LogRetention::default(),
+                default_log_display: crate::LogDisplay::default(),
+            },
+        );
+        (runtime, events_rx)
+    }
+
+    /// A start under a grant the session holds uses it as it is: no store transaction, and the
+    /// same deadline.
+    #[tokio::test]
+    async fn a_held_grant_admits_without_the_store() -> eyre::Result<()> {
+        let root = tempfile::tempdir()?;
+        let registry = crate::PortRegistry::at(root.path().join("registry"));
+        let own = registered(&registry, root.path(), "own")?;
+        let services = roster([sleeper("app", Some("desk"))?]);
+        let (mut runtime, mut events_rx) = unscheduled(&services, &own);
+        // A deadline an hour out that the store never recorded.
+        let granted = Standing::Granted {
+            renew_by_unix_ms: unix_now_ms().unwrap_or_default() + 3_600_000,
+            judged_until: tokio::time::Instant::now(),
+        };
+        runtime.claims.insert("desk".to_string(), granted);
+
+        let reason = "taken by restart app".to_string();
+        runtime
+            .admit(&services, &mut events_rx, "desk", reason)
+            .await?;
+        assert_eq!(runtime.claims.get("desk"), Some(&granted));
+        // The store never saw the session take the resource.
+        assert_eq!(store(&own)?.written_view("desk")?.owner, None);
+        Ok(())
+    }
+
+    /// A session that stops gracefully removes its claims once its services stopped, so the
+    /// resource passes to the waiting session.
+    #[tokio::test]
+    async fn a_graceful_stop_removes_the_claims() -> eyre::Result<()> {
+        let root = tempfile::tempdir()?;
+        let registry = crate::PortRegistry::at(root.path().join("registry"));
+        let own = registered(&registry, root.path(), "own")?;
+        let other = registered(&registry, root.path(), "other")?;
+        let harness = harness(roster([sleeper("app", Some("desk"))?]), own);
+        running(&harness, "app").await?;
+        let waiting = store(&other)?.reserve("desk", Request::default())?;
+        assert_eq!(waiting.state, ReservationState::Waiting { position: 1 });
+
+        harness.shutdown.cancel();
+        harness.handle.await??;
+        assert_eq!(
+            store(&other)?.poll("desk")?.state,
+            ReservationState::Granted
+        );
+        Ok(())
+    }
+
+    /// Moves the deadline of the grant of `resource` in `root`'s registry into the past, as a
+    /// suspended machine wakes up to find it.
+    fn make_overdue(root: &Path, resource: &str) -> eyre::Result<()> {
+        let path = root
+            .join("registry/resources")
+            .join(format!("{resource}.json"));
+        let mut file: serde_json::Value = serde_json::from_slice(&fs::read(&path)?)?;
+        let renew_by = file
+            .pointer_mut("/owner/claim/renew_by_unix_ms")
+            .ok_or_else(|| eyre::eyre!("{resource} has no owner"))?;
+        *renew_by = serde_json::json!(1);
+        fs::write(&path, serde_json::to_vec(&file)?)?;
+        Ok(())
+    }
+
+    /// A grant past its deadline goes on while nobody waits, and renew, reserve and starts agree
+    /// on it; once a session waits, the holder releases it: its services stop, and the resource
+    /// passes on only after their runs exited.
+    #[tokio::test]
+    async fn an_overdue_grant_lapses_only_when_contested() -> eyre::Result<()> {
+        let root = tempfile::tempdir()?;
+        let registry = crate::PortRegistry::at(root.path().join("registry"));
+        let own = registered(&registry, root.path(), "own")?;
+        let other = registered(&registry, root.path(), "other")?;
+        let services = roster([sleeper("app", Some("desk"))?]);
+        let (mut runtime, mut events_rx) = unscheduled(&services, &own);
+
+        // The session holds the resource with a live run.
+        store(&own)?.admit("desk", Request::default())?;
+        let held = store(&own)?.poll("desk")?;
+        let renew_by = held
+            .own_claim()
+            .map(|claim| claim.renew_by_unix_ms)
+            .ok_or_else(|| eyre::eyre!("the grant is missing"))?;
+        // Judged long ago, so the timer asks the store once the wall clock is past the deadline.
+        let overdue_standing = Standing::Granted {
+            renew_by_unix_ms: 1,
+            judged_until: tokio::time::Instant::now(),
+        };
+        runtime.claims.insert(
+            "desk".to_string(),
+            Standing::Granted {
+                renew_by_unix_ms: renew_by,
+                judged_until: tokio::time::Instant::now(),
+            },
+        );
+        let app = runtime
+            .services
+            .get_mut("app")
+            .ok_or_else(|| eyre::eyre!("app runtime is missing"))?;
+        start_dummy_run(app)?;
+        if let Some(running) = &mut app.running {
+            running.resource = Some("desk".to_string());
+        }
+
+        // Before the deadline the timer needs no store.
+        assert!(!runtime.check_due_grants(&services, &mut events_rx).await);
+
+        // Overdue but uncontested, the grant goes on, and a renewal extends it.
+        make_overdue(root.path(), "desk")?;
+        runtime.claims.insert("desk".to_string(), overdue_standing);
+        assert!(runtime.check_due_grants(&services, &mut events_rx).await);
+        assert!(
+            runtime
+                .claims
+                .get("desk")
+                .is_some_and(|standing| standing.may_start())
+        );
+        let renew = ReservationRequest::Renew {
+            resource: "desk".to_string(),
+            claim: None,
+        };
+        let renewed = runtime
+            .reservation(&services, &mut events_rx, &Caller::Local, renew.clone())
+            .await?;
+        assert_eq!(renewed.state, ReservationState::Granted);
+
+        // Overdue with a waiter, the timer's judgement makes the session release.
+        make_overdue(root.path(), "desk")?;
+        runtime.claims.insert("desk".to_string(), overdue_standing);
+        store(&other)?.reserve("desk", Request::default())?;
+        assert!(runtime.check_due_grants(&services, &mut events_rx).await);
+        let app = runtime
+            .services
+            .get("app")
+            .ok_or_else(|| eyre::eyre!("app runtime is missing"))?;
+        assert_eq!(app.desired, DesiredState::Disabled);
+        assert!(app.running.as_ref().is_some_and(|run| run.stop_requested));
+        assert_eq!(runtime.claims.get("desk"), Some(&Standing::Releasing));
+        let admitted = runtime.admit(&services, &mut events_rx, "desk", "test".to_string());
+        assert_matches!(
+            admitted.await,
+            Err(CommandRejection::ResourceUnavailable(message)) if message.contains("being released")
+        );
+        let renewed = runtime.reservation(&services, &mut events_rx, &Caller::Local, renew);
+        assert_matches!(
+            renewed.await,
+            Err(CommandRejection::ResourceUnavailable(message)) if message.contains("being released")
+        );
+
+        // The resource stays while the run is live, and passes on once it exited.
+        runtime.settle_releases(&services, &mut events_rx).await;
+        assert_eq!(
+            store(&other)?.poll("desk")?.state,
+            ReservationState::Waiting { position: 1 }
+        );
+        let spec = services
+            .get("app")
+            .map(|service| service.spec.clone())
+            .ok_or_else(|| eyre::eyre!("app is missing"))?;
+        if let Some(app) = runtime.services.get_mut("app") {
+            app.finish_current_run(&spec, 0);
+        }
+        runtime.settle_releases(&services, &mut events_rx).await;
+        assert_eq!(runtime.claims.get("desk"), None);
+        assert_eq!(
+            store(&other)?.poll("desk")?.state,
+            ReservationState::Granted
+        );
+        Ok(())
+    }
+
+    /// Only the session's own process or project may control a service that needs a resource,
+    /// reserve for the session, or shut it down; other services stay open to everyone.
+    #[tokio::test]
+    async fn only_the_own_project_controls_tagged_services() -> eyre::Result<()> {
+        let root = tempfile::tempdir()?;
+        let registry = crate::PortRegistry::at(root.path().join("registry"));
+        let own = registered(&registry, root.path(), "own")?;
+        let own_project = Caller::Project(store(&own)?.session_id().to_string());
+        let foreign = Caller::Project("someone-else".to_string());
+        let harness = harness(
+            roster([sleeper("app", Some("desk"))?, sleeper("plain", None)?]),
+            own,
+        );
+        running(&harness, "app").await?;
+        running(&harness, "plain").await?;
+        let app = "app".to_string();
+
+        // Callers from elsewhere are refused for everything the resource protects.
+        for rejection in [
+            rejected(harness.control.restart(Caller::Unknown, &app).await)?,
+            rejected(harness.control.disable(foreign.clone(), &app).await)?,
+            rejected(
+                harness
+                    .control
+                    .reserve(Caller::Unknown, "desk", None, None)
+                    .await,
+            )?,
+            rejected(harness.control.shutdown(foreign.clone()).await)?,
+        ] {
+            assert_matches!(rejection, CommandRejection::PolicyDenied(_));
+        }
+        // A client that names no project learns how to name one.
+        let unnamed = rejected(harness.control.restart(Caller::Unknown, &app).await)?;
+        assert_matches!(
+            unnamed,
+            CommandRejection::PolicyDenied(message) if message.contains("did not name its project")
+        );
+
+        // The own project, the own process, and anyone for an untagged service pass.
+        accepted(
+            harness
+                .control
+                .restart(Caller::Unknown, &"plain".into())
+                .await,
+        )?;
+        accepted(harness.control.restart(own_project.clone(), &app).await)?;
+        accepted(harness.control.disable(Caller::Local, &app).await)?;
+        harness
+            .control
+            .shutdown(own_project)
+            .await
+            .map_err(|_| eyre::eyre!("scheduler stopped"))??;
+        assert!(harness.shutdown.is_cancelled());
+        harness.handle.await??;
+        Ok(())
+    }
+
+    /// Another project may stop a session that holds, waits for, and runs nothing, even when its
+    /// config names a resource; the accepted stop cancels the session before the reply.
+    #[tokio::test]
+    async fn a_session_that_uses_no_resource_may_be_stopped_from_elsewhere() -> eyre::Result<()> {
+        let root = tempfile::tempdir()?;
+        let registry = crate::PortRegistry::at(root.path().join("registry"));
+        let other = registered(&registry, root.path(), "other")?;
+        store(&other)?.admit("desk", Request::default())?;
+        let own = registered(&registry, root.path(), "own")?;
+        let harness = harness(roster([sleeper("app", Some("desk"))?]), own);
+        wait_until(&harness.reader, "app", |app| {
+            app.desired == Desired::Disabled
+        })
+        .await?;
+
+        let foreign = Caller::Project("someone-else".to_string());
+        harness
+            .control
+            .shutdown(foreign)
+            .await
+            .map_err(|_| eyre::eyre!("scheduler stopped"))??;
+        assert!(harness.shutdown.is_cancelled());
+        harness.handle.await??;
+        Ok(())
+    }
+
+    /// A restart of every service from another project is refused as a whole when one of them
+    /// needs a resource, so none restarts.
+    #[tokio::test]
+    async fn restart_all_is_refused_before_anything_restarts() -> eyre::Result<()> {
+        let root = tempfile::tempdir()?;
+        let registry = crate::PortRegistry::at(root.path().join("registry"));
+        let own = registered(&registry, root.path(), "own")?;
+        let harness = harness(
+            roster([sleeper("plain", None)?, sleeper("app", Some("desk"))?]),
+            own,
+        );
+        running(&harness, "plain").await?;
+        running(&harness, "app").await?;
+
+        let rejection = rejected(harness.control.restart_all(Caller::Unknown).await)?;
+        assert_matches!(rejection, CommandRejection::PolicyDenied(_));
+        let plain = harness
+            .reader
+            .service("plain")
+            .ok_or_else(|| eyre::eyre!("plain disappeared"))?;
+        assert_eq!(
+            (plain.run_generation, plain.execution),
+            (1, Execution::Running)
+        );
+
+        harness.shutdown.cancel();
+        harness.handle.await??;
+        Ok(())
+    }
+
+    /// Neither a restart's reload nor a reconcile may give a running service another resource.
+    #[tokio::test]
+    async fn reloads_refuse_a_resource_change_on_a_live_run() -> eyre::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let config_path = dir.path().join("micromux.yaml");
+        let yaml = |resource: &str| {
+            format!(
+                "version: \"1\"\nservices:\n  app:\n    command: [\"sh\", \"-c\", \"sleep 60\"]\n{resource}"
+            )
+        };
+        fs::write(&config_path, yaml(""))?;
+        let services = services_from_config_path(&config_path)?;
+        let harness = spawn_harness(services, Some(reload_config(&config_path)?));
+        running(&harness, "app").await?;
+
+        fs::write(&config_path, yaml("    resource: desk\n"))?;
+        let restart = rejected(harness.control.restart(Caller::Local, &"app".into()).await)?;
+        let reconcile = rejected(harness.control.reconcile_config(Caller::Local, false).await)?;
+        for rejection in [restart, reconcile] {
+            assert_matches!(
+                rejection,
+                CommandRejection::ConfigReload(message) if message.contains("stop them first: app")
+            );
+        }
+        let app = harness
+            .reader
+            .service("app")
+            .ok_or_else(|| eyre::eyre!("app disappeared"))?;
+        assert_eq!((app.run_generation, app.resource), (1, None));
+
+        harness.shutdown.cancel();
+        harness.handle.await??;
+        Ok(())
+    }
+
+    /// A dynamic clone keeps the resource of the service it was cloned from, only the own project
+    /// renews its lease, and a replacement that would bring another resource is refused.
+    #[tokio::test]
+    async fn dynamic_clones_keep_the_resource_of_their_source() -> eyre::Result<()> {
+        let root = tempfile::tempdir()?;
+        let registry = crate::PortRegistry::at(root.path().join("registry"));
+        let own = registered(&registry, root.path(), "own")?;
+        let harness = spawn_harness_with_session(
+            roster([
+                sleeper("app", Some("desk"))?,
+                sleeper("viewer", Some("display"))?,
+            ]),
+            None,
+            Path::new(".").to_path_buf(),
+            enabled_dynamic_policy(Path::new("."))?,
+            own,
+        );
+        running(&harness, "app").await?;
+
+        let mut clone = dynamic_params("clone", &["sh", "-c", "sleep 60"]);
+        clone.from_service = Some("app".to_string());
+        dynamic_accepted(harness.control.start_dynamic(Caller::Local, clone).await)?;
+        let snapshot = running(&harness, "clone").await?;
+        assert_eq!(snapshot.resource.as_deref(), Some("desk"));
+
+        // The clone's lease, like the clone, is the own project's to renew.
+        let renewal = rejected(
+            harness
+                .control
+                .renew_dynamic(Caller::Unknown, &"clone".into(), 1, None)
+                .await,
+        )?;
+        assert_matches!(renewal, CommandRejection::PolicyDenied(_));
+
+        let mut other = dynamic_params("clone", &["sh", "-c", "sleep 60"]);
+        other.from_service = Some("viewer".to_string());
+        let rejection = rejected(
+            harness
+                .control
+                .replace_dynamic(Caller::Local, &"clone".into(), 1, other)
+                .await,
+        )?;
+        assert_matches!(
+            rejection,
+            CommandRejection::InvalidSpec(message) if message.contains("`display`")
+        );
+
+        harness.shutdown.cancel();
+        harness.handle.await??;
+        Ok(())
+    }
+
+    /// Applying a reconcile that touches a service that needs a resource is reserved for the
+    /// session's own project, while anyone may preview it.
+    #[tokio::test]
+    async fn only_the_own_project_applies_a_reconcile_of_tagged_services() -> eyre::Result<()> {
+        let root = tempfile::tempdir()?;
+        let registry = crate::PortRegistry::at(root.path().join("registry"));
+        let own = registered(&registry, root.path(), "own")?;
+        let config_path = root.path().join("micromux.yaml");
+        let yaml = |command: &str| {
+            format!(
+                "version: \"1\"\nservices:\n  app:\n    command: [\"sh\", \"-c\", \"{command}\"]\n    resource: desk\n"
+            )
+        };
+        fs::write(&config_path, yaml("sleep 60"))?;
+        let harness = spawn_harness_with_session(
+            services_from_config_path(&config_path)?,
+            Some(reload_config(&config_path)?),
+            root.path().to_path_buf(),
+            DynamicServicesPolicy::default(),
+            own,
+        );
+        running(&harness, "app").await?;
+
+        fs::write(&config_path, yaml("sleep 61"))?;
+        let rejection = rejected(
+            harness
+                .control
+                .reconcile_config(Caller::Unknown, false)
+                .await,
+        )?;
+        assert_matches!(rejection, CommandRejection::PolicyDenied(_));
+        reconcile_accepted(
+            harness
+                .control
+                .reconcile_config(Caller::Unknown, true)
+                .await,
+        )?;
+        reconcile_accepted(harness.control.reconcile_config(Caller::Local, false).await)?;
+
+        harness.shutdown.cancel();
+        harness.handle.await??;
+        Ok(())
+    }
+
+    /// A service that needs one resource and depends on a service that needs another starts in
+    /// the same scheduling pass as its dependency, which takes both resources.
+    #[tokio::test]
+    async fn admission_follows_a_dependency_chain_within_one_pass() -> eyre::Result<()> {
+        let root = tempfile::tempdir()?;
+        let registry = crate::PortRegistry::at(root.path().join("registry"));
+        let own = registered(&registry, root.path(), "own")?;
+        let mut top = service_config("top", ("sh", &["-c", "sleep 60"]));
+        top.resource = Some(spanned_string("display"));
+        top.depends_on = vec![config::Dependency {
+            name: spanned_string("base"),
+            condition: None,
+        }];
+        let top = Service::new("top", Path::new("."), top)?;
+        let harness = harness(
+            roster([top, sleeper("base", Some("desk"))?]),
+            Arc::clone(&own),
+        );
+
+        // Nothing but the initial pass wakes the scheduler, so `top` starts only if that pass
+        // admitted `display` after `base` started.
+        running(&harness, "base").await?;
+        running(&harness, "top").await?;
+        // Each grant records how it was taken.
+        for (resource, service) in [("desk", "base"), ("display", "top")] {
+            let owner = store(&own)?.written_view(resource)?.owner;
+            assert_eq!(
+                owner.map(|owner| (owner.claim.session_name, owner.claim.reason)),
+                Some(("own".to_string(), Some(format!("taken to start {service}"))))
+            );
+        }
+
+        harness.shutdown.cancel();
+        harness.handle.await??;
+        Ok(())
+    }
 }

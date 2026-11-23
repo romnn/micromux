@@ -10,12 +10,27 @@
 //! which the in-process TUI and the control server (for attached TUIs) hold.
 //! The MCP server never sends them.
 
-use super::types::{Command, ServiceID};
+use super::types::{Command, ReservationRequest, ServiceID};
+use crate::session::ReservationReply;
 use crate::{DynamicServiceParams, Lease, RestartPolicy, ServiceSpec};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use tokio::sync::{mpsc, oneshot};
+
+/// Who sent a command, which decides whether it may touch services that need a resource.
+///
+/// The scope is cooperative: every session of a user can claim any project.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Caller {
+    /// The session's own process, such as its in-process TUI.
+    Local,
+    /// A client that named its home project by session id, the digest of the project's
+    /// canonical config path.
+    Project(String),
+    /// A client that did not name its home project.
+    Unknown,
+}
 
 /// Acknowledgement for one affected service: the generation the scheduler latched while processing
 /// the command. Reused directly as the control-protocol wire payload.
@@ -150,6 +165,14 @@ pub enum CommandRejection {
     /// The supplied service definition is invalid.
     #[error("invalid service spec: {0}")]
     InvalidSpec(String),
+    /// A resource the command needs is held or queued for by another session, or this session's
+    /// claim of it is gone, releasing, or lapsed.
+    #[error("resource unavailable: {0}")]
+    ResourceUnavailable(String),
+    /// The reservation store could not be read or written, so nobody can tell who holds the
+    /// resource; trying again may succeed.
+    #[error("reservation store failed: {0}")]
+    ReservationStore(String),
 }
 
 /// The inner result of a service-control command: either the per-service acks, or a typed rejection.
@@ -198,84 +221,81 @@ pub type ReconcileResult = Result<ReconcileReceipt, CommandRejection>;
 /// Result of one environment query.
 pub type EnvironmentResult = Result<ResolvedEnvironment, CommandRejection>;
 
+impl CommandRejection {
+    /// What went wrong, without the kind of rejection in front, for a sentence of its own.
+    #[must_use]
+    pub fn message(&self) -> String {
+        match self {
+            Self::InvalidState(message)
+            | Self::ConfigReload(message)
+            | Self::PolicyDenied(message)
+            | Self::LimitExceeded(message)
+            | Self::InvalidSpec(message)
+            | Self::ResourceUnavailable(message)
+            | Self::ReservationStore(message) => message.clone(),
+            Self::UnknownService | Self::RevisionMismatch { .. } => self.to_string(),
+        }
+    }
+
+    /// The same rejection with `note` appended to its message; a rejection without a message
+    /// stays as it is.
+    #[must_use]
+    pub(crate) fn with_note(self, note: &str) -> Self {
+        let noted = |message: String| format!("{message}; {note}");
+        match self {
+            Self::InvalidState(message) => Self::InvalidState(noted(message)),
+            Self::ConfigReload(message) => Self::ConfigReload(noted(message)),
+            Self::PolicyDenied(message) => Self::PolicyDenied(noted(message)),
+            Self::LimitExceeded(message) => Self::LimitExceeded(noted(message)),
+            Self::InvalidSpec(message) => Self::InvalidSpec(noted(message)),
+            Self::ResourceUnavailable(message) => Self::ResourceUnavailable(noted(message)),
+            Self::ReservationStore(message) => Self::ReservationStore(noted(message)),
+            Self::UnknownService | Self::RevisionMismatch { .. } => self,
+        }
+    }
+}
+
+/// Result of one reserve, renew or release.
+pub type ReservationResult = Result<ReservationReply, CommandRejection>;
+
 /// The scheduler dropped the reply channel (it is shutting down) before acknowledging a command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error("the scheduler has stopped")]
 pub struct SchedulerStopped;
 
-/// The reply half of an acknowledged command. Possession-scoped: there is no public constructor, so
-/// only the crate (the `ServiceControl` dispatch path) can attach an ack to a `Command`, and only
-/// the scheduler can satisfy it.
+/// The reply half of an acknowledged command, answered with `Result<T, CommandRejection>`.
+///
+/// Possession-scoped: there is no public constructor, so only the crate (the `ServiceControl`
+/// dispatch path) can attach an ack to a `Command`, and only the scheduler can satisfy it.
 #[derive(Debug)]
-pub struct CommandAck {
-    tx: oneshot::Sender<ServiceCommandResult>,
+pub struct ReplyAck<T> {
+    tx: oneshot::Sender<Result<T, CommandRejection>>,
 }
 
-/// Reply half for a dynamic-service command.
-#[derive(Debug)]
-pub struct DynamicCommandAck {
-    tx: oneshot::Sender<DynamicServiceResult>,
-}
-
-/// Reply half for a config-reconciliation command.
-#[derive(Debug)]
-pub struct ReconcileCommandAck {
-    tx: oneshot::Sender<ReconcileResult>,
-}
-
-/// Reply half for an environment query.
-#[derive(Debug)]
-pub struct EnvironmentCommandAck {
-    tx: oneshot::Sender<EnvironmentResult>,
-}
-
-impl CommandAck {
-    pub(crate) fn new() -> (Self, oneshot::Receiver<ServiceCommandResult>) {
+impl<T> ReplyAck<T> {
+    pub(crate) fn new() -> (Self, oneshot::Receiver<Result<T, CommandRejection>>) {
         let (tx, rx) = oneshot::channel();
         (Self { tx }, rx)
     }
 
     /// Satisfy the command. A dropped receiver (caller gone) is not an error here.
-    pub(crate) fn send(self, result: ServiceCommandResult) {
+    pub(crate) fn send(self, result: Result<T, CommandRejection>) {
         let _ = self.tx.send(result);
     }
 }
 
-impl DynamicCommandAck {
-    pub(crate) fn new() -> (Self, oneshot::Receiver<DynamicServiceResult>) {
-        let (tx, rx) = oneshot::channel();
-        (Self { tx }, rx)
-    }
-
-    pub(crate) fn send(self, result: DynamicServiceResult) {
-        let _ = self.tx.send(result);
-    }
-}
-
-impl ReconcileCommandAck {
-    pub(crate) fn new() -> (Self, oneshot::Receiver<ReconcileResult>) {
-        let (tx, rx) = oneshot::channel();
-        (Self { tx }, rx)
-    }
-
-    pub(crate) fn send(self, result: ReconcileResult) {
-        let _ = self.tx.send(result);
-    }
-}
-
-impl EnvironmentCommandAck {
-    pub(crate) fn new() -> (Self, oneshot::Receiver<EnvironmentResult>) {
-        let (tx, rx) = oneshot::channel();
-        (Self { tx }, rx)
-    }
-
-    pub(crate) fn send(self, result: EnvironmentResult) {
-        let _ = self.tx.send(result);
+impl From<mpsc::Sender<Command>> for ServiceControl {
+    fn from(tx: mpsc::Sender<Command>) -> Self {
+        Self::new(tx)
     }
 }
 
 /// The restricted command port handed to untrusted adapters. Cloning shares one channel to the
 /// scheduler.
+///
+/// Every mutation names its [`Caller`]: only the session's own process or project may control a
+/// service that needs a resource, which the scheduler refuses for anyone else with
+/// [`CommandRejection::PolicyDenied`].
 #[derive(Clone)]
 pub struct ServiceControl {
     tx: mpsc::Sender<Command>,
@@ -286,11 +306,11 @@ impl ServiceControl {
         Self { tx }
     }
 
-    async fn dispatch(
+    async fn request<T>(
         &self,
-        make: impl FnOnce(CommandAck) -> Command,
-    ) -> Result<ServiceCommandResult, SchedulerStopped> {
-        let (ack, rx) = CommandAck::new();
+        make: impl FnOnce(ReplyAck<T>) -> Command,
+    ) -> Result<Result<T, CommandRejection>, SchedulerStopped> {
+        let (ack, rx) = ReplyAck::new();
         self.tx
             .send(make(ack))
             .await
@@ -304,9 +324,14 @@ impl ServiceControl {
     ///
     /// Returns [`SchedulerStopped`] if the scheduler is no longer accepting commands. The inner
     /// result is the scheduler's typed acknowledgement or rejection.
-    pub async fn restart(&self, id: &ServiceID) -> Result<ServiceCommandResult, SchedulerStopped> {
+    pub async fn restart(
+        &self,
+        caller: Caller,
+        id: &ServiceID,
+    ) -> Result<ServiceCommandResult, SchedulerStopped> {
         let id = id.clone();
-        self.dispatch(move |ack| Command::Restart {
+        self.request(move |ack| Command::Restart {
+            caller,
             service: id,
             ack: Some(ack),
         })
@@ -318,9 +343,15 @@ impl ServiceControl {
     /// # Errors
     ///
     /// Returns [`SchedulerStopped`] if the scheduler is no longer accepting commands.
-    pub async fn restart_all(&self) -> Result<ServiceCommandResult, SchedulerStopped> {
-        self.dispatch(|ack| Command::RestartAll { ack: Some(ack) })
-            .await
+    pub async fn restart_all(
+        &self,
+        caller: Caller,
+    ) -> Result<ServiceCommandResult, SchedulerStopped> {
+        self.request(|ack| Command::RestartAll {
+            caller,
+            ack: Some(ack),
+        })
+        .await
     }
 
     /// Enable (and start) a single service.
@@ -328,9 +359,14 @@ impl ServiceControl {
     /// # Errors
     ///
     /// Returns [`SchedulerStopped`] if the scheduler is no longer accepting commands.
-    pub async fn enable(&self, id: &ServiceID) -> Result<ServiceCommandResult, SchedulerStopped> {
+    pub async fn enable(
+        &self,
+        caller: Caller,
+        id: &ServiceID,
+    ) -> Result<ServiceCommandResult, SchedulerStopped> {
         let id = id.clone();
-        self.dispatch(move |ack| Command::Enable {
+        self.request(move |ack| Command::Enable {
+            caller,
             service: id,
             ack: Some(ack),
         })
@@ -342,9 +378,14 @@ impl ServiceControl {
     /// # Errors
     ///
     /// Returns [`SchedulerStopped`] if the scheduler is no longer accepting commands.
-    pub async fn disable(&self, id: &ServiceID) -> Result<ServiceCommandResult, SchedulerStopped> {
+    pub async fn disable(
+        &self,
+        caller: Caller,
+        id: &ServiceID,
+    ) -> Result<ServiceCommandResult, SchedulerStopped> {
         let id = id.clone();
-        self.dispatch(move |ack| Command::Disable {
+        self.request(move |ack| Command::Disable {
+            caller,
             service: id,
             ack: Some(ack),
         })
@@ -360,14 +401,15 @@ impl ServiceControl {
     /// Returns [`SchedulerStopped`] if the scheduler is no longer accepting commands.
     pub async fn reconcile_config(
         &self,
+        caller: Caller,
         dry_run: bool,
     ) -> Result<ReconcileResult, SchedulerStopped> {
-        let (ack, rx) = ReconcileCommandAck::new();
-        self.tx
-            .send(Command::ReconcileConfig { dry_run, ack })
-            .await
-            .map_err(|_| SchedulerStopped)?;
-        rx.await.map_err(|_| SchedulerStopped)
+        self.request(|ack| Command::ReconcileConfig {
+            caller,
+            dry_run,
+            ack,
+        })
+        .await
     }
 
     /// Report the variables the session injects, or the environment it gives one service.
@@ -389,15 +431,11 @@ impl ServiceControl {
         &self,
         service: Option<&ServiceID>,
     ) -> Result<EnvironmentResult, SchedulerStopped> {
-        let (ack, rx) = EnvironmentCommandAck::new();
-        self.tx
-            .send(Command::Environment {
-                service: service.cloned(),
-                ack,
-            })
-            .await
-            .map_err(|_| SchedulerStopped)?;
-        rx.await.map_err(|_| SchedulerStopped)
+        self.request(|ack| Command::Environment {
+            service: service.cloned(),
+            ack,
+        })
+        .await
     }
 
     /// Report the session's own environment: the session-wide `env_file`, read from disk for
@@ -412,12 +450,8 @@ impl ServiceControl {
     /// The inner result rejects a session-wide `env_file` that cannot be loaded with
     /// [`CommandRejection::ConfigReload`].
     pub async fn session_environment(&self) -> Result<EnvironmentResult, SchedulerStopped> {
-        let (ack, rx) = EnvironmentCommandAck::new();
-        self.tx
-            .send(Command::SessionEnvironment { ack })
+        self.request(|ack| Command::SessionEnvironment { ack })
             .await
-            .map_err(|_| SchedulerStopped)?;
-        rx.await.map_err(|_| SchedulerStopped)
     }
 
     /// Create and start a dynamic service.
@@ -427,17 +461,15 @@ impl ServiceControl {
     /// Returns [`SchedulerStopped`] if the scheduler is no longer accepting commands.
     pub async fn start_dynamic(
         &self,
+        caller: Caller,
         params: DynamicServiceParams,
     ) -> Result<DynamicServiceResult, SchedulerStopped> {
-        let (ack, rx) = DynamicCommandAck::new();
-        self.tx
-            .send(Command::StartDynamic {
-                params,
-                ack: Some(ack),
-            })
-            .await
-            .map_err(|_| SchedulerStopped)?;
-        rx.await.map_err(|_| SchedulerStopped)
+        self.request(|ack| Command::StartDynamic {
+            caller,
+            params,
+            ack: Some(ack),
+        })
+        .await
     }
 
     /// Replace or revive a dynamic service at an expected revision.
@@ -447,21 +479,19 @@ impl ServiceControl {
     /// Returns [`SchedulerStopped`] if the scheduler is no longer accepting commands.
     pub async fn replace_dynamic(
         &self,
+        caller: Caller,
         service: &ServiceID,
         expected_revision: u64,
         params: DynamicServiceParams,
     ) -> Result<DynamicServiceResult, SchedulerStopped> {
-        let (ack, rx) = DynamicCommandAck::new();
-        self.tx
-            .send(Command::ReplaceDynamic {
-                service: service.clone(),
-                expected_revision,
-                params,
-                ack: Some(ack),
-            })
-            .await
-            .map_err(|_| SchedulerStopped)?;
-        rx.await.map_err(|_| SchedulerStopped)
+        self.request(|ack| Command::ReplaceDynamic {
+            caller,
+            service: service.clone(),
+            expected_revision,
+            params,
+            ack: Some(ack),
+        })
+        .await
     }
 
     /// Renew a live dynamic service's lease without restarting it.
@@ -471,21 +501,19 @@ impl ServiceControl {
     /// Returns [`SchedulerStopped`] if the scheduler is no longer accepting commands.
     pub async fn renew_dynamic(
         &self,
+        caller: Caller,
         service: &ServiceID,
         expected_revision: u64,
         expires_after: Option<Lease>,
     ) -> Result<DynamicServiceResult, SchedulerStopped> {
-        let (ack, rx) = DynamicCommandAck::new();
-        self.tx
-            .send(Command::RenewDynamic {
-                service: service.clone(),
-                expected_revision,
-                expires_after,
-                ack: Some(ack),
-            })
-            .await
-            .map_err(|_| SchedulerStopped)?;
-        rx.await.map_err(|_| SchedulerStopped)
+        self.request(|ack| Command::RenewDynamic {
+            caller,
+            service: service.clone(),
+            expected_revision,
+            expires_after,
+            ack: Some(ack),
+        })
+        .await
     }
 
     /// Retire a dynamic service without removing its post-mortem state.
@@ -495,16 +523,113 @@ impl ServiceControl {
     /// Returns [`SchedulerStopped`] if the scheduler is no longer accepting commands.
     pub async fn stop_dynamic(
         &self,
+        caller: Caller,
         service: &ServiceID,
     ) -> Result<DynamicServiceResult, SchedulerStopped> {
-        let (ack, rx) = DynamicCommandAck::new();
-        self.tx
-            .send(Command::StopDynamic {
-                service: service.clone(),
-                ack: Some(ack),
-            })
+        self.request(|ack| Command::StopDynamic {
+            caller,
+            service: service.clone(),
+            ack: Some(ack),
+        })
+        .await
+    }
+
+    /// Reserve `resource` for this session: granted at once while it is free, queued otherwise.
+    ///
+    /// A request this session already has is updated and renewed.
+    /// `estimate_secs` and `reason` are shown to every other session and change nothing about
+    /// the grant.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SchedulerStopped`] if the scheduler is no longer accepting commands.
+    /// The inner result rejects a caller from another project with
+    /// [`CommandRejection::PolicyDenied`].
+    pub async fn reserve(
+        &self,
+        caller: Caller,
+        resource: &str,
+        estimate_secs: Option<u64>,
+        reason: Option<String>,
+    ) -> Result<ReservationResult, SchedulerStopped> {
+        let request = ReservationRequest::Reserve {
+            resource: resource.to_string(),
+            estimate_secs,
+            reason,
+        };
+        self.reservation(caller, request).await
+    }
+
+    /// Move the `renew_by` deadline of this session's request for `resource`, granted or queued.
+    ///
+    /// With `claim`, only that request is renewed, so a waiter notices that its request was
+    /// replaced.
+    /// A grant past its deadline has lapsed and cannot be renewed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SchedulerStopped`] if the scheduler is no longer accepting commands.
+    pub async fn renew_reservation(
+        &self,
+        caller: Caller,
+        resource: &str,
+        claim: Option<String>,
+    ) -> Result<ReservationResult, SchedulerStopped> {
+        let request = ReservationRequest::Renew {
+            resource: resource.to_string(),
+            claim,
+        };
+        self.reservation(caller, request).await
+    }
+
+    /// Release this session's request for `resource`.
+    ///
+    /// A queued request is dropped at once.
+    /// A grant first stops and disables the session's services that need the resource, so the
+    /// reply says `draining` until they have stopped and the resource passes on.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SchedulerStopped`] if the scheduler is no longer accepting commands.
+    pub async fn release_reservation(
+        &self,
+        caller: Caller,
+        resource: &str,
+    ) -> Result<ReservationResult, SchedulerStopped> {
+        let request = ReservationRequest::Release {
+            resource: resource.to_string(),
+        };
+        self.reservation(caller, request).await
+    }
+
+    async fn reservation(
+        &self,
+        caller: Caller,
+        request: ReservationRequest,
+    ) -> Result<ReservationResult, SchedulerStopped> {
+        self.request(move |ack| Command::Reservation {
+            caller,
+            request,
+            ack,
+        })
+        .await
+    }
+
+    /// Stops the session for `caller`: the scheduler cancels the session before it replies, so
+    /// it admits and starts nothing more.
+    ///
+    /// A caller from another project may not while the session holds, waits for, or releases a
+    /// resource, or a run of a service that needs one has not ended.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SchedulerStopped`] if the scheduler is no longer accepting commands.
+    /// The inner result refuses with [`CommandRejection::PolicyDenied`] naming the resources.
+    pub async fn shutdown(
+        &self,
+        caller: Caller,
+    ) -> Result<Result<(), CommandRejection>, SchedulerStopped> {
+        self.request(move |ack| Command::Shutdown { caller, ack })
             .await
-            .map_err(|_| SchedulerStopped)?;
-        rx.await.map_err(|_| SchedulerStopped)
     }
 }

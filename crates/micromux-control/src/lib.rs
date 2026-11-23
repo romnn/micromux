@@ -31,8 +31,9 @@ use tokio_util::codec::LinesCodecError;
 use tokio_util::codec::{Framed, LinesCodec};
 
 pub use client::{
-    Client, EndpointProbe, EndpointProbeResult, Subscription, answering_session_probes,
-    probe_endpoint, probe_endpoints, probe_runtime_dir, probe_runtime_dirs,
+    Client, EndpointProbe, EndpointProbeResult, IdentifiedConnection, Subscription,
+    answering_session_probes, connect_identified, probe_endpoint, probe_endpoints,
+    probe_runtime_dir, probe_runtime_dirs, require_reservations, stopped_services,
     unique_answering_session_probes,
 };
 #[cfg(unix)]
@@ -47,9 +48,9 @@ pub use micromux::{
 };
 pub use protocol::{
     DiskLogReadHealth, DynamicServicesCaps, ENVIRONMENT_PROTOCOL_VERSION, EVENTS_PROTOCOL_VERSION,
-    ErrorCode, InputBytes, MAX_REMOTE_PASTE_BYTES, PROTOCOL_VERSION, ProtocolVersion, Request,
-    Response, SESSION_ENV_FILE_PROTOCOL_VERSION, ServiceBrief, SessionCapabilities, SessionInfo,
-    TERMINAL_PROTOCOL_VERSION,
+    ErrorCode, InputBytes, MAX_REMOTE_PASTE_BYTES, PROTOCOL_VERSION, ProtocolVersion,
+    RESERVATIONS_PROTOCOL_VERSION, Request, Response, SESSION_ENV_FILE_PROTOCOL_VERSION,
+    ServiceBrief, SessionCapabilities, SessionInfo, TERMINAL_PROTOCOL_VERSION,
 };
 pub use select::{
     AmbiguousSelection, LISTED_ABSENT_PROBES, ProbeReport, ResolvedSession, RuntimeDirDetail,
@@ -121,6 +122,20 @@ pub enum ControlError {
     /// The peer sent a response that did not match the request.
     #[error("unexpected control response: {0}")]
     Unexpected(String),
+    /// The session refused the request; carries its message.
+    #[error("{0}")]
+    Refused(String),
+    /// The session predates reservations.
+    #[error(
+        "session `{session}` speaks control protocol {peer}, but reservations need \
+         {RESERVATIONS_PROTOCOL_VERSION} or later; restart the session with this micromux"
+    )]
+    NoReservations {
+        /// The session's name.
+        session: String,
+        /// The session's protocol version.
+        peer: ProtocolVersion,
+    },
 }
 
 impl From<LinesCodecError> for ControlError {

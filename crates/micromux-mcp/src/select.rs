@@ -201,6 +201,26 @@ impl Discovery {
             .map_err(|error| map_select_error(cwd, error))
     }
 
+    /// Resolve the session of the config found at or above `cwd`, whatever `MICROMUX_SESSION`
+    /// selects.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::resolve`].
+    pub(crate) async fn resolve_project(&self, cwd: &Path) -> Result<Resolved, ToolError> {
+        if !micromux_control::transport_supported() {
+            return Err(ToolError::Unsupported);
+        }
+        resolve_selector_with_statuses(
+            &self.runtime_dir_statuses(),
+            cwd,
+            Some(SessionSelector::Current),
+            None,
+        )
+        .await
+        .map_err(|error| map_select_error(cwd, error))
+    }
+
     /// List every session that answers `Describe`.
     ///
     /// Endpoints that refuse a connection are skipped, and removed when no session owns them;
@@ -996,6 +1016,7 @@ mod tests {
                     name: "svc".to_string(),
                 }],
                 services_truncated: false,
+                reservations_truncated: false,
                 micromux_version: env!("CARGO_PKG_VERSION").to_string(),
                 capabilities: None,
             }
@@ -1045,6 +1066,7 @@ mod tests {
             config_path: "/different/display/path.yaml".to_string(),
             services: Vec::new(),
             services_truncated: false,
+            reservations_truncated: false,
             micromux_version: env!("CARGO_PKG_VERSION").to_string(),
             capabilities: None,
         };
@@ -1081,6 +1103,7 @@ mod tests {
                 .to_string(),
             services: Vec::new(),
             services_truncated: false,
+            reservations_truncated: false,
             micromux_version: env!("CARGO_PKG_VERSION").to_string(),
             capabilities: None,
         };
@@ -1117,6 +1140,7 @@ mod tests {
                 .to_string(),
             services: Vec::new(),
             services_truncated: false,
+            reservations_truncated: false,
             micromux_version: env!("CARGO_PKG_VERSION").to_string(),
             capabilities: None,
         };

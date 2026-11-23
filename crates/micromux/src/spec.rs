@@ -186,6 +186,11 @@ pub struct ServiceSpec {
     #[serde(skip)]
     #[schemars(skip)]
     pub cleanup: Option<CleanupSpec>,
+    /// Shared resource the service needs: only the session holding its reservation runs it.
+    ///
+    /// Only configured services and their `from_service` clones carry one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource: Option<String>,
 }
 
 impl Default for ServiceSpec {
@@ -203,6 +208,7 @@ impl Default for ServiceSpec {
             stop_grace_period: DEFAULT_STOP_GRACE_PERIOD,
             stop_signal: StopSignal::default(),
             cleanup: None,
+            resource: None,
         }
     }
 }

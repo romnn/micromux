@@ -38,7 +38,10 @@ const IDEMPOTENCY_WINDOW: usize = 64;
 mod types;
 #[cfg(test)]
 pub(crate) use types::Event;
-pub use types::{Command, MAX_PTY_INPUT_BATCH_BYTES, MAX_PTY_PASTE_BYTES, OutputStream, ServiceID};
+pub use types::{
+    Command, MAX_PTY_INPUT_BATCH_BYTES, MAX_PTY_PASTE_BYTES, OutputStream, ReservationRequest,
+    ServiceID,
+};
 pub(crate) use types::{LogUpdateKind, ProcessEvent, RunId, State};
 
 #[path = "scheduler/input.rs"]
@@ -50,15 +53,18 @@ pub use input::{
 
 #[path = "scheduler/control.rs"]
 mod control;
-pub(crate) use control::CommandAck;
 pub use control::{
-    CommandRejection, DynamicServiceAck, DynamicServiceResult, EnvironmentResult, ReconcileAction,
-    ReconcileActionKind, ReconcileReceipt, ReconcileResult, ResolvedEnvironment, SchedulerStopped,
-    ServiceCommandAck, ServiceCommandResult, ServiceControl,
+    Caller, CommandRejection, DynamicServiceAck, DynamicServiceResult, EnvironmentResult,
+    ReconcileAction, ReconcileActionKind, ReconcileReceipt, ReconcileResult, ReplyAck,
+    ReservationResult, ResolvedEnvironment, SchedulerStopped, ServiceCommandAck,
+    ServiceCommandResult, ServiceControl,
 };
 
 #[path = "scheduler/pty.rs"]
 mod pty;
+
+#[path = "scheduler/reservations.rs"]
+mod reservations;
 
 #[path = "scheduler/schedule.rs"]
 mod schedule;
@@ -179,6 +185,9 @@ pub(super) struct RunningService {
     /// Whether micromux asked the run to stop. The terminate token cannot tell: the run cancels
     /// it itself once its process exits.
     stop_requested: bool,
+    /// The resource the run's service needed when it started, which the run keeps until it
+    /// exits.
+    resource: Option<String>,
 }
 
 impl RunningService {
@@ -287,6 +296,8 @@ impl From<&Service> for RunConfig {
             stop_grace_period,
             stop_signal,
             cleanup,
+            // Captured by the run itself, and a reload cannot change it while the run is live.
+            resource: _,
         } = &service.spec;
         Self {
             command: command.clone(),
@@ -812,6 +823,11 @@ pub(super) fn project_snapshot(
             None
         },
         depends_on: service.spec.depends_on.clone(),
+        resource: runtime
+            .running
+            .as_ref()
+            .and_then(|running| running.resource.clone())
+            .or_else(|| service.spec.resource.clone()),
     };
     (snapshot, runtime.uptime_started_at)
 }
@@ -838,6 +854,14 @@ fn unix_now_ms() -> Option<u64> {
         .duration_since(std::time::UNIX_EPOCH)
         .ok()?;
     u64::try_from(elapsed.as_millis()).ok()
+}
+
+/// Sleeps until `deadline`, or forever without one: an optional timer arm of a `select!`.
+async fn sleep_until_some(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
+    }
 }
 
 fn service_event(
@@ -955,11 +979,50 @@ async fn load_services_from_disk_async(reload: ReloadConfig) -> Result<LoadedSer
         .map_err(|err| format!("config reload task failed: {err}"))?
 }
 
+/// Refuses `updated` definitions that change the resource of a service whose run is live or
+/// whose start was requested.
+///
+/// The run keeps the resource it started with, and a requested start took the resource of its
+/// definition when it was accepted, so another one in the definition would let the session start
+/// or stop runs of a resource it does not hold.
+fn reject_resource_changes_of_started_services(
+    current: &ServiceMap,
+    runtimes: &HashMap<ServiceID, ServiceRuntime>,
+    updated: &ServiceMap,
+) -> Result<(), String> {
+    let changed = updated
+        .iter()
+        .filter(|(service_id, service)| {
+            let Some(runtime) = runtimes.get(*service_id) else {
+                return false;
+            };
+            let pinned = match &runtime.running {
+                Some(running) => Some(&running.resource),
+                None if runtime.start_requested => current
+                    .get(*service_id)
+                    .map(|current| &current.spec.resource),
+                None => None,
+            };
+            pinned.is_some_and(|resource| *resource != service.spec.resource)
+        })
+        .map(|(service_id, _)| service_id.as_str())
+        .collect::<Vec<_>>();
+    if changed.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "the config changes the resource of running or starting services; stop them first: {}",
+            changed.join(", ")
+        ))
+    }
+}
+
 fn validate_reloaded_services(
     current: &ServiceMap,
     runtimes: &HashMap<ServiceID, ServiceRuntime>,
     updated: &ServiceMap,
 ) -> Result<(), String> {
+    reject_resource_changes_of_started_services(current, runtimes, updated)?;
     if let Some(id) = updated.keys().find(|id| {
         current
             .get(*id)
@@ -1069,9 +1132,16 @@ fn session_environment(
 
 /// A command's acknowledgement, held back until the scheduling pass the command triggers has run.
 enum Reply {
-    Service(Option<CommandAck>, ServiceCommandResult),
-    Dynamic(Option<control::DynamicCommandAck>, DynamicServiceResult),
-    Reconcile(control::ReconcileCommandAck, ReconcileResult),
+    Service(
+        Option<ReplyAck<Vec<ServiceCommandAck>>>,
+        ServiceCommandResult,
+    ),
+    Dynamic(Option<ReplyAck<DynamicServiceAck>>, DynamicServiceResult),
+    Reconcile(ReplyAck<ReconcileReceipt>, ReconcileResult),
+    Reservation(
+        ReplyAck<crate::session::ReservationReply>,
+        Box<ReservationResult>,
+    ),
 }
 
 impl Reply {
@@ -1080,6 +1150,7 @@ impl Reply {
             Self::Service(ack, result) => SchedulerRuntime::reply(ack, result),
             Self::Dynamic(ack, result) => SchedulerRuntime::reply_dynamic(ack, result),
             Self::Reconcile(ack, result) => ack.send(result),
+            Self::Reservation(ack, result) => ack.send(*result),
         }
     }
 }
@@ -1105,6 +1176,10 @@ struct SchedulerRuntime {
     default_log_retention: LogRetention,
     default_log_display: LogDisplay,
     idempotency: VecDeque<IdempotencyRecord>,
+    /// This session's requests for resources, by resource.
+    claims: std::collections::BTreeMap<String, reservations::Standing>,
+    /// When the poll timer next checks on queued requests and releases.
+    next_reservation_poll: Option<tokio::time::Instant>,
 }
 
 struct SchedulerResources {
@@ -1191,6 +1266,8 @@ impl SchedulerRuntime {
             default_log_retention,
             default_log_display,
             idempotency: VecDeque::new(),
+            claims: std::collections::BTreeMap::new(),
+            next_reservation_poll: None,
         }
     }
 
@@ -1242,10 +1319,16 @@ impl SchedulerRuntime {
             .append_event(service_id, service_event(generation, kind, detail));
     }
 
-    fn running_pty(&self, service_id: &ServiceID) -> Result<&pty::PtyHandles, pty::PtyInputDrop> {
+    /// The terminal of the service's live run, when it is the run `run` names, if any.
+    fn running_pty(
+        &self,
+        service_id: &ServiceID,
+        run: Option<u64>,
+    ) -> Result<&pty::PtyHandles, pty::PtyInputDrop> {
         self.services
             .get(service_id)
             .and_then(|runtime| runtime.running.as_ref())
+            .filter(|running| run.is_none_or(|run| running.run_id.get() == run))
             .map(|running| &running.pty)
             .ok_or(pty::PtyInputDrop::WriterStopped)
     }
@@ -1348,6 +1431,12 @@ impl SchedulerRuntime {
             let next_expiry = self.next_expiry();
             let next_drain_deadline = self.next_drain_deadline();
             let next_input_drop_report = self.next_input_drop_report();
+            let next_grant_check = self.next_grant_check();
+            self.next_reservation_poll = self.needs_poll().then(|| {
+                self.next_reservation_poll
+                    .unwrap_or_else(|| tokio::time::Instant::now() + reservations::POLL_INTERVAL)
+            });
+            let next_reservation_poll = self.next_reservation_poll;
             let needs_schedule = tokio::select! {
                 () = self.shutdown.cancelled() => {
                     tracing::debug!("exiting scheduler");
@@ -1381,7 +1470,7 @@ impl SchedulerRuntime {
                     let service_id = input.service_id().to_string();
                     let input_kind = input.kind().as_str();
                     let result = self
-                        .running_pty(&service_id)
+                        .running_pty(&service_id, input.run())
                         .and_then(|pty| pty.write_input(input));
                     self.report_input_drop(&service_id, input_kind, result);
                     false
@@ -1392,35 +1481,24 @@ impl SchedulerRuntime {
                     };
                     self.handle_event(services, &event)
                 }
-                () = async {
-                    match next_backoff {
-                        Some(deadline) => tokio::time::sleep_until(deadline).await,
-                        None => std::future::pending::<()>().await,
-                    }
-                } => true,
-                () = async {
-                    match next_expiry {
-                        Some(deadline) => tokio::time::sleep_until(deadline).await,
-                        None => std::future::pending::<()>().await,
-                    }
-                } => self.expire_due(services),
-                () = async {
-                    match next_drain_deadline {
-                        Some(deadline) => tokio::time::sleep_until(deadline).await,
-                        None => std::future::pending::<()>().await,
-                    }
-                } => {
+                () = sleep_until_some(next_backoff) => true,
+                () = sleep_until_some(next_expiry) => self.expire_due(services),
+                () = sleep_until_some(next_drain_deadline) => {
                     self.cancel_due_drains();
                     false
                 },
-                () = async {
-                    match next_input_drop_report {
-                        Some(deadline) => tokio::time::sleep_until(deadline).await,
-                        None => std::future::pending::<()>().await,
-                    }
-                } => {
+                () = sleep_until_some(next_input_drop_report) => {
                     self.report_due_input_drops();
                     false
+                }
+                // Before a deadline this only looks at the wall clock and sleeps again.
+                () = sleep_until_some(next_grant_check) => {
+                    self.check_due_grants(services, events_rx).await
+                }
+                () = sleep_until_some(next_reservation_poll) => {
+                    self.next_reservation_poll = None;
+                    self.poll_reservations(services, events_rx).await;
+                    true
                 }
             };
 
@@ -1723,9 +1801,11 @@ impl SchedulerRuntime {
         }
     }
 
-    fn start_dynamic(
+    async fn start_dynamic(
         &mut self,
         services: &mut ServiceMap,
+        events_rx: &mut mpsc::Receiver<ProcessEvent>,
+        caller: &Caller,
         params: DynamicServiceParams,
     ) -> Result<DynamicServiceAck, CommandRejection> {
         self.require_dynamic_enabled()?;
@@ -1776,6 +1856,12 @@ impl SchedulerRuntime {
         )
         .map_err(|err| CommandRejection::InvalidSpec(err.to_string()))?;
         self.validate_candidate(services, &service)?;
+        self.require_own_start(services, caller, &service)?;
+        // The resource is taken before the service exists, so a refusal leaves no trace of it.
+        if let Some(resource) = service.spec.resource.clone() {
+            let reason = format!("taken by the start of {}", params.service);
+            self.admit(services, events_rx, &resource, reason).await?;
+        }
 
         let mut runtime = ServiceRuntime::new(ServiceRuntimeInit::from(&service));
         runtime.expires_at = expires_at;
@@ -1806,9 +1892,11 @@ impl SchedulerRuntime {
         Ok(ack)
     }
 
-    fn replace_dynamic(
+    async fn replace_dynamic(
         &mut self,
         services: &mut ServiceMap,
+        events_rx: &mut mpsc::Receiver<ProcessEvent>,
+        caller: &Caller,
         service_id: &ServiceID,
         expected_revision: u64,
         params: DynamicServiceParams,
@@ -1852,10 +1940,15 @@ impl SchedulerRuntime {
             ))
         })?;
         let MaterializedSpec {
-            spec,
+            mut spec,
             working_dir,
             lifetime,
         } = self.materialize_spec(services, &params)?;
+        spec.resource = reservations::replacement_resource(
+            service_id,
+            spec.resource.take(),
+            current.spec.resource.clone(),
+        )?;
         let (expires_at, expires_at_unix_ms) = Self::lease_deadlines(lifetime)?;
         let origin = DynamicOrigin {
             created_at_unix_ms,
@@ -1869,6 +1962,13 @@ impl SchedulerRuntime {
             .map_err(|err| CommandRejection::InvalidSpec(err.to_string()))?;
         candidate.origin = ServiceOrigin::Dynamic(origin.clone());
         self.validate_candidate(services, &candidate)?;
+        self.require_own_start(services, caller, &candidate)?;
+        // The resource is taken before the live run, revision, or lease change, so a refusal
+        // leaves them as they were.
+        if let Some(resource) = candidate.spec.resource.clone() {
+            let reason = format!("taken by the replacement of {service_id}");
+            self.admit(services, events_rx, &resource, reason).await?;
+        }
 
         let runtime = self
             .services
@@ -1889,10 +1989,8 @@ impl SchedulerRuntime {
             false,
             false,
         );
-        let service = services
-            .get_mut(service_id)
-            .ok_or(CommandRejection::UnknownService)?;
-        *service = candidate;
+        // The service exists, so it keeps its place in the map.
+        services.insert(service_id.clone(), candidate);
         self.sync(services, service_id);
         self.append_event(
             service_id,
@@ -1910,12 +2008,18 @@ impl SchedulerRuntime {
     fn stop_dynamic(
         &mut self,
         services: &ServiceMap,
+        caller: &Caller,
         service_id: &ServiceID,
     ) -> Result<DynamicServiceAck, CommandRejection> {
         self.require_dynamic_enabled()?;
         let service = services
             .get(service_id)
             .ok_or(CommandRejection::UnknownService)?;
+        self.require_own(
+            caller,
+            service_id,
+            self.resource_of(services, service_id).as_deref(),
+        )?;
         let origin = Self::dynamic_origin(service)?;
         let runtime = self
             .services
@@ -1949,6 +2053,7 @@ impl SchedulerRuntime {
     fn renew_dynamic(
         &mut self,
         services: &mut ServiceMap,
+        caller: &Caller,
         service_id: &ServiceID,
         expected_revision: u64,
         expires_after: Option<Lease>,
@@ -1957,6 +2062,11 @@ impl SchedulerRuntime {
         let service = services
             .get(service_id)
             .ok_or(CommandRejection::UnknownService)?;
+        self.require_own(
+            caller,
+            service_id,
+            self.resource_of(services, service_id).as_deref(),
+        )?;
         let origin = Self::dynamic_origin(service)?;
         if origin.revision != expected_revision {
             return Err(CommandRejection::RevisionMismatch {
@@ -2140,8 +2250,21 @@ impl SchedulerRuntime {
         services: &mut ServiceMap,
         events_rx: &mut mpsc::Receiver<ProcessEvent>,
     ) -> Result<(), CommandRejection> {
+        if let Some(pending) = self.load_reload(services, events_rx).await? {
+            self.publish_reload(services, pending);
+        }
+        Ok(())
+    }
+
+    /// Loads and validates the config on disk, without applying it; `None` without a config to
+    /// reload.
+    async fn load_reload(
+        &mut self,
+        services: &ServiceMap,
+        events_rx: &mut mpsc::Receiver<ProcessEvent>,
+    ) -> Result<Option<LoadedServices>, CommandRejection> {
         let Some(reload) = self.reload_config.clone() else {
-            return Ok(());
+            return Ok(None);
         };
         let LoadedServices {
             services: updated,
@@ -2168,7 +2291,18 @@ impl SchedulerRuntime {
         }
         ServiceGraph::new(&merged)
             .map_err(|err| CommandRejection::ConfigReload(err.to_string()))?;
+        Ok(Some(LoadedServices {
+            services: merged,
+            session_env_files,
+        }))
+    }
 
+    /// Applies a config `load_reload` validated.
+    fn publish_reload(&mut self, services: &mut ServiceMap, loaded: LoadedServices) {
+        let LoadedServices {
+            services: merged,
+            session_env_files,
+        } = loaded;
         let changed = services
             .iter()
             .filter(|(service_id, service)| {
@@ -2204,7 +2338,6 @@ impl SchedulerRuntime {
                 self.append_event(service_id, ServiceEventKind::ConfigReloaded, detail.clone());
             }
         }
-        Ok(())
     }
 
     fn reconcile_actions(
@@ -2300,6 +2433,9 @@ impl SchedulerRuntime {
                 "service `{service_id}` exists as a live or retired dynamic service; stop it or rename the configured service"
             )));
         }
+
+        reject_resource_changes_of_started_services(services, &self.services, updated)
+            .map_err(CommandRejection::ConfigReload)?;
 
         let removed = actions
             .iter()
@@ -2445,6 +2581,7 @@ impl SchedulerRuntime {
         &mut self,
         services: &mut ServiceMap,
         events_rx: &mut mpsc::Receiver<ProcessEvent>,
+        caller: &Caller,
         dry_run: bool,
     ) -> Result<ReconcileReceipt, CommandRejection> {
         let reload = self.reload_config.clone().ok_or_else(|| {
@@ -2465,6 +2602,14 @@ impl SchedulerRuntime {
         // reject (dynamic-id collision, orphaned dependents, graph failure) is not a preview.
         self.validate_reconcile_candidate(services, &updated, &actions)?;
         if !dry_run {
+            for action in &actions {
+                let resource = self.resource_of(services, &action.service).or_else(|| {
+                    updated
+                        .get(&action.service)
+                        .and_then(|service| service.spec.resource.clone())
+                });
+                self.require_own(caller, &action.service, resource.as_deref())?;
+            }
             self.apply_reconcile(services, &updated, &actions);
             self.session_env_files = session_env_files;
             self.publish_route_owners(services);
@@ -2535,19 +2680,10 @@ impl SchedulerRuntime {
         if self.shutdown.is_cancelled() {
             return;
         }
-        schedule::schedule_ready(&mut schedule::ScheduleContext {
-            services,
-            runtimes: &mut self.services,
-            current_pty_size: self.current_pty_size,
-            events_tx: &self.events_tx,
-            #[cfg(test)]
-            test_events: &mut self.test_events,
-            writer: &self.writer,
-            shutdown: &self.shutdown,
-        });
+        self.start_ready(services, events_rx).await;
     }
 
-    fn reply(ack: Option<CommandAck>, result: ServiceCommandResult) {
+    fn reply(ack: Option<ReplyAck<Vec<ServiceCommandAck>>>, result: ServiceCommandResult) {
         match ack {
             Some(ack) => ack.send(result),
             // Fire-and-forget senders (the TUI) have nowhere to surface a rejection; leave a
@@ -2560,7 +2696,7 @@ impl SchedulerRuntime {
         }
     }
 
-    fn reply_dynamic(ack: Option<control::DynamicCommandAck>, result: DynamicServiceResult) {
+    fn reply_dynamic(ack: Option<ReplyAck<DynamicServiceAck>>, result: DynamicServiceResult) {
         match ack {
             Some(ack) => ack.send(result),
             None => {
@@ -2577,6 +2713,7 @@ impl SchedulerRuntime {
         &mut self,
         services: &mut ServiceMap,
         events_rx: &mut mpsc::Receiver<ProcessEvent>,
+        caller: &Caller,
         service_id: &ServiceID,
     ) -> ServiceCommandResult {
         if !self.services.contains_key(service_id) {
@@ -2598,7 +2735,24 @@ impl SchedulerRuntime {
         }
         // `DynamicServicesPolicy` is session-latched, so config reload cannot narrow a dynamic
         // service's accepted working roots between its creation and a later restart.
-        self.reload_services(services, events_rx).await?;
+        let pending = self.load_reload(services, events_rx).await?;
+        let definition = pending
+            .as_ref()
+            .map_or(&*services, |pending| &pending.services)
+            .get(service_id)
+            .ok_or(CommandRejection::UnknownService)?;
+        self.require_own_start(services, caller, definition)?;
+        if let Some(pending) = &pending {
+            self.require_own_reload(services, caller, &pending.services)?;
+        }
+        // The run takes the resource of the definition it starts with, before anything changes.
+        if let Some(resource) = definition.spec.resource.clone() {
+            let reason = format!("taken by restart {service_id}");
+            self.admit(services, events_rx, &resource, reason).await?;
+        }
+        if let Some(pending) = pending {
+            self.publish_reload(services, pending);
+        }
         let runtime = self
             .services
             .get_mut(service_id)
@@ -2623,6 +2777,7 @@ impl SchedulerRuntime {
         &mut self,
         services: &mut ServiceMap,
         events_rx: &mut mpsc::Receiver<ProcessEvent>,
+        caller: &Caller,
         service_id: &ServiceID,
     ) -> ServiceCommandResult {
         if !self.services.contains_key(service_id) {
@@ -2637,17 +2792,33 @@ impl SchedulerRuntime {
                 Self::retired_guidance(reason).to_string(),
             ));
         }
-        self.reload_services(services, events_rx).await?;
+        let pending = self.load_reload(services, events_rx).await?;
+        let definition = pending
+            .as_ref()
+            .map_or(&*services, |pending| &pending.services)
+            .get(service_id)
+            .ok_or(CommandRejection::UnknownService)?;
+        self.require_own_start(services, caller, definition)?;
+        // Enabling a job never starts or cancels a run of it: an enabled job is left alone, and a
+        // disabled one returns to where it was. Only a restart runs a job on request, so enabling
+        // one takes no resource. A service takes its resource now, even while it still waits for
+        // its dependencies.
+        let job = definition.spec.kind == crate::ServiceKind::Job;
+        if let Some(pending) = &pending {
+            self.require_own_reload(services, caller, &pending.services)?;
+        }
+        if !job && let Some(resource) = definition.spec.resource.clone() {
+            let reason = format!("taken by enable {service_id}");
+            self.admit(services, events_rx, &resource, reason).await?;
+        }
+        if let Some(pending) = pending {
+            self.publish_reload(services, pending);
+        }
         let runtime = self
             .services
             .get_mut(service_id)
             .ok_or(CommandRejection::UnknownService)?;
         let observed_generation = runtime.run_generation();
-        // Enabling a job never starts or cancels a run of it: an enabled job is left alone, and a
-        // disabled one returns to where it was. Only a restart runs a job on request.
-        let job = services
-            .get(service_id)
-            .is_some_and(|service| service.spec.kind == crate::ServiceKind::Job);
         match (job, runtime.desired) {
             (false, _) => runtime.request_enable(),
             (true, DesiredState::Disabled) => runtime.enable_without_start(),
@@ -2668,8 +2839,17 @@ impl SchedulerRuntime {
     fn apply_disable(
         &mut self,
         services: &ServiceMap,
+        caller: &Caller,
         service_id: &ServiceID,
     ) -> ServiceCommandResult {
+        if !self.services.contains_key(service_id) {
+            return Err(CommandRejection::UnknownService);
+        }
+        self.require_own(
+            caller,
+            service_id,
+            self.resource_of(services, service_id).as_deref(),
+        )?;
         let Some(runtime) = self.services.get_mut(service_id) else {
             return Err(CommandRejection::UnknownService);
         };
@@ -2691,25 +2871,62 @@ impl SchedulerRuntime {
         &mut self,
         services: &mut ServiceMap,
         events_rx: &mut mpsc::Receiver<ProcessEvent>,
+        caller: &Caller,
     ) -> ServiceCommandResult {
-        self.reload_services(services, events_rx).await?;
-        let mut acks = Vec::new();
-        for service_id in services.keys() {
-            let restart = self
-                .services
-                .get_mut(service_id)
-                .filter(|runtime| runtime.desired == DesiredState::Enabled && runtime.is_live())
-                // A manual job runs only when asked for by name.
-                .filter(|_| {
-                    services
-                        .get(service_id)
-                        .is_none_or(|service| service.startup_mode != StartupMode::Manual)
+        let pending = self.load_reload(services, events_rx).await?;
+        let definitions = pending
+            .as_ref()
+            .map_or(&*services, |pending| &pending.services);
+        let restart_set = definitions
+            .iter()
+            .filter(|(service_id, service)| {
+                self.services.get(*service_id).is_some_and(|runtime| {
+                    runtime.desired == DesiredState::Enabled && runtime.is_live()
                 })
-                .map(|runtime| {
-                    let observed_generation = runtime.run_generation();
-                    runtime.request_restart();
-                    observed_generation
-                });
+                    // A manual job runs only when asked for by name.
+                    && service.startup_mode != StartupMode::Manual
+            })
+            .map(|(service_id, _)| service_id.clone())
+            .collect::<Vec<_>>();
+        // Refuse the whole command before restarting anything.
+        if let Some(pending) = &pending {
+            self.require_own_reload(services, caller, &pending.services)?;
+        }
+        for service in restart_set
+            .iter()
+            .filter_map(|service_id| definitions.get(service_id))
+        {
+            self.require_own_start(services, caller, service)?;
+        }
+        let resources = restart_set
+            .iter()
+            .filter_map(|service_id| definitions.get(service_id)?.spec.resource.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        // Every resource is taken before anything restarts; a refusal names those taken before
+        // it, which the session keeps.
+        let mut admitted = Vec::new();
+        for resource in &resources {
+            let reason = "taken by restart-all".to_string();
+            if let Err(rejection) = self.admit(services, events_rx, resource, reason).await {
+                if admitted.is_empty() {
+                    return Err(rejection);
+                }
+                return Err(
+                    rejection.with_note(&format!("the session holds {}", admitted.join(", ")))
+                );
+            }
+            admitted.push(resource.as_str());
+        }
+        if let Some(pending) = pending {
+            self.publish_reload(services, pending);
+        }
+        let mut acks = Vec::new();
+        for service_id in &restart_set {
+            let restart = self.services.get_mut(service_id).map(|runtime| {
+                let observed_generation = runtime.run_generation();
+                runtime.request_restart();
+                observed_generation
+            });
             if let Some(observed_generation) = restart {
                 self.sync(services, service_id);
                 self.append_event(
@@ -2739,7 +2956,7 @@ impl SchedulerRuntime {
 
     /// Answers `ack` with the session's own environment, which reads the session-wide `env_file`
     /// from disk, on a blocking thread so a slow filesystem never stalls the scheduler.
-    fn session_environment(&self, ack: control::EnvironmentCommandAck) {
+    fn session_environment(&self, ack: ReplyAck<ResolvedEnvironment>) {
         let config_dir = self.config_dir.clone();
         let entries = self.session_env_files.entries.clone();
         let session = std::sync::Arc::clone(&self.session);
@@ -2780,6 +2997,10 @@ impl SchedulerRuntime {
         })
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one flat arm per command variant; splitting the dispatch would scatter it"
+    )]
     async fn handle_command(
         &mut self,
         services: &mut ServiceMap,
@@ -2787,50 +3008,110 @@ impl SchedulerRuntime {
         command: Command,
     ) -> Option<Reply> {
         let reply = match command {
-            Command::Restart { service, ack } => {
-                Reply::Service(ack, self.apply_restart(services, events_rx, &service).await)
-            }
-            Command::Enable { service, ack } => {
-                Reply::Service(ack, self.apply_enable(services, events_rx, &service).await)
-            }
-            Command::RestartAll { ack } => {
-                Reply::Service(ack, self.apply_restart_all(services, events_rx).await)
-            }
-            Command::Disable { service, ack } => {
-                let result = self.apply_disable(services, &service);
+            Command::Restart {
+                caller,
+                service,
+                ack,
+            } => Reply::Service(
+                ack,
+                self.apply_restart(services, events_rx, &caller, &service)
+                    .await,
+            ),
+            Command::Enable {
+                caller,
+                service,
+                ack,
+            } => Reply::Service(
+                ack,
+                self.apply_enable(services, events_rx, &caller, &service)
+                    .await,
+            ),
+            Command::RestartAll { caller, ack } => Reply::Service(
+                ack,
+                self.apply_restart_all(services, events_rx, &caller).await,
+            ),
+            Command::Disable {
+                caller,
+                service,
+                ack,
+            } => {
+                let result = self.apply_disable(services, &caller, &service);
                 #[cfg(test)]
                 if result.is_ok() {
                     self.test_events.forward(Event::Disabled(service.clone()));
                 }
                 Reply::Service(ack, result)
             }
-            Command::ReconcileConfig { dry_run, ack } => Reply::Reconcile(
+            Command::ReconcileConfig {
+                caller,
+                dry_run,
                 ack,
-                self.reconcile_config(services, events_rx, dry_run).await,
+            } => Reply::Reconcile(
+                ack,
+                self.reconcile_config(services, events_rx, &caller, dry_run)
+                    .await,
             ),
-            Command::StartDynamic { params, ack } => {
-                Reply::Dynamic(ack, self.start_dynamic(services, params))
-            }
+            Command::StartDynamic {
+                caller,
+                params,
+                ack,
+            } => Reply::Dynamic(
+                ack,
+                self.start_dynamic(services, events_rx, &caller, params)
+                    .await,
+            ),
             Command::ReplaceDynamic {
+                caller,
                 service,
                 expected_revision,
                 params,
                 ack,
             } => Reply::Dynamic(
                 ack,
-                self.replace_dynamic(services, &service, expected_revision, params),
+                self.replace_dynamic(
+                    services,
+                    events_rx,
+                    &caller,
+                    &service,
+                    expected_revision,
+                    params,
+                )
+                .await,
             ),
             Command::RenewDynamic {
+                caller,
                 service,
                 expected_revision,
                 expires_after,
                 ack,
             } => Reply::Dynamic(
                 ack,
-                self.renew_dynamic(services, &service, expected_revision, expires_after),
+                self.renew_dynamic(
+                    services,
+                    &caller,
+                    &service,
+                    expected_revision,
+                    expires_after,
+                ),
             ),
-            Command::StopDynamic { service, ack } => {
-                Reply::Dynamic(ack, self.stop_dynamic(services, &service))
+            Command::StopDynamic {
+                caller,
+                service,
+                ack,
+            } => Reply::Dynamic(ack, self.stop_dynamic(services, &caller, &service)),
+            Command::Reservation {
+                caller,
+                request,
+                ack,
+            } => {
+                let result = self
+                    .reservation(services, events_rx, &caller, request)
+                    .await;
+                Reply::Reservation(ack, Box::new(result))
+            }
+            Command::Shutdown { caller, ack } => {
+                ack.send(self.shutdown_for(&caller));
+                return None;
             }
             // A read changes nothing, so it skips the scheduling pass a reply waits for.
             Command::Environment { service, ack } => {
@@ -3235,6 +3516,7 @@ pub(crate) async fn scheduler(input: SchedulerInput) -> Result<(), crate::graph:
 
     rt.cancel_all_running();
     rt.drain_on_shutdown(&services, &mut events_rx).await;
+    rt.remove_claims_on_stop().await;
     Ok(())
 }
 

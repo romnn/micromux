@@ -178,6 +178,9 @@ impl PtyInputKind {
 #[derive(Debug)]
 pub struct PreparedPtyInput {
     service_id: Arc<str>,
+    /// The run the input was authorized for, if any: input for a run that was since replaced
+    /// is discarded instead of reaching the new run.
+    run: Option<u64>,
     data: Vec<u8>,
     kind: PtyInputKind,
     permit: InputPermit,
@@ -219,10 +222,24 @@ impl PreparedPtyInput {
         };
         Ok(Self {
             service_id,
+            run: None,
             data,
             kind,
             permit,
         })
+    }
+
+    /// Binds the input to the run with generation `run`, so it reaches only that run.
+    #[must_use]
+    pub fn for_run(mut self, run: u64) -> Self {
+        self.run = Some(run);
+        self
+    }
+
+    /// The run the input is bound to, if any.
+    #[must_use]
+    pub const fn run(&self) -> Option<u64> {
+        self.run
     }
 
     /// Number of payload bytes held by this reservation.
@@ -259,12 +276,13 @@ impl PreparedPtyInput {
     ///
     /// # Errors
     ///
-    /// Returns `other` unchanged when the payloads target different services or sessions, either
+    /// Returns `other` unchanged when the payloads target different services, runs, or sessions, either
     /// value is a paste, or the combined batch would exceed [`MAX_PTY_INPUT_BATCH_BYTES`].
     pub fn try_merge(&mut self, other: Self) -> Result<(), Self> {
         if self.kind != PtyInputKind::Input
             || other.kind != PtyInputKind::Input
             || self.service_id != other.service_id
+            || self.run != other.run
             || !Arc::ptr_eq(&self.permit.budget, &other.permit.budget)
             || self.data.len() + other.data.len() > MAX_PTY_INPUT_BATCH_BYTES
         {

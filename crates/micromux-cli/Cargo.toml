@@ -60,6 +60,7 @@ futures.workspace = true
 # parse cli arguments
 clap = { version = "4", features = ["derive", "env"] }
 humantime = "2"
+chrono = { workspace = true, features = ["clock"] }
 
 # `micromux env --format json`
 serde_json.workspace = true

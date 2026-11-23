@@ -1526,3 +1526,112 @@ async fn shutdown_request_stops_the_session_and_removes_the_endpoint() -> eyre::
 // deterministically at the model level — `model::tests::run_log_after_pages_from_the_beginning_*` —
 // because the PTY/terminal capture samples a fast burst (it does not emit one record per line for
 // rapid output), so a service cannot reliably produce >2000 distinct records over the socket.
+
+/// Only a client that names the session's own project controls a service that needs a
+/// resource, types into it, reconciles it, reserves for the session, or stops it; a client that
+/// names another project or none is refused, and the session's reservations reach its
+/// description.
+#[tokio::test]
+async fn only_the_own_project_controls_tagged_services_over_the_socket() -> eyre::Result<()> {
+    let dir = unique_dir("identify")?;
+    let yaml = "version: 1\nservices:\n  svc:\n    command: [\"sh\", \"-c\", \"sleep 60\"]\n    \
+                resource: desk\n";
+    let session = build_session_yaml(dir.path(), yaml)?;
+    request_until(&session.endpoint, Request::ListServices, |response| {
+        matches!(response, Response::Services(services)
+            if services.first().is_some_and(|s| matches!(s.execution, micromux::Execution::Running)))
+    })
+    .await?;
+    let restart = || Request::Restart {
+        service: "svc".to_string(),
+    };
+    let refused = |response: &Response| {
+        matches!(
+            response,
+            Response::Error {
+                code: ErrorCode::PolicyDenied,
+                ..
+            }
+        )
+    };
+
+    // A client that names no project is refused everything the resource protects.
+    let mut client = Client::connect(&session.endpoint).await?;
+    for request in [
+        restart(),
+        Request::SendInput {
+            service: "svc".to_string(),
+            data: micromux_control::InputBytes::from(b"x".to_vec()),
+            paste: false,
+        },
+        Request::ReleaseReservation {
+            resource: "desk".to_string(),
+        },
+        Request::Shutdown,
+    ] {
+        let response = client.request(request).await?;
+        eyre::ensure!(refused(&response), "{response:?}");
+    }
+
+    // Naming another project changes nothing.
+    let other = client
+        .request(Request::Identify {
+            project: "0123456789abcdef".to_string(),
+        })
+        .await?;
+    eyre::ensure!(matches!(other, Response::Identified), "{other:?}");
+    let response = client.request(restart()).await?;
+    eyre::ensure!(refused(&response), "{response:?}");
+
+    // An edit of the tagged service on disk is applied only for the own project.
+    std::fs::write(
+        dir.path().join("micromux.yaml"),
+        yaml.replace("sleep 60", "sleep 61"),
+    )?;
+    let reconcile = Request::ReconcileConfig { dry_run: false };
+    let response = client.request(reconcile.clone()).await?;
+    eyre::ensure!(refused(&response), "{response:?}");
+
+    // A client working in the session's project may, and sees the grant it renewed.
+    let mut client = micromux_control::connect_identified(&session.endpoint, dir.path())
+        .await?
+        .client;
+    let response = client.request(reconcile).await?;
+    eyre::ensure!(
+        matches!(&response, Response::Reconcile(receipt)
+            if receipt.actions.iter().any(|action| action.service == "svc")),
+        "{response:?}"
+    );
+    let response = client.request(restart()).await?;
+    eyre::ensure!(
+        matches!(response, Response::Accepted { .. }),
+        "{response:?}"
+    );
+    let response = client
+        .request(Request::RenewReservation {
+            resource: "desk".to_string(),
+            claim: None,
+        })
+        .await?;
+    eyre::ensure!(
+        matches!(&response, Response::Reservation(reply)
+            if reply.state == micromux::ReservationState::Granted),
+        "{response:?}"
+    );
+    let reservations = client
+        .describe()
+        .await?
+        .session
+        .map(|session| session.reservations)
+        .unwrap_or_default();
+    assert_eq!(
+        reservations
+            .iter()
+            .map(|view| (view.name.as_str(), view.owner.is_some()))
+            .collect::<Vec<_>>(),
+        [("desk", true)]
+    );
+
+    session.shutdown.cancel();
+    Ok(())
+}

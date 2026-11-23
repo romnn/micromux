@@ -416,7 +416,7 @@ services:
         std::fs::write(&config_path, config(route_port, true))?;
         handles
             .service_control()
-            .reconcile_config(false)
+            .reconcile_config(micromux::Caller::Local, false)
             .await
             .map_err(|_| eyre::eyre!("scheduler stopped"))?
             .map_err(|rejection| eyre::eyre!("reconcile rejected: {rejection}"))?;

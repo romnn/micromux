@@ -1,12 +1,21 @@
-//! Waiting for a service to become healthy or exit, shared by `micromux ctl wait` and the MCP
-//! waits so both resolve, fail fast, and honor generations the same way.
+//! Waiting for a service to become healthy or exit, or for a reservation to be granted, shared by
+//! `micromux ctl wait` and the MCP waits so both resolve, fail fast, and honor generations the
+//! same way.
 
+use std::path::Path;
 use std::time::Duration;
 
+use micromux::SessionChange;
 use micromux::{ChangeKind, DependencyFailure, DependencyFailureReason, Desired, Execution};
-use micromux::{Health, ServiceKind, ServiceSnapshot, SessionChange};
+use micromux::{Health, ReservationReply, ReservationState, ServiceKind, ServiceSnapshot};
 
-use crate::{Client, ControlEndpoint, Subscription};
+use crate::{
+    Client, ControlEndpoint, ControlError, EndpointProbeResult, ErrorCode, IdentifiedConnection,
+    Request, Response, Subscription, connect_identified, probe_endpoint, require_reservations,
+};
+
+/// How often a reservation wait renews its queued request.
+const RESERVATION_POLL: Duration = Duration::from_secs(2);
 
 /// What a wait waits for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -411,5 +420,122 @@ mod tests {
              code 1 and will not restart, so it cannot complete successfully; fix it and restart \
              `seed`"
         );
+    }
+}
+
+/// How a wait for a reservation ended.
+#[derive(Debug)]
+pub enum ReservationWait {
+    /// The session holds the resource.
+    Granted(Box<ReservationReply>),
+    /// The request can no longer be granted: it is gone or released, or the session stopped or
+    /// was replaced by another instance; carries why.
+    Ended(String),
+    /// The deadline passed while the request waits; carries the last answer, if any, with the
+    /// request's position and the holder.
+    TimedOut(Option<Box<ReservationReply>>),
+}
+
+/// Waits until the session at `endpoint` holds `resource` or `deadline` passes, renewing its
+/// queued request every two seconds so the request does not lapse while it waits.
+///
+/// It connects with [`connect_identified`] from `cwd`, and pins the session instance that answers
+/// and the request its first renewal reports.
+/// Only a confirmed loss ends the wait: the request is gone or released, or the session's
+/// endpoint is gone or answers as another instance.
+/// A failed store, a timeout, or a broken connection is retried on a fresh connection until the
+/// deadline.
+///
+/// # Errors
+///
+/// Returns an error when the first connection fails, [`ControlError::NoReservations`] for a
+/// session that predates reservations, or [`ControlError::Refused`] when the session refuses the
+/// renewal for another reason, such as a client from another project.
+pub async fn wait_for_reservation(
+    endpoint: &ControlEndpoint,
+    cwd: &Path,
+    resource: &str,
+    deadline: tokio::time::Instant,
+) -> Result<ReservationWait, ControlError> {
+    let mut last = None;
+    let waited = tokio::time::timeout_at(
+        deadline,
+        renew_until_granted(endpoint, cwd, resource, &mut last),
+    )
+    .await;
+    waited.unwrap_or(Ok(ReservationWait::TimedOut(last)))
+}
+
+/// The loop of [`wait_for_reservation`], which keeps its latest answer in `last`.
+async fn renew_until_granted(
+    endpoint: &ControlEndpoint,
+    cwd: &Path,
+    resource: &str,
+    last: &mut Option<Box<ReservationReply>>,
+) -> Result<ReservationWait, ControlError> {
+    let IdentifiedConnection { client, session } = connect_identified(endpoint, cwd).await?;
+    require_reservations(&session)?;
+    let mut connection = Some(client);
+    let mut claim = None;
+    loop {
+        let Some(client) = connection.as_mut() else {
+            tokio::time::sleep(RESERVATION_POLL).await;
+            match connect_identified(endpoint, cwd).await {
+                Ok(reconnected) if reconnected.session.is_same_instance(&session) => {
+                    connection = Some(reconnected.client);
+                }
+                Ok(_) => {
+                    return Ok(ReservationWait::Ended(
+                        "the session was replaced by another instance".to_string(),
+                    ));
+                }
+                Err(_) => {
+                    if matches!(
+                        probe_endpoint(endpoint).await.result,
+                        EndpointProbeResult::Absent(_)
+                    ) {
+                        return Ok(ReservationWait::Ended("the session stopped".to_string()));
+                    }
+                }
+            }
+            continue;
+        };
+        let request = Request::RenewReservation {
+            resource: resource.to_string(),
+            claim: claim.clone(),
+        };
+        // A connection whose exchange failed or timed out may still deliver that late response,
+        // so it is never asked again.
+        let Ok(response) = client.request(request).await else {
+            connection = None;
+            continue;
+        };
+        match response {
+            Response::Reservation(reply) => match reply.state {
+                ReservationState::Granted => return Ok(ReservationWait::Granted(reply)),
+                ReservationState::Waiting { .. } => {
+                    claim = claim.or_else(|| reply.claim.clone());
+                    *last = Some(reply);
+                    tokio::time::sleep(RESERVATION_POLL).await;
+                }
+                ReservationState::Releasing | ReservationState::Released => {
+                    return Ok(ReservationWait::Ended(format!(
+                        "the session released resource `{resource}`"
+                    )));
+                }
+            },
+            // The request is gone or released.
+            Response::Error {
+                code: ErrorCode::InvalidState | ErrorCode::Busy,
+                message,
+            } => return Ok(ReservationWait::Ended(message)),
+            // The store or the scheduler failed for now.
+            Response::Error {
+                code: ErrorCode::Internal | ErrorCode::Timeout | ErrorCode::SchedulerStopped,
+                ..
+            } => tokio::time::sleep(RESERVATION_POLL).await,
+            Response::Error { message, .. } => return Err(ControlError::Refused(message)),
+            other => return Err(ControlError::Unexpected(format!("{other:?}"))),
+        }
     }
 }

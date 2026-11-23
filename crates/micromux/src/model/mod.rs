@@ -373,6 +373,13 @@ pub struct ServiceSnapshot {
     /// Services this one waits for before it starts, with the condition each must reach.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub depends_on: Vec<crate::spec::DependencySpec>,
+    /// The shared resource the service needs: the live run's when it captured one, else the
+    /// current definition's.
+    ///
+    /// Only the session holding the resource's reservation runs the service, and only that
+    /// session's own project may control it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource: Option<String>,
 }
 
 /// How a service's most recent `cleanup` command ended.
@@ -434,6 +441,7 @@ impl ServiceSnapshot {
             last_cleanup: None,
             dependency_failure: None,
             depends_on: Vec::new(),
+            resource: None,
         }
     }
 }

@@ -24,7 +24,7 @@ pub(crate) async fn run(options: &Options, raw_session: Option<&str>) -> Result<
             .await
             .map_err(|error| crate::Error::Message(format_select_error(error, "attach")))?;
     let config_path = std::path::PathBuf::from(&resolved.info.config_path);
-    let remote = micromux_tui::RemoteSource::connect(resolved.endpoint)
+    let remote = micromux_tui::RemoteSource::connect(resolved.endpoint, cwd)
         .await
         .map_err(|error| crate::Error::Message(format_control_error(error, "attach")))?;
 
@@ -172,6 +172,7 @@ mod tests {
                 config_path: "/project/micromux.yaml".to_string(),
                 services: Vec::new(),
                 services_truncated: false,
+                reservations_truncated: false,
                 micromux_version: "test".to_string(),
                 capabilities: None,
             }],
