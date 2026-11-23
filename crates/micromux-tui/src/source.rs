@@ -152,11 +152,9 @@ impl SessionSource {
     ///
     /// Both sources read an in-process store of at most [`micromux::EVENT_HISTORY`] events: the
     /// session model, or the attached TUI's mirror of it.
-    /// It is `None` when the session reports no lifecycle events, as an attached session older
-    /// than [`micromux_control::EVENTS_PROTOCOL_VERSION`].
-    pub(crate) fn events(&self, id: &str) -> Option<Vec<ServiceEvent>> {
+    pub(crate) fn events(&self, id: &str) -> Vec<ServiceEvent> {
         match self {
-            Self::Local(source) => Some(source.reader.events(id, None, None).0),
+            Self::Local(source) => source.reader.events(id, None, None).0,
             Self::Remote(source) => source.events(id),
         }
     }

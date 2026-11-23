@@ -182,9 +182,7 @@ async fn remote_terminal_types_into_and_resizes_the_service() -> eyre::Result<()
     let dir = unique_dir("remote-terminal")?;
     let session = build_session(dir.path(), INTERACTIVE_YAML)?;
     let source = RemoteSource::connect(session.endpoint.clone(), std::env::current_dir()?).await?;
-    let terminal = source
-        .terminal()
-        .ok_or_else(|| eyre::eyre!("a current session accepts terminal input"))?;
+    let terminal = source.terminal();
     wait_for_running(&source).await?;
 
     assert!(terminal.try_resize(120, 33));

@@ -350,6 +350,9 @@ pub(super) struct ServiceRuntime {
     /// cannot meet its condition without an intervention. `Some` only while `blocked_on` is not
     /// empty.
     dependency_failure: Option<DependencyFailure>,
+    /// Whether the last scheduling pass found the service's start waiting for the session's
+    /// queued request for its resource.
+    waiting_for_resource: bool,
     input_drops: InputDropThrottle,
 }
 
@@ -453,6 +456,7 @@ impl ServiceRuntime {
             blocked_on: Vec::new(),
             last_run_stopped: false,
             dependency_failure: None,
+            waiting_for_resource: false,
             input_drops: InputDropThrottle::default(),
         }
     }
@@ -601,12 +605,17 @@ impl ServiceRuntime {
         self.clear_logs_on_start = false;
         self.restart.clear_backoff();
         if matches!(self.state, State::Disabled) && self.running.is_none() {
-            // A job that finished on its own keeps its outcome; one that never ran, or that
-            // micromux interrupted, is pending again.
-            self.state = match (self.last_exit_code, self.last_run_stopped) {
-                (Some(exit_code), false) => State::Exited { exit_code },
-                _ => State::Pending,
-            };
+            self.state = self.resumed_job_state();
+        }
+    }
+
+    /// The state a disabled job returns to when it is enabled without a start: a job that
+    /// finished on its own keeps its outcome; one that never ran, or that micromux interrupted,
+    /// is pending again.
+    fn resumed_job_state(&self) -> State {
+        match (self.last_exit_code, self.last_run_stopped) {
+            (Some(exit_code), false) => State::Exited { exit_code },
+            _ => State::Pending,
         }
     }
 
@@ -828,6 +837,7 @@ pub(super) fn project_snapshot(
             .as_ref()
             .and_then(|running| running.resource.clone())
             .or_else(|| service.spec.resource.clone()),
+        waiting_for_resource: runtime.waiting_for_resource,
     };
     (snapshot, runtime.uptime_started_at)
 }
@@ -979,12 +989,12 @@ async fn load_services_from_disk_async(reload: ReloadConfig) -> Result<LoadedSer
         .map_err(|err| format!("config reload task failed: {err}"))?
 }
 
-/// Refuses `updated` definitions that change the resource of a service whose run is live or
-/// whose start was requested.
+/// Refuses `updated` definitions that add, remove, or change the resource of a service whose run
+/// is live or that has a start to come.
 ///
-/// The run keeps the resource it started with, and a requested start took the resource of its
-/// definition when it was accepted, so another one in the definition would let the session start
-/// or stop runs of a resource it does not hold.
+/// The run keeps the resource it started with, and the session claimed the resource of the
+/// current definition for the start to come, so another one in the definition would let the
+/// session start or stop runs of a resource it does not hold.
 fn reject_resource_changes_of_started_services(
     current: &ServiceMap,
     runtimes: &HashMap<ServiceID, ServiceRuntime>,
@@ -993,14 +1003,16 @@ fn reject_resource_changes_of_started_services(
     let changed = updated
         .iter()
         .filter(|(service_id, service)| {
-            let Some(runtime) = runtimes.get(*service_id) else {
+            let (Some(runtime), Some(current)) =
+                (runtimes.get(*service_id), current.get(*service_id))
+            else {
                 return false;
             };
             let pinned = match &runtime.running {
                 Some(running) => Some(&running.resource),
-                None if runtime.start_requested => current
-                    .get(*service_id)
-                    .map(|current| &current.spec.resource),
+                None if schedule::has_pending_start(current, runtime) => {
+                    Some(&current.spec.resource)
+                }
                 None => None,
             };
             pinned.is_some_and(|resource| *resource != service.spec.resource)
@@ -1011,7 +1023,8 @@ fn reject_resource_changes_of_started_services(
         Ok(())
     } else {
         Err(format!(
-            "the config changes the resource of running or starting services; stop them first: {}",
+            "the config changes the resource of services that run or are to start; disable them \
+             first: {}",
             changed.join(", ")
         ))
     }
@@ -1418,11 +1431,9 @@ impl SchedulerRuntime {
         pty_input_rx: &mut mpsc::Receiver<PreparedPtyInput>,
         events_rx: &mut mpsc::Receiver<ProcessEvent>,
     ) {
-        tracing::debug!("started initial scheduling pass");
-        self.schedule_pass(services, events_rx).await;
-        tracing::debug!("completed initial scheduling pass");
-
         let mut pty_input_closed = false;
+        // The initial scheduling pass is the first one due.
+        let mut pass_due = true;
         loop {
             tracing::debug!("waiting for scheduling event");
             // Snapshot time-based work before selecting. Without explicit timer arms, restart
@@ -1437,6 +1448,7 @@ impl SchedulerRuntime {
                     .unwrap_or_else(|| tokio::time::Instant::now() + reservations::POLL_INTERVAL)
             });
             let next_reservation_poll = self.next_reservation_poll;
+            let mut replies = Vec::new();
             let needs_schedule = tokio::select! {
                 () = self.shutdown.cancelled() => {
                     tracing::debug!("exiting scheduler");
@@ -1446,15 +1458,8 @@ impl SchedulerRuntime {
                     let Some(command) = command else {
                         break;
                     };
-                    if let Some(reply) = self.handle_command(services, events_rx, command).await {
-                        // Acknowledge only once the pass the command triggers has run, so a caller
-                        // that reads the session right after the reply sees the command's effects,
-                        // such as a restarted dependency's dependents no longer failed.
-                        self.evict_retired(services);
-                        self.schedule_pass(services, events_rx).await;
-                        reply.send();
-                    }
-                    false
+                    replies.extend(self.handle_command(services, events_rx, command).await);
+                    !replies.is_empty()
                 }
                 input = async {
                     if pty_input_closed {
@@ -1500,17 +1505,41 @@ impl SchedulerRuntime {
                     self.poll_reservations(services, events_rx).await;
                     true
                 }
-            };
+                // A pass that ended at a store transaction wakes the scheduler again, as late as
+                // any other source, so timers and commands get their turn in between.
+                () = std::future::ready(()), if pass_due => true,
+            } || pass_due;
 
+            if !self.shutdown.is_cancelled() && needs_schedule {
+                // The commands that arrived meanwhile apply before the pass, so it starts nothing
+                // they turn off, such as a service a grant the poll just noticed would start but
+                // a disable waiting here cancels. Only those present now: later ones wait for the
+                // next wake, so they cannot hold back the pass and the replies.
+                for _ in 0..commands_rx.len() {
+                    if self.shutdown.is_cancelled() {
+                        break;
+                    }
+                    let Ok(command) = commands_rx.try_recv() else {
+                        break;
+                    };
+                    replies.extend(self.handle_command(services, events_rx, command).await);
+                }
+            }
+            if !self.shutdown.is_cancelled() {
+                // Retirement can become evictable only after later process/log-reader events
+                // arrive, so enforce the bounded tombstone roster after every scheduler wake
+                // rather than only on insertion.
+                self.evict_retired(services);
+                pass_due = needs_schedule && self.schedule_pass(services, events_rx).await;
+            }
+            // Acknowledge only once the pass the commands trigger has run, so a caller that reads
+            // the session right after the reply sees the command's effects, such as a restarted
+            // dependency's dependents no longer failed.
+            for reply in replies {
+                reply.send();
+            }
             if self.shutdown.is_cancelled() {
                 break;
-            }
-            // Retirement can become evictable only after later process/log-reader events arrive,
-            // so enforce the bounded tombstone roster after every scheduler wake rather than only
-            // on insertion.
-            self.evict_retired(services);
-            if needs_schedule {
-                self.schedule_pass(services, events_rx).await;
             }
         }
     }
@@ -2222,18 +2251,35 @@ impl SchedulerRuntime {
     where
         F: Future<Output = Result<T, String>>,
     {
-        // Process exits must keep freeing event-channel capacity during a slow reload, while
-        // shutdown must stop waiting so service termination is not coupled to filesystem liveness.
-        // Applying a completed candidate remains serialized on this task.
-        tokio::pin!(load);
+        // Shutdown must stop waiting so service termination is not coupled to filesystem
+        // liveness.
+        let shutdown = self.shutdown.clone();
+        tokio::select! {
+            biased;
+            () = shutdown.cancelled() => {
+                Err("config reload interrupted by session shutdown".to_string())
+            }
+            result = self.await_handling_events(services, events_rx, load) => result,
+        }
+    }
+
+    /// Awaits `task` while handling process events, so that exits keep freeing event-channel
+    /// capacity; applying its result remains serialized on this task.
+    async fn await_handling_events<F, T>(
+        &mut self,
+        services: &ServiceMap,
+        events_rx: &mut mpsc::Receiver<ProcessEvent>,
+        task: F,
+    ) -> T
+    where
+        F: Future<Output = T>,
+    {
+        tokio::pin!(task);
         let mut events_open = true;
         loop {
             tokio::select! {
                 biased;
-                () = self.shutdown.cancelled() => {
-                    return Err("config reload interrupted by session shutdown".to_string());
-                }
-                result = &mut load => return result,
+                result = &mut task => return result,
                 event = events_rx.recv(), if events_open => {
                     if let Some(event) = event {
                         let _ = self.handle_event(services, &event);
@@ -2671,16 +2717,21 @@ impl SchedulerRuntime {
         }
     }
 
+    /// Runs one scheduling pass, and returns whether it ended at a store transaction, after which
+    /// another pass is due.
+    ///
+    /// A pass ends at its first store transaction, so a command that arrives meanwhile applies
+    /// before the next pass starts anything it turns off.
     async fn schedule_pass(
         &mut self,
         services: &mut ServiceMap,
         events_rx: &mut mpsc::Receiver<ProcessEvent>,
-    ) {
+    ) -> bool {
         self.reload_before_auto_restart(services, events_rx).await;
         if self.shutdown.is_cancelled() {
-            return;
+            return false;
         }
-        self.start_ready(services, events_rx).await;
+        self.start_ready(services, events_rx).await
     }
 
     fn reply(ack: Option<ReplyAck<Vec<ServiceCommandAck>>>, result: ServiceCommandResult) {
@@ -2745,10 +2796,13 @@ impl SchedulerRuntime {
         if let Some(pending) = &pending {
             self.require_own_reload(services, caller, &pending.services)?;
         }
-        // The run takes the resource of the definition it starts with, before anything changes.
-        if let Some(resource) = definition.spec.resource.clone() {
-            let reason = format!("taken by restart {service_id}");
-            self.admit(services, events_rx, &resource, reason).await?;
+        // The run takes or queues for the resource of the definition it starts with, before
+        // anything changes.
+        let resource = definition.spec.resource.clone();
+        if let Some(resource) = &resource {
+            let reason = format!("requested by restart {service_id}");
+            self.queue_for(services, events_rx, resource, reason)
+                .await?;
         }
         if let Some(pending) = pending {
             self.publish_reload(services, pending);
@@ -2765,7 +2819,7 @@ impl SchedulerRuntime {
         self.append_event(
             service_id,
             ServiceEventKind::RestartRequested,
-            "service restart requested",
+            self.request_detail("service restart requested", resource.as_deref()),
         );
         Ok(vec![ServiceCommandAck {
             service: service_id.clone(),
@@ -2801,15 +2855,17 @@ impl SchedulerRuntime {
         self.require_own_start(services, caller, definition)?;
         // Enabling a job never starts or cancels a run of it: an enabled job is left alone, and a
         // disabled one returns to where it was. Only a restart runs a job on request, so enabling
-        // one takes no resource. A service takes its resource now, even while it still waits for
-        // its dependencies.
+        // one takes no resource. A service takes or queues for its resource now, even while it
+        // still waits for its dependencies.
         let job = definition.spec.kind == crate::ServiceKind::Job;
         if let Some(pending) = &pending {
             self.require_own_reload(services, caller, &pending.services)?;
         }
-        if !job && let Some(resource) = definition.spec.resource.clone() {
-            let reason = format!("taken by enable {service_id}");
-            self.admit(services, events_rx, &resource, reason).await?;
+        let resource = definition.spec.resource.clone().filter(|_| !job);
+        if let Some(resource) = &resource {
+            let reason = format!("requested by enable {service_id}");
+            self.queue_for(services, events_rx, resource, reason)
+                .await?;
         }
         if let Some(pending) = pending {
             self.publish_reload(services, pending);
@@ -2828,7 +2884,7 @@ impl SchedulerRuntime {
         self.append_event(
             service_id,
             ServiceEventKind::EnableRequested,
-            "service enable requested",
+            self.request_detail("service enable requested", resource.as_deref()),
         );
         Ok(vec![ServiceCommandAck {
             service: service_id.clone(),
@@ -2877,11 +2933,17 @@ impl SchedulerRuntime {
         let definitions = pending
             .as_ref()
             .map_or(&*services, |pending| &pending.services);
+        // A service whose start waits for its resource keeps waiting: it starts with its current
+        // definition once the session gets the resource, and has no run to restart.
         let restart_set = definitions
             .iter()
             .filter(|(service_id, service)| {
                 self.services.get(*service_id).is_some_and(|runtime| {
-                    runtime.desired == DesiredState::Enabled && runtime.is_live()
+                    runtime.desired == DesiredState::Enabled
+                        && runtime.is_live()
+                        && !services.get(*service_id).is_some_and(|current| {
+                            self.start_is_queued(current, runtime)
+                        })
                 })
                     // A manual job runs only when asked for by name.
                     && service.startup_mode != StartupMode::Manual
@@ -2902,20 +2964,13 @@ impl SchedulerRuntime {
             .iter()
             .filter_map(|service_id| definitions.get(service_id)?.spec.resource.clone())
             .collect::<std::collections::BTreeSet<_>>();
-        // Every resource is taken before anything restarts; a refusal names those taken before
-        // it, which the session keeps.
-        let mut admitted = Vec::new();
+        // Every resource is taken before anything restarts, and only while it is free: a queue
+        // entry for one resource could make its holder hand it over although a later one refuses
+        // the command. A grant taken before a refusal goes again once the command's scheduling
+        // pass finds nothing that needs it.
         for resource in &resources {
             let reason = "taken by restart-all".to_string();
-            if let Err(rejection) = self.admit(services, events_rx, resource, reason).await {
-                if admitted.is_empty() {
-                    return Err(rejection);
-                }
-                return Err(
-                    rejection.with_note(&format!("the session holds {}", admitted.join(", ")))
-                );
-            }
-            admitted.push(resource.as_str());
+            self.admit(services, events_rx, resource, reason).await?;
         }
         if let Some(pending) = pending {
             self.publish_reload(services, pending);
@@ -3514,6 +3569,7 @@ pub(crate) async fn scheduler(input: SchedulerInput) -> Result<(), crate::graph:
     )
     .await;
 
+    rt.remove_idle_claims_on_stop().await;
     rt.cancel_all_running();
     rt.drain_on_shutdown(&services, &mut events_rx).await;
     rt.remove_claims_on_stop().await;

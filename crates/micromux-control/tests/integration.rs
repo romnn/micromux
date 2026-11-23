@@ -1527,6 +1527,64 @@ async fn shutdown_request_stops_the_session_and_removes_the_endpoint() -> eyre::
 // because the PTY/terminal capture samples a fast burst (it does not emit one record per line for
 // rapid output), so a service cannot reliably produce >2000 distinct records over the socket.
 
+/// A release while nobody waits keeps the session's service running and its grant due, and a
+/// reservation wait then reports the grant without extending it.
+#[tokio::test]
+async fn a_reservation_wait_confirms_a_grant_without_extending_it() -> eyre::Result<()> {
+    let dir = unique_dir("reservation-wait")?;
+    let yaml = "version: 1\nservices:\n  svc:\n    command: [\"sh\", \"-c\", \"sleep 60\"]\n    \
+                resource: desk\n";
+    let session = build_session_yaml(dir.path(), yaml)?;
+    request_until(&session.endpoint, Request::ListServices, |response| {
+        matches!(response, Response::Services(services)
+            if services.first().is_some_and(|s| matches!(s.execution, micromux::Execution::Running)))
+    })
+    .await?;
+    let mut client = micromux_control::connect_identified(&session.endpoint, dir.path())
+        .await?
+        .client;
+    let renew_by = |response: &Response| match response {
+        Response::Reservation(reply) if reply.state == micromux::ReservationState::Granted => {
+            reply.own_claim().map(|claim| claim.renew_by_unix_ms)
+        }
+        _ => None,
+    };
+
+    let released = client
+        .request(Request::ReleaseReservation {
+            resource: "desk".to_string(),
+        })
+        .await?;
+    let due = renew_by(&released).ok_or_else(|| eyre::eyre!("{released:?}"))?;
+
+    let waited = micromux_control::wait::wait_for_reservation(
+        &session.endpoint,
+        dir.path(),
+        "desk",
+        tokio::time::Instant::now() + Duration::from_secs(10),
+    )
+    .await?;
+    eyre::ensure!(
+        matches!(&waited, micromux_control::wait::ReservationWait::Granted(_)),
+        "{waited:?}"
+    );
+    let status = client
+        .request(Request::ReservationStatus {
+            resource: "desk".to_string(),
+        })
+        .await?;
+    assert_eq!(renew_by(&status), Some(due));
+    let services = client.request(Request::ListServices).await?;
+    eyre::ensure!(
+        matches!(&services, Response::Services(services)
+            if services.first().is_some_and(|s| matches!(s.execution, micromux::Execution::Running))),
+        "{services:?}"
+    );
+
+    session.shutdown.cancel();
+    Ok(())
+}
+
 /// Only a client that names the session's own project controls a service that needs a
 /// resource, types into it, reconciles it, reserves for the session, or stops it; a client that
 /// names another project or none is refused, and the session's reservations reach its

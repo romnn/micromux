@@ -23,9 +23,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use micromux::{DependencyFailure, Desired, Execution, Health, HealthAttempt, ServiceSnapshot};
 use micromux_control::{
-    Client, ControlEndpoint, ControlError, ENVIRONMENT_PROTOCOL_VERSION, ErrorCode, Request,
-    Response, SESSION_ENV_FILE_PROTOCOL_VERSION, SessionInfo, SocketProbeDetails, endpoint_for,
-    transport_supported, usable_runtime_dirs,
+    Client, ControlEndpoint, ControlError, ErrorCode, Request, Response, SessionInfo,
+    SocketProbeDetails, endpoint_for, transport_supported, usable_runtime_dirs,
 };
 use regex::{Regex, RegexBuilder};
 use rmcp::{
@@ -129,9 +128,11 @@ dependency and restart semantics. Use `start_session` to create a project's head
 human can run `micromux attach` to observe it. Use `stop_session` to stop it explicitly. A service \
 that names a `resource` runs in one session at a time: only the session holding the resource runs \
 it, and only clients working in that session's project may control it. For the current project, \
-`reserve_resource` takes a resource or queues for it, `wait_for_reservation` waits for the grant, \
-`renew_reservation` keeps it within the hour and lists who waits, and `release_resource` gives it \
-back; `list_sessions` and `list_services` show each resource's holder and queue.";
+`enable_service` of such a service or `reserve_resource` takes the resource or queues for it, and \
+the session starts what waited as soon as it gets the resource, with no further call; \
+`wait_for_reservation` reports the grant, `renew_reservation` extends the turn and lists who \
+waits, and `release_resource` hands it over once another session queues; `list_sessions` and \
+`list_services` show each resource's holder and queue.";
 
 /// The MCP server handler. Cheap to clone; holds no supervision state.
 #[derive(Clone)]
@@ -631,31 +632,17 @@ struct ReservationResult {
     session_ref: SessionRef,
     #[serde(flatten)]
     reply: micromux::ReservationReply,
-    /// Seconds until the session's own request must renew; negative once it is overdue.
+    /// Seconds until the session's own request is due: a grant then passes on as soon as another
+    /// request waits, and a queued request is renewed by the session itself; negative once due.
     #[serde(skip_serializing_if = "Option::is_none")]
     renew_in_secs: Option<i64>,
-    /// Seconds until the resource's holder must renew; negative once it is overdue.
+    /// Seconds until the resource's holder is due; negative once due.
     #[serde(skip_serializing_if = "Option::is_none")]
     holder_renew_in_secs: Option<i64>,
-    /// The session's services that need the resource and do not run; once granted, start them
-    /// with `enable_service`.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    services: Vec<String>,
 }
 
 impl ReservationResult {
-    async fn new(
-        session: &SessionInfo,
-        client: &mut Client,
-        reply: micromux::ReservationReply,
-    ) -> Self {
-        let services = if reply.state == micromux::ReservationState::Granted {
-            micromux_control::stopped_services(client, &reply.view.name)
-                .await
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
+    fn new(session: &SessionInfo, reply: micromux::ReservationReply) -> Self {
         Self {
             session_ref: SessionRef::from(session),
             renew_in_secs: reply
@@ -667,7 +654,6 @@ impl ReservationResult {
                 .as_ref()
                 .map(|owner| renew_in_secs(owner.claim.renew_by_unix_ms)),
             reply,
-            services,
         }
     }
 }
@@ -1446,8 +1432,8 @@ impl McpServer {
             .map_err(error_data)
     }
 
-    /// Sends a reservation request for the current project's session, on a connection whose own
-    /// description shows the session understands it.
+    /// Sends a reservation request for the current project's session, on a connection that names
+    /// the project.
     async fn reservation(&self, request: Request) -> ToolResult<ReservationResult> {
         let resolved = self.reservation_session().await?;
         let micromux_control::IdentifiedConnection {
@@ -1456,15 +1442,12 @@ impl McpServer {
         } = micromux_control::connect_identified(&resolved.endpoint, &self.cwd)
             .await
             .map_err(|err| error_data(err.into()))?;
-        micromux_control::require_reservations(&session).map_err(|err| error_data(err.into()))?;
         let response = client
             .request(request)
             .await
             .map_err(|err| error_data(err.into()))?;
         let reply = convert::reservation(response).map_err(error_data)?;
-        Ok(Json(
-            ReservationResult::new(&session, &mut client, reply).await,
-        ))
+        Ok(Json(ReservationResult::new(&session, reply)))
     }
 
     async fn mutate(
@@ -1718,28 +1701,12 @@ impl McpServer {
             .resolve(&self.cwd, args.session)
             .await
             .map_err(error_data)?;
-        let version = resolved.info.protocol_version;
-        if !version.supports(ENVIRONMENT_PROTOCOL_VERSION) {
-            return Err(ErrorData::invalid_params(
-                format!(
-                    "session `{}` speaks control protocol {version}, but get_session_env needs \
-                     {ENVIRONMENT_PROTOCOL_VERSION} or later; restart the session with this \
-                     micromux",
-                    resolved.info.name
-                ),
-                None,
-            ));
-        }
-        // A session too old for a session-wide env file has its variables alone for its own
-        // environment.
-        let request =
-            if args.service.is_none() && version.supports(SESSION_ENV_FILE_PROTOCOL_VERSION) {
-                Request::GetSessionEnvironment
-            } else {
-                Request::GetEnvironment {
-                    service: args.service.clone(),
-                }
-            };
+        let request = match &args.service {
+            None => Request::GetSessionEnvironment,
+            Some(service) => Request::GetEnvironment {
+                service: Some(service.clone()),
+            },
+        };
         let response = send_request(&resolved.endpoint, request)
             .await
             .map_err(error_data)?;
@@ -2588,11 +2555,15 @@ impl McpServer {
     #[tool(
         description = "Reserve a shared resource for the current project's session: granted at \
         once while it is free, queued first in, first out otherwise. Only the session holding a \
-        resource runs the services that name it in `resource`, and starting such a service while \
-        the resource is free reserves it too. estimate_secs and reason are shown to every other \
-        session. A grant lapses unless renewed within the hour; the result's `state` says whether \
-        the session holds the resource or waits at a position, and `view` lists the holder and \
-        queue. Calling it again updates and renews the request."
+        resource runs the services that name it in `resource`. A fresh reservation also starts \
+        the session's configured services that name the resource and start with the session, as \
+        soon as the session gets it, with no further call; enabling one such service queues for \
+        it the same way. The session keeps a queued request alive by itself. A grant runs for an \
+        hour, and after that until another session queues, when the session stops its services \
+        that need it and passes it on. estimate_secs and reason are shown to every other \
+        session. The result's `state` says whether the session holds the resource or waits at a \
+        position, and `view` lists the holder and queue. Calling it again updates the estimate \
+        and reason and renews the request, without enabling anything."
     )]
     async fn reserve_resource(
         &self,
@@ -2609,9 +2580,10 @@ impl McpServer {
 
     #[tool(
         description = "Renew the current project's session's reservation of a resource, granted \
-        or queued, moving its renew_by deadline an hour out. Renew at least hourly while you \
-        need the resource: a lapsed grant stops the session's services that need it and passes \
-        it on. The result lists the queue, so check who waits and release early when you can."
+        or queued, moving its renew_by deadline an hour out. A grant past its deadline passes on \
+        as soon as another session queues, so renew while you need the resource; once another \
+        session waits for a grant past its deadline, renewing is refused. The result lists the \
+        queue, so check who waits and release early when you can."
     )]
     async fn renew_reservation(
         &self,
@@ -2627,8 +2599,11 @@ impl McpServer {
 
     #[tool(
         description = "Release the current project's session's reservation of a resource. A \
-        queued request goes at once; a grant first stops and disables the session's services \
-        that need the resource (state `draining`), then passes it to the next request."
+        queued request goes at once, with the starts that waited for it. A grant becomes due: \
+        while nobody waits, the services keep running and `state` stays `granted`; once another \
+        session queues, the session stops and disables its services that need the resource \
+        (state `releasing`) and passes it on. To stop a broken copy, disable its services: \
+        disabling the last one gives the resource up too."
     )]
     async fn release_resource(
         &self,
@@ -2643,12 +2618,13 @@ impl McpServer {
 
     #[tool(
         description = "Wait until the current project's session holds a resource it queued for \
-        with reserve_resource, renewing the queued request every 2 seconds while it waits. \
-        Returns status granted with the services to start, ended (the request was released, or \
-        the session stopped or was replaced; detail says why), or timeout with the request's \
-        last position and the holder, after which the request stays queued and you can call \
-        again. A session whose services were refused the resource at start does not start them \
-        on its own once granted: enable them then."
+        with reserve_resource or enable_service, looking every 2 seconds without renewing or \
+        extending anything. Returns status granted (the session holds the resource; its \
+        services that waited for it start on their own, and wait_for_healthy tells when one is \
+        ready), ended (the request was released or replaced, the session hands the resource \
+        over, or the session stopped or was replaced; detail says why), or timeout with the \
+        request's last position and the holder, after which the request stays queued and you \
+        can call again."
     )]
     async fn wait_for_reservation(
         &self,
@@ -2676,15 +2652,7 @@ impl McpServer {
             wait::ReservationWait::Ended(why) => (ReservationWaitStatus::Ended, None, Some(why)),
             wait::ReservationWait::TimedOut(last) => (ReservationWaitStatus::Timeout, last, None),
         };
-        let reply = match reply {
-            Some(reply) => {
-                let mut client = Client::connect(&resolved.endpoint)
-                    .await
-                    .map_err(|err| error_data(err.into()))?;
-                Some(ReservationResult::new(&resolved.info, &mut client, *reply).await)
-            }
-            None => None,
-        };
+        let reply = reply.map(|reply| ReservationResult::new(&resolved.info, *reply));
         Ok(Json(ReservationWaitResult {
             session_ref: SessionRef::from(&resolved.info),
             status,
@@ -4635,6 +4603,71 @@ services:
             variables.get("SESSION_SECRET").map(String::as_str),
             Some("s3ss10n")
         );
+
+        session.finish().await
+    }
+
+    /// A release while nobody waits keeps the grant through the MCP tools, and a reservation wait
+    /// reports it without extending its deadline or listing services to start.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wait_for_reservation_reports_a_released_grant_as_it_is() -> eyre::Result<()> {
+        let project = tempfile::tempdir()?;
+        // `viewer` needs the same resource but does not run, which a grant once listed as a
+        // service to start.
+        let yaml = "version: 1\nservices:\n  app:\n    command: [\"sh\", \"-c\", \"sleep 60\"]\n    \
+                    resource: desk\n  viewer:\n    command: [\"sh\", \"-c\", \"sleep 60\"]\n    \
+                    resource: desk\n    disabled: true\n";
+        let (session, _) =
+            boot_mcp_session_with_yaml(project.path(), "mcp-reservation-test", yaml)?;
+        let mut server = session.server();
+        server.cwd = project.path().to_path_buf();
+        let resource = || super::ResourceArgs {
+            resource: "desk".to_string(),
+        };
+        // The session takes the free resource as `app` starts.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let released = loop {
+            let Json(released) = server
+                .release_resource(Parameters(resource()))
+                .await
+                .map_err(|err| eyre::eyre!(err.message))?;
+            if released.reply.state == micromux::ReservationState::Granted {
+                break released;
+            }
+            eyre::ensure!(
+                tokio::time::Instant::now() < deadline,
+                "the session never held the resource: {:?}",
+                released.reply
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        assert!(released.renew_in_secs.is_some_and(|secs| secs <= 0));
+
+        let Json(waited) = server
+            .wait_for_reservation(Parameters(super::ReservationWaitArgs {
+                resource: "desk".to_string(),
+                timeout_secs: Some(10),
+            }))
+            .await
+            .map_err(|err| eyre::eyre!(err.message))?;
+        assert!(
+            matches!(waited.status, super::ReservationWaitStatus::Granted),
+            "{:?}",
+            waited.detail
+        );
+        let deadline = |result: &super::ReservationResult| {
+            result.reply.own_claim().map(|claim| claim.renew_by_unix_ms)
+        };
+        assert_eq!(
+            waited.reply.as_ref().and_then(deadline),
+            deadline(&released)
+        );
+        let json = serde_json::to_value(&waited)?;
+        let reply = json
+            .get("reply")
+            .ok_or_else(|| eyre::eyre!("the grant is missing: {json}"))?;
+        assert!(reply.get("services").is_none(), "{json}");
 
         session.finish().await
     }

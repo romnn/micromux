@@ -245,41 +245,43 @@ services:
 **Who holds it.**
 
 - A resource is held by at most one session of your user on this host; the rest queue for it, first in, first out.
-- Only the session holding the resource starts the services that name it.
-- A command that starts such a service, `restart`, `enable`, `restart-all`, or a dynamic service's start or replacement, takes the resource at once, even while the service still waits for its dependencies, as `reserve` would. The session then holds it until it releases it or the grant lapses, and the grant's reason says which command took it, such as "taken by enable desktop".
-- While another session holds the resource, the command fails, changes nothing, and names the holder: its session and worktree, its estimate and reason, and when it must renew. A refused `restart-all` keeps the resources it took before the refusal, and its message names them.
-- Session startup and other automatic starts take the resource when the service is ready to run. While another session holds it, they disable the service with one event naming the holder. A disabled service does not start on its own once the session gets the resource later: enable it then.
+- Only the session holding the resource starts the services that name it, and a session asks for it by wanting to run one of them.
+- `enable` or `restart` of such a service takes the resource when it is free and otherwise queues the session for it, even while the service still waits for its dependencies. The service then shows as queued and starts on its own once the session gets the resource, after the previous holder's services and their cleanups are gone; nothing has to run in between. The request's reason says which command made it, such as "requested by enable desktop".
+- `restart-all` and a dynamic service's start or replacement take only a free resource: while another session holds or queues for it, they fail, change nothing, and name the holder: its session and worktree, its estimate and reason, and when it must renew. `restart-all` leaves a service that waits for the resource waiting.
+- Session startup and other automatic starts take the resource when the service is ready to run and nobody else has it. Otherwise they disable the service with one event naming the holder; enable it to queue.
+- The session keeps the resource while one of its services runs or is to start, and gives it up when nothing needs it any more: once you disable the last such service, or once it exited for good.
 
 **Reserve, wait, renew, release.** From a session's project:
 
 ```bash
 micromux ctl reserve desktop-app --for 1h --reason "test the model loader against this worktree's build"
-micromux ctl wait --reservation desktop-app --timeout 2h   # renews the queued request while it waits
+micromux ctl wait --reservation desktop-app --timeout 2h   # until the session holds it
 micromux ctl renew desktop-app                             # lists who waits
 micromux ctl release desktop-app
 ```
 
-`reserve` grants the resource at once when it is free and queues the request otherwise. `--for` and `--reason` are shown to everyone else and change nothing about the grant; a later `reserve` without them keeps the ones given before. Reserving a resource that no service of the session names warns, in case of a typo, and reserves it anyway. After a grant, `reserve` and `wait` name the session's services that need the resource and do not run, with the `micromux ctl enable` command that starts them. The MCP server has the same operations as `reserve_resource`, `wait_for_reservation`, `renew_reservation`, and `release_resource`. See [the control plane]({{< relref "../agent-control/control-plane.md" >}}#shared-resources) for the exit codes.
+`reserve` grants the resource at once when it is free and queues the request otherwise, and it requests a start of every service of the session that names the resource and starts with the session, so neither one with `disabled: true` nor a manual job, and no job whose run already finished. A reservation with no such service is refused. `--for` and `--reason` are shown to everyone else and change nothing about the grant; reserving again renews the request, takes them if given, and enables nothing. `wait --reservation` only looks: it reports once the session holds the resource and extends nothing; wait for a service to be ready with `ctl wait SERVICE`. The MCP server has the same operations as `reserve_resource`, `wait_for_reservation`, `renew_reservation`, and `release_resource`. See [the control plane]({{< relref "../agent-control/control-plane.md" >}}#shared-resources) for the exit codes.
 
-**Renew while others wait.** A grant runs until its `renew_by` deadline, one hour after it was granted or last renewed. Each renewal lists the queue, so a holder sees the demand at least once an hour. Past the deadline, the holder keeps the resource for as long as nobody waits for it, and a late renewal extends it. Once a request waits, the holder's next check, start, or renewal finds the grant lapsed: the session stops and disables its services that need the resource and passes it to the next request. A queued request lapses at its own deadline, and a running `wait --reservation` renews it.
+**A turn, and handing over.** A grant is protected for an hour after it was granted or last renewed, its `renew_by` deadline. Each renewal lists the queue, so a holder sees the demand. Past the deadline, the holder keeps the resource for as long as nobody waits for it, and a renewal extends it. Once a request waits, the holder notices within seconds: the session stops and disables its services that need the resource and passes it to the next request, and a renewal can no longer stop that. The session keeps its own queued request alive while a service waits for it.
 
-**Release.** Releasing first stops and disables the session's services that need the resource, then passes it on; until they have stopped, the reservation reads as being released. The next session gets the resource only once none of those processes or their cleanups is left, so it can start its own copy on the same ports. A session that stops gives up its resources once its services have stopped.
+**Release.** Releasing a grant ends its protected turn at once but stops nothing while nobody waits: the same processes keep running, and the session hands the resource over as soon as another session queues. Handing over stops and disables the services that run or are to start; a job that finished keeps its outcome. Releasing a queued request drops it, with the starts that waited for it. To stop a broken copy, disable its services; disabling the last one gives the resource up once it stopped. The next session gets the resource only once none of the previous holder's processes or their cleanups is left, so it can start its own copy on the same ports. A session that stops gives up its queued requests at once and its grants once its services have stopped.
 
 **Dead sessions.** When a session's process is gone, through a crash, a kill, or a reboot, the next session that looks drops its grant and queued requests at once, without waiting for the deadline. It gets the resource only once the dead session's services and their cleanups have ended, as after a release.
 
 **Who may control these services.** Only clients working in the session's own project may start, restart, enable, disable, or replace a service that names a resource, type into it in an attached TUI, reserve, renew, or release for the session, apply a reconcile or a reload that touches such a service, or stop the session while it holds, waits for, or runs a resource. Your working directory decides your project: the config found at or above it, whatever `-c` selects. Every other client is refused, with the project that may. The scope is cooperative: it keeps sessions of one user from taking each other's resources by accident, it is no security boundary. The session's own TUI may always; it has no keys to reserve, renew, or release, which are for agents and scripts.
 
-**Changing `resource`.** A config reload or a reconcile refuses to add, remove, or rename the `resource` of a service that runs or was asked to start; stop the service first.
+**Changing `resource`.** A config reload or a reconcile refuses to add, remove, or rename the `resource` of a service that runs or is to start; disable the service first.
 
 **Rollout.**
 
 - Every worktree that runs the service needs a micromux that understands `resource`: an older one ignores the key with a warning and runs the service regardless. Set `strict: true` so an older micromux refuses the config instead.
-- A client older than control protocol 3.21 names no project, so it can no longer control a service that names a resource, or stop a session that uses one; its refusal says to run a newer micromux from inside the project.
+- Starting on its own after the grant and keeping the app on release need a micromux with control protocol 4.0 or newer in the sessions on both sides of a hand-over. An older holder still stops its services on release, and an older waiter starts nothing after the grant until its service is enabled.
 - A service with a `resource` needs a config loaded from a file, and process containment, so `resource` is refused on platforms without it, such as Windows.
 
 Known limitations:
 
-- The deadline is kept in wall-clock time between sessions, so a clock step can end a queued request early, or keep a request whose agent is gone queued longer.
+- The deadline is kept in wall-clock time between sessions, so a clock step can end a protected turn early or late.
+- A queued request lives as long as its session wants to run the service, also when the agent that queued is gone, so a forgotten worktree can get the resource for a protected hour; release or disable to give the request up.
 - `ctl ls`, `ctl describe`, MCP, and the TUI show the reservation files as last written, so a session that died can show as holder or waiter until any session next reserves, renews, polls, or starts a service that needs the resource.
 
 ## Per-service overrides

@@ -1,6 +1,6 @@
 # 6. Shared resources: one session at a time runs a service that names a resource, judged by its holder
 
-**Status:** accepted · **Date:** 2026-11-23
+**Status:** superseded by [ADR 7](0007-reservations-are-requests-to-run.md) · **Date:** 2026-11-23
 
 ## Context
 

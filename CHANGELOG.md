@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **A shared resource passes on without an agent step: enabling or reserving queues for it and
+  starts the service once the session gets it, and a release keeps it running until another
+  session queues.** `micromux ctl enable`, `reserve` and `release` changed meaning, so the control
+  protocol is 4.0: restart running sessions, attached TUIs and `micromux mcp` after upgrading.
+
 ## v0.4.8
 
 - **Reserve a shared resource that one session at a time runs.** A service's `resource` names

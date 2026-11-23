@@ -3778,9 +3778,10 @@ mod tests {
         let (_runner, handles) = mux.start(micromux::CancellationToken::new());
         let (commands, _commands_rx) = mpsc::channel(1);
         let refusal = "resource `desktop-app` is held: queue with `micromux ctl reserve \
-                       desktop-app` (MCP: reserve_resource); held by session \
-                       feature-model-loader (/home/user/src/feature-model-loader), must renew \
-                       within 59m (by 23:22 +01:00); once granted, enable the service";
+                       desktop-app` (MCP: reserve_resource) or by enabling the service, which \
+                       then starts once granted; held by session feature-model-loader \
+                       (/home/user/src/feature-model-loader), must renew within 59m (by 23:22 \
+                       +01:00)";
         let mut app = App::new(
             SessionSource::Local(LocalSource::new(handles.reader, commands).with_notice(refusal)),
             Some(handles.terminal),
@@ -3928,7 +3929,7 @@ mod tests {
         let terminal = source.terminal();
         let mut app = App::new(
             SessionSource::Remote(source),
-            terminal,
+            Some(terminal),
             micromux::CancellationToken::new(),
             ViewOptions::default(),
         );
@@ -3965,7 +3966,7 @@ mod tests {
         let terminal = source.terminal();
         let mut app = App::new(
             SessionSource::Remote(source),
-            terminal,
+            Some(terminal),
             micromux::CancellationToken::new(),
             ViewOptions::default(),
         );
@@ -4038,9 +4039,7 @@ mod tests {
     #[tokio::test]
     async fn input_refused_while_reconnecting_is_discarded() -> eyre::Result<()> {
         let (source, mut forwarding) = RemoteSource::offline();
-        let terminal = source
-            .terminal()
-            .ok_or_else(|| eyre::eyre!("the offline session accepts terminal input"))?;
+        let terminal = source.terminal();
         let mut app = App::new(
             SessionSource::Remote(source),
             Some(terminal.clone()),

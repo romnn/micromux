@@ -12,9 +12,11 @@
 //!
 //! The holder's `renew_by` is the one deadline, kept in wall-clock time, and only the holder
 //! judges it, in the transaction that admits, reserves, or renews for it: a holder past its
-//! deadline goes on while nobody waits, and is refused, so that it releases the resource, once
-//! somebody does. A holder releases by stopping its services that name the resource, then
-//! removing its claim; until then the file shows it as the ordinary owner.
+//! deadline goes on while nobody waits, and is refused, so that it hands the resource over, once
+//! somebody does.
+//! A release makes the deadline due at once, so the holder keeps running while nobody waits.
+//! A holder hands over by stopping its services that name the resource, then removing its claim;
+//! until then the file shows it as the ordinary owner.
 //!
 //! # Handoff
 //!
@@ -29,7 +31,7 @@
 //! has none.
 //!
 //! The decisions behind this design are recorded in
-//! [ADR 6](https://github.com/romnn/micromux/blob/main/adr/0006-shared-resource-reservations.md).
+//! [ADR 7](https://github.com/romnn/micromux/blob/main/adr/0007-reservations-are-requests-to-run.md).
 //!
 //! A session instance is live while it holds its instance lock and its port record still names
 //! the instance's token, so a restart of the same config does not inherit the old instance's
@@ -210,7 +212,8 @@ pub(crate) enum ReservationError {
     /// Another session holds the resource.
     #[error(
         "resource `{resource}` is held: queue with `micromux ctl reserve {resource}` (MCP: \
-         reserve_resource); held by session {}, {}; once granted, enable the service",
+         reserve_resource) or by enabling the service, which then starts once granted; held by \
+         session {}, {}",
         owner.claim,
         crate::renew_label(owner.claim.renew_by_unix_ms)
     )]
@@ -223,7 +226,8 @@ pub(crate) enum ReservationError {
     /// Other sessions queue for the resource.
     #[error(
         "resource `{resource}` is queued for: queue with `micromux ctl reserve {resource}` (MCP: \
-         reserve_resource); {waiting} request(s) already wait; once granted, enable the service"
+         reserve_resource) or by enabling the service, which then starts once granted; {waiting} \
+         request(s) already wait"
     )]
     Queued {
         /// The resource.
@@ -252,10 +256,11 @@ pub(crate) enum ReservationError {
         /// The resource.
         resource: String,
     },
-    /// This session is releasing the resource.
+    /// This session hands the resource over to a waiting request.
     #[error(
-        "resource `{resource}` is being released: reserve it again with `micromux ctl reserve \
-         {resource}` (MCP: reserve_resource) once this session's services that need it stopped"
+        "resource `{resource}` is being handed over to a waiting session: queue for it again with \
+         `micromux ctl reserve {resource}` (MCP: reserve_resource) once this session's services \
+         that need it stopped"
     )]
     Releasing {
         /// The resource.
@@ -264,9 +269,9 @@ pub(crate) enum ReservationError {
     /// This session's grant is past its `renew_by` deadline while other sessions wait, so the
     /// session releases it.
     #[error(
-        "resource `{resource}` is being released: queue for it again with `micromux ctl \
-         reserve {resource}` (MCP: reserve_resource); this session's grant was due to renew \
-         while {waiting} request(s) wait"
+        "resource `{resource}` is being handed over: queue for it again with `micromux ctl \
+         reserve {resource}` (MCP: reserve_resource); this session's grant was due while \
+         {waiting} request(s) wait"
     )]
     Lapsed {
         /// The resource.
@@ -344,9 +349,28 @@ pub(crate) struct Request {
     pub(crate) reason: Option<String>,
 }
 
+/// What a request does to a claim its session has already.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Existing {
+    /// Renews the claim and takes the estimate and reason the request gives, keeping those it
+    /// leaves out.
+    Update,
+    /// Leaves the claim as it is: its place, deadline, estimate and reason.
+    Keep,
+}
+
 fn renew_by(now: u64) -> u64 {
     let interval = u64::try_from(RENEW_INTERVAL.as_millis()).unwrap_or(u64::MAX);
     now.saturating_add(interval)
+}
+
+/// Moves a waiter's deadline, but only by a minute or more, so that polling does not rewrite the
+/// file every few seconds.
+fn renew_waiter(claim: &mut Claim, now: u64) {
+    let next = renew_by(now);
+    if next.saturating_sub(claim.renew_by_unix_ms) >= MIN_WAITER_RENEWAL_MS {
+        claim.renew_by_unix_ms = next;
+    }
 }
 
 /// The content of a reservation file.
@@ -462,16 +486,16 @@ impl ResourceFile {
         Ok(renew_by)
     }
 
-    /// Queues a request of `me`, or renews the one it has and takes the estimate and reason
-    /// `request` gives, keeping those it leaves out.
+    /// Queues a request of `me` with `request`, or handles the one it has as `existing` says.
     ///
     /// The transaction's final normalization grants a request queued for a free resource.
-    fn reserve(
+    fn enqueue(
         &mut self,
         resource: &str,
         me: &Holder,
         now: u64,
         request: Request,
+        existing: Existing,
         claim_id: impl FnOnce() -> String,
     ) -> Result<(), ReservationError> {
         if request
@@ -485,6 +509,9 @@ impl ResourceFile {
             self.judge(resource, owner, now)?;
         }
         let update = |claim: &mut Claim| {
+            if existing == Existing::Keep {
+                return;
+            }
             if request.estimate_secs.is_some() {
                 claim.estimate_secs = request.estimate_secs;
             }
@@ -534,13 +561,18 @@ impl ResourceFile {
         let resource = resource.to_string();
         match self.waiter_mut(me) {
             Some(claim) if named(claim) => {
-                let next = renew_by(now);
-                if next.saturating_sub(claim.renew_by_unix_ms) >= MIN_WAITER_RENEWAL_MS {
-                    claim.renew_by_unix_ms = next;
-                }
+                renew_waiter(claim, now);
                 Ok(())
             }
             _ => Err(ReservationError::Gone { resource }),
+        }
+    }
+
+    /// Makes the grant of `me` due now, unless it is due already, so that it passes on as soon as
+    /// a request waits and goes on while none does.
+    fn yield_turn(&mut self, me: &Holder, now: u64) {
+        if let Some(owner) = self.mine_mut(me) {
+            owner.claim.renew_by_unix_ms = owner.claim.renew_by_unix_ms.min(now);
         }
     }
 
@@ -649,8 +681,39 @@ impl ResourceStore {
         resource: &str,
         request: Request,
     ) -> Result<ReservationReply, ReservationError> {
+        self.enqueue(resource, request, Existing::Update)
+    }
+
+    /// Queues a request for `resource`, granted at once while it is free, unless this session has
+    /// one already, which keeps its place and deadline.
+    pub(crate) fn join(
+        &self,
+        resource: &str,
+        request: Request,
+    ) -> Result<ReservationReply, ReservationError> {
+        self.enqueue(resource, request, Existing::Keep)
+    }
+
+    fn enqueue(
+        &self,
+        resource: &str,
+        request: Request,
+        existing: Existing,
+    ) -> Result<ReservationReply, ReservationError> {
         let file = self.transaction(resource, |file, now, _| {
-            file.reserve(resource, &self.me, now, request, || self.claim_id())
+            file.enqueue(resource, &self.me, now, request, existing, || {
+                self.claim_id()
+            })
+        })?;
+        Ok(file.reply(resource, &self.me))
+    }
+
+    /// Makes this session's grant of `resource` due now, so that it passes on as soon as a
+    /// request waits; the reply's queue shows whether one waits already.
+    pub(crate) fn yield_turn(&self, resource: &str) -> Result<ReservationReply, ReservationError> {
+        let file = self.transaction(resource, |file, now, _| {
+            file.yield_turn(&self.me, now);
+            Ok(())
         })?;
         Ok(file.reply(resource, &self.me))
     }
@@ -670,9 +733,43 @@ impl ResourceStore {
 
     /// Reports where this session's request for `resource` stands, after granting the resource
     /// to the head of the queue when it can.
+    #[cfg(test)]
     pub(crate) fn poll(&self, resource: &str) -> Result<ReservationReply, ReservationError> {
         let file = self.transaction(resource, |_, _, _| Ok(()))?;
         Ok(file.reply(resource, &self.me))
+    }
+
+    /// Keeps this session's queued request for `resource` from lapsing, and queues it again at the
+    /// end of the queue when it lapsed anyway, as across a long suspend, since the session still
+    /// wants the resource; a grant is reported as it is.
+    pub(crate) fn keep_queued(&self, resource: &str) -> Result<ReservationReply, ReservationError> {
+        let file = self.transaction(resource, |file, now, _| {
+            if file.mine_mut(&self.me).is_some() {
+                return Ok(());
+            }
+            if let Some(claim) = file.waiter_mut(&self.me) {
+                renew_waiter(claim, now);
+                return Ok(());
+            }
+            let request = Request {
+                estimate_secs: None,
+                reason: Some("queued again after the request lapsed".to_string()),
+            };
+            file.enqueue(resource, &self.me, now, request, Existing::Keep, || {
+                self.claim_id()
+            })
+        })?;
+        Ok(file.reply(resource, &self.me))
+    }
+
+    /// Reports where this session's request for `resource` stands in the file as last written,
+    /// without the registry lock and without writing.
+    ///
+    /// The session normalizes the file on its own poll, so a grant shows here within a poll
+    /// interval.
+    pub(crate) fn status(&self, resource: &str) -> Result<ReservationReply, ReservationError> {
+        let path = self.file_path(resource)?;
+        Ok(read_file(&path)?.reply(resource, &self.me))
     }
 
     /// Removes this session's claims of `resource`, which a holder does once no process of it
@@ -858,9 +955,14 @@ mod tests {
     }
 
     fn queued(file: &mut ResourceFile, me: &Holder, now: u64) -> eyre::Result<()> {
-        file.reserve("desk", me, now, Request::default(), || {
-            format!("{}-claim", me.session_name)
-        })?;
+        file.enqueue(
+            "desk",
+            me,
+            now,
+            Request::default(),
+            Existing::Update,
+            || format!("{}-claim", me.session_name),
+        )?;
         Ok(())
     }
 
@@ -1020,7 +1122,14 @@ mod tests {
         for refused in [
             file.admission("desk", &one, later, true).map(|_| ()),
             file.renew("desk", &one, later, None),
-            file.reserve("desk", &one, later, Request::default(), String::new),
+            file.enqueue(
+                "desk",
+                &one,
+                later,
+                Request::default(),
+                Existing::Keep,
+                String::new,
+            ),
         ] {
             assert!(
                 matches!(refused, Err(ReservationError::Lapsed { waiting: 1, .. })),
@@ -1043,12 +1152,123 @@ mod tests {
             estimate_secs: Some(600),
             reason: Some("demo".to_string()),
         };
-        file.reserve("desk", &one, NOW, request, || "one-claim".to_string())?;
-        file.reserve("desk", &one, NOW + 1, Request::default(), String::new)?;
+        file.enqueue("desk", &one, NOW, request, Existing::Update, || {
+            "one-claim".to_string()
+        })?;
+        file.enqueue(
+            "desk",
+            &one,
+            NOW + 1,
+            Request::default(),
+            Existing::Update,
+            String::new,
+        )?;
         let claim = file.waiters.first().cloned();
         assert_eq!(
             claim.map(|claim| (claim.estimate_secs, claim.reason)),
             Some((Some(600), Some("demo".to_string())))
+        );
+        Ok(())
+    }
+
+    /// A request that joins keeps a claim the session has as it is, owner or waiter, so a
+    /// second start neither moves it in the queue nor extends it.
+    #[test]
+    fn joining_again_keeps_the_claim_as_it_is() -> eyre::Result<()> {
+        let (one, two) = (holder("one"), holder("two"));
+        let mut file = ResourceFile::default();
+        file.admit("desk", &one, NOW, true, Request::default(), || {
+            "one-claim".to_string()
+        })?;
+        queued(&mut file, &two, NOW)?;
+        let unchanged = file.clone();
+        let later = Request {
+            estimate_secs: Some(600),
+            reason: Some("later".to_string()),
+        };
+        for me in [&one, &two] {
+            file.enqueue(
+                "desk",
+                me,
+                NOW + 120_000,
+                later.clone(),
+                Existing::Keep,
+                String::new,
+            )?;
+        }
+        assert_eq!(file, unchanged);
+        Ok(())
+    }
+
+    /// A yielded grant is due at once and goes on while nobody waits, a second yield keeps it
+    /// due, and a waiter makes the holder's next check refuse it.
+    #[test]
+    fn a_yielded_grant_passes_on_once_a_request_waits() -> eyre::Result<()> {
+        let (one, two) = (holder("one"), holder("two"));
+        let mut file = ResourceFile::default();
+        file.admit("desk", &one, NOW, true, Request::default(), || {
+            "one-claim".to_string()
+        })?;
+        file.yield_turn(&one, NOW + 10);
+        file.yield_turn(&one, NOW + 20);
+        assert_eq!(
+            file.admission("desk", &one, NOW + 30, true)?,
+            Some(NOW + 10)
+        );
+        queued(&mut file, &two, NOW + 40)?;
+        assert!(matches!(
+            file.admission("desk", &one, NOW + 50, true),
+            Err(ReservationError::Lapsed { waiting: 1, .. })
+        ));
+        Ok(())
+    }
+
+    /// A session keeps its queued request alive, and queues it again at the end of the queue once
+    /// it lapsed anyway.
+    #[test]
+    fn a_lapsed_request_is_queued_again_at_the_end() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let registry = PortRegistry::at(directory.path().join("registry"));
+        let range = super::super::DEFAULT_PORT_RANGE;
+        let session = |name: &str| -> eyre::Result<_> {
+            let config = PathBuf::from(format!("/projects/{name}/micromux.yaml"));
+            let (_, lease) = registry.acquire(&config, name, &[], &[], &range)?;
+            let store = ResourceStore::new(
+                &registry,
+                Holder {
+                    session_id: super::super::config_path_key(&config),
+                    instance: lease.token.clone(),
+                    session_name: name.to_string(),
+                    config_path: config.display().to_string(),
+                },
+            )?;
+            Ok((lease, store))
+        };
+        let (_one_lease, one) = session("one")?;
+        let (_two_lease, two) = session("two")?;
+        let (_three_lease, three) = session("three")?;
+        one.admit("desk", Request::default())?;
+        two.reserve("desk", Request::default())?;
+        three.reserve("desk", Request::default())?;
+
+        // The request of `two` lapses, as across a long suspend.
+        let path = directory.path().join("registry/resources/desk.json");
+        let mut file: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+        if let Some(renew_by) = file.pointer_mut("/waiters/0/renew_by_unix_ms") {
+            *renew_by = serde_json::json!(1);
+        }
+        std::fs::write(&path, serde_json::to_vec(&file)?)?;
+
+        let reply = two.keep_queued("desk")?;
+        assert_eq!(reply.state, ReservationState::Waiting { position: 2 });
+        assert_eq!(
+            reply
+                .view
+                .waiters
+                .iter()
+                .map(|claim| claim.session_name.as_str())
+                .collect::<Vec<_>>(),
+            ["three", "two"]
         );
         Ok(())
     }
@@ -1089,7 +1309,14 @@ mod tests {
             reason: Some("x".repeat(MAX_REASON_CHARS + 1)),
         };
         assert!(matches!(
-            file.reserve("desk", &holder("two"), NOW, too_long, String::new),
+            file.enqueue(
+                "desk",
+                &holder("two"),
+                NOW,
+                too_long,
+                Existing::Update,
+                String::new
+            ),
             Err(ReservationError::ReasonTooLong)
         ));
 
@@ -1097,11 +1324,12 @@ mod tests {
             queued(&mut file, &holder(&format!("waiter{index}")), NOW)?;
         }
         assert!(matches!(
-            file.reserve(
+            file.enqueue(
                 "desk",
                 &holder("late"),
                 NOW,
                 Request::default(),
+                Existing::Keep,
                 String::new
             ),
             Err(ReservationError::QueueFull { .. })

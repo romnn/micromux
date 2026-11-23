@@ -1215,7 +1215,12 @@ fn service_info_rows(
     rows.extend(info_rows("URLs", urls));
     rows.extend(info_rows("Ports", port_rows(snapshot, session)));
     if let Some(resource) = &snapshot.resource {
-        rows.extend(info_rows("Resource", vec![resource.clone()]));
+        let resource = if snapshot.waiting_for_resource {
+            format!("{resource}, queued: starts once this session gets it")
+        } else {
+            resource.clone()
+        };
+        rows.extend(info_rows("Resource", vec![resource]));
     }
     rows.extend(info_rows(
         "Command",
@@ -1483,6 +1488,10 @@ fn state_name(snapshot: &micromux::ServiceSnapshot) -> String {
     }
     if snapshot.desired == micromux::Desired::Disabled {
         return "DISABLED".to_string();
+    }
+    // The start waits for the session's turn with a resource another session holds.
+    if snapshot.waiting_for_resource {
+        return "QUEUED".to_string();
     }
 
     let job = snapshot.kind == micromux::ServiceKind::Job;

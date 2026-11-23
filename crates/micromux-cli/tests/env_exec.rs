@@ -545,8 +545,7 @@ fn env_and_exec_fail_without_a_session_for_the_config() -> eyre::Result<()> {
 }
 
 /// A stand-in for a session started by an older micromux: it describes itself with the protocol
-/// it is given, answers `GetEnvironment` without a service with one allocated port, as a 3.19
-/// session does, and rejects every other request, as a 3.13 session rejects `GetEnvironment`.
+/// it is given and rejects every other request.
 struct OldSession {
     socket: PathBuf,
     stop: Arc<AtomicBool>,
@@ -591,15 +590,6 @@ impl OldSession {
         });
         let replies = Replies {
             description: serde_json::to_string(&description)?,
-            variables: serde_json::to_string(&micromux_control::Response::Environment(
-                micromux_control::ResolvedEnvironment {
-                    variables: BTreeMap::from([(
-                        "OLD_SESSION_PORT".to_string(),
-                        "20001".to_string(),
-                    )]),
-                    stale: false,
-                },
-            ))?,
             rejection: serde_json::to_string(&micromux_control::Response::error(
                 micromux_control::ErrorCode::BadRequest,
                 "unknown variant",
@@ -632,7 +622,6 @@ impl OldSession {
 /// What an [`OldSession`] answers, as encoded frames.
 struct Replies {
     description: String,
-    variables: String,
     rejection: String,
 }
 
@@ -644,7 +633,6 @@ fn answer(stream: std::os::unix::net::UnixStream, replies: &Replies) -> std::io:
     for request in BufReader::new(stream).lines() {
         let reply = match serde_json::from_str::<micromux_control::Request>(&request?) {
             Ok(micromux_control::Request::Describe) => &replies.description,
-            Ok(micromux_control::Request::GetEnvironment { service: None }) => &replies.variables,
             _ => &replies.rejection,
         };
         writeln!(writer, "{reply}")?;
@@ -662,9 +650,9 @@ impl Drop for OldSession {
     }
 }
 
-/// A session too old to answer is refused before anything is asked of it or run.
+/// A session of an older protocol major line is refused before anything is asked of it or run.
 #[test]
-fn env_and_exec_refuse_a_session_too_old_to_answer() -> eyre::Result<()> {
+fn env_and_exec_refuse_a_session_of_another_protocol_line() -> eyre::Result<()> {
     let project = tempfile::tempdir()?;
     std::fs::write(
         project.path().join("micromux.yaml"),
@@ -672,17 +660,14 @@ fn env_and_exec_refuse_a_session_too_old_to_answer() -> eyre::Result<()> {
     )?;
     let _old = OldSession::bind(
         project.path(),
-        micromux_control::ProtocolVersion::new(3, 13),
+        micromux_control::ProtocolVersion::new(3, 21),
     )?;
 
     let output = run(project.path(), &["env"])?;
     assert_eq!(output.status.code(), Some(1));
     assert_eq!(stdout(&output), "");
     assert!(
-        stderr(&output).contains(
-            "the running session `old` (protocol 3.13) is too old for `micromux env`; restart it \
-             with this micromux"
-        ),
+        stderr(&output).contains("protocol_mismatch (peer=3.21, ours=4.0)"),
         "{}",
         stderr(&output)
     );
@@ -690,61 +675,11 @@ fn env_and_exec_refuse_a_session_too_old_to_answer() -> eyre::Result<()> {
     let output = run(project.path(), &["exec", "--", "sh", "-c", "touch ran"])?;
     assert_eq!(output.status.code(), Some(125));
     assert!(
-        stderr(&output).contains("is too old for `micromux exec`"),
+        stderr(&output).contains("protocol_mismatch (peer=3.21, ours=4.0)"),
         "{}",
         stderr(&output)
     );
     assert!(!project.path().join("ran").exists());
-    Ok(())
-}
-
-/// A session that predates the session-wide env file has its variables alone for its own
-/// environment, so `env` and `exec` read those with the request it knows, and only writing a file
-/// needs a newer session; `--if-running` does not excuse that.
-#[test]
-fn a_session_without_session_env_files_serves_its_variables() -> eyre::Result<()> {
-    let project = tempfile::tempdir()?;
-    std::fs::write(
-        project.path().join("micromux.yaml"),
-        "version: 1\nservices: {}\n",
-    )?;
-    let _old = OldSession::bind(
-        project.path(),
-        micromux_control::ProtocolVersion::new(3, 19),
-    )?;
-
-    let output = run(project.path(), &["env"])?;
-    assert!(output.status.success(), "{}", stderr(&output));
-    assert_eq!(stdout(&output), "OLD_SESSION_PORT=20001\n");
-    let output = run(
-        project.path(),
-        &[
-            "exec",
-            "--",
-            "sh",
-            "-c",
-            "printf '%s' \"$OLD_SESSION_PORT\"",
-        ],
-    )?;
-    assert!(output.status.success(), "{}", stderr(&output));
-    assert_eq!(stdout(&output), "20001");
-
-    for args in [
-        &["env", "--file"][..],
-        &["env", "--file", "--if-running"],
-        &["env", "--file", "--service", "svc"],
-    ] {
-        let output = run(project.path(), args)?;
-        assert_eq!(output.status.code(), Some(1), "{args:?}");
-        assert_eq!(stdout(&output), "", "{args:?}");
-        assert!(
-            stderr(&output).contains(
-                "the running session `old` (protocol 3.19) is too old for `micromux env --file`"
-            ),
-            "{args:?}: {}",
-            stderr(&output)
-        );
-    }
     Ok(())
 }
 

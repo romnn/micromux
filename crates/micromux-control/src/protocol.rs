@@ -20,29 +20,11 @@ use serde::{Deserialize, Serialize};
 ///
 /// Bump the minor for additive changes (new optional/defaulted fields, new tools that reuse
 /// existing requests), and bump the major for incompatible request/response semantics.
-pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(3, 21);
-
-/// The first protocol revision whose sessions answer [`Request::GetEvents`].
-pub const EVENTS_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(3, 3);
-
-/// The first protocol revision whose sessions answer [`Request::GetEnvironment`].
-pub const ENVIRONMENT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(3, 15);
-
-/// The first protocol revision whose sessions answer [`Request::GetSessionEnvironment`] and
-/// [`Request::WriteEnvironmentFile`], and load a session-wide `env_file`.
 ///
-/// An older session has no session-wide `env_file`, so its variables alone, which
-/// [`Request::GetEnvironment`] returns without a service, are its whole environment.
-pub const SESSION_ENV_FILE_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(3, 20);
-
-/// The first protocol revision whose sessions answer [`Request::Identify`], [`Request::Reserve`],
-/// [`Request::RenewReservation`], and [`Request::ReleaseReservation`], and report reservations in
-/// their description.
-pub const RESERVATIONS_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(3, 21);
-
-/// The first protocol revision whose sessions answer [`Request::SendInput`] and
-/// [`Request::ResizeTerminal`].
-pub const TERMINAL_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(3, 18);
+/// 4.0 made `Enable` queue for a resource another session holds, `Reserve` request the starts it
+/// is for, and `ReleaseReservation` keep the services running while nobody waits.
+/// Every 4.x session answers every request of this file.
+pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(4, 0);
 
 /// The largest paste one [`Request::SendInput`] carries.
 ///
@@ -56,7 +38,7 @@ const _: () = assert!(
 );
 
 pub(crate) const fn supports_versioned_subscriptions(version: ProtocolVersion) -> bool {
-    version.major() == PROTOCOL_VERSION.major() && version.minor() >= 7
+    version.is_compatible_with(PROTOCOL_VERSION)
 }
 
 /// A typed control protocol version.
@@ -163,8 +145,6 @@ pub enum Request {
         service: ServiceID,
     },
     /// Return retained scheduler lifecycle events for a service.
-    ///
-    /// Sessions answer it from protocol [`EVENTS_PROTOCOL_VERSION`] on.
     GetEvents {
         /// Target service.
         service: ServiceID,
@@ -220,11 +200,8 @@ pub enum Request {
     },
     /// Return the session's variables, or one service's resolved environment, with their values.
     ///
-    /// Sessions answer it from protocol [`ENVIRONMENT_PROTOCOL_VERSION`] on; older ones reject it
-    /// as a bad request.
     /// Without a service it never includes the session-wide `env_file`, whose values may be
-    /// secrets, because clients predating [`Request::GetSessionEnvironment`] show these values
-    /// unasked.
+    /// secrets: [`Request::GetSessionEnvironment`] is the request that asks for them.
     /// See [`micromux::ServiceControl::environment`] for what the variables are.
     GetEnvironment {
         /// Service id, matched exactly, or `None` for the session's variables.
@@ -232,15 +209,11 @@ pub enum Request {
     },
     /// Return the session's own environment, with its values: the session-wide `env_file`, read
     /// from disk for this request, and the session's variables over it.
-    ///
-    /// Sessions answer it from protocol [`SESSION_ENV_FILE_PROTOCOL_VERSION`] on; older ones
-    /// reject it as a bad request.
     GetSessionEnvironment,
     /// Write the environment [`Request::GetEnvironment`] returns for a service, or
     /// [`Request::GetSessionEnvironment`] without one, to a dotenv file the session owns, and
     /// return its path.
     ///
-    /// Sessions answer it from protocol [`SESSION_ENV_FILE_PROTOCOL_VERSION`] on.
     /// An environment the file cannot carry literally fails the request, see
     /// [`micromux::to_dotenv`], and leaves an earlier file as it was.
     /// Each request rewrites the file at the same path, in a private directory next to the
@@ -260,8 +233,6 @@ pub enum Request {
     },
     /// Write bytes to a service's PTY, as typed into an attached TUI.
     ///
-    /// Sessions answer it from protocol [`TERMINAL_PROTOCOL_VERSION`] on; older ones reject it as a
-    /// bad request.
     /// Input from every client, the session's own TUI included, is written in the order the
     /// session receives it, and one request's bytes are written contiguously.
     /// The MCP server never sends it: agents get no tool that types into a service.
@@ -277,7 +248,6 @@ pub enum Request {
     },
     /// Resize every service PTY in the session.
     ///
-    /// Sessions answer it from protocol [`TERMINAL_PROTOCOL_VERSION`] on.
     /// The last resize the session receives wins, whichever client sent it, the session's own TUI
     /// included, and runs started later take that size too.
     ResizeTerminal {
@@ -295,8 +265,7 @@ pub enum Request {
     Shutdown,
     /// Name the project the client works in for the rest of the connection.
     ///
-    /// Sessions answer it from protocol [`RESERVATIONS_PROTOCOL_VERSION`] on, with
-    /// [`Response::Identified`].
+    /// Sessions answer it with [`Response::Identified`].
     /// Only a client whose project is the session's own may control the session's services that
     /// need a resource, reserve resources for it, or type into those services.
     /// The scope is cooperative: every client of a user may name any project.
@@ -307,9 +276,11 @@ pub enum Request {
     },
     /// Reserve a resource for the session: granted at once while it is free, queued otherwise.
     ///
-    /// Sessions answer it from protocol [`RESERVATIONS_PROTOCOL_VERSION`] on, with
-    /// [`Response::Reservation`].
-    /// A request the session already has is updated and renewed.
+    /// Sessions answer it with [`Response::Reservation`].
+    /// A fresh request also requests a start of the session's configured services that name the
+    /// resource and start with the session, which run once the session gets it; one that would
+    /// start nothing is refused.
+    /// A request the session already has is updated and renewed, and enables nothing.
     Reserve {
         /// The resource.
         resource: String,
@@ -322,9 +293,9 @@ pub enum Request {
     },
     /// Move the deadline of the session's request for a resource, granted or queued.
     ///
-    /// Sessions answer it from protocol [`RESERVATIONS_PROTOCOL_VERSION`] on, with
-    /// [`Response::Reservation`], which lists the queue.
-    /// A grant past its deadline has lapsed and is refused.
+    /// Sessions answer it with [`Response::Reservation`], which lists the queue.
+    /// A grant past its deadline while another request waits is being handed over and is
+    /// refused.
     RenewReservation {
         /// The resource.
         resource: String,
@@ -334,10 +305,21 @@ pub enum Request {
     },
     /// Release the session's request for a resource.
     ///
-    /// Sessions answer it from protocol [`RESERVATIONS_PROTOCOL_VERSION`] on, with
-    /// [`Response::Reservation`]: `released`, or `draining` while the services that need the
-    /// resource stop.
+    /// Sessions answer it with [`Response::Reservation`].
+    /// A queued request goes at once, with the starts that waited for it: `released`.
+    /// A grant becomes due at once: while no other request waits, the services keep running and
+    /// the state stays `granted`; once one waits, `releasing` while the services that need the
+    /// resource stop, after which it passes on.
     ReleaseReservation {
+        /// The resource.
+        resource: String,
+    },
+    /// Report where the session's request for a resource stands, as its reservation file was
+    /// last written, without renewing a queued request or extending a grant.
+    ///
+    /// Sessions answer it with [`Response::Reservation`].
+    /// Any client may ask; it changes nothing.
+    ReservationStatus {
         /// The resource.
         resource: String,
     },
@@ -371,6 +353,7 @@ impl Request {
                 | Self::GetEnvironment { .. }
                 | Self::GetSessionEnvironment
                 | Self::WriteEnvironmentFile { .. }
+                | Self::ReservationStatus { .. }
                 | Self::ReconcileConfig { dry_run: true }
         )
     }
@@ -748,48 +731,30 @@ mod tests {
     fn protocol_version_uses_major_minor_shape_and_accepts_same_major() {
         assert_eq!(
             serde_json::to_value(PROTOCOL_VERSION).unwrap(),
-            json!({ "major": 3, "minor": 21 })
+            json!({ "major": 4, "minor": 0 })
         );
         assert_eq!(
             serde_json::from_value::<ProtocolVersion>(json!({ "major": 1, "minor": 0 })).unwrap(),
             ProtocolVersion::new(1, 0)
         );
 
-        assert!(PROTOCOL_VERSION.is_compatible_with(ProtocolVersion::new(3, 19)));
-        assert!(!PROTOCOL_VERSION.is_compatible_with(ProtocolVersion::new(2, 9)));
+        assert!(PROTOCOL_VERSION.is_compatible_with(ProtocolVersion::new(4, 3)));
+        assert!(!PROTOCOL_VERSION.is_compatible_with(ProtocolVersion::new(3, 21)));
+        assert!(supports_versioned_subscriptions(ProtocolVersion::new(4, 0)));
         assert!(!supports_versioned_subscriptions(ProtocolVersion::new(
-            3, 6
+            3, 21
         )));
-        assert!(supports_versioned_subscriptions(ProtocolVersion::new(3, 7)));
     }
 
-    /// A session answers `GetEvents` only from 3.3 on, and never across a major line.
+    /// A revision gate holds on the same major line from the revision's minor on, and never
+    /// across a major line.
     #[test]
-    fn events_require_protocol_3_3_on_the_same_major_line() {
-        assert!(ProtocolVersion::new(3, 3).supports(EVENTS_PROTOCOL_VERSION));
-        assert!(!ProtocolVersion::new(3, 2).supports(EVENTS_PROTOCOL_VERSION));
-        assert!(!ProtocolVersion::new(4, 3).supports(EVENTS_PROTOCOL_VERSION));
-        assert!(PROTOCOL_VERSION.supports(EVENTS_PROTOCOL_VERSION));
-    }
-
-    /// A session answers `GetEnvironment` only from 3.15 on, and never across a major line.
-    #[test]
-    fn environment_requires_protocol_3_15_on_the_same_major_line() {
-        assert!(ProtocolVersion::new(3, 15).supports(ENVIRONMENT_PROTOCOL_VERSION));
-        assert!(ProtocolVersion::new(3, 16).supports(ENVIRONMENT_PROTOCOL_VERSION));
-        assert!(!ProtocolVersion::new(3, 14).supports(ENVIRONMENT_PROTOCOL_VERSION));
-        assert!(!ProtocolVersion::new(4, 15).supports(ENVIRONMENT_PROTOCOL_VERSION));
-        assert!(PROTOCOL_VERSION.supports(ENVIRONMENT_PROTOCOL_VERSION));
-    }
-
-    /// A session answers the requests for its own environment and its env files only from 3.20
-    /// on, and never across a major line.
-    #[test]
-    fn session_env_files_require_protocol_3_20_on_the_same_major_line() {
-        assert!(ProtocolVersion::new(3, 20).supports(SESSION_ENV_FILE_PROTOCOL_VERSION));
-        assert!(!ProtocolVersion::new(3, 19).supports(SESSION_ENV_FILE_PROTOCOL_VERSION));
-        assert!(!ProtocolVersion::new(4, 20).supports(SESSION_ENV_FILE_PROTOCOL_VERSION));
-        assert!(PROTOCOL_VERSION.supports(SESSION_ENV_FILE_PROTOCOL_VERSION));
+    fn a_revision_is_supported_from_its_minor_on_the_same_major_line() {
+        let revision = ProtocolVersion::new(4, 2);
+        assert!(ProtocolVersion::new(4, 2).supports(revision));
+        assert!(ProtocolVersion::new(4, 3).supports(revision));
+        assert!(!ProtocolVersion::new(4, 1).supports(revision));
+        assert!(!ProtocolVersion::new(5, 2).supports(revision));
     }
 
     #[test]
@@ -832,14 +797,19 @@ mod tests {
         Ok(())
     }
 
-    /// A session answers reservation requests only from 3.21 on, and none of them is repeated
-    /// after a lost response.
+    /// Reservation requests round-trip, and none that changes a reservation is repeated after a
+    /// lost response.
     #[test]
-    fn reservation_requests_require_protocol_3_21_and_are_never_retried() -> serde_json::Result<()>
-    {
-        assert!(ProtocolVersion::new(3, 21).supports(RESERVATIONS_PROTOCOL_VERSION));
-        assert!(!ProtocolVersion::new(3, 20).supports(RESERVATIONS_PROTOCOL_VERSION));
-        assert!(PROTOCOL_VERSION.supports(RESERVATIONS_PROTOCOL_VERSION));
+    fn reservation_requests_round_trip_and_mutations_are_never_retried() -> serde_json::Result<()> {
+        let status = Request::ReservationStatus {
+            resource: "desk".to_string(),
+        };
+        assert!(status.is_retry_safe());
+        let encoded = serde_json::to_value(&status)?;
+        assert_eq!(
+            serde_json::to_value(serde_json::from_value::<Request>(encoded.clone())?)?,
+            encoded
+        );
 
         let requests = [
             Request::Identify {
@@ -874,15 +844,6 @@ mod tests {
             }
         );
         Ok(())
-    }
-
-    /// A session answers terminal requests only from 3.18 on, and never across a major line.
-    #[test]
-    fn terminal_requests_require_protocol_3_18_on_the_same_major_line() {
-        assert!(ProtocolVersion::new(3, 18).supports(TERMINAL_PROTOCOL_VERSION));
-        assert!(!ProtocolVersion::new(3, 17).supports(TERMINAL_PROTOCOL_VERSION));
-        assert!(!ProtocolVersion::new(4, 18).supports(TERMINAL_PROTOCOL_VERSION));
-        assert!(PROTOCOL_VERSION.supports(TERMINAL_PROTOCOL_VERSION));
     }
 
     /// Input travels as base64, so control and non-UTF-8 bytes survive the JSON frame unchanged.
@@ -1225,8 +1186,8 @@ mod tests {
     #[test]
     fn protocol_version_ignores_additive_fields() {
         let version = serde_json::from_value::<ProtocolVersion>(json!({
-            "major": 3,
-            "minor": 21,
+            "major": 4,
+            "minor": 0,
             "future_capability": true
         }))
         .unwrap();

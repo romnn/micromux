@@ -83,17 +83,6 @@ pub(crate) fn text(events: &[ServiceEvent]) -> Text<'static> {
     events.iter().map(event_line).collect()
 }
 
-/// The pane's text for a session that cannot report lifecycle events.
-pub(crate) fn unsupported_text() -> Text<'static> {
-    Text::from(
-        format!(
-            "this session predates lifecycle events; they need protocol {} or later",
-            micromux_control::EVENTS_PROTOCOL_VERSION
-        )
-        .fg(Color::DarkGray),
-    )
-}
-
 /// One event as `HH:MM:SS kind detail`, with the time in local time and the kind colored by what
 /// the transition means for the service.
 pub(crate) fn event_line(event: &ServiceEvent) -> Line<'static> {
@@ -157,6 +146,7 @@ fn kind_label(event: &ServiceEvent) -> (&'static str, Style) {
         ServiceEventKind::CleanupStarted => ("cleanup", blue),
         ServiceEventKind::CleanupFinished => ("cleaned up", green),
         ServiceEventKind::CleanupFailed => ("cleanup err", red),
+        ServiceEventKind::ResourceGranted => ("granted", green),
         ServiceEventKind::Unknown => ("unknown", gray),
     }
 }
