@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use indexmap::IndexMap;
 use micromux::{
     Caller, Command, CommandRejection, HealthAttempt, LogLine, SchedulerStopped, ServiceControl,
     ServiceEvent, ServiceID, ServiceSnapshot, SessionChange, SessionModelReader, SessionStatus,
@@ -11,6 +12,7 @@ use parking_lot::Mutex;
 use tokio::sync::{Notify, broadcast, mpsc};
 
 use crate::RemoteSource;
+use crate::reservation::ReservationRead;
 
 pub(crate) struct AttachmentStatus {
     pub session: micromux_control::SessionInfo,
@@ -48,6 +50,17 @@ pub struct LocalSource {
     /// Wakes the TUI when `refusal` changed.
     refusal_changed: Arc<Notify>,
     session: Option<SessionStatus>,
+    /// Where the session stands with each resource its services name, as last read.
+    reservations: Arc<Mutex<IndexMap<String, ReservationRead>>>,
+    /// Wakes the TUI when `reservations` changed.
+    reservations_changed: Arc<Notify>,
+    /// Ends the task that refreshes `reservations` once the source is gone, so it does not keep
+    /// the scheduler's command channel open.
+    #[expect(
+        dead_code,
+        reason = "held for its drop, which stops the reservation refresh task"
+    )]
+    stop_refresh: tokio::sync::oneshot::Sender<()>,
 }
 
 impl LocalSource {
@@ -61,6 +74,16 @@ impl LocalSource {
         let refusal = Arc::new(Mutex::new(None));
         let refusal_changed = Arc::new(Notify::new());
         let control = ServiceControl::from(commands);
+        let reservations = Arc::default();
+        let reservations_changed = Arc::new(Notify::new());
+        let (stop_refresh, stopped) = tokio::sync::oneshot::channel();
+        tokio::spawn(refresh_reservations(
+            reader.clone(),
+            control.clone(),
+            Arc::clone(&reservations),
+            Arc::clone(&reservations_changed),
+            stopped,
+        ));
         tokio::spawn({
             let refusal = Arc::clone(&refusal);
             let refusal_changed = Arc::clone(&refusal_changed);
@@ -84,6 +107,9 @@ impl LocalSource {
             refusal,
             refusal_changed,
             session: None,
+            reservations,
+            reservations_changed,
+            stop_refresh,
         }
     }
 
@@ -99,6 +125,74 @@ impl LocalSource {
     pub fn with_notice(mut self, notice: impl Into<String>) -> Self {
         self.notice = Some(notice.into());
         self
+    }
+}
+
+/// Reads where the session stands with each resource its services name, one resource after
+/// another every [`crate::reservation::REFRESH_INTERVAL`], and at once when a service names a
+/// resource not read yet, until the scheduler stops or the source is gone.
+///
+/// The reads go through the scheduler, which knows the session's own claim and whether it hands
+/// a resource over.
+async fn refresh_reservations(
+    reader: SessionModelReader,
+    control: ServiceControl,
+    reservations: Arc<Mutex<IndexMap<String, ReservationRead>>>,
+    changed: Arc<Notify>,
+    mut stopped: tokio::sync::oneshot::Receiver<()>,
+) {
+    use micromux::ChangeKind;
+    use tokio::sync::broadcast::error::RecvError;
+
+    let mut tick = tokio::time::interval(crate::reservation::REFRESH_INTERVAL);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut roster = reader.subscribe();
+    loop {
+        tokio::select! {
+            _ = &mut stopped => return,
+            _ = tick.tick() => {}
+            // The scheduler names a service's resource in its snapshot only once it runs, so
+            // the first reads wait on that rather than on the next tick.
+            change = roster.recv() => match change {
+                Ok(change) if !matches!(change.kind, ChangeKind::Status | ChangeKind::Roster) => {
+                    continue;
+                }
+                Ok(_) | Err(RecvError::Lagged(_)) => {
+                    let read = reservations.lock();
+                    let named = crate::reservation::named_resources(&reader.services());
+                    if named.iter().all(|resource| read.contains_key(resource)) {
+                        continue;
+                    }
+                }
+                Err(RecvError::Closed) => return,
+            },
+        }
+        let resources = crate::reservation::named_resources(&reader.services());
+        // The source can go while a read waits on the scheduler, which then must not keep its
+        // command channel open until the read and the rest of the round are done.
+        let round = async {
+            let mut read = IndexMap::new();
+            for resource in resources {
+                let reply = control
+                    .reservation_status(Caller::Local, &resource)
+                    .await
+                    .ok()?;
+                read.insert(resource, reply.map_err(|rejection| rejection.message()));
+            }
+            Some(read)
+        };
+        let read = tokio::select! {
+            _ = &mut stopped => return,
+            read = round => read,
+        };
+        let Some(read) = read else {
+            return;
+        };
+        let mut current = reservations.lock();
+        if *current != read {
+            *current = read;
+            changed.notify_one();
+        }
     }
 }
 
@@ -288,28 +382,50 @@ impl SessionSource {
         }
     }
 
-    /// Whether the session left its reservations out of a description too large to send.
-    pub(crate) fn reservations_truncated(&self) -> bool {
+    /// Where the session stands with `resource`, as last read, if it was read.
+    pub(crate) fn reservation(&self, resource: &str) -> Option<ReservationRead> {
         match self {
-            Self::Local(_) => false,
-            Self::Remote(source) => source.attachment_status().session.reservations_truncated,
+            Self::Local(source) => source.reservations.lock().get(resource).cloned(),
+            Self::Remote(source) => source.reservation(resource),
         }
     }
 
-    /// Holder and queue of every resource the session uses, read now for a local session and
-    /// as last described for a remote one.
-    pub(crate) fn reservations(&self) -> Vec<micromux::ResourceView> {
-        match self {
-            Self::Local(source) => source
-                .session
-                .as_ref()
-                .map(SessionStatus::reservations)
-                .unwrap_or_default(),
-            Self::Remote(_) => self
-                .session_summary()
-                .map(|session| session.reservations)
-                .unwrap_or_default(),
+    /// Records `read` as where a local session stands with `resource`, as its refresh would.
+    #[cfg(test)]
+    pub(crate) fn set_reservation(&self, resource: &str, read: ReservationRead) {
+        if let Self::Local(source) = self {
+            source
+                .reservations
+                .lock()
+                .insert(resource.to_string(), read);
         }
+    }
+
+    /// How soon a relative time the reservation views show changes, by the reads as last made.
+    pub(crate) fn next_reservation_change(&self, now_ms: u64) -> Option<std::time::Duration> {
+        match self {
+            Self::Local(source) => {
+                crate::reservation::next_change(source.reservations.lock().values(), now_ms)
+            }
+            Self::Remote(source) => source.next_reservation_change(now_ms),
+        }
+    }
+
+    /// Where the session stands with each resource its services name, as last read.
+    pub(crate) fn reservation_reads(&self) -> Vec<ReservationRead> {
+        match self {
+            Self::Local(source) => source.reservations.lock().values().cloned().collect(),
+            Self::Remote(source) => source.reservation_reads(),
+        }
+    }
+
+    /// Holder and queue of every resource the session's services name, as last read.
+    pub(crate) fn reservations(&self) -> Vec<micromux::ResourceView> {
+        self.reservation_reads()
+            .into_iter()
+            .filter_map(Result::ok)
+            .map(|reply| reply.view)
+            .collect()
     }
 
     /// The local session's notice: why its latest lifecycle command was refused, else its
@@ -330,6 +446,15 @@ impl SessionSource {
     pub(crate) async fn local_notice_changed(&self) {
         match self {
             Self::Local(source) => source.refusal_changed.notified().await,
+            Self::Remote(_) => std::future::pending().await,
+        }
+    }
+
+    /// Waits until a local session's reservation reads changed; a remote source reports them
+    /// through its regular change stream instead.
+    pub(crate) async fn local_reservations_changed(&self) {
+        match self {
+            Self::Local(source) => source.reservations_changed.notified().await,
             Self::Remote(_) => std::future::pending().await,
         }
     }

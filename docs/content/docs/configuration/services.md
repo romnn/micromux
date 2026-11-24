@@ -270,6 +270,8 @@ micromux ctl release desktop-app
 
 **Who may control these services.** Only clients working in the session's own project may start, restart, enable, disable, or replace a service that names a resource, type into it in an attached TUI, reserve, renew, or release for the session, apply a reconcile or a reload that touches such a service, or stop the session while it holds, waits for, or runs a resource. Your working directory decides your project: the config found at or above it, whatever `-c` selects. Every other client is refused, with the project that may. The scope is cooperative: it keeps sessions of one user from taking each other's resources by accident, it is no security boundary. The session's own TUI may always; it has no keys to reserve, renew, or release, which are for agents and scripts.
 
+**In the TUI.** Under each service that names a resource, the list notes until when the session's turn is protected and how many sessions wait, or which session holds the resource and the place of a queued start; a pane above the logs details the selected service's reservation. See [the terminal UI]({{< relref "../tui.md" >}}#shared-resources).
+
 **Changing `resource`.** A config reload or a reconcile refuses to add, remove, or rename the `resource` of a service that runs or is to start; disable the service first.
 
 **Rollout.**

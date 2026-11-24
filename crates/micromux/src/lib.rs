@@ -108,7 +108,7 @@ pub use structured_log::{
     numeric_timestamp_to_unix_ms, render_scalar, sanitize_text, structured_log_level_in_object,
     structured_log_level_in_record, structured_log_timestamp_in_record,
 };
-pub use time_label::{display_time, renew_label};
+pub use time_label::{display_time, duration_label, renew_label};
 
 pub(crate) type ServiceMap = indexmap::IndexMap<ServiceID, service::Service>;
 

@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- **The TUI shows who holds each shared resource.** A note under every service that names a
+  resource says until when this session's turn is protected or which session holds it and the
+  queued place, and a pane above the logs details the selected service's reservation.
 - **A shared resource passes on without an agent step: enabling or reserving queues for it and
   starts the service once the session gets it, and a release keeps it running until another
   session queues.** `micromux ctl enable`, `reserve` and `release` changed meaning, so the control

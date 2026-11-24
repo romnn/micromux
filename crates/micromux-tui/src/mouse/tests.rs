@@ -204,7 +204,7 @@ async fn service_clicks_follow_the_list_when_it_scrolls() -> eyre::Result<()> {
     // Selecting the last service scrolls the list so it shows.
     app.state.selected_service = 39;
     let frame = draw(&mut app);
-    assert!(app.hits.first_service > 0);
+    assert!(app.first_service > 0);
 
     // A click on a row picks the service drawn there, not the one at that index from the top.
     click(&mut app, find(&frame, "svc30")?);
@@ -1728,9 +1728,9 @@ async fn a_name_cut_short_copies_what_shows() -> eyre::Result<()> {
         .hits
         .service_names
         .get(2)
-        .map(|hit| hit.area)
         .ok_or_else(|| eyre::eyre!("no name on the third row"))?;
-    assert_eq!(area.right(), app.hits.service_rows.right());
+    let (area, item) = (area.area, area.item);
+    assert_eq!(area.right(), item.right());
     let row = row_text(&frame, worker.y);
     let shown = row
         .chars()
@@ -2066,5 +2066,329 @@ async fn a_one_row_popup_keeps_its_close_hint() -> eyre::Result<()> {
     app.render_info(crate::InfoView::Service, area, &mut buffer);
     let row = row_text(&buffer, 0);
     assert!(row.contains("i or Esc closes"), "{row}");
+    Ok(())
+}
+
+/// The selected service's ID.
+fn selected(app: &App) -> Option<&str> {
+    app.state
+        .current_service()
+        .map(|service| service.snapshot.id.as_str())
+}
+
+/// Gives the services at `indexes` resource `desk`, as the scheduler projects it from their
+/// definitions, and records `read` as where the session stands with it.
+fn share(app: &mut App, indexes: &[usize], read: crate::reservation::ReservationRead) {
+    for index in indexes {
+        if let Some(service) = app.state.services.get_mut(*index) {
+            service.snapshot.resource = Some("desk".to_string());
+        }
+    }
+    app.source.set_reservation("desk", read);
+}
+
+/// `count` services that each need resource `desk`, which this session holds.
+fn shared_app(count: usize) -> eyre::Result<App> {
+    let mut services = String::new();
+    for index in 0..count {
+        writeln!(
+            services,
+            "  svc{index:02}:\n    command: [\"sleep\", \"30\"]"
+        )?;
+    }
+    let mut app = app(&format!("version: 1\nservices:\n{services}"))?;
+    let indexes = (0..count).collect::<Vec<_>>();
+    let now = crate::render::now_unix_ms();
+    share(
+        &mut app,
+        &indexes,
+        Ok(crate::reservation::test_reply(
+            micromux::ReservationState::Granted,
+            Some("own"),
+            &[],
+            Some("own"),
+            now,
+        )),
+    );
+    Ok(app)
+}
+
+/// A queued shared service takes a row for its holder and one for its place under its own,
+/// and a click on any of them selects it, while the service after it keeps its own row.
+#[tokio::test]
+async fn a_shared_services_notes_select_it() -> eyre::Result<()> {
+    let mut app = app(indoc! {r#"
+        version: 1
+        services:
+          api:
+            command: ["sleep", "30"]
+          display:
+            command: ["sleep", "30"]
+          worker:
+            command: ["sleep", "30"]
+    "#})?;
+    let now = crate::render::now_unix_ms();
+    share(
+        &mut app,
+        &[1],
+        Ok(crate::reservation::test_reply(
+            micromux::ReservationState::Waiting { position: 2 },
+            Some("feature-x"),
+            &["bugfix-y", "own"],
+            Some("own"),
+            now,
+        )),
+    );
+    let frame = draw(&mut app);
+    let display = find(&frame, "display")?;
+    let held = find(&frame, "held by feature-x")?;
+    let place = find(&frame, "2/2 in queue")?;
+    let worker = find(&frame, "worker")?;
+    assert_eq!(
+        [held.y, place.y, worker.y],
+        [display.y + 1, display.y + 2, display.y + 3]
+    );
+
+    // Either note row selects the service it belongs to; the next service's row selects that.
+    click(&mut app, place);
+    assert_eq!(selected(&app), Some("display"));
+    click(&mut app, worker);
+    assert_eq!(selected(&app), Some("worker"));
+    click(&mut app, held);
+    assert_eq!(selected(&app), Some("display"));
+    Ok(())
+}
+
+/// A list of two-row services scrolls by whole services: selecting the last shows it with its
+/// note, and a click lands on the service drawn there.
+#[tokio::test]
+async fn a_list_of_shared_services_scrolls_by_whole_services() -> eyre::Result<()> {
+    let mut app = shared_app(30)?;
+    app.state.selected_service = 29;
+    let frame = draw(&mut app);
+    assert!(app.first_service > 0);
+    let last = find(&frame, "svc29")?;
+    assert!(row_text(&frame, last.y + 1).contains("until"));
+
+    click(&mut app, find(&frame, "svc25")?);
+    assert_eq!(selected(&app), Some("svc25"));
+    Ok(())
+}
+
+/// The reservation pane shows while a shared service is selected and takes its rows from the
+/// logs, which the service terminals follow; a terminal too short for it and a log row leaves
+/// it out.
+#[tokio::test]
+async fn the_reservation_pane_shows_for_a_shared_service() -> eyre::Result<()> {
+    let mut app = app(indoc! {r#"
+        version: 1
+        services:
+          api:
+            command: ["sleep", "30"]
+          display:
+            command: ["sleep", "30"]
+    "#})?;
+    let now = crate::render::now_unix_ms();
+    share(
+        &mut app,
+        &[1],
+        Ok(crate::reservation::test_reply(
+            micromux::ReservationState::Granted,
+            Some("own"),
+            &[],
+            Some("own"),
+            now,
+        )),
+    );
+    let area = Rect::new(0, 0, WIDTH, HEIGHT);
+
+    // Without a shared service selected, the logs take the whole column.
+    let frame = draw(&mut app);
+    assert!(find(&frame, "Reservation").is_err());
+    let (_, unshared_rows) = app.desired_pty_size();
+    let chrome = app.chrome_rows(WIDTH);
+    assert!(app.screen_layout(area, chrome).reservation.is_empty());
+
+    // With one selected, the pane takes five rows from them.
+    app.state.selected_service = 1;
+    let frame = draw(&mut app);
+    find(&frame, "Reservation · desk")?;
+    find(&frame, "this session")?;
+    let layout = app.screen_layout(area, chrome);
+    assert_eq!(layout.reservation.height, 5);
+    let (_, shared_rows) = app.desired_pty_size();
+    assert_eq!(shared_rows, unshared_rows - 5);
+
+    // A short terminal shrinks the pane while the logs keep a row, and drops it below that.
+    let short = |main: u16| {
+        let area = Rect::new(0, 0, WIDTH, chrome.header + main + chrome.footer);
+        app.screen_layout(area, chrome).reservation.height
+    };
+    assert_eq!(short(7), 4);
+    assert_eq!(short(5), 0);
+    Ok(())
+}
+
+/// A selection in the info popup is dropped once the popup's rows change under it, as when the
+/// queue moves, so a copy never takes another row's text.
+#[tokio::test]
+async fn a_popup_selection_is_dropped_when_its_rows_change() -> eyre::Result<()> {
+    let mut app = app(indoc! {r#"
+        version: 1
+        services:
+          display:
+            command: ["sleep", "30"]
+    "#})?;
+    let now = crate::render::now_unix_ms();
+    let waiting = |waiter: &str| {
+        Ok(crate::reservation::test_reply(
+            micromux::ReservationState::Granted,
+            Some("own"),
+            &[waiter],
+            Some("own"),
+            now,
+        ))
+    };
+    share(&mut app, &[0], waiting("feature-a"));
+    press_key(&mut app, KeyCode::Char('i'));
+    let frame = draw(&mut app);
+    // The reservation pane above names the waiter too, so look only inside the popup.
+    let popup = app
+        .hits
+        .popup
+        .as_ref()
+        .map(|popup| popup.area)
+        .ok_or_else(|| eyre::eyre!("the info popup is not open"))?;
+    let waiter = (popup.y..popup.bottom())
+        .find_map(|y| {
+            let row = row_text(&frame, y);
+            let byte = row.find("feature-a")?;
+            let x = row.get(..byte)?.chars().count();
+            Some(Position::new(u16::try_from(x).ok()?, y))
+        })
+        .ok_or_else(|| eyre::eyre!("the popup does not name the waiter"))?;
+    drag(&mut app, waiter, &[Position::new(waiter.x + 8, waiter.y)]);
+    draw(&mut app);
+    assert!(app.mouse.selection.is_some());
+
+    // Another waiter of a name as long takes the place: the popup keeps its size and rows, but
+    // they say something else.
+    app.source.set_reservation("desk", waiting("feature-b"));
+    draw(&mut app);
+    assert!(app.mouse.selection.is_none());
+    Ok(())
+}
+
+/// Draws `app` with a services list `list_rows` rows tall.
+fn draw_list_rows(app: &mut App, list_rows: u16) -> Buffer {
+    let chrome = app.chrome_rows(WIDTH);
+    let area = Rect::new(0, 0, WIDTH, chrome.header + chrome.footer + list_rows + 2);
+    let mut buffer = Buffer::empty(area);
+    app.render(area, &mut buffer);
+    buffer
+}
+
+/// A short list of services of two rows and one draws every service its clicks can land on,
+/// with no blank row left where a service would fit, and a queued start that only has room
+/// for one note keeps its place in the queue.
+#[tokio::test]
+async fn a_short_list_draws_every_service_a_click_can_select() -> eyre::Result<()> {
+    let mut app = app(indoc! {r#"
+        version: 1
+        services:
+          alpha:
+            command: ["sleep", "30"]
+          bravo:
+            command: ["sleep", "30"]
+          charlie:
+            command: ["sleep", "30"]
+    "#})?;
+    let now = crate::render::now_unix_ms();
+    share(
+        &mut app,
+        &[0, 1],
+        Ok(crate::reservation::test_reply(
+            micromux::ReservationState::Granted,
+            Some("own"),
+            &[],
+            Some("own"),
+            now,
+        )),
+    );
+
+    // Three rows hold `bravo` and its note, then `charlie`.
+    app.state.selected_service = 1;
+    let frame = draw_list_rows(&mut app, 3);
+    let charlie = find(&frame, "charlie")?;
+    assert_eq!(find(&frame, "bravo")?.y + 2, charlie.y);
+    for hit in &app.hits.service_names {
+        assert!(row_text(&frame, hit.item.y).contains(hit.service.as_str()));
+    }
+    click(&mut app, charlie);
+    assert_eq!(selected(&app), Some("charlie"));
+
+    // In two rows a queued start keeps its place rather than its holder.
+    app.source.set_reservation(
+        "desk",
+        Ok(crate::reservation::test_reply(
+            micromux::ReservationState::Waiting { position: 2 },
+            Some("feature-x"),
+            &["bugfix-y", "own"],
+            Some("own"),
+            now,
+        )),
+    );
+    app.state.selected_service = 1;
+    let frame = draw_list_rows(&mut app, 2);
+    find(&frame, "2/2 in queue")?;
+    assert!(find(&frame, "held by").is_err());
+    Ok(())
+}
+
+/// A holder with the longest name a session may have still leaves the pane's second column in
+/// view, with this session's place in the queue.
+#[tokio::test]
+async fn a_long_holder_name_leaves_the_place_in_view() -> eyre::Result<()> {
+    let mut app = shared_app(1)?;
+    let holder = "h".repeat(63);
+    app.source.set_reservation(
+        "desk",
+        Ok(crate::reservation::test_reply(
+            micromux::ReservationState::Waiting { position: 1 },
+            Some(&holder),
+            &["own"],
+            Some("own"),
+            crate::render::now_unix_ms(),
+        )),
+    );
+    let frame = draw(&mut app);
+    let place = find(&frame, "Place")?;
+    assert!(row_text(&frame, place.y).contains("1/1"));
+    find(&frame, "Queue")?;
+    Ok(())
+}
+
+/// On an 80-column terminal the reservation pane is one column wide, which takes the whole
+/// pane, so the holder and this session's place show in full.
+#[tokio::test]
+async fn a_narrow_pane_gives_its_one_column_the_whole_width() -> eyre::Result<()> {
+    let mut app = shared_app(1)?;
+    app.source.set_reservation(
+        "desk",
+        Ok(crate::reservation::test_reply(
+            micromux::ReservationState::Waiting { position: 1 },
+            Some("payments-fix"),
+            &["own"],
+            Some("own"),
+            crate::render::now_unix_ms(),
+        )),
+    );
+    let area = Rect::new(0, 0, 80, HEIGHT);
+    let mut frame = Buffer::empty(area);
+    ratatui::widgets::Widget::render(&mut app, area, &mut frame);
+    let holder = find(&frame, "Holder")?;
+    assert!(row_text(&frame, holder.y).contains("payments-fix"));
+    let place = find(&frame, "Place")?;
+    assert!(row_text(&frame, place.y).contains("1/1"));
     Ok(())
 }
