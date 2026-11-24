@@ -629,15 +629,18 @@ services:
 
     // While the service still sits in its slow trap, the cleanup has not run, and its lock is
     // already taken.
+    // A probe takes a free lock for an instant, which could make the shim's own attempt find it
+    // busy, so it waits for the deadline the shim records in the lock file once it holds it.
     let deadline = Instant::now() + Duration::from_secs(2);
-    let held = loop {
-        let held = std::fs::File::open(state.lock("svc"))
-            .is_ok_and(|lock| matches!(lock.try_lock(), Err(std::fs::TryLockError::WouldBlock)));
-        if held || Instant::now() >= deadline {
-            break held;
-        }
+    while std::fs::read_to_string(state.lock("svc"))
+        .unwrap_or_default()
+        .is_empty()
+        && Instant::now() < deadline
+    {
         std::thread::sleep(Duration::from_millis(20));
-    };
+    }
+    let held = std::fs::File::open(state.lock("svc"))
+        .is_ok_and(|lock| matches!(lock.try_lock(), Err(std::fs::TryLockError::WouldBlock)));
     let cleaned_early = directory.path().join("cleanups").exists();
     let service_alive = pids.iter().copied().any(alive);
 
