@@ -97,10 +97,24 @@ pub(crate) fn capture(
         });
     }
 
-    for keys in scenario.keys {
-        writer.write_all(keys)?;
-        writer.flush().ok();
-        settle(&rx, &mut parser);
+    // The text the screen never showed, if any; the capture fails once micromux quit.
+    let mut missing = scenario
+        .ready
+        .filter(|text| !wait_for_text(&rx, &mut parser, text));
+    if missing.is_none() {
+        for keys in scenario.keys {
+            writer.write_all(keys)?;
+            writer.flush().ok();
+            settle(&rx, &mut parser);
+        }
+        if let Some(text) = scenario.shows {
+            wait_for_text(&rx, &mut parser, text);
+            settle(&rx, &mut parser);
+        }
+        // The saved frame itself must show it, not only one before it.
+        missing = scenario
+            .shows
+            .filter(|text| !parser.screen().contents().contains(text));
     }
 
     let screen = parser.screen().clone();
@@ -114,7 +128,13 @@ pub(crate) fn capture(
     drop(rx);
     let _ = reader_thread.join();
 
-    Ok(screen)
+    match missing {
+        Some(text) => Err(Error::MissingText {
+            scenario: scenario.name,
+            text,
+        }),
+        None => Ok(screen),
+    }
 }
 
 /// Feed PTY output into `parser` until the TUI drew its first frame, which shows the services
@@ -158,6 +178,23 @@ fn wait_for_first_frame(
         }
     }
     false
+}
+
+/// Feed PTY output into `parser` until the screen shows `text`, for at most ten seconds, and
+/// return whether it did.
+fn wait_for_text(rx: &mpsc::Receiver<Vec<u8>>, parser: &mut vt100::Parser, text: &str) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !parser.screen().contents().contains(text) {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(chunk) => parser.process(&chunk),
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => return false,
+        }
+    }
+    true
 }
 
 /// Drive the parser until the rendered screen stops changing.

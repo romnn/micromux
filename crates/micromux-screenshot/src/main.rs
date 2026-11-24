@@ -10,10 +10,12 @@
 mod ansi;
 mod capture;
 mod freeze;
+mod neighbor;
 mod proxy;
 mod scenario;
 mod theme;
 
+use crate::neighbor::Neighbor;
 use crate::proxy::Proxy;
 use crate::scenario::SCENARIOS;
 use crate::theme::THEMES;
@@ -62,6 +64,16 @@ pub(crate) enum Error {
     ProxyPortTaken { port: u16 },
     #[error("the demo proxy did not listen on port {port} in time")]
     ProxyNotReady { port: u16 },
+    #[error(
+        "the neighbor session in {} did not take the demo's resource in time",
+        project.display()
+    )]
+    NeighborNotReady { project: PathBuf },
+    #[error("scenario {scenario} never showed {text:?}, so its screenshot would be wrong")]
+    MissingText {
+        scenario: &'static str,
+        text: &'static str,
+    },
 }
 
 impl Error {
@@ -103,7 +115,16 @@ fn main() -> Result<(), Error> {
     let proxy = Proxy::start(&micromux, &state_dir)?;
 
     for scenario in SCENARIOS {
+        // A worktree next to the demo's, as the session holding a shared resource usually is.
+        let neighbor = scenario
+            .neighbor
+            .then(|| {
+                let project = home.join("dev").join("payments-fix");
+                Neighbor::start(&micromux, &home, &state_dir, &project)
+            })
+            .transpose()?;
         let screen = capture::capture(&micromux, &home, &state_dir, &example_dir, scenario)?;
+        drop(neighbor);
 
         for theme in &THEMES {
             let ansi =

@@ -108,3 +108,10 @@ services:
     command: ["./bin/seed.sh"]
     depends_on:
       - migrate
+
+  # One worktree at a time drives the shared test browser: the session that holds `browser` runs
+  # it, and another worktree queues for it.
+  e2e:
+    name: E2E browser
+    command: ["./bin/e2e.sh"]
+    resource: browser
