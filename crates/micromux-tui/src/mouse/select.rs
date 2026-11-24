@@ -81,8 +81,8 @@ pub(crate) struct TextContext {
     formats: std::collections::BTreeMap<String, crate::json_log::LineFormat>,
     wrap: bool,
     width: u16,
-    /// What a service name or a URL shows: the service's ID and name, or the URL; empty for
-    /// every other pane.
+    /// What a service name, a URL or an info popup shows: the service's ID and name, the URL, or
+    /// the popup's rows; empty for every other pane.
     identity: Vec<String>,
 }
 
@@ -306,6 +306,15 @@ impl App {
                 .get(index)
                 .map(|link| vec![link.url.clone()])
                 .unwrap_or_default(),
+            // An info popup's rows change under the selection, as when a reservation's queue
+            // moves, so a selection holds only while they read the same.
+            TextPane::Info(_) => match &self.hits.popup {
+                Some(PopupHit {
+                    content: PopupContent::Text { lines, .. },
+                    ..
+                }) => lines.iter().map(ToString::to_string).collect(),
+                _ => Vec::new(),
+            },
             _ => Vec::new(),
         };
         let (service, formats, wrap) = match pane {

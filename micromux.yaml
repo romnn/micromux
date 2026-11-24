@@ -77,6 +77,17 @@ services:
     command: "true"
     healthcheck:
       test: "exit 1"
+  display:
+    name: Shared display
+    # A stand-in for an app that one worktree at a time may run, such as one tied to a device.
+    # The first session takes `demo-display`; another worktree's start is refused, and
+    # `micromux ctl enable display` there queues it until this one runs
+    # `micromux ctl release demo-display` or stops.
+    resource: demo-display
+    command:
+      - sh
+      - -c
+      - while true; do echo "the shared display shows $MICROMUX_SESSION"; sleep 5; done
   docker:
     command: "watch docker ps"
   htop:

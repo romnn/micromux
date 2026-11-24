@@ -49,11 +49,7 @@ const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 pub(crate) struct Hits {
     /// The services pane, borders included.
     pub(crate) services: Rect,
-    /// The rows of the services list.
-    pub(crate) service_rows: Rect,
-    /// Index of the service on the first row of the list.
-    pub(crate) first_service: usize,
-    /// The services' names on the list's shown rows, one for each row from the first.
+    /// The services the list shows, top to bottom, with their rows and names.
     pub(crate) service_names: Vec<NameHit>,
     /// The logs pane, borders and scrollbar included.
     pub(crate) logs: Rect,
@@ -75,10 +71,12 @@ pub(crate) struct HintHit {
     pub(crate) keys: &'static str,
 }
 
-/// A service's name in the services list and the cells it was drawn in.
+/// A service in the services list: the cells its name was drawn in, and all its rows.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct NameHit {
     pub(crate) area: Rect,
+    /// The rows the service takes, two for one that names a resource.
+    pub(crate) item: Rect,
     /// The service's ID.
     pub(crate) service: String,
     /// The name as the row shows it, which may cut it short.
@@ -525,12 +523,19 @@ impl App {
             if self.mouse.navigate {
                 self.focus = Focus::Services;
                 // Typed input goes to the selected service, so a click must not retarget it.
-                if !self.pty_input_mode && self.hits.service_rows.contains(position) {
-                    let index = self.hits.first_service
-                        + usize::from(position.y - self.hits.service_rows.y);
-                    if index < self.state.services.len() {
-                        self.state.selected_service = index;
-                    }
+                if !self.pty_input_mode
+                    && let Some(hit) = self
+                        .hits
+                        .service_names
+                        .iter()
+                        .find(|hit| hit.item.contains(position))
+                    && let Some(index) = self
+                        .state
+                        .services
+                        .iter()
+                        .position(|service| service.snapshot.id == hit.service)
+                {
+                    self.state.selected_service = index;
                 }
             }
             // Of a service's row only its name selects.

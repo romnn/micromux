@@ -18,6 +18,7 @@ use micromux_control::{
 use parking_lot::RwLock;
 use tokio::sync::{broadcast, mpsc};
 
+use crate::reservation::ReservationRead;
 use crate::source::AttachmentStatus;
 use crate::timeline::Timeline;
 
@@ -46,6 +47,9 @@ struct MirrorStore {
     services: IndexMap<ServiceID, MirrorEntry>,
     connected: bool,
     notice: Option<String>,
+    /// Where the session stands with each resource its services name, as last read while
+    /// connected to this session instance.
+    reservations: IndexMap<String, ReservationRead>,
 }
 
 struct MirrorEntry {
@@ -166,6 +170,7 @@ impl RemoteSource {
             services: IndexMap::new(),
             connected: false,
             notice: None,
+            reservations: IndexMap::new(),
         }));
         let (changes, _) = broadcast::channel(CHANGE_CHANNEL_CAPACITY);
         let (subscription, service_ids) =
@@ -218,6 +223,21 @@ impl RemoteSource {
             connected: store.connected,
             notice: store.notice.clone(),
         }
+    }
+
+    /// Where the session stands with `resource`, as last read, if it was read.
+    pub(crate) fn reservation(&self, resource: &str) -> Option<ReservationRead> {
+        self.store.read().reservations.get(resource).cloned()
+    }
+
+    /// How soon a relative time the reservation views show changes, by the reads as last made.
+    pub(crate) fn next_reservation_change(&self, now_ms: u64) -> Option<Duration> {
+        crate::reservation::next_change(self.store.read().reservations.values(), now_ms)
+    }
+
+    /// Where the session stands with each resource its services name, as last read.
+    pub(crate) fn reservation_reads(&self) -> Vec<ReservationRead> {
+        self.store.read().reservations.values().cloned().collect()
     }
 
     /// Return every mirrored service in server order.
@@ -356,6 +376,7 @@ impl RemoteSource {
                 services: IndexMap::new(),
                 connected: true,
                 notice: None,
+                reservations: IndexMap::new(),
             })),
             changes,
             commands,
@@ -529,9 +550,23 @@ async fn run_connected(
     let mut describe = tokio::time::interval(SESSION_REFRESH_INTERVAL);
     describe.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     describe.reset();
+    // Reservations change with other sessions, so each tick sweeps the resources the services
+    // name, one read a turn of this loop, so input and commands never wait behind several.
+    let mut reservations = tokio::time::interval(crate::reservation::REFRESH_INTERVAL);
+    reservations.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut sweep = VecDeque::new();
     loop {
         tokio::select! {
             () = shutdown.cancelled() => return ConnectedLoopExit::Shutdown,
+            _ = reservations.tick() => start_sweep(&mut sweep, store, changes),
+            () = std::future::ready(()), if !sweep.is_empty() => {
+                if let Err(err) = read_reservation(request, store, changes, &mut sweep).await {
+                    if reconnect_after_refresh_error(&err) {
+                        return ConnectedLoopExit::Reconnect;
+                    }
+                    record_notice(store, changes, err.to_string());
+                }
+            }
             _ = describe.tick() => {
                 match request.describe().await {
                     Ok(session) => refresh_summary(store, changes, session),
@@ -629,6 +664,85 @@ async fn establish(
     Ok((request, subscription))
 }
 
+/// Starts a `sweep` over the resources the services name unless one is still going, after
+/// dropping the reads of resources they no longer name and waking the TUI if there were any.
+fn start_sweep(
+    sweep: &mut VecDeque<String>,
+    store: &Arc<RwLock<MirrorStore>>,
+    changes: &broadcast::Sender<SessionChange>,
+) {
+    if !sweep.is_empty() {
+        return;
+    }
+    let dropped = {
+        let mut guard = store.write();
+        let resources = crate::reservation::named_resources(
+            guard.services.values().map(|entry| &entry.snapshot),
+        );
+        let before = guard.reservations.len();
+        guard
+            .reservations
+            .retain(|name, _| resources.contains(name));
+        *sweep = resources.into();
+        guard.reservations.len() != before
+    };
+    if dropped {
+        publish_reservations(changes);
+    }
+}
+
+/// Reads where the session stands with the next resource of `sweep` and wakes the TUI when that
+/// changed.
+async fn read_reservation(
+    request: &mut Client,
+    store: &Arc<RwLock<MirrorStore>>,
+    changes: &broadcast::Sender<SessionChange>,
+    sweep: &mut VecDeque<String>,
+) -> Result<(), ControlError> {
+    let Some(resource) = sweep.pop_front() else {
+        return Ok(());
+    };
+    // The roster may have dropped the resource since the sweep began.
+    let named = store
+        .read()
+        .services
+        .values()
+        .any(|entry| entry.snapshot.resource.as_ref() == Some(&resource));
+    if !named {
+        return Ok(());
+    }
+    let read = match request
+        .request(Request::ReservationStatus {
+            resource: resource.clone(),
+        })
+        .await?
+    {
+        Response::Reservation(reply) => Ok(*reply),
+        Response::Error { message, .. } => Err(message),
+        other => Err(format!("unexpected response: {other:?}")),
+    };
+    {
+        let mut guard = store.write();
+        if guard.reservations.get(&resource) == Some(&read) {
+            return Ok(());
+        }
+        guard.reservations.insert(resource, read);
+    }
+    publish_reservations(changes);
+    Ok(())
+}
+
+/// Wakes the TUI for changed reservation reads, which belong to the whole session.
+fn publish_reservations(changes: &broadcast::Sender<SessionChange>) {
+    publish(
+        changes,
+        SessionChange {
+            service_id: SessionChange::SESSION_WIDE.to_string(),
+            kind: ChangeKind::Status,
+        },
+    );
+}
+
 /// Takes the session's latest URLs and routing status from a fresh description, waking the TUI
 /// when they changed.
 fn refresh_summary(
@@ -659,6 +773,7 @@ fn update_session(store: &Arc<RwLock<MirrorStore>>, session: SessionInfo) {
     if !guard.session.is_same_instance(&session) {
         guard.services.clear();
         guard.notice = None;
+        guard.reservations.clear();
     }
     guard.session = session;
 }
@@ -1218,8 +1333,14 @@ fn reconnect_after_subscription_error(error: &ControlError) -> bool {
     )
 }
 
+/// Marks the mirror disconnected and forgets its reservation reads, which nothing keeps current
+/// any more.
 fn mark_disconnected(store: &Arc<RwLock<MirrorStore>>, changes: &broadcast::Sender<SessionChange>) {
-    store.write().connected = false;
+    {
+        let mut guard = store.write();
+        guard.connected = false;
+        guard.reservations.clear();
+    }
     publish(
         changes,
         SessionChange {
@@ -1419,6 +1540,7 @@ mod tests {
             services: [(entry.snapshot.id.clone(), entry)].into_iter().collect(),
             connected: true,
             notice: None,
+            reservations: IndexMap::new(),
         }))
     }
 
@@ -1432,6 +1554,33 @@ mod tests {
             events: Timeline::default(),
             clear_logs_after_generation: None,
         }
+    }
+
+    /// A sweep reads every resource the services name and drops the reads of resources they no
+    /// longer name, which wakes the TUI.
+    #[test]
+    fn a_sweep_reads_the_named_resources_and_drops_the_rest() {
+        let mut entry = entry_with_log(1, "line");
+        entry.snapshot.resource = Some("desk".to_string());
+        let store = store_with(entry);
+        store
+            .write()
+            .reservations
+            .insert("gone".to_string(), Err("a read of before".to_string()));
+        let (changes, mut woken) = broadcast::channel(8);
+
+        let mut sweep = VecDeque::new();
+        start_sweep(&mut sweep, &store, &changes);
+        assert_eq!(sweep, ["desk"]);
+        assert!(store.read().reservations.is_empty());
+        assert!(woken.try_recv().is_ok());
+
+        // A sweep still going is left alone, and nothing to drop the next time wakes nobody.
+        start_sweep(&mut sweep, &store, &changes);
+        assert_eq!(sweep, ["desk"]);
+        sweep.clear();
+        start_sweep(&mut sweep, &store, &changes);
+        assert!(woken.try_recv().is_err());
     }
 
     fn source_for(store: Arc<RwLock<MirrorStore>>) -> RemoteSource {

@@ -57,6 +57,16 @@ The services list, combined-log tags, and service popups show each service's con
 
 Restart, disable, and enable all go through the [control plane]({{< relref "agent-control/control-plane.md" >}}), so they respect dependency gating and restart policy. When the session refuses one, such as a start of a service whose resource another session holds, the header shows why in red until a later command is accepted. It leads with the `micromux ctl reserve` command that queues for the resource; the holder follows when the terminal is wide enough, and the session overview (`u`) always shows it.
 
+## Shared resources
+
+A service that names a [shared resource]({{< relref "configuration/services.md" >}}#shared-resources) gets a gray note under its name in the sidebar, whichever service is selected: until when this session's turn with the resource is protected and how many sessions wait for it, or which session holds it. A start that waits for the resource shows **QUEUED** and its place in the queue on a row of its own.
+
+While such a service is selected, a **Reservation** pane above the logs details it: the holder, since when it holds the resource and until when its turn is protected, this session's place, the queue in order, and the holder's reason. `i` adds each session's worktree and every waiter's reason. The pane takes its rows from the logs only while it shows.
+
+{{< figure src="images/reservation-held.png" alt="The E2E browser service running with a note under its name saying until when its turn is protected, and the reservation pane above the logs naming this session as the holder with an empty queue" caption="This session holds the shared browser: the note says until when its turn is protected." >}}
+
+{{< figure src="images/reservation-queued.png" alt="The E2E browser service queued, with the notes held by payments-fix and 1/1 in queue, and the reservation pane naming payments-fix as the holder with its reason" caption="Another worktree holds it: enabling the service queues it, and it starts once its turn comes." >}}
+
 ## Searching logs
 
 `/` opens a prompt over the footer's last row: type a query and press `Enter` to search the logs the log pane shows, the selected service's or [every service's](#all-services-logs), or `Esc` to cancel; `Backspace` edits it. The query matches literal text, the way the pane shows it, and ignores case unless it has an uppercase letter, as vim's smartcase does: `error` finds `ERROR` too, `Error` finds only `Error`.

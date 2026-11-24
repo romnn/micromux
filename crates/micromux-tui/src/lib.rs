@@ -15,6 +15,7 @@ mod mouse;
 mod platform;
 mod remote;
 mod render;
+mod reservation;
 mod search;
 mod source;
 mod state;
@@ -520,6 +521,7 @@ impl App {
                 }
             } => Some(Wake::Summary),
             () = self.source.local_notice_changed() => Some(Wake::Summary),
+            () = self.source.local_reservations_changed() => Some(Wake::Summary),
             () = continued.recv() => Some(Wake::Continued),
             Some(failure) = self.failed_openers.recv() => Some(Wake::OpenerFailed(failure)),
         }
@@ -615,14 +617,23 @@ impl App {
         Ok(())
     }
 
-    /// When the event loop must wake by itself: to retry queued PTY input, or to take back the
-    /// quit hint or the mouse's notice.
+    /// When the event loop must wake by itself: to retry queued PTY input, to take back the
+    /// quit hint or the mouse's notice, or to redraw a reservation's turn as it runs out.
     fn next_timer(&self) -> Option<std::time::Instant> {
-        let retry = (!self.pending_pty_input.is_empty())
-            .then(|| std::time::Instant::now() + PENDING_PTY_INPUT_RETRY);
+        let now = std::time::Instant::now();
+        let retry = (!self.pending_pty_input.is_empty()).then(|| now + PENDING_PTY_INPUT_RETRY);
         let hint = self.quit_hint_at.map(|at| at + QUIT_HINT_DURATION);
         let notice = self.mouse.notice_deadline();
-        retry.into_iter().chain(hint).chain(notice).min()
+        let turn = self
+            .source
+            .next_reservation_change(render::now_unix_ms())
+            .map(|after| now + after);
+        retry
+            .into_iter()
+            .chain(hint)
+            .chain(notice)
+            .chain(turn)
+            .min()
     }
 
     /// Does what is due `now`: retries queued PTY input and takes back an expired quit hint or

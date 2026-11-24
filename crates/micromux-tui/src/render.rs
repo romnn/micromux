@@ -412,7 +412,7 @@ mod tests {
             created_at_unix_ms: 0,
         });
 
-        let rows = super::service_info_rows(&snapshot, &|_| None, None, None, 1_000)
+        let rows = super::service_info_rows(&snapshot, &|_| None, None, None, None, 1_000)
             .iter()
             .map(Line::to_string)
             .collect::<Vec<_>>()
@@ -451,6 +451,23 @@ mod tests {
                 format!("{}{}", " ".repeat(12), "x".repeat(6)),
             ]
         );
+    }
+
+    /// The list scrolls on from where it was, no further than the services that fit at the
+    /// bottom, and as far as it takes to show the selected service whole.
+    #[test]
+    fn the_list_offset_keeps_the_selected_service_whole() {
+        use super::list_offset;
+        // Two services of two rows and one of one in three rows: the second needs the list
+        // scrolled to it, and then the third fits under it.
+        assert_eq!(list_offset(&[2, 2, 1], 3, 0, 1), 1);
+        assert_eq!(list_offset(&[2, 2, 1], 3, 0, 0), 0);
+        // Scrolled further than the end needs, it comes back; scrolled past the selection, it
+        // goes up to it.
+        assert_eq!(list_offset(&[1, 1, 1, 1], 3, 3, 3), 1);
+        assert_eq!(list_offset(&[1, 1, 1, 1], 3, 2, 0), 0);
+        // An empty list starts at the top.
+        assert_eq!(list_offset(&[], 3, 5, 0), 0);
     }
 
     #[test]
@@ -1163,6 +1180,7 @@ fn service_info_rows(
     dependency_kind: &dyn Fn(&str) -> Option<micromux::ServiceKind>,
     session: Option<&micromux::SessionSummary>,
     last_healthcheck: Option<&micromux::HealthAttempt>,
+    reservation: Option<&crate::reservation::ReservationRead>,
     now_unix_ms: u64,
 ) -> Vec<Line<'static>> {
     let mut state = vec![state_name(snapshot).set_style(crate::style::service_style(snapshot))];
@@ -1215,12 +1233,15 @@ fn service_info_rows(
     rows.extend(info_rows("URLs", urls));
     rows.extend(info_rows("Ports", port_rows(snapshot, session)));
     if let Some(resource) = &snapshot.resource {
-        let resource = if snapshot.waiting_for_resource {
-            format!("{resource}, queued: starts once this session gets it")
-        } else {
-            resource.clone()
-        };
-        rows.extend(info_rows("Resource", vec![resource]));
+        rows.extend(info_rows("Resource", vec![resource.clone()]));
+        for (label, values) in crate::reservation::detail_cells(
+            reservation,
+            now_unix_ms,
+            std::env::var_os("HOME").as_deref(),
+            true,
+        ) {
+            rows.extend(info_rows(label, values));
+        }
     }
     rows.extend(info_rows(
         "Command",
@@ -1266,7 +1287,7 @@ fn service_info_rows(
 }
 
 /// `path` with a leading `home` directory written as `~`, as a shell prompt shows it.
-fn home_relative(path: &str, home: Option<&std::ffi::OsStr>) -> String {
+pub(crate) fn home_relative(path: &str, home: Option<&std::ffi::OsStr>) -> String {
     let rest = home
         .and_then(std::ffi::OsStr::to_str)
         .filter(|home| !home.is_empty() && *home != "/")
@@ -1370,12 +1391,7 @@ fn cleanup_phrase(cleanup: &micromux::CleanupStatus) -> String {
 }
 
 /// The session's name, proxy and every route, for the session popup.
-/// The session popup's rows; `reservations_truncated` says the session left its reservations
-/// out of a description too large to send.
-fn session_info_rows(
-    session: Option<&micromux::SessionSummary>,
-    reservations_truncated: bool,
-) -> Vec<Line<'static>> {
+fn session_info_rows(session: Option<&micromux::SessionSummary>) -> Vec<Line<'static>> {
     let Some(session) = session else {
         return vec![Line::raw("This session reports no session details.")];
     };
@@ -1435,15 +1451,7 @@ fn session_info_rows(
             .map(|(name, port)| Span::raw(format!(":{port}  {name}")))
             .collect(),
     ));
-    if reservations_truncated {
-        rows.push(Line::default());
-        rows.extend(info_rows(
-            "Resources",
-            vec![Span::raw(
-                "too many to show here; run `micromux ctl ls` in the session's project",
-            )],
-        ));
-    } else if !session.reservations.is_empty() {
+    if !session.reservations.is_empty() {
         rows.push(Line::default());
         rows.extend(info_rows(
             "Resources",
@@ -1634,6 +1642,9 @@ pub(crate) struct ScreenLayout {
     /// Everything between the header and the footer, where popups center.
     pub main: Rect,
     pub services: Rect,
+    /// The pane above the logs with where the session stands with the selected service's
+    /// resource, or an empty area while it is hidden.
+    pub reservation: Rect,
     /// The logs pane, borders and scrollbar included.
     pub logs: Rect,
     /// The side pane, or an empty area while it is hidden.
@@ -2106,7 +2117,7 @@ fn truncate_with_dots(text: &str, max_cells: usize) -> String {
 }
 
 /// Wall clock in the unit lease expiries are expressed in.
-fn now_unix_ms() -> u64 {
+pub(crate) fn now_unix_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| {
@@ -2193,6 +2204,49 @@ fn pane_name(name: &str, focused: bool) -> Span<'static> {
     }
 }
 
+/// The first service a list of items `heights` tall shows in `room` rows, scrolled on from
+/// `previous` and keeping `selected` whole in view.
+///
+/// The list scrolls on from where the last frame left it, so the rows a click lands on stay put
+/// once the selection moves to one of them.
+/// Rows freed by a taller pane or a shorter roster go to the services above, which ratatui would
+/// leave scrolled out of view, so the offset goes no further than the first of the services that
+/// fit whole at the bottom.
+/// Keeping the selected service whole from the offset means ratatui draws exactly the services
+/// that fit from it, as the names are found, and never moves it itself, which can leave a row
+/// blank under the last service.
+fn list_offset(heights: &[usize], room: usize, previous: usize, selected: usize) -> usize {
+    // The first of the items up to `last` that fit whole together with it.
+    let lowest_fitting = |last: usize| {
+        let mut used = 0;
+        let mut lowest = last;
+        for (index, height) in heights.iter().enumerate().take(last + 1).rev() {
+            if used + height > room {
+                break;
+            }
+            used += height;
+            lowest = index;
+        }
+        lowest
+    };
+    let max_offset = lowest_fitting(heights.len().saturating_sub(1));
+    previous
+        .min(max_offset)
+        .clamp(lowest_fitting(selected), selected)
+}
+
+/// Rows of the reservation pane, its borders included.
+const RESERVATION_PANE_HEIGHT: u16 = 5;
+
+/// Columns of a reservation cell's label.
+const RESERVATION_LABEL_WIDTH: usize = 8;
+
+/// The narrowest column of reservation cells, below which the pane shows one column.
+const RESERVATION_COLUMN_WIDTH: usize = 36;
+
+/// Blank columns between the reservation pane's two columns of cells.
+const RESERVATION_GUTTER: usize = 6;
+
 /// The accent of the focused pane's frame.
 pub(crate) const FOCUS_COLOR: Color = Color::Cyan;
 
@@ -2275,9 +2329,13 @@ impl Widget for &mut App {
                 .collect::<Vec<_>>(),
         )
         .render(layout.header, buf);
-        let (service_rows, first_service, service_names) =
-            self.render_services(layout.services, buf);
+        let service_names = self.render_services(layout.services, buf);
         let links = self.render_logs(layout.logs, buf);
+        if let Some(resource) = self.selected_resource()
+            && !layout.reservation.is_empty()
+        {
+            self.render_reservation(resource, layout.reservation, buf);
+        }
         if let Some(pane) = self.side_pane {
             self.render_side_pane(pane, layout.side, buf);
         }
@@ -2294,8 +2352,6 @@ impl Widget for &mut App {
         // The popups below record themselves as they draw.
         self.hits = crate::mouse::Hits {
             services: layout.services,
-            service_rows,
-            first_service,
             service_names,
             logs: layout.logs,
             side: layout.side,
@@ -2500,6 +2556,23 @@ impl App {
             ])
             .spacing(0)
             .areas(main);
+        // While the selected service names a resource, the reservation pane takes the top of
+        // the right column: its text rows, fewer on a short terminal as long as the logs keep a
+        // row of text, and none below one row of its own.
+        let pane_height = if self.selected_resource().is_some() {
+            RESERVATION_PANE_HEIGHT.min(right.height.saturating_sub(3))
+        } else {
+            0
+        };
+        let [reservation, right] = if pane_height >= 3 {
+            Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(pane_height), Constraint::Min(0)])
+                .spacing(0)
+                .areas(right)
+        } else {
+            [Rect::default(), right]
+        };
         let [logs, side] = if self.side_pane.is_some() {
             Layout::default()
                 .direction(Direction::Horizontal)
@@ -2513,9 +2586,82 @@ impl App {
             header,
             main,
             services,
+            reservation,
             logs,
             side,
             footer,
+        }
+    }
+
+    /// The resource the selected service names, if any.
+    fn selected_resource(&self) -> Option<&str> {
+        self.state
+            .current_service()
+            .and_then(|service| service.snapshot.resource.as_deref())
+    }
+
+    /// Draws where the session stands with `resource` in `area`, most important rows first.
+    fn render_reservation(&self, resource: &str, area: Rect, buf: &mut Buffer) {
+        let block = pane_block(false).title(Line::from(vec![
+            pane_name("Reservation", false),
+            " · ".fg(Color::DarkGray),
+            Span::raw(format!("{resource} ")),
+        ]));
+        let cells = crate::reservation::detail_cells(
+            self.source.reservation(resource).as_ref(),
+            now_unix_ms(),
+            std::env::var_os("HOME").as_deref(),
+            false,
+        );
+        let inner = block.inner(area);
+        let cell = |(label, values): &(&str, Vec<Line<'static>>)| {
+            let mut line = Line::from(Span::styled(
+                format!("{label:<RESERVATION_LABEL_WIDTH$}"),
+                App::HEADER_COLOR,
+            ));
+            if let Some(value) = values.first() {
+                line.spans.extend(value.spans.iter().cloned());
+            }
+            line
+        };
+        // Two columns of three cells where they fit, else the holder, this session's place and
+        // the turn, in the order a short pane keeps them.
+        let columns = if usize::from(inner.width) >= 2 * RESERVATION_COLUMN_WIDTH {
+            let (left, right) = cells.split_at(cells.len().min(3));
+            vec![left.to_vec(), right.to_vec()]
+        } else {
+            vec![
+                ["Status", "Holder", "Place", "Until"]
+                    .iter()
+                    .filter_map(|wanted| cells.iter().find(|(label, _)| label == wanted))
+                    .cloned()
+                    .collect(),
+            ]
+        };
+        block.render(area, buf);
+        let columns = columns
+            .iter()
+            .map(|column| column.iter().map(cell).collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        // One column takes the whole pane. Of two, the first takes its widest cell and a gutter,
+        // but no more than half the pane, so a long holder name cannot crowd out the second,
+        // which takes the rest.
+        let constraints = match columns.as_slice() {
+            [first, _] => {
+                let widest = first.iter().map(Line::width).max().unwrap_or_default();
+                let first_width =
+                    rows_u16(widest + RESERVATION_GUTTER).min(inner.width.saturating_sub(2) / 2);
+                vec![Constraint::Length(first_width), Constraint::Min(0)]
+            }
+            _ => vec![Constraint::Min(0)],
+        };
+        let areas = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints(constraints)
+            .horizontal_margin(1)
+            .split(inner);
+        for (column, area) in columns.into_iter().zip(areas.iter()) {
+            Paragraph::new(column).render(*area, buf);
         }
     }
 
@@ -2632,14 +2778,32 @@ impl App {
             .or(self.input_notice.as_deref())
     }
 
-    /// Draws the services list and returns the rows it was drawn in, the index of the service
-    /// on the first of them, and where the shown rows' names went.
-    fn render_services(
-        &mut self,
-        area: Rect,
-        buf: &mut Buffer,
-    ) -> (Rect, usize, Vec<crate::mouse::NameHit>) {
-        // Each row and the columns before its name.
+    /// Draws the services list and returns, for each service it shows, where its rows and its
+    /// name went.
+    ///
+    /// A service that names a resource takes rows under its own with where the session stands
+    /// with it, as many as fit in the list with its own row, since ratatui leaves an item taller
+    /// than the list undrawn.
+    fn render_services(&mut self, area: Rect, buf: &mut Buffer) -> Vec<crate::mouse::NameHit> {
+        let block = pane_block(self.focus == crate::Focus::Services)
+            .title(pane_name("Services", self.focus == crate::Focus::Services));
+        let rows = block.inner(area);
+        // The marker takes the selected service's status color.
+        let marker = selection_marker(
+            self.state
+                .current_service()
+                .map_or_else(Style::default, |service| {
+                    crate::style::service_style(&service.snapshot)
+                }),
+        );
+        // The list puts the marker before the selected row and as many blanks before the others.
+        let marker_width = marker.width();
+        // An item taller than the list would go undrawn, so its notes take at most the rows
+        // under its own.
+        let note_rows = usize::from(rows.height).saturating_sub(1);
+        let now_ms = now_unix_ms();
+
+        // Each item and the columns before its name.
         let (items, name_columns): (Vec<ListItem>, Vec<usize>) = self
             .state
             .services
@@ -2661,36 +2825,39 @@ impl App {
                 } else {
                     service.snapshot.name.as_str().into()
                 });
-
-                (ListItem::new(line), name_column)
+                let mut lines = vec![line];
+                if let Some(resource) = &service.snapshot.resource {
+                    // The rows start under the name and leave the state column empty, so they
+                    // read as notes on the service rather than services of their own.
+                    let width = usize::from(rows.width).saturating_sub(marker_width + name_column);
+                    let notes = crate::reservation::list_notes(
+                        self.source.reservation(resource).as_ref(),
+                        now_ms,
+                        width,
+                    );
+                    // Of notes that do not all fit, the last stay, such as a queued start's place
+                    // rather than its holder.
+                    let skipped = notes.len().saturating_sub(note_rows);
+                    lines.extend(notes.into_iter().skip(skipped).map(|mut note| {
+                        note.spans.insert(0, Span::raw(" ".repeat(name_column)));
+                        note
+                    }));
+                }
+                (ListItem::new(lines), name_column)
             })
             .unzip();
+        let heights = items.iter().map(ListItem::height).collect::<Vec<_>>();
 
-        let block = pane_block(self.focus == crate::Focus::Services)
-            .title(pane_name("Services", self.focus == crate::Focus::Services));
-        let rows = block.inner(area);
-        // The list scrolls on from where the last frame left it, so the rows a click lands on
-        // stay put once the selection moves to one of them.
-        // Rows freed by a taller pane or a shorter roster go to the services above, which ratatui
-        // would leave scrolled out of view.
-        let max_offset = self
-            .state
-            .services
-            .len()
-            .saturating_sub(usize::from(rows.height));
-        let mut state = ListState::default()
-            .with_offset(self.first_service.min(max_offset))
-            .with_selected(Some(self.state.selected_service));
-        // The marker takes the selected service's status color.
-        let marker = selection_marker(
-            self.state
-                .current_service()
-                .map_or_else(Style::default, |service| {
-                    crate::style::service_style(&service.snapshot)
-                }),
+        let selected = self.state.selected_service;
+        let offset = list_offset(
+            &heights,
+            usize::from(rows.height),
+            self.first_service,
+            selected,
         );
-        // The list puts the marker before the selected row and as many blanks before the others.
-        let marker_width = marker.width();
+        let mut state = ListState::default()
+            .with_offset(offset)
+            .with_selected(Some(selected));
         let sidebar = List::new(items)
             .block(block)
             .highlight_style(Self::HIGHLIGHT_STYLE)
@@ -2698,25 +2865,35 @@ impl App {
         StatefulWidget::render(&sidebar, area, buf, &mut state);
         self.first_service = state.offset();
 
+        // The list draws only whole items from its offset on.
         // A name is what its row shows of it, so a name cut short selects and copies only what
         // shows, and one with no room keeps an empty place, so the names after it keep theirs.
-        let names = (rows.y..rows.bottom())
-            .zip(state.offset()..)
-            .map_while(|(y, index)| {
-                let service = self.state.services.get(index)?;
-                let x = rows
-                    .x
-                    .saturating_add(rows_u16(marker_width + name_columns.get(index)?))
-                    .min(rows.right());
-                let (text, width) = drawn_text(buf, y, x, rows.right());
-                Some(crate::mouse::NameHit {
-                    area: Rect::new(x, y, width, 1),
-                    service: service.snapshot.id.clone(),
-                    line: Line::raw(text),
-                })
-            })
-            .collect();
-        (rows, state.offset(), names)
+        let mut names = Vec::new();
+        let mut y = rows.y;
+        for (index, height) in heights.iter().enumerate().skip(state.offset()) {
+            let height = rows_u16(*height);
+            let (Some(service), Some(name_column)) =
+                (self.state.services.get(index), name_columns.get(index))
+            else {
+                break;
+            };
+            if y.saturating_add(height) > rows.bottom() {
+                break;
+            }
+            let x = rows
+                .x
+                .saturating_add(rows_u16(marker_width + name_column))
+                .min(rows.right());
+            let (text, width) = drawn_text(buf, y, x, rows.right());
+            names.push(crate::mouse::NameHit {
+                area: Rect::new(x, y, width, 1),
+                item: Rect::new(rows.x, y, rows.width, height),
+                service: service.snapshot.id.clone(),
+                line: Line::raw(text),
+            });
+            y = y.saturating_add(height);
+        }
+        names
     }
 
     /// Reads new log records and renders the text the log pane shows for a pane `area` wide.
@@ -2944,6 +3121,12 @@ impl App {
                         },
                         session.as_ref(),
                         attempts.last(),
+                        service
+                            .snapshot
+                            .resource
+                            .as_deref()
+                            .and_then(|resource| self.source.reservation(resource))
+                            .as_ref(),
                         now_unix_ms(),
                     ),
                 )
@@ -2958,7 +3141,7 @@ impl App {
                     .map_or_else(|| "no session".to_string(), |session| session.name.clone());
                 (
                     format!(" Session · {name} "),
-                    session_info_rows(session.as_ref(), self.source.reservations_truncated()),
+                    session_info_rows(session.as_ref()),
                 )
             }
         };

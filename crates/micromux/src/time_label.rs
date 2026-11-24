@@ -21,9 +21,9 @@ pub fn display_time(unix_ms: u64) -> String {
     let relative = if unix_ms.abs_diff(now) < MINUTE_MS {
         "just now".to_string()
     } else if unix_ms >= now {
-        format!("in {}", distance(unix_ms - now))
+        format!("in {}", duration_label(unix_ms - now))
     } else {
-        format!("{} ago", distance(now - unix_ms))
+        format!("{} ago", duration_label(now - unix_ms))
     };
     with_clock(relative, "at", unix_ms)
 }
@@ -42,13 +42,19 @@ pub fn renew_label(renew_by_unix_ms: u64) -> String {
         )
     } else if renew_by_unix_ms >= now {
         with_clock(
-            format!("must renew within {}", distance(renew_by_unix_ms - now)),
+            format!(
+                "must renew within {}",
+                duration_label(renew_by_unix_ms - now)
+            ),
             "by",
             renew_by_unix_ms,
         )
     } else {
         with_clock(
-            format!("was due to renew {} ago", distance(now - renew_by_unix_ms)),
+            format!(
+                "was due to renew {} ago",
+                duration_label(now - renew_by_unix_ms)
+            ),
             "at",
             renew_by_unix_ms,
         )
@@ -73,9 +79,10 @@ fn with_clock(relative: String, preposition: &str, unix_ms: u64) -> String {
     format!("{relative} ({preposition} {})", time.format(format))
 }
 
-/// A distance of a minute or more rounded to the nearest minute: `1h`, `1h 5m`, or `59m`.
-fn distance(ms: u64) -> String {
-    let minutes = (ms + MINUTE_MS / 2) / MINUTE_MS;
+/// A duration of a minute or more rounded to the nearest minute: `1h`, `1h 5m`, or `59m`.
+#[must_use]
+pub fn duration_label(ms: u64) -> String {
+    let minutes = ms.saturating_add(MINUTE_MS / 2) / MINUTE_MS;
     match (minutes / 60, minutes % 60) {
         (0, minutes) => format!("{minutes}m"),
         (hours, 0) => format!("{hours}h"),
@@ -90,9 +97,9 @@ mod tests {
 
     #[test]
     fn distances_round_to_the_nearest_minute() {
-        assert_eq!(distance(3_600_000 - 400), "1h");
-        assert_eq!(distance(3_725_000), "1h 2m");
-        assert_eq!(distance(3_540_500), "59m");
+        assert_eq!(duration_label(3_600_000 - 400), "1h");
+        assert_eq!(duration_label(3_725_000), "1h 2m");
+        assert_eq!(duration_label(3_540_500), "59m");
     }
 
     #[test]
