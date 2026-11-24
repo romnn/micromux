@@ -747,8 +747,10 @@ async fn serve_old_page(
     let port = listener.local_addr()?.port();
     let task = tokio::spawn(async move {
         while let Ok((mut stream, _)) = listener.accept().await {
-            let mut request = [0u8; 1024];
-            let _ = stream.read(&mut request).await;
+            // The whole request is read, so closing the connection cannot reset the reply.
+            if read_head(&mut stream).await.is_err() {
+                continue;
+            }
             let response = format!(
                 "HTTP/1.1 404 Not Found\r\ncontent-type: text/html; charset=utf-8\r\n\
                  connection: close\r\n\r\n<!doctype html><html><body><h1>404 Not Found: no \

@@ -97,24 +97,23 @@ const STYLE: &str = "\
     @media (prefers-color-scheme:dark){:root{--fg:#e6edf3;--muted:#8d96a0;--line:#30363d;\
     --bg:#0d1117;--hover:#161b22;--link:#4493f8}}\
     body{font:15px/1.5 system-ui,sans-serif;max-width:52rem;margin:3rem auto;padding:0 1rem;\
-    color:var(--fg);background:var(--bg)}\
+    color:var(--fg);background:var(--bg);overflow-wrap:anywhere}\
     h1{font-size:1.1rem;font-weight:600;margin:0 0 1.5rem}\
     code{font:.85rem ui-monospace,SFMono-Regular,Menlo,monospace}\
     .muted{color:var(--muted)}\
     details{border:1px solid var(--line);border-radius:8px;margin:.5rem 0;overflow:hidden}\
-    summary{display:flex;align-items:baseline;gap:.75rem;padding:.6rem .9rem;cursor:pointer;\
-    list-style:none;white-space:nowrap}\
+    summary{display:flex;flex-wrap:wrap;align-items:baseline;gap:.25rem .75rem;\
+    padding:.6rem .9rem;cursor:pointer;list-style:none}\
     summary::-webkit-details-marker{display:none}\
     summary::before{content:\"\u{203a}\";color:var(--muted);transition:transform .15s}\
     details[open] summary::before{transform:rotate(90deg)}\
     summary:hover{background:var(--hover)}\
-    summary code{overflow:hidden;text-overflow:ellipsis;min-width:0}\
     .name{font-weight:600}\
     .pill{font-size:.75rem;border:1px solid var(--line);border-radius:999px;padding:0 .5rem}\
     .count{margin-left:auto;font-size:.85rem}\
-    .path{margin:0;padding:0 .9rem 0 2.1rem;font-size:.8rem;overflow-wrap:anywhere}\
+    .path{margin:0;padding:0 .9rem 0 2.1rem;font-size:.8rem}\
     ul{list-style:none;margin:0;padding:.4rem .9rem .8rem 2.1rem}\
-    li{font:.85rem/1.8 ui-monospace,SFMono-Regular,Menlo,monospace;overflow-wrap:anywhere}\
+    li{font:.85rem/1.8 ui-monospace,SFMono-Regular,Menlo,monospace}\
     a{color:var(--link);text-decoration:none}a:hover{text-decoration:underline}\
     footer{margin-top:2rem;font-size:.8rem}";
 
