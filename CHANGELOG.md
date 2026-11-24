@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.5.0
+
 - **The TUI shows who holds each shared resource.** A note under every service that names a
   resource says until when this session's turn is protected or which session holds it and the
   queued place, and a pane above the logs details the selected service's reservation.
