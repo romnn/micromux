@@ -736,19 +736,45 @@ async fn a_busy_outdated_proxy_is_refused_with_its_sessions() -> eyre::Result<()
     Ok(())
 }
 
+/// Serves the not-found page an outdated proxy serves on its HTTP port, listing the sessions
+/// `page` holds when each request arrives, and returns the port.
+///
+/// It never exits by itself; aborting the task stops accepting connections.
+async fn serve_old_page(
+    page: tokio::sync::watch::Receiver<String>,
+) -> eyre::Result<(u16, tokio::task::JoinHandle<()>)> {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
+    let port = listener.local_addr()?.port();
+    let task = tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request).await;
+            let response = format!(
+                "HTTP/1.1 404 Not Found\r\ncontent-type: text/html; charset=utf-8\r\n\
+                 connection: close\r\n\r\n<!doctype html><html><body><h1>404 Not Found: no \
+                 micromux route</h1>{}<hr><small>micromux proxy</small></body></html>",
+                page.borrow().as_str()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        }
+    });
+    Ok((port, task))
+}
+
 /// An outdated proxy that does not list its sessions over the socket still lists them on its
 /// not-found page, so a session refuses it at once, naming the sessions that use it, and stops
 /// waiting for an idle one as soon as a session registers with it.
 #[tokio::test]
 async fn an_outdated_proxy_is_refused_with_the_sessions_its_page_lists() -> eyre::Result<()> {
-    // The stand-in speaks protocol 1 over the socket, and a current proxy serves the HTTP port
-    // it reports, whose not-found page is the one every older proxy serves too.
-    let proxy = start_proxy(Duration::from_secs(60)).await?;
+    // The stand-in speaks protocol 1 over the socket and serves an older proxy's not-found page
+    // on the HTTP port it reports.
+    let (page_tx, page) = tokio::sync::watch::channel(OLD_IDLE_PAGE.to_string());
+    let (port, old_page) = serve_old_page(page).await?;
     let directory = tempfile::tempdir()?;
     let paths = ProxyPaths::in_dir(directory.path());
     let (old_proxy, _received) = spawn_old_proxy(
         &paths,
-        format!(r#"{{"type":"info","port":{},"pid":4242}}"#, proxy.port),
+        format!(r#"{{"type":"info","port":{port},"pid":4242}}"#),
         UNKNOWN_REQUEST.to_string(),
     )?;
     let with_paths = || {
@@ -763,33 +789,17 @@ async fn an_outdated_proxy_is_refused_with_the_sessions_its_page_lists() -> eyre
 
     // Idle: the session waits, and a session registering meanwhile ends the wait with its name.
     let shutdown = CancellationToken::new();
-    let (waiting_tx, mut waiting_rx) = tokio::sync::mpsc::unbounded_channel();
-    let register_old = async {
-        waiting_rx.recv().await;
-        Registrar::start(
-            proxy.paths.clone(),
-            registration("two", &[("app", 1, None)]),
-            proxy.port,
-            None,
-            &shutdown,
-            |_| {},
-        )
-        .await
-    };
-    let (refused, two) = tokio::join!(
-        Registrar::start(
-            paths.clone(),
-            with_paths(),
-            proxy.port,
-            None,
-            &shutdown,
-            move |waiting| {
-                let _ = waiting_tx.send(waiting.to_string());
-            },
-        ),
-        register_old
-    );
-    let _two = two?;
+    let refused = Registrar::start(
+        paths.clone(),
+        with_paths(),
+        port,
+        None,
+        &shutdown,
+        move |_| {
+            page_tx.send_replace(OLD_BUSY_PAGE.to_string());
+        },
+    )
+    .await;
     assert!(
         matches!(
             &refused,
@@ -804,16 +814,9 @@ async fn an_outdated_proxy_is_refused_with_the_sessions_its_page_lists() -> eyre
 
     // Busy: the session refuses it right away.
     let mut waits = Vec::new();
-    let refused = Registrar::start(
-        paths,
-        with_paths(),
-        proxy.port,
-        None,
-        &shutdown,
-        |waiting| {
-            waits.push(waiting.to_string());
-        },
-    )
+    let refused = Registrar::start(paths, with_paths(), port, None, &shutdown, |waiting| {
+        waits.push(waiting.to_string());
+    })
     .await;
     let Err(err @ micromux_proxy::ClientError::OutdatedProxy { .. }) = &refused else {
         eyre::bail!("{refused:?}");
@@ -826,10 +829,17 @@ async fn an_outdated_proxy_is_refused_with_the_sessions_its_page_lists() -> eyre
     assert!(waits.is_empty(), "{waits:?}");
 
     old_proxy.abort();
-    proxy.shutdown.cancel();
-    proxy.task.await??;
+    old_page.abort();
     Ok(())
 }
+
+/// The body an outdated proxy's not-found page has while no session is registered.
+const OLD_IDLE_PAGE: &str = "<p>No session is registered with the proxy right now.</p>";
+
+/// The body an outdated proxy's not-found page has while session `two` is registered.
+const OLD_BUSY_PAGE: &str = "<p>Live sessions:</p><ul><li><strong>two</strong> \
+    <small>(/projects/two/micromux.yaml)</small><ul><li><a href=\"http://app.two.localhost/\">\
+    http://app.two.localhost/</a></li></ul></li></ul>";
 
 /// A session that is asked to stop while it waits for an outdated proxy stops waiting.
 #[tokio::test]
@@ -1068,14 +1078,17 @@ async fn overview_reads_the_current_branch_without_reregistering() -> eyre::Resu
     )
     .await?;
     let first = get(proxy.port, "localhost").await?;
-    assert!(first.contains("<strong>loop1</strong>"), "{first}");
-    assert!(first.contains("<code>feature/first</code>"), "{first}");
+    assert!(
+        first.contains("<span class=\"name\">loop1</span>"),
+        "{first}"
+    );
+    assert!(first.contains(">feature/first</code>"), "{first}");
     std::fs::write(
         directory.path().join(".git/HEAD"),
         "ref: refs/heads/feature/second\n",
     )?;
     let second = get(proxy.port, "localhost").await?;
-    assert!(second.contains("<code>feature/second</code>"), "{second}");
+    assert!(second.contains(">feature/second</code>"), "{second}");
     assert!(!second.contains("feature/first"), "{second}");
     proxy.shutdown.cancel();
     proxy.task.await??;

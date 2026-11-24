@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- **The proxy's session list folds each session to one line and follows the browser's light or
+  dark theme.** Open `http://localhost/` and click a session to see its URLs.
+
 ## v0.5.0
 
 - **The TUI shows who holds each shared resource.** A note under every service that names a
