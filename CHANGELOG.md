@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.5.1
+
 - **The proxy's session list folds each session to one line and follows the browser's light or
   dark theme.** Open `http://localhost/` and click a session to see its URLs.
 
