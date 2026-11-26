@@ -1,4 +1,4 @@
-//! The session side: finding or starting the proxy, and keeping a registration alive.
+//! The session side: finding, starting or replacing the proxy, and keeping a registration alive.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -12,14 +12,14 @@ use tokio::sync::watch;
 use tokio_util::codec::{Framed, LinesCodec};
 use tokio_util::sync::CancellationToken;
 
-use crate::listen::PortPreference;
+use crate::listen::{self, PortPreference};
 use crate::paths::ProxyPaths;
 use crate::protocol::{
-    ClientMessage, IDLE_TIMEOUT, LEASE_TIMEOUT, MAX_MESSAGE_BYTES, PING_INTERVAL, PORTS_PROTOCOL,
-    ProxyMessage, RegisteredSession, Registration, RouteTarget,
+    ClientMessage, LEASE_TIMEOUT, MAX_MESSAGE_BYTES, PING_INTERVAL, PORTS_PROTOCOL, ProxyMessage,
+    Registration, RouteTarget,
 };
 
-/// How long a session waits for a proxy it started to come up.
+/// How long a session waits for a proxy it started to come up, which also bounds a replacement.
 const START_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long one request on the registration socket may take.
@@ -30,21 +30,6 @@ const MAX_BACKOFF: Duration = Duration::from_secs(10);
 
 /// Longest proxy error output reported back to the session.
 const MAX_ERROR_OUTPUT: u64 = 16 * 1024;
-
-/// How long a session waits for an outdated proxy to exit before it gives up.
-///
-/// An outdated proxy that no session uses exits within its idle timeout.
-/// The lease covers a session that went away without closing its connection, which the proxy
-/// only notices once the lease runs out, and leaves room for the proxy's idle check and shutdown.
-pub const OUTDATED_PROXY_WAIT: Duration = IDLE_TIMEOUT.saturating_add(LEASE_TIMEOUT);
-
-/// How the description [`Registrar::start`] passes to `on_wait` begins while the session waits
-/// for an outdated proxy to exit, for a caller that only sees that description as text, such as
-/// the process that started the session and reads its stderr.
-pub const WAITING_FOR_OUTDATED_PROXY: &str = "waiting for the outdated proxy";
-
-/// How often a session checks whether an outdated proxy has exited.
-const OUTDATED_PROXY_POLL: Duration = Duration::from_millis(250);
 
 type Connection = Framed<UnixStream, LinesCodec>;
 
@@ -85,9 +70,13 @@ pub enum ClientError {
         wanted: String,
     },
     /// The running proxy speaks an older registration protocol that would serve the routes
-    /// differently, such as ignoring their paths, and other sessions still use it, or it did not
-    /// exit in time.
-    #[error("{}", outdated_proxy_message(*.pid, *.protocol, *.required, .sessions.as_deref()))]
+    /// differently, such as ignoring their paths, and this session could not replace it.
+    #[error(
+        "the running micromux proxy (pid {pid}) speaks registration protocol {protocol}, but this \
+         session's routes need {required} (path routes); it was started by an older micromux, \
+         which starts it again while its sessions run: restart them with this micromux, or stop \
+         the proxy with `kill {pid}`"
+    )]
     OutdatedProxy {
         /// Process id of the running proxy.
         pid: u32,
@@ -95,9 +84,6 @@ pub enum ClientError {
         protocol: u32,
         /// The protocol the routes need.
         required: u32,
-        /// The sessions registered with the proxy, or `None` when it cannot tell and did not
-        /// exit within the wait.
-        sessions: Option<Vec<RegisteredSession>>,
     },
     /// The proxy refused the registration because of a conflict with another session.
     #[error("the micromux proxy rejected the routes: {0}")]
@@ -108,43 +94,6 @@ pub enum ClientError {
     /// The proxy answered something unexpected or nothing at all.
     #[error("unexpected reply from the micromux proxy: {0}")]
     Protocol(String),
-    /// The session was asked to stop while it waited for an outdated proxy to exit.
-    #[error("cancelled while waiting for the outdated micromux proxy to exit")]
-    Cancelled,
-}
-
-/// Explains [`ClientError::OutdatedProxy`] and what to do about it.
-fn outdated_proxy_message(
-    pid: u32,
-    protocol: u32,
-    required: u32,
-    sessions: Option<&[RegisteredSession]>,
-) -> String {
-    let outdated = format!(
-        "the running micromux proxy (pid {pid}) speaks registration protocol {protocol}, but this \
-         session's routes need {required} (path routes)"
-    );
-    match sessions {
-        Some(sessions) if !sessions.is_empty() => {
-            let sessions = sessions
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(", ");
-            format!(
-                "{outdated}; it was started by an older micromux and still serves {sessions}: \
-                 stop those sessions or restart them with this micromux, which would otherwise \
-                 start it again, and start this session again; once only sessions of this \
-                 micromux use it, `kill {pid}` moves them to a new proxy"
-            )
-        }
-        _ => format!(
-            "{outdated}; it was started by an older micromux and did not exit within \
-             {OUTDATED_PROXY_WAIT:?}, so sessions of that micromux likely still use it: stop or \
-             restart them, which would otherwise start it again, then start this session again, \
-             or stop the proxy with `kill {pid}`"
-        ),
-    }
 }
 
 impl ClientError {
@@ -157,24 +106,44 @@ impl ClientError {
     }
 }
 
-/// Starts a detached proxy process when none is running.
+/// Starts a detached proxy process when none is running, or in place of one from an older
+/// release.
 #[derive(Debug, Clone)]
 pub struct ProxyLauncher {
     program: PathBuf,
     args: Vec<OsString>,
+    /// The micromux release `program` runs, or `None` when it does not parse, which never
+    /// replaces a running proxy.
+    version: Option<semver::Version>,
 }
 
 impl ProxyLauncher {
-    /// A launcher running `program` with `args`, followed by `--port` and `--fallback-port`.
+    /// A launcher running `program`, of micromux release `version`, with `args`, followed by
+    /// `--port` and `--fallback-port`.
     #[must_use]
     pub fn new(
         program: impl Into<PathBuf>,
         args: impl IntoIterator<Item = impl Into<OsString>>,
+        version: &str,
     ) -> Self {
         Self {
             program: program.into(),
             args: args.into_iter().map(Into::into).collect(),
+            version: semver::Version::parse(version).ok(),
         }
+    }
+
+    /// Whether a proxy that reports `version` runs an older release than this launcher starts.
+    ///
+    /// A proxy that reports none predates the report, so it is older; one whose version does not
+    /// parse is never taken for older.
+    fn upgrades(&self, version: Option<&str>) -> bool {
+        let Some(ours) = &self.version else {
+            return false;
+        };
+        version.is_none_or(|theirs| {
+            semver::Version::parse(theirs).is_ok_and(|theirs| theirs.cmp_precedence(ours).is_lt())
+        })
     }
 
     fn launch(&self, preference: PortPreference) -> std::io::Result<tokio::process::Child> {
@@ -198,70 +167,286 @@ impl ProxyLauncher {
     }
 }
 
+/// What a proxy says about itself in [`ProxyMessage::Info`].
+#[derive(Debug)]
+struct ProxyInfo {
+    port: u16,
+    pid: u32,
+    protocol: u32,
+    version: Option<String>,
+}
+
+/// One attempt's budget for finding, starting or replacing the proxy.
+struct Handoff {
+    deadline: Instant,
+    /// The proxy this attempt asked to exit, which may still answer while it shuts down.
+    ///
+    /// An attempt replaces at most one proxy, so sessions of different releases cannot keep
+    /// replacing each other's proxies within it.
+    retired: Option<u32>,
+}
+
+impl Handoff {
+    fn new() -> Self {
+        Self {
+            deadline: Instant::now() + START_TIMEOUT,
+            retired: None,
+        }
+    }
+}
+
 /// Finds the running proxy, or starts one, has it listen as `preference` asks, and returns the
 /// port it serves the session on.
 ///
 /// A running proxy listens on the preferred port, or on the fallback when the preferred one is
 /// privileged or taken, alongside the ports it serves other sessions on.
+/// A running proxy from an older release than `launcher` starts is replaced first: a successor
+/// starts on its port and the old proxy exits, which drops the connections it carried, and every
+/// session registered with it registers again with the successor.
 /// A proxy older than [`PORTS_PROTOCOL`] listens on one port only, and is accepted only when
 /// that port is one `preference` allows.
-/// When it is not and the proxy says no session uses it, it is asked to stop, and a current
-/// proxy takes its place.
 ///
 /// # Errors
 ///
 /// Returns [`ClientError::CannotListen`] when the proxy cannot bind an acceptable port,
-/// [`ClientError::PortMismatch`] when an older proxy that sessions use listens on another port,
-/// [`ClientError::StartFailed`] with the proxy's own explanation when a started proxy exits, and
-/// [`ClientError::Unreachable`] when no proxy runs and `launcher` is `None`.
+/// [`ClientError::PortMismatch`] when an older proxy that cannot be replaced listens on another
+/// port, [`ClientError::StartFailed`] with the proxy's own explanation when a started proxy
+/// exits, and [`ClientError::Unreachable`] when no proxy runs and `launcher` is `None`.
 pub async fn ensure_proxy(
     paths: &ProxyPaths,
     preference: PortPreference,
     launcher: Option<&ProxyLauncher>,
 ) -> Result<u16, ClientError> {
-    let first = match listen(&paths.socket, preference).await {
-        Err(err) if err.is_transient() => err,
-        result => return result,
-    };
-    let Some(launcher) = launcher else {
-        return Err(first);
-    };
-    let mut child = launcher
-        .launch(preference)
-        .map_err(|err| ClientError::StartFailed(format!("cannot run the proxy: {err}")))?;
-    let deadline = Instant::now() + START_TIMEOUT;
+    let mut handoff = Handoff::new();
     loop {
-        match listen(&paths.socket, preference).await {
-            Err(err) if err.is_transient() => {}
+        let (connection, info) = connect_current(paths, preference, launcher, &mut handoff).await?;
+        match listen(connection, &info, preference).await {
+            // A proxy that answered a moment ago may be exiting for idleness by now.
+            Err(err)
+                if err.is_transient()
+                    && launcher.is_some()
+                    && Instant::now() < handoff.deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
             result => return result,
+        }
+    }
+}
+
+/// Connects to the running proxy, and returns the connection with what the proxy said about
+/// itself.
+///
+/// Without a running proxy, `launcher` starts one that listens as `preference` asks.
+/// A running proxy from an older release than `launcher` starts is replaced (see [`replace`]),
+/// once per `handoff`; a session without a launcher uses whichever proxy runs.
+async fn connect_current(
+    paths: &ProxyPaths,
+    preference: PortPreference,
+    launcher: Option<&ProxyLauncher>,
+    handoff: &mut Handoff,
+) -> Result<(Connection, ProxyInfo), ClientError> {
+    let mut reply = hello(&paths.socket).await;
+    loop {
+        let started = match reply {
+            // The replaced proxy may still answer while it shuts down.
+            Ok((_, info)) if Some(info.pid) == handoff.retired => None,
+            Ok((connection, info)) => {
+                let Some(launcher) = launcher.filter(|launcher| {
+                    handoff.retired.is_none() && launcher.upgrades(info.version.as_deref())
+                }) else {
+                    return Ok((connection, info));
+                };
+                match replace(&connection, &info, launcher) {
+                    Ok(successor) => {
+                        tracing::info!(
+                            pid = info.pid,
+                            version = info.version.as_deref().unwrap_or("unknown"),
+                            "replacing a proxy from an older micromux"
+                        );
+                        handoff.retired = Some(info.pid);
+                        Some(successor)
+                    }
+                    Err(reason) => {
+                        tracing::info!(
+                            pid = info.pid,
+                            reason,
+                            "keeping a proxy from an older micromux"
+                        );
+                        return Ok((connection, info));
+                    }
+                }
+            }
+            Err(err) if err.is_transient() => {
+                let Some(launcher) = launcher else {
+                    return Err(err);
+                };
+                Some(launcher.launch(preference).map_err(|err| {
+                    ClientError::StartFailed(format!("cannot run the proxy: {err}"))
+                })?)
+            }
+            Err(err) => return Err(err),
+        };
+        reply = match started {
+            Some(child) => Ok(wait_for_start(paths, child, handoff).await?),
+            None if Instant::now() >= handoff.deadline => return Err(no_answer(paths)),
+            None => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                hello(&paths.socket).await
+            }
+        };
+    }
+}
+
+/// Waits until a proxy other than the one `handoff` retired answers, which `child`, a proxy this
+/// session started, may or may not be, and returns its reply.
+///
+/// A `child` that lost the start keeps waiting for the lock, and exits once the lock stays taken
+/// for longer than the proxy waits for it.
+async fn wait_for_start(
+    paths: &ProxyPaths,
+    mut child: tokio::process::Child,
+    handoff: &Handoff,
+) -> Result<(Connection, ProxyInfo), ClientError> {
+    let answered = async || {
+        hello(&paths.socket)
+            .await
+            .ok()
+            .filter(|(_, info)| Some(info.pid) != handoff.retired)
+    };
+    loop {
+        if let Some(reply) = answered().await {
+            return Ok(reply);
         }
         if let Ok(Some(status)) = child.try_wait() {
             // It may have lost a start race to another proxy that is up by now.
-            match listen(&paths.socket, preference).await {
-                Err(err) if err.is_transient() => {}
-                result => return result,
-            }
-            let mut output = String::new();
-            if let Some(stderr) = child.stderr.take() {
-                let _ = stderr
-                    .take(MAX_ERROR_OUTPUT)
-                    .read_to_string(&mut output)
-                    .await;
-            }
-            let output = output.trim();
-            return Err(ClientError::StartFailed(if output.is_empty() {
-                format!("it exited with {status}")
-            } else {
-                output.to_string()
-            }));
+            return match answered().await {
+                Some(reply) => Ok(reply),
+                None => Err(start_failed(&mut child, status).await),
+            };
         }
-        if Instant::now() >= deadline {
-            return Err(ClientError::StartFailed(format!(
-                "it did not answer on {} within {START_TIMEOUT:?}",
-                paths.socket.display()
-            )));
+        if Instant::now() >= handoff.deadline {
+            return Err(no_answer(paths));
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+fn no_answer(paths: &ProxyPaths) -> ClientError {
+    ClientError::StartFailed(format!(
+        "no current proxy answered on {} within {START_TIMEOUT:?}",
+        paths.socket.display()
+    ))
+}
+
+/// Explains why a proxy this session started exited with `status`, from its own error output.
+async fn start_failed(
+    child: &mut tokio::process::Child,
+    status: std::process::ExitStatus,
+) -> ClientError {
+    let mut output = String::new();
+    if let Some(stderr) = child.stderr.take() {
+        let _ = stderr
+            .take(MAX_ERROR_OUTPUT)
+            .read_to_string(&mut output)
+            .await;
+    }
+    let output = output.trim();
+    ClientError::StartFailed(if output.is_empty() {
+        format!("it exited with {status}")
+    } else {
+        output.to_string()
+    })
+}
+
+/// Starts a successor to the proxy behind `connection`, which `info` describes, and asks that
+/// proxy to exit.
+///
+/// The successor starts on the proxy's own port, which sessions of every release accept, and
+/// waits for the proxy's lock, so it takes over as soon as the proxy lets go, before a session of
+/// an older release can start one of its own.
+/// The signal goes only to the process verified as the socket's peer, run by this user, and never
+/// to this process.
+/// Its pid could still be reused between the check and the signal, but only if the proxy exits
+/// on its own in that moment.
+///
+/// Returns why the proxy is kept instead, such as when the successor could not listen on the
+/// proxy's port because it is privileged and the older binary had the capability to bind it.
+fn replace(
+    connection: &Connection,
+    info: &ProxyInfo,
+    launcher: &ProxyLauncher,
+) -> Result<tokio::process::Child, String> {
+    let peer = connection
+        .get_ref()
+        .peer_cred()
+        .map_err(|err| format!("cannot identify the proxy process: {err}"))?;
+    let pid = i32::try_from(info.pid).map_err(|_| format!("invalid pid {}", info.pid))?;
+    if peer.pid() != Some(pid)
+        || peer.uid() != nix::unistd::geteuid().as_raw()
+        || info.pid == std::process::id()
+    {
+        return Err("the process behind the socket is not the proxy it reports".to_string());
+    }
+    if !listen::may_bind(info.port) {
+        return Err(format!(
+            "this micromux may not listen on port {}",
+            info.port
+        ));
+    }
+    let mut successor = launcher
+        .launch(PortPreference {
+            port: info.port,
+            fallback_port: None,
+        })
+        .map_err(|err| format!("cannot run the proxy: {err}"))?;
+    match nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(pid),
+        nix::sys::signal::Signal::SIGTERM,
+    ) {
+        // Another session replaced it first, and the successor may already be taking over.
+        Ok(()) | Err(nix::errno::Errno::ESRCH) => Ok(successor),
+        Err(err) => {
+            let _ = successor.start_kill();
+            Err(format!("cannot stop it: {err}"))
+        }
+    }
+}
+
+/// Has the proxy behind `connection`, which `info` describes, listen as `preference` asks, and
+/// returns the port.
+async fn listen(
+    mut connection: Connection,
+    info: &ProxyInfo,
+    preference: PortPreference,
+) -> Result<u16, ClientError> {
+    if info.protocol < PORTS_PROTOCOL {
+        if preference.accepts(info.port) {
+            return Ok(info.port);
+        }
+        return Err(ClientError::PortMismatch {
+            running: info.port,
+            wanted: match preference.fallback_port {
+                Some(fallback) => format!("{} or {fallback}", preference.port),
+                None => preference.port.to_string(),
+            },
+        });
+    }
+    let listen = ClientMessage::Listen {
+        port: preference.port,
+        fallback_port: preference.fallback_port,
+    };
+    match request(&mut connection, &listen).await? {
+        ProxyMessage::Listening { port } => Ok(port),
+        ProxyMessage::Rejected {
+            reason,
+            transient: true,
+        } => Err(ClientError::Unavailable(reason)),
+        ProxyMessage::Rejected {
+            reason,
+            transient: false,
+        } => Err(ClientError::CannotListen(reason)),
+        other => Err(ClientError::Protocol(format!("{other:?}"))),
     }
 }
 
@@ -276,6 +461,29 @@ async fn connect(socket: &Path) -> Result<Connection, ClientError> {
         stream,
         LinesCodec::new_with_max_length(MAX_MESSAGE_BYTES),
     ))
+}
+
+/// Connects to the proxy answering on `socket` and asks what it is.
+async fn hello(socket: &Path) -> Result<(Connection, ProxyInfo), ClientError> {
+    let mut connection = connect(socket).await?;
+    match request(&mut connection, &ClientMessage::Hello).await? {
+        ProxyMessage::Info {
+            port,
+            pid,
+            protocol,
+            version,
+            ..
+        } => Ok((
+            connection,
+            ProxyInfo {
+                port,
+                pid,
+                protocol,
+                version,
+            },
+        )),
+        other => Err(ClientError::Protocol(format!("{other:?}"))),
+    }
 }
 
 async fn request(
@@ -301,75 +509,11 @@ async fn request(
     }
 }
 
-/// Has the proxy answering on `socket` listen as `preference` asks, and returns the port.
-async fn listen(socket: &Path, preference: PortPreference) -> Result<u16, ClientError> {
-    let mut connection = connect(socket).await?;
-    let (port, pid, protocol, sessions) =
-        match request(&mut connection, &ClientMessage::Hello).await? {
-            ProxyMessage::Info {
-                port,
-                pid,
-                protocol,
-                sessions,
-            } => (port, pid, protocol, sessions),
-            other => return Err(ClientError::Protocol(format!("{other:?}"))),
-        };
-    if protocol < PORTS_PROTOCOL {
-        if preference.accepts(port) {
-            return Ok(port);
-        }
-        // An older proxy that no session uses only waits out its idle timeout, so it makes way
-        // for a current one, which the caller then starts.
-        if sessions.is_some_and(|sessions| sessions.is_empty())
-            && let Ok(ProxyMessage::Stopping) =
-                request(&mut connection, &ClientMessage::StopIfIdle).await
-        {
-            tracing::info!(pid, protocol, port, "stopped an idle proxy on another port");
-            return Err(ClientError::Unavailable(format!(
-                "stopped the idle older proxy (pid {pid}) that listened only on port {port}"
-            )));
-        }
-        return Err(ClientError::PortMismatch {
-            running: port,
-            wanted: match preference.fallback_port {
-                Some(fallback) => format!("{} or {fallback}", preference.port),
-                None => preference.port.to_string(),
-            },
-        });
-    }
-    let listen = ClientMessage::Listen {
-        port: preference.port,
-        fallback_port: preference.fallback_port,
-    };
-    match request(&mut connection, &listen).await? {
-        ProxyMessage::Listening { port } => Ok(port),
-        ProxyMessage::Rejected {
-            reason,
-            transient: true,
-        } => Err(ClientError::Unavailable(reason)),
-        ProxyMessage::Rejected {
-            reason,
-            transient: false,
-        } => Err(ClientError::CannotListen(reason)),
-        other => Err(ClientError::Protocol(format!("{other:?}"))),
-    }
-}
-
-/// Connects to the proxy on exactly `port` (starting it if needed) and registers.
+/// Connects to the proxy serving exactly `port` (starting or replacing it as
+/// [`connect_current`] does) and registers.
 ///
-/// A proxy that speaks too old a protocol for the routes is taken over when no session uses it:
-/// a proxy that answers [`ClientMessage::StopIfIdle`] is asked to stop, and any other is given
-/// until [`OUTDATED_PROXY_WAIT`] to exit by itself, with `on_wait` told what the session waits
-/// for.
-/// Either way the next round starts a current proxy.
-/// A proxy that serves other sessions, by its own account or its not-found page's, is refused
-/// with their names, and nothing ever signals the old proxy's process.
-async fn register(
-    target: &Maintained,
-    outdated_proxies: &mut OutdatedProxies,
-    on_wait: &mut (dyn FnMut(&str) + Send),
-    stop: &CancellationToken,
-) -> Result<Live, ClientError> {
+/// A proxy from revision 4 on opens the port for the registration itself.
+async fn register(target: &Maintained, handoff: &mut Handoff) -> Result<Live, ClientError> {
     let Maintained {
         paths,
         registration,
@@ -381,172 +525,22 @@ async fn register(
         port: *port,
         fallback_port: None,
     };
-    let required = registration.required_protocol();
-    loop {
-        // A port that cannot be bound right now may come free again, while the session cannot
-        // move to another one, so the registration keeps retrying rather than failing.
-        ensure_proxy(paths, exact, launcher.as_ref())
-            .await
-            .map_err(|err| match err {
-                ClientError::CannotListen(reason) => ClientError::Unavailable(reason),
-                err => err,
-            })?;
-        let mut connection = connect(&paths.socket).await?;
-        // Ask on the registration connection itself, so the answer describes the very proxy that
-        // takes the routes even if another one replaced it since `ensure_proxy`.
-        let (proxy_port, pid, protocol, sessions) =
-            match request(&mut connection, &ClientMessage::Hello).await? {
-                ProxyMessage::Info {
-                    port,
-                    pid,
-                    protocol,
-                    sessions,
-                } => (port, pid, protocol, sessions),
-                other => return Err(ClientError::Protocol(format!("{other:?}"))),
-            };
-        if protocol >= required {
-            return register_on(connection, registration, protocol).await;
-        }
-        let outdated = |sessions| ClientError::OutdatedProxy {
-            pid,
-            protocol,
-            required,
-            sessions,
-        };
-
-        // Outdated proxy: stop it if it says nobody uses it, refuse it if somebody does.
-        // A proxy older than revision 3 does not say over the socket, but its not-found page
-        // lists the sessions; one that tells neither way is waited out.
-        let stoppable = sessions.is_some();
-        let sessions = match sessions {
-            Some(sessions) => Some(sessions),
-            None => listed_sessions(proxy_port).await,
-        };
-        match sessions {
-            Some(sessions) if !sessions.is_empty() => return Err(outdated(Some(sessions))),
-            Some(_) if stoppable => {
-                match request(&mut connection, &ClientMessage::StopIfIdle).await {
-                    Ok(ProxyMessage::Stopping) => {
-                        tracing::info!(pid, protocol, "stopped an idle outdated proxy");
-                    }
-                    Ok(ProxyMessage::Busy { sessions }) => return Err(outdated(Some(sessions))),
-                    // It may be exiting already; the wait below tells.
-                    Ok(_) | Err(_) => {}
-                }
-            }
-            Some(_) | None => {}
-        }
-
-        // Wait for it to exit
-        drop(connection);
-        if outdated_proxies.announced != Some(pid) {
-            outdated_proxies.announced = Some(pid);
-            tracing::info!(
-                pid,
-                protocol,
-                required,
-                "waiting for an outdated proxy to exit"
-            );
-            on_wait(&format!("{WAITING_FOR_OUTDATED_PROXY} (pid {pid}) to exit"));
-        }
-        let deadline = *outdated_proxies
-            .deadline
-            .get_or_insert_with(|| tokio::time::Instant::now() + OUTDATED_PROXY_WAIT);
-        if tokio::time::Instant::now() >= deadline {
-            return Err(outdated(None));
-        }
-        tokio::select! {
-            () = stop.cancelled() => return Err(ClientError::Cancelled),
-            () = tokio::time::sleep(OUTDATED_PROXY_POLL) => {}
-        }
-    }
-}
-
-/// The wait for outdated proxies to exit, which spans every registration attempt until one
-/// succeeds.
-///
-/// One bound covers them all, even when the attempt fails for another reason in between or an
-/// older micromux starts another outdated proxy after the first one exits.
-#[derive(Debug, Default)]
-struct OutdatedProxies {
-    /// When the session stops waiting, set once it first finds an outdated proxy.
-    deadline: Option<tokio::time::Instant>,
-    /// The outdated proxy the session last reported waiting for.
-    announced: Option<u32>,
-}
-
-impl OutdatedProxies {
-    /// Whether the session is still within its wait for an outdated proxy.
-    fn waiting(&self) -> bool {
-        self.deadline
-            .is_some_and(|deadline| tokio::time::Instant::now() < deadline)
-    }
-}
-
-/// The host the session asks a proxy's not-found page for; no session domain contains it.
-const PROBE_HOST: &str = "micromux-probe.invalid";
-
-/// The sessions an older proxy listening on `port` lists on its not-found page, or `None` when
-/// the page cannot be read.
-///
-/// Every proxy answers a host no session serves with a page that says either that no session is
-/// registered or which sessions are, so a proxy that predates [`ProxyMessage::Info`]'s session
-/// list still tells.
-async fn listed_sessions(port: u16) -> Option<Vec<RegisteredSession>> {
-    let probe = async {
-        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
-            .await
-            .ok()?;
-        tokio::io::AsyncWriteExt::write_all(
-            &mut stream,
-            format!("GET / HTTP/1.1\r\nHost: {PROBE_HOST}\r\nConnection: close\r\n\r\n").as_bytes(),
-        )
-        .await
-        .ok()?;
-        let mut response = String::new();
-        stream
-            .take(MAX_PAGE_BYTES)
-            .read_to_string(&mut response)
-            .await
-            .ok()?;
-        Some(response)
-    };
-    let response = tokio::time::timeout(REPLY_TIMEOUT, probe).await.ok()??;
-    parse_not_found_sessions(&response)
-}
-
-/// Longest not-found page read from an older proxy.
-const MAX_PAGE_BYTES: u64 = 256 * 1024;
-
-/// Reads the session list off a proxy's not-found response.
-fn parse_not_found_sessions(response: &str) -> Option<Vec<RegisteredSession>> {
-    if !response.starts_with("HTTP/1.1 404 ") {
-        return None;
-    }
-    if response.contains("<p>No session is registered with the proxy right now.</p>") {
-        return Some(Vec::new());
-    }
-    let (_, list) = response.split_once("<p>Live sessions:</p>")?;
-    // The page escapes names and paths, so neither contains the markup around them.
-    let mut sessions = Vec::new();
-    for item in list.split("<li><strong>").skip(1) {
-        let (session, rest) = item.split_once("</strong> <small>(")?;
-        let (config_path, _) = rest.split_once(")</small>")?;
-        sessions.push(RegisteredSession {
-            session: unescape_html(session),
-            config_path: unescape_html(config_path),
+    let (connection, info) = connect_current(paths, exact, launcher.as_ref(), handoff).await?;
+    if info.protocol < PORTS_PROTOCOL && info.port != *port {
+        return Err(ClientError::PortMismatch {
+            running: info.port,
+            wanted: port.to_string(),
         });
     }
-    (!sessions.is_empty()).then_some(sessions)
-}
-
-/// Reverses the proxy pages' HTML escaping.
-fn unescape_html(text: &str) -> String {
-    text.replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&#39;", "'")
-        .replace("&amp;", "&")
+    let required = registration.required_protocol();
+    if info.protocol < required {
+        return Err(ClientError::OutdatedProxy {
+            pid: info.pid,
+            protocol: info.protocol,
+            required,
+        });
+    }
+    register_on(connection, registration, info.protocol).await
 }
 
 /// Registers on `connection`, whose proxy speaks `protocol`.
@@ -608,26 +602,20 @@ impl Registrar {
     /// routes on; a proxy that does not listen on it opens it, or refuses the registration as
     /// retryable while it cannot.
     ///
-    /// A running proxy that speaks too old a protocol for the routes but serves no session is
-    /// taken over: the registrar has it stop, or waits for it to exit by itself, and then starts
-    /// a current one.
-    /// `on_wait` receives a description of such a wait, such as `waiting for the outdated proxy
-    /// (pid 4242) to exit`, for the session to show while it starts.
-    /// Later waits, on a reconnect, are reported through [`Self::status`].
+    /// A running proxy from an older release than `launcher` starts is replaced first, as
+    /// [`ensure_proxy`] describes.
     ///
     /// # Errors
     ///
     /// Returns the first registration's error, such as [`ClientError::Rejected`] when another
-    /// live session already serves the same session domain,
-    /// [`ClientError::OutdatedProxy`] when an outdated proxy still serves other sessions or does
-    /// not exit in time, and [`ClientError::Cancelled`] when `shutdown` fires during that wait.
+    /// live session already serves the same session domain, and [`ClientError::OutdatedProxy`]
+    /// when a proxy too old for the routes runs and cannot be replaced.
     pub async fn start(
         paths: ProxyPaths,
         registration: Registration,
         port: u16,
         launcher: Option<ProxyLauncher>,
         shutdown: &CancellationToken,
-        mut on_wait: impl FnMut(&str) + Send,
     ) -> Result<Self, ClientError> {
         let registration = Registration {
             proxy_port: port,
@@ -641,18 +629,12 @@ impl Registrar {
         };
         // A proxy that answered a moment ago may be exiting for idleness or replaced by now, so
         // retry what a fresh proxy can fix; conflicts and port mismatches stay fatal.
-        let deadline = Instant::now() + START_TIMEOUT;
+        let mut handoff = Handoff::new();
         let mut backoff = Duration::from_millis(50);
-        let mut outdated_proxies = OutdatedProxies::default();
         let connection = loop {
-            match register(&maintained, &mut outdated_proxies, &mut on_wait, shutdown).await {
+            match register(&maintained, &mut handoff).await {
                 Ok(connection) => break connection,
-                // An outdated proxy that exits while the session waits for it can fail an attempt
-                // midway, which the next attempt recovers from as long as the wait lasts.
-                Err(err)
-                    if err.is_transient()
-                        && (Instant::now() < deadline || outdated_proxies.waiting()) =>
-                {
+                Err(err) if err.is_transient() && Instant::now() < handoff.deadline => {
                     tracing::debug!(%err, "retrying the proxy registration");
                     tokio::time::sleep(backoff).await;
                     backoff = (backoff * 2).min(Duration::from_secs(1));
@@ -717,10 +699,8 @@ async fn maintain(
 ) {
     let mut connection = Some(connection);
     let mut backoff = Duration::from_millis(250);
-    let mut outdated_proxies = OutdatedProxies::default();
     loop {
         if let Some(live) = connection.take() {
-            outdated_proxies = OutdatedProxies::default();
             // The channel starts out registered, so only a restored registration notifies.
             status.send_if_modified(|current| {
                 let restored = *current != RegistrationStatus::Registered;
@@ -739,14 +719,8 @@ async fn maintain(
             () = tokio::time::sleep(backoff) => {}
         }
         maintained.registration.routes = routes.borrow_and_update().clone();
-        let mut on_wait = |reason: &str| {
-            status.send_replace(RegistrationStatus::Unavailable {
-                reason: reason.to_string(),
-            });
-        };
-        match register(&maintained, &mut outdated_proxies, &mut on_wait, &stop).await {
+        match register(&maintained, &mut Handoff::new()).await {
             Ok(live) => connection = Some(live),
-            Err(ClientError::Cancelled) => return,
             Err(err) => {
                 tracing::warn!(%err, "cannot restore the proxy registration");
                 status.send_replace(RegistrationStatus::Unavailable {
@@ -813,67 +787,5 @@ async fn keep_alive(
                 return Some("the proxy stopped answering".to_string());
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use similar_asserts::assert_eq;
-
-    /// A protocol 1 proxy's not-found page, as it renders it, lists the sessions with their
-    /// escaped names and config paths, or says that none is registered.
-    #[test]
-    fn reads_the_sessions_off_a_not_found_page() {
-        let response = |body: &str| {
-            format!(
-                "HTTP/1.1 404 Not Found\r\ncontent-type: text/html; charset=utf-8\r\n\r\n\
-                 <!doctype html><html><head><meta charset=\"utf-8\"><title>404 Not Found: no \
-                 micromux route</title></head><body><h1>404 Not Found: no micromux route</h1>\
-                 <p>No micromux session serves <code>micromux-probe.invalid</code>.</p>{body}\
-                 <hr><small>micromux proxy</small></body></html>"
-            )
-        };
-
-        // Idle
-        assert_eq!(
-            parse_not_found_sessions(&response(
-                "<p>No session is registered with the proxy right now.</p>"
-            )),
-            Some(Vec::new())
-        );
-
-        // Busy, with escaped names and paths
-        let busy = response(
-            "<p>Live sessions:</p><ul>\
-             <li><strong>luup2</strong> <small>(/home/me/luup2/micromux.yaml)</small><ul>\
-             <li><a href=\"http://app.luup2.localhost\">http://app.luup2.localhost</a></li>\
-             </ul></li>\
-             <li><strong>a&amp;b</strong> <small>(/tmp/&lt;x&gt; &#39;y&#39;/micromux.yaml)</small>\
-             <ul></ul></li></ul>",
-        );
-        assert_eq!(
-            parse_not_found_sessions(&busy),
-            Some(vec![
-                RegisteredSession {
-                    session: "luup2".to_string(),
-                    config_path: "/home/me/luup2/micromux.yaml".to_string(),
-                },
-                RegisteredSession {
-                    session: "a&b".to_string(),
-                    config_path: "/tmp/<x> 'y'/micromux.yaml".to_string(),
-                },
-            ])
-        );
-
-        // Anything else tells nothing
-        assert_eq!(
-            parse_not_found_sessions("HTTP/1.1 502 Bad Gateway\r\n\r\n"),
-            None
-        );
-        assert_eq!(
-            parse_not_found_sessions(&response("<p>Something else</p>")),
-            None
-        );
     }
 }

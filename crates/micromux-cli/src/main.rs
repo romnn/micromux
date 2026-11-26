@@ -733,10 +733,6 @@ async fn async_main() -> color_eyre::Result<()> {
         Err(Error::CleanupWait(micromux::CleanupWaitError::Cancelled)) => {
             std::process::exit(EXIT_INTERRUPTED)
         }
-        #[cfg(unix)]
-        Err(Error::Proxy(micromux_proxy::ClientError::Cancelled)) => {
-            std::process::exit(EXIT_INTERRUPTED)
-        }
         Err(Error::Exit(code)) => std::process::exit(code),
         Err(err) => Err(err.into()),
     }

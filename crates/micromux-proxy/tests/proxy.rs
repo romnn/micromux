@@ -5,7 +5,9 @@ use std::time::Duration;
 
 use color_eyre::eyre;
 use micromux_proxy::protocol::{Registration, RouteTarget};
-use micromux_proxy::{PortPreference, ProxyPaths, Registrar, ServeOptions, ensure_proxy, serve};
+use micromux_proxy::{
+    PortPreference, ProxyLauncher, ProxyPaths, Registrar, ServeOptions, ensure_proxy, serve,
+};
 use similar_asserts::assert_eq;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
@@ -195,7 +197,6 @@ async fn routes_by_host_and_preserves_the_host_header() -> eyre::Result<()> {
         proxy.port,
         None,
         &CancellationToken::new(),
-        |_| {},
     )
     .await?;
 
@@ -245,7 +246,6 @@ async fn path_routes_split_a_host_and_strip_prefixes() -> eyre::Result<()> {
         proxy.port,
         None,
         &CancellationToken::new(),
-        |_| {},
     )
     .await?;
 
@@ -317,7 +317,6 @@ async fn upgrades_tunnel_through_stripped_path_routes() -> eyre::Result<()> {
         proxy.port,
         None,
         &CancellationToken::new(),
-        |_| {},
     )
     .await?;
 
@@ -374,14 +373,12 @@ async fn upgrades_tunnel_through_stripped_path_routes() -> eyre::Result<()> {
 
 /// A stand-in for a proxy started by an older micromux, listening on `paths`.
 ///
-/// It answers `hello` with `info` and `stop_if_idle` with `stop_reply` (an older proxy rejects
-/// the request it does not know), accepts every registration, and reports every message it
+/// It answers `hello` with `info`, accepts every registration, and reports every message it
 /// receives on the returned channel.
 /// It never exits by itself; aborting the task stops accepting connections.
 fn spawn_old_proxy(
     paths: &ProxyPaths,
     info: String,
-    stop_reply: String,
 ) -> eyre::Result<(
     tokio::task::JoinHandle<()>,
     tokio::sync::mpsc::UnboundedReceiver<micromux_proxy::protocol::ClientMessage>,
@@ -396,7 +393,6 @@ fn spawn_old_proxy(
                 return;
             };
             let info = info.clone();
-            let stop_reply = stop_reply.clone();
             let received_tx = received_tx.clone();
             tokio::spawn(async move {
                 let (reader, mut writer) = stream.into_split();
@@ -410,7 +406,6 @@ fn spawn_old_proxy(
                     let reply = match &message {
                         Ok(ClientMessage::Hello) => info.as_str(),
                         Ok(ClientMessage::Register(_)) => r#"{"type":"registered"}"#,
-                        Ok(ClientMessage::StopIfIdle) => stop_reply.as_str(),
                         _ => r#"{"type":"pong"}"#,
                     };
                     if let Ok(message) = message {
@@ -431,13 +426,8 @@ fn spawn_old_proxy(
     Ok((task, received))
 }
 
-/// What an older proxy that speaks protocol 1 replies to `stop_if_idle`, which it does not know.
-const UNKNOWN_REQUEST: &str =
-    r#"{"type":"rejected","reason":"invalid message: unknown variant","transient":false}"#;
-
-/// The pid an outdated stand-in proxy reports as its own: the test process's, so a signal that
-/// should never be sent, such as `SIGTERM` or `SIGKILL`, ends the test run instead of passing
-/// unnoticed.
+/// The pid an outdated stand-in proxy reports as its own: the test process's, which a session
+/// never signals, so a signal sent anyway ends the test run instead of passing unnoticed.
 ///
 /// A child process would serve as well, but spawning one forks the test process, and until it
 /// execs, the fork holds copies of the sockets parallel tests have open, which keeps their ports
@@ -446,427 +436,96 @@ fn bystander_pid() -> u32 {
     std::process::id()
 }
 
-/// Takes over the registration socket of `old`'s directory for `proxy`, the way a fresh proxy
-/// replaces an exited one: renaming the socket replaces the stand-in's in one step.
-fn replace_old_proxy(old: &ProxyPaths, proxy: &Proxy) -> eyre::Result<()> {
-    std::fs::rename(&proxy.paths.socket, &old.socket)?;
-    Ok(())
+/// A launcher that claims a newer release than every proxy here, and creates `marker` instead of
+/// starting a proxy should it ever run.
+fn newer_launcher(marker: &std::path::Path) -> ProxyLauncher {
+    let args: [std::ffi::OsString; 3] = ["-c".into(), r#"touch "$0""#.into(), marker.into()];
+    ProxyLauncher::new("sh", args, "99.0.0")
 }
 
-/// A proxy that does not report the path-route protocol, as one started by an older micromux,
-/// would ignore route paths, so a session with path routes does not register with it.
-/// Such a proxy cannot tell whether sessions use it, so the session waits for it to exit, bounded
-/// by its idle timeout plus a lease, and then refuses it with an error naming the proxy, while a
-/// session without paths still registers until its routes gain a path.
-/// The session never signals the pid the proxy reports.
-#[tokio::test(start_paused = true)]
-async fn path_routes_wait_for_an_outdated_proxy_and_refuse_one_that_stays() -> eyre::Result<()> {
-    use micromux_proxy::protocol::{IDLE_TIMEOUT, LEASE_TIMEOUT, ProxyMessage};
+/// A proxy from an older release is replaced only when the session can verify that the socket's
+/// peer is that proxy, which a stand-in in this process never is: the session uses it as it is,
+/// registering routes it can serve without asking it to stop, and refusing at once routes it
+/// cannot serve.
+#[tokio::test]
+async fn an_older_proxy_that_cannot_be_verified_is_kept() -> eyre::Result<()> {
+    use micromux_proxy::protocol::ClientMessage;
 
     let directory = tempfile::tempdir()?;
     let paths = ProxyPaths::in_dir(directory.path());
-    let pid = bystander_pid();
-    let info = format!(r#"{{"type":"info","port":1,"pid":{pid}}}"#);
-    // The stand-in's reply is what an older proxy sends: no protocol, read as the first one, and
-    // no sessions, which it cannot tell.
-    assert!(matches!(
-        serde_json::from_str::<ProxyMessage>(&info)?,
-        ProxyMessage::Info {
-            protocol: 1,
-            sessions: None,
-            ..
-        }
-    ));
-    let (old_proxy, mut received) = spawn_old_proxy(&paths, info, UNKNOWN_REQUEST.to_string())?;
+    let launched = directory.path().join("launched");
+    let port = 18_510;
+    let with_paths = || {
+        let mut registration = registration("one", &[]);
+        registration.routes = vec![path_route("api", "/rest/", false, 1)];
+        registration
+    };
 
-    // The session waits, says so, and gives up once the bound has passed.
-    let mut with_paths = registration("one", &[]);
-    with_paths
-        .routes
-        .push(path_route("api", "/rest/", false, 2));
-    let started = tokio::time::Instant::now();
-    let mut waits = Vec::new();
-    let refused = Registrar::start(
+    // Path routes on a proxy that serves them
+    let info = format!(
+        r#"{{"type":"info","port":{port},"pid":{},"protocol":3,"sessions":[]}}"#,
+        bystander_pid()
+    );
+    let (old, mut received) = spawn_old_proxy(&paths, info)?;
+    let shutdown = CancellationToken::new();
+    let registrar = Registrar::start(
         paths.clone(),
-        with_paths,
-        1,
-        None,
-        &CancellationToken::new(),
-        |waiting| waits.push(waiting.to_string()),
-    )
-    .await;
-    let waited = started.elapsed();
-    assert!(
-        matches!(
-            &refused,
-            Err(micromux_proxy::ClientError::OutdatedProxy {
-                pid: refused_pid,
-                protocol: 1,
-                required: 2,
-                sessions: None,
-            }) if *refused_pid == pid
-        ),
-        "{refused:?}"
-    );
-    assert_eq!(
-        waits,
-        [format!(
-            "waiting for the outdated proxy (pid {pid}) to exit"
-        )]
-    );
-    // The paused clock jumps to the next timer while a request waits for its reply, which can be
-    // its reply timeout, so the upper end of the wait is loose.
-    let bound = IDLE_TIMEOUT + LEASE_TIMEOUT;
-    assert!(waited >= bound && waited < bound * 2, "{waited:?}");
-    // A proxy that cannot tell is never asked to stop, and its pid, this process's, was never
-    // signalled, or the test would not have got here.
-    while let Ok(message) = received.try_recv() {
-        assert!(
-            !matches!(message, micromux_proxy::protocol::ClientMessage::StopIfIdle),
-            "{message:?}"
-        );
-    }
-
-    let without_paths = Registrar::start(
-        paths,
-        registration("two", &[("app", 3, None)]),
-        1,
-        None,
-        &CancellationToken::new(),
-        |_| {},
+        with_paths(),
+        port,
+        Some(newer_launcher(&launched)),
+        &shutdown,
     )
     .await?;
-
-    // Routes that gain a path later are not sent over the connection checked without one; the
-    // reconnect waits for the old proxy, then refuses it and reports why.
-    let mut status = without_paths.status();
-    without_paths
-        .routes()
-        .send_replace(vec![path_route("app", "/rest/", false, 3)]);
-    // No timeout guards these waits: on the paused clock, a timer that fires while the
-    // registrar waits for a reply would jump the clock past the whole wait.
-    let waiting = format!("waiting for the outdated proxy (pid {pid}) to exit");
-    status
-        .wait_for(|status| {
-            matches!(
-                status,
-                micromux_proxy::RegistrationStatus::Unavailable { reason } if *reason == waiting
-            )
-        })
-        .await?;
-    status
-        .wait_for(|status| {
-            matches!(
-                status,
-                micromux_proxy::RegistrationStatus::Unavailable { reason }
-                    if reason.contains("registration protocol 1")
-            )
-        })
-        .await?;
-
-    old_proxy.abort();
-    Ok(())
-}
-
-/// An outdated proxy that cannot tell whether sessions use it, and exits while the session
-/// waits, is replaced by a current proxy that takes the session's path routes.
-#[tokio::test]
-async fn path_routes_take_over_an_outdated_proxy_once_it_exits() -> eyre::Result<()> {
-    let proxy = start_proxy(Duration::from_secs(60)).await?;
-    let directory = tempfile::tempdir()?;
-    let paths = ProxyPaths::in_dir(directory.path());
-    let pid = bystander_pid();
-    let (old_proxy, _received) = spawn_old_proxy(
-        &paths,
-        format!(r#"{{"type":"info","port":{},"pid":{pid}}}"#, proxy.port),
-        UNKNOWN_REQUEST.to_string(),
-    )?;
-    let upstream = TcpListener::bind(("127.0.0.1", 0)).await?;
-    let mut one = registration("one", &[]);
-    one.routes.push(path_route(
-        "api",
-        "/rest/",
-        true,
-        upstream.local_addr()?.port(),
-    ));
-
-    // The old proxy exits once the session announced its wait, and a current one takes its
-    // place.
-    let (waiting_tx, mut waiting_rx) = tokio::sync::mpsc::unbounded_channel();
-    let exit = async {
-        let waiting = waiting_rx.recv().await;
-        old_proxy.abort();
-        replace_old_proxy(&paths, &proxy)?;
-        Ok::<_, eyre::Report>(waiting)
-    };
-    let shutdown = CancellationToken::new();
-    let (registrar, waiting) = tokio::join!(
-        Registrar::start(
-            paths.clone(),
-            one,
-            proxy.port,
-            None,
-            &shutdown,
-            move |waiting| {
-                let _ = waiting_tx.send(waiting.to_string());
-            },
-        ),
-        exit
-    );
-    let _registrar = registrar?;
-    assert_eq!(
-        waiting?,
-        Some(format!(
-            "waiting for the outdated proxy (pid {pid}) to exit"
-        ))
-    );
-
-    // The current proxy serves the path route.
-    let served = answer_once(upstream, "rest");
-    let response = get_target(proxy.port, "api.one.localhost", "/rest/x").await?;
-    assert!(response.ends_with("rest"), "{response}");
-    assert!(served.await??.starts_with("GET /x HTTP/1.1\r\n"));
-
-    proxy.shutdown.cancel();
-    proxy.task.await??;
-    Ok(())
-}
-
-/// An outdated proxy that lists no registered session is asked to stop, and replaced at once.
-///
-/// Every proxy from protocol 3 on lists its sessions, so this is how a session gets past a
-/// protocol 3 proxy once its routes need a later protocol.
-#[tokio::test]
-async fn an_idle_outdated_proxy_that_lists_its_sessions_is_stopped() -> eyre::Result<()> {
-    use micromux_proxy::protocol::ClientMessage;
-
-    let proxy = start_proxy(Duration::from_secs(60)).await?;
-    let directory = tempfile::tempdir()?;
-    let paths = ProxyPaths::in_dir(directory.path());
-    let (old_proxy, mut received) = spawn_old_proxy(
-        &paths,
-        format!(
-            r#"{{"type":"info","port":{},"pid":4242,"protocol":1,"sessions":[]}}"#,
-            proxy.port
-        ),
-        r#"{"type":"stopping"}"#.to_string(),
-    )?;
-
-    // The stand-in exits once asked to stop, and a current proxy takes its place.
-    let exit = async {
-        loop {
-            match received.recv().await {
-                Some(ClientMessage::StopIfIdle) => break,
-                Some(_) => {}
-                None => eyre::bail!("the stand-in stopped before it was asked to"),
-            }
-        }
-        old_proxy.abort();
-        replace_old_proxy(&paths, &proxy)?;
-        Ok(())
-    };
-    let mut one = registration("one", &[]);
-    one.routes.push(path_route("api", "/rest/", false, 2));
-    let shutdown = CancellationToken::new();
-    let (registrar, exited) = tokio::join!(
-        Registrar::start(paths.clone(), one, proxy.port, None, &shutdown, |_| {},),
-        exit
-    );
-    exited?;
-    let registrar = registrar?;
-    assert_eq!(
-        *registrar.status().borrow(),
-        micromux_proxy::RegistrationStatus::Registered
-    );
-
-    proxy.shutdown.cancel();
-    proxy.task.await??;
-    Ok(())
-}
-
-/// An outdated proxy that still serves other sessions is refused at once with their names,
-/// whether its `hello` lists them or a session registered just before the request to stop.
-#[tokio::test]
-async fn a_busy_outdated_proxy_is_refused_with_its_sessions() -> eyre::Result<()> {
-    use micromux_proxy::protocol::ClientMessage;
-
-    let busy = r#"[{"session":"old","config_path":"/old/micromux.yaml"}]"#;
-    for (info_sessions, stop_reply) in [
-        (busy.to_string(), UNKNOWN_REQUEST.to_string()),
-        (
-            "[]".to_string(),
-            format!(r#"{{"type":"busy","sessions":{busy}}}"#),
-        ),
-    ] {
-        let directory = tempfile::tempdir()?;
-        let paths = ProxyPaths::in_dir(directory.path());
-        let (old_proxy, mut received) = spawn_old_proxy(
-            &paths,
-            format!(
-                r#"{{"type":"info","port":1,"pid":4242,"protocol":1,"sessions":{info_sessions}}}"#
-            ),
-            stop_reply,
-        )?;
-        let mut one = registration("one", &[]);
-        one.routes.push(path_route("api", "/rest/", false, 2));
-        let mut waits = Vec::new();
-        let refused = Registrar::start(paths, one, 1, None, &CancellationToken::new(), |waiting| {
-            waits.push(waiting.to_string());
-        })
-        .await;
-
-        // The error names the old proxy and the session it serves, without any wait.
-        let Err(err @ micromux_proxy::ClientError::OutdatedProxy { sessions, .. }) = &refused
-        else {
-            eyre::bail!("{refused:?}");
-        };
-        assert_eq!(sessions.as_ref().map(Vec::len), Some(1));
-        let message = err.to_string();
-        assert!(message.contains("pid 4242"), "{message}");
-        assert!(message.contains("old (/old/micromux.yaml)"), "{message}");
-        assert!(waits.is_empty(), "{waits:?}");
-        // A proxy that lists sessions is not even asked to stop.
-        if info_sessions == busy {
-            while let Ok(message) = received.try_recv() {
-                assert!(!matches!(message, ClientMessage::StopIfIdle), "{message:?}");
-            }
-        }
-        old_proxy.abort();
+    drop(registrar);
+    old.abort();
+    received.close();
+    let mut messages = Vec::new();
+    while let Some(message) = received.recv().await {
+        messages.push(message);
     }
-    Ok(())
-}
+    assert!(
+        messages
+            .iter()
+            .all(|message| matches!(message, ClientMessage::Hello | ClientMessage::Register(_))),
+        "{messages:?}"
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|message| matches!(message, ClientMessage::Register(_))),
+        "{messages:?}"
+    );
 
-/// Serves the not-found page an outdated proxy serves on its HTTP port, listing the sessions
-/// `page` holds when each request arrives, and returns the port.
-///
-/// It never exits by itself; aborting the task stops accepting connections.
-async fn serve_old_page(
-    page: tokio::sync::watch::Receiver<String>,
-) -> eyre::Result<(u16, tokio::task::JoinHandle<()>)> {
-    let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
-    let port = listener.local_addr()?.port();
-    let task = tokio::spawn(async move {
-        while let Ok((mut stream, _)) = listener.accept().await {
-            // The whole request is read, so closing the connection cannot reset the reply.
-            if read_head(&mut stream).await.is_err() {
-                continue;
-            }
-            let response = format!(
-                "HTTP/1.1 404 Not Found\r\ncontent-type: text/html; charset=utf-8\r\n\
-                 connection: close\r\n\r\n<!doctype html><html><body><h1>404 Not Found: no \
-                 micromux route</h1>{}<hr><small>micromux proxy</small></body></html>",
-                page.borrow().as_str()
-            );
-            let _ = stream.write_all(response.as_bytes()).await;
-        }
-    });
-    Ok((port, task))
-}
-
-/// An outdated proxy that does not list its sessions over the socket still lists them on its
-/// not-found page, so a session refuses it at once, naming the sessions that use it, and stops
-/// waiting for an idle one as soon as a session registers with it.
-#[tokio::test]
-async fn an_outdated_proxy_is_refused_with_the_sessions_its_page_lists() -> eyre::Result<()> {
-    // The stand-in speaks protocol 1 over the socket and serves an older proxy's not-found page
-    // on the HTTP port it reports.
-    let (page_tx, page) = tokio::sync::watch::channel(OLD_IDLE_PAGE.to_string());
-    let (port, old_page) = serve_old_page(page).await?;
-    let directory = tempfile::tempdir()?;
-    let paths = ProxyPaths::in_dir(directory.path());
-    let (old_proxy, _received) = spawn_old_proxy(
-        &paths,
-        format!(r#"{{"type":"info","port":{port},"pid":4242}}"#),
-        UNKNOWN_REQUEST.to_string(),
-    )?;
-    let with_paths = || {
-        let mut one = registration("one", &[]);
-        one.routes.push(path_route("api", "/rest/", false, 2));
-        one
-    };
-    let old = |session: &str| micromux_proxy::protocol::RegisteredSession {
-        session: session.to_string(),
-        config_path: format!("/projects/{session}/micromux.yaml"),
-    };
-
-    // Idle: the session waits, and a session registering meanwhile ends the wait with its name.
-    let shutdown = CancellationToken::new();
+    // Path routes on a proxy that would ignore their paths
+    std::fs::remove_file(&paths.socket)?;
+    let info = format!(
+        r#"{{"type":"info","port":{port},"pid":{}}}"#,
+        bystander_pid()
+    );
+    let (old, _received) = spawn_old_proxy(&paths, info)?;
     let refused = Registrar::start(
         paths.clone(),
         with_paths(),
         port,
-        None,
+        Some(newer_launcher(&launched)),
         &shutdown,
-        move |_| {
-            page_tx.send_replace(OLD_BUSY_PAGE.to_string());
-        },
     )
     .await;
     assert!(
         matches!(
-            &refused,
+            refused,
             Err(micromux_proxy::ClientError::OutdatedProxy {
-                pid: 4242,
-                sessions: Some(sessions),
+                protocol: 1,
+                required: 2,
                 ..
-            }) if *sessions == [old("two")]
+            })
         ),
         "{refused:?}"
     );
+    old.abort();
 
-    // Busy: the session refuses it right away.
-    let mut waits = Vec::new();
-    let refused = Registrar::start(paths, with_paths(), port, None, &shutdown, |waiting| {
-        waits.push(waiting.to_string());
-    })
-    .await;
-    let Err(err @ micromux_proxy::ClientError::OutdatedProxy { .. }) = &refused else {
-        eyre::bail!("{refused:?}");
-    };
-    assert!(
-        err.to_string()
-            .contains("two (/projects/two/micromux.yaml)"),
-        "{err}"
-    );
-    assert!(waits.is_empty(), "{waits:?}");
-
-    old_proxy.abort();
-    old_page.abort();
-    Ok(())
-}
-
-/// The body an outdated proxy's not-found page has while no session is registered.
-const OLD_IDLE_PAGE: &str = "<p>No session is registered with the proxy right now.</p>";
-
-/// The body an outdated proxy's not-found page has while session `two` is registered.
-const OLD_BUSY_PAGE: &str = "<p>Live sessions:</p><ul><li><strong>two</strong> \
-    <small>(/projects/two/micromux.yaml)</small><ul><li><a href=\"http://app.two.localhost/\">\
-    http://app.two.localhost/</a></li></ul></li></ul>";
-
-/// A session that is asked to stop while it waits for an outdated proxy stops waiting.
-#[tokio::test]
-async fn waiting_for_an_outdated_proxy_ends_with_the_session() -> eyre::Result<()> {
-    let directory = tempfile::tempdir()?;
-    let paths = ProxyPaths::in_dir(directory.path());
-    let (old_proxy, _received) = spawn_old_proxy(
-        &paths,
-        r#"{"type":"info","port":1,"pid":4242}"#.to_string(),
-        UNKNOWN_REQUEST.to_string(),
-    )?;
-    let shutdown = CancellationToken::new();
-    let mut one = registration("one", &[]);
-    one.routes.push(path_route("api", "/rest/", false, 2));
-    let stop = shutdown.clone();
-    let cancelled = tokio::time::timeout(
-        Duration::from_secs(10),
-        Registrar::start(paths, one, 1, None, &shutdown, move |_| stop.cancel()),
-    )
-    .await?;
-    assert!(
-        matches!(cancelled, Err(micromux_proxy::ClientError::Cancelled)),
-        "{cancelled:?}"
-    );
-    old_proxy.abort();
+    // Neither attempt started a successor.
+    assert!(!launched.exists());
     Ok(())
 }
 
@@ -889,8 +548,8 @@ async fn ask(
     Ok(serde_json::from_str(&line)?)
 }
 
-/// A current proxy lists its registered sessions, refuses to stop while any is registered, and
-/// exits at once when asked to stop without one.
+/// A current proxy reports its release, lists its registered sessions, refuses to stop while any
+/// is registered, and exits at once when asked to stop without one.
 #[tokio::test]
 async fn the_proxy_lists_its_sessions_and_stops_only_when_idle() -> eyre::Result<()> {
     use micromux_proxy::protocol::{
@@ -905,7 +564,6 @@ async fn the_proxy_lists_its_sessions_and_stops_only_when_idle() -> eyre::Result
         proxy.port,
         None,
         &CancellationToken::new(),
-        |_| {},
     )
     .await?;
     let one = RegisteredSession {
@@ -921,6 +579,7 @@ async fn the_proxy_lists_its_sessions_and_stops_only_when_idle() -> eyre::Result
             pid: std::process::id(),
             protocol: PROTOCOL_VERSION,
             sessions: Some(vec![one.clone()]),
+            version: Some(env!("CARGO_PKG_VERSION").to_string()),
         }
     );
     assert_eq!(
@@ -940,6 +599,7 @@ async fn the_proxy_lists_its_sessions_and_stops_only_when_idle() -> eyre::Result
             pid: std::process::id(),
             protocol: PROTOCOL_VERSION,
             sessions: Some(Vec::new()),
+            version: Some(env!("CARGO_PKG_VERSION").to_string()),
         })
     {
         eyre::ensure!(
@@ -969,7 +629,6 @@ async fn upgrades_become_tunnels() -> eyre::Result<()> {
         proxy.port,
         None,
         &CancellationToken::new(),
-        |_| {},
     )
     .await?;
 
@@ -1036,7 +695,6 @@ async fn error_pages_name_sessions_and_services() -> eyre::Result<()> {
         proxy.port,
         None,
         &CancellationToken::new(),
-        |_| {},
     )
     .await?;
 
@@ -1076,7 +734,6 @@ async fn overview_reads_the_current_branch_without_reregistering() -> eyre::Resu
         proxy.port,
         None,
         &CancellationToken::new(),
-        |_| {},
     )
     .await?;
     let first = get(proxy.port, "localhost").await?;
@@ -1163,7 +820,6 @@ async fn replaced_routes_take_effect_on_the_live_registration() -> eyre::Result<
         proxy.port,
         None,
         &CancellationToken::new(),
-        |_| {},
     )
     .await?;
     let mut status = registrar.status();
@@ -1250,7 +906,6 @@ async fn routes_end_with_the_registration_and_the_proxy_exits_when_idle() -> eyr
         proxy.port,
         None,
         &CancellationToken::new(),
-        |_| {},
     )
     .await?;
 
@@ -1276,7 +931,6 @@ async fn conflicting_sessions_and_ports_are_refused() -> eyre::Result<()> {
         proxy.port,
         None,
         &CancellationToken::new(),
-        |_| {},
     )
     .await?;
     let mut other = registration("one", &[("app", 2, None)]);
@@ -1288,7 +942,6 @@ async fn conflicting_sessions_and_ports_are_refused() -> eyre::Result<()> {
         proxy.port,
         None,
         &CancellationToken::new(),
-        |_| {},
     )
     .await;
     assert!(
@@ -1353,7 +1006,6 @@ async fn sessions_on_different_ports_share_one_proxy() -> eyre::Result<()> {
         proxy.port,
         None,
         &CancellationToken::new(),
-        |_| {},
     )
     .await?;
     let _two = Registrar::start(
@@ -1362,7 +1014,6 @@ async fn sessions_on_different_ports_share_one_proxy() -> eyre::Result<()> {
         other.port,
         None,
         &CancellationToken::new(),
-        |_| {},
     )
     .await?;
     let one = answer_once(one_upstream, "one");
@@ -1407,7 +1058,6 @@ async fn a_port_closes_once_no_session_uses_it() -> eyre::Result<()> {
         proxy.port,
         None,
         &CancellationToken::new(),
-        |_| {},
     )
     .await?;
     let two = Registrar::start(
@@ -1416,7 +1066,6 @@ async fn a_port_closes_once_no_session_uses_it() -> eyre::Result<()> {
         other.port,
         None,
         &CancellationToken::new(),
-        |_| {},
     )
     .await?;
 
@@ -1452,7 +1101,6 @@ async fn the_port_the_proxy_started_on_stays_open() -> eyre::Result<()> {
         proxy.port,
         None,
         &CancellationToken::new(),
-        |_| {},
     )
     .await?;
     // A session on another port keeps the proxy itself running.
@@ -1462,7 +1110,6 @@ async fn the_port_the_proxy_started_on_stays_open() -> eyre::Result<()> {
         other.port,
         None,
         &CancellationToken::new(),
-        |_| {},
     )
     .await?;
 
@@ -1523,8 +1170,8 @@ async fn a_registration_opens_the_port_it_names() -> eyre::Result<()> {
 }
 
 /// A proxy older than the multi-port protocol serves a session only on its own port: it is
-/// joined there without being asked to listen, refused on another port while sessions use it,
-/// and asked to stop on another port when none does, so a current proxy can take its place.
+/// joined there without being asked to listen, and refused on another port by a session that
+/// cannot replace it.
 #[tokio::test]
 async fn an_older_proxy_serves_only_its_own_port() -> eyre::Result<()> {
     use micromux_proxy::protocol::ClientMessage;
@@ -1534,7 +1181,6 @@ async fn an_older_proxy_serves_only_its_own_port() -> eyre::Result<()> {
         fallback_port: None,
     };
 
-    // In use by a session
     let directory = tempfile::tempdir()?;
     let paths = ProxyPaths::in_dir(directory.path());
     let port = 18_500;
@@ -1544,7 +1190,6 @@ async fn an_older_proxy_serves_only_its_own_port() -> eyre::Result<()> {
             r#"{{"type":"info","port":{port},"pid":{},"protocol":3,"sessions":[{{"session":"one","config_path":"/one"}}]}}"#,
             bystander_pid()
         ),
-        UNKNOWN_REQUEST.to_string(),
     )?;
     let joined = ensure_proxy(
         &paths,
@@ -1577,32 +1222,6 @@ async fn an_older_proxy_serves_only_its_own_port() -> eyre::Result<()> {
         "{messages:?}"
     );
 
-    // Used by no session
-    let directory = tempfile::tempdir()?;
-    let paths = ProxyPaths::in_dir(directory.path());
-    let (idle, mut received) = spawn_old_proxy(
-        &paths,
-        format!(
-            r#"{{"type":"info","port":{port},"pid":{},"protocol":3,"sessions":[]}}"#,
-            bystander_pid()
-        ),
-        r#"{"type":"stopping"}"#.to_string(),
-    )?;
-    let stopped = ensure_proxy(&paths, other(port), None).await;
-    assert!(
-        matches!(stopped, Err(micromux_proxy::ClientError::Unavailable(_))),
-        "{stopped:?}"
-    );
-    idle.abort();
-    received.close();
-    let mut messages = Vec::new();
-    while let Some(message) = received.recv().await {
-        messages.push(message);
-    }
-    assert!(
-        messages.contains(&ClientMessage::StopIfIdle),
-        "{messages:?}"
-    );
     Ok(())
 }
 
@@ -1622,7 +1241,6 @@ async fn streaming_responses_are_not_buffered() -> eyre::Result<()> {
         proxy.port,
         None,
         &CancellationToken::new(),
-        |_| {},
     )
     .await?;
 
@@ -1682,7 +1300,6 @@ async fn chunked_request_bodies_are_forwarded() -> eyre::Result<()> {
         proxy.port,
         None,
         &CancellationToken::new(),
-        |_| {},
     )
     .await?;
 
@@ -1742,7 +1359,6 @@ async fn stopping_the_proxy_ends_its_registrations() -> eyre::Result<()> {
         proxy.port,
         None,
         &CancellationToken::new(),
-        |_| {},
     )
     .await?;
     let mut status = registrar.status();
