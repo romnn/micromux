@@ -2665,7 +2665,7 @@ impl McpServer {
         description = "Start a new headless micromux session for a project (brings its services \
         up). Spawns `micromux serve` detached for the project's config and returns once the session \
         is reachable, which takes longer while the session first waits for a previous session's \
-        cleanups or for an outdated shared proxy to exit; a no-op if one is already running for \
+        cleanups; a no-op if one is already running for \
         that config, and a session that is still starting is reported with reachable=false \
         instead of being started twice. `path` is a project directory or a config file — omit \
         for the MCP server's directory. If another worktree's session binds the same ports, stop \
@@ -3677,7 +3677,7 @@ pub async fn serve_stdio(
 /// Waits for the session `spawned` to become reachable, and reports it, or why it did not.
 ///
 /// The child gets [`START_READY_TIMEOUT`], and more while it reports waiting for a previous
-/// session's cleanups or for an outdated proxy to exit, each for as long as that wait is bounded.
+/// session's cleanups, for as long as that wait is bounded.
 /// A child that exits gets only a short grace for a concurrent start to come up, unless it exited
 /// because another session for the config is already starting: that session gets an ordinary
 /// start, and is reported as still starting rather than stopped when it takes longer.
@@ -3732,8 +3732,8 @@ async fn await_spawned_session(
                 return Err(error_data(err));
             }
         }
-        // A session that waits for a previous session's cleanups or for an outdated proxy to
-        // exit is still starting, for as long as that wait is bounded.
+        // A session that waits for a previous session's cleanups is still starting, for as long
+        // as that wait is bounded.
         // Checking right before the deadline also catches a wait announced during the probe.
         if child_exit.is_none() {
             let reported = ReportedStart::read(&stderr_path);

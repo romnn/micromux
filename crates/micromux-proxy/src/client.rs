@@ -141,8 +141,9 @@ impl ProxyLauncher {
         let Some(ours) = &self.version else {
             return false;
         };
-        version
-            .is_none_or(|theirs| semver::Version::parse(theirs).is_ok_and(|theirs| theirs < *ours))
+        version.is_none_or(|theirs| {
+            semver::Version::parse(theirs).is_ok_and(|theirs| theirs.cmp_precedence(ours).is_lt())
+        })
     }
 
     fn launch(&self, preference: PortPreference) -> std::io::Result<tokio::process::Child> {
@@ -246,6 +247,8 @@ async fn connect_current(
     handoff: &mut Handoff,
 ) -> Result<(Connection, ProxyInfo), ClientError> {
     let mut child: Option<tokio::process::Child> = None;
+    // A proxy this call started that exited, kept for its explanation.
+    let mut exited: Option<(tokio::process::Child, std::process::ExitStatus)> = None;
     loop {
         match hello(&paths.socket).await {
             // The replaced proxy still answers while it shuts down.
@@ -254,6 +257,11 @@ async fn connect_current(
                 Some(launcher)
                     if handoff.retired.is_none() && launcher.upgrades(info.version.as_deref()) =>
                 {
+                    // A proxy this call started before the old one answered waits for the same
+                    // lock, and must not win it with a port older sessions do not accept.
+                    if let Some(mut queued) = child.take() {
+                        let _ = queued.start_kill();
+                    }
                     match replace(&connection, &info, launcher) {
                         Ok(successor) => {
                             tracing::info!(
@@ -277,6 +285,9 @@ async fn connect_current(
                 _ => return Ok((connection, info)),
             },
             Err(err) if err.is_transient() => {
+                if let Some((mut child, status)) = exited.take() {
+                    return Err(start_failed(&mut child, status).await);
+                }
                 let Some(launcher) = launcher else {
                     return Err(err);
                 };
@@ -288,13 +299,14 @@ async fn connect_current(
             }
             Err(err) => return Err(err),
         }
-        if let Some(mut exited) = child.take_if(|child| matches!(child.try_wait(), Ok(Some(_)))) {
-            // It may have lost a start race to another proxy that is up by now.
-            match hello(&paths.socket).await {
-                Ok((_, info)) if Some(info.pid) != handoff.retired => continue,
-                Err(err) if !err.is_transient() => return Err(err),
-                _ => return Err(start_failed(&mut exited).await),
-            }
+        if let Some(running) = child.as_mut()
+            && let Ok(Some(status)) = running.try_wait()
+            && let Some(running) = child.take()
+        {
+            // It may have lost a start race to another proxy that is up by now, which the next
+            // round finds; otherwise it fails with this proxy's explanation.
+            exited = Some((running, status));
+            continue;
         }
         if Instant::now() >= handoff.deadline {
             return Err(ClientError::StartFailed(format!(
@@ -306,8 +318,11 @@ async fn connect_current(
     }
 }
 
-/// Explains why a proxy this session started exited, from its own error output.
-async fn start_failed(child: &mut tokio::process::Child) -> ClientError {
+/// Explains why a proxy this session started exited with `status`, from its own error output.
+async fn start_failed(
+    child: &mut tokio::process::Child,
+    status: std::process::ExitStatus,
+) -> ClientError {
     let mut output = String::new();
     if let Some(stderr) = child.stderr.take() {
         let _ = stderr
@@ -317,10 +332,7 @@ async fn start_failed(child: &mut tokio::process::Child) -> ClientError {
     }
     let output = output.trim();
     ClientError::StartFailed(if output.is_empty() {
-        match child.try_wait() {
-            Ok(Some(status)) => format!("it exited with {status}"),
-            _ => "it exited".to_string(),
-        }
+        format!("it exited with {status}")
     } else {
         output.to_string()
     })
@@ -367,14 +379,17 @@ fn replace(
             fallback_port: None,
         })
         .map_err(|err| format!("cannot run the proxy: {err}"))?;
-    if let Err(err) = nix::sys::signal::kill(
+    match nix::sys::signal::kill(
         nix::unistd::Pid::from_raw(pid),
         nix::sys::signal::Signal::SIGTERM,
     ) {
-        let _ = successor.start_kill();
-        return Err(format!("cannot stop it: {err}"));
+        // Another session replaced it first, and the successor may already be taking over.
+        Ok(()) | Err(nix::errno::Errno::ESRCH) => Ok(successor),
+        Err(err) => {
+            let _ = successor.start_kill();
+            Err(format!("cannot stop it: {err}"))
+        }
     }
-    Ok(successor)
 }
 
 /// Has the proxy behind `connection`, which `info` describes, listen as `preference` asks, and

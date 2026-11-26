@@ -8,7 +8,8 @@ use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use color_eyre::eyre;
-use micromux_proxy::{PortPreference, ProxyLauncher, ProxyPaths, ensure_proxy};
+use micromux_proxy::protocol::{Registration, RouteTarget};
+use micromux_proxy::{PortPreference, ProxyLauncher, ProxyPaths, Registrar, ensure_proxy};
 use similar_asserts::assert_eq;
 
 mod common;
@@ -30,25 +31,43 @@ fn ask_proxy(socket: &Path, message: &str) -> eyre::Result<serde_json::Value> {
     Ok(serde_json::from_str(&line)?)
 }
 
-/// The pid and startup port of the proxy answering on `socket`, once one answers.
-fn proxy_info(socket: &Path) -> eyre::Result<(u64, u64)> {
+/// The pid and startup port of the first proxy answering on `socket` for which `ready` holds on
+/// its `hello` reply.
+fn proxy_info(
+    socket: &Path,
+    ready: impl Fn(&serde_json::Value) -> bool,
+) -> eyre::Result<(u64, u64)> {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         if let Ok(info) = ask_proxy(socket, r#"{"type":"hello"}"#)
+            && ready(&info)
             && let Some(pid) = info.get("pid").and_then(serde_json::Value::as_u64)
             && let Some(port) = info.get("port").and_then(serde_json::Value::as_u64)
         {
             return Ok((pid, port));
         }
-        eyre::ensure!(Instant::now() < deadline, "no proxy answered");
+        eyre::ensure!(Instant::now() < deadline, "no proxy answered as expected");
         std::thread::sleep(Duration::from_millis(50));
     }
 }
 
-/// A session whose launcher starts a newer release than the running proxy replaces it: the
-/// successor takes over the old proxy's port, the old proxy exits, and the session's own port is
-/// served by the successor.
-#[tokio::test]
+/// Whether the `hello` reply `info` lists the session `name`.
+fn lists(info: &serde_json::Value, name: &str) -> bool {
+    info.get("sessions")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|sessions| {
+            sessions.iter().any(|session| {
+                session.get("session").and_then(serde_json::Value::as_str) == Some(name)
+            })
+        })
+}
+
+/// A session whose launcher starts a newer release than the running proxy replaces it even while
+/// another session uses it: the successor takes over the old proxy's port, the old proxy exits,
+/// the other session registers again with the successor, and the new session's own port is served
+/// by the successor.
+// The checks below block their thread while the registrar reconnects on another.
+#[tokio::test(flavor = "multi_thread")]
 async fn a_newer_release_replaces_the_running_proxy() -> eyre::Result<()> {
     let project = tempfile::tempdir()?;
     let state = common::state_directory(project.path());
@@ -60,8 +79,34 @@ async fn a_newer_release_replaces_the_running_proxy() -> eyre::Result<()> {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
-    let (old_pid, _) = proxy_info(&paths.socket)?;
+    let (old_pid, _) = proxy_info(&paths.socket, |_| true)?;
     assert_eq!(old_pid, u64::from(old.id()));
+
+    // A session that uses the old proxy and cannot start one itself
+    let shutdown = micromux::CancellationToken::new();
+    let _registrar = Registrar::start(
+        paths.clone(),
+        Registration {
+            git_metadata: false,
+            session: "one".to_string(),
+            session_domain: "one.localhost".to_string(),
+            config_path: "/one/micromux.yaml".to_string(),
+            working_dir: None,
+            pid: std::process::id(),
+            proxy_port: started_port,
+            routes: vec![RouteTarget {
+                host: "app".to_string(),
+                path: None,
+                strip_prefix: false,
+                port: free_port()?,
+                service: None,
+            }],
+        },
+        started_port,
+        None,
+        &shutdown,
+    )
+    .await?;
 
     // The same binary, claiming a newer release
     let launcher = ProxyLauncher::new(
@@ -95,9 +140,16 @@ async fn a_newer_release_replaces_the_running_proxy() -> eyre::Result<()> {
         }
         std::thread::sleep(Duration::from_millis(50));
     };
-    let successor = proxy_info(&paths.socket);
-    // The successor outlives the test otherwise; with no session registered, it stops at once.
-    let _ = ask_proxy(&paths.socket, r#"{"type":"stop_if_idle"}"#);
+    let successor = proxy_info(&paths.socket, |info| lists(info, "one"));
+    // The successor outlives the test otherwise; without a session, it stops at once.
+    shutdown.cancel();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while ask_proxy(&paths.socket, r#"{"type":"stop_if_idle"}"#)
+        .is_ok_and(|reply| reply.get("type").and_then(serde_json::Value::as_str) == Some("busy"))
+        && Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(50));
+    }
 
     assert_eq!(served?, session_port);
     assert!(exited.is_some(), "the old proxy kept running");

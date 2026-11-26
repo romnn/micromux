@@ -436,9 +436,11 @@ fn bystander_pid() -> u32 {
     std::process::id()
 }
 
-/// A launcher that claims a newer release than every proxy here, and fails should it ever run.
-fn newer_launcher() -> ProxyLauncher {
-    ProxyLauncher::new("/nonexistent/micromux", ["proxy"], "99.0.0")
+/// A launcher that claims a newer release than every proxy here, and creates `marker` instead of
+/// starting a proxy should it ever run.
+fn newer_launcher(marker: &std::path::Path) -> ProxyLauncher {
+    let args: [std::ffi::OsString; 3] = ["-c".into(), r#"touch "$0""#.into(), marker.into()];
+    ProxyLauncher::new("sh", args, "99.0.0")
 }
 
 /// A proxy from an older release is replaced only when the session can verify that the socket's
@@ -451,6 +453,7 @@ async fn an_older_proxy_that_cannot_be_verified_is_kept() -> eyre::Result<()> {
 
     let directory = tempfile::tempdir()?;
     let paths = ProxyPaths::in_dir(directory.path());
+    let launched = directory.path().join("launched");
     let port = 18_510;
     let with_paths = || {
         let mut registration = registration("one", &[]);
@@ -469,7 +472,7 @@ async fn an_older_proxy_that_cannot_be_verified_is_kept() -> eyre::Result<()> {
         paths.clone(),
         with_paths(),
         port,
-        Some(newer_launcher()),
+        Some(newer_launcher(&launched)),
         &shutdown,
     )
     .await?;
@@ -504,7 +507,7 @@ async fn an_older_proxy_that_cannot_be_verified_is_kept() -> eyre::Result<()> {
         paths.clone(),
         with_paths(),
         port,
-        Some(newer_launcher()),
+        Some(newer_launcher(&launched)),
         &shutdown,
     )
     .await;
@@ -520,6 +523,9 @@ async fn an_older_proxy_that_cannot_be_verified_is_kept() -> eyre::Result<()> {
         "{refused:?}"
     );
     old.abort();
+
+    // Neither attempt started a successor.
+    assert!(!launched.exists());
     Ok(())
 }
 
