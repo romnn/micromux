@@ -134,6 +134,22 @@ fn with_fallback<T>(
 }
 
 /// Binds exactly `port`.
+/// Whether this process may bind `port`, whoever listens on it now.
+///
+/// The privilege check comes before the check for a listener, so a port another proxy holds
+/// still tells.
+pub(crate) fn may_bind(port: u16) -> bool {
+    // macOS lets unprivileged processes bind low ports on the wildcard address, which
+    // `bind_port` falls back to.
+    if cfg!(target_os = "macos") {
+        return true;
+    }
+    !matches!(
+        TcpListener::bind((Ipv4Addr::LOCALHOST, port)),
+        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied
+    )
+}
+
 pub(crate) fn bind_port(port: u16) -> Result<Bound, BindError> {
     match bind_set(port, false) {
         // macOS lets unprivileged processes bind low ports only on the wildcard address.

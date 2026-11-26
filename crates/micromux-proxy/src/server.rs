@@ -686,6 +686,7 @@ impl Shared {
             pid: std::process::id(),
             protocol: PROTOCOL_VERSION,
             sessions: Some(Self::registered_sessions(&self.state())),
+            version: Some(env!("CARGO_PKG_VERSION").to_string()),
         }
     }
 

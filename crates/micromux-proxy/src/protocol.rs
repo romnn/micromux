@@ -14,11 +14,11 @@
 //! [`ProxyMessage::Info`] on its registration connection first and refuses a proxy that is too
 //! old, rather than registering routes that proxy would serve differently.
 //!
-//! An outdated proxy that no session uses is only waiting out its [`IDLE_TIMEOUT`], so the
-//! session takes it over instead: it asks the proxy to exit with [`ClientMessage::StopIfIdle`]
-//! when [`ProxyMessage::Info`] lists the registered sessions, and otherwise waits for it to exit.
-//! A proxy older than revision 3 lists its sessions only on the HTML page it answers a host no
-//! session serves with, which the session reads instead.
+//! A session that can start a proxy replaces a running one from an older micromux release, which
+//! [`ProxyMessage::Info`] reports, with its own, so the proxy's code follows upgrades even while
+//! sessions keep it busy (see `ensure_proxy`).
+//! Sessions of earlier releases instead ask a proxy too old for their routes to exit with
+//! [`ClientMessage::StopIfIdle`] when no session uses it.
 //!
 //! One proxy serves every port its sessions ask for.
 //! A session learns its port from [`ClientMessage::Listen`] before its services start, and its
@@ -125,6 +125,10 @@ pub enum ProxyMessage {
         /// not tell.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         sessions: Option<Vec<RegisteredSession>>,
+        /// The micromux release the proxy runs, such as `0.5.1`, or `None` from a proxy of an
+        /// older release, which does not tell.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        version: Option<String>,
     },
     /// Reply to [`ClientMessage::Listen`]: the proxy listens on `port`.
     Listening {

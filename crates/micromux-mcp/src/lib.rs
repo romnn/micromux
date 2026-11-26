@@ -57,9 +57,9 @@ use crate::tools::logs::{
     truncate_wait_matches,
 };
 use crate::tools::sessions::{
-    CHILD_EXIT_GRACE, OUTDATED_PROXY_START_BUDGET, ReportedStart, START_READY_TIMEOUT,
-    already_running_any, already_starting_pid, holder_may_run, reachable_session_for_start,
-    remove_captured_stderr, spawn_detached_serve, start_failure_message, start_session_report,
+    CHILD_EXIT_GRACE, ReportedStart, START_READY_TIMEOUT, already_running_any,
+    already_starting_pid, holder_may_run, reachable_session_for_start, remove_captured_stderr,
+    spawn_detached_serve, start_failure_message, start_session_report,
 };
 #[cfg(unix)]
 use crate::tools::sessions::{ProcessExitWatch, STOP_CONFIRM_TIMEOUT};
@@ -3694,7 +3694,6 @@ async fn await_spawned_session(
     let mut deadline = spawned_at + START_READY_TIMEOUT;
     let mut child_exit: Option<std::process::ExitStatus> = None;
     let mut previous_cleanup_waits = 0;
-    let mut waits_for_outdated_proxy = false;
     let mut already_starting: Option<String> = None;
     loop {
         // Observe early exit before deciding whether an answering session is ours; after the
@@ -3746,10 +3745,6 @@ async fn await_spawned_session(
             {
                 previous_cleanup_waits = reported.previous_cleanup_waits.len();
                 deadline = deadline.max(now + *bound + START_READY_TIMEOUT);
-            }
-            if !waits_for_outdated_proxy && reported.outdated_proxy_wait {
-                waits_for_outdated_proxy = true;
-                deadline = deadline.max(now + OUTDATED_PROXY_START_BUDGET);
             }
         }
         if tokio::time::Instant::now() >= deadline {
@@ -6170,14 +6165,6 @@ mod start_tests {
         ))
     }
 
-    /// The line a session prints while it waits for an outdated proxy to exit.
-    fn outdated_proxy() -> String {
-        format!(
-            "{} (pid 4242) to exit",
-            micromux_proxy::WAITING_FOR_OUTDATED_PROXY
-        )
-    }
-
     /// The line a session prints while it waits for a previous session's cleanups.
     fn previous_cleanup(bound: Duration) -> String {
         micromux::PreviousCleanupWait {
@@ -6188,11 +6175,10 @@ mod start_tests {
     }
 
     /// A spawned session gets the ordinary start time, and, once it says it waits for a previous
-    /// session's cleanups or for an outdated proxy to exit, that wait plus an ordinary start, even
-    /// when it says so at the last moment; a session that never comes up is stopped then.
+    /// session's cleanups, that wait plus an ordinary start, even when it says so at the last
+    /// moment; a session that never comes up is stopped then.
     #[tokio::test(start_paused = true)]
     async fn a_waiting_start_gets_the_time_its_waits_need() -> eyre::Result<()> {
-        let proxy_budget = micromux_proxy::OUTDATED_PROXY_WAIT + START_READY_TIMEOUT;
         let cleanup = Duration::from_secs(200);
         // Each check of the session takes a poll of 150 ms.
         let slack = Duration::from_secs(1);
@@ -6201,28 +6187,14 @@ mod start_tests {
         let cases = [
             ("no wait", vec![], START_READY_TIMEOUT),
             (
-                "outdated proxy",
-                vec![(Duration::ZERO, outdated_proxy())],
-                proxy_budget,
-            ),
-            (
-                "late outdated proxy",
-                vec![(late, outdated_proxy())],
-                late + proxy_budget,
-            ),
-            (
                 "previous cleanup",
                 vec![(Duration::ZERO, previous_cleanup(cleanup))],
                 cleanup + START_READY_TIMEOUT,
             ),
-            // The proxy wait starts once the cleanups are done, and extends from there.
             (
-                "previous cleanup, then outdated proxy",
-                vec![
-                    (Duration::ZERO, previous_cleanup(cleanup)),
-                    (Duration::from_secs(150), outdated_proxy()),
-                ],
-                Duration::from_secs(150) + proxy_budget,
+                "late previous cleanup",
+                vec![(late, previous_cleanup(cleanup))],
+                late + cleanup + START_READY_TIMEOUT,
             ),
         ];
         for (case, reports, budget) in cases {

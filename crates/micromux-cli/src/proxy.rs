@@ -129,9 +129,6 @@ pub(crate) async fn register(
         mux.proxy_port(),
         Some(launcher()?),
         shutdown,
-        // The MCP `start_session` tool reads this line from a headless session's stderr to give
-        // the session the time the wait needs.
-        |waiting| eprintln!("{waiting}"),
     )
     .await?;
     Ok(Some(RouteRegistration { registrar }))
@@ -203,6 +200,7 @@ fn launcher() -> Result<micromux_proxy::ProxyLauncher, Error> {
     Ok(micromux_proxy::ProxyLauncher::new(
         std::env::current_exe()?,
         ["proxy"],
+        env!("CARGO_PKG_VERSION"),
     ))
 }
 
@@ -403,7 +401,6 @@ services:
                 proxy_port,
                 None,
                 &shutdown,
-                |_| {},
             )
             .await?,
         };

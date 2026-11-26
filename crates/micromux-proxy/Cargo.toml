@@ -44,7 +44,8 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 bytes = "1"
 socket2 = "0.6"
-nix.workspace = true
+nix = { workspace = true, features = ["signal", "user"] }
+semver.workspace = true
 
 [dev-dependencies]
 color-eyre.workspace = true

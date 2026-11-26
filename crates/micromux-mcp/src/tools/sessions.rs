@@ -183,8 +183,6 @@ pub(crate) fn remove_captured_stderr(path: &Path) {
 pub(crate) struct ReportedStart {
     /// How long the session waits for a previous session's cleanups, each time it said so.
     pub(crate) previous_cleanup_waits: Vec<Duration>,
-    /// Whether it waits for an outdated shared proxy to exit.
-    pub(crate) outdated_proxy_wait: bool,
     /// The session's error when another session for its config is already starting or running.
     pub(crate) already_starting: Option<String>,
 }
@@ -212,7 +210,6 @@ impl ReportedStart {
     fn parse(stderr: &str) -> Self {
         Self {
             previous_cleanup_waits: micromux::reported_previous_cleanup_waits(stderr),
-            outdated_proxy_wait: outdated_proxy_wait_reported(stderr),
             already_starting: stderr
                 .lines()
                 .find(|line| line.contains(micromux_control::SESSION_ALREADY_STARTING))
@@ -220,26 +217,6 @@ impl ReportedStart {
         }
     }
 }
-
-#[cfg(unix)]
-fn outdated_proxy_wait_reported(stderr: &str) -> bool {
-    stderr.contains(micromux_proxy::WAITING_FOR_OUTDATED_PROXY)
-}
-
-/// Sessions only start on Unix, where the proxy exists.
-#[cfg(not(unix))]
-fn outdated_proxy_wait_reported(_stderr: &str) -> bool {
-    false
-}
-
-/// How long a session that waits for an outdated proxy to exit may take to start from then on.
-#[cfg(unix)]
-pub(crate) const OUTDATED_PROXY_START_BUDGET: Duration =
-    micromux_proxy::OUTDATED_PROXY_WAIT.saturating_add(START_READY_TIMEOUT);
-
-/// Sessions only start on Unix, where the proxy exists.
-#[cfg(not(unix))]
-pub(crate) const OUTDATED_PROXY_START_BUDGET: Duration = START_READY_TIMEOUT;
 
 /// Whether the session an "already starting" error names may still run: it names none, or its
 /// process exists.
@@ -423,15 +400,10 @@ mod tests {
             services: vec!["infra".to_string()],
             bound: Duration::from_secs(85),
         };
-        let proxy = format!(
-            "{} (pid 4242) to exit",
-            micromux_proxy::WAITING_FOR_OUTDATED_PROXY
-        );
         assert_eq!(
-            ReportedStart::parse(&format!("{cleanup}\n{proxy}\n")),
+            ReportedStart::parse(&format!("{cleanup}\n")),
             ReportedStart {
                 previous_cleanup_waits: vec![Duration::from_secs(85)],
-                outdated_proxy_wait: true,
                 already_starting: None,
             }
         );
