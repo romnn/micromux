@@ -246,76 +246,97 @@ async fn connect_current(
     launcher: Option<&ProxyLauncher>,
     handoff: &mut Handoff,
 ) -> Result<(Connection, ProxyInfo), ClientError> {
-    let mut child: Option<tokio::process::Child> = None;
-    // A proxy this call started that exited, kept for its explanation.
-    let mut exited: Option<(tokio::process::Child, std::process::ExitStatus)> = None;
     loop {
-        match hello(&paths.socket).await {
-            // The replaced proxy still answers while it shuts down.
-            Ok((_, info)) if Some(info.pid) == handoff.retired => {}
-            Ok((connection, info)) => match launcher {
-                Some(launcher)
-                    if handoff.retired.is_none() && launcher.upgrades(info.version.as_deref()) =>
-                {
-                    // A proxy this call started before the old one answered waits for the same
-                    // lock, and must not win it with a port older sessions do not accept.
-                    if let Some(mut queued) = child.take() {
-                        let _ = queued.start_kill();
+        let started = match hello(&paths.socket).await {
+            // The replaced proxy may still answer while it shuts down.
+            Ok((_, info)) if Some(info.pid) == handoff.retired => None,
+            Ok((connection, info)) => {
+                let Some(launcher) = launcher.filter(|launcher| {
+                    handoff.retired.is_none() && launcher.upgrades(info.version.as_deref())
+                }) else {
+                    return Ok((connection, info));
+                };
+                match replace(&connection, &info, launcher) {
+                    Ok(successor) => {
+                        tracing::info!(
+                            pid = info.pid,
+                            version = info.version.as_deref().unwrap_or("unknown"),
+                            "replacing a proxy from an older micromux"
+                        );
+                        handoff.retired = Some(info.pid);
+                        Some(successor)
                     }
-                    match replace(&connection, &info, launcher) {
-                        Ok(successor) => {
-                            tracing::info!(
-                                pid = info.pid,
-                                version = info.version.as_deref().unwrap_or("unknown"),
-                                "replacing a proxy from an older micromux"
-                            );
-                            handoff.retired = Some(info.pid);
-                            child = Some(successor);
-                        }
-                        Err(reason) => {
-                            tracing::info!(
-                                pid = info.pid,
-                                reason,
-                                "keeping a proxy from an older micromux"
-                            );
-                            return Ok((connection, info));
-                        }
+                    Err(reason) => {
+                        tracing::info!(
+                            pid = info.pid,
+                            reason,
+                            "keeping a proxy from an older micromux"
+                        );
+                        return Ok((connection, info));
                     }
                 }
-                _ => return Ok((connection, info)),
-            },
+            }
             Err(err) if err.is_transient() => {
-                if let Some((mut child, status)) = exited.take() {
-                    return Err(start_failed(&mut child, status).await);
-                }
                 let Some(launcher) = launcher else {
                     return Err(err);
                 };
-                if child.is_none() {
-                    child = Some(launcher.launch(preference).map_err(|err| {
-                        ClientError::StartFailed(format!("cannot run the proxy: {err}"))
-                    })?);
-                }
+                Some(launcher.launch(preference).map_err(|err| {
+                    ClientError::StartFailed(format!("cannot run the proxy: {err}"))
+                })?)
             }
             Err(err) => return Err(err),
+        };
+        match started {
+            Some(child) => wait_for_start(paths, child, handoff).await?,
+            None if Instant::now() >= handoff.deadline => return Err(no_answer(paths)),
+            None => tokio::time::sleep(Duration::from_millis(50)).await,
         }
-        if let Some(running) = child.as_mut()
-            && let Ok(Some(status)) = running.try_wait()
-            && let Some(running) = child.take()
-        {
-            // It may have lost a start race to another proxy that is up by now, which the next
-            // round finds; otherwise it fails with this proxy's explanation.
-            exited = Some((running, status));
-            continue;
+    }
+}
+
+/// Waits until a proxy other than the one `handoff` retired answers, which `child`, a proxy this
+/// session started, may or may not be.
+///
+/// A proxy that wins the start instead of `child` leaves it waiting for the lock, so `child` is
+/// stopped then: taking over later, it could listen on a port older sessions do not accept.
+async fn wait_for_start(
+    paths: &ProxyPaths,
+    mut child: tokio::process::Child,
+    handoff: &Handoff,
+) -> Result<(), ClientError> {
+    let answered = async || {
+        hello(&paths.socket)
+            .await
+            .ok()
+            .map(|(_, info)| info.pid)
+            .filter(|pid| Some(*pid) != handoff.retired)
+    };
+    loop {
+        if let Some(pid) = answered().await {
+            if child.id() != Some(pid) {
+                let _ = child.start_kill();
+            }
+            return Ok(());
+        }
+        if let Ok(Some(status)) = child.try_wait() {
+            // It may have lost a start race to another proxy that is up by now.
+            if answered().await.is_some() {
+                return Ok(());
+            }
+            return Err(start_failed(&mut child, status).await);
         }
         if Instant::now() >= handoff.deadline {
-            return Err(ClientError::StartFailed(format!(
-                "no current proxy answered on {} within {START_TIMEOUT:?}",
-                paths.socket.display()
-            )));
+            return Err(no_answer(paths));
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
+
+fn no_answer(paths: &ProxyPaths) -> ClientError {
+    ClientError::StartFailed(format!(
+        "no current proxy answered on {} within {START_TIMEOUT:?}",
+        paths.socket.display()
+    ))
 }
 
 /// Explains why a proxy this session started exited with `status`, from its own error output.
