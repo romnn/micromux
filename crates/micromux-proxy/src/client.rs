@@ -246,8 +246,9 @@ async fn connect_current(
     launcher: Option<&ProxyLauncher>,
     handoff: &mut Handoff,
 ) -> Result<(Connection, ProxyInfo), ClientError> {
+    let mut reply = hello(&paths.socket).await;
     loop {
-        let started = match hello(&paths.socket).await {
+        let started = match reply {
             // The replaced proxy may still answer while it shuts down.
             Ok((_, info)) if Some(info.pid) == handoff.retired => None,
             Ok((connection, info)) => {
@@ -286,44 +287,43 @@ async fn connect_current(
             }
             Err(err) => return Err(err),
         };
-        match started {
-            Some(child) => wait_for_start(paths, child, handoff).await?,
+        reply = match started {
+            Some(child) => Ok(wait_for_start(paths, child, handoff).await?),
             None if Instant::now() >= handoff.deadline => return Err(no_answer(paths)),
-            None => tokio::time::sleep(Duration::from_millis(50)).await,
-        }
+            None => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                hello(&paths.socket).await
+            }
+        };
     }
 }
 
 /// Waits until a proxy other than the one `handoff` retired answers, which `child`, a proxy this
-/// session started, may or may not be.
+/// session started, may or may not be, and returns its reply.
 ///
-/// A proxy that wins the start instead of `child` leaves it waiting for the lock, so `child` is
-/// stopped then: taking over later, it could listen on a port older sessions do not accept.
+/// A `child` that lost the start keeps waiting for the lock, and exits once the lock stays taken
+/// for longer than the proxy waits for it.
 async fn wait_for_start(
     paths: &ProxyPaths,
     mut child: tokio::process::Child,
     handoff: &Handoff,
-) -> Result<(), ClientError> {
+) -> Result<(Connection, ProxyInfo), ClientError> {
     let answered = async || {
         hello(&paths.socket)
             .await
             .ok()
-            .map(|(_, info)| info.pid)
-            .filter(|pid| Some(*pid) != handoff.retired)
+            .filter(|(_, info)| Some(info.pid) != handoff.retired)
     };
     loop {
-        if let Some(pid) = answered().await {
-            if child.id() != Some(pid) {
-                let _ = child.start_kill();
-            }
-            return Ok(());
+        if let Some(reply) = answered().await {
+            return Ok(reply);
         }
         if let Ok(Some(status)) = child.try_wait() {
             // It may have lost a start race to another proxy that is up by now.
-            if answered().await.is_some() {
-                return Ok(());
-            }
-            return Err(start_failed(&mut child, status).await);
+            return match answered().await {
+                Some(reply) => Ok(reply),
+                None => Err(start_failed(&mut child, status).await),
+            };
         }
         if Instant::now() >= handoff.deadline {
             return Err(no_answer(paths));
