@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.5.2
+
 - **The shared proxy follows micromux upgrades.** A session of a newer micromux replaces a proxy
   that an older one started when it starts or reconnects, even while other sessions use it, and
   those sessions move to the new proxy by themselves.
