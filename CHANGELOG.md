@@ -5,6 +5,9 @@
 - **The shared proxy follows micromux upgrades.** A session of a newer micromux replaces a proxy
   that an older one started when it starts or reconnects, even while other sessions use it, and
   those sessions move to the new proxy by themselves.
+- **The proxy's session list marks sessions on another micromux version than the proxy.** It also
+  lists routes sorted with their service and port, links pull requests and waits for them on the
+  first load, and adds a filter (press `/`) and a theme switch.
 
 ## v0.5.1
 

@@ -53,6 +53,7 @@ async fn handle(mut request: Request<Incoming>, port: u16, shared: &Shared) -> R
                 &host,
                 request.uri().path(),
                 &shared.listed_sessions_with_git().await,
+                &shared.facts(),
             ),
         );
     };

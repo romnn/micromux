@@ -120,6 +120,7 @@ pub(crate) async fn register(
         config_path: config_path.display().to_string(),
         working_dir: working_dir.map(|directory| directory.display().to_string()),
         pid: std::process::id(),
+        micromux_version: Some(env!("CARGO_PKG_VERSION").to_string()),
         proxy_port: mux.proxy_port(),
         routes: route_targets(mux.routes()),
     };
@@ -395,6 +396,7 @@ services:
                     config_path: config_path.display().to_string(),
                     working_dir: None,
                     pid: std::process::id(),
+                    micromux_version: None,
                     proxy_port,
                     routes: super::route_targets(mux.routes()),
                 },

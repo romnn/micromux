@@ -11,7 +11,7 @@ use parking_lot::Mutex;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, watch};
 use tokio::time::Instant;
 use tracing::Instrument as _;
 
@@ -39,11 +39,38 @@ impl GitContext {
     ///
     /// Git gets up to 250 ms on each call; GitHub requests never delay the response.
     /// Each process shares a cache keyed by directory and branch, with at most four concurrent
-    /// GitHub lookups, each limited to five seconds.
+    /// GitHub lookups, each limited to five seconds; further lookups wait for their turn.
     /// Found PRs expire after an hour; missing PRs and failures retry after five minutes.
     /// A cold lookup returns the branch alone until a later call observes its result.
     pub async fn discover(directory: &Path) -> Option<Self> {
         CACHE.context(directory).await
+    }
+}
+
+/// An open GitHub pull request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullRequest {
+    /// Its number.
+    pub number: u64,
+    /// Its page, as GitHub reports it.
+    pub url: String,
+}
+
+/// The checked-out branch of a session's working directory and its pull request, for a page that
+/// links the pull request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitOverview {
+    /// Current local branch; detached HEAD and non-repositories have no overview.
+    pub branch: String,
+    /// The open GitHub pull request of the branch, when a lookup has found one.
+    pub pull_request: Option<PullRequest>,
+}
+
+impl GitOverview {
+    /// Reads the branch and its pull request from the cache [`GitContext::discover`] uses,
+    /// waiting until `deadline` for a lookup that has not finished yet.
+    pub async fn discover(directory: &Path, deadline: Instant) -> Option<Self> {
+        CACHE.overview(directory, deadline).await
     }
 }
 
@@ -83,7 +110,7 @@ impl super::SessionStatus {
 
 trait GitProvider: Send + Sync + 'static {
     fn branch(&self, directory: &Path) -> impl Future<Output = Option<String>> + Send;
-    fn pull_request(&self, key: &CacheKey) -> impl Future<Output = Option<u64>> + Send;
+    fn pull_request(&self, key: &CacheKey) -> impl Future<Output = Option<PullRequest>> + Send;
 }
 
 struct Commands;
@@ -101,26 +128,25 @@ impl GitProvider for Commands {
         (!branch.is_empty()).then_some(branch)
     }
 
-    async fn pull_request(&self, key: &CacheKey) -> Option<u64> {
+    async fn pull_request(&self, key: &CacheKey) -> Option<PullRequest> {
         #[derive(Deserialize)]
-        struct PullRequest {
+        struct Listed {
             number: u64,
+            url: String,
         }
         let output = command_output(
             Command::new("gh")
                 .args(["pr", "list", "--head", &key.branch, "--state", "open"])
-                .args(["--json", "number", "--limit", "1"])
+                .args(["--json", "number,url", "--limit", "1"])
                 .env("GH_PROMPT_DISABLED", "1")
                 .env("GIT_TERMINAL_PROMPT", "0")
                 .current_dir(&key.directory),
             GH_TIMEOUT,
         )
         .await?;
-        let requests: Vec<PullRequest> = serde_json::from_slice(&output).ok()?;
-        requests
-            .first()
-            .map(|request| request.number)
-            .filter(|number| *number > 0)
+        let requests: Vec<Listed> = serde_json::from_slice(&output).ok()?;
+        let Listed { number, url } = requests.into_iter().next()?;
+        (number > 0).then_some(PullRequest { number, url })
     }
 }
 
@@ -146,14 +172,18 @@ struct CacheKey {
 }
 
 struct CachedPullRequest {
-    number: Option<u64>,
+    pull_request: Option<PullRequest>,
     refresh_at: Instant,
+    /// Whether a lookup for this entry is queued or running.
+    pending: bool,
 }
 
 struct GitCache<P> {
     provider: P,
     entries: Mutex<HashMap<CacheKey, CachedPullRequest>>,
     lookups: Arc<Semaphore>,
+    /// Ticks whenever a lookup publishes its result.
+    published: watch::Sender<()>,
 }
 
 impl<P: GitProvider> GitCache<P> {
@@ -162,53 +192,81 @@ impl<P: GitProvider> GitCache<P> {
             provider,
             entries: Mutex::new(HashMap::new()),
             lookups: Arc::new(Semaphore::new(4)),
+            published: watch::Sender::new(()),
         }
     }
 
     async fn context(self: &Arc<Self>, directory: &Path) -> Option<GitContext> {
+        let GitOverview {
+            branch,
+            pull_request,
+        } = self.overview(directory, Instant::now()).await?;
+        Some(GitContext {
+            branch,
+            pull_request: pull_request.map(|pull_request| pull_request.number),
+        })
+    }
+
+    async fn overview(
+        self: &Arc<Self>,
+        directory: &Path,
+        deadline: Instant,
+    ) -> Option<GitOverview> {
         let branch = self.provider.branch(directory).await?;
         let key = CacheKey {
             directory: directory.to_path_buf(),
             branch: branch.clone(),
         };
-        let pull_request = self.cached_pull_request(key);
-        Some(GitContext {
-            branch,
-            pull_request,
-        })
+        // Subscribe before reading, so a result published in between still wakes the wait.
+        let mut published = self.published.subscribe();
+        loop {
+            let (pull_request, pending) = self.cached_pull_request(key.clone());
+            if !pending || Instant::now() >= deadline {
+                return Some(GitOverview {
+                    branch,
+                    pull_request,
+                });
+            }
+            let _ = tokio::time::timeout_at(deadline, published.changed()).await;
+        }
     }
 
-    fn cached_pull_request(self: &Arc<Self>, key: CacheKey) -> Option<u64> {
+    /// The cached pull request of `key`, and whether a lookup for it is still pending, which this
+    /// call starts when the entry is missing or stale.
+    fn cached_pull_request(self: &Arc<Self>, key: CacheKey) -> (Option<PullRequest>, bool) {
         let now = Instant::now();
         let mut entries = self.entries.lock();
         entries.retain(|_, entry| now < entry.refresh_at + FOUND_TTL);
         if let Some(entry) = entries.get(&key)
             && now < entry.refresh_at
         {
-            return entry.number;
+            return (entry.pull_request.clone(), entry.pending);
         }
-        let number = entries.get(&key).and_then(|entry| entry.number);
+        let pull_request = entries
+            .get(&key)
+            .and_then(|entry| entry.pull_request.clone());
         if !entries.contains_key(&key) && entries.len() >= MAX_ENTRIES {
-            return None;
+            return (None, false);
         }
-        let Ok(permit) = Arc::clone(&self.lookups).try_acquire_owned() else {
-            return number;
-        };
         // Reserve the retry window before spawning, so concurrent callers share one lookup.
         // It also bounds retries if the runtime cancels a refresh before it can publish.
         entries.insert(
             key.clone(),
             CachedPullRequest {
-                number,
+                pull_request: pull_request.clone(),
                 refresh_at: now + RETRY_TTL,
+                pending: true,
             },
         );
         drop(entries);
         let cache = Arc::clone(self);
         tokio::spawn(
             async move {
-                let number = cache.provider.pull_request(&key).await;
-                let ttl = if number.is_some() {
+                let Ok(_permit) = Arc::clone(&cache.lookups).acquire_owned().await else {
+                    return;
+                };
+                let pull_request = cache.provider.pull_request(&key).await;
+                let ttl = if pull_request.is_some() {
                     FOUND_TTL
                 } else {
                     RETRY_TTL
@@ -216,15 +274,16 @@ impl<P: GitProvider> GitCache<P> {
                 cache.entries.lock().insert(
                     key,
                     CachedPullRequest {
-                        number,
+                        pull_request,
                         refresh_at: Instant::now() + ttl,
+                        pending: false,
                     },
                 );
-                drop(permit);
+                cache.published.send_replace(());
             }
             .instrument(tracing::Span::current()),
         );
-        number
+        (pull_request, true)
     }
 }
 
@@ -263,19 +322,24 @@ mod tests {
             std::future::ready(self.branch.lock().clone())
         }
 
-        async fn pull_request(&self, _key: &CacheKey) -> Option<u64> {
+        async fn pull_request(&self, _key: &CacheKey) -> Option<PullRequest> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             self.started.add_permits(1);
             self.gate.acquire().await.ok()?.forget();
-            *self.number.lock()
+            self.number.lock().map(|number| PullRequest {
+                number,
+                url: format!("https://github.com/owner/repo/pull/{number}"),
+            })
         }
     }
 
     async fn finish_refresh(cache: &GitCache<FakeGit>) -> eyre::Result<()> {
         cache.provider.gate.add_permits(4);
-        // Every refresh holds a permit until it has published its result.
-        let permits = cache.lookups.acquire_many(4).await?;
-        drop(permits);
+        // Subscribe before checking, so a result published in between still wakes the wait.
+        let mut published = cache.published.subscribe();
+        while cache.entries.lock().values().any(|entry| entry.pending) {
+            published.changed().await?;
+        }
         Ok(())
     }
 
@@ -390,6 +454,8 @@ mod tests {
         assert!(cache.entries.lock().is_empty());
     }
 
+    /// At most four lookups run at once, and the rest wait for their turn instead of being
+    /// dropped.
     #[tokio::test]
     async fn github_concurrency_is_bounded() -> eyre::Result<()> {
         let cache = Arc::new(GitCache::new(FakeGit::new(None)));
@@ -399,9 +465,69 @@ mod tests {
                 .await;
         }
         cache.provider.started.acquire_many(4).await?.forget();
+        tokio::task::yield_now().await;
         assert_eq!(cache.provider.calls.load(Ordering::SeqCst), 4);
-        finish_refresh(&cache).await?;
-        assert_eq!(cache.provider.calls.load(Ordering::SeqCst), 4);
+
+        // Each finished lookup lets a waiting one start.
+        cache.provider.gate.add_permits(4);
+        cache.provider.started.acquire_many(4).await?.forget();
+        tokio::task::yield_now().await;
+        assert_eq!(cache.provider.calls.load(Ordering::SeqCst), 8);
+        cache.provider.gate.add_permits(6);
+        cache.provider.started.acquire_many(2).await?.forget();
+        assert_eq!(cache.provider.calls.load(Ordering::SeqCst), 10);
+        Ok(())
+    }
+
+    /// A wait for a cold lookup ends as soon as it publishes, even a lookup that waited for its
+    /// turn and found no pull request, and gives up at its deadline otherwise.
+    #[tokio::test(start_paused = true)]
+    async fn an_overview_waits_for_pending_lookups_until_its_deadline() -> eyre::Result<()> {
+        let cache = Arc::new(GitCache::new(FakeGit::new(Some(42))));
+        let deadline = Instant::now() + Duration::from_secs(2);
+
+        // Found
+        let waiting = tokio::spawn({
+            let cache = Arc::clone(&cache);
+            async move { cache.overview(Path::new("/project"), deadline).await }
+        });
+        cache.provider.started.acquire().await?.forget();
+        cache.provider.gate.add_permits(1);
+        let overview = waiting
+            .await?
+            .ok_or_else(|| eyre::eyre!("missing branch"))?;
+        assert_eq!(
+            overview.pull_request.map(|pull_request| pull_request.url),
+            Some("https://github.com/owner/repo/pull/42".to_string())
+        );
+        assert!(Instant::now() < deadline);
+
+        // Missing, after waiting for its turn behind four running lookups
+        *cache.provider.number.lock() = None;
+        for directory in 0..4 {
+            cache
+                .context(Path::new(&format!("/busy/{directory}")))
+                .await;
+        }
+        let waiting = tokio::spawn({
+            let cache = Arc::clone(&cache);
+            async move { cache.overview(Path::new("/other"), deadline).await }
+        });
+        cache.provider.started.acquire_many(4).await?.forget();
+        cache.provider.gate.add_permits(5);
+        let overview = waiting
+            .await?
+            .ok_or_else(|| eyre::eyre!("missing branch"))?;
+        assert_eq!(overview.pull_request, None);
+        assert!(Instant::now() < deadline);
+
+        // Still running at the deadline
+        let overview = cache
+            .overview(Path::new("/slow"), deadline)
+            .await
+            .ok_or_else(|| eyre::eyre!("missing branch"))?;
+        assert_eq!(overview.pull_request, None);
+        assert!(Instant::now() >= deadline);
         Ok(())
     }
 

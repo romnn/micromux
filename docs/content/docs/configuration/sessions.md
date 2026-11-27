@@ -101,7 +101,7 @@ Browsers resolve every `*.localhost` name to the local machine on their own, so 
 
 - `port` is the upstream port on `127.0.0.1`. It may reference micromux's own environment and the [injected variables](#injected-variables), typically an `allocate_ports` name, but not a service's `env_file`. A route cannot point at the proxy's own port.
 - The proxy routes by the `Host` header, which reaches the service unchanged, and passes WebSocket upgrades and streaming responses (SSE, chunked) through without buffering.
-- A hostname or path no route serves, such as `http://localhost/`, gets a 404 page listing the live sessions with their branch and pull request; each one folds out to its URLs. The page follows the browser's light or dark theme. A route whose service does not accept connections gets a 502 page naming the session and the service. The service is the one whose `ports` list the route's port, so list the port there. A config reload that adds, removes, or changes services updates which service that is.
+- A hostname or path no route serves, such as `http://localhost/`, gets a 404 page listing the live sessions with their branch, pull request, micromux version and age; each one folds out to its routes, sorted by host, with the service and port behind each. A session whose version differs from the proxy's is marked. A host inside one session's domain lists that session first and unfolded. A filter box (press `/`) narrows the list to matching sessions and routes, and Enter opens the first match. The page follows the browser's light or dark theme unless its theme switch picks one, and its footer names the proxy's version, pid and uptime. A route whose service does not accept connections gets a 502 page naming the session and the service. The service is the one whose `ports` list the route's port, so list the port there. A config reload that adds, removes, or changes services updates which service that is.
 - `routes` are not supported on Windows.
 
 ### Path routes
@@ -129,7 +129,7 @@ routes:
 
 ### The proxy
 
-Visit `http://localhost` (including your proxy port when it is not 80) to see the registered sessions and their endpoints. Each session also shows its current Git branch and, when available, an open GitHub PR number. Session names stay the same.
+Visit `http://localhost` (including your proxy port when it is not 80) to see the registered sessions and their endpoints. Each session also shows its current Git branch and, when available, a link to its open GitHub PR. Session names stay the same.
 
 To disable both Git and GitHub metadata fetching, set this in your [user config]({{< relref "../tui.md" >}}#user-config) for all projects, or in a project's `micromux.yaml`:
 
@@ -140,7 +140,7 @@ git:
 
 The project's `git.metadata` takes precedence over the user's setting; it defaults to `true` when neither file sets it. A project can use `metadata: true` to override a user-level default of `false`. Disabling it also hides previously cached metadata. The setting is read at session startup, so restart running sessions after changing it.
 
-Git context comes from the directory where the session was launched. The branch is checked on each overview request or MCP session description, so switching branches does not need a restart. PR lookups use `gh` in the background: the first response may show only the branch, with the PR appearing on a later request. Each process caches found PRs for an hour and retries missing PRs or failures after five minutes, keyed by directory and branch. Concurrent requests share a lookup. Missing Git or `gh`, detached HEAD, non-repositories, authentication failures, and network timeouts simply leave the corresponding metadata absent. MCP exposes the same context under `session.git` in `list_sessions` and in the session returned by `get_session_urls`.
+Git context comes from the directory where the session was launched. The branch is checked on each overview request or MCP session description, so switching branches does not need a restart. PR lookups use `gh` in the background. The overview page waits up to about two seconds for lookups still running; MCP answers at once, so its first response may show only the branch, with the PR appearing on a later request. At most four lookups run at a time; the rest queue. Each process caches found PRs for an hour and retries missing PRs or failures after five minutes, keyed by directory and branch. Concurrent requests share a lookup. Missing Git or `gh`, detached HEAD, non-repositories, authentication failures, and network timeouts simply leave the corresponding metadata absent. MCP exposes the same context under `session.git` in `list_sessions` and in the session returned by `get_session_urls`.
 
 The first session with routes starts the proxy (`micromux proxy`) in the background. Sessions keep their routes registered over a local socket for as long as they run; a session that crashes loses its routes within seconds, and the proxy exits on its own a minute after the last session is gone.
 
