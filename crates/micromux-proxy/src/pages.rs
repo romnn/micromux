@@ -31,29 +31,6 @@ pub(crate) struct ProxyFacts {
     pub(crate) uptime: Duration,
 }
 
-/// The URL a route of `session` answers on.
-pub(crate) fn route_url(session: &ListedSession, route: &RouteTarget) -> String {
-    let (labels, port, path) = route_parts(session, route);
-    let labels = labels
-        .map(|labels| format!("{labels}."))
-        .unwrap_or_default();
-    format!("http://{labels}{}{port}{path}", session.domain)
-}
-
-/// The parts of a route's URL: its own host labels (none for the catch-all, which serves the
-/// session domain itself), the port suffix, and the path.
-fn route_parts<'a>(
-    session: &ListedSession,
-    route: &'a RouteTarget,
-) -> (Option<&'a str>, String, &'a str) {
-    let labels = (route.host != "*").then_some(route.host.as_str());
-    let port = match session.proxy_port {
-        80 => String::new(),
-        port => format!(":{port}"),
-    };
-    (labels, port, route.path.as_deref().unwrap_or("/"))
-}
-
 /// Whether `host` is `domain` or lies under it.
 fn within(host: &str, domain: &str) -> bool {
     host == domain
@@ -92,8 +69,14 @@ pub(crate) fn not_found(
         count(sessions.len(), "session"),
         count(routes, "route")
     );
+    // The session the host lies in, if any, is the one the visitor most likely looked for
+    let likely = sessions
+        .iter()
+        .map(|session| session.domain.as_str())
+        .filter(|domain| within(host, domain))
+        .max_by_key(|domain| domain.len());
     let mut body = String::from("<header>");
-    if path == "/" && overview_host(host, sessions) {
+    if path == "/" && likely.is_none() && overview_host(host, sessions) {
         let _ = write!(body, "<h1>{summary}</h1>");
     } else {
         let _ = write!(
@@ -115,19 +98,11 @@ pub(crate) fn not_found(
         );
     }
 
-    // The session the host belongs to first, then the rest by name
-    let likely = sessions
-        .iter()
-        .filter(|session| within(host, &session.domain))
-        .max_by_key(|session| session.domain.len());
-    let ordered = likely.into_iter().chain(
-        sessions
-            .iter()
-            .filter(|session| !likely.is_some_and(|likely| std::ptr::eq(likely, *session))),
-    );
+    // The likely session first, then the rest by name; each session has its own domain
+    let mut ordered = sessions.iter().collect::<Vec<_>>();
+    ordered.sort_by_key(|session| Some(session.domain.as_str()) != likely);
     for session in ordered {
-        let open =
-            sessions.len() == 1 || likely.is_some_and(|likely| std::ptr::eq(likely, session));
+        let open = sessions.len() == 1 || Some(session.domain.as_str()) == likely;
         session_block(&mut body, session, open, proxy.version);
     }
 
@@ -191,6 +166,10 @@ fn session_block(body: &mut String, session: &ListedSession, open: bool, proxy_v
         escape(&session.config_path)
     );
 
+    let port = match session.proxy_port {
+        80 => String::new(),
+        port => format!(":{port}"),
+    };
     // Routes in DNS order, so a host's subdomains stay together, then by path
     let mut routes = session.routes.iter().collect::<Vec<_>>();
     routes.sort_by_cached_key(|route| {
@@ -198,29 +177,28 @@ fn session_block(body: &mut String, session: &ListedSession, open: bool, proxy_v
         (labels, route.path.clone())
     });
     for route in routes {
-        let (labels, port, path) = route_parts(session, route);
+        let path = route.path.as_deref().unwrap_or("/");
+        // The catch-all serves the session domain itself
+        let (host, own, domain) = if route.host == "*" {
+            (
+                session.domain.clone(),
+                breakable(&session.domain),
+                String::new(),
+            )
+        } else {
+            (
+                format!("{}.{}", route.host, session.domain),
+                breakable(&route.host),
+                format!(".<wbr>{}", breakable(&session.domain)),
+            )
+        };
         let _ = write!(
             body,
-            "<tr><td><a href=\"{}\">",
-            escape(&route_url(session, route))
+            "<tr><td><a href=\"http://{}{port}{}\"><span class=\"own\">{own}</span>\
+             <span class=\"domain\">{domain}{port}</span>",
+            escape(&host),
+            escape(path)
         );
-        match labels {
-            Some(labels) => {
-                let _ = write!(
-                    body,
-                    "<span class=\"own\">{}</span><span class=\"domain\">.{}{port}</span>",
-                    breakable(labels),
-                    breakable(&session.domain)
-                );
-            }
-            None => {
-                let _ = write!(
-                    body,
-                    "<span class=\"own\">{}</span><span class=\"domain\">{port}</span>",
-                    breakable(&session.domain)
-                );
-            }
-        }
         let _ = write!(
             body,
             "<span class=\"own\">{}</span></a></td>",
@@ -296,15 +274,10 @@ fn compare(ours: &str, theirs: &str) -> Option<std::cmp::Ordering> {
     Some(ours.cmp_precedence(&theirs))
 }
 
-/// Whether `url` is an absolute `https` URL with a host, and nothing that could leave the
-/// attribute it is written into even before escaping.
+/// Whether `url` is an absolute `https` URL with a host, so a link to it cannot run script.
 fn safe_https(url: &str) -> bool {
-    url.strip_prefix("https://").is_some_and(|rest| {
-        !rest.is_empty()
-            && !rest.starts_with('/')
-            && !rest.contains(|c: char| {
-                c.is_whitespace() || c.is_control() || matches!(c, '"' | '\'' | '<' | '>' | '`')
-            })
+    url.parse::<hyper::Uri>().is_ok_and(|uri| {
+        uri.scheme_str() == Some("https") && uri.host().is_some_and(|host| !host.is_empty())
     })
 }
 
@@ -327,13 +300,15 @@ const SCRIPT: &str = r#"<script>
     if (theme === "auto") delete root.dataset.theme; else root.dataset.theme = theme;
     button.textContent = labels[theme];
   };
-  let theme = localStorage.getItem("micromux-theme");
+  // A browser that denies storage throws; the switch then works without remembering
+  let theme = "auto";
+  try { theme = localStorage.getItem("micromux-theme"); } catch {}
   if (!themes.includes(theme)) theme = "auto";
   show(theme);
   button.hidden = false;
   button.addEventListener("click", () => {
     theme = themes[(themes.indexOf(theme) + 1) % themes.length];
-    localStorage.setItem("micromux-theme", theme);
+    try { localStorage.setItem("micromux-theme", theme); } catch {}
     show(theme);
   });
 
@@ -341,29 +316,33 @@ const SCRIPT: &str = r#"<script>
   if (!filter) return;
   filter.hidden = false;
   const sessions = [...document.querySelectorAll("details")];
-  const unfolded = sessions.map((session) => session.open);
+  // Which sessions were unfolded when a search began, restored once it is cleared
+  let unfolded = null;
   filter.addEventListener("input", () => {
     const query = filter.value.trim().toLowerCase();
+    if (query && !unfolded) unfolded = sessions.map((session) => session.open);
     sessions.forEach((session, index) => {
       const rows = [...session.querySelectorAll("tr")];
       if (!query) {
         session.hidden = false;
-        session.open = unfolded[index];
+        if (unfolded) session.open = unfolded[index];
         rows.forEach((row) => (row.hidden = false));
         return;
       }
       const about = session.querySelector("summary").textContent + " " +
         session.querySelector(".path").textContent;
       const named = about.toLowerCase().includes(query);
-      const matching = rows.filter((row) => row.textContent.toLowerCase().includes(query));
+      const matching = rows.filter((row) =>
+        (row.querySelector("a").href + " " + row.textContent).toLowerCase().includes(query));
       session.hidden = !named && matching.length === 0;
       session.open = !session.hidden;
       rows.forEach((row) => (row.hidden = matching.length > 0 && !matching.includes(row)));
     });
+    if (!query) unfolded = null;
   });
   filter.addEventListener("keydown", (event) => {
-    if (event.key === "Enter") {
-      const link = document.querySelector("details:not([hidden]) tr:not([hidden]) a");
+    if (event.key === "Enter" && filter.value.trim()) {
+      const link = document.querySelector("details[open]:not([hidden]) tr:not([hidden]) a");
       if (link) location.href = link.href;
     } else if (event.key === "Escape") {
       filter.value = "";
@@ -428,7 +407,7 @@ const STYLE: &str = "\
     a{color:var(--link);text-decoration:none}a:hover{text-decoration:underline}\
     footer{margin-top:2rem;font-size:.8rem}\
     @media (max-width:40rem){tr{display:flex;flex-wrap:wrap}td:first-child{flex:1 1 100%}\
-    td.target{padding:0 .9rem .3rem 3.1rem;text-align:left}}";
+    td.target{padding:0 .9rem .3rem 3.1rem;text-align:left;white-space:normal}}";
 
 /// A small route icon for the browser tab, so the browser asks for no `/favicon.ico`.
 const ICON: &str = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' \
@@ -596,6 +575,7 @@ mod tests {
             "javascript:alert(1)",
             "http://example.com/1",
             "https:///x",
+            "https://?x",
             "https://a\" b",
         ] {
             assert!(!safe_https(url), "{url}");
@@ -637,6 +617,12 @@ mod tests {
         // A lone session starts unfolded
         let page = not_found("localhost", "/", &sessions[..1], &PROXY);
         assert!(page.contains("<details open>"));
+
+        // A session that owns the bare host makes it a route miss, not the overview
+        let mut owner = session("owner", None);
+        owner.domain = "localhost".to_string();
+        let page = not_found("localhost", "/", &[owner], &PROXY);
+        assert!(page.contains("No route serves <code>localhost/</code>"));
     }
 
     #[test]

@@ -48,7 +48,7 @@ impl GitContext {
 }
 
 /// An open GitHub pull request.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct PullRequest {
     /// Its number.
     pub number: u64,
@@ -129,11 +129,6 @@ impl GitProvider for Commands {
     }
 
     async fn pull_request(&self, key: &CacheKey) -> Option<PullRequest> {
-        #[derive(Deserialize)]
-        struct Listed {
-            number: u64,
-            url: String,
-        }
         let output = command_output(
             Command::new("gh")
                 .args(["pr", "list", "--head", &key.branch, "--state", "open"])
@@ -144,9 +139,11 @@ impl GitProvider for Commands {
             GH_TIMEOUT,
         )
         .await?;
-        let requests: Vec<Listed> = serde_json::from_slice(&output).ok()?;
-        let Listed { number, url } = requests.into_iter().next()?;
-        (number > 0).then_some(PullRequest { number, url })
+        let requests: Vec<PullRequest> = serde_json::from_slice(&output).ok()?;
+        requests
+            .into_iter()
+            .next()
+            .filter(|request| request.number > 0)
     }
 }
 
@@ -514,7 +511,12 @@ mod tests {
             async move { cache.overview(Path::new("/other"), deadline).await }
         });
         cache.provider.started.acquire_many(4).await?.forget();
-        cache.provider.gate.add_permits(5);
+        // An unrelated lookup finishing lets this one start but does not end its wait
+        cache.provider.gate.add_permits(1);
+        cache.provider.started.acquire().await?.forget();
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished());
+        cache.provider.gate.add_permits(4);
         let overview = waiting
             .await?
             .ok_or_else(|| eyre::eyre!("missing branch"))?;
@@ -528,6 +530,7 @@ mod tests {
             .ok_or_else(|| eyre::eyre!("missing branch"))?;
         assert_eq!(overview.pull_request, None);
         assert!(Instant::now() >= deadline);
+        assert!(Instant::now() < deadline + Duration::from_millis(100));
         Ok(())
     }
 

@@ -1188,23 +1188,12 @@ pub(crate) mod tests {
         assert_eq!(port(8080, "app.one.localhost"), None);
         assert_eq!(port(80, "app.two.localhost"), None);
 
-        let urls = shared
+        let ports = shared
             .listed_sessions()
-            .iter()
-            .flat_map(|session| {
-                session
-                    .routes
-                    .iter()
-                    .map(|route| crate::pages::route_url(session, route))
-            })
+            .into_iter()
+            .map(|session| (session.name, session.proxy_port))
             .collect::<Vec<_>>();
-        assert_eq!(
-            urls,
-            [
-                "http://app.one.localhost/",
-                "http://app.two.localhost:8080/"
-            ]
-        );
+        assert_eq!(ports, [("one".to_string(), 80), ("two".to_string(), 8080)]);
         Ok(())
     }
 
