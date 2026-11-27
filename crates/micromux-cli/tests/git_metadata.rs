@@ -39,9 +39,9 @@ fn fake_commands(directory: &Path) -> eyre::Result<()> {
     "#};
     let gh = indoc! {r#"
         #!/bin/sh
-        [ "$*" = 'pr list --head feature/metadata --state open --json number --limit 1' ] || exit 1
+        [ "$*" = 'pr list --head feature/metadata --state open --json number,url --limit 1' ] || exit 1
         printf 'gh\n' >> "$MICROMUX_TEST_COMMAND_LOG"
-        printf '[{"number":42}]\n'
+        printf '[{"number":42,"url":"https://github.com/owner/repo/pull/42"}]\n'
     "#};
     for (name, script) in [("git", git), ("gh", gh)] {
         let path = bin.join(name);

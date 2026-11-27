@@ -18,7 +18,7 @@ use indexmap::IndexMap;
 
 use crate::config::{ConfigFile, SessionConfig};
 
-pub use git::GitContext;
+pub use git::{GitContext, GitOverview, PullRequest};
 pub(crate) use registry::{
     DEFAULT_PORT_RANGE, Lease, PortRequest, create_private_dir, user_state_directory,
 };

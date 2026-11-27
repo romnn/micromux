@@ -93,7 +93,7 @@ pub enum ClientMessage {
     ///
     /// Sent again on the same connection for the same session, it swaps the routes in place and
     /// keeps the session's proxied connections and tunnels open.
-    Register(Registration),
+    Register(Box<Registration>),
     /// Keeps the registration alive.
     Ping,
     /// Asks the proxy to exit now if no session is registered, answered with
@@ -191,6 +191,9 @@ pub struct Registration {
     pub working_dir: Option<String>,
     /// Process id of the session.
     pub pid: u32,
+    /// The micromux release the session runs, such as `0.5.1`; older sessions omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub micromux_version: Option<String>,
     /// The proxy port the session's services were told about, the only port its routes are
     /// served on.
     ///

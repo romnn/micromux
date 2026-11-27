@@ -11,7 +11,7 @@ use tokio_util::codec::{Framed, LinesCodec};
 use tokio_util::sync::CancellationToken;
 
 use crate::listen::{self, Acquired, BindError, Bound, PortPreference};
-use crate::pages::ListedSession;
+use crate::pages::{ListedSession, ProxyFacts};
 use crate::paths::ProxyPaths;
 use crate::protocol::{
     ClientMessage, LEASE_TIMEOUT, MAX_MESSAGE_BYTES, PROTOCOL_VERSION, ProxyMessage,
@@ -20,6 +20,10 @@ use crate::protocol::{
 
 /// How long a starting proxy waits for a previous one to release the singleton lock.
 const LOCK_WAIT: Duration = Duration::from_secs(5);
+
+/// How long the not-found page waits for pull request lookups that are still running, such as
+/// right after the proxy started.
+const OVERVIEW_GIT_WAIT: Duration = Duration::from_secs(2);
 
 /// How the proxy runs.
 #[derive(Debug, Clone)]
@@ -173,6 +177,8 @@ async fn acquire_lock(path: &PathBuf) -> Result<std::fs::File, ServeError> {
 pub(crate) struct Shared {
     /// The port the proxy started with, which [`ProxyMessage::Info`] reports.
     started_port: u16,
+    /// When the proxy started, for its uptime.
+    started_at: tokio::time::Instant,
     state: Mutex<State>,
     /// The HTTP listeners by port.
     ///
@@ -222,6 +228,8 @@ struct State {
 
 struct Entry {
     generation: u64,
+    /// When the session's connection registered, which a route swap on it keeps.
+    registered_at: tokio::time::Instant,
     registration: Registration,
     /// Cancelled when the registration ends, which also ends its proxied connections.
     cancel: CancellationToken,
@@ -284,6 +292,7 @@ impl Shared {
     fn new(started_port: u16, stop: CancellationToken) -> Self {
         Self {
             started_port,
+            started_at: tokio::time::Instant::now(),
             state: Mutex::new(State {
                 sessions: HashMap::new(),
                 next_generation: 0,
@@ -490,9 +499,13 @@ impl Shared {
         best_route(host_routes.into_iter(), path).map(|route| target(entry, route))
     }
 
+    /// The live sessions with their Git context, for the not-found page.
+    ///
+    /// Pull request lookups that are still running get one shared [`OVERVIEW_GIT_WAIT`].
     pub(crate) async fn listed_sessions_with_git(&self) -> Vec<ListedSession> {
         // Snapshot before I/O to keep the routing table available during Git lookups.
         let mut sessions = self.listed_sessions();
+        let deadline = tokio::time::Instant::now() + OVERVIEW_GIT_WAIT;
         futures::future::join_all(sessions.iter_mut().map(|session| async move {
             if !session.git_metadata {
                 return;
@@ -503,16 +516,17 @@ impl Shared {
                 .map(std::path::Path::new)
                 .or_else(|| std::path::Path::new(&session.config_path).parent());
             if let Some(directory) = directory {
-                session.git = micromux::session::GitContext::discover(directory).await;
+                session.git = micromux::session::GitOverview::discover(directory, deadline).await;
             }
         }))
         .await;
         sessions
     }
 
-    /// The live sessions and their URLs, each with its own port, for the not-found page.
+    /// The live sessions, sorted by name, for the not-found page.
     pub(crate) fn listed_sessions(&self) -> Vec<ListedSession> {
         let state = self.state();
+        let now = tokio::time::Instant::now();
         let mut sessions = state
             .sessions
             .iter()
@@ -521,28 +535,25 @@ impl Shared {
                 working_dir: entry.registration.working_dir.clone(),
                 git: None,
                 name: entry.registration.session.clone(),
+                domain: domain.clone(),
                 config_path: entry.registration.config_path.clone(),
-                urls: entry
-                    .registration
-                    .routes
-                    .iter()
-                    .map(|route| {
-                        let suffix = match entry.registration.proxy_port {
-                            80 => String::new(),
-                            port => format!(":{port}"),
-                        };
-                        let path = route.path.as_deref().unwrap_or("/");
-                        if route.host == "*" {
-                            format!("http://{domain}{suffix}{path}")
-                        } else {
-                            format!("http://{}.{domain}{suffix}{path}", route.host)
-                        }
-                    })
-                    .collect(),
+                version: entry.registration.micromux_version.clone(),
+                registered_for: now.saturating_duration_since(entry.registered_at),
+                proxy_port: entry.registration.proxy_port,
+                routes: entry.registration.routes.clone(),
             })
             .collect::<Vec<_>>();
         sessions.sort_by(|a, b| a.name.cmp(&b.name));
         sessions
+    }
+
+    /// What the proxy's own pages say about it.
+    pub(crate) fn facts(&self) -> ProxyFacts {
+        ProxyFacts {
+            version: env!("CARGO_PKG_VERSION"),
+            pid: std::process::id(),
+            uptime: self.started_at.elapsed(),
+        }
     }
 
     fn register(
@@ -629,6 +640,7 @@ impl Shared {
             session_domain.clone(),
             Entry {
                 generation,
+                registered_at: tokio::time::Instant::now(),
                 registration,
                 cancel: cancel.clone(),
             },
@@ -842,7 +854,7 @@ async fn serve_registration(stream: UnixStream, shared: Arc<Shared>, stop: Cance
             },
             Ok(ClientMessage::Register(registration)) => {
                 match shared
-                    .register_listening(registration, owned.as_ref())
+                    .register_listening(*registration, owned.as_ref())
                     .await
                 {
                     Ok(registered) => {
@@ -901,6 +913,7 @@ pub(crate) mod tests {
             config_path: config_path.to_string(),
             working_dir: None,
             pid: 1,
+            micromux_version: None,
             proxy_port: 80,
             routes: routes
                 .iter()
@@ -1175,18 +1188,12 @@ pub(crate) mod tests {
         assert_eq!(port(8080, "app.one.localhost"), None);
         assert_eq!(port(80, "app.two.localhost"), None);
 
-        let urls = shared
+        let ports = shared
             .listed_sessions()
             .into_iter()
-            .flat_map(|session| session.urls)
+            .map(|session| (session.name, session.proxy_port))
             .collect::<Vec<_>>();
-        assert_eq!(
-            urls,
-            [
-                "http://app.one.localhost/",
-                "http://app.two.localhost:8080/"
-            ]
-        );
+        assert_eq!(ports, [("one".to_string(), 80), ("two".to_string(), 8080)]);
         Ok(())
     }
 

@@ -77,6 +77,7 @@ fn registration(session: &str, routes: &[(&str, u16, Option<&str>)]) -> Registra
         config_path: format!("/projects/{session}/micromux.yaml"),
         working_dir: None,
         pid: std::process::id(),
+        micromux_version: None,
         routes: routes
             .iter()
             .map(|(host, port, service)| RouteTarget {
@@ -1143,7 +1144,7 @@ async fn a_registration_opens_the_port_it_names() -> eyre::Result<()> {
         .write_all(
             format!(
                 "{}\n",
-                serde_json::to_string(&ClientMessage::Register(two))?
+                serde_json::to_string(&ClientMessage::Register(Box::new(two)))?
             )
             .as_bytes(),
         )

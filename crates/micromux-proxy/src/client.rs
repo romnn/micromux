@@ -551,7 +551,7 @@ async fn register_on(
 ) -> Result<Live, ClientError> {
     match request(
         &mut connection,
-        &ClientMessage::Register(registration.clone()),
+        &ClientMessage::Register(Box::new(registration.clone())),
     )
     .await?
     {
@@ -770,7 +770,7 @@ async fn keep_alive(
                 if maintained.registration.required_protocol() > protocol {
                     return Some("the new routes need a newer proxy".to_string());
                 }
-                let register = ClientMessage::Register(maintained.registration.clone());
+                let register = ClientMessage::Register(Box::new(maintained.registration.clone()));
                 let Ok(register) = serde_json::to_string(&register) else {
                     return Some("cannot encode the new routes".to_string());
                 };

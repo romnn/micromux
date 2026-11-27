@@ -93,6 +93,7 @@ async fn a_newer_release_replaces_the_running_proxy() -> eyre::Result<()> {
             config_path: "/one/micromux.yaml".to_string(),
             working_dir: None,
             pid: std::process::id(),
+            micromux_version: None,
             proxy_port: started_port,
             routes: vec![RouteTarget {
                 host: "app".to_string(),
